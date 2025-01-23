@@ -1098,7 +1098,7 @@ def main():
     files_to_process = [json_file for json_file in search_results_dir.glob('*.json') if json_file.name not in processed_files]
     
     # Use ThreadPoolExecutor to process files concurrently
-    with ThreadPoolExecutor(max_workers=1) as executor:  # Adjust max_workers based on your system's capabilities
+    with ThreadPoolExecutor(max_workers=5) as executor:  # Adjust max_workers based on your system's capabilities
         futures = {executor.submit(process_file, json_file, enhancer, done_dir): json_file for json_file in files_to_process}
         
         for future in as_completed(futures):

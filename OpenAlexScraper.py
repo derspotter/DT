@@ -1,4 +1,5 @@
 import json
+from urllib.parse import quote_plus
 import requests
 import time
 from pathlib import Path
@@ -170,18 +171,69 @@ def get_authors_and_editors(ref):
     
     return authors, editors
 
-class OpenAlexSearcher:
+class OpenAlexCrossrefSearcher:
     def __init__(self, email="spott@wzb.eu"):
         self.base_url = "https://api.openalex.org/works"
         self.headers = {'User-Agent': f'mailto:{email}'}
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works'
         self.rate_limiter = RateLimiter(max_per_second=10)
+        self.crossref_headers = {'mailto': email}
+
+    def search_crossref(self, title, authors, year):
+        """Search Crossref for matching works."""
+        query = []
+        if title:
+            query.append(f'title:{quote_plus(title)}')
+        if authors:
+            authors_str = '+'.join(quote_plus(author) for author in authors)
+            query.append(f'author:{authors_str}')
+        if year:
+            query.append(f'published:{year}')
+            
+        if not query:
+            return []
+            
+        url = f'https://api.crossref.org/works?query={"+".join(query)}&rows=5'
+        
+        try:
+            self.rate_limiter.wait_if_needed()
+            response = requests.get(url, headers=self.crossref_headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data['message']['items']:
+                # Convert Crossref results to OpenAlex-like format for compatibility
+                results = []
+                for item in data['message']['items']:
+                    result = {
+                        'id': f"crossref:{item.get('DOI', '')}",
+                        'doi': item.get('DOI'),
+                        'display_name': item.get('title', [''])[0],
+                        'publication_year': item.get('published-print', {}).get('date-parts', [[None]])[0][0],
+                        'type': item.get('type'),
+                        'authorships': [
+                            {
+                                'author': {
+                                    'display_name': f"{author.get('given', '')} {author.get('family', '')}"
+                                }
+                            }
+                            for author in item.get('author', [])
+                        ]
+                    }
+                    results.append(result)
+                return results
+            return []
+                
+        except Exception as e:
+            print(f"Crossref error: {e}")
+            return []
 
     def search(self, title, year, container_title, step):
         """
-        Search OpenAlex with different strategies based on step number.
-        Steps 1-6 use filter queries.
-        Steps 7-8 use the 'search' parameter for title and container_title separately.
+        Search OpenAlex and Crossref with different strategies based on step number.
+        Steps 1-7: use OpenAlex filter queries
+        Step 8: use Crossref search
+        Step 9: use OpenAlex search parameter for container_title
         """
         if not title and not container_title:
             return {"step": step, "results": [], "success": False}
@@ -190,7 +242,7 @@ class OpenAlexSearcher:
         title = clean_search_term(title)
         container = clean_search_term(container_title)
 
-        # Steps 1-6: use filter parameter
+        # Steps 1-7: use filter parameter
         if step in [1, 4]:
             if container:
                 query = f'display_name:"{title}"|"{container}"'
@@ -206,65 +258,140 @@ class OpenAlexSearcher:
                 query = f'title.search:{title}|{container}'
             else:
                 query = f'title.search:{title}'
-        
-        # Steps 7-8: use search parameter separately for title and container
-        if step in [7, 8]:
-            if step == 7 and title:
-                search_query = f'{title}'
-            elif step == 8 and container:
-                search_query = f'{container}'
-            else:
-                return {"step": step, "results": [], "success": False}
-            
+        elif step == 7:
+            search_query = f'{title}'
             params = {
                 'search': search_query,
                 'select': self.fields,
-                'per-page': 100
+                'per-page': 10
             }
-        else:
+        
+        # Step 8: Crossref search
+        elif step == 8:
+            try:
+                print(f"\nStep {step}: Crossref Search")
+                query = []
+                if title:
+                    query.append(f'title:{quote_plus(title)}')
+                if container:
+                    query.append(f'container-title:{quote_plus(container)}')
+                if year:
+                    query.append(f'published:{year}')
+                    
+                if not query:
+                    return {"step": step, "results": [], "success": False}
+                    
+                url = f'https://api.crossref.org/works?query={"+".join(query)}&rows=10'
+                print(f"Crossref Query: {url}")
+                
+                self.rate_limiter.wait_if_needed()
+                response = requests.get(url, headers=self.crossref_headers)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data['message']['items']:
+                    # Convert Crossref results to OpenAlex-like format
+                    results = []
+                    for item in data['message']['items']:
+                        # Get publication year from the most specific date available
+                        pub_year = None
+                        for date_field in ['published-print', 'published-online', 'published']:
+                            if date_parts := item.get(date_field, {}).get('date-parts', [[None]])[0]:
+                                pub_year = date_parts[0]
+                                if pub_year:
+                                    break
+
+                        result = {
+                            'id': f"crossref:{item.get('DOI', '')}",
+                            'doi': item.get('DOI'),
+                            'display_name': item.get('title', [''])[0],
+                            'publication_year': pub_year,
+                            'type': item.get('type'),
+                            'authorships': [
+                                {
+                                    'author': {
+                                        'display_name': f"{author.get('given', '')} {author.get('family', '')}"
+                                    }
+                                }
+                                for author in item.get('author', [])
+                            ]
+                        }
+                        results.append(result)
+                    
+                    return {
+                        "step": step,
+                        "results": results,
+                        "success": len(results) > 0,
+                        "query": url,
+                        "meta": data.get('message', {}).get('total-results'),
+                        "url": url
+                    }
+                
+                return {"step": step, "results": [], "success": False}
+                    
+            except Exception as e:
+                print(f"Error in Crossref search: {e}")
+                return {"step": step, "results": [], "success": False, "error": str(e)}
+        
+        # Step 9: Container title search
+        elif step == 9:
+            if container:
+                search_query = f'{container}'
+                params = {
+                    'search': search_query,
+                    'select': self.fields,
+                    'per-page': 10
+                }
+            else:
+                return {"step": step, "results": [], "success": False}
+        
+        # OpenAlex API calls (for steps 1-7 and 9)
+        if step not in [8]:  # All steps except Crossref
             # Add year for steps 1-3
-            if year and step <= 3:
+            if step <= 3 and year:
                 query = f'{query},publication_year:{year}'
             
-            params = {
-                'filter': query,
-                'select': self.fields,
-                'per-page': 100
-            }
+            # Set up parameters if not already set (for steps 1-6)
+            if step <= 6:
+                params = {
+                    'filter': query,
+                    'select': self.fields,
+                    'per-page': 10
+                }
 
-        try:
-            print(f"\nStep {step} Search")
-            if step in [7, 8]:
-                print(f"Search query: {params['search']}")
-            else:
-                print(f"Filter Query: {query}")
-            
-            # Apply rate limiting
-            self.rate_limiter.wait_if_needed()
-            
-            response = requests.get(self.base_url, headers=self.headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            results = data.get('results', [])
-            
-            return {
-                "step": step,
-                "results": results,
-                "success": len(results) > 0,
-                "query": params.get('filter') or params.get('search'),
-                "meta": data.get('meta', {}),
-                "url": response.url
-            }
-            
-        except Exception as e:
-            print(f"Error in step {step}: {e}")
-            return {"step": step, "results": [], "success": False, "error": str(e)}
-        
+            try:
+                print(f"\nStep {step} Search")
+                if step in [7, 9]:
+                    print(f"Search query: {params['search']}")
+                else:
+                    print(f"Filter Query: {query}")
+                
+                # Apply rate limiting
+                self.rate_limiter.wait_if_needed()
+                
+                response = requests.get(self.base_url, headers=self.headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                results = data.get('results', [])
+                
+                return {
+                    "step": step,
+                    "results": results,
+                    "success": len(results) > 0,
+                    "query": params.get('filter') or params.get('search'),
+                    "meta": data.get('meta', {}),
+                    "url": response.url
+                }
+                
+            except Exception as e:
+                print(f"Error in step {step}: {e}")
+                return {"step": step, "results": [], "success": False, "error": str(e)}
+           
 def process_bibliography_files():
-    searcher = OpenAlexSearcher()
+    searcher = OpenAlexCrossrefSearcher()
     bib_dir = Path('bibliographies')
-    output_dir = Path('search_results')
+    output_dir = Path('new_search_results')
     output_dir.mkdir(exist_ok=True)
     
     for json_file in bib_dir.glob('*_bibliography.json'):
@@ -290,153 +417,110 @@ def process_bibliography_files():
                 print(f"Year: {year}")
             if container_title:
                 print(f"Container: {container_title}")
-                
-            ref['search_results'] = []
-            all_results = []
+            
+            # Use dictionary to store unique results by ID
+            all_results = {}
             first_success_step = None
             
-            # Try steps 1-5
-            print("\nTrying steps 1-5:")
-            for step in range(1, 6):
+            # Try all steps 1-9 in order
+            print("\nTrying all search steps:")
+            for step in range(1, 10):
                 results = searcher.search(title, year, container_title, step)
-                ref['search_results'].append(results)
                 
                 if results['success']:
                     print(f"Step {step}: Found {len(results['results'])} results")
                     if first_success_step is None:
                         first_success_step = step
-                        if step == 1:
-                            print("Step 1 successful - using only these results")
-                            all_results = results['results']
-                            break
-                        else:
-                            print(f"First success at step {step} - will continue through step 5")
-                    if step > 1:
-                        all_results = results['results']
+                    
+                    # Add new results to our collection
+                    for result in results['results']:
+                        result_id = result.get('id')
+                        if result_id and result_id not in all_results:
+                            all_results[result_id] = {
+                                'result': result,
+                                'first_found_in_step': step
+                            }
                 else:
                     print(f"Step {step}: No results")
             
-            # Try step 6 if less than 100 results
-            if len(all_results) < 100:
-                print("\nTrying step 6 (less than 100 total results):")
-                results = searcher.search(title, year, container_title, 6)
-                ref['search_results'].append(results)
-                if results['success']:
-                    print(f"Step 6: Found {len(results['results'])} results")
-                    all_results.extend(results['results'])
-                else:
-                    print("Step 6: No results")
-            
-            # If still no results, try steps 7 and 8
-            if not all_results:
-                # Try step 7 (title search)
-                if title:
-                    print("\nTrying step 7 (title search):")
-                    results = searcher.search(title, year, container_title, 7)
-                    ref['search_results'].append(results)
-                    if results['success']:
-                        print(f"Step 7: Found {len(results['results'])} results")
-                        all_results = results['results']
-                    else:
-                        print("Step 7: No results")
-                
-                # Try step 8 (container title search) if still no results
-                if container_title:
-                    print("\nTrying step 8 (container title search):")
-                    results = searcher.search(title, year, container_title, 8)
-                    ref['search_results'].append(results)
-                    if results['success']:
-                        print(f"Step 8: Found {len(results['results'])} results")
-                        all_results.extend(results['results'])
-                    else:
-                        print("Step 8: No results")
-            
-            print(f"\nTotal results collected: {len(all_results)}")
+            # Convert dictionary values back to list
+            unique_results = [item['result'] for item in all_results.values()]
+            print(f"\nTotal unique results collected: {len(unique_results)}")
             
             # Do author matching if we have results
-            if all_results:
+            if unique_results:
                 ref_authors = get_authors_from_ref(ref)
-    
-                # Always use find_best_author_match
+                
+                # Match authors for unique results
                 matched_results = [
                     {
                         'result': result,
-                        'author_match_score': find_best_author_match(ref_authors, result)
+                        'author_match_score': find_best_author_match(ref_authors, result),
+                        'first_found_in_step': all_results[result['id']]['first_found_in_step']
                     }
-                    for result in all_results
+                    for result in unique_results
                 ]
 
-                # Sort by author match score
-                matched_results.sort(key=lambda x: x['author_match_score'], reverse=True)
+                # Sort by author match score and then by step number (earlier steps preferred)
+                matched_results.sort(key=lambda x: (-x['author_match_score'], x['first_found_in_step']))
 
-                # Accept the result if:
-                # 1. Either there's a good author match (score > 0.0)
-                # 2. Or if there's exactly one result after step 6
-                accept_result = (
-                    (matched_results[0]['author_match_score'] > 0.0) or 
-                    (first_success_step is not None and first_success_step <= 3)
-                )
-
+                # Accept the result if there's a good author match
+                accept_result = matched_results[0]['author_match_score'] > 0.0
+                
                 if accept_result:
                     best_match = matched_results[0]
                     result = best_match['result']
-
-                    # Print best match details
+                    
                     print("\nBest match:")
                     print(f"Title: {result.get('display_name')}")
                     print(f"Authors: {', '.join(a['author'].get('display_name', '') for a in result.get('authorships', []))}")
                     print(f"Year: {result.get('publication_year')}")
                     print(f"Match score: {best_match['author_match_score']:.2f}")
-                    if len(all_results) == 1 and ref['search_results'][-1]['step'] >= 6:
-                        print("Accepted due to single result after step 6")
-
+                    print(f"First found in step: {best_match['first_found_in_step']}")
+                    
                     # Assign ref fields
                     ref['match_found'] = True
                     ref['doi'] = result.get('doi')
-                    ref['is_open_access'] = result.get('open_access', {}).get('is_oa', False)
-                    ref['open_access_url'] = result.get('open_access', {}).get('oa_url')
-                    ref['author_match_score'] = best_match.get('author_match_score')
+                    # Handle OpenAlex vs Crossref results
+                    if best_match['first_found_in_step'] == 8:  # Crossref result
+                        ref['is_open_access'] = None
+                        ref['open_access_url'] = None
+                        ref['source'] = 'crossref'
+                        ref['referenced_works'] = None  # Crossref doesn't provide referenced works
+                    else:  # OpenAlex result
+                        ref['is_open_access'] = result.get('open_access', {}).get('is_oa', False)
+                        ref['open_access_url'] = result.get('open_access', {}).get('oa_url')
+                        ref['source'] = 'openalex'
+                        ref['referenced_works'] = result.get('referenced_works', [])
+                    
+                    ref['author_match_score'] = best_match['author_match_score']
                     ref['openalex_id'] = result.get('id')
                     ref['matched_title'] = result.get('display_name')
                     ref['matched_authors'] = [
                         a.get('author', {}).get('display_name') 
                         for a in result.get('authorships', [])
                     ]
-
-                    # Determine match_step
-                    if first_success_step is not None:
-                        ref['match_step'] = first_success_step
-                    else:
-                        for r in ref['search_results']:
-                            if r['success']:
-                                ref['match_step'] = r['step']
-                                break
+                    ref['match_step'] = best_match['first_found_in_step']
+                    
                 else:
                     # No acceptable matches
                     print("\nNo acceptable matches found:")
-                    print(f"Number of results: {len(all_results)}")
                     print(f"Best author match score: {matched_results[0]['author_match_score']:.2f}")
                     if ref_authors:
                         print("Reference authors:", ref_authors)
-                        if matched_results and matched_results[0]['result'].get('authorships'):
-                            print("Best match authors:", [
-                                a['author'].get('display_name', '')
-                                for a in matched_results[0]['result']['authorships']
-                            ])
+                        print("Best match authors:", [
+                            a['author'].get('display_name', '')
+                            for a in matched_results[0]['result']['authorships']
+                        ])
                     ref['match_found'] = False
-                    ##input("\nPress Enter to continue...")
-
+            
             else:
                 # No results at all
                 print("\nNo results found in any step")
                 ref['match_found'] = False
-                ##input("\nPress Enter to continue...")
-                ##continue
-
-            # Remove the detailed search results
-            ref.pop('search_results', None)
+            
             print("\n" + "="*50)
-
+        
         # Save results
         output_file = output_dir / f"search_results_{json_file.name}"
         with open(output_file, 'w', encoding='utf-8') as f:

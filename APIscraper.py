@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from pdfminer.high_level import extract_text
 
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 class RateLimiter:
     def __init__(self, requests_per_minute, input_tokens_per_minute, output_tokens_per_minute):
@@ -85,7 +85,7 @@ Human: Please extract the bibliography or references section from the following 
     Text to process:
     {text}
     
-    Return ONLY the JSON array, no other text.
+    Return ONLY the JSON array, no other text. If no bibliography is found, return an empty array [].
     
 Assistant:"""
     
@@ -101,7 +101,7 @@ Assistant:"""
         print(f"[DEBUG] Sending request to Claude API...")
         message = client.messages.create(
             model="claude-3-5-sonnet-20241022",
-            max_tokens=2048,
+            max_tokens=4096,
             messages=[
                 {
                     "role": "user",
@@ -110,15 +110,34 @@ Assistant:"""
             ]
         )
         print(f"[DEBUG] Received response from Claude API")
-        # Extract the JSON string from the response
+        
+        # Extract the response content
+        message_content = message.content[0].text
+        print(f"[DEBUG] Raw API response: {message_content[:500]}...")  # Log first 500 chars
+        
         try:
-            message_content = message.content[0].text  # Extract the JSON string from TextBlock
-            # Load the JSON string into a Python dictionary to validate it (optional)
             bibliography_list = json.loads(message_content)
-            return bibliography_list  # Return this to be saved later, avoiding multiple saves
+            if not isinstance(bibliography_list, list):
+                print(f"[ERROR] Expected JSON array, got {type(bibliography_list)}")
+                return []
+            return bibliography_list
             
         except json.JSONDecodeError as e:
             print(f"[ERROR] Failed to decode JSON: {e}")
+            print(f"[ERROR] Response was not valid JSON. First 100 characters: {message_content[:100]}")
+            
+            # Attempt to salvage partial JSON
+            try:
+                # Try to find anything that looks like JSON array
+                import re
+                json_array_match = re.search(r'\[(.*)\]', message_content)
+                if json_array_match:
+                    salvaged_json = json_array_match.group(0)
+                    print("[DEBUG] Attempting to parse salvaged JSON array")
+                    return json.loads(salvaged_json)
+            except Exception as salvage_error:
+                print(f"[ERROR] Failed to salvage JSON: {salvage_error}")
+            
             return []
 
     except Exception as e:
@@ -129,12 +148,19 @@ def process_pdf_directory(api_key, input_dir, output_dir):
     rate_limiter = RateLimiter(requests_per_minute=50, input_tokens_per_minute=40000, output_tokens_per_minute=8000)
     os.makedirs(output_dir, exist_ok=True)
     
+    # Keep track of successes and failures
+    results = {
+        'success': [],
+        'failure': []
+    }
+    
     for pdf_path in Path(input_dir).glob("*.pdf"):
-        print(f"Processing {pdf_path.name}...")
+        print(f"\nProcessing {pdf_path.name}...")
         try:
             text = extract_text_from_pdf(pdf_path)
             if not text or not text.strip():
-                print(f"No text extracted from {pdf_path.name}. Skipping...")
+                print(f"[WARNING] No text extracted from {pdf_path.name}. Skipping...")
+                results['failure'].append((pdf_path.name, "No text extracted"))
                 continue
 
             # Extract bibliography as a list of references
@@ -143,13 +169,38 @@ def process_pdf_directory(api_key, input_dir, output_dir):
                 output_path = Path(output_dir) / f"{pdf_path.stem}_bibliography.json"
                 with open(output_path, "w", encoding="utf-8") as f:
                     json.dump(bibliography, f, indent=2, ensure_ascii=False)
-                print(f"Saved bibliography to {output_path}")
+                print(f"[SUCCESS] Saved bibliography to {output_path}")
+                results['success'].append(pdf_path.name)
             else:
-                print(f"No bibliography found for {pdf_path.name}")
+                print(f"[WARNING] No bibliography found for {pdf_path.name}")
+                results['failure'].append((pdf_path.name, "No bibliography found"))
+                
         except Exception as e:
-            print(f"Error processing {pdf_path.name}: {str(e)}")
+            print(f"[ERROR] Error processing {pdf_path.name}: {str(e)}")
+            results['failure'].append((pdf_path.name, str(e)))
+    
+    # Print summary
+    print("\nProcessing Summary:")
+    print(f"Successfully processed: {len(results['success'])} files")
+    print(f"Failed to process: {len(results['failure'])} files")
+    
+    if results['failure']:
+        print("\nFailed files and reasons:")
+        for file, reason in results['failure']:
+            print(f"- {file}: {reason}")
+    
+    # Save summary to file
+    summary_path = Path(output_dir) / "processing_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\nSummary saved to {summary_path}")
 
 if __name__ == "__main__":
     INPUT_DIR = "papers"
     OUTPUT_DIR = "bibliographies"
+    
+    API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    if not API_KEY:
+        raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+        
     process_pdf_directory(API_KEY, INPUT_DIR, OUTPUT_DIR)
