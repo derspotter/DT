@@ -1,0 +1,28 @@
+flowchart TD
+    subgraph "PDF Acquisition"
+        A[User] -->|"Provides URL\n(Website with PDFs)"| B[download_pdfs.py]
+        A -->|"Provides Search Query\nor Research Topics"| C[downloader.py]
+        
+        B -->|"Scrapes Website\nand Subpages"| D[PDF Files in pdf_downloads/]
+        C -->|"Uses Gemini API to\nSearch and Find PDFs"| E[PDF Files in downloaded_pdfs/]
+    end
+
+    subgraph "Metadata Extraction"
+        D --> F[pdf_metadata_extractor.py]
+        E --> F
+        
+        F -->|"Extract First\nPages"| G[PikePDF]
+        G -->|"First Few Pages"| H[Gemini API]
+        H -->|"Initial Metadata"| I[OpenAlex API]
+        I -->|"Enhanced Metadata\n(with DOI if found)"| J[combined_metadata.json]
+    end
+
+    classDef downloadScripts fill:#d4f1f9,stroke:#05a,stroke-width:2px
+    classDef metadataProcess fill:#ffe6cc,stroke:#d79b00,stroke-width:2px
+    classDef storage fill:#e1d5e7,stroke:#9673a6,stroke-width:2px
+    classDef apis fill:#d5e8d4,stroke:#82b366,stroke-width:2px
+
+    class B,C downloadScripts
+    class F,G,H,I metadataProcess
+    class D,E,J storage
+    class G,H,I apis
