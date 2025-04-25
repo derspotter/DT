@@ -1,0 +1,15 @@
+{
+  "watch": ["src/"],
+  "ext": "js,mjs,cjs,json",
+  "ignore": [
+    "node_modules/**",
+    "uploads/**",
+    "dl_lit/temp_pages/",
+    "dl_lit/temp_pages/**",
+    "dl_lit/bibliographies/",
+    "dl_lit/bibliographies/**",
+    "*.pyc"
+  ],
+  "exec": "node src/index.js",
+  "delay": 500
+}

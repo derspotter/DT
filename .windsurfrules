@@ -1,0 +1,165 @@
+Please make use of VanJS in the frontend where you can. Take this as inspiration:
+# VanJS Features - Concise Summary
+
+## Core Concepts
+
+VanJS is an ultra-lightweight (~2KB minified) vanilla  framework for building reactive web UIs without JSX or transpilation.
+
+- **Pure ** - Uses plain function calls to create DOM elements
+- **Lightweight** - Minimal bundle size impact
+- **Component-based** - Build reusable UI components as  functions
+- **Reactive** - State changes automatically update the UI
+
+## DOM Composition and Manipulation
+
+### Basic Hello World
+
+
+const {a, div, li, p, ul} = van.tags
+
+const Hello = () => div(
+  p("👋Hello"),
+  ul(
+    li("🗺️World"),
+    li(a({href: "https://vanjs.org/"}, "🍦VanJS")),
+  ),
+)
+
+van.add(document.body, Hello())
+
+
+**Explanation:** Each tag function (`div`, `p`, etc.) creates the corresponding DOM element. The first argument can be a properties object, and subsequent arguments become children of the element.
+
+### Dynamic DOM Manipulation
+
+
+const StaticDom = () => {
+  const dom = div(
+    div(
+      button("Dummy Button"),
+      button({
+        onclick: () => van.add(dom,
+          div(button("New Button")),
+          div(a({href: "https://www.example.com/"}, "This is a link")),
+        )
+      }, "Button to Add More Elements"),
+      button({onclick: () => alert("Hello from VanJS")}, "Hello"),
+    ),
+  )
+  return dom
+}
+
+
+**Explanation:** The `van.add` function lets you dynamically add new elements to existing DOM nodes. This example shows how to add new buttons and links when a button is clicked.
+
+## State Management and Reactivity
+
+### Simple Counter Example
+
+
+const Counter = () => {
+  const counter = van.state(0)  // Create a reactive state
+  return span(
+    "❤️ ", counter, " ",  // counter will automatically update in the DOM
+    button({onclick: () => ++counter.val}, "👍"),
+    button({onclick: () => --counter.val}, "👎"),
+  )
+}
+
+
+**Explanation:** The `van.state(0)` creates a reactive state variable. When used directly in the DOM tree, it automatically updates the UI when its value changes via `counter.val`.
+
+### Stopwatch Example
+
+
+const Stopwatch = () => {
+  const elapsed = van.state(0)
+  let id
+  const start = () => id = id || setInterval(() => elapsed.val += .01, 10)
+  return span(
+    pre({style: "display: inline;"}, () => elapsed.val.toFixed(2), "s "),
+    button({onclick: start}, "Start"),
+    button({onclick: () => (clearInterval(id), id = 0)}, "Stop"),
+    button({onclick: () => (clearInterval(id), id = 0, elapsed.val = 0)}, "Reset"),
+  )
+}
+
+
+**Explanation:** This example shows how to combine reactive state with timer functions to create a stopwatch. The elapsed time is automatically updated in the UI as it changes.
+
+### State-Derived Values
+
+
+const DerivedState = () => {
+  const text = van.state("VanJS")
+  const length = van.derive(() => text.val.length)  // Derived state
+  return span(
+    "The length of ",
+    input({type: "text", value: text, oninput: e => text.val = e.target.value}),
+    " is ", length, ".",  // Automatically updates when text changes
+  )
+}
+
+
+**Explanation:** The `van.derive()` function creates a state that depends on other states. When the `text` state changes, the `length` state automatically updates.
+
+## State Binding (Reactivity)
+
+### Two-Way Binding with Inputs
+
+
+const ConnectedInputs = () => {
+  const text = van.state("")
+  return span(
+    // Both inputs stay in sync through the shared text state
+    input({type: "text", value: text, oninput: e => text.val = e.target.value}),
+    input({type: "text", value: text, oninput: e => text.val = e.target.value}),
+  )
+}
+
+
+**Explanation:** When a state is used as a property value and updated in event handlers, it creates two-way binding between DOM elements.
+
+### State-Derived Properties
+
+
+const FontPreview = () => {
+  const size = van.state(16), color = van.state("blue")
+  return span(
+    "Size: ",
+    input({type: "range", min: 10, max: 36, value: size,
+      oninput: e => size.val = e.target.value}),
+    " Color: ",
+    select({oninput: e => color.val = e.target.value},
+      ["blue", "green", "red", "brown"].map(c => option({selected: () => color.val === c}, c)),
+    ),
+    // State-derived style property
+    span({style: () => `font-size: ${size.val}px; color: ${color.val};`}, " Hello VanJS"),
+  )
+}
+
+
+**Explanation:** For properties that depend on state, use a function that returns the property value. The function reruns whenever any states it references change.
+
+### Conditional Rendering with State
+
+
+const TodoItem = ({text}) => {
+  const done = van.state(false), deleted = van.state(false)
+  // Conditional rendering based on state
+  return () => deleted.val ? null : div(
+    input({type: "checkbox", checked: done, onclick: e => done.val = e.target.checked}),
+    () => (done.val ? del : span)(text),  // Change element type based on state
+    a({onclick: () => deleted.val = true}, "❌"),
+  )
+}
+
+const TodoList = () => {
+  const inputDom = input({type: "text"})
+  const dom = div(
+    inputDom,
+    button({onclick: () => van.add(dom, TodoItem({text: inputDom.value}))}, "Add"),
+  )
+  return dom
+}
+

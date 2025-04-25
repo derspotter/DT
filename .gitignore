@@ -1,0 +1,19 @@
+.env
+
+# Ignore generated directories from dl_lit scripts
+/dl_lit/papers/
+/dl_lit/temp_pages/
+/dl_lit/bibliographies/
+/dl_lit/uploads/
+/backend/backend/
+/backend/node_modules/
+/backend/uploads/
+/backend/dl_lit/
+/backend/papers/
+/backend/temp_pages/
+/backend/bibs/
+temp_test_input/
+temp_test_output/
+.roo/
+.vscode/
+

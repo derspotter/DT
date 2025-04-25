@@ -1,0 +1,11 @@
+include:
+  - path: ./frontend/docker-compose.yml
+    project_directory: ./frontend
+  - path: ./backend/docker-compose.yml
+    project_directory: ./backend
+
+# You can define shared resources like networks here if needed,
+# although Compose often handles network merging automatically.
+# networks:
+#   documentalyze-network:
+#     driver: bridge

@@ -5,7 +5,11 @@ import time
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
-from rapidfuzz import fuzz
+
+try:
+    from rapidfuzz import fuzz
+except ImportError:
+    raise ImportError("Module 'rapidfuzz' not found. Install with 'pip install rapidfuzz'")
 
 class RateLimiter:
     def __init__(self, max_per_second=10):
@@ -33,6 +37,71 @@ def clean_search_term(term):
     if term is None:
         return None
     return term.replace(',', ' ')
+def convert_inverted_index_to_text(inverted_index):
+    """Convert an abstract_inverted_index to readable text"""
+    if not inverted_index:
+        return ""
+
+    # Create a list of (word, position) tuples
+    word_positions = []
+    for word, positions in inverted_index.items():
+        for position in positions:
+            word_positions.append((word, position))
+
+    # Sort by position
+    word_positions.sort(key=lambda x: x[1])
+
+    # Join words
+    text = " ".join(word for word, _ in word_positions)
+    return text
+def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu"):
+    """
+    Fetches the OpenAlex IDs of works that cite the work at the given URL.
+    Handles pagination to get all citing work IDs.
+    """
+    if not cited_by_url:
+        return []
+
+    citing_work_ids = []
+    url = f"{cited_by_url}&select=id&per-page=100&mailto={mailto}" # Request only ID, increase per-page limit
+    page = 1
+
+    print(f"Fetching citing work IDs from: {cited_by_url}")
+
+    while url:
+        try:
+            # Apply rate limiting
+            rate_limiter.wait_if_needed()
+
+            response = requests.get(url, headers={"Accept": "application/json"})
+            response.raise_for_status()
+            data = response.json()
+
+            results = data.get("results", [])
+            for work in results:
+                work_id = work.get("id")
+                if work_id:
+                    citing_work_ids.append(work_id)
+
+            # Check for next page
+            meta = data.get("meta", {})
+            if meta.get("next_page"):
+                url = meta["next_page"]
+                page += 1
+                print(f"Fetching next page of citing works: Page {page}")
+            else:
+                url = None # No more pages
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching citing works from {url}: {str(e)}")
+            # Stop fetching if there's an error
+            url = None
+        except Exception as e:
+            print(f"Unexpected error fetching citing works from {url}: {str(e)}")
+            url = None
+
+    print(f"Finished fetching citing work IDs. Found {len(citing_work_ids)}")
+    return citing_work_ids
 
 def get_authors_from_ref(ref):
     """
@@ -175,7 +244,7 @@ class OpenAlexCrossrefSearcher:
     def __init__(self, email="spott@wzb.eu"):
         self.base_url = "https://api.openalex.org/works"
         self.headers = {'User-Agent': f'mailto:{email}'}
-        self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works'
+        self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords'
         self.rate_limiter = RateLimiter(max_per_second=10)
         self.crossref_headers = {'mailto': email}
 
@@ -228,7 +297,7 @@ class OpenAlexCrossrefSearcher:
             print(f"Crossref error: {e}")
             return []
 
-    def search(self, title, year, container_title, step):
+    def search(self, title, year, container_title, abstract, keywords, step):
         """
         Search OpenAlex and Crossref with different strategies based on step number.
         Steps 1-7: use OpenAlex filter queries
@@ -501,7 +570,41 @@ def process_bibliography_files():
                         for a in result.get('authorships', [])
                     ]
                     ref['match_step'] = best_match['first_found_in_step']
-                    
+
+                    # Extract cited_by_api_url
+                    cited_by_url = result.get('cited_by_api_url')
+                    ref['cited_by_api_url'] = cited_by_url # Keep the URL for reference if needed later
+
+                    if cited_by_url:
+                        print(f"Extracted cited_by_api_url: {cited_by_url}")
+                        # Fetch citing work IDs using the new function
+                        ref['cited_by_work_ids'] = fetch_citing_work_ids(cited_by_url, searcher.rate_limiter, mailto="spott@wzb.eu")
+                        print(f"Added {len(ref.get('cited_by_work_ids', []))} citing work IDs.")
+                    else:
+                        ref['cited_by_api_url'] = None
+                        ref['cited_by_work_ids'] = []
+                        print("No cited_by_api_url found in OpenAlex result, no citing work IDs fetched.")
+
+                    # Extract and convert abstract
+                    abstract_inverted_index = result.get('abstract_inverted_index')
+                    if abstract_inverted_index:
+                        ref['abstract'] = convert_inverted_index_to_text(abstract_inverted_index)
+                        print(f"Extracted abstract ({len(ref['abstract'])} characters)")
+                    else:
+                        ref['abstract'] = None
+                        print("No abstract found in OpenAlex result")
+
+                    # Extract keywords
+                    keywords = result.get('keywords')
+                    if keywords:
+                        # Keywords are returned as a list of dicts like [{'keyword': '...', 'score': ...}]
+                        # We want just a list of strings
+                        ref['keywords'] = [k.get('keyword') for k in keywords if k.get('keyword')]
+                        print(f"Extracted {len(ref['keywords'])} keywords")
+                    else:
+                        ref['keywords'] = []
+                        print("No keywords found in OpenAlex result")
+
                 else:
                     # No acceptable matches
                     print("\nNo acceptable matches found:")
