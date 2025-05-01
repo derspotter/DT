@@ -1,0 +1,11 @@
+requests
+PyMuPDF
+beautifulsoup4
+google-cloud-aiplatform
+google-generativeai
+pikepdf
+python-dotenv
+rapidfuzz
+python-slugify
+pdfminer.six
+openai
