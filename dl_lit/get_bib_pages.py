@@ -11,6 +11,7 @@ import shutil
 import time
 import concurrent.futures
 from dotenv import load_dotenv
+import glob
 
 print("--- Script Top --- ", flush=True)
 
@@ -412,12 +413,9 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                 print("Error: PDF has 0 pages.", flush=True)
                 return
 
-        print("Starting concurrent tasks for section finding and offset detection...", flush=True)
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_sections = executor.submit(find_reference_section_pages, pdf_path, section_model, uploaded_pdf)
-            future_offset = executor.submit(detect_page_number_offset, pdf_path, offset_model, page_count_for_offset)
-            sections = future_sections.result()
-            offset_details = future_offset.result()
+        print("Starting sequential tasks for section finding and offset detection...", flush=True)
+        sections = find_reference_section_pages(pdf_path, section_model, uploaded_pdf)
+        offset_details = detect_page_number_offset(pdf_path, offset_model, page_count_for_offset)
 
         if not sections:
             print("No reference sections found.", flush=True)
@@ -733,33 +731,52 @@ Output Format:
         print("--- extract_reference_sections function finished ---", flush=True)
 
 
+def process_pdf(pdf_path, output_dir):
+    return extract_reference_sections(pdf_path, output_dir)
+
+
 if __name__ == "__main__":
     print("--- get_bib_pages.py script started ---", flush=True)
     # --- Argument Parsing Setup ---
     print("--- Setting up ArgParser --- ", flush=True)
-    parser = argparse.ArgumentParser(description='Extract bibliography pages from a PDF.')
-    parser.add_argument('--input-pdf', required=True, help='Path to the input PDF file.')
-    parser.add_argument('--output-dir', required=True, help='Directory to save extracted page PDFs.')
-    print("--- Parsing Arguments --- ", flush=True)
+    parser = argparse.ArgumentParser(description='Extract bibliography pages from PDFs.')
+    parser.add_argument('input', help='Path to a PDF file or directory containing PDFs')
+    parser.add_argument('--output-dir', default='bib_output', help='Output directory for extracted pages and JSON files')
     args = parser.parse_args()
+    print("--- Parsing Arguments --- ", flush=True)
     print("--- Arguments Parsed --- ", flush=True)
 
-    # Validate input PDF path
-    if not os.path.isfile(args.input_pdf):
-        print(f"Error: Input PDF not found at {args.input_pdf}", flush=True)
-        sys.exit(1)
+    # --- Setup Output Directory ---
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Output directory set to: {output_dir}", flush=True)
 
-    # Expand user path for output directory
-    output_dir_expanded = os.path.expanduser(args.output_dir)
+    # --- Determine Input Type (File or Directory) ---
+    input_path = os.path.abspath(args.input)
+    if os.path.isdir(input_path):
+        pdf_files = glob.glob(os.path.join(input_path, '*.pdf'))
+        print(f"Found {len(pdf_files)} PDF files in directory: {input_path}", flush=True)
+    else:
+        pdf_files = [input_path] if input_path.endswith('.pdf') else []
+        if not pdf_files:
+            print(f"Error: {input_path} is not a PDF file.", flush=True)
+            sys.exit(1)
+        print(f"Processing single PDF file: {input_path}", flush=True)
 
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir_expanded, exist_ok=True)
+    # --- Process PDFs Sequentially ---
+    print(f"Starting sequential processing of {len(pdf_files)} PDF(s)...", flush=True)
+    start_time = time.time()
 
-    print(f"Attempting to process PDF: {args.input_pdf}", flush=True)
-    print(f"Output directory for pages: {output_dir_expanded}", flush=True)
+    total_bib_pages = 0
+    processed_count = 0
 
-    print(f"--- Calling extract_reference_sections for {args.input_pdf} -> {output_dir_expanded} ---", flush=True)
-    # Process the PDF
-    extract_reference_sections(args.input_pdf, output_dir_expanded)
-    print("--- extract_reference_sections finished ---", flush=True)
-    print("Processing complete.", flush=True)
+    for pdf_path in pdf_files:
+        bib_pages = process_pdf(pdf_path, output_dir)
+        total_bib_pages += len(bib_pages)
+        processed_count += 1
+        print(f"Completed {processed_count}/{len(pdf_files)} PDFs: {os.path.basename(pdf_path)} - {len(bib_pages)} bibliography pages found.", flush=True)
+
+    end_time = time.time()
+    execution_time = end_time - start_time
+    print(f"Processing complete. Total execution time: {execution_time:.2f} seconds", flush=True)
+    print(f"Processed {processed_count} PDFs, found {total_bib_pages} bibliography pages.", flush=True)
