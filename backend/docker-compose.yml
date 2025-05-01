@@ -14,5 +14,4 @@ services:
       - ./src:/usr/src/app/src
       - ./uploads:/usr/src/app/uploads # Reverted container path
       - ../dl_lit:/usr/src/app/dl_lit # Mount the python scripts
-      - ./papers:/usr/src/app/bibs # Reverted container path
     command: npm run dev

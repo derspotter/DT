@@ -131,3 +131,39 @@ footer {
 .remove-file:hover {
     background-color: #c0392b;
 }
+
+/* --- Bibliography Output Box --- */
+#bib-list {
+    border: 1px solid #ccc;
+    background-color: #f9f9f9;
+    padding: 15px;
+    margin-top: 10px; /* Add some space below the heading */
+    border-radius: 5px;
+    max-height: 400px; /* Limit height and make scrollable */
+    overflow-y: auto;
+}
+
+#bib-list ul {
+    list-style-type: none; /* Remove default bullet points */
+    padding: 0;
+    margin: 0;
+}
+
+#bib-list li {
+    margin-bottom: 10px; /* Space between entries */
+    border-bottom: 1px dashed #eee; /* Separator line */
+    padding-bottom: 10px;
+}
+
+#bib-list li:last-child {
+    border-bottom: none; /* No line after the last entry */
+}
+
+#bib-list pre {
+    white-space: pre-wrap; /* Allow wrapping */
+    word-wrap: break-word; /* Break long words */
+    background-color: #fff; /* Slightly different background for clarity */
+    padding: 8px;
+    border-radius: 3px;
+    font-size: 0.9em;
+}

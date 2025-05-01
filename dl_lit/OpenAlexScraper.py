@@ -459,7 +459,7 @@ class OpenAlexCrossrefSearcher:
            
 def process_bibliography_files():
     searcher = OpenAlexCrossrefSearcher()
-    bib_dir = Path('bibliographies')
+    bib_dir = Path('dl_lit/bibliographies') 
     output_dir = Path('new_search_results')
     output_dir.mkdir(exist_ok=True)
     
@@ -480,6 +480,8 @@ def process_bibliography_files():
                 except (ValueError, TypeError):
                     year = None
             container_title = ref.get('journal') or ref.get('container_title')
+            abstract = ref.get('abstract') # Get abstract
+            keywords = ref.get('keywords') # Get keywords
             
             print(f"\n--- Searching for: {title} ---")
             if year:
@@ -494,7 +496,8 @@ def process_bibliography_files():
             # Try all steps 1-9 in order
             print("\nTrying all search steps:")
             for step in range(1, 10):
-                results = searcher.search(title, year, container_title, step)
+                # Pass abstract and keywords to search
+                results = searcher.search(title, year, container_title, abstract, keywords, step)
                 
                 if results['success']:
                     print(f"Step {step}: Found {len(results['results'])} results")

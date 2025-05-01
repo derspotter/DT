@@ -9,26 +9,19 @@ import argparse
 import tempfile
 import shutil
 import time
+import concurrent.futures
+from dotenv import load_dotenv
 
 print("--- Script Top --- ", flush=True)
-import google.generativeai as genai
-import json
-import pikepdf
-import os
-from collections import defaultdict
-import sys
-import argparse
-import tempfile
-import shutil
-import time
 
 print("--- Imports Done --- ", flush=True)
 
 # --- Added: Configure Google API Key ---
 print("--- Configuring GenAI --- ", flush=True)
+load_dotenv()
 api_key = os.getenv('GOOGLE_API_KEY')
 if not api_key:
-    print("Error: GOOGLE_API_KEY environment variable not set.")
+    print("Error: GOOGLE_API_KEY environment variable not set.", flush=True)
     # Consider exiting or raising an error if the key is essential
     # sys.exit(1) # Uncomment to exit if key is missing
 else:
@@ -88,83 +81,47 @@ IMPORTANT RULES:
 - Be sure to include the entire section (from the first page it appears on to the last).
 """ 
 
-        uploaded_file = None
-        try:
-            uploaded_file = genai.upload_file(path=pdf_path, display_name="Source PDF")
-            print("Initialization complete.")
-            
-            # Make the API call
+        # Use pre-uploaded full PDF for section finding
+        uploaded_file = uploaded_pdf
+        print("Using pre-uploaded PDF for section finding.", flush=True)
+        # Make the API call
+        response = model.generate_content([prompt, uploaded_file], request_options={'timeout': 600})
+        print(f"Raw find_reference_section_pages response: {response.text}", flush=True)
+        # Extract JSON part
+        if response.text:
             try:
-                response = model.generate_content([prompt, uploaded_file], request_options={'timeout': 600})
-                # print(f"Raw find_reference_section_pages response: {response.text}") # DEBUG
+                cleaned_response = clean_json_response(response.text)
+                sections = json.loads(cleaned_response)
+                # Validate that all sections have both start_page and end_page
+                valid_sections = []
+                for section in sections:
+                    if 'start_page' in section and 'end_page' in section:
+                        valid_sections.append(section)
+                    else:
+                        print(f"Warning: Skipping incomplete section: {section}")
                 
-                # Extract JSON part
-                if response.text:
-                    try:
-                        cleaned_response = clean_json_response(response.text)
-                        sections = json.loads(cleaned_response)
-                        # Validate that all sections have both start_page and end_page
-                        valid_sections = []
-                        for section in sections:
-                            if 'start_page' in section and 'end_page' in section:
-                                valid_sections.append(section)
-                            else:
-                                print(f"Warning: Skipping incomplete section: {section}")
-                        
-                        if not valid_sections:
-                            print("No valid sections found (missing start_page or end_page)")
-                            return None
-                        
-                        print(f"Found reference sections: {json.dumps(valid_sections, indent=2)}")
-                        
-                        return valid_sections
-                    except json.JSONDecodeError as e:
-                        print(f"Error parsing JSON response: {e}")
-                        print(f"Raw response: {response.text}")
-                        return None
-                else:
-                    print("Empty response from model")
+                if not valid_sections:
+                    print("No valid sections found (missing start_page or end_page)")
                     return None
-            except google_exceptions.GoogleAPIError as e:
-                print(f"Error during find_reference_section_pages API call: {e}", file=sys.stderr)
-                sections = [] # Return empty list on API error
-            except Exception as e:
-                print(f"Unexpected error during find_reference_section_pages: {e}", file=sys.stderr)
-                sections = [] # Return empty list on other errors
                 
-        except Exception as e:
-            print(f"Error uploading or processing PDF for section finding: {e}", file=sys.stderr)
-            
+                print(f"Found reference sections: {json.dumps(valid_sections, indent=2)}")
+                
+                return valid_sections
+            except json.JSONDecodeError as e:
+                print(f"Error parsing JSON response: {e}")
+                print(f"Raw response: {response.text}")
+                return None
+        else:
+            print("Empty response from model")
+            return None
+
+    except google_exceptions.GoogleAPIError as e:
+        print(f"Error during find_reference_section_pages API call: {e}", file=sys.stderr)
+        sections = [] # Return empty list on API error
     except Exception as e:
-        print(f"Error finding reference sections: {str(e)}")
-        return None
-
-def _extract_and_save_single_page(pdf_doc: pikepdf.Pdf, page_index: int, base_filename: str) -> str | None:
-    """Extracts a single page to a temporary file.
-    Returns the path to the temporary file or None on error.
-    """
-    temp_pdf_path = None
-    try:
-        # Create a temporary PDF with only the target page
-        single_page_pdf = pikepdf.Pdf.new()
-        single_page_pdf.pages.append(pdf_doc.pages[page_index])
-
-        # Save to a temporary file
-        temp_dir = tempfile.mkdtemp()
-        # Use a more descriptive name including the original index
-        temp_pdf_path = os.path.join(temp_dir, f"{base_filename}_physical_page_{page_index}.pdf")
-        single_page_pdf.save(temp_pdf_path)
-        single_page_pdf.close()
-        print(f"      - Saved temporary single-page PDF: {temp_pdf_path}", flush=True)
-        return temp_pdf_path
-    except Exception as e:
-        print(f"      - Error saving temporary page {page_index}: {e}", flush=True)
-        # Cleanup if path was created but save failed?
-        if temp_pdf_path and os.path.exists(os.path.dirname(temp_pdf_path)):
-             try: shutil.rmtree(os.path.dirname(temp_pdf_path)) 
-             except: pass # Ignore cleanup errors
-        return None
-
+        print(f"Unexpected error during find_reference_section_pages: {e}", file=sys.stderr)
+        sections = [] # Return empty list on other errors
+        
 def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total_pages: int):
     """
     Sample pages at 20/40/60/80%, extract them, upload as a batch, 
@@ -183,7 +140,7 @@ def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total
 
     if total_pages <= 0:
         print("Error: Cannot detect offset for PDF with 0 pages.")
-        return None
+        return
         
     offsets = []
     samples = []
@@ -216,102 +173,104 @@ def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total
     try:
         with pikepdf.open(pdf_path) as pdf_doc:
             for i, page_index in enumerate(valid_indices):
-                # Create a unique-ish base name for temp files
-                base_filename = f"offset_sample_{chr(ord('A') + i)}_{int(time.time())}" 
-                temp_path = _extract_and_save_single_page(pdf_doc, page_index, base_filename)
-                if temp_path:
-                    temp_file_paths.append(temp_path)
-                    # Prepare for potential future batch upload if API supports it directly
-                    # For now, we upload sequentially but reference in one prompt
-                    print(f"    - Uploading temp page for index {page_index}...", flush=True)
-                    # Use a display name that's simple for the model
-                    display_name = f"page{chr(ord('A') + i)}.pdf" 
-                    uploaded_file = genai.upload_file(path=temp_path, display_name=display_name)
-                    print(f"      - Uploaded as: {uploaded_file.name} (Display: {display_name})", flush=True)
-                    uploaded_files_info[uploaded_file.name] = { 
-                        'physical_index': page_index, 
-                        'file_object': uploaded_file,
-                        'display_name': display_name 
-                    }
-                    upload_parts.append(uploaded_file) # Add file object for the prompt
-                else:
-                    print(f"    - Failed to extract/save page for index {page_index}. Skipping sample.", flush=True)
-        
-        if len(upload_parts) < 2: # Need at least 2 samples for reliable offset
-            print("    - Insufficient pages successfully uploaded for offset detection.", flush=True)
-            return None
+                # Create a temporary PDF with only the target page
+                single_page_pdf = pikepdf.Pdf.new()
+                single_page_pdf.pages.append(pdf_doc.pages[page_index])
 
-        # --- Single Prompt Construction --- 
-        prompt_lines = ["Analyze the following uploaded PDF pages to determine the printed page number visible on each:"]
-        for upload_name, info in uploaded_files_info.items():
-            prompt_lines.append(f"- For the file named '{info['display_name']}', what is the printed page number visible? Respond with only the integer number or the word 'None' if no number is clearly visible.")
-        prompt_lines.append("\nPlease provide the results clearly, associating each detected number (or 'None') with its corresponding file display name (e.g., 'pageA.pdf: 38', 'pageB.pdf: None'). Ensure each file gets its own line in the response.")
-        
-        full_prompt = "\n".join(prompt_lines)
-        print("\n--- Sending Batch Offset Detection Prompt ---")
-        # print(full_prompt) # Uncomment for debugging prompt
+                # Save to a temporary file
+                temp_dir = tempfile.mkdtemp()
+                # Use a more descriptive name including the original index
+                temp_pdf_path = os.path.join(temp_dir, f"offset_sample_{chr(ord('A') + i)}_{int(time.time())}" + ".pdf")
+                single_page_pdf.save(temp_pdf_path)
+                single_page_pdf.close()
+                print(f"      - Saved temporary single-page PDF: {temp_pdf_path}", flush=True)
+                temp_file_paths.append(temp_pdf_path)
+                # Prepare for potential future batch upload if API supports it directly
+                # For now, we upload sequentially but reference in one prompt
+                print(f"    - Uploading temp page for index {page_index}...", flush=True)
+                # Use a display name that's simple for the model
+                display_name = f"page{chr(ord('A') + i)}.pdf" 
+                uploaded_file = genai.upload_file(path=temp_pdf_path, display_name=display_name)
+                print(f"      - Uploaded as URI: {uploaded_file.name}", flush=True)
+                uploaded_files_info[uploaded_file.name] = {
+                    'physical_index': page_index,
+                    'file_object': uploaded_file
+                }
+                upload_parts.append(uploaded_file) # Add file object for the prompt
+            if len(upload_parts) < 2: # Need at least 2 samples for reliable offset
+                print("    - Insufficient pages successfully uploaded for offset detection.", flush=True)
+                return None
 
-        # --- Send Prompt with All Uploaded Files --- 
-        # The API expects a list where the first item is the prompt string
-        # and subsequent items are the File objects.
-        request_content = [full_prompt] + upload_parts 
-        # Make the API call
-        try:
-            response = model.generate_content(request_content, request_options={'timeout': 600})
-            print("--- Received Batch Offset Detection Response ---")
-            # print(response.text) # Uncomment for debugging response
+            # --- Single Prompt Construction (strict JSON schema) --- 
+            uris = list(uploaded_files_info.keys())
+            attached_list = "\n".join(f"- {u}" for u in uris)
+            full_prompt = f"""
+Objective:
+  Determine the printed page numbers visible on each attached PDF page.
 
-            # --- Parse Response --- 
-            parsed_numbers = {}
-            # Simple parsing - assumes format like 'pageA.pdf: 38' or similar per line
-            for line in response.text.strip().split('\n'):
-                line = line.strip()
-                if ':' in line:
+Attachments:
+{attached_list}
+
+Output Format:
+  Return ONLY a valid JSON object mapping each URI to its printed page number or null, for example:
+  {{
+{',\n'.join(f'    "{u}": null' for u in uris)}
+  }}
+No markdown or extra text.
+"""
+
+            print("\n--- Sending Batch Offset Detection Prompt ---")
+            # print(full_prompt) # Uncomment for debugging prompt
+
+            # --- Send Prompt with All Uploaded Files --- 
+            # The API expects a list where the first item is the prompt string
+            # and subsequent items are the File objects.
+            request_content = [full_prompt] + upload_parts 
+            # Make the API call
+            try:
+                response = model.generate_content(request_content, request_options={'timeout': 600})
+                print("--- Received Batch Offset Detection Response ---")
+                print("--- Raw Offset Detection Response ---", flush=True)
+                print(response.text, flush=True)
+                # --- Parse JSON Response for offset detection ---
+                try:
+                    offset_json = json.loads(clean_json_response(response.text))
+                except Exception as e:
+                    print(f"    - Error parsing offset JSON: {e}", flush=True)
+                    return None
+                # Map URIs to raw values
+                parsed_numbers = {}
+                for uri, value in offset_json.items():
+                    if uri not in uploaded_files_info:
+                        print(f"    - Warning: Unknown URI '{uri}' in JSON offset response", flush=True)
+                        continue
+                    parsed_numbers[uploaded_files_info[uri]['physical_index']] = value
+                print(f"Parsed raw numbers: {parsed_numbers}", flush=True)
+
+                # --- Calculate Offset ---
+                offsets = []
+                samples = []
+                for phys_idx, raw in parsed_numbers.items():
+                    # raw may be int or str; convert here
+                    if raw is None:
+                        samples.append({"physical_index": phys_idx, "printed_number": None, "calculated_offset": None})
+                        continue
                     try:
-                        file_part, num_part = line.split(':', 1)
-                        file_display_name = file_part.strip()
-                        num_str = num_part.strip().lower()
-                        
-                        # Find the original info by display name
-                        original_physical_index = -1
-                        for up_info in uploaded_files_info.values():
-                            if up_info['display_name'] == file_display_name:
-                                original_physical_index = up_info['physical_index']
-                                break
-                        
-                        if original_physical_index != -1:
-                            if num_str != 'none':
-                                parsed_numbers[original_physical_index] = int(num_str)
-                            else:
-                                 parsed_numbers[original_physical_index] = None # Mark as None if reported
-                        else:
-                             print(f"    - Warning: Could not map parsed display name '{file_display_name}' back to an uploaded file.")
-
-                    except ValueError:
-                        print(f"    - Warning: Could not parse number from line: {line}")
-                    except Exception as parse_err:
-                         print(f"    - Warning: Error parsing line '{line}': {parse_err}")
-        
-            print(f"Parsed printed numbers: {parsed_numbers}", flush=True)
-
-            # --- Calculate Offset --- 
-            offsets = []
-            samples = []
-            for physical_idx, printed_num in parsed_numbers.items():
-                 if printed_num is not None:
-                     offset = printed_num - (physical_idx + 1)
-                     offsets.append(offset)
-                     samples.append({"physical_index": physical_idx, "printed_number": printed_num, "calculated_offset": offset})
-                 else:
-                     samples.append({"physical_index": physical_idx, "printed_number": None, "calculated_offset": None})
-
-        except google_exceptions.GoogleAPIError as e:
-            print(f"Error during batch offset detection API call: {e}", file=sys.stderr)
-            return None # Indicate error
-        except Exception as e:
-            print(f"Unexpected error during batch offset detection processing: {e}", file=sys.stderr)
-            return None # Indicate error
-            
+                        printed_num = int(raw)
+                    except (TypeError, ValueError):
+                        print(f"    - Warning: Non-integer printed value '{raw}' for index {phys_idx}", flush=True)
+                        samples.append({"physical_index": phys_idx, "printed_number": raw, "calculated_offset": None})
+                        continue
+                    offset = printed_num - (phys_idx + 1)
+                    offsets.append(offset)
+                    samples.append({"physical_index": phys_idx, "printed_number": printed_num, "calculated_offset": offset})
+            except google_exceptions.GoogleAPIError as e:
+                print(f"Error during batch offset detection API call: {e}", file=sys.stderr)
+                return None # Indicate error
+            except Exception as e:
+                print(f"Unexpected error during batch offset detection processing: {e}", file=sys.stderr)
+                return None # Indicate error
+                
     except Exception as e:
         print(f"Error during offset detection setup or file handling: {e}", file=sys.stderr)
     finally:
@@ -402,6 +361,32 @@ def get_printed_page_number(pdf_doc: pikepdf.Pdf, page_index: int, model: genai.
         return None
     # No finally block needed as we are not creating/deleting temporary files here
 
+def _extract_and_save_single_page(pdf_doc: pikepdf.Pdf, page_index: int, base_filename: str) -> str | None:
+    """Extracts a single page to a temporary file.
+    Returns the path to the temporary file or None on error.
+    """
+    temp_pdf_path = None
+    try:
+        # Create a temporary PDF with only the target page
+        single_page_pdf = pikepdf.Pdf.new()
+        single_page_pdf.pages.append(pdf_doc.pages[page_index])
+
+        # Save to a temporary file
+        temp_dir = tempfile.mkdtemp()
+        # Use a more descriptive name including the original index
+        temp_pdf_path = os.path.join(temp_dir, f"{base_filename}_physical_page_{page_index}.pdf")
+        single_page_pdf.save(temp_pdf_path)
+        single_page_pdf.close()
+        print(f"      - Saved temporary single-page PDF: {temp_pdf_path}", flush=True)
+        return temp_pdf_path
+    except Exception as e:
+        print(f"      - Error saving temporary page {page_index}: {e}", flush=True)
+        # Cleanup if path was created but save failed?
+        if temp_pdf_path and os.path.exists(os.path.dirname(temp_pdf_path)):
+             try: shutil.rmtree(os.path.dirname(temp_pdf_path)) 
+             except: pass # Ignore cleanup errors
+        return None
+
 def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/papers"):
     """Main function to find, adjust, validate, and extract reference sections."""
     print("--- Entered extract_reference_sections --- ", flush=True)
@@ -412,28 +397,31 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
         
     try:
         # --- Centralized Initialization --- 
-        print("Initializing Generative Model and uploading PDF...", flush=True)
-        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        print("Initializing Generative Models and uploading PDF...", flush=True)
+        # Use separate models: one for section finding, one for offset detection
+        section_model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
+        offset_model = genai.GenerativeModel("gemini-2.0-flash-exp")
         uploaded_pdf = genai.upload_file(pdf_path)
         print("Initialization complete.", flush=True)
         # --- End Initialization --- 
 
-        # 1. Find potential reference sections (printed numbers?)
-        # Pass model and uploaded_pdf
-        sections = find_reference_section_pages(pdf_path, model, uploaded_pdf)
-        if not sections:
-            print("No reference sections found.", flush=True)
-            return
-        
-        # 2. Detect page number offset
+        # 1 & 2. Find sections and detect offset concurrently
         with pikepdf.Pdf.open(pdf_path) as temp_doc:
             page_count_for_offset = len(temp_doc.pages)
             if page_count_for_offset == 0:
                 print("Error: PDF has 0 pages.", flush=True)
                 return
-        
-        # Pass model and the uploaded_pdf object to detect_page_number_offset
-        offset_details = detect_page_number_offset(pdf_path, model, page_count_for_offset)
+
+        print("Starting concurrent tasks for section finding and offset detection...", flush=True)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_sections = executor.submit(find_reference_section_pages, pdf_path, section_model, uploaded_pdf)
+            future_offset = executor.submit(detect_page_number_offset, pdf_path, offset_model, page_count_for_offset)
+            sections = future_sections.result()
+            offset_details = future_offset.result()
+
+        if not sections:
+            print("No reference sections found.", flush=True)
+            return
         if not offset_details or 'offset' not in offset_details:
             print("Could not determine page number offset. Cannot proceed with extraction.", flush=True)
             return
@@ -521,35 +509,48 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                         uploaded_start = genai.upload_file(path=temp_start_file_path, display_name=f"start_page_{i+1}.pdf")
                         uploaded_validation_files['start'] = {'file_object': uploaded_start, 'temp_path': temp_start_file_path}
                         validation_upload_parts.append(uploaded_start)
-                        print(f"      - Uploaded as {uploaded_start.name}", flush=True)
+                        print(f"      - Uploaded as URI: {uploaded_start.name}", flush=True)
 
                         print(f"    - Uploading validation page: End (physical {physical_end_to_validate})...", flush=True)
                         uploaded_end = genai.upload_file(path=temp_end_file_path, display_name=f"end_page_{i+1}.pdf")
                         uploaded_validation_files['end'] = {'file_object': uploaded_end, 'temp_path': temp_end_file_path}
                         validation_upload_parts.append(uploaded_end)
-                        print(f"      - Uploaded as {uploaded_end.name}", flush=True)
+                        print(f"      - Uploaded as URI: {uploaded_end.name}", flush=True)
 
                     except Exception as upload_err:
                         print(f"    - Error uploading validation pages: {upload_err}. Skipping section.", flush=True)
                         continue # Cannot proceed without uploads
 
                     # Construct Validation Prompt (Always use REPORTED numbers for validation check)
-                    prompt_lines = [
-                        "Please examine the two uploaded PDF files representing a potential start and end page of a bibliography/reference section.",
-                        f"File 1: '{uploaded_start.display_name}' (physical page {physical_start_to_validate + 1}) - Does this page LOOK like the START of a bibliography AND have the PRINTED page number {reported_start}?",
-                        f"File 2: '{uploaded_end.display_name}' (physical page {physical_end_to_validate + 1}) - Does this page LOOK like the END of a bibliography AND have the PRINTED page number {reported_end}?",
-                        "\nFor EACH file, answer the following two questions:",
-                        f"1. What is the page number PRINTED on the page itself? (Must match {reported_start} for File 1, {reported_end} for File 2). Respond with the integer or 'None'.",
-                        f"2. Does the content on this page look like it is the START (for File 1, corresponding to reported {reported_start}) or END (for File 2, corresponding to reported {reported_end}) of a bibliography section? Respond 'Yes' or 'No'.",
-                        "\nREQUIRED RESPONSE FORMAT (example):",
-                        f"{uploaded_start.display_name}:",
-                        f"  Printed Number: {reported_start}", # Example shows the target number
-                        "  Is Start Page: Yes",
-                        f"{uploaded_end.display_name}:",
-                        f"  Printed Number: {reported_end}", # Example shows the target number
-                        "  Is End Page: Yes"
-                    ]
-                    validation_prompt = "\n".join(prompt_lines)
+                    validation_prompt = f"""
+Objective:
+  Validate that two attached PDF pages correspond to the START and END of a bibliography/reference section, and verify their printed page numbers.
+
+Attachments:
+  - START page URI: {uploaded_start.name}
+  - END page URI:   {uploaded_end.name}
+
+Context:
+  - Reported START printed number: {reported_start}
+  - Reported END printed number:   {reported_end}
+
+Tasks:
+  1. For URI '{uploaded_start.name}':
+     a. Extract the printed page number on the page. Provide the integer or 'None'.
+     b. Confirm if this page marks the START of a bibliography section. Respond 'Yes' or 'No'.
+  2. For URI '{uploaded_end.name}':
+     a. Extract the printed page number on the page. Provide the integer or 'None'.
+     b. Confirm if this page marks the END of a bibliography section. Respond 'Yes' or 'No'.
+
+Output Format:
+  Return a JSON object with two keys (the URIs), for example:
+  {{
+    "{uploaded_start.name}": {{"printed_number": 53, "is_start": true}},
+    "{uploaded_end.name}":   {{"printed_number": 54, "is_end":   true}}
+  }}
+  ONLY valid JSON. No markdown or extra text.
+"""
+
                     print(f"\n    --- Sending Validation Prompt for Section {i+1} (Checking reported pages {reported_start}-{reported_end}) ---")
                     # print(validation_prompt) # Debugging
 
@@ -557,33 +558,30 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                     request_content = [validation_prompt] + validation_upload_parts
                     # Make the API call
                     try:
-                        response = model.generate_content(request_content, request_options={'timeout': 600})
+                        response = section_model.generate_content(request_content, request_options={'timeout': 600})
                         print(f"    --- Received Validation Response for Section {i+1} ---")
                         # print(f"Raw validation response: {response.text}") # DEBUG
 
-                        # Parse Validation Response
-                        parsed_validation = {'start': {'number': None, 'is_marker': False}, 'end': {'number': None, 'is_marker': False}}
-                        current_file_key = None
-                        response_text = response.text.strip()
-                        for line in response_text.split('\n'):
-                            line = line.strip()
-                            if line.startswith(uploaded_start.display_name):
-                                current_file_key = 'start'
-                            elif line.startswith(uploaded_end.display_name):
-                                current_file_key = 'end'
-                            elif current_file_key:
-                                if line.lower().startswith("printed number:"):
-                                    num_str = line.split(":", 1)[1].strip()
-                                    try: 
-                                        parsed_validation[current_file_key]['number'] = int(num_str)
-                                    except ValueError: 
-                                        print(f"      - Warning: Could not parse printed number '{num_str}' as int.")
-                                        pass # Keep as None if not an int
-                                elif line.lower().startswith("is start page:") or line.lower().startswith("is end page:"):
-                                    answer = line.split(":", 1)[1].strip().lower()
-                                    parsed_validation[current_file_key]['is_marker'] = (answer == 'yes')
-                    
-                        print(f"    - Parsed Validation: {parsed_validation}", flush=True)
+                        # Parse JSON Validation Response
+                        try:
+                            validation_json = json.loads(clean_json_response(response.text))
+                        except Exception as e:
+                            print(f"      - Error parsing validation JSON: {e}", flush=True)
+                            return None
+                        # Map JSON to internal validation dict
+                        start_info = validation_json.get(uploaded_start.name, {})
+                        end_info   = validation_json.get(uploaded_end.name, {})
+                        parsed_validation = {
+                            'start': {
+                                'number': start_info.get('printed_number'),
+                                'is_marker': bool(start_info.get('is_start'))
+                            },
+                            'end': {
+                                'number': end_info.get('printed_number'),
+                                'is_marker': bool(end_info.get('is_end'))
+                            }
+                        }
+                        print(f"    - Parsed Validation (JSON): {parsed_validation}", flush=True)
 
                         # Final Check (Local) - Compare parsed numbers against originally REPORTED numbers
                         tolerance = 0 # Require exact number match for validation
@@ -653,8 +651,16 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
             print("Validated sections (physical 0-based indices):", json.dumps(adjusted_sections, indent=2), flush=True)
             
             output_dir_abs = os.path.expanduser(output_dir) # Ensure path is expanded
-            os.makedirs(output_dir_abs, exist_ok=True) # Ensure output dir exists
-            print(f"Output directory: {output_dir_abs}", flush=True)
+            base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+            # --- ADDED: Create specific subdirectory for this PDF --- 
+            specific_output_dir = os.path.join(output_dir_abs, base_name)
+            os.makedirs(specific_output_dir, exist_ok=True) # Ensure specific output dir exists
+            print(f"Output directory for intermediate pages: {specific_output_dir}", flush=True)
+            # --- END ADDED ---
+
+            # --- ADDED: List to store names of generated page PDFs --- 
+            generated_page_pdf_filenames = []
+            # --- END ADDED ---
 
             # Re-open the PDF for the final extraction pass
             with pikepdf.open(pdf_path) as final_doc:
@@ -675,10 +681,15 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                                 
                                 # Use physical index + 1 for human-readable filename numbering
                                 output_filename = f"{base_name}_section{i}_page{page_num_idx + 1}.pdf"
-                                output_path = os.path.join(output_dir_abs, output_filename)
+                                # --- MODIFIED: Save inside the specific subdirectory ---
+                                output_path = os.path.join(specific_output_dir, output_filename)
+                                # --- END MODIFIED ---
                                 
                                 new_pdf_page.save(output_path)
                                 print(f"    - Saved: {output_path}", flush=True)
+                                # --- ADDED: Record the filename --- 
+                                generated_page_pdf_filenames.append(output_filename)
+                                # --- END ADDED ---
                             else:
                                  print(f"    - Warning: Physical page index {page_num_idx} out of bounds during final extraction for section {i}. Skipping page.", flush=True)
 
@@ -686,6 +697,20 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                             print(f"    - Error extracting physical page {page_num_idx} of section {i}: {extract_err}", flush=True)
                         finally:
                             new_pdf_page.close() # Close the single-page PDF object
+
+            # --- ADDED: Create the manifest JSON file if pages were generated --- 
+            if generated_page_pdf_filenames:
+                manifest_json_path = os.path.join(specific_output_dir, f"{base_name}_bibliography_pages.json")
+                manifest_data = {"pages": generated_page_pdf_filenames}
+                try:
+                    with open(manifest_json_path, 'w') as f_json:
+                        json.dump(manifest_data, f_json, indent=2)
+                    print(f"--- Created manifest JSON: {manifest_json_path} ---", flush=True)
+                except Exception as json_err:
+                    print(f"--- Error creating manifest JSON {manifest_json_path}: {json_err} ---", flush=True)
+            else:
+                print("--- No page PDFs were generated, skipping manifest JSON creation. ---", flush=True)
+            # --- END ADDED ---
         
         print("--- Extraction Complete (if any sections were valid) ---", flush=True)
         # --- End Step 4 ---

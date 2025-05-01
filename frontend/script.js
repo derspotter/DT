@@ -2,6 +2,23 @@
 
 console.log("Digital Library frontend script loaded.");
 
+// --- Function to render bibliography data ---
+// Moved to top level for broader scope
+function renderBibliography(data, container) {
+    container.innerHTML = ''; // Clear previous content
+    if (!Array.isArray(data) || data.length === 0) {
+        container.textContent = 'No bibliography files found.'; // Updated message
+        return;
+    }
+    const ul = document.createElement('ul');
+    data.forEach(filename => { // data is now an array of filenames
+        const li = document.createElement('li');
+        li.textContent = filename; // Display the filename directly
+        ul.appendChild(li);
+    });
+    container.appendChild(ul);
+}
+
 // Drag and drop functionality for PDF files
 document.addEventListener('DOMContentLoaded', () => {
     const dropZone = document.getElementById('drop-zone');
@@ -11,6 +28,47 @@ document.addEventListener('DOMContentLoaded', () => {
     // Store uploaded files
     const uploadedFiles = new Map();
     
+    // Get consolidate button and status elements
+    const consolidateButton = document.getElementById('consolidate-button');
+    const consolidateStatus = document.getElementById('consolidate-status');
+
+    // Add event listener for consolidate button
+    if (consolidateButton && consolidateStatus) {
+        consolidateButton.addEventListener('click', async () => {
+            consolidateStatus.textContent = 'Consolidating...';
+            consolidateStatus.style.color = 'orange';
+            consolidateButton.disabled = true;
+
+            try {
+                const response = await fetch('/api/bibliographies/consolidate', {
+                    method: 'POST'
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    console.log('Consolidation successful:', result);
+                    consolidateStatus.textContent = 'Consolidation successful! master_bibliography.json created.';
+                    consolidateStatus.style.color = 'green';
+                    loadInitialBibliographies(); // Refresh the list
+                } else {
+                    console.error('Consolidation failed:', result);
+                    consolidateStatus.textContent = `Consolidation failed: ${result.message || 'Unknown error'}`;
+                    consolidateStatus.style.color = 'red';
+                }
+
+            } catch (error) {
+                console.error('Error triggering consolidation:', error);
+                consolidateStatus.textContent = 'Error contacting server for consolidation.';
+                consolidateStatus.style.color = 'red';
+            } finally {
+                consolidateButton.disabled = false;
+            }
+        });
+    } else {
+        console.warn('Consolidate button or status element not found.');
+    }
+
     // Convert bytes to readable format
     function formatFileSize(bytes) {
         if (bytes === 0) return '0 Bytes';
@@ -104,43 +162,41 @@ document.addEventListener('DOMContentLoaded', () => {
                 return;
             }
 
-            // Update status and disable button during API call
-            statusSpan.textContent = 'Starting extraction...';
-            extractBibButton.disabled = true;
-            extractBibButton.textContent = 'Starting...';
-            removeButton.disabled = true; // Also disable remove during extraction start
+            const bibContainer = document.getElementById('bib-list');
+            statusSpan.textContent = 'Requesting extraction...';
+            extractBibButton.disabled = true; // Disable button during processing
 
             try {
-                console.log(`Requesting bibliography extraction for backend file: ${backendFilename}`);
-                
-                // Call the new backend endpoint
-                const response = await fetch(`/api/extract-bibliography/${backendFilename}`, { 
-                    method: 'POST',
-                    // No body needed, filename is in URL
+                // Add method: 'POST' to the fetch options
+                const response = await fetch(`/api/extract-bibliography/${encodeURIComponent(backendFilename)}`, {
+                    method: 'POST'
                 });
+                const result = await response.json();
 
-                // Check for 202 Accepted or other success codes
-                if (!response.ok && response.status !== 202) { 
-                    const errorData = await response.text(); 
-                    console.error('Backend error response:', errorData);
-                    throw new Error(`HTTP error! status: ${response.status}`);
+                if (response.ok) {
+                    statusSpan.textContent = 'Extraction started...';
+                    // Display a message in the main bibliography box
+                    if(bibContainer) bibContainer.textContent = 'Processing new file, list will refresh shortly...';
+
+                    // Wait for a reasonable time (e.g., 15 seconds) for the script to likely complete
+                    // In a production scenario, you might use WebSockets or more sophisticated polling
+                    console.log('Waiting 15 seconds before refreshing bibliography list...');
+                    setTimeout(() => {
+                        console.log('Refreshing bibliography list now.');
+                        loadInitialBibliographies(); // Reload the entire list
+                         // Re-enable the button for the specific file if needed, or handle globally
+                        // extractBibButton.disabled = false; 
+                        // statusSpan.textContent = 'Extraction complete.'; // Or update based on refresh
+                    }, 15000); // 15 seconds delay
+
+                } else {
+                    statusSpan.textContent = `Error: ${result.message || 'Unknown error'}`;
+                    extractBibButton.disabled = false; // Re-enable on error
                 }
-
-                const result = await response.json(); // Get the { message: '...' } response
-                console.log('Backend response:', result);
-                statusSpan.textContent = result.message || 'Extraction started (background).'; 
-                extractBibButton.textContent = 'Extraction Running'; // Indicate background process
-                // Keep button disabled? Or allow re-trigger? For now, keep disabled.
-
             } catch (error) {
-                console.error('Error starting bibliography extraction:', error);
+                console.error('Error requesting bibliography extraction:', error);
                 statusSpan.textContent = 'Error starting extraction.';
-                alert('Error starting bibliography extraction. Please check console.'); 
                 extractBibButton.disabled = false; // Re-enable on error
-                extractBibButton.textContent = 'Extract Bibliography'; 
-            } finally {
-                // Re-enable remove button once API call finishes (success or fail)
-                 removeButton.disabled = false; 
             }
         });
         
@@ -194,62 +250,145 @@ document.addEventListener('DOMContentLoaded', () => {
         
         // Trigger upload immediately after adding elements to list
         uploadFile(file, listItem, statusSpan, extractBibButton);
-        // --- END AUTO UPLOAD ---
+        
+         // Poll and render bibliography JSON
+         async function pollBibliography(fileName, container) {
+             const baseName = fileName.replace(/\.[^/.]+$/, '');
+             const url = `/api/bibliography/${encodeURIComponent(baseName)}`;
+             try {
+                 const response = await fetch(url);
+                 if (!response.ok) {
+                     throw new Error(`HTTP error! status: ${response.status}`);
+                 }
+                 const data = await response.json();
+                 renderBibliography(data, container); // Use the rendering function
+             } catch (error) {
+                 console.error('Error polling bibliography:', error);
+             }
+         }
+
+    } // Close addFileToList
+
+    // Function to load all current bibliographies
+    async function loadInitialBibliographies() {
+        const bibContainer = document.getElementById('bib-list');
+        if (!bibContainer) {
+            console.error('Bibliography container #bib-list not found.');
+            return;
+        }
+        bibContainer.textContent = 'Loading existing bibliographies...'; // Loading message
+
+        try {
+            const response = await fetch('/api/bibliographies/all-current');
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            const data = await response.json();
+            console.log('Loaded initial bibliographies:', data);
+            renderBibliography(data, bibContainer); // Use the rendering function
+        } catch (error) {
+            console.error('Error loading initial bibliographies:', error);
+            bibContainer.textContent = 'Error loading bibliographies.';
+        }
     }
-    
+
+    // Call the initial load function
+    loadInitialBibliographies();
+
     // Handle files being selected or dropped
     function handleFiles(files) {
         for (let i = 0; i < files.length; i++) {
             addFileToList(files[i]);
         }
     }
-    
-    // File input change event (when files are selected via the dialog)
+
     fileInput.addEventListener('change', () => {
         handleFiles(fileInput.files);
         fileInput.value = '';
     });
-    
-    // Prevent default drag behaviors
+
     ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
         dropZone.addEventListener(eventName, preventDefaults, false);
     });
-    
+
     function preventDefaults(e) {
         e.preventDefault();
         e.stopPropagation();
     }
-    
-    // Highlight drop zone when file is dragged over it
+
     ['dragenter', 'dragover'].forEach(eventName => {
         dropZone.addEventListener(eventName, highlight, false);
     });
-    
+
     ['dragleave', 'drop'].forEach(eventName => {
         dropZone.addEventListener(eventName, unhighlight, false);
     });
-    
+
     function highlight() {
         dropZone.classList.add('highlight');
     }
-    
+
     function unhighlight() {
         dropZone.classList.remove('highlight');
     }
-    
-    // Handle dropped files
+
     dropZone.addEventListener('drop', handleDrop, false);
-    
+
     function handleDrop(e) {
         const dt = e.dataTransfer;
         const files = dt.files;
         handleFiles(files);
     }
-    
-    // Open file picker when the drop zone is clicked
+
     dropZone.addEventListener('click', () => {
         fileInput.click();
     });
-    
+
     console.log("Drag and drop functionality initialized.");
-});
+
+    // --- WebSocket Connection ---
+    let socket;
+
+    function connectWebSocket() {
+        // Use ws:// because we are likely running http locally
+        // Adjust if your backend is served over https (wss://)
+        // Assumes backend runs on port 4000 where the WebSocket server was attached
+        const wsUrl = 'ws://localhost:4000'; 
+        const logOutputDiv = document.getElementById('logOutput'); // Get the log div
+        logOutputDiv.innerHTML = 'Connecting to server logs...<br>'; // Clear previous logs
+        console.log(`Attempting to connect WebSocket to ${wsUrl}`);
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+            console.log('WebSocket connection established');
+            logOutputDiv.innerHTML += 'Connection established. Waiting for logs...<br>';
+        };
+
+        socket.onmessage = (event) => {
+            console.log('Message from server:', event.data);
+            const logEntry = document.createElement('div');
+            logEntry.textContent = event.data; // Display the raw message
+            logOutputDiv.appendChild(logEntry);
+            // Auto-scroll to the bottom
+            logOutputDiv.scrollTop = logOutputDiv.scrollHeight;
+        };
+
+        socket.onclose = (event) => {
+            console.log('WebSocket connection closed:', event);
+            logOutputDiv.innerHTML += 'Log connection closed. Attempting to reconnect in 5 seconds...<br>';
+            // Attempt to reconnect after a delay
+            setTimeout(connectWebSocket, 5000); 
+        };
+
+        socket.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            logOutputDiv.innerHTML += `WebSocket error: ${error.message || 'Unknown error'}. Check browser console.<br>`;
+            // Don't automatically reconnect on error immediately, 
+            // might spam if the server is down. Rely on onclose for retries.
+        };
+    }
+
+    // Initial connection attempt
+    connectWebSocket();
+    // --- End WebSocket Connection ---
+}); // end DOMContentLoaded

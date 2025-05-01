@@ -1,19 +1,26 @@
 .env
 
 # Ignore generated directories from dl_lit scripts
-/dl_lit/papers/
-/dl_lit/temp_pages/
-/dl_lit/bibliographies/
-/dl_lit/uploads/
+/dl_lit/temp_pages/*
+!/dl_lit/temp_pages/.gitkeep
+/dl_lit/bibliographies/*
+!/dl_lit/bibliographies/.gitkeep
 /backend/backend/
 /backend/node_modules/
-/backend/uploads/
+/backend/uploads/*
+!/backend/uploads/.gitkeep
 /backend/dl_lit/
-/backend/papers/
-/backend/temp_pages/
+/backend/temp_pages/*
+!/backend/temp_pages/.gitkeep
 /backend/bibs/
 temp_test_input/
 temp_test_output/
 .roo/
 .vscode/
+cline.json
+new_search_results/*
+!/new_search_results/.gitkeep
+dl_lit/temp_bib_pages/
+*.pdf
+*.log
 

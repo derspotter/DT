@@ -6,15 +6,50 @@ import argparse
 from pdfminer.high_level import extract_text
 from dotenv import load_dotenv
 import google.generativeai as genai
+import concurrent.futures
+from collections import deque
+from threading import Lock
+from datetime import datetime, timedelta
 
 # --- Configuration ---
-# Use Gemini Flash by default for speed
-DEFAULT_MODEL_NAME = 'gemini-2.0-flash-lite' # Updated model name
-# DEFAULT_MODEL_NAME = 'gemini-1.5-flash-latest' 
-# DEFAULT_MODEL_NAME = 'deepseek-chat' # Can switch later if needed
+# Use Gemini standard Flash model for speed
+DEFAULT_MODEL_NAME = 'gemini-2.0-flash'
 
 # Global client/model variable
 api_model = None
+
+# --- Rate Limiter --- (Respecting 15 RPM = 0.25 RPS)
+MAX_REQUESTS_PER_MINUTE = 15
+MIN_INTERVAL_SECONDS = 60.0 / MAX_REQUESTS_PER_MINUTE
+request_timestamps = deque()
+rate_limiter_lock = Lock()
+
+def wait_for_rate_limit():
+    """Blocks until it's safe to make another API request based on 15 RPM."""
+    with rate_limiter_lock:
+        now = datetime.now()
+        # Remove timestamps older than 1 minute
+        while request_timestamps and (now - request_timestamps[0]) > timedelta(minutes=1):
+            request_timestamps.popleft()
+
+        # If we've made max requests in the last minute, wait
+        if len(request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
+            time_since_oldest = (now - request_timestamps[0]).total_seconds()
+            wait_time = 60.0 - time_since_oldest
+            if wait_time > 0:
+                print(f"[RATE LIMIT] Reached {MAX_REQUESTS_PER_MINUTE} RPM. Waiting {wait_time:.2f} seconds...", flush=True)
+                time.sleep(wait_time)
+
+        # Check minimum interval between requests
+        if request_timestamps:
+             time_since_last = (now - request_timestamps[-1]).total_seconds()
+             if time_since_last < MIN_INTERVAL_SECONDS:
+                 interval_wait = MIN_INTERVAL_SECONDS - time_since_last
+                 # print(f"[RATE LIMIT] Minimum interval not met. Waiting {interval_wait:.2f} seconds...", flush=True)
+                 time.sleep(interval_wait)
+
+        # Record this request's timestamp
+        request_timestamps.append(datetime.now())
 
 # --- Helper Functions ---
 
@@ -26,14 +61,6 @@ def load_api_key():
         if not key:
             print("[ERROR] GOOGLE_API_KEY not found.", flush=True)
         return key
-    elif 'deepseek' in DEFAULT_MODEL_NAME:
-        # Placeholder for DeepSeek key if needed later
-        # key = os.getenv('DEEPSEEK_API_KEY')
-        # if not key:
-        #     print("[ERROR] DEEPSEEK_API_KEY not found.", flush=True)
-        # return key
-        print("[ERROR] DeepSeek configuration not yet implemented in V2.", flush=True)
-        return None
     else:
         print(f"[ERROR] Unknown model type in DEFAULT_MODEL_NAME: {DEFAULT_MODEL_NAME}", flush=True)
         return None
@@ -51,12 +78,6 @@ def configure_api_client():
             api_model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
             print(f"[INFO] Successfully configured Google client ({DEFAULT_MODEL_NAME}).", flush=True)
             return True
-        # Add elif for deepseek if needed later
-        # elif 'deepseek' in DEFAULT_MODEL_NAME:
-            # from openai import OpenAI
-            # api_model = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
-            # print("[INFO] Successfully configured DeepSeek client.", flush=True)
-            # return True
         else:
             return False
     except Exception as e:
@@ -82,13 +103,36 @@ def get_bibliography_via_api(text_content):
         return None
 
     # Basic prompt - can be refined
-    system_prompt = "You are an expert academic assistant. Extract all bibliography reference entries from the provided text. Return the result ONLY as a JSON array of objects. Each object should represent one reference and include fields like 'authors' (as a list of strings), 'year' (integer), 'title', 'source', 'volume', 'pages', etc., where available. If no references are found, return an empty JSON array []."
+    system_prompt = """You are an expert research assistant. Your task is to extract bibliography or reference list entries from the provided text, which is a page from a PDF document. Return the bibliography entries as a JSON array of objects. Each object should represent a single bibliography entry and have the following fields where available:
+
+- authors: array of author names (strings)
+- year: publication year (integer or string)
+- title: title of the work (string)
+- source: journal name, book title, conference name, etc. (string)
+- volume: journal volume (integer or string)
+- issue: journal issue (integer or string)
+- pages: page range (string, e.g., "123-145")
+- publisher: publisher name if present (string)
+- location: place of publication if present (string)
+- type: type of document (e.g., 'journal article', 'book', 'book chapter', 'conference paper', etc.) (string)
+- doi: DOI if present (string)
+- url: URL if present (string)
+- isbn: ISBN if present for books (string)
+- issn: ISSN if present for journals (string)
+- abstract: abstract if present (string)
+- keywords: array of keywords if present (strings)
+- language: language of publication if not English (string)
+
+Return ONLY the JSON array. Do not include any introductory text, explanations, apologies, or markdown formatting like ```json. If no bibliography entries are found in the text, return an empty JSON array []."""
     # Fix: Added closing quote to the f-string
     user_prompt = f"Extract bibliography entries from the following text:\n\n---\n{text_content}\n---\n\nOutput only the JSON array:"
 
     start_time = time.time()
     print(f"[DEBUG] Sending request to {DEFAULT_MODEL_NAME} API...", flush=True)
     try:
+        # --- Wait for Rate Limit before API Call ---
+        wait_for_rate_limit()
+
         # --- Gemini API Call ---
         if 'google' in DEFAULT_MODEL_NAME or 'gemini' in DEFAULT_MODEL_NAME:
              # Configure for JSON output with Gemini
@@ -100,10 +144,6 @@ def get_bibliography_via_api(text_content):
                 generation_config=generation_config 
             )
             raw_response_content = response.text # Gemini specific
-        # --- Add DeepSeek logic here if needed later ---
-        # elif 'deepseek' in DEFAULT_MODEL_NAME:
-            # response = api_model.chat.completions.create(...) # DeepSeek specific call
-            # raw_response_content = response.choices[0].message.content
         else:
             print("[ERROR] API call logic not implemented for this model.", flush=True)
             return None
@@ -115,7 +155,6 @@ def get_bibliography_via_api(text_content):
         # --- Robust JSON Parsing ---
         try:
             parsed_json = json.loads(raw_response_content)
-            # Handle cases where the API might wrap the list in a dict (like observed with DeepSeek)
             if isinstance(parsed_json, dict) and len(parsed_json) == 1:
                 # If it's a dict with one key, assume the value is the list we want
                 potential_list = next(iter(parsed_json.values()))
@@ -143,48 +182,38 @@ def get_bibliography_via_api(text_content):
 
 # --- Main Processing Logic ---
 
-def process_directory_v2(input_dir, output_dir):
-    """Processes all PDFs in the input directory."""
-    os.makedirs(output_dir, exist_ok=True)
-    pdf_files = glob.glob(os.path.join(input_dir, '*.pdf'))
-    
-    if not pdf_files:
-        print(f"[WARNING] No PDF files found in {input_dir}", flush=True)
-        return
+def process_single_pdf(pdf_path, output_dir, summary_dict, summary_lock):
+    """Processes a single PDF file: extract text, call API, save result."""
+    filename = os.path.basename(pdf_path)
+    print(f"\n[INFO] Processing {filename}...", flush=True)
+    start_process_time = time.time()
+    file_success = False
+    failure_reason = "Unknown"
 
-    print(f"[DEBUG] Starting processing of directory: {input_dir}", flush=True)
-    results_summary = {
-        "processed_files": 0,
-        "successful_files": 0,
-        "failed_files": 0,
-        "failures": []
-    }
-
-    for pdf_path in pdf_files:
-        start_process_time = time.time()
-        filename = os.path.basename(pdf_path)
-        print(f"\n[INFO] Processing {filename}...", flush=True)
-        results_summary["processed_files"] += 1
-
+    try:
         # 1. Extract Text
         text = extract_text_from_pdf_v2(pdf_path)
         if text is None:
-            results_summary["failed_files"] += 1
-            results_summary["failures"].append({"file": filename, "reason": "Text extraction failed"})
-            continue
+            failure_reason = "Text extraction failed"
+            raise ValueError(failure_reason)
         extract_duration = time.time() - start_process_time
-        print(f"[TIMER] Text extraction took {extract_duration:.2f} seconds.", flush=True)
+        print(f"[TIMER] Text extraction for {filename} took {extract_duration:.2f} seconds.", flush=True)
 
         # 2. Get Bibliography via API
+        stage_start_time = time.time()
         bibliography_data = get_bibliography_via_api(text)
-        api_duration = time.time() - start_process_time - extract_duration
-        print(f"[TIMER] Bibliography extraction function call took {api_duration:.2f} seconds.", flush=True)
+        api_duration = time.time() - stage_start_time
+        print(f"[TIMER] Bibliography extraction for {filename} took {api_duration:.2f} seconds.", flush=True)
 
-        if bibliography_data is None or not bibliography_data: # Handles None and empty list
-             print(f"[WARNING] No bibliography found or extracted for {filename}", flush=True)
-             results_summary["failed_files"] += 1
-             results_summary["failures"].append({"file": filename, "reason": "No bibliography returned by API or processing failed"})
-             # Optionally save an empty file? For now, we just record failure.
+        if bibliography_data is None:
+            failure_reason = "API call failed or returned None"
+            raise ValueError(failure_reason)
+        elif not bibliography_data:
+            print(f"[WARNING] No bibliography found by API for {filename}", flush=True)
+            # Consider this a success in terms of processing, but no data found
+            failure_reason = "No bibliography content found by API" # Not strictly a failure, but no output
+            file_success = True # Treat as success because process completed
+            # Don't save an empty file, just report no data found
         else:
             # 3. Save Output
             output_filename = f"{os.path.splitext(filename)[0]}_bibliography.json"
@@ -194,27 +223,85 @@ def process_directory_v2(input_dir, output_dir):
                 with open(output_path, 'w', encoding='utf-8') as f_out:
                     json.dump(bibliography_data, f_out, indent=2, ensure_ascii=False)
                 write_duration = time.time() - write_start
-                print(f"[SUCCESS] Saved bibliography to {output_path} (write took {write_duration:.2f} seconds).", flush=True)
-                results_summary["successful_files"] += 1
+                print(f"[SUCCESS] Saved bibliography for {filename} to {output_path} (write took {write_duration:.2f} seconds).", flush=True)
+                file_success = True
             except Exception as e:
-                print(f"[ERROR] Failed to write JSON output for {filename}: {e}", flush=True)
-                results_summary["failed_files"] += 1
-                results_summary["failures"].append({"file": filename, "reason": f"Failed to write JSON: {e}"}) 
+                failure_reason = f"Failed to write JSON output: {e}"
+                print(f"[ERROR] {failure_reason} for {filename}", flush=True)
+                file_success = False
 
-        total_duration = time.time() - start_process_time
-        print(f"[TIMER] Total processing for {filename} took {total_duration:.2f} seconds.", flush=True)
-
-    # --- Save Summary ---
-    summary_path = os.path.join(output_dir, 'processing_summary_v2.json')
-    try:
-        with open(summary_path, 'w', encoding='utf-8') as f_summary:
-            json.dump(results_summary, f_summary, indent=2, ensure_ascii=False)
-        print(f"\nProcessing Summary saved to {summary_path}", flush=True)
     except Exception as e:
-        print(f"[ERROR] Failed to write summary file: {e}", flush=True)
+        # Catch errors during text extraction or API call steps
+        if failure_reason == "Unknown": # If not already set
+            failure_reason = f"Processing error: {e}"
+        print(f"[ERROR] Failed processing {filename}: {failure_reason}", flush=True)
+        file_success = False
 
-    print("\n--- APIscraper_v2.py MAIN END ---", flush=True)
+    # Update shared summary dictionary safely
+    with summary_lock:
+        summary_dict["processed_files"] += 1
+        if file_success:
+            summary_dict["successful_files"] += 1
+        else:
+            summary_dict["failed_files"] += 1
+            summary_dict["failures"].append({"file": filename, "reason": failure_reason})
 
+def process_directory_v2(input_dir, base_output_dir, max_workers=5):
+    """Processes all PDFs in the input directory concurrently, saving to a temporary subdir."""
+    # Create a timestamped temporary directory within the base output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_output_dir_name = f"temp_scrape_{timestamp}"
+    actual_output_dir = os.path.join(base_output_dir, temp_output_dir_name)
+    
+    try:
+        os.makedirs(actual_output_dir, exist_ok=True)
+        print(f"[INFO] Created temporary output directory: {actual_output_dir}", flush=True)
+    except OSError as e:
+        print(f"[ERROR] Could not create temporary output directory {actual_output_dir}: {e}", flush=True)
+        return # Cannot proceed without output directory
+
+    pdf_files = glob.glob(os.path.join(input_dir, '*.pdf'))
+
+    if not pdf_files:
+        print(f"[WARNING] No PDF files found in {input_dir}", flush=True)
+        return
+
+    print(f"[INFO] Found {len(pdf_files)} PDF files in {input_dir}.")
+    print(f"[INFO] Starting concurrent processing with up to {max_workers} workers and 15 RPM limit.", flush=True)
+    print(f"[INFO] Results will be saved in: {actual_output_dir}", flush=True)
+    results_summary = {
+        "processed_files": 0,
+        "successful_files": 0,
+        "failed_files": 0,
+        "failures": []
+    }
+    summary_lock = Lock()
+
+    # Use ThreadPoolExecutor for I/O-bound tasks
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit tasks for each PDF, passing the actual_output_dir
+        futures = [executor.submit(process_single_pdf, pdf_path, actual_output_dir, results_summary, summary_lock)
+                   for pdf_path in pdf_files]
+
+        # Wait for all tasks to complete and handle potential exceptions
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()  # Retrieve result or re-raise exception from the thread
+            except Exception as exc:
+                print(f'[ERROR] An error occurred in a worker thread: {exc}', flush=True)
+                # Error is already logged within process_single_pdf and summary updated
+
+    # Print summary
+    print("\n--- Processing Summary ---")
+    print(f"Total files found: {len(pdf_files)}")
+    print(f"Files processed: {results_summary['processed_files']}")
+    print(f"Successful extractions: {results_summary['successful_files']}")
+    print(f"Failed extractions: {results_summary['failed_files']}")
+    if results_summary['failures']:
+        print("Failures:")
+        for failure in results_summary['failures']:
+            print(f"  - {failure['file']}: {failure['reason']}")
+    print("-------------------------")
 
 # --- Entry Point ---
 
@@ -223,15 +310,22 @@ if __name__ == "__main__":
 
     # Configure API client at the start
     if not configure_api_client():
-        print("[FATAL] Exiting due to API client configuration failure.", flush=True)
+        print("[FATAL] Exiting due to API configuration failure.", flush=True)
         exit(1) # Or handle more gracefully depending on needs
 
     parser = argparse.ArgumentParser(description='V2: Extract bibliographies from PDFs using an API.')
     parser.add_argument('--input-dir', required=True, help='Directory containing input PDF files.')
-    parser.add_argument('--output-dir', required=True, help='Directory to save output JSON files.')
+    # Changed argument name
+    parser.add_argument('--base-output-dir', required=True, help='Base directory to create a temporary subdir for output JSON files.')
+    parser.add_argument('--workers', type=int, default=5, help='Maximum number of concurrent worker threads.')
     args = parser.parse_args()
 
     print(f"Input PDF directory: {args.input_dir}")
-    print(f"Output JSON directory: {args.output_dir}")
+    print(f"Base Output directory: {args.base_output_dir}")
 
-    process_directory_v2(args.input_dir, args.output_dir)
+    # Process the directory
+    start_total_time = time.time()
+    # Pass workers as a keyword argument
+    process_directory_v2(args.input_dir, args.base_output_dir, max_workers=args.workers)
+    end_total_time = time.time()
+    print(f"\n[INFO] Total processing time: {end_total_time - start_total_time:.2f} seconds.", flush=True)

@@ -29,6 +29,24 @@
             <h2>Uploaded Files</h2>
             <ul id="file-list"></ul>
         </div>
+        <div class="file-list-container">
+            <h2>Bibliography</h2>
+            <button id="consolidate-button" style="margin-left: 10px;">Consolidate Bibliographies</button>
+            <span id="consolidate-status" style="margin-left: 10px; font-style: italic;"></span>
+            <div id="bib-list" class="bibliography-output-box">
+                <!-- Bibliography entries will be populated here by script.js -->
+            </div>
+        </div>
+        <div class="file-list-container">
+            <h2>Processed Bibliographies</h2>
+            <ul id="bibliographyList"></ul>
+        </div>
+        <div class="file-list-container">
+            <h2>Server Logs</h2>
+            <div id="logOutput" style="height: 300px; overflow-y: scroll; border: 1px solid #ccc; background-color: #f8f8f8; padding: 10px; font-family: monospace; white-space: pre-wrap;">
+                Connecting to server logs...
+            </div>
+        </div>
     </main>
     <footer>
         <p>&copy; 2025 Digital Library Project</p>

@@ -6,7 +6,8 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
-import { execFile, spawn } from 'child_process';
+import { spawn } from 'child_process';
+import { WebSocketServer } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -33,6 +34,53 @@ if (!fs.existsSync(uploadDir)) {
 const app = express();
 const port = process.env.PORT || 4000;
 
+// --- WebSocket Setup ---
+// Create HTTP server instance from Express app
+const server = app.listen(port, () => {
+  console.log(`HTTP server listening on port ${port}`);
+});
+
+// Create WebSocket server attached to the HTTP server
+const wss = new WebSocketServer({ server });
+const clients = new Set();
+
+wss.on('connection', (ws) => {
+  console.log('Client connected via WebSocket');
+  clients.add(ws);
+
+  ws.on('message', (message) => {
+    // Handle messages from client if needed in the future
+    console.log('Received message from client:', message);
+  });
+
+  ws.on('close', () => {
+    console.log('Client disconnected');
+    clients.delete(ws);
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+    clients.delete(ws); // Remove client on error
+  });
+
+  // Send a welcome message (optional)
+  ws.send('WebSocket connection established. Waiting for script output...');
+});
+
+// Function to broadcast messages to all connected clients
+function broadcast(message) {
+  // Prepend a timestamp for clarity
+  const timestamp = new Date().toISOString();
+  const formattedMessage = `[${timestamp}] ${message}`;
+  // console.log(`Broadcasting: ${formattedMessage}`); // Optional: Log broadcasts
+  clients.forEach((client) => {
+    if (client.readyState === client.OPEN) { // Use client.OPEN constant
+      client.send(formattedMessage);
+    }
+  });
+}
+// --- End WebSocket Setup ---
+
 // Middleware
 // Configure CORS to allow requests specifically from the frontend origin
 const corsOptions = {
@@ -41,6 +89,91 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
+
+// Dynamic route to fetch bibliography JSON by basename
+app.get('/api/bibliographies/:baseName/data', (req, res) => {
+  const base = req.params.baseName;
+  function findFile(dir) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const ent of entries) {
+      if (ent.isFile() && ent.name === `${base}_bibliography.json`) {
+        return path.join(dir, ent.name);
+      }
+      if (ent.isDirectory()) {
+        const f = findFile(path.join(dir, ent.name));
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+  const filePath = findFile(BIB_OUTPUT_DIR);
+  if (!filePath) {
+    return res.status(404).json({ error: 'Bibliography not found yet' });
+  }
+  res.sendFile(filePath);
+});
+
+app.use('/api/bibliographies', express.static(BIB_OUTPUT_DIR));
+
+// GET combined bibliography entries for a given baseName
+app.get('/api/bibliographies/:baseName/all', (req, res) => {
+  const base = req.params.baseName;
+  const combined = [];
+  function walk(dir) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const ent of entries) {
+      const abs = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        walk(abs);
+      } else if (ent.isFile() && ent.name.startsWith(base) && ent.name.endsWith('_bibliography.json')) {
+        try {
+          const json = JSON.parse(fs.readFileSync(abs, 'utf8'));
+          if (Array.isArray(json)) combined.push(...json);
+        } catch (e) {
+          console.error(`Error reading/parsing ${abs}:`, e);
+        }
+      }
+    }
+  }
+  walk(BIB_OUTPUT_DIR);
+  res.json(combined);
+});
+
+// --- NEW: GET ALL current bibliography entries --- 
+app.get('/api/bibliographies/all-current', (req, res) => {
+  console.log('[/api/bibliographies/all-current] Received request for file list.');
+  const fileList = [];
+  function walk(dir, relativePath = '') {
+    try {
+      // Check if directory exists before reading
+      if (!fs.existsSync(dir)) {
+        console.warn(`[/api/bibliographies/all-current] Directory not found, skipping: ${dir}`);
+        return;
+      }
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const ent of entries) {
+        const abs = path.join(dir, ent.name);
+        const rel = path.join(relativePath, ent.name);
+        if (ent.isDirectory()) {
+          walk(abs, rel);
+        } else if (ent.isFile() && ent.name.endsWith('_bibliography.json')) {
+            console.log(`[/api/bibliographies/all-current] Found file: ${rel}`);
+            fileList.push(rel); // Add relative path to the list
+        }
+      }
+    } catch (readDirErr) {
+      console.error(`[/api/bibliographies/all-current] Error reading directory ${dir}:`, readDirErr);
+    }
+  }
+
+  // Start walking from the base bibliography output directory
+  walk(BIB_OUTPUT_DIR);
+
+  console.log(`[/api/bibliographies/all-current] Returning ${fileList.length} bibliography filenames.`);
+  // Set content type and send JSON response
+  res.setHeader('Content-Type', 'application/json');
+  res.status(200).json(fileList); // Return the list of filenames
+});
 
 // Configure multer for file upload
 const storage = multer.diskStorage({
@@ -130,59 +263,89 @@ app.post('/api/extract-bibliography/:filename', (req, res) => {
     console.log(`[/api/extract-bibliography] Created temp directory: ${tempPagesDir}`);
 
     // 3. Run get_bib_pages.py in background
-    console.log(`[/api/extract-bibliography] Starting ${GET_BIB_PAGES_SCRIPT}...`);
     const getPagesArgs = [
       '--input-pdf', inputPdfPath,
-      '--output-dir', tempPagesDir
+      '--output-dir', BIB_OUTPUT_DIR // Keep this, it seems to place output in BIB_OUTPUT_DIR/baseName/
     ];
-    
-    execFile('python3', [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], (error, stdout, stderr) => {
-      console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} stdout:
-${stdout}`);
-      if (stderr) {
-        console.warn(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} stderr:
-${stderr}`);
-      }
-      
-      if (error) {
-        console.error(`[/api/extract-bibliography] Error executing ${GET_BIB_PAGES_SCRIPT}:`, error);
-        // Clean up temp dir on error if needed?
-        // fs.rm(...) 
-        return; // Stop processing if first script failed
+
+    console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
+    const getPagesProcess = spawn('python', [GET_BIB_PAGES_SCRIPT, ...getPagesArgs]);
+
+    getPagesProcess.stdout.on('data', (data) => {
+      const message = data.toString();
+      console.log(`[get_bib_pages stdout]: ${message}`);
+      broadcast(`[get_bib_pages] ${message}`);
+    });
+
+    getPagesProcess.stderr.on('data', (data) => {
+      const message = data.toString();
+      console.error(`[get_bib_pages stderr]: ${message}`);
+      broadcast(`[get_bib_pages ERROR] ${message}`);
+    });
+
+    getPagesProcess.on('close', (code) => {
+      console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
+      if (code !== 0) {
+        const errorMessage = `[/api/extract-bibliography] Error during bibliography page extraction (get_bib_pages.py exited with code ${code}).`;
+        broadcast(errorMessage);
+        console.error(errorMessage);
+        // Clean up temporary directory on error
+        fs.rm(tempPagesDir, { recursive: true, force: true }, (rmErr) => {
+          if (rmErr) console.error(`[/api/extract-bibliography] Error cleaning up temp dir ${tempPagesDir}:`, rmErr);
+        });
+        // Send error response only if headers not already sent
+        if (!res.headersSent) {
+          return res.status(500).json({ error: 'Error during bibliography page extraction.', scriptCode: code });
+        }
+        return; // Stop further processing
       }
 
-      console.log(`[/api/extract-bibliography] Finished ${GET_BIB_PAGES_SCRIPT}.`);
+      // **Proceed to Step 2: Call API Scraper only if Step 1 succeeded**
+      const baseName = path.basename(filename, path.extname(filename)); // Extract base name from original filename
+      // Construct the expected JSON path based on the *output* structure of get_bib_pages
+      // It should be in BIB_OUTPUT_DIR/<baseName>/<baseName>_bibliography_pages.json
+      const jsonSubDir = path.join(BIB_OUTPUT_DIR, baseName); // Subdirectory named after the base PDF name
+      const jsonInputPath = path.join(jsonSubDir, `${baseName}_bibliography_pages.json`);
 
-      // 4. Run APIscraper.py in background (only if first script succeeded)
-      console.log(`[/api/extract-bibliography] Starting ${API_SCRAPER_SCRIPT}...`);
+      console.log(`[/api/extract-bibliography] Looking for input JSON for API scraper: ${jsonInputPath}`);
+
+      // Check if the expected JSON file exists
+      if (!fs.existsSync(jsonInputPath)) {
+        const errorMessage = `[/api/extract-bibliography] Input JSON for API scraper not found: ${jsonInputPath}`;
+        console.error(errorMessage);
+        broadcast(errorMessage); // Broadcast error
+        // Clean up temporary directory as processing cannot continue
+        fs.rm(tempPagesDir, { recursive: true, force: true }, (rmErr) => {
+          if (rmErr) console.error(`[/api/extract-bibliography] Error cleaning up temp dir ${tempPagesDir}:`, rmErr);
+        });
+        if (!res.headersSent) {
+          return res.status(500).json({ error: 'Intermediate JSON file not found after page extraction.' });
+        }
+        return;
+      }
+
+      console.log(`[/api/extract-bibliography] Spawning: python ${API_SCRAPER_SCRIPT} ...`);
+      // Correct arguments based on APIscraper_v2.py's argparse
       const scrapeApiArgs = [
-        '--input-dir', tempPagesDir,
-        '--output-dir', BIB_OUTPUT_DIR
+        '--input-dir', jsonSubDir,       // Directory containing the JSON from get_bib_pages.py
+        '--base-output-dir', BIB_OUTPUT_DIR // The main output directory
       ];
-      
-      const pythonProcess = spawn('python3', [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
+      const apiScraperProcess = spawn('python', [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
 
-      // Log stdout data as it comes in
-      pythonProcess.stdout.on('data', (data) => {
-        console.log(`[/api/extract-bibliography] ${API_SCRAPER_SCRIPT} stdout:
-${data}`);
+      // Stream output via WebSocket (Already correctly implemented in previous step)
+      apiScraperProcess.stdout.on('data', (data) => {
+        const message = data.toString();
+        console.log(`[APIscraper stdout]: ${message}`);
+        broadcast(`[APIscraper] ${message}`); // Broadcast stdout
       });
 
-      // Log stderr data as it comes in
-      pythonProcess.stderr.on('data', (data) => {
-        console.error(`[/api/extract-bibliography] ${API_SCRAPER_SCRIPT} stderr:
-${data}`);
+      apiScraperProcess.stderr.on('data', (data) => {
+        const message = data.toString();
+        console.error(`[APIscraper stderr]: ${message}`);
+        broadcast(`[APIscraper ERROR] ${message}`); // Broadcast stderr
       });
 
-      // Log any spawn errors (e.g., python3 not found)
-      pythonProcess.on('error', (error) => {
-        console.error(`[/api/extract-bibliography] Failed to start ${API_SCRAPER_SCRIPT}:`, error);
-        // Stop processing
-        return; 
-      });
-
-      // Log when the script finishes
-      pythonProcess.on('close', (code) => {
+      apiScraperProcess.on('close', (code) => {
         if (code !== 0) {
           console.error(`[/api/extract-bibliography] ${API_SCRAPER_SCRIPT} exited with code ${code}`);
           // Stop processing
@@ -216,7 +379,59 @@ ${data}`);
 });
 // --- END NEW ENDPOINT ---
 
-// Start the server
-app.listen(port, () => {
-  console.log(`Backend server running on port ${port}`);
+// --- NEW: POST endpoint to trigger consolidation --- 
+app.post('/api/bibliographies/consolidate', (req, res) => {
+  console.log('[/api/bibliographies/consolidate] Received request.');
+
+  const pythonScriptPath = path.join(__dirname, '..', 'dl_lit', 'consolidate_bibs.py');
+  const inputDir = BIB_OUTPUT_DIR; 
+  const outputFile = path.join(inputDir, 'master_bibliography.json');
+
+  console.log(`[/api/bibliographies/consolidate] Attempting to execute python3 with script: ${pythonScriptPath}`);
+
+  // Execute python3 - PATH in Dockerfile ensures /opt/venv/bin/python3 is used
+  const pythonProcess = spawn('python3', [
+    pythonScriptPath,
+    inputDir,
+    outputFile
+  ], { stdio: 'pipe' });
+
+  let stdoutData = '';
+  let stderrData = '';
+
+  pythonProcess.stdout.on('data', (data) => {
+    stdoutData += data.toString();
+    console.log(`[/api/bibliographies/consolidate] Script stdout: ${data}`);
+    broadcast(`[/api/bibliographies/consolidate] ${data}`); // Broadcast stdout
+  });
+
+  pythonProcess.stderr.on('data', (data) => {
+    stderrData += data.toString();
+    console.error(`[/api/bibliographies/consolidate] Script stderr: ${data}`);
+    broadcast(`[/api/bibliographies/consolidate ERROR] ${data}`); // Broadcast stderr
+  });
+
+  pythonProcess.on('close', (code) => {
+    console.log(`[/api/bibliographies/consolidate] Script exited with code ${code}`);
+    if (code === 0) {
+      res.status(200).json({ message: 'Consolidation successful.', output: stdoutData });
+    } else {
+      res.status(500).json({ 
+          message: 'Consolidation failed.', 
+          error: stderrData || 'Unknown error from script.', 
+          stdout: stdoutData 
+      });
+    }
+  });
+
+  pythonProcess.on('error', (err) => {
+    console.error('[/api/bibliographies/consolidate] Failed to start subprocess.', err);
+    res.status(500).json({ message: 'Failed to start consolidation process.', error: err.message });
+  });
 });
+
+// --- REMOVED: app.listen is now handled by the server variable for WebSocket ---
+// app.listen(port, () => {
+//   console.log(`Server listening on port ${port}`);
+// });
+// --- END REMOVED ---
