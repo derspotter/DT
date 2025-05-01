@@ -457,7 +457,7 @@ class OpenAlexCrossrefSearcher:
                 print(f"Error in step {step}: {e}")
                 return {"step": step, "results": [], "success": False, "error": str(e)}
            
-def process_bibliography_files():
+def process_bibliography_files(fetch_citations=True): # Add fetch_citations parameter
     searcher = OpenAlexCrossrefSearcher()
     bib_dir = Path('dl_lit/bibliographies') 
     output_dir = Path('new_search_results')
@@ -578,15 +578,19 @@ def process_bibliography_files():
                     cited_by_url = result.get('cited_by_api_url')
                     ref['cited_by_api_url'] = cited_by_url # Keep the URL for reference if needed later
 
-                    if cited_by_url:
+                    # Fetch citing works only if fetch_citations is True
+                    if fetch_citations and cited_by_url:
                         print(f"Extracted cited_by_api_url: {cited_by_url}")
                         # Fetch citing work IDs using the new function
                         ref['cited_by_work_ids'] = fetch_citing_work_ids(cited_by_url, searcher.rate_limiter, mailto="spott@wzb.eu")
                         print(f"Added {len(ref.get('cited_by_work_ids', []))} citing work IDs.")
                     else:
-                        ref['cited_by_api_url'] = None
+                        ref['cited_by_api_url'] = None # Set to None if not fetching or no URL
                         ref['cited_by_work_ids'] = []
-                        print("No cited_by_api_url found in OpenAlex result, no citing work IDs fetched.")
+                        if fetch_citations and not cited_by_url:
+                             print("No cited_by_api_url found in OpenAlex result, no citing work IDs fetched.")
+                        elif not fetch_citations:
+                             print("Fetching citing works is disabled.")
 
                     # Extract and convert abstract
                     abstract_inverted_index = result.get('abstract_inverted_index')
@@ -635,4 +639,5 @@ def process_bibliography_files():
         print(f"\nSaved search results to {output_file}")
 
 if __name__ == "__main__":
-    process_bibliography_files()
+    # Example: To disable fetching citations, call: process_bibliography_files(fetch_citations=False)
+    process_bibliography_files() # Default is True
