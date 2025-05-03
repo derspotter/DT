@@ -26,3 +26,6 @@ dl_lit/temp_bib_pages/
 venv/
 done/
 dl_lit/done/
+processed_references.db
+processed_references.db.old
+
