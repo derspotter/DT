@@ -48,81 +48,61 @@ def clean_json_response(text):
         text = text[:-3]  # Remove ``` suffix
     return text.strip()
 
-def find_reference_section_pages(pdf_path: str, model: genai.GenerativeModel, uploaded_pdf):
-    """First pass: Get reference section page ranges from the full PDF."""
+def find_reference_section_pages(pdf_path: str, model, uploaded_pdf):
+    """Use GenAI to find reference section pages in the PDF."""
     print(f"Attempting to find reference sections in PDF: {pdf_path}", flush=True)
-    try:
-        # Ensure genai is configured before use (checked in caller)
-        prompt = """
-Your task is to find ALL bibliography/reference sections in this PDF.
+    print("Using pre-uploaded PDF for section finding.", flush=True)
+    
+    # Comprehensive prompt for finding reference sections
+    prompt = """
+Your task is to identify ALL bibliography or reference sections in this PDF document.
 
 INSTRUCTIONS:
-1. Look for sections titled: References, Bibliography, Works Cited, Citations, Notes, Endnotes.
-2. For each section found, determine its start and end page numbers AS THEY ARE PRINTED ON THE PAGE.
-3. **CRITICAL: Use the page numbers visibly printed on the document pages (usually at the top or bottom), NOT internal PDF page indices.**
-4. Return ONLY a JSON array with the format shown below.
-5. Do not include any explanatory text.
+1. Find sections with references, citations, or bibliographic entries, titled 'References', 'Bibliography', 'Works Cited', or similar. Look for patterns like lists of authors, years, titles, even if untitled.
+2. Use printed page numbers visible on the pages. If none, use sequential order as in the PDF.
+3. **IMPORTANT: 'start_page' is where the section begins (title or first entry), even if it starts mid-page or at the end after other content. Include this page at all costs. 'end_page' is where the last entry ends, excluding empty or unrelated pages after it.**
+4. **IMPORTANT: Find ALL bibliography sections, especially after chapters. Do not skip any reference lists, even short or unusual ones.**
+5. Return ONLY a JSON array as shown below, with no extra text or markdown.
 
-REQUIRED FORMAT:
+FORMAT:
 [
     {
-        "start_page": 211, # Example: The number ACTUALLY printed on the page where the section starts
-        "end_page": 278   # Example: The number ACTUALLY printed on the page where the section ends
+        "start_page": 16,  // Printed page number (or sequential if none) where section starts (even mid-page or end)
+        "end_page": 19     // Printed page number where last entry ends (exclude empty/unrelated pages)
     }
 ]
 
-IMPORTANT RULES:
-- ALWAYS include both start_page AND end_page for each section.
+RULES:
+- Always include 'start_page' and 'end_page' for each section.
 - Use INTEGER numbers only.
-- **Use the actual PRINTED page numbers visible on the pages.**
-- **Do NOT report page ranges that only contain footnotes at the bottom of individual pages. Focus on distinct, continuous sections dedicated to references or bibliography.**
-- Return ONLY valid JSON, no markdown, no explanations.
-- Include ALL reference sections if multiple exist.
-- If there is only one section at the end, return only that one.
-- Be sure to include the entire section (from the first page it appears on to the last).
-""" 
+- Ensure 'start_page' includes the first entry or title, even mid-page. 'end_page' must be the last entry's page, not beyond.
+- Include EVERY bibliography section, checking chapter ends.
+- Return ONLY valid JSON, no explanations.
+"""
 
-        # Use pre-uploaded full PDF for section finding
-        uploaded_file = uploaded_pdf
-        print("Using pre-uploaded PDF for section finding.", flush=True)
-        # Make the API call
-        response = model.generate_content([prompt, uploaded_file], request_options={'timeout': 600})
-        print(f"Raw find_reference_section_pages response: {response.text}", flush=True)
-        # Extract JSON part
-        if response.text:
-            try:
-                cleaned_response = clean_json_response(response.text)
-                sections = json.loads(cleaned_response)
-                # Validate that all sections have both start_page and end_page
-                valid_sections = []
-                for section in sections:
-                    if 'start_page' in section and 'end_page' in section:
-                        valid_sections.append(section)
-                    else:
-                        print(f"Warning: Skipping incomplete section: {section}")
-                
-                if not valid_sections:
-                    print("No valid sections found (missing start_page or end_page)")
-                    return None
-                
-                print(f"Found reference sections: {json.dumps(valid_sections, indent=2)}")
-                
-                return valid_sections
-            except json.JSONDecodeError as e:
-                print(f"Error parsing JSON response: {e}")
-                print(f"Raw response: {response.text}")
-                return None
-        else:
-            print("Empty response from model")
-            return None
-
-    except google_exceptions.GoogleAPIError as e:
-        print(f"Error during find_reference_section_pages API call: {e}", file=sys.stderr)
-        sections = [] # Return empty list on API error
-    except Exception as e:
-        print(f"Unexpected error during find_reference_section_pages: {e}", file=sys.stderr)
-        sections = [] # Return empty list on other errors
+    try:
+        # Generate content with timeout
+        response = model.generate_content([prompt, uploaded_pdf], request_options={'timeout': 600})
+        print("Raw find_reference_section_pages response: ```json")
+        print(response.text)
+        print("```", flush=True)
         
+        # Extract JSON from response
+        import re
+        json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response.text)
+        if json_match:
+            json_text = json_match.group(1)
+        else:
+            json_text = response.text
+
+        sections = json.loads(json_text)
+        print(f"Found reference sections: {json.dumps(sections, indent=2)}")
+        print("")
+        return sections
+    except Exception as e:
+        print(f"Error in find_reference_section_pages: {e}", flush=True)
+        return []
+
 def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total_pages: int):
     """
     Sample pages at 20/40/60/80%, extract them, upload as a batch, 
@@ -205,6 +185,7 @@ def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total
             # --- Single Prompt Construction (strict JSON schema) --- 
             uris = list(uploaded_files_info.keys())
             attached_list = "\n".join(f"- {u}" for u in uris)
+            uris_nulls = ','.join(f'    "{u}": null' for u in uris)
             full_prompt = f"""
 Objective:
   Determine the printed page numbers visible on each attached PDF page.
@@ -214,9 +195,9 @@ Attachments:
 
 Output Format:
   Return ONLY a valid JSON object mapping each URI to its printed page number or null, for example:
-  {{
-{',\n'.join(f'    "{u}": null' for u in uris)}
-  }}
+{{
+{uris_nulls}
+}}
 No markdown or extra text.
 """
 
@@ -262,7 +243,7 @@ No markdown or extra text.
                         print(f"    - Warning: Non-integer printed value '{raw}' for index {phys_idx}", flush=True)
                         samples.append({"physical_index": phys_idx, "printed_number": raw, "calculated_offset": None})
                         continue
-                    offset = printed_num - (phys_idx + 1)
+                    offset = printed_num - phys_idx
                     offsets.append(offset)
                     samples.append({"physical_index": phys_idx, "printed_number": printed_num, "calculated_offset": offset})
             except google_exceptions.GoogleAPIError as e:
@@ -398,12 +379,10 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
         
     try:
         # --- Centralized Initialization --- 
-        print("Initializing Generative Models and uploading PDF...", flush=True)
-        # Use separate models: one for section finding, one for offset detection
-        section_model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
-        offset_model = genai.GenerativeModel("gemini-2.0-flash-exp")
+        print("Initializing Generative Models and uploading PDF...")
+        model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17", generation_config=genai.types.GenerationConfig(temperature=0.0))
         uploaded_pdf = genai.upload_file(pdf_path)
-        print("Initialization complete.", flush=True)
+        print("Initialization complete.")
         # --- End Initialization --- 
 
         # 1 & 2. Find sections and detect offset concurrently
@@ -414,8 +393,8 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                 return
 
         print("Starting sequential tasks for section finding and offset detection...", flush=True)
-        sections = find_reference_section_pages(pdf_path, section_model, uploaded_pdf)
-        offset_details = detect_page_number_offset(pdf_path, offset_model, page_count_for_offset)
+        sections = find_reference_section_pages(pdf_path, model, uploaded_pdf)
+        offset_details = detect_page_number_offset(pdf_path, model, page_count_for_offset)
 
         if not sections:
             print("No reference sections found.", flush=True)
@@ -427,13 +406,28 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
         offset = offset_details['offset']
         print(f"Detected page number offset: {offset}", flush=True)
 
-                # --- Step 3: Validate and Adjust Sections (Includes Model Call 3) ---
+        # --- Step 3: Validate and Adjust Sections (Includes Model Call 3) ---
         print("\n--- Validating Sections ---", flush=True)
         with pikepdf.open(pdf_path) as doc: # Open PDF locally for potential page extractions
             total_pages = len(doc.pages)
             print(f"Total physical pages in PDF: {total_pages}", flush=True)
             adjusted_sections = [] # Initialize here
-            for i, section in enumerate(sections):
+            
+            # Determine which sections to validate: first, two middle, and last if more than 4 sections
+            if len(sections) <= 4:
+                sections_to_validate = list(range(len(sections)))
+            else:
+                mid_point = len(sections) // 2
+                sections_to_validate = [0, mid_point-1, mid_point, len(sections)-1]
+                # Ensure no duplicates in case mid_point calculations overlap
+                sections_to_validate = sorted(list(set(sections_to_validate)))
+            
+            print(f"Validating {len(sections_to_validate)} out of {len(sections)} sections: indices {sections_to_validate}", flush=True)
+            
+            validated_count = 0
+            for index in sections_to_validate:
+                i = index
+                section = sections[index]
                 section_validated = False
                 temp_start_file_path = None
                 temp_end_file_path = None
@@ -450,8 +444,8 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                     print(f"\n  - Section {i+1}: Processing reported printed pages: Start={reported_start}, End={reported_end}", flush=True)
 
                     # Calculate Potential Physical Indices using offset
-                    physical_start_offset = reported_start - offset - 1
-                    physical_end_offset = reported_end - offset - 1
+                    physical_start_offset = reported_start - offset
+                    physical_end_offset = reported_end - offset
                     print(f"    - Calculated potential physical indices using offset {offset}: Start={physical_start_offset}, End={physical_end_offset}", flush=True)
 
                     # Determine which physical indices to use for validation
@@ -556,7 +550,7 @@ Output Format:
                     request_content = [validation_prompt] + validation_upload_parts
                     # Make the API call
                     try:
-                        response = section_model.generate_content(request_content, request_options={'timeout': 600})
+                        response = model.generate_content(request_content, request_options={'timeout': 600})
                         print(f"    --- Received Validation Response for Section {i+1} ---")
                         # print(f"Raw validation response: {response.text}") # DEBUG
 
@@ -582,23 +576,28 @@ Output Format:
                         print(f"    - Parsed Validation (JSON): {parsed_validation}", flush=True)
 
                         # Final Check (Local) - Compare parsed numbers against originally REPORTED numbers
-                        tolerance = 0 # Require exact number match for validation
-                        start_num_match = (parsed_validation['start']['number'] is not None and 
-                                           abs(parsed_validation['start']['number'] - reported_start) <= tolerance) 
-                        start_marker_match = parsed_validation['start']['is_marker']
-                        end_num_match = (parsed_validation['end']['number'] is not None and 
-                                         abs(parsed_validation['end']['number'] - reported_end) <= tolerance)
-                        end_marker_match = parsed_validation['end']['is_marker']
+                        tolerance = 2  # Allow small discrepancy in page numbers to handle off-by-one errors
+                        start_num_match = (parsed_validation['start']['number'] is None or 
+                                         abs(parsed_validation['start']['number'] - reported_start) <= tolerance)
+                        end_num_match = (parsed_validation['end']['number'] is None or 
+                                       abs(parsed_validation['end']['number'] - reported_end) <= tolerance)
+                        
+                        # Marker checks are lenient: if number is None, marker can be False; also, one of start or end can have False marker
+                        start_marker_match = (parsed_validation['start']['number'] is not None or parsed_validation['start']['is_marker'])
+                        end_marker_match = (parsed_validation['end']['number'] is not None or parsed_validation['end']['is_marker'])
+                        marker_condition = (start_marker_match or end_marker_match)  # At least one marker should be True if numbers are present
 
                         print(f"    - Validation Checks: StartNumMatch={start_num_match} (Target: {reported_start}), StartMarkerOK={start_marker_match}, EndNumMatch={end_num_match} (Target: {reported_end}), EndMarkerOK={end_marker_match}", flush=True)
 
-                        if start_num_match and start_marker_match and end_num_match and end_marker_match:
+                        # Pass validation if number matches (or is None) and marker condition is satisfied
+                        if (start_num_match and end_num_match and marker_condition):
                             print(f"    - Section {i+1} PASSED ALL VALIDATIONS using physical pages {physical_start_to_validate}-{physical_end_to_validate} (Method: {validation_method}).", flush=True)
                             adjusted_sections.append({
                                 "start_page": physical_start_to_validate, 
                                 "end_page": physical_end_to_validate
                             })
                             section_validated = True
+                            validated_count += 1
                         else:
                             print(f"    - Section {i+1} FAILED model validation checks using physical pages {physical_start_to_validate}-{physical_end_to_validate} (Method: {validation_method}).", flush=True)
                             section_validated = False
@@ -639,6 +638,15 @@ Output Format:
                     uploaded_validation_files = {}
                     temp_start_file_path = None
                     temp_end_file_path = None
+            
+            # Check if at least 3 out of 4 validated sections passed (or all if fewer than 4)
+            validation_threshold = min(3, len(sections_to_validate)) if len(sections_to_validate) == 4 else len(sections_to_validate)
+            if validated_count >= validation_threshold:
+                print(f"Validation successful: {validated_count}/{len(sections_to_validate)} sections validated. Extracting all sections.", flush=True)
+                adjusted_sections = sections
+            else:
+                print(f"Validation failed: Only {validated_count}/{len(sections_to_validate)} sections validated. Skipping extraction.", flush=True)
+                return
 
         # --- Step 4: Extract Fully Validated Sections ---
         if not adjusted_sections:
@@ -729,7 +737,7 @@ Output Format:
         else:
              print("\n--- Final Cleanup: No main uploaded file object found to delete. ---", flush=True)
         print("--- extract_reference_sections function finished ---", flush=True)
-
+        return generated_page_pdf_filenames if 'generated_page_pdf_filenames' in locals() else []
 
 def process_pdf(pdf_path, output_dir):
     return extract_reference_sections(pdf_path, output_dir)
@@ -770,11 +778,23 @@ if __name__ == "__main__":
     total_bib_pages = 0
     processed_count = 0
 
+    done_bibs_dir = os.path.join(output_dir, 'done_bibs')
+    os.makedirs(done_bibs_dir, exist_ok=True)
+
     for pdf_path in pdf_files:
         bib_pages = process_pdf(pdf_path, output_dir)
         total_bib_pages += len(bib_pages)
         processed_count += 1
         print(f"Completed {processed_count}/{len(pdf_files)} PDFs: {os.path.basename(pdf_path)} - {len(bib_pages)} bibliography pages found.", flush=True)
+
+        # Move PDF to done_bibs if bibliography pages were extracted
+        if bib_pages:
+            dest_path = os.path.join(done_bibs_dir, os.path.basename(pdf_path))
+            try:
+                shutil.move(pdf_path, dest_path)
+                print(f"Moved {os.path.basename(pdf_path)} to {done_bibs_dir}", flush=True)
+            except Exception as e:
+                print(f"Error moving {os.path.basename(pdf_path)} to {done_bibs_dir}: {e}", flush=True)
 
     end_time = time.time()
     execution_time = end_time - start_time

@@ -24,4 +24,5 @@ dl_lit/temp_bib_pages/
 *.pdf
 *.log
 venv/
-
+done/
+dl_lit/done/

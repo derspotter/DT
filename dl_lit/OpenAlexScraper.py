@@ -5,6 +5,10 @@ import time
 from pathlib import Path
 from collections import deque
 from datetime import datetime, timedelta
+import argparse
+import concurrent.futures
+import threading
+import os
 
 try:
     from rapidfuzz import fuzz
@@ -12,31 +16,34 @@ except ImportError:
     raise ImportError("Module 'rapidfuzz' not found. Install with 'pip install rapidfuzz'")
 
 class RateLimiter:
-    def __init__(self, max_per_second=10):
+    def __init__(self, max_per_second):
         self.max_per_second = max_per_second
         self.request_times = deque()
+        self.lock = threading.Lock()
     
     def wait_if_needed(self):
         now = datetime.now()
         
-        # Remove timestamps older than 1 second
-        while self.request_times and (now - self.request_times[0]) > timedelta(seconds=1):
-            self.request_times.popleft()
-        
-        # If we've hit the limit, wait
-        if len(self.request_times) >= self.max_per_second:
-            wait_time = 1 - (now - self.request_times[0]).total_seconds()
-            if wait_time > 0:
-                time.sleep(wait_time)
-        
-        # Record this request
-        self.request_times.append(now)
+        with self.lock:
+            # Remove timestamps older than 1 second
+            while self.request_times and (now - self.request_times[0]) > timedelta(seconds=1):
+                self.request_times.popleft()
+            
+            # If we've hit the limit, wait
+            if len(self.request_times) >= self.max_per_second:
+                wait_time = 1 - (now - self.request_times[0]).total_seconds()
+                if wait_time > 0:
+                    time.sleep(wait_time)
+            
+            # Record this request
+            self.request_times.append(now)
 
 def clean_search_term(term):
     """Remove commas and clean up the search term."""
     if term is None:
         return None
     return term.replace(',', ' ')
+
 def convert_inverted_index_to_text(inverted_index):
     """Convert an abstract_inverted_index to readable text"""
     if not inverted_index:
@@ -54,6 +61,7 @@ def convert_inverted_index_to_text(inverted_index):
     # Join words
     text = " ".join(word for word, _ in word_positions)
     return text
+
 def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu"):
     """
     Fetches the OpenAlex IDs of works that cite the work at the given URL.
@@ -184,6 +192,7 @@ def match_author_name(ref_author, result_author):
         return 1.0
 
     return 0.0
+
 def find_best_author_match(ref_authors, result, ref_editors=None):
     """
     Match authors and editors against result authors.
@@ -241,12 +250,20 @@ def get_authors_and_editors(ref):
     return authors, editors
 
 class OpenAlexCrossrefSearcher:
-    def __init__(self, email="spott@wzb.eu"):
-        self.base_url = "https://api.openalex.org/works"
-        self.headers = {'User-Agent': f'mailto:{email}'}
-        self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords'
-        self.rate_limiter = RateLimiter(max_per_second=10)
-        self.crossref_headers = {'mailto': email}
+    def __init__(self, mailto='spott@wzb.eu'):
+        self.base_url = 'https://api.openalex.org/works'
+        self.headers = {
+            'Accept': 'application/json',
+            'User-Agent': f'OpenAlexScraper/{mailto}'
+        }
+        self.crossref_base_url = 'https://api.crossref.org/works'
+        self.crossref_headers = {
+            'Accept': 'application/json',
+            'User-Agent': f'OpenAlexScraper/1.0 (mailto:{mailto})'
+        }
+        self.rate_limiter = RateLimiter(max_per_second=5)  # Very conservative rate limit
+        self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
+        self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
 
     def search_crossref(self, title, authors, year):
         """Search Crossref for matching works."""
@@ -297,7 +314,7 @@ class OpenAlexCrossrefSearcher:
             print(f"Crossref error: {e}")
             return []
 
-    def search(self, title, year, container_title, abstract, keywords, step):
+    def search(self, title, year, container_title, abstract, keywords, step, rate_limiter):
         """
         Search OpenAlex and Crossref with different strategies based on step number.
         Steps 1-7: use OpenAlex filter queries
@@ -351,9 +368,10 @@ class OpenAlexCrossrefSearcher:
                     return {"step": step, "results": [], "success": False}
                     
                 url = f'https://api.crossref.org/works?query={"+".join(query)}&rows=10'
+                
                 print(f"Crossref Query: {url}")
                 
-                self.rate_limiter.wait_if_needed()
+                rate_limiter.wait_if_needed()
                 response = requests.get(url, headers=self.crossref_headers)
                 response.raise_for_status()
                 data = response.json()
@@ -436,7 +454,7 @@ class OpenAlexCrossrefSearcher:
                     print(f"Filter Query: {query}")
                 
                 # Apply rate limiting
-                self.rate_limiter.wait_if_needed()
+                rate_limiter.wait_if_needed()
                 
                 response = requests.get(self.base_url, headers=self.headers, params=params)
                 response.raise_for_status()
@@ -457,187 +475,234 @@ class OpenAlexCrossrefSearcher:
                 print(f"Error in step {step}: {e}")
                 return {"step": step, "results": [], "success": False, "error": str(e)}
            
-def process_bibliography_files(fetch_citations=True): # Add fetch_citations parameter
-    searcher = OpenAlexCrossrefSearcher()
-    bib_dir = Path('dl_lit/bibliographies') 
-    output_dir = Path('new_search_results')
-    output_dir.mkdir(exist_ok=True)
+def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
+    print(f"\n=== Processing {json_file} ===")
     
-    for json_file in bib_dir.glob('*_bibliography.json'):
-        print(f"\n=== Processing {json_file.name} ===")
-        
-        with open(json_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        references = data.get('references', data) if isinstance(data, dict) else data
-        
-        for ref in references:
-            title = ref.get('title')
-            year = ref.get('year')
-            if year:
-                try:
-                    year = int(year)
-                except (ValueError, TypeError):
-                    year = None
-            container_title = ref.get('journal') or ref.get('container_title')
-            abstract = ref.get('abstract') # Get abstract
-            keywords = ref.get('keywords') # Get keywords
-            
-            print(f"\n--- Searching for: {title} ---")
-            if year:
-                print(f"Year: {year}")
-            if container_title:
-                print(f"Container: {container_title}")
-            
-            # Use dictionary to store unique results by ID
-            all_results = {}
-            first_success_step = None
-            
-            # Try all steps 1-9 in order
-            print("\nTrying all search steps:")
-            for step in range(1, 10):
-                # Pass abstract and keywords to search
-                results = searcher.search(title, year, container_title, abstract, keywords, step)
-                
-                if results['success']:
-                    print(f"Step {step}: Found {len(results['results'])} results")
-                    if first_success_step is None:
-                        first_success_step = step
-                    
-                    # Add new results to our collection
-                    for result in results['results']:
-                        result_id = result.get('id')
-                        if result_id and result_id not in all_results:
-                            all_results[result_id] = {
-                                'result': result,
-                                'first_found_in_step': step
-                            }
-                else:
-                    print(f"Step {step}: No results")
-            
-            # Convert dictionary values back to list
-            unique_results = [item['result'] for item in all_results.values()]
-            print(f"\nTotal unique results collected: {len(unique_results)}")
-            
-            # Do author matching if we have results
-            if unique_results:
-                ref_authors = get_authors_from_ref(ref)
-                
-                # Match authors for unique results
-                matched_results = [
-                    {
-                        'result': result,
-                        'author_match_score': find_best_author_match(ref_authors, result),
-                        'first_found_in_step': all_results[result['id']]['first_found_in_step']
-                    }
-                    for result in unique_results
-                ]
-
-                # Sort by author match score and then by step number (earlier steps preferred)
-                matched_results.sort(key=lambda x: (-x['author_match_score'], x['first_found_in_step']))
-
-                # Accept the result if there's a good author match
-                accept_result = matched_results[0]['author_match_score'] > 0.0
-                
-                if accept_result:
-                    best_match = matched_results[0]
-                    result = best_match['result']
-                    
-                    print("\nBest match:")
-                    print(f"Title: {result.get('display_name')}")
-                    print(f"Authors: {', '.join(a['author'].get('display_name', '') for a in result.get('authorships', []))}")
-                    print(f"Year: {result.get('publication_year')}")
-                    print(f"Match score: {best_match['author_match_score']:.2f}")
-                    print(f"First found in step: {best_match['first_found_in_step']}")
-                    
-                    # Assign ref fields
-                    ref['match_found'] = True
-                    ref['doi'] = result.get('doi')
-                    # Handle OpenAlex vs Crossref results
-                    if best_match['first_found_in_step'] == 8:  # Crossref result
-                        ref['is_open_access'] = None
-                        ref['open_access_url'] = None
-                        ref['source'] = 'crossref'
-                        ref['referenced_works'] = None  # Crossref doesn't provide referenced works
-                    else:  # OpenAlex result
-                        ref['is_open_access'] = result.get('open_access', {}).get('is_oa', False)
-                        ref['open_access_url'] = result.get('open_access', {}).get('oa_url')
-                        ref['source'] = 'openalex'
-                        ref['referenced_works'] = result.get('referenced_works', [])
-                    
-                    ref['author_match_score'] = best_match['author_match_score']
-                    ref['openalex_id'] = result.get('id')
-                    ref['matched_title'] = result.get('display_name')
-                    ref['matched_authors'] = [
-                        a.get('author', {}).get('display_name') 
-                        for a in result.get('authorships', [])
-                    ]
-                    ref['match_step'] = best_match['first_found_in_step']
-
-                    # Extract cited_by_api_url
-                    cited_by_url = result.get('cited_by_api_url')
-                    ref['cited_by_api_url'] = cited_by_url # Keep the URL for reference if needed later
-
-                    # Fetch citing works only if fetch_citations is True
-                    if fetch_citations and cited_by_url:
-                        print(f"Extracted cited_by_api_url: {cited_by_url}")
-                        # Fetch citing work IDs using the new function
-                        ref['cited_by_work_ids'] = fetch_citing_work_ids(cited_by_url, searcher.rate_limiter, mailto="spott@wzb.eu")
-                        print(f"Added {len(ref.get('cited_by_work_ids', []))} citing work IDs.")
-                    else:
-                        ref['cited_by_api_url'] = None # Set to None if not fetching or no URL
-                        ref['cited_by_work_ids'] = []
-                        if fetch_citations and not cited_by_url:
-                             print("No cited_by_api_url found in OpenAlex result, no citing work IDs fetched.")
-                        elif not fetch_citations:
-                             print("Fetching citing works is disabled.")
-
-                    # Extract and convert abstract
-                    abstract_inverted_index = result.get('abstract_inverted_index')
-                    if abstract_inverted_index:
-                        ref['abstract'] = convert_inverted_index_to_text(abstract_inverted_index)
-                        print(f"Extracted abstract ({len(ref['abstract'])} characters)")
-                    else:
-                        ref['abstract'] = None
-                        print("No abstract found in OpenAlex result")
-
-                    # Extract keywords
-                    keywords = result.get('keywords')
-                    if keywords:
-                        # Keywords are returned as a list of dicts like [{'keyword': '...', 'score': ...}]
-                        # We want just a list of strings
-                        ref['keywords'] = [k.get('keyword') for k in keywords if k.get('keyword')]
-                        print(f"Extracted {len(ref['keywords'])} keywords")
-                    else:
-                        ref['keywords'] = []
-                        print("No keywords found in OpenAlex result")
-
-                else:
-                    # No acceptable matches
-                    print("\nNo acceptable matches found:")
-                    print(f"Best author match score: {matched_results[0]['author_match_score']:.2f}")
-                    if ref_authors:
-                        print("Reference authors:", ref_authors)
-                        print("Best match authors:", [
-                            a['author'].get('display_name', '')
-                            for a in matched_results[0]['result']['authorships']
-                        ])
-                    ref['match_found'] = False
-            
-            else:
-                # No results at all
-                print("\nNo results found in any step")
-                ref['match_found'] = False
-            
-            print("\n" + "="*50)
-        
-        # Save results
-        output_file = output_dir / f"search_results_{json_file.name}"
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    references = data.get('references', data) if isinstance(data, dict) else data
+    results_per_file = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:  # Process one reference at a time
+        future_to_ref = {executor.submit(process_single_reference, ref, searcher, RateLimiter(max_per_second=5)): ref for ref in references}
+        for future in concurrent.futures.as_completed(future_to_ref):
+            ref = future_to_ref[future]
+            try:
+                processed_ref = future.result()
+                if processed_ref:
+                    results_per_file.append(processed_ref)
+                print(f"[DEBUG] Completed processing for reference: {ref.get('title', 'Untitled')}")
+            except Exception as e:
+                print(f"[ERROR] Processing failed for {ref.get('title', 'Untitled')}: {e}")
+    
+    if results_per_file:
+        output_file = Path(output_dir) / f"{Path(json_file).stem}_openalex_results.json"
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
+            json.dump(results_per_file, f, indent=2)
         print(f"\nSaved search results to {output_file}")
 
-if __name__ == "__main__":
-    # Example: To disable fetching citations, call: process_bibliography_files(fetch_citations=False)
-    process_bibliography_files() # Default is True
+def process_single_reference(ref, searcher, rate_limiter):
+    title = ref.get('title')
+    year = ref.get('year')
+    if year:
+        try:
+            year = int(year)
+        except (ValueError, TypeError):
+            year = None
+    container_title = ref.get('journal') or ref.get('container_title')
+    abstract = ref.get('abstract')  # Get abstract
+    keywords = ref.get('keywords')  # Get keywords
+    
+    print(f"\n--- Searching for: {title} ---")
+    if year:
+        print(f"Year: {year}")
+    if container_title:
+        print(f"Container: {container_title}")
+    
+    # Use dictionary to store unique results by ID
+    all_results = {}
+    first_success_step = None
+    
+    # Try all steps 1-9 in order
+    print("\nTrying all search steps:")
+    for step in range(1, 10):
+        # Pass abstract and keywords to search
+        results = searcher.search(title, year, container_title, abstract, keywords, step, rate_limiter=rate_limiter)
+        
+        if results['success']:
+            print(f"Step {step}: Found {len(results['results'])} results")
+            if first_success_step is None:
+                first_success_step = step
+            
+            # Add new results to our collection
+            for result in results['results']:
+                result_id = result.get('id')
+                if result_id and result_id not in all_results:
+                    all_results[result_id] = result
+                    all_results[result_id]['first_found_in_step'] = step
+        else:
+            error_msg = results.get('error', 'Unknown error')
+            if error_msg == 'Unknown error' and results.get('meta', {}).get('count', 0) == 0:
+                print(f"Step {step}: No results found for this query")
+            else:
+                print(f"Step {step}: Failed - {error_msg}")
+                print(f"[DEBUG] Detailed error info for step {step}: {results}")
+    
+    # Assuming further processing of results continues here...
+    # Return processed results for this reference
+    unique_results = list(all_results.values())
+    
+    if unique_results:
+        ref_authors = get_authors_from_ref(ref)
+        
+        # Match authors for unique results
+        matched_results = [
+            {
+                'result': result,
+                'author_match_score': find_best_author_match(ref_authors, result),
+                'first_found_in_step': all_results[result['id']]['first_found_in_step']
+            }
+            for result in unique_results
+        ]
+
+        # Sort by author match score and then by step number (earlier steps preferred)
+        matched_results.sort(key=lambda x: (-x['author_match_score'], x['first_found_in_step']))
+
+        # Accept the result if there's a good author match
+        accept_result = matched_results[0]['author_match_score'] > 0.0
+        
+        if accept_result:
+            best_match = matched_results[0]
+            result = best_match['result']
+            
+            print("\nBest match:")
+            print(f"Title: {result.get('display_name')}")
+            print(f"Authors: {', '.join(a['author'].get('display_name', '') for a in result.get('authorships', []))}")
+            print(f"Year: {result.get('publication_year')}")
+            print(f"Match score: {best_match['author_match_score']:.2f}")
+            print(f"First found in step: {best_match['first_found_in_step']}")
+            print("[DEBUG] All keys in result dictionary:", list(result.keys()))
+            
+            # Extract cited_by_api_url
+            cited_by_url = result.get('cited_by_api_url')
+            if 'cited_by_api_url' not in result:
+                print("[DEBUG] cited_by_api_url not found in result. Checking for similar keys.")
+                for key in result.keys():
+                    if 'cited' in key.lower() or 'cite' in key.lower():
+                        print(f"[DEBUG] Found potential citation key: {key} = {result.get(key)}")
+            ref['cited_by_api_url'] = cited_by_url  # Keep the URL for reference if needed later
+
+            if cited_by_url:
+                print(f"Extracted cited_by_api_url: {cited_by_url}")
+                # Fetch citing work IDs using the new function
+                citing_work_ids = fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu")
+                print(f"Added {len(citing_work_ids)} citing work IDs.")
+                # Save citing work IDs if we fetched them
+                if citing_work_ids:
+                    ref['citing_work_ids'] = citing_work_ids
+            else:
+                ref['cited_by_api_url'] = None
+                ref['citing_work_ids'] = []
+                print("No cited_by_api_url found in OpenAlex result, no citing work IDs fetched.")
+
+            # Extract and convert abstract
+            abstract_inverted_index = result.get('abstract_inverted_index')
+            if abstract_inverted_index:
+                ref['abstract'] = convert_inverted_index_to_text(abstract_inverted_index)
+                print(f"Extracted abstract ({len(ref['abstract'])} characters)")
+            else:
+                ref['abstract'] = None
+                print("No abstract found in OpenAlex result")
+
+            # Extract keywords
+            keywords = result.get('keywords')
+            if keywords:
+                # Keywords are returned as a list of dicts like [{'keyword': '...', 'score': ...}]
+                # We want just a list of strings
+                ref['keywords'] = [k.get('keyword') for k in keywords if k.get('keyword')]
+                print(f"Extracted {len(ref['keywords'])} keywords")
+            else:
+                ref['keywords'] = []
+                print("No keywords found in OpenAlex result")
+
+        else:
+            # No acceptable matches
+            print("\nNo acceptable matches found:")
+            print(f"Best author match score: {matched_results[0]['author_match_score']:.2f}")
+            if ref_authors:
+                print("Reference authors:", ref_authors)
+                print("Best match authors:", [
+                    a['author'].get('display_name', '')
+                    for a in matched_results[0]['result']['authorships']
+                ])
+            ref['match_found'] = False
+        
+        return ref
+    else:
+        # No results at all
+        print("\nNo results found in any step")
+        ref['match_found'] = False
+        return ref
+
+def process_bibliography_files(bib_dir, output_dir, searcher, fetch_citations=True):
+    rate_limiter = RateLimiter(max_per_second=5)
+    bib_dir_path = Path(bib_dir)
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Output directory set to: {output_dir_path}")
+
+    json_files = list(bib_dir_path.glob('*.json'))
+    print(f"[INFO] Found {len(json_files)} JSON files in {bib_dir_path}")
+
+    def process_file(json_file):
+        print(f"\n=== Processing {json_file.name} ===")
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        references = data.get('references', data) if isinstance(data, dict) else data
+        print(f"[INFO] Loaded {len(references)} references from {json_file.name}")
+
+        results = []
+        for ref in references:
+            result = process_single_reference(ref, searcher, rate_limiter)
+            if result:
+                results.append(result)
+            print("\n" + "="*50)
+
+        output_file = output_dir_path / f"{json_file.stem}_openalex_results.json"
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        print(f"\nSaved search results to {output_file}")
+        return json_file.name
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(process_file, json_file) for json_file in json_files]
+        for future in concurrent.futures.as_completed(futures):
+            print(f"[INFO] Completed processing {future.result()}")
+
+    print(f"[SUCCESS] Processed all files in {bib_dir_path}")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Scrape OpenAlex for references and citations.')
+    parser.add_argument('--bib-dir', type=str, help='Directory containing bibliography JSON files')
+    parser.add_argument('--input-file', type=str, help='Single bibliography JSON file to process')
+    parser.add_argument('--output-dir', type=str, default='openalex_output', help='Directory to save OpenAlex results')
+    parser.add_argument('--fetch-citations', action='store_true', help='Fetch citation data for each reference')
+    args = parser.parse_args()
+    
+    if not args.bib_dir and not args.input_file:
+        parser.error("Either --bib-dir or --input-file must be specified")
+    if args.bib_dir and args.input_file:
+        parser.error("Only one of --bib-dir or --input-file can be specified")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"[INFO] Output directory set to: {args.output_dir}")
+    
+    searcher = OpenAlexCrossrefSearcher()
+    
+    if args.input_file:
+        process_single_file(args.input_file, args.output_dir, searcher, fetch_citations=args.fetch_citations)
+    else:
+        process_bibliography_files(args.bib_dir, args.output_dir, searcher, fetch_citations=args.fetch_citations)

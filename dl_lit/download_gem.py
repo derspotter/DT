@@ -4,12 +4,18 @@ import requests
 import os
 import threading
 import sqlite3  
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from pathlib import Path
 from collections import deque
 import fitz  
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import colorama
+colorama.init(autoreset=True) # Makes colors reset automatically
+GREEN = colorama.Fore.GREEN
+RED = colorama.Fore.RED
+YELLOW = colorama.Fore.YELLOW
+RESET = colorama.Style.RESET_ALL # Use colorama's reset
 
 import google.cloud.aiplatform as aiplatform
 from google import genai
@@ -26,9 +32,9 @@ from google.genai.types import (
 
 
 # ANSI escape codes for colors
-GREEN = "\033[92m"
-RED = "\033[91m"
-RESET = "\033[0m"  
+# GREEN = "\033[92m"
+# RED = "\033[91m"
+# RESET = "\033[0m"  
 
 class ServiceRateLimiter:
     def __init__(self, rps_limit=None, rpm_limit=None, tpm_limit=None, quota_window_minutes=60):
@@ -130,94 +136,57 @@ class ServiceRateLimiter:
         with self.lock:
             self.backoff_time = 1
             self.quota_exceeded = False
+            self.quota_reset_time = None
 
-def is_reference_downloaded(reference: dict, enhanced_results_dir: str, db_conn: sqlite3.Connection) -> bool:
-    """
-    Check if a reference has already been downloaded using database and file checks.
-    Returns True if the reference is a duplicate and has no referenced works to process.
-    """
-    
-    def normalize_string(s):
-        """Normalize string for comparison by removing spaces and converting to lowercase."""
-        if not s:
-            return ""
-        return "".join(s.lower().split())
-    
-    def references_match(ref1, ref2):
-        """Compare two references for matching based on key fields."""
-        # DOI is the most reliable identifier if available
-        if ref1.get('doi') and ref2.get('doi'):
-            return ref1['doi'] == ref2['doi']
-        
-        # Check title, authors, and year
-        title_match = normalize_string(ref1.get('title', '')) == normalize_string(ref2.get('title', ''))
-        year_match = ref1.get('year') == ref2.get('year')
-        
-        # Compare authors lists
-        authors1 = [normalize_string(a) for a in ref1.get('authors', [])]
-        authors2 = [normalize_string(a) for a in ref2.get('authors', [])]
-        authors_match = sorted(authors1) == sorted(authors2)
-        
-        return title_match and year_match and authors_match
-
-    # First, check the database for DOI or title+authors match in both tables
-    doi = reference.get('doi', '').strip().lower()
-    title = normalize_string(reference.get('title', ''))
-    authors = [normalize_string(a) for a in reference.get('authors', [])]
+def is_reference_downloaded(reference: dict, output_dir: Path, db_conn: sqlite3.Connection, check_input_table: bool = False) -> bool:
+    """Check if a reference exists in current_references, previous_references, or optionally input_references."""
+    doi = reference.get('doi', '').strip().lower() if reference.get('doi') else ''
+    ref_id = reference.get('id', '')
+    openalex_id_part = ref_id.split('/')[-1] if ref_id and 'openalex.org/' in ref_id else ref_id
+    title = ''.join(reference.get('title', '').lower().split()) if reference.get('title') else ''
+    authors = [''.join(a.lower().split()) for a in reference.get('authors', []) if a] if reference.get('authors') else []
     authors_str = ','.join(sorted(authors)) if authors else ''
     cursor = db_conn.cursor()
-    
-    # Check if reference has referenced_works to process
-    has_referenced_works = bool(reference.get('referenced_works', []))
-    
-    if doi:
-        cursor.execute("SELECT doi FROM previous_references WHERE doi = ?", (doi,))
-        if cursor.fetchone():
-            return not has_referenced_works  # Return False if has referenced works to process them
-        cursor.execute("SELECT doi FROM current_references WHERE doi = ?", (doi,))
-        if cursor.fetchone():
-            return not has_referenced_works
-    
-    if title and authors_str:
-        cursor.execute("SELECT title, authors FROM previous_references WHERE title = ? AND authors = ?", (title, authors_str))
-        if cursor.fetchone():
-            return not has_referenced_works
-        cursor.execute("SELECT title, authors FROM current_references WHERE title = ? AND authors = ?", (title, authors_str))
-        if cursor.fetchone():
-            return not has_referenced_works
+    tables_to_check = ['current_references', 'previous_references']
+    if check_input_table:
+        tables_to_check.append('input_references')
 
-    # If not found in database, fall back to checking JSON files
-    enhanced_results_dir = Path(enhanced_results_dir)
-    json_files = enhanced_results_dir.glob('**/*.json')
-    
-    for file_path in json_files:
+    for table in tables_to_check:
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Handle both array and object formats
-            references = data['references'] if isinstance(data, dict) else data
-            
-            for ref in references:
-                if 'downloaded_file' in ref and references_match(reference, ref):
-                    # Found a match in files, add to database to speed up future checks
-                    cursor.execute("INSERT OR IGNORE INTO previous_references (doi, title, year, authors, metadata) VALUES (?, ?, ?, ?, ?)",
-                                 (doi, title, reference.get('year', ''), authors_str, json.dumps(ref)))
-                    db_conn.commit()
-                    return not has_referenced_works
-                    
-        except Exception as e:
-            print(f"Error checking file {file_path}: {e}")
+            if doi:
+                cursor.execute(f"SELECT doi FROM {table} WHERE doi = ?", (doi,))
+                if cursor.fetchone():
+                    return True
+            if openalex_id_part:
+                # Query for 'id' field directly as it matches the JSON key
+                cursor.execute(f"SELECT id FROM {table} WHERE id = ?", (openalex_id_part,))
+                if cursor.fetchone():
+                    return True
+                # Fallback to extracting from metadata JSON if 'id' column doesn't exist or no match found
+                cursor.execute(f"SELECT metadata FROM {table}")
+                for row in cursor.fetchall():
+                    try:
+                        metadata = json.loads(row[0])
+                        metadata_id = metadata.get('id', '')
+                        if metadata_id and metadata_id.split('/')[-1] == openalex_id_part:
+                            return True
+                    except json.JSONDecodeError:
+                        continue
+            if title and authors_str:
+                cursor.execute(f"SELECT title, authors FROM {table} WHERE title = ? AND authors = ?", (title, authors_str))
+                if cursor.fetchone():
+                    return True
+        except sqlite3.OperationalError as e:
+            print(f"Database error checking table {table}: {e}")
             continue
-    
     return False
 
 def add_reference_to_database(reference: dict, db_conn: sqlite3.Connection, table: str = 'current_references'):
     """Add a processed reference to the specified database table."""
-    doi = reference.get('doi', '').strip().lower()
-    title = "".join(reference.get('title', '').lower().split())
+    doi = reference.get('doi', '').strip().lower() if reference.get('doi') else ''
+    title = ''.join(reference.get('title', '').lower().split()) if reference.get('title') else ''
     year = str(reference.get('year', ''))
-    authors = ["".join(a.lower().split()) for a in reference.get('authors', [])]
+    authors = [''.join(a.lower().split()) for a in reference.get('authors', []) if a] if reference.get('authors') else []
     authors_str = ','.join(sorted(authors)) if authors else ''
     metadata_json = json.dumps(reference)
     
@@ -228,9 +197,9 @@ def add_reference_to_database(reference: dict, db_conn: sqlite3.Connection, tabl
 
 def update_download_status(reference: dict, db_conn: sqlite3.Connection, table: str = 'current_references', downloaded: bool = True):
     """Update the downloaded status of a reference in the current_references table."""
-    doi = reference.get('doi', '').strip().lower()
-    title = "".join(reference.get('title', '').lower().split())
-    authors = ["".join(a.lower().split()) for a in reference.get('authors', [])]
+    doi = reference.get('doi', '').strip().lower() if reference.get('doi') else ''
+    title = ''.join(reference.get('title', '').lower().split()) if reference.get('title') else ''
+    authors = [''.join(a.lower().split()) for a in reference.get('authors', []) if a] if reference.get('authors') else []
     authors_str = ','.join(sorted(authors)) if authors else ''
     downloaded_val = 1 if downloaded else 0
     
@@ -257,15 +226,43 @@ def load_metadata_to_database(metadata_dir: str, db_conn: sqlite3.Connection, ta
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Handle both array and object formats
-            references = data['references'] if isinstance(data, dict) else data
-            
+            references = []
+            if isinstance(data, list):
+                references = data # Input is a list of references
+                print(f"  Loaded {len(references)} references from list in {file_path.name}")
+            elif isinstance(data, dict):
+                # First, try the 'references' key standard
+                references = data.get('references', [])
+                if references:
+                    print(f"  Loaded {len(references)} references from 'references' key in {file_path.name}")
+                else:
+                    # If 'references' key missing/empty, assume values are references
+                    references = list(data.values()) # Convert values view to list
+                    if references:
+                        print(f"  Loaded {len(references)} references from dictionary values in {file_path.name}")
+                    else:
+                       print(f"  Warning: Loaded dictionary from {file_path.name} but found no references in 'references' key or as values.")
+            else:
+                print(f"  Warning: Unexpected JSON format in {file_path.name}. Expected list or dict, got {type(data)}. Skipping file.")
+                # references remains []
+
+            # Reset counts for each file
+            file_added_count = 0
+            file_skipped_count = 0
+
             for ref in references:
+                # Ensure the item from values() is actually a dictionary (reference object)
+                if not isinstance(ref, dict):
+                    print(f"  Warning: Skipping non-dictionary item found in {file_path.name}: {type(ref)}")
+                    continue
+                
                 if 'downloaded_file' in ref:  # Only add if it was actually downloaded
                     # Check for duplicates in previous_references and current_references
-                    doi = ref.get('doi', '').strip().lower()
-                    title = "".join(ref.get('title', '').lower().split())
-                    authors = ["".join(a.lower().split()) for a in ref.get('authors', [])]
+                    doi = ref.get('doi', '').strip().lower() if ref.get('doi') else ''
+                    ref_id = ref.get('id', '')
+                    openalex_id_part = ref_id.split('/')[-1] if ref_id and 'openalex.org/' in ref_id else ref_id
+                    title = ''.join(ref.get('title', '').lower().split()) if ref.get('title') else ''
+                    authors = [''.join(a.lower().split()) for a in ref.get('authors', []) if a] if ref.get('authors') else []
                     authors_str = ','.join(sorted(authors)) if authors else ''
                     cursor = db_conn.cursor()
                     
@@ -291,10 +288,15 @@ def load_metadata_to_database(metadata_dir: str, db_conn: sqlite3.Connection, ta
                     
                     add_reference_to_database(ref, db_conn, table)
                     count += 1
+                    file_added_count += 1
+                else:
+                    # Optionally log skipped refs that weren't marked as downloaded
+                    # print(f"  Skipping reference from metadata without 'downloaded_file': {ref.get('title', 'Untitled')}")
+                    pass # Silently skip if not downloaded
             
-            print(f"Processed {file_path} - added {count} references, skipped {skipped_count} duplicates so far.")
-        except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            print(f"Processed {file_path} - added {file_added_count} new references, skipped {file_skipped_count} duplicates this file.")
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON from {file_path}: {e}")
             continue
     
     print(f"Finished loading metadata. Added {count} references to the {table} table, skipped {skipped_count} duplicates.")
@@ -319,9 +321,9 @@ def load_input_jsons(input_dir: str, db_conn: sqlite3.Connection, table: str = '
             
             for ref in references:
                 # Check if already in input_references to avoid duplicates from previous partial runs
-                doi = ref.get('doi', '').strip().lower()
-                title = "".join(ref.get('title', '').lower().split())
-                authors = ["".join(a.lower().split()) for a in ref.get('authors', [])]
+                doi = ref.get('doi', '').strip().lower() if ref.get('doi') else ''
+                title = ''.join(ref.get('title', '').lower().split()) if ref.get('title') else ''
+                authors = [''.join(a.lower().split()) for a in ref.get('authors', []) if a] if ref.get('authors') else []
                 authors_str = ','.join(sorted(authors)) if authors else ''
                 cursor = db_conn.cursor()
                 if doi:
@@ -346,9 +348,9 @@ def load_input_jsons(input_dir: str, db_conn: sqlite3.Connection, table: str = '
 
 def remove_reference_from_input(reference: dict, db_conn: sqlite3.Connection, table: str = 'input_references'):
     """Remove a processed reference from the input table."""
-    doi = reference.get('doi', '').strip().lower()
-    title = "".join(reference.get('title', '').lower().split())
-    authors = ["".join(a.lower().split()) for a in reference.get('authors', [])]
+    doi = reference.get('doi', '').strip().lower() if reference.get('doi') else ''
+    title = ''.join(reference.get('title', '').lower().split()) if reference.get('title') else ''
+    authors = [''.join(a.lower().split()) for a in reference.get('authors', []) if a] if reference.get('authors') else []
     authors_str = ','.join(sorted(authors)) if authors else ''
     
     cursor = db_conn.cursor()
@@ -359,13 +361,13 @@ def remove_reference_from_input(reference: dict, db_conn: sqlite3.Connection, ta
     db_conn.commit()
 
 class BibliographyEnhancer:
-    def __init__(self, email):
-        self.email = email
-        self.unpaywall_headers = {'email': email}
+    def __init__(self, db_file=None, email=None):
+        self.email = email if email else 'spott@wzb.eu'
+        self.unpaywall_headers = {'email': self.email}
         
-        # Initialize database connection
-        self.db_conn = sqlite3.connect('processed_references.db')
-        self._setup_database()
+        # Use threading.local() to store thread-specific database connections
+        self.local_storage = threading.local()
+        self.db_file = db_file if db_file else str(Path(__file__).parent / 'processed_references.db')
         
         # Service-specific rate limiters
         self.gemini_limiter = ServiceRateLimiter(
@@ -375,6 +377,15 @@ class BibliographyEnhancer:
         )
         self.openalex_limiter = ServiceRateLimiter(
             rps_limit=10  
+        )
+        self.unpaywall_limiter = ServiceRateLimiter(
+            rpm_limit=600
+        )
+        self.scihub_limiter = ServiceRateLimiter(
+            rpm_limit=10
+        )
+        self.libgen_limiter = ServiceRateLimiter(
+            rpm_limit=10
         )
 
         # PROJECT_ID = "your-project-id"
@@ -399,6 +410,16 @@ class BibliographyEnhancer:
         self.client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
         # Use Google Search for grounding
         self.google_search_tool = Tool(google_search=GoogleSearch())
+        self.proxies = None # Initialize proxies attribute
+        
+    @property
+    def db_conn(self):
+        # Get or create a database connection for the current thread
+        if not hasattr(self.local_storage, 'db_conn') or self.local_storage.db_conn is None:
+            self.local_storage.db_conn = sqlite3.connect(self.db_file, check_same_thread=False)
+            # Enable foreign key constraints for this connection
+            self.local_storage.db_conn.execute("PRAGMA foreign_keys = ON")
+        return self.local_storage.db_conn
 
     def _setup_database(self):
         """Setup the SQLite database with necessary tables for previous, current, and input references."""
@@ -559,14 +580,29 @@ class BibliographyEnhancer:
     def check_unpaywall(self, doi):
         if not doi:
             return None
-            
+        
+        # Clean the DOI if it starts with doi: prefix
+        if doi.lower().startswith('doi:'):
+            doi = doi[4:].strip()
+        
+        # Extract the DOI part if it's a URL
+        if doi.startswith(('http://', 'https://')):
+            parsed = urlparse(doi)
+            if 'doi.org' in parsed.netloc and parsed.path:
+                doi = parsed.path[1:] if parsed.path.startswith('/') else parsed.path
+            elif parsed.path.startswith('/10.'):
+                doi = parsed.path[1:]
+        
+        # Check if the DOI starts with 10.
+        if not doi.startswith('10.'):
+            print(f"Invalid DOI format for Unpaywall: {doi} - DOI must start with '10.'")
+            return None
+        
         url = f'https://api.unpaywall.org/v2/{doi}?email={self.email}'
         
         try:
-            response = requests.get(url)
-            if response.status_code == 422:
-                print(f"Invalid DOI format for Unpaywall: {doi}")
-                return None
+            self.unpaywall_limiter.wait_if_needed()
+            response = requests.get(url, headers=self.unpaywall_headers, timeout=10)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
@@ -579,6 +615,50 @@ class BibliographyEnhancer:
             print(f"JSON decode error for {doi}: {e}")
             return None
 
+    def try_download(self, url_info, ref, downloads_dir):
+        url = url_info['url']
+        print(f"Trying {url_info['source']}: {url}")
+        try:
+            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30, allow_redirects=True)
+            if response.status_code == 200:
+                content_type = response.headers.get('content-type', '').lower()
+                if 'application/pdf' in content_type:
+                    filename = self.save_pdf(response.content, ref, downloads_dir, url_info['source'])
+                    if filename:
+                        return {
+                            'success': True,
+                            'file': str(filename),
+                            'source': url_info['source'],
+                            'reason': url_info['reason']
+                        }
+                elif 'json' in content_type:
+                    try:
+                        data = response.json()
+                        # Handle JSON response if it contains PDF links or other useful information
+                        if 'pdf_url' in data:
+                            url_info['url'] = data['pdf_url']
+                            url_info['reason'] = f"{url_info['reason']} (via JSON response)"
+                            return self.try_download(url_info, ref, downloads_dir)
+                        return {'success': False, 'reason': 'JSON response did not contain PDF link'}
+                    except json.JSONDecodeError:
+                        print(f"JSON parse error for {url}: Response was not valid JSON")
+                        return {'success': False, 'reason': 'JSON parse error'}
+                else:
+                    # Check if the response is HTML and look for PDF links
+                    if 'html' in content_type or 'text' in content_type:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        pdf_links = [a['href'] for a in soup.find_all('a', href=True) if a['href'].endswith('.pdf')]
+                        if pdf_links:
+                            url_info['url'] = pdf_links[0]
+                            url_info['reason'] = f"{url_info['reason']} (PDF link found in HTML)"
+                            return self.try_download(url_info, ref, downloads_dir)
+                    return {'success': False, 'reason': f'Unsupported content type: {content_type}'}
+            else:
+                return {'success': False, 'reason': f'HTTP {response.status_code}'}
+        except requests.exceptions.RequestException as e:
+            return {'success': False, 'reason': f'Request error: {str(e)}'}
+        except Exception as e:
+            return {'success': False, 'reason': f'Unexpected error: {str(e)}'}
 
     def search_with_scihub(self, doi):
             """
@@ -599,70 +679,105 @@ class BibliographyEnhancer:
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
             }
 
+            query = doi or ref.get('title')
+            if not query:
+                return None
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            max_retries = 3
+
             for mirror in scihub_mirrors:
-                scihub_url = f"{mirror}/{doi}"
                 print(f"Searching Sci-Hub mirror: {mirror}")
+                attempt = 0
+                while attempt < max_retries:
+                    attempt += 1
+                    pdf_link = None # Initialize for this attempt
+                    try:
+                        # Rate limiting before request
+                        self.scihub_limiter.wait_if_needed() # Corrected call
+                        # wait_time = self.sci_hub_limiter.wait_for_token() # Incorrect call
+                        # if wait_time > 0:
+                        #    print(f"Rate limit approached, waiting {wait_time:.1f} seconds...")
+                        #    time.sleep(wait_time)
+                            
+                        sci_hub_query_url = mirror.strip('/') + '/' # Ensure single slash at end
+                        response = requests.post(sci_hub_query_url, data={'request': query}, headers=headers, timeout=60, proxies=self.proxies)
 
-                try:
-                    response = requests.get(scihub_url, headers=headers, timeout=30)
-                    if response.status_code == 404:
-                        print(f"DOI not found on {mirror}")
-                        continue
-                    response.raise_for_status()
+                        # --- Mirror Responded - Process and Decide --- 
+                        if response.status_code == 200:
+                            try:
+                                soup = BeautifulSoup(response.text, 'html.parser')
+                                button = soup.find('button', onclick=True)
+                                iframe = soup.find('iframe', {'id': 'pdf'})
+                                embed = soup.find('embed', {'type': 'application/pdf'})
+                                pdf_link = None # Initialize before extraction
 
-                    # Parse the HTML response to find the PDF link
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    pdf_link = None
-                    
-                    # Check embed tag first
-                    embed = soup.find('embed', {'type': 'application/pdf'})
-                    if embed and embed.get('src'):
-                        pdf_link = embed['src']
-                    
-                    # If no embed, check iframe
-                    if not pdf_link:
-                        iframe = soup.find('iframe', {'id': 'pdf'})
-                        if iframe and iframe.get('src'):
-                            pdf_link = iframe['src']
-                    
-                    # If still no link, check for download button
-                    if not pdf_link:
-                        save_button = soup.find('button', string='↓ save')
-                        if save_button:
-                            onclick = save_button.get('onclick', '')
-                            if "location.href='" in onclick:
-                                pdf_link = onclick.split("location.href='")[1].split("'")[0]
-                    
-                    # If we found any kind of link, process it
-                    if pdf_link:
-                        # Handle relative URLs
-                        if not pdf_link.startswith(('http://', 'https://')):
-                            if pdf_link.startswith('//'):
-                                pdf_link = f"https:{pdf_link}"
-                            elif pdf_link.startswith('/'):
-                                pdf_link = f"{mirror}{pdf_link}"
-                            else:
-                                pdf_link = f"{mirror}/{pdf_link}"
+                                if button and 'location.href=' in button['onclick']:
+                                    link_part = button['onclick'].split('location.href=')[1]
+                                    pdf_link = link_part.split('?')[0].strip("'/") # Basic extraction
+                                    if not pdf_link.startswith('http'):
+                                         pdf_link = urljoin(mirror, pdf_link) # Handle relative links like /downloads/...
+                                elif iframe and iframe.get('src'):
+                                    pdf_link = iframe['src']
+                                    if not pdf_link.startswith('http'):
+                                         pdf_link = urljoin(mirror, pdf_link)
+                                elif embed and embed.get('src'):
+                                    pdf_link = embed['src']
+                                    if not pdf_link.startswith('http'):
+                                        pdf_link = urljoin(mirror, pdf_link)
                                 
-                        print(f"Found PDF link: {pdf_link}")
-                        # Return immediately when we find a working mirror
-                        return {
-                            'url': pdf_link,
-                            'source': 'Sci-Hub',
-                            'reason': 'DOI resolved to PDF via Sci-Hub'
-                        }
+                                if pdf_link:
+                                    print(f"  Found PDF link via {mirror}")
+                                    return pdf_link # SUCCESS - STOP SEARCHING
+                                else:
+                                    print(f"  No PDF link found on {mirror} (HTML parsed, DOI might not be available)")
+                                    return None # MIRROR WORKED, NO LINK - STOP SEARCHING
+                                    
+                            except Exception as parse_err:
+                                print(f"  Error parsing HTML from {mirror}: {parse_err}")
+                                return None # MIRROR WORKED, PARSE FAILED - STOP SEARCHING
+
+                        elif response.status_code in [404, 403]:
+                            print(f"  DOI not found or forbidden on {mirror} ({response.status_code})")
+                            return None # MIRROR WORKED, KNOWN FAILURE - STOP SEARCHING
+                        
+                        elif 500 <= response.status_code < 600:
+                             print(f"  Server error {response.status_code} on {mirror}. Retrying (Attempt {attempt}/{max_retries})...")
+                             if attempt < max_retries:
+                                 time.sleep(attempt) # Simple backoff
+                                 continue # Retry on same mirror
+                             else:
+                                 print(f"  Max retries failed for server error on {mirror}.")
+                                 break # Break retry loop, try next mirror
+                        else:
+                             # Other unexpected client/server errors
+                             print(f"  Unexpected HTTP status {response.status_code} from {mirror}. Trying next mirror.")
+                             break # Break retry loop, try next mirror
+
+                    # --- Handle Request Exceptions (Reachability) --- 
+                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.TooManyRedirects) as reach_err:
+                        print(f"  Mirror {mirror} unreachable (Attempt {attempt}/{max_retries}): {reach_err}")
+                        if attempt < max_retries:
+                            time.sleep(attempt) # Wait before retry on same mirror
+                            continue # Go to next attempt in while loop
+                        else:
+                            print(f"  Max retries failed for reachability on {mirror}.")
+                            break # Max retries reached, break while loop to try next mirror
                     
-                    print(f"No PDF link found on {mirror}")
+                    # --- Handle Other Request/Unexpected Exceptions --- 
+                    except Exception as e: # Includes other RequestException
+                        print(f"  Error for {mirror} (Attempt {attempt}/{max_retries}): {e}. Trying next mirror.")
+                        break # Break retry loop, try next mirror
 
-                except requests.exceptions.ConnectionError:
-                    print(f"Cannot connect to {mirror}")
-                except requests.exceptions.Timeout:
-                    print(f"Timeout connecting to {mirror}")
-                except requests.exceptions.RequestException as e:
-                    print(f"Error accessing {mirror}: {e}")
+                # --- After While Loop for a specific mirror --- 
+                # If we finished the while loop (break or max_retries), it means this mirror failed definitively. 
+                # The outer 'for' loop will automatically continue to the next mirror.
+                print(f"  Failed to get link from {mirror}. Trying next mirror if available...")
 
-            # Only reaches here if all mirrors failed
-            print("No working Sci-Hub mirrors found")
+            # --- After For Loop (all mirrors tried and failed reachability) --- 
+            print("Sci-Hub: No PDF link found on any reachable mirror.")
             return None
        
     def search_with_libgen(self, ref):
@@ -684,105 +799,11 @@ class BibliographyEnhancer:
         print(f"Searching LibGen for: {title}")
 
         try:
+            self.libgen_limiter.wait_if_needed()
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
             }
             response = requests.get(libgen_url, headers=headers, timeout=30)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, 'html.parser')
-            matches = []
-            pdf_matches = []
-            other_matches = []
-
-            # Find the results table
-            table = soup.find('table', {'id': 'tablelibgen'})
-            if not table:
-                return []
-
-            # Process rows (skip header)
-            rows = table.find_all('tr')[1:]  
-            print(f"Found {len(rows)} results to process")
-            
-            for row in rows:
-                cells = row.find_all('td')
-                if len(cells) < 9:
-                    continue
-                    
-                result_title = cells[0].get_text(strip=True)
-                result_author = cells[1].get_text(strip=True)
-                file_ext = cells[7].get_text(strip=True).lower()
-                
-                # Skip if it's a review
-                if "Review by:" in result_author:
-                    continue
-                    
-                # Skip if book title contains review markers
-                if is_book:
-                    review_markers = [
-                        "vol.", "iss.", "pp.", "pages",
-                        "Review of", "Book Review",
-                        ") pp.", ") p.",
-                    ]
-                    if any(marker in result_title for marker in review_markers):
-                        continue
-                
-                # Get mirror links
-                mirrors_cell = cells[-1]
-                for link in mirrors_cell.find_all('a'):
-                    href = link.get('href', '')
-                    source = link.get('data-original-title', '')
-                    if href:
-                        # Handle relative URLs
-                        if not href.startswith('http'):
-                            href = f"{base_url}{href if href.startswith('/') else '/' + href}"
-                            
-                        match_entry = {
-                            'url': href,
-                            'title': result_title,
-                            'authors': result_author,
-                            'source': f'LibGen ({source})',
-                            'reason': f'{file_ext.upper()} download'
-                        }
-                        
-                        # Separate PDF and non-PDF matches
-                        if file_ext == 'pdf':
-                            pdf_matches.append(match_entry)
-                        else:
-                            other_matches.append(match_entry)
-
-            # Combine PDF matches first, then other formats
-            matches = pdf_matches + other_matches
-            print(f"Found {len(matches)} non-review download links ({len(pdf_matches)} PDFs)")
-            return matches
-
-        except Exception as e:
-            print(f"Error searching LibGen: {e}")
-            return []
-        
-    def is_likely_pdf_url(self, url):
-        url_lower = url.lower()
-        
-        # General PDF checks
-        if any([
-            url_lower.endswith('.pdf'),
-            'pdf' in url_lower and '/download' in url_lower,
-            'pdf' in url_lower and '/view' in url_lower,
-            '/pdf/' in url_lower,
-            'pdf' in url_lower and 'download' in url_lower,
-        ]):
-            return True
-        
-        return False
-        
-
-    def try_extract_pdf_link(self, html_url):
-        try:
-            print(f"  Checking HTML page for PDF link: {html_url}")
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
-            }
-            response = requests.get(html_url, headers=headers, timeout=30)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -801,8 +822,69 @@ class BibliographyEnhancer:
                     found_link = get_button['href']
                     print(f"  Found GET button link: {found_link}")
                 else:
-                    return None
+                    return []
 
+            # Handle relative URLs in one place
+            if not found_link.startswith(('http://', 'https://')):
+                found_link = urljoin(response.url, found_link)
+                
+            return found_link
+
+        except requests.exceptions.RequestException as e:
+            print(f"  Error checking HTML page: {e}")
+            return None
+        except Exception as e:
+            print(f"  Unexpected error checking HTML page: {e}")
+            return None
+            
+    def is_likely_pdf_url(self, url):
+        """Checks if a URL is likely to point directly to a PDF based on patterns."""
+        url_lower = url.lower()
+        
+        # General PDF checks
+        if any([
+            url_lower.endswith('.pdf'),
+            'pdf' in url_lower and '/download' in url_lower,
+            'pdf' in url_lower and '/view' in url_lower,
+            '/pdf/' in url_lower,
+            'pdf' in url_lower and 'download' in url_lower, # Added check
+        ]):
+            return True
+        
+        return False
+        
+    def try_extract_pdf_link(self, html_url):
+        try:
+            print(f"  Checking HTML page for PDF link: {html_url}")
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15'
+            }
+            response = requests.get(html_url, headers=headers, timeout=30)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for PDF links first
+            found_link = None # Initialize found_link
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag['href']
+                if self.is_likely_pdf_url(href):
+                    print(f"  Found PDF link: {href}")
+                    found_link = href
+                    break
+            else:
+                # If no PDF links, try GET button
+                get_button = soup.find('a', href=True, string='GET')
+                if get_button:
+                    found_link = get_button['href']
+                    print(f"  Found GET button link: {found_link}")
+                else:
+                    return None # Return None if no PDF link or GET button found
+
+            # Return None if loop finished without finding a link and GET button wasn't found either
+            if found_link is None:
+                 return None
+                 
             # Handle relative URLs in one place
             if not found_link.startswith(('http://', 'https://')):
                 found_link = urljoin(response.url, found_link)
@@ -958,35 +1040,47 @@ class BibliographyEnhancer:
                     print(f"No data returned for work {work_id}")
                     continue
 
-                # First safely extract the nested structures
-                primary_location = work.get('primary_location') or {}     
-                source = primary_location.get('source') or {}             
-                open_access = work.get('open_access') or {}               
-                authorships = work.get('authorships') or []               
-
-                # Handle authors list separately since it's more complex
-                authors = []
-                for authorship in authorships:
-                    if authorship:  
-                        author = authorship.get('author')
-                        if author:  
-                            display_name = author.get('display_name')
-                            if display_name:  
-                                authors.append(display_name)
-
-                # Now build the reference work safely
-                ref_work = {
-                    'title': work.get('title',''),                 
-                    'year': work.get('publication_year'),          
-                    'doi': work.get('doi'),                        
-                    'type': work.get('type'),                      
-                    'open_access_url': open_access.get('oa_url'),  
-                    'authors': authors,                            
-                    'container_title': source.get('display_name'),  
-                    'url': open_access.get('oa_url')               
+                # Convert OpenAlex work data to our reference format
+                parent_identifier = ref.get('doi', ref.get('title', 'Untitled'))
+                enhanced_ref = {
+                    'title': work.get('display_name', ''),
+                    'authors': [auth.get('author', {}).get('display_name', auth.get('raw_author_name', '')) for auth in work.get('authorships', []) if auth.get('author') or auth.get('raw_author_name')],
+                    'year': str(work.get('publication_year', '')),
+                    'doi': work.get('doi', ''),
+                    'openalex_id': work.get('id', ''),
+                    'source': f"Referenced by {parent_identifier}"
                 }
                 
-                bibliography['references'].append(ref_work)
+                # Check if already in input_references to avoid duplicates from previous partial runs
+                doi = enhanced_ref.get('doi', '').strip().lower() if enhanced_ref.get('doi') else ''
+                title = ''.join(enhanced_ref.get('title', '').lower().split()) if enhanced_ref.get('title') else ''
+                authors = [''.join(a.lower().split()) for a in enhanced_ref.get('authors', []) if a] if enhanced_ref.get('authors') else []
+                authors_str = ','.join(sorted(authors)) if authors else ''
+                cursor = self.db_conn.cursor()
+                
+                if doi:
+                    cursor.execute("SELECT doi FROM input_references WHERE doi = ?", (doi,))
+                    if cursor.fetchone():
+                        continue
+                    cursor.execute("SELECT doi FROM previous_references WHERE doi = ?", (doi,))
+                    if cursor.fetchone():
+                        continue
+                    cursor.execute("SELECT doi FROM current_references WHERE doi = ?", (doi,))
+                    if cursor.fetchone():
+                        continue
+                
+                if title and authors_str:
+                    cursor.execute("SELECT title, authors FROM input_references WHERE title = ? AND authors = ?", (title, authors_str))
+                    if cursor.fetchone():
+                        continue
+                    cursor.execute("SELECT title, authors FROM previous_references WHERE title = ? AND authors = ?", (title, authors_str))
+                    if cursor.fetchone():
+                        continue
+                    cursor.execute("SELECT title, authors FROM current_references WHERE title = ? AND authors = ?", (title, authors_str))
+                    if cursor.fetchone():
+                        continue
+                
+                bibliography['references'].append(enhanced_ref)
                             
             except Exception as e:
                 print(f"Error processing referenced work {work_id}: {e}")
@@ -1028,184 +1122,172 @@ class BibliographyEnhancer:
         else:
             print("No valid referenced works to process")       
 
-    def enhance_bibliography(self, json_file, output_dir=None):
-        """
-        Enhanced version of bibliography processor with the following order:
-        1. Direct sources (direct URLs, DOI URLs, Unpaywall URLs, OpenAlex URLs).
-        2. Combined search and evaluation with Gemini.
-        3. Sci-Hub (using DOI).
-        4. LibGen.
-        """
-        with open(json_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        references = data['references'] if isinstance(data, dict) else data
-            
-        if output_dir:
-            downloads_dir = Path(output_dir) / 'downloads'
-            output_dir_path = Path(output_dir)
-        else:
-            downloads_dir = self.script_dir / 'downloads'
-            output_dir_path = self.script_dir / 'enhanced_results'
-        
+    def enhance_bibliography(self, ref, downloads_dir, force_download=False):
+        """Enhances a single reference dictionary, attempts download, and returns the modified ref or None."""
+        # Ensure downloads_dir is a Path object (it should be, but double-check)
+        if not isinstance(downloads_dir, Path):
+            print(f"ERROR: downloads_dir passed to enhance_bibliography is not a Path object: {type(downloads_dir)}")
+            try:
+                downloads_dir = Path(downloads_dir)
+            except TypeError:
+                print("ERROR: Cannot convert downloads_dir to Path. Aborting enhance_bibliography for this ref.")
+                return None # Indicate failure
+
+        # Ensure the directory exists (it should, but good practice)
         downloads_dir.mkdir(parents=True, exist_ok=True)
-        output_dir_path.mkdir(parents=True, exist_ok=True)
+
+        # Check if already downloaded using the passed downloads_dir and the thread-local db connection
+        if is_reference_downloaded(ref, downloads_dir, self.db_conn, check_input_table=False):
+            print(f"\nSkipping already downloaded: {ref.get('title','Untitled')}")
+            return None # Indicate skipped/already done
         
-        for ref in references:
+        # --- Start of main processing logic for the single 'ref' --- 
+        print(f"\nProcessing: {ref.get('title', ref.get('display_name', 'Untitled'))}")
+        # Extract authors from authorships if available, otherwise use authors directly
+        authors_list = ref.get('authors', [])
+        print(f"Authors: {', '.join(authors_list)}")
+        # Use publication_year if year is not available
+        ref_year = ref.get('year', ref.get('publication_year', None))
+        print(f"Year: {ref_year}")
+        
+        urls_to_try = []
+        
+        # 1. Try direct URL first if it exists
+        if ref.get('url'):
+            print("Found direct URL in reference")
+            urls_to_try.append({
+                'url': ref['url'],
+                'title': ref.get('title', ''),
+                'snippet': '',
+                'source': 'Direct URL',
+                'reason': 'Direct URL from reference'
+            })
+        
+        # 1. Try DOI resolution
+        if ref.get('doi'):
+            doi_url = self.clean_doi_url(ref['doi'])
+            urls_to_try.append({
+                'url': doi_url,
+                'title': ref.get('title', ''),
+                'snippet': '',
+                'source': 'DOI',
+                'reason': 'DOI resolution'
+            })
+            
+            # 1. Check Unpaywall for open access versions
+            unpaywall_result = self.check_unpaywall(ref['doi'])
+            if unpaywall_result and unpaywall_result.get('best_oa_location'):
+                oa_location = unpaywall_result['best_oa_location']
+                if oa_location.get('url_for_pdf'):
+                    print(f"  Unpaywall found OA PDF URL: {oa_location['url_for_pdf']}")
+                    urls_to_try.append({
+                        'url': oa_location['url_for_pdf'],
+                        'title': ref.get('title', ''),
+                        'snippet': '',
+                        'source': oa_location.get('host_type', 'Unpaywall OA'),
+                        'reason': 'Found via Unpaywall DOI lookup'
+                    })
+                else:
+                    print(f"  Unpaywall found OA location but no direct PDF URL for DOI {ref['doi']}.")
+            else:
+                 print(f"  Unpaywall found no OA location for DOI {ref['doi']}.")
 
-            if is_reference_downloaded(ref, str(output_dir_path), self.db_conn):
-                print(f"\nSkipping already downloaded: {ref.get('title','Untitled')}")
-                continue
+        if ref.get('open_access_url'):
+            urls_to_try.append({
+                'url': ref['open_access_url'],
+                'title': ref.get('title', ''),
+                'snippet': '',
+                'source': 'OpenAlex',
+                'reason': 'Open access URL from OpenAlex'
+            })
+        
+        # Try downloading from direct sources first
+        download_success = False
+        for url_info in urls_to_try:
+            if self.try_download_url(url_info['url'], url_info['source'], ref, downloads_dir):
+                ref['download_source'] = url_info['source']
+                ref['download_reason'] = url_info['reason']
+                download_success = True
+                file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
+                print(f"{GREEN}✓ Downloaded from: {url_info['source']} as {Path(file_path).name}{RESET}")
 
-            print(f"\nProcessing: {ref.get('title','Untitled')}")
-            print("DEBUG - Full reference content:", ref)  
-            print(f"Authors: {', '.join(ref.get('authors', []))}")
-            print(f"Year: {ref.get('year')}")
+        # 2. If direct methods fail, try combined search and evaluation with Gemini
+        if not download_success:
+            print("Direct methods failed. Trying combined search and evaluation with Gemini...")
+            gemini_matches = self.search_and_evaluate_with_gemini(ref)
             
-            
-            urls_to_try = []
-            
-            # 1. Try direct URL first if it exists
-            if ref.get('url'):
-                print("Found direct URL in reference")
-                urls_to_try.append({
-                    'url': ref['url'],
-                    'title': ref.get('title', ''),
-                    'snippet': '',
-                    'source': 'Direct URL',
-                    'reason': 'Direct URL from reference'
-                })
-            
-            # 1. Try DOI resolution
-            if ref.get('doi'):
-                doi_url = self.clean_doi_url(ref['doi'])
-                urls_to_try.append({
-                    'url': doi_url,
-                    'title': ref.get('title', ''),
-                    'snippet': '',
-                    'source': 'DOI',
-                    'reason': 'DOI resolution'
-                })
-                
-                # 1. Check Unpaywall for open access versions
-                unpaywall_result = self.check_unpaywall(ref['doi'])
-                if unpaywall_result and unpaywall_result.get('oa_locations'):
-                    for location in unpaywall_result['oa_locations']:
-                        pdf_url = location.get('url_for_pdf') or location.get('url')
-                        if pdf_url:
-                            urls_to_try.append({
-                                'url': pdf_url,
-                                'title': ref.get('title', ''),
-                                'snippet': '',
-                                'source': 'Unpaywall',
-                                'reason': f"Open access version from {location.get('repository_institution', 'Unpaywall')}"
-                            })
+            if gemini_matches:
+                print("\nPotential matches found from Gemini:")
+                for match in gemini_matches:
+                    print(f"- {match.get('title', 'No title')}")
+                    print(f"  URL: {match.get('url', 'No URL')}")
+                    print(f"  Reason: {match.get('reason', 'No reason provided')}")
+                    print(f"  Source: {match.get('source', 'Unknown')}")
+                    
+                    if match.get('url'):  
+                        if self.try_download_url(match['url'], match.get('source', 'Gemini'), ref, downloads_dir):
+                            ref['download_source'] = match.get('source', 'Gemini')
+                            ref['download_reason'] = match.get('reason', 'Successfully downloaded')
+                            download_success = True
+                            file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
+                            print(f"{GREEN}✓ Downloaded from: {match.get('source', 'Gemini')} as {Path(file_path).name}{RESET}")
 
-            # 1. Try OpenAlex URL
-            if ref.get('open_access_url'):
-                urls_to_try.append({
-                    'url': ref['open_access_url'],
-                    'title': ref.get('title', ''),
-                    'snippet': '',
-                    'source': 'OpenAlex',
-                    'reason': 'Open access URL from OpenAlex'
-                })
+        # 3. If Gemini fails, try Sci-Hub (using DOI)
+        if not download_success and ref.get('doi'):
+            print("Gemini failed. Trying Sci-Hub...")
+            scihub_result = self.search_with_scihub(ref['doi'])
             
-            # Try downloading from direct sources first
-            download_success = False
-            for url_info in urls_to_try:
-                if self.try_download_url(url_info['url'], url_info['source'], ref, downloads_dir):
-                    ref['download_source'] = url_info['source']
-                    ref['download_reason'] = url_info['reason']
+            if scihub_result:
+                print(f"\nFound PDF link on Sci-Hub: {scihub_result['url']}")
+                if self.try_download_url(scihub_result['url'], scihub_result['source'], ref, downloads_dir):
+                    ref['download_source'] = scihub_result['source']
+                    ref['download_reason'] = scihub_result['reason']
                     download_success = True
-                    print(f"Downloaded from: {url_info['source']}")
-                    break
-            
-            # 2. If direct methods fail, try combined search and evaluation with Gemini
-            if not download_success:
-                print("Direct methods failed. Trying combined search and evaluation with Gemini...")
-                gemini_matches = self.search_and_evaluate_with_gemini(ref)
-                
-                if gemini_matches:
-                    print("\nPotential matches found from Gemini:")
-                    for match in gemini_matches:
-                        print(f"- {match.get('title', 'No title')}")
-                        print(f"  URL: {match.get('url', 'No URL')}")
-                        print(f"  Reason: {match.get('reason', 'No reason provided')}")
-                        print(f"  Source: {match.get('source', 'Unknown')}")
-                        
-                        if match.get('url'):  
-                            if self.try_download_url(match['url'], match.get('source', 'Gemini'), ref, downloads_dir):
-                                ref['download_source'] = match.get('source', 'Gemini')
-                                ref['download_reason'] = match.get('reason', 'Successfully downloaded')
-                                download_success = True
-                                print(f"Downloaded from: {match.get('source', 'Gemini')}")
-                                break
-            
-            # 3. If Gemini fails, try Sci-Hub (using DOI)
-            if not download_success and ref.get('doi'):
-                print("Gemini failed. Trying Sci-Hub...")
-                scihub_result = self.search_with_scihub(ref['doi'])
-                
-                if scihub_result:
-                    print(f"\nFound PDF link on Sci-Hub: {scihub_result['url']}")
-                    if self.try_download_url(scihub_result['url'], scihub_result['source'], ref, downloads_dir):
-                        ref['download_source'] = scihub_result['source']
-                        ref['download_reason'] = scihub_result['reason']
-                        download_success = True
-                        print(f"Downloaded from: {scihub_result['source']}")
-            
-            # 4. If Sci-Hub fails, try LibGen
-            if not download_success:
-                print("Sci-Hub failed. Trying LibGen...")
-                libgen_matches = self.search_with_libgen(ref)
-                
-                if libgen_matches:
-                    print("\nPotential matches found on LibGen:")
-                    for match in libgen_matches:
-                        print(f"- {match.get('title', 'No title')}")
-                        print(f"  URL: {match.get('url', 'No URL')}")
-                        print(f"  Reason: {match.get('reason', 'No reason provided')}")
-                        print(f"  Source: {match.get('source', 'Unknown')}")
-                        
-                        if match.get('url'):  
-                            if self.try_download_url(match['url'], match.get('source', "LibGen"), ref, downloads_dir):
-                                ref['download_source'] = match.get('source', "LibGen")
-                                ref['download_reason'] = match.get('reason', 'Successfully downloaded')
-                                download_success = True
-                                print(f"Downloaded from: {match.get('source', 'LibGen')}")
-                                break
-            
-            # If all methods fail, mark as not found
-            if not download_success:
-                print(f"  {RED}✗ No valid matches found through any method{RESET}")
-                ref['download_status'] = 'not_found'
-                ref['download_reason'] = 'No valid matches found through any method'
+                    file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
+                    print(f"{GREEN}✓ Downloaded from: {scihub_result['source']} as {Path(file_path).name}{RESET}")
 
-            if ref.get('referenced_works'):
-                print("\nProcessing referenced works...")
-                self.download_referenced_works(ref, downloads_dir)
+        # 4. If Sci-Hub fails, try LibGen
+        if not download_success:
+            print("Sci-Hub failed. Trying LibGen...")
+            libgen_matches = self.search_with_libgen(ref)
+            
+            if libgen_matches:
+                print("\nPotential matches found on LibGen:")
+                for match in libgen_matches:
+                    print(f"- {match.get('title', 'No title')}")
+                    print(f"  URL: {match.get('url', 'No URL')}")
+                    print(f"  Reason: {match.get('reason', 'No reason provided')}")
+                    print(f"  Source: {match.get('source', 'Unknown')}")
+                    
+                    if match.get('url'):  
+                        if self.try_download_url(match['url'], match.get('source', "LibGen"), ref, downloads_dir):
+                            ref['download_source'] = match.get('source', "LibGen")
+                            ref['download_reason'] = match.get('reason', 'Successfully downloaded')
+                            download_success = True
+                            file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
+                            print(f"{GREEN}✓ Downloaded from: {match.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
 
-            ##input("Press Enter to continue to the next reference...")
+        # If all methods fail, mark as not found
+        if not download_success:
+            print(f"  {RED}✗ No valid matches found through any method{RESET}")
+            ref['download_status'] = 'not_found'
+            ref['download_reason'] = 'No valid matches found through any method'
 
-        # Save enhanced bibliography
-        output_file = output_dir_path / f"enhanced_{json_file.name}"
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        # Print statements for verification
-        print(f"downloads_dir: {downloads_dir}")
-        print(f"output_dir_path: {output_dir_path}")
+        if ref.get('referenced_works'):
+            print("\nProcessing referenced works...")
+            self.download_referenced_works(ref, downloads_dir)
 
-        # Print summary
-        total_refs = len(references)
-        downloaded = sum(1 for ref in references if 'downloaded_file' in ref)
-        print(f"\nSummary:")
-        print(f"Total references: {total_refs}")
-        print(f"Successfully downloaded: {downloaded}")
-        print(f"Success rate: {(downloaded/total_refs)*100:.1f}%")
-        
-        return output_file
+        ##input("Press Enter to continue to the next reference...")
+
+        # Return the modified ref dictionary if download was successful, otherwise None
+        if 'downloaded_file' in ref and ref['downloaded_file']:
+             # Optionally, update DB status here if enhance_bibliography is solely responsible
+             # update_download_status(ref, self.db_conn, downloaded=True)
+             return ref # Return the modified ref dict on success
+        else:
+             # Optionally, update DB status here if enhance_bibliography is solely responsible
+             # update_download_status(ref, self.db_conn, downloaded=False)
+             return None # Return None on failure or skip
 
     def extract_and_enhance_referenced_works(self, ref, db_conn: sqlite3.Connection):
         """
@@ -1239,8 +1321,8 @@ class BibliographyEnhancer:
                 # Convert OpenAlex work data to our reference format
                 parent_identifier = ref.get('doi', ref.get('title', 'Untitled'))
                 enhanced_ref = {
-                    'title': work.get('title', ''),
-                    'authors': [auth.get('author', {}).get('display_name', '') for auth in work.get('authorships', []) if auth.get('author')],
+                    'title': work.get('display_name', ''),
+                    'authors': [auth.get('author', {}).get('display_name', auth.get('raw_author_name', '')) for auth in work.get('authorships', []) if auth.get('author') or auth.get('raw_author_name')],
                     'year': str(work.get('publication_year', '')),
                     'doi': work.get('doi', ''),
                     'openalex_id': work.get('id', ''),
@@ -1248,9 +1330,9 @@ class BibliographyEnhancer:
                 }
                 
                 # Check if already in input_references or other tables to avoid duplicates
-                doi = enhanced_ref.get('doi', '').strip().lower()
-                title = "".join(enhanced_ref.get('title', '').lower().split())
-                authors = ["".join(a.lower().split()) for a in enhanced_ref.get('authors', [])]
+                doi = enhanced_ref.get('doi', '').strip().lower() if enhanced_ref.get('doi') else ''
+                title = ''.join(enhanced_ref.get('title', '').lower().split()) if enhanced_ref.get('title') else ''
+                authors = [''.join(a.lower().split()) for a in enhanced_ref.get('authors', []) if a] if enhanced_ref.get('authors') else []
                 authors_str = ','.join(sorted(authors)) if authors else ''
                 cursor = db_conn.cursor()
                 
@@ -1283,9 +1365,11 @@ class BibliographyEnhancer:
                         continue
                 
                 # Add to input_references for processing
-                add_reference_to_database(enhanced_ref, db_conn, 'input_references')
+                add_reference_to_database(enhanced_ref, db_conn, table='input_references')
                 added_count += 1
-                print(f"Added referenced work {enhanced_ref.get('title', 'Untitled')} to input_references.")
+                work_title = enhanced_ref.get('title', 'Untitled')
+                work_id = enhanced_ref.get('id', 'Unknown ID').split('/')[-1]
+                print(f"    Added referenced work to input_references: {work_title[:60]} (ID: {work_id})")
             except Exception as e:
                 print(f"Error processing referenced work {work_id}: {e}")
                 continue
@@ -1293,7 +1377,230 @@ class BibliographyEnhancer:
         print(f"Added {added_count} referenced works to input_references for processing.")
         return added_count
 
-    def process_references_from_database(self, output_dir, max_concurrent=5, force_download=False):
+    def _expand_inputs_with_referenced_works(self):
+        """Pre-processes the input_references table. Finds referenced works, fetches their metadata (excluding *their* refs), checks for duplicates, and adds new ones back to input_references."""
+        print("\n--- Expanding input references with referenced works ---")
+        cursor = self.db_conn.cursor()
+        cursor.execute("SELECT metadata FROM input_references")
+        current_input_refs_json = [row[0] for row in cursor.fetchall()]
+        initial_input_count = len(current_input_refs_json)
+        print(f"Checking {initial_input_count} initial input references for referenced works...")
+
+        newly_added_count = 0
+        processed_origin_refs = 0
+
+        # Fields to select from OpenAlex for referenced works (exclude 'referenced_works')
+        fields_for_referenced = "id,doi,display_name,authorships,publication_year,type,primary_location,open_access"
+
+        for ref_json in current_input_refs_json:
+            try:
+                if not ref_json:
+                    print("  Skipping empty metadata for a reference.")
+                    continue
+                ref = json.loads(ref_json)
+                processed_origin_refs += 1
+
+                # Debug the raw data to see what fields are available
+                title = ref.get('display_name', ref.get('title', 'Untitled'))
+                ref_id_raw = ref.get('openalex_id', ref.get('id', 'Unknown ID'))
+                ref_id = ref_id_raw.split('/')[-1] if ref_id_raw and isinstance(ref_id_raw, str) and ref_id_raw.startswith('https://openalex.org/') else ref_id_raw
+                if ref_id == 'Unknown ID':
+                    print(f"  Warning: ID field missing or invalid in reference data.")
+                if title == 'Untitled':
+                    print(f"  Warning: Neither 'display_name' nor 'title' found in reference data.")
+                print(f"  Processing reference: {title[:60]} (ID: {ref_id})")
+
+                referenced_works_urls = ref.get('referenced_works', [])
+                if not referenced_works_urls:
+                    print(f"    No referenced works found for this reference.")
+                    continue
+
+                print(f"    Found {len(referenced_works_urls)} referenced works to process...")
+
+                # Filter out invalid URLs and extract work IDs
+                valid_work_ids = []
+                for work_url in referenced_works_urls:
+                    if not work_url or not isinstance(work_url, str) or not work_url.startswith('https://openalex.org/'):
+                        print(f"      Skipping invalid or non-OpenAlex URL: {str(work_url)[:50]}...")
+                        continue
+                    work_id = work_url.split('/')[-1]
+                    valid_work_ids.append(work_id)
+
+                if not valid_work_ids:
+                    print(f"      No valid OpenAlex work IDs to fetch.")
+                    continue
+
+                # Check for duplicates before querying OpenAlex
+                filtered_work_ids = []
+                for work_id in valid_work_ids:
+                    duplicate_found = False
+                    for table in ['current_references', 'previous_references', 'input_references']:
+                        try:
+                            cursor.execute(f"SELECT metadata FROM {table}")
+                            for row in cursor.fetchall():
+                                metadata_json = row[0]
+                                try:
+                                    metadata = json.loads(metadata_json) if metadata_json else {}
+                                    db_id_raw = metadata.get('openalex_id', metadata.get('id', ''))
+                                    db_id = db_id_raw.split('/')[-1] if db_id_raw and isinstance(db_id_raw, str) and db_id_raw.startswith('https://openalex.org/') else db_id_raw
+                                    if db_id and db_id == work_id:
+                                        duplicate_found = True
+                                        table_title, metadata_json = result
+                                        title_to_show = table_title if table_title and table_title != '' else (json.loads(metadata_json).get('display_name', json.loads(metadata_json).get('title', 'Untitled')) if metadata_json else 'Untitled')
+                                        print(f"          Skipping referenced work already in database ({table}) based on DOI: {title_to_show[:60]} (ID: {work_id})")
+                                        break
+                                except json.JSONDecodeError:
+                                    continue
+                            if duplicate_found:
+                                break
+                        except sqlite3.OperationalError as e:
+                            print(f"Database error checking table {table}: {e}")
+                            continue
+                        except json.JSONDecodeError:
+                            print(f"          Warning: Failed to decode JSON metadata in table {table}.")
+                            continue
+                    if not duplicate_found:
+                        filtered_work_ids.append(work_id)
+
+                if not filtered_work_ids:
+                    print(f"      All referenced work IDs are duplicates. Skipping API call.")
+                    continue
+
+                print(f"      Will query OpenAlex for {len(filtered_work_ids)} non-duplicate referenced works.")
+
+                # Process in batches of 100 to avoid API limits
+                batch_size = 100
+                for i in range(0, len(filtered_work_ids), batch_size):
+                    batch_ids = filtered_work_ids[i:i + batch_size]
+                    print(f"      Fetching metadata for {len(batch_ids)} referenced works in a batch request (batch {i//batch_size + 1} of {len(filtered_work_ids)//batch_size + 1})...")
+                    try:
+                        self.openalex_limiter.wait_if_needed()
+                        filter_param = "openalex:" + "|".join(batch_ids)
+                        api_url = f"https://api.openalex.org/works?filter={filter_param}&select={fields_for_referenced}&per-page={len(batch_ids)}&mailto={self.email}"
+                        response = requests.get(api_url, headers={'User-Agent': f'BibliographyEnhancer/{self.email}'}, timeout=60)
+                        response.raise_for_status()
+                        batch_data = response.json()
+                        results = batch_data.get('results', [])
+                        print(f"        Successfully fetched metadata for {len(results)} out of {len(batch_ids)} referenced works.")
+                    except requests.exceptions.RequestException as api_err:
+                        print(f"        API Error fetching batch metadata: {api_err}")
+                        continue
+                    except json.JSONDecodeError:
+                        print(f"        API Error: Invalid JSON response for batch request")
+                        continue
+
+                    if not results:
+                        print(f"        No data returned for any referenced works in this batch.")
+                        continue
+
+                    # Process each returned work
+                    processed_ids = []
+                    for referenced_work_data in results:
+                        if not referenced_work_data:
+                            print(f"        Skipping empty metadata for a referenced work.")
+                            continue
+                        work_id = referenced_work_data.get('openalex_id', '').split('/')[-1]
+                        processed_ids.append(work_id)
+                        print(f"        Processing referenced work ID: {work_id}")
+
+                        work_title = referenced_work_data.get('display_name', referenced_work_data.get('title', 'Untitled'))
+                        ref_doi = referenced_work_data.get('doi', '').strip().lower() if referenced_work_data.get('doi') else ''
+                        duplicate_found = False
+
+                        # Check DOI first
+                        if ref_doi:
+                            for table in ['current_references', 'previous_references', 'input_references']:
+                                try:
+                                    cursor.execute(f"SELECT title, metadata FROM {table} WHERE doi = ?", (ref_doi,))
+                                    result = cursor.fetchone()
+                                    if result:
+                                        duplicate_found = True
+                                        table_title, metadata_json = result
+                                        title_to_show = table_title if table_title and table_title != '' else (json.loads(metadata_json).get('display_name', json.loads(metadata_json).get('title', 'Untitled')) if metadata_json else 'Untitled')
+                                        print(f"          Skipping referenced work already in database ({table}) based on DOI: {title_to_show[:60]} (ID: {work_id})")
+                                        break
+                                except sqlite3.OperationalError as e:
+                                    print(f"Database error checking table {table}: {e}")
+                                    continue
+                                except json.JSONDecodeError:
+                                    print(f"          Warning: Failed to decode JSON metadata in table {table}.")
+                                    continue
+                            if duplicate_found:
+                                continue
+
+                        # If no DOI match, check title and author
+                        if not duplicate_found and work_title and work_title != 'Untitled':
+                            authorships = referenced_work_data.get('authorships', [])
+                            if authorships:
+                                # Extract author names
+                                author_names = []
+                                for authorship in authorships:
+                                    author = authorship.get('author')
+                                    if author:
+                                        author_name = author.get('display_name')
+                                        if author_name:
+                                            author_names.append(author_name)
+
+                                if author_names:
+                                    for table in ['current_references', 'previous_references', 'input_references']:
+                                        try:
+                                            cursor.execute("SELECT title, metadata FROM {table}")
+                                            for row in cursor.fetchall():
+                                                table_title, metadata_json = row
+                                                if table_title and table_title.lower() == work_title.lower():
+                                                    try:
+                                                        metadata = json.loads(metadata_json) if metadata_json else {}
+                                                        db_authorships = metadata.get('authorships', [])
+                                                        if db_authorships:
+                                                            db_author_names = []
+                                                            for db_authorship in db_authorships:
+                                                                db_author = db_authorship.get('author')
+                                                                if db_author:
+                                                                    db_author_name = db_author.get('display_name')
+                                                                    if db_author_name:
+                                                                        db_author_names.append(db_author_name)
+                                                            if db_author_names and set([n.lower() for n in author_names]) & set([n.lower() for n in db_author_names]):
+                                                                duplicate_found = True
+                                                                print(f"          Skipping referenced work already in database ({table}) based on title and author match: {work_title[:60]} (ID: {work_id})")
+                                                                break
+                                                    except json.JSONDecodeError:
+                                                        print(f"          Warning: Failed to decode JSON metadata in table {table}.")
+                                                        continue
+                                            if duplicate_found:
+                                                break
+                                        except sqlite3.OperationalError as e:
+                                            print(f"Database error checking table {table}: {e}")
+                                            continue
+
+                        if duplicate_found:
+                            continue
+
+                        # If no duplicate found, check using is_reference_downloaded for additional validation
+                        if is_reference_downloaded(referenced_work_data, None, self.db_conn, check_input_table=True):
+                            print(f"          Skipping referenced work already in database (via is_reference_downloaded check): {work_title[:60]} (ID: {work_id})")
+                            continue
+
+                        # If it passed all checks, add it to the input table for later processing
+                        add_reference_to_database(referenced_work_data, self.db_conn, table='input_references')
+                        newly_added_count += 1
+                        print(f"          Added referenced work to input_references: {work_title[:60]} (ID: {work_id})")
+
+                    # Note any IDs that were requested but not returned in the results
+                    missing_ids = [wid for wid in batch_ids if wid not in processed_ids]
+                    if missing_ids:
+                        print(f"        Note: {len(missing_ids)} referenced work IDs were not returned by the API.")
+            except json.JSONDecodeError:
+                print(f"  Error decoding JSON for an input reference.")
+                continue
+            except Exception as e:
+                import traceback
+                print(f"  Error processing referenced works for an input reference: {e}")
+                print(f"  Stack trace: {traceback.format_exc()}")
+                continue
+
+        print(f"--- Expansion complete: Processed {processed_origin_refs} origin refs, added {newly_added_count} new referenced works to input_references ---")
+
+    def process_references_from_database(self, output_dir, max_concurrent=5, force_download=False, skip_referenced_works=False):
         """
         Process references from the input_references table, checking for duplicates,
         downloading if necessary, and updating database tables.
@@ -1309,43 +1616,49 @@ class BibliographyEnhancer:
         
         download_tasks = []
         processed_count = 0
-        skipped_count = 0
-        
-        print(f"Found {len(references_to_process)} references to process from input_references table.")
-        
-        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-            for ref in references_to_process:
-                is_duplicate = is_reference_downloaded(ref, output_dir, self.db_conn)
-                has_referenced_works = bool(ref.get('referenced_works', []))
-                
-                if not force_download and is_duplicate and not has_referenced_works:
-                    print(f"Reference already downloaded, skipping: {ref.get('title', 'Untitled')}")
+        total_refs = len(references_to_process)
+        updated_references = [] # Store updated references after processing
+
+        print(f"\nProcessing {total_refs} references from database sequentially...")
+
+        # Sequential processing loop
+        for i, ref in enumerate(references_to_process):
+            print(f"\nProcessing reference {i+1}/{total_refs}: {ref.get('title', 'Untitled')}")
+            try: # ADD TRY BLOCK HERE
+                # Ensure downloads_dir is passed correctly as a Path object
+                updated_ref = self.enhance_bibliography(ref, downloads_dir, force_download=force_download)
+                updated_references.append(updated_ref) # Append the potentially modified ref
+            except Exception as e: # CATCH EXCEPTIONS HERE
+                print(f"{RED}!!! Error processing reference {ref.get('title', 'Untitled')}: {e}{RESET}")
+                # Optionally log the full traceback
+                # import traceback
+                # traceback.print_exc()
+                # Append the original ref or a modified one indicating error
+                ref['download_status'] = 'error'
+                ref['error_message'] = str(e)
+                updated_references.append(ref)
+
+            processed_count += 1
+            if processed_count % 10 == 0:
+                print(f"Processed {processed_count}/{total_refs} references...")
+                # Optionally save intermediate results here if needed
+                # self.save_partial_metadata(output_dir, updated_references)
+
+        print("\nFinished processing all references.")
+
+        # Update database with processed references
+        for ref in updated_references:
+            if ref:
+                if 'downloaded_file' in ref:
+                    add_reference_to_database(ref, self.db_conn, 'current_references')
                     remove_reference_from_input(ref, self.db_conn)
-                    skipped_count += 1
-                    continue
-                
-                if has_referenced_works:
-                    # Extract and add referenced works to input_references
-                    self.extract_and_enhance_referenced_works(ref, self.db_conn)
-                    if is_duplicate and not force_download:
-                        print(f"Reference already downloaded but processed referenced works: {ref.get('title', 'Untitled')}")
-                        remove_reference_from_input(ref, self.db_conn)
-                        skipped_count += 1
-                        continue
-                
-                download_tasks.append(executor.submit(self.download_reference, ref, downloads_dir))
-                processed_count += 1
-            
-            for future in as_completed(download_tasks):
-                try:
-                    result = future.result()
-                    if result and 'downloaded_file' in result:
-                        add_reference_to_database(result, self.db_conn, 'current_references')
-                        remove_reference_from_input(result, self.db_conn)
-                except Exception as e:
-                    print(f"Error in download task: {e}")
+                else:
+                    remove_reference_from_input(ref, self.db_conn)
         
-        print(f"Processed {processed_count} references, skipped {skipped_count} already downloaded.")
+        # Commit all database changes made during this batch
+        self.db_conn.commit()
+        print("Database updates committed.")
+
         return processed_count
 
     def save_final_metadata(self, output_dir):
@@ -1377,7 +1690,20 @@ class BibliographyEnhancer:
 
 
     def try_download_url(self, url, source, ref, downloads_dir):
-        safe_title = "".join(c for c in ((ref or {}).get('title', '') or 'Untitled')[:50] if c.isalnum() or c in ' -_')
+        """Attempts to download a PDF from a given URL.
+        Includes basic validation and HTML page handling.
+        Returns True if successful, False otherwise. Sets ref['downloaded_file'] on success.
+        """
+        # Safely get title, provide fallback, ensure string
+        title_val = (ref or {}).get('title', '') or 'Untitled'
+        if not isinstance(title_val, str):
+            print(f"{RED}ERROR try_download_url: Title is not a string for ref ID {ref.get('id', 'N/A')}! Using fallback.{RESET}")
+            title_val = 'Untitled_check_source_data'
+
+        print(f"DEBUG try_download_url called with source: {source}, url: {url}") # Debug print for source
+
+        # Create safe filename from title
+        safe_title = "".join(c for c in (title_val[:50]) if c.isalnum() or c in ' -_').strip()
         filename = downloads_dir / f"{ref.get('year', 'unknown')}_{safe_title}.pdf"
         ref_type = ref.get('type', '')
         
@@ -1389,58 +1715,69 @@ class BibliographyEnhancer:
                 'Accept': 'text/html,application/pdf,application/x-pdf,*/*'
             }
             
+            # Add timeout to request
             response = requests.get(url, allow_redirects=True, headers=headers, timeout=30)
             
+            # Check for specific HTTP error codes
             if response.status_code == 404:
-                print("  ✗ URL not found (404)")
+                print("  PDF not found (404)")
                 return False
             elif response.status_code == 403:
-                print("  ✗ Access forbidden (403)")
+                print("  Access forbidden (403)")
                 return False
             elif response.status_code == 429:
-                print("  ✗ Too many requests (429) - Rate limited")
+                print("  Too many requests (429) - Rate limited")
                 return False
             elif response.status_code != 200:
-                print(f"  ✗ HTTP error {response.status_code}")
+                print(f"  HTTP error {response.status_code}")
                 return False
-                        
+                    
             content = response.content
             
             # Enhanced PDF validation
             if self.is_valid_pdf(content, ref_type):
                 with open(filename, 'wb') as f:
                     f.write(content)
-                print("  ✓ Direct download successful - Valid complete PDF")
+                print("  Direct download successful - Valid complete PDF")
                 ref['downloaded_file'] = str(filename)
                 ref['download_source'] = source
                 return True
             else:
-                print("  ✗ Downloaded file is not a valid complete PDF")
-                
+                print(f"  {YELLOW}Downloaded file is not a valid complete PDF{RESET}")
+
                 # If it seems to be HTML, try extracting PDF link
-                if 'text/html' in response.headers.get('Content-Type', '').lower():
-                    pdf_url = self.try_extract_pdf_link(url)
-                    if pdf_url and pdf_url != url:
-                        return self.try_download_url(pdf_url, source, ref, downloads_dir)
-            
-            return False
-                
+                # --- MODIFICATION HERE ---
+                pdf_url_from_html = self.try_extract_pdf_link(url) # Pass the original URL
+                if pdf_url_from_html and pdf_url_from_html != url: # Avoid infinite loops
+                    print(f"  Found potential PDF link in HTML, retrying download for: {pdf_url_from_html}")
+                    # Recursively call try_download_url with the new link, potentially updating source
+                    return self.try_download_url(pdf_url_from_html, source + " (via HTML)", ref, downloads_dir)
+                else:
+                     print(f"  {YELLOW}Could not extract a PDF link from the HTML page.{RESET}")
+                # --- END MODIFICATION ---
+
+            return False # Return False if download wasn't valid PDF and no link extracted/retried
+
         except requests.exceptions.ConnectionError:
-            print("  ✗ Connection error - Could not reach server")
+            print("  Connection error - Could not reach server")
             return False
         except requests.exceptions.Timeout:
-            print("  ✗ Request timed out")
+            print("  Request timed out")
             return False
         except requests.exceptions.TooManyRedirects:
-            print("  ✗ Too many redirects")
+            print("  Too many redirects")
             return False
         except requests.exceptions.RequestException as e:
-            print(f"  ✗ Request failed: {str(e)}")
+            print(f"  Request failed: {str(e)}")
             return False
         except Exception as e:
-            print(f"  ✗ Unexpected error: {str(e)}")
+            print(f"  Unexpected error: {str(e)}")
             if filename.exists():
-                filename.unlink()
+                try:
+                    filename.unlink()
+                    print(f"  Removed potentially incomplete file: {filename.name}")
+                except Exception as unlink_e:
+                     print(f"  Error removing file during exception handling: {unlink_e}")
             return False
 
 def process_file(json_file, enhancer, done_dir):
@@ -1457,15 +1794,15 @@ def process_file(json_file, enhancer, done_dir):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Enhance bibliography data and download PDFs.")
-    parser.add_argument("--email", required=True, help="Email for Unpaywall API")
     parser.add_argument("--input", required=True, help="Input directory with JSON files")
     parser.add_argument("--output", required=True, help="Output directory for enhanced results")
     parser.add_argument("--done", default="done", help="Directory for processed input files")
     parser.add_argument("--force", action="store_true", help="Force download even if already downloaded")
     parser.add_argument("--load-metadata", help="Directory containing existing metadata.json files to load into database")
+    parser.add_argument("--skip-referenced-works", action="store_true", help="Skip adding referenced works to input references")
     args = parser.parse_args()
     
-    enhancer = BibliographyEnhancer(args.email)
+    enhancer = BibliographyEnhancer()
     enhancer.results_dir = args.output
     input_dir = Path(args.input)
     done_dir = Path(args.done)
@@ -1483,8 +1820,12 @@ def main():
     for json_file in json_files:
         process_file(json_file, enhancer, done_dir)
     
+    # Expand input references with their referenced works before processing
+    if not args.skip_referenced_works:
+        enhancer._expand_inputs_with_referenced_works()
+    
     # Process references from database
-    enhancer.process_references_from_database(args.output, force_download=args.force)
+    enhancer.process_references_from_database(args.output, force_download=args.force, skip_referenced_works=args.skip_referenced_works)
     
     # Save the final metadata file after all processing is complete
     enhancer.save_final_metadata(args.output)

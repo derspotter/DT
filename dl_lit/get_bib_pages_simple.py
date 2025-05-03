@@ -142,10 +142,66 @@ Do not include any extra keys, explanations, or formatting.
         print("[WARNING] Model response out of order; reordering by index.", file=sys.stderr)
     mapping = sorted(mapping, key=lambda x: x['index'])
 
+    # Validate sections
+    validated_mapping = []
+    for i, entry in enumerate(mapping):
+        if entry['has_references']:
+            print(f"Validating page {entry['index']}...")
+            # Extract single page for validation
+            with pikepdf.Pdf.open(args.input_pdf) as pdf:
+                page_pdf = pikepdf.Pdf.new()
+                page_pdf.pages.append(pdf.pages[entry['index']])
+                # Save temporary single-page PDF
+                temp_dir = tempfile.mkdtemp()
+                temp_path = os.path.join(temp_dir, f"validate_page_{entry['index']}.pdf")
+                page_pdf.save(temp_path)
+
+            print(f"    - Saved temporary single-page PDF for validation.")
+
+            # Upload temporary PDF
+            uploaded_page = client.files.upload(file=temp_path)
+            print(f"    - Uploaded validation page: {entry['index']}")
+
+            # Validation prompt
+            validation_prompt = f"""
+You are tasked with validating if this page contains references.
+
+Output Format:
+  Return a JSON object with a single key, for example:
+  {{
+    "{uploaded_page.name}": {{"is_reference": true}}
+  }}
+  ONLY valid JSON. No markdown or extra text.
+"""
+
+            print(f"    --- Sending Validation Prompt for Page {entry['index']} ---")
+            request_content = [validation_prompt, uploaded_page]
+            try:
+                response = client.models.generate_content(request_content, request_options={'timeout': 600})
+                print(f"    --- Received Validation Response for Page {entry['index']} ---")
+                validation_json = json.loads(response.text.strip())
+                is_reference = validation_json.get(uploaded_page.name, {}).get("is_reference", False)
+                print(f"    - Validation Results: is_reference={is_reference}")
+            except Exception as e:
+                print(f"    - Error during validation: {e}")
+                is_reference = False
+            finally:
+                # Clean up
+                try:
+                    client.files.delete(uploaded_page.name)
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    print(f"    - Cleanup error: {e}")
+
+            if is_reference:
+                validated_mapping.append(entry)
+            else:
+                print(f"  - Page {entry['index']} failed validation and will be skipped.")
+
     os.makedirs(args.output_dir, exist_ok=True)
     out_path = os.path.join(args.output_dir, 'reference_pages.json')
     with open(out_path, 'w') as f:
-        json.dump(mapping, f, indent=2)
+        json.dump(validated_mapping, f, indent=2)
     print(f'Saved reference presence mapping to {out_path}')
 
 if __name__ == '__main__':
