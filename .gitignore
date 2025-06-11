@@ -28,4 +28,12 @@ done/
 dl_lit/done/
 processed_references.db
 processed_references.db.old
-
+testdir
+dl_lit/scraped
+**/*.db
+*.sqlite
+processed_references.db
+dl_lit/bib_output/MM_IGZA_Bd-5-GT-1-6-2023-2/MM_IGZA_Bd-5-GT-1-6-2023-2_bibliography_pages.json
+processed_references.db
+dl_lit_project/data/metadata.bib
+dl_lit/exported_bib/current_references.bib

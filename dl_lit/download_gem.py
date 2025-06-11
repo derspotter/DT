@@ -4,12 +4,14 @@ import requests
 import os
 import threading
 import sqlite3  
+import copy
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 from collections import deque
 import fitz  
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from queue import Queue
 import colorama
 colorama.init(autoreset=True) # Makes colors reset automatically
 GREEN = colorama.Fore.GREEN
@@ -30,6 +32,28 @@ from google.genai.types import (
     VertexAISearch,
 )
 
+# Add Pydantic for structured output with Gemini
+try:
+    from pydantic import BaseModel, Field
+    from typing import List, Optional
+    PYDANTIC_AVAILABLE = True
+    
+    # Define model for structured Gemini output
+    class PdfMatch(BaseModel):
+        url: str = Field(description="URL to the PDF file")
+        title: str = Field(description="Title of the publication")
+        snippet: Optional[str] = Field(default="", description="A short description or snippet")
+        source: str = Field(default="Gemini", description="Source of the PDF")
+        reason: str = Field(default="Verified to be the exact publication", description="Reason for including this match")
+        
+    class PdfMatchListContainer(BaseModel):
+        matches: List[PdfMatch] = Field(description="List of PDF matches")
+        
+except ImportError:
+    PYDANTIC_AVAILABLE = False
+    print("Pydantic not available. Structured output for Gemini API will not be used.")
+
+import datetime  # Added missing import
 
 # ANSI escape codes for colors
 # GREEN = "\033[92m"
@@ -37,10 +61,11 @@ from google.genai.types import (
 # RESET = "\033[0m"  
 
 class ServiceRateLimiter:
-    def __init__(self, rps_limit=None, rpm_limit=None, tpm_limit=None, quota_window_minutes=60):
+    def __init__(self, rps_limit=None, rpm_limit=None, tpm_limit=None, rpd_limit=None, quota_window_minutes=60):
         self.RPS_LIMIT = rps_limit
         self.RPM_LIMIT = rpm_limit
         self.TPM_LIMIT = tpm_limit
+        self.RPD_LIMIT = rpd_limit  # New: Requests per day limit
         self.QUOTA_WINDOW = quota_window_minutes
         
         # For RPS tracking (if needed)
@@ -52,15 +77,56 @@ class ServiceRateLimiter:
         # For token tracking (if needed)
         self.token_counts = deque() if tpm_limit else None
         
+        # For daily request tracking (if needed)
+        self.daily_requests = deque() if rpd_limit else None
+        self.current_day = None
+        
         self.quota_reset_time = None
         self.quota_exceeded = False
+        self.daily_limit_exceeded = False  # New: Track if daily limit exceeded
         self.lock = threading.Lock()
         self.backoff_time = 1
 
     def wait_if_needed(self, estimated_tokens=0):
-        """Thread-safe rate limiting for both RPS and RPM with token tracking."""
+        """Thread-safe rate limiting for RPS, RPM, TPM with token tracking and daily limits."""
         with self.lock:
             now = time.time()
+            now_datetime = datetime.datetime.now() # Define datetime object
+            today = now_datetime.date() # Use the datetime object for consistency
+            
+            # Use id(self) to distinguish limiter instances in debug output
+            limiter_id = id(self)
+            print(f"DEBUG RateLimiter ({limiter_id}): Entering wait_if_needed. Current day: {self.current_day}, Today: {today}") # DEBUG
+
+            # Check and update current day for daily limits
+            if self.RPD_LIMIT:
+                if self.current_day != today:
+                    print(f"DEBUG RateLimiter ({limiter_id}): New day detected. Resetting daily count ({len(self.daily_requests)}) and flag ({self.daily_limit_exceeded}). RPD_LIMIT={self.RPD_LIMIT}") # DEBUG
+                    self.current_day = today
+                    self.daily_requests.clear()
+                    self.daily_limit_exceeded = False
+
+                # Check if daily limit is exceeded
+                print(f"DEBUG RateLimiter ({limiter_id}): Checking daily_limit_exceeded flag: {self.daily_limit_exceeded}") # DEBUG
+                if self.daily_limit_exceeded:
+                    print(f"DEBUG RateLimiter ({limiter_id}): Daily limit flag is True, returning False. RPD_LIMIT={self.RPD_LIMIT}") # DEBUG
+                    return False
+
+                # Remove timestamps from previous days
+                removed_count = 0
+                while self.daily_requests and (today - self.daily_requests[0].date()).days > 0:
+                    self.daily_requests.popleft()
+                    removed_count += 1
+                if removed_count > 0:
+                    print(f"DEBUG RateLimiter ({limiter_id}): Removed {removed_count} old daily timestamps.") # DEBUG
+
+                # Check if the current count meets or exceeds the limit
+                current_daily_count = len(self.daily_requests)
+                print(f"DEBUG RateLimiter ({limiter_id}): Checking daily count: {current_daily_count} >= {self.RPD_LIMIT}?") # DEBUG
+                if current_daily_count >= self.RPD_LIMIT:
+                    print(f"DEBUG RateLimiter ({limiter_id}): Daily limit count reached ({current_daily_count}). Setting flag and returning False. RPD_LIMIT={self.RPD_LIMIT}") # DEBUG
+                    self.daily_limit_exceeded = True
+                    return False
             
             # Check quota exceeded state
             if self.quota_exceeded and self.quota_reset_time:
@@ -92,33 +158,50 @@ class ServiceRateLimiter:
                     self.minute_requests.popleft()
                 
                 if len(self.minute_requests) >= self.RPM_LIMIT:
-                    wait_time = self.minute_requests[0] - minute_ago
-                    if wait_time > 0:
-                        print(f"Rate limit approached, waiting {wait_time:.1f} seconds...")
-                        time.sleep(wait_time)
-                        now = time.time()  
+                    wait_time = 60.0 - (now - self.minute_requests[0])
+                    print(f"RPM limit reached, waiting {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                    now = time.time()
 
             # Handle token limiting if configured
             if self.TPM_LIMIT and estimated_tokens > 0:
-                minute_ago = now - 60.0
-                while self.token_counts and self.token_counts[0][0] < minute_ago:
+                current_minute = int(now / 60)
+                while self.token_counts and self.token_counts[0][0] < current_minute - 1:
                     self.token_counts.popleft()
                 
-                total_tokens = sum(count[1] for count in self.token_counts)
-                if total_tokens + estimated_tokens > self.TPM_LIMIT:
-                    wait_time = self.token_counts[0][0] - minute_ago
-                    if wait_time > 0:
-                        print(f"Token limit approached, waiting {wait_time:.1f} seconds...")
-                        time.sleep(wait_time)
-                        now = time.time()  
-                
-                self.token_counts.append((now, estimated_tokens))
-
-            # Record the request with final timestamp after all potential waits
-            if self.second_requests is not None:
+                current_tokens = sum(count for _, count in self.token_counts)
+                if current_tokens + estimated_tokens > self.TPM_LIMIT:
+                    wait_time = 60.0 - (now % 60.0) + 1.0  # Wait until next minute plus 1s buffer
+                    print(f"TPM limit reached, waiting {wait_time:.1f} seconds...")
+                    time.sleep(wait_time)
+                    # Update the time and clear old entries after waiting
+                    now = time.time()
+                    current_minute = int(now / 60)
+                    while self.token_counts and self.token_counts[0][0] < current_minute - 1:
+                        self.token_counts.popleft()
+                        
+                # Add tokens to the current minute
+                if self.token_counts and self.token_counts[-1][0] == current_minute:
+                    self.token_counts[-1] = (current_minute, self.token_counts[-1][1] + estimated_tokens)
+                else:
+                    self.token_counts.append((current_minute, estimated_tokens))
+                    
+            # Update tracking for all request types
+            #now_datetime = datetime.datetime.now() # Removed redundant line
+            
+            # Track requests per second
+            if self.RPS_LIMIT:
                 self.second_requests.append(now)
-            if self.minute_requests is not None:
+                
+            # Track requests per minute
+            if self.RPM_LIMIT:
                 self.minute_requests.append(now)
+                
+            # Track requests per day
+            if self.RPD_LIMIT:
+                self.daily_requests.append(now_datetime) # Use the defined datetime object
+            
+            return True # Proceed with the request
 
     def handle_response_error(self, error):
         """Handle quota exceeded errors with exponential backoff."""
@@ -181,14 +264,21 @@ def is_reference_downloaded(reference: dict, output_dir: Path, db_conn: sqlite3.
             continue
     return False
 
-def add_reference_to_database(reference: dict, db_conn: sqlite3.Connection, table: str = 'current_references'):
-    """Add a processed reference to the specified database table."""
-    doi = reference.get('doi', '').strip().lower() if reference.get('doi') else ''
-    title = ''.join(reference.get('title', '').lower().split()) if reference.get('title') else ''
-    year = str(reference.get('year', ''))
-    authors = [''.join(a.lower().split()) for a in reference.get('authors', []) if a] if reference.get('authors') else []
+def add_reference_to_database(reference_data, db_conn, table='current_references'):
+    try:
+        metadata_json = json.dumps(reference_data, ensure_ascii=False)
+    except TypeError as e:
+        print(f"JSON serialization error: {str(e)}")
+        return
+    
+    # Properly escape single quotes for SQLite
+    metadata_json = metadata_json.replace("'", "''")
+    
+    doi = reference_data.get('doi', '').strip().lower() if reference_data.get('doi') else ''
+    title = ''.join(reference_data.get('title', '').lower().split()) if reference_data.get('title') else ''
+    year = str(reference_data.get('year', ''))
+    authors = [''.join(a.lower().split()) for a in reference_data.get('authors', []) if a] if reference_data.get('authors') else []
     authors_str = ','.join(sorted(authors)) if authors else ''
-    metadata_json = json.dumps(reference)
     
     cursor = db_conn.cursor()
     cursor.execute(f"INSERT OR IGNORE INTO {table} (doi, title, year, authors, metadata) VALUES (?, ?, ?, ?, ?)",
@@ -316,16 +406,46 @@ def load_input_jsons(input_dir: str, db_conn: sqlite3.Connection, table: str = '
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Handle both array and object formats
-            references = data['references'] if isinstance(data, dict) else data
-            
-            for ref in references:
+            references_in_file = [] # Initialize list for references from this specific file
+            if isinstance(data, list):
+                references_in_file = data
+                # print(f"  Processing {len(references_in_file)} references from list in {file_path.name}")
+            elif isinstance(data, dict):
+                # Try 'references' key first
+                potential_refs_list = data.get('references') # Use .get() to avoid KeyError
+                if isinstance(potential_refs_list, list):
+                    references_in_file = potential_refs_list
+                    # print(f"  Processing {len(references_in_file)} references from 'references' key in {file_path.name}")
+                else:
+                    # If no 'references' key or it's not a list, assume values are the references
+                    potential_refs_vals = list(data.values()) # Get values
+                    # Filter to ensure they are actual reference dictionaries
+                    references_in_file = [item for item in potential_refs_vals if isinstance(item, dict)]
+                    if not references_in_file and potential_refs_list is not None:
+                        # Handle edge case where 'references' key exists but isn't a list
+                         print(f"  Warning: 'references' key in {file_path.name} exists but is not a list ({type(potential_refs_list)}). Also, dictionary values are not references.")
+                    elif not references_in_file:
+                         print(f"  Warning: Dictionary format in {file_path.name} has no 'references' list and its values are not reference objects.")
+                    # else:
+                        # print(f"  Processing {len(references_in_file)} references from dictionary values in {file_path.name}")
+            else:
+                print(f"  Warning: Unexpected JSON format in {file_path.name}. Expected list or dict, got {type(data)}. Skipping file.")
+                continue # Skip this file
+
+            file_added_count = 0 # Track adds for this file
+            for ref in references_in_file:
+                # Ensure the item is actually a dictionary (reference object)
+                if not isinstance(ref, dict):
+                    print(f"  Warning: Skipping non-dictionary item found while processing {file_path.name}: {type(ref)}")
+                    continue
+                    
                 # Check if already in input_references to avoid duplicates from previous partial runs
                 doi = ref.get('doi', '').strip().lower() if ref.get('doi') else ''
                 title = ''.join(ref.get('title', '').lower().split()) if ref.get('title') else ''
                 authors = [''.join(a.lower().split()) for a in ref.get('authors', []) if a] if ref.get('authors') else []
                 authors_str = ','.join(sorted(authors)) if authors else ''
                 cursor = db_conn.cursor()
+                
                 if doi:
                     cursor.execute(f"SELECT doi FROM {table} WHERE doi = ?", (doi,))
                     if cursor.fetchone():
@@ -337,10 +457,15 @@ def load_input_jsons(input_dir: str, db_conn: sqlite3.Connection, table: str = '
                 
                 add_reference_to_database(ref, db_conn, table)
                 count += 1
+                file_added_count += 1
             
-            print(f"Processed {file_path} - added {count} references so far.")
+            # Use file_added_count for the per-file message
+            print(f"Processed {file_path.name} - added {file_added_count} new references to {table}.")
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON from {file_path}: {e}")
+            continue
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            print(f"Error processing {file_path}: {e}") # General exception catch
             continue
     
     print(f"Finished loading input JSONs. Added {count} references to the {table} table.")
@@ -369,17 +494,23 @@ class BibliographyEnhancer:
         self.local_storage = threading.local()
         self.db_file = db_file if db_file else str(Path(__file__).parent / 'processed_references.db')
         
+        # Ensure database is set up immediately
+        self._setup_database()
+        
         # Service-specific rate limiters
         self.gemini_limiter = ServiceRateLimiter(
-            rpm_limit=100, 
-            tpm_limit=4_000_000,
+            rpm_limit=15,  # 15 requests per minute
+            tpm_limit=1_000_000,  # 1M tokens per minute
+            rpd_limit=1_500,  # 1,500 requests per day
             quota_window_minutes=60
         )
         self.openalex_limiter = ServiceRateLimiter(
-            rps_limit=10  
+            rps_limit=10,  # 10 requests per second
+            rpd_limit=100_000  # 100,000 requests per day
         )
         self.unpaywall_limiter = ServiceRateLimiter(
-            rpm_limit=600
+            rpm_limit=100,  # 100 requests per minute
+            rpd_limit=100_000  # 100,000 requests per day
         )
         self.scihub_limiter = ServiceRateLimiter(
             rpm_limit=10
@@ -470,6 +601,8 @@ class BibliographyEnhancer:
     def search_and_evaluate_with_gemini(self, ref):
         """
         Perform a combined search and evaluation using Gemini with enhanced rate limiting.
+        Uses structured output via Pydantic models if available.
+        Will skip (return []) if daily request limit is exceeded.
         """
         title = ref.get('title', '')
         authors = ref.get('authors', [])
@@ -479,11 +612,15 @@ class BibliographyEnhancer:
         query = f'"{title}" {", ".join(authors) if authors else ""} {year} (pdf OR filetype:pdf)'
         print(f"Searching and evaluating with Gemini for: {query}")
 
+        # Check rate limits - return early if daily limit exceeded
+        # This returns False if daily limit exceeded
+        if not self.gemini_limiter.wait_if_needed(estimated_tokens=0):
+            print("Gemini daily limit exceeded. Skipping Gemini search and proceeding with other methods.")
+            return []
+            
         # Define the search and evaluation prompt
-        combined_prompt = f'''You are helping find exact PDF matches for an academic publication. Perform the following tasks:
-        1. Search for the publication using Google Search.
-        2. Evaluate the results to ensure they are complete PDFs, not partial content.
-
+        combined_prompt = f"""You are helping find exact PDF matches for an academic publication.
+        
         Publication to find:   
         Title: {title}
         Authors: {', '.join(authors)}
@@ -513,48 +650,70 @@ class BibliographyEnhancer:
 
         6. DO NOT include any other academic publications, even if they are by the same authors or have similar titles. ONLY return the exact publication being searched for.
 
-        Return matches in this JSON format:
-        [
-            {{
-                "url": "url",
-                "title": "title",
-                "snippet": "snippet",
-                "source": "source",
-                "reason": "Verified to be the exact publication"
-            }}
-        ]
-
-        If not 100% certain a result is the exact publication, DO NOT include it. Return [] instead.'''
+        7. You MUST return structured output as a JSON list of matches. If no matches are found, return an empty list [].
+        """
 
         max_retries = 3
         retry_count = 0
 
         while retry_count < max_retries:
             try:
-                # Wait for rate limiting if needed
-                self.gemini_limiter.wait_if_needed(estimated_tokens=1000)  
+                # Wait for rate limiting for tokens
+                if not self.gemini_limiter.wait_if_needed(estimated_tokens=1000):
+                    # If daily limit exceeded during retry, return empty results
+                    print("Gemini daily limit exceeded during retry. Skipping and moving to next method.")
+                    return []
 
-                response = self.client.models.generate_content(
-                    contents=combined_prompt,
-                    model=self.MODEL_ID,
-                    config=GenerateContentConfig(
-                        temperature=0.0,
-                        response_modalities=["TEXT"],
-                        tools=[self.google_search_tool],
+                # Use structured output if Pydantic is available
+                if PYDANTIC_AVAILABLE:
+                    response = self.client.models.generate_content(
+                        contents=combined_prompt,
+                        model=self.MODEL_ID,
+                        config=GenerateContentConfig(
+                            temperature=0.0,
+                            response_modalities=["TEXT"],
+                            tools=[self.google_search_tool],
+                            response_mime_type="application/json",
+                            response_schema=PdfMatchListContainer, # Use the container class
+                        )
                     )
-                )
-
+                    
+                    # Try to use the parsed response directly
+                    try:
+                        parsed_container = response.parsed
+                        if parsed_container is not None:
+                            # Access the 'matches' list within the container
+                            parsed_matches = parsed_container.matches 
+                            # Convert Pydantic models to dictionaries
+                            matches = [match.dict() for match in parsed_matches]
+                            print(f"Found {len(matches)} potential PDF matches after evaluation")
+                            return matches
+                    except Exception as parse_err:
+                        print(f"Error parsing structured response: {parse_err}")
+                        # Fall back to text parsing if structured parsing fails
+                else:
+                    # Fall back to original implementation if Pydantic not available
+                    response = self.client.models.generate_content(
+                        contents=combined_prompt,
+                        model=self.MODEL_ID,
+                        config=GenerateContentConfig(
+                            temperature=0.0,
+                            response_modalities=["TEXT"],
+                            tools=[self.google_search_tool],
+                        )
+                    )
+                
                 # Reset backoff on successful request
                 self.gemini_limiter.reset_backoff()
 
-                # Process response
+                # Process response text (used as fallback when structured parsing fails)
                 response_text = response.text.strip()
                 response_text = response_text.replace('```json', '').replace('```', '').strip()
 
                 try:
                     matches = json.loads(response_text)
                     if isinstance(matches, list):
-                        print(f"Found {len(matches)} potential PDF matches after evaluation")
+                        print(f"Found {len(matches)} potential PDF matches after text parsing")
                         return matches
                     else:
                         print("Response was not a list of matches")
@@ -601,7 +760,11 @@ class BibliographyEnhancer:
         url = f'https://api.unpaywall.org/v2/{doi}?email={self.email}'
         
         try:
-            self.unpaywall_limiter.wait_if_needed()
+            # Check for rate limits including daily limit
+            if not self.unpaywall_limiter.wait_if_needed():
+                print(f"Unpaywall daily request limit exceeded. Skipping Unpaywall check for DOI {doi}.")
+                return None
+                
             response = requests.get(url, headers=self.unpaywall_headers, timeout=10)
             response.raise_for_status()
             return response.json()
@@ -661,130 +824,108 @@ class BibliographyEnhancer:
             return {'success': False, 'reason': f'Unexpected error: {str(e)}'}
 
     def search_with_scihub(self, doi):
-            """
-            Search for a paper on Sci-Hub using its DOI and retrieve the download link.
-            Returns immediately after finding a working mirror.
-            """
-            if not doi:
-                return None
-
-            # Try multiple Sci-Hub mirrors
-            scihub_mirrors = [
-                "https://sci-hub.se",
-                "https://sci-hub.st",
-                "https://sci-hub.ru"
-            ]
-
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
-            }
-
-            query = doi or ref.get('title')
-            if not query:
-                return None
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            max_retries = 3
-
-            for mirror in scihub_mirrors:
-                print(f"Searching Sci-Hub mirror: {mirror}")
-                attempt = 0
-                while attempt < max_retries:
-                    attempt += 1
-                    pdf_link = None # Initialize for this attempt
-                    try:
-                        # Rate limiting before request
-                        self.scihub_limiter.wait_if_needed() # Corrected call
-                        # wait_time = self.sci_hub_limiter.wait_for_token() # Incorrect call
-                        # if wait_time > 0:
-                        #    print(f"Rate limit approached, waiting {wait_time:.1f} seconds...")
-                        #    time.sleep(wait_time)
-                            
-                        sci_hub_query_url = mirror.strip('/') + '/' # Ensure single slash at end
-                        response = requests.post(sci_hub_query_url, data={'request': query}, headers=headers, timeout=60, proxies=self.proxies)
-
-                        # --- Mirror Responded - Process and Decide --- 
-                        if response.status_code == 200:
-                            try:
-                                soup = BeautifulSoup(response.text, 'html.parser')
-                                button = soup.find('button', onclick=True)
-                                iframe = soup.find('iframe', {'id': 'pdf'})
-                                embed = soup.find('embed', {'type': 'application/pdf'})
-                                pdf_link = None # Initialize before extraction
-
-                                if button and 'location.href=' in button['onclick']:
-                                    link_part = button['onclick'].split('location.href=')[1]
-                                    pdf_link = link_part.split('?')[0].strip("'/") # Basic extraction
-                                    if not pdf_link.startswith('http'):
-                                         pdf_link = urljoin(mirror, pdf_link) # Handle relative links like /downloads/...
-                                elif iframe and iframe.get('src'):
-                                    pdf_link = iframe['src']
-                                    if not pdf_link.startswith('http'):
-                                         pdf_link = urljoin(mirror, pdf_link)
-                                elif embed and embed.get('src'):
-                                    pdf_link = embed['src']
-                                    if not pdf_link.startswith('http'):
-                                        pdf_link = urljoin(mirror, pdf_link)
-                                
-                                if pdf_link:
-                                    print(f"  Found PDF link via {mirror}")
-                                    return pdf_link # SUCCESS - STOP SEARCHING
-                                else:
-                                    print(f"  No PDF link found on {mirror} (HTML parsed, DOI might not be available)")
-                                    return None # MIRROR WORKED, NO LINK - STOP SEARCHING
-                                    
-                            except Exception as parse_err:
-                                print(f"  Error parsing HTML from {mirror}: {parse_err}")
-                                return None # MIRROR WORKED, PARSE FAILED - STOP SEARCHING
-
-                        elif response.status_code in [404, 403]:
-                            print(f"  DOI not found or forbidden on {mirror} ({response.status_code})")
-                            return None # MIRROR WORKED, KNOWN FAILURE - STOP SEARCHING
-                        
-                        elif 500 <= response.status_code < 600:
-                             print(f"  Server error {response.status_code} on {mirror}. Retrying (Attempt {attempt}/{max_retries})...")
-                             if attempt < max_retries:
-                                 time.sleep(attempt) # Simple backoff
-                                 continue # Retry on same mirror
-                             else:
-                                 print(f"  Max retries failed for server error on {mirror}.")
-                                 break # Break retry loop, try next mirror
-                        else:
-                             # Other unexpected client/server errors
-                             print(f"  Unexpected HTTP status {response.status_code} from {mirror}. Trying next mirror.")
-                             break # Break retry loop, try next mirror
-
-                    # --- Handle Request Exceptions (Reachability) --- 
-                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.TooManyRedirects) as reach_err:
-                        print(f"  Mirror {mirror} unreachable (Attempt {attempt}/{max_retries}): {reach_err}")
-                        if attempt < max_retries:
-                            time.sleep(attempt) # Wait before retry on same mirror
-                            continue # Go to next attempt in while loop
-                        else:
-                            print(f"  Max retries failed for reachability on {mirror}.")
-                            break # Max retries reached, break while loop to try next mirror
-                    
-                    # --- Handle Other Request/Unexpected Exceptions --- 
-                    except Exception as e: # Includes other RequestException
-                        print(f"  Error for {mirror} (Attempt {attempt}/{max_retries}): {e}. Trying next mirror.")
-                        break # Break retry loop, try next mirror
-
-                # --- After While Loop for a specific mirror --- 
-                # If we finished the while loop (break or max_retries), it means this mirror failed definitively. 
-                # The outer 'for' loop will automatically continue to the next mirror.
-                print(f"  Failed to get link from {mirror}. Trying next mirror if available...")
-
-            # --- After For Loop (all mirrors tried and failed reachability) --- 
-            print("Sci-Hub: No PDF link found on any reachable mirror.")
+        """
+        Search for a paper on Sci-Hub using its DOI and retrieve the download link.
+        Returns immediately after finding a working mirror.
+        """
+        if not doi:
+            print("Sci-Hub: No DOI provided")
             return None
-       
+        
+        # Clean and normalize the DOI first
+        clean_doi = doi
+        if clean_doi.startswith("doi:"):
+            clean_doi = clean_doi[4:]  # Remove 'doi:' prefix
+        if clean_doi.startswith("https://doi.org/") or clean_doi.startswith("http://doi.org/"):
+            # Extract just the DOI part for Sci-Hub
+            clean_doi = clean_doi.replace("https://doi.org/", "").replace("http://doi.org/", "")
+            
+        print(f"Sci-Hub: Searching for DOI {clean_doi}")
+
+        # Try multiple Sci-Hub mirrors
+        scihub_mirrors = [
+            "https://sci-hub.se",
+            "https://sci-hub.st",
+            "https://sci-hub.ru"
+        ]
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
+        }
+
+        # Apply rate limiting before starting the loop
+        self.scihub_limiter.wait_if_needed()
+
+        for mirror in scihub_mirrors:
+            scihub_url = f"{mirror}/{clean_doi}"
+            print(f"  Trying Sci-Hub mirror: {mirror}")
+
+            try:
+                response = requests.get(scihub_url, headers=headers, timeout=30, proxies=self.proxies)
+                if response.status_code == 404:
+                    print(f"    DOI not found on {mirror}. Stopping search as content is likely the same across mirrors.")
+                    return None
+                response.raise_for_status()
+
+                # Parse the HTML response to find the PDF link
+                soup = BeautifulSoup(response.text, 'html.parser')
+                pdf_link = None
+                
+                # Check embed tag first
+                embed = soup.find('embed', {'type': 'application/pdf'})
+                if embed and embed.get('src'):
+                    pdf_link = embed['src']
+                
+                # If no embed, check iframe
+                if not pdf_link:
+                    iframe = soup.find('iframe', {'id': 'pdf'})
+                    if iframe and iframe.get('src'):
+                        pdf_link = iframe['src']
+                
+                # If still no link, check for download button
+                if not pdf_link:
+                    save_button = soup.find('button', string='↓ save')
+                    if save_button:
+                        onclick = save_button.get('onclick', '')
+                        if "location.href='" in onclick:
+                            pdf_link = onclick.split("location.href='")[1].split("'")[0]
+                
+                # If we found any kind of link, process it
+                if pdf_link:
+                    # Handle relative URLs
+                    if not pdf_link.startswith(('http://', 'https://')):
+                        if pdf_link.startswith('//'):
+                            pdf_link = f"https:{pdf_link}"
+                        elif pdf_link.startswith('/'):
+                            pdf_link = f"{mirror}{pdf_link}"
+                        else:
+                            pdf_link = f"{mirror}/{pdf_link}"
+                            
+                    print(f"Found PDF link via {mirror}: {pdf_link}")
+                    # Return dictionary when we find a working mirror
+                    return {
+                        'url': pdf_link,
+                        'source': 'Sci-Hub',
+                        'reason': f'DOI resolved to PDF via {mirror}'
+                    }
+                
+                print(f"No PDF link found on {mirror}. Stopping search as content is likely the same across mirrors.")
+                return None
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                print(f"Connection issue with {mirror}: {e}. Trying next mirror...")
+            except requests.exceptions.RequestException as e:
+                print(f"Error accessing {mirror}: {e}. Trying next mirror...")
+
+        # Only reaches here if all mirrors failed due to connection issues
+        print("No working Sci-Hub mirrors found due to connection issues")
+        return None
+
     def search_with_libgen(self, ref):
         """Search for publications on LibGen and extract working download links, prioritizing PDFs."""
         # Inside the search_with_libgen function, just change how we build the query:
         title = ref.get('title', '')
-        authors = ref.get('authors', [])
+        authors_data = ref.get('authorships', [])
+        authors = [author.get('author', {}).get('display_name', '') for author in authors_data] if authors_data else []
         ref_type = ref.get('type', '').lower()  
         is_book = ref_type in ['book', 'monograph']
 
@@ -797,9 +938,11 @@ class BibliographyEnhancer:
         libgen_url = f"{base_url}/index.php?req={query}&lg_topic=libgen&open=0&view=simple&res=25&phrase=1&column=def"
         
         print(f"Searching LibGen for: {title}")
+        print(f"  Book type detection: is_book={is_book}, ref_type='{ref_type}'")
+        print(f"  Using author surname: '{author_surname}'")
+        print(f"  LibGen URL: {libgen_url}")
 
         try:
-            self.libgen_limiter.wait_if_needed()
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
             }
@@ -807,35 +950,89 @@ class BibliographyEnhancer:
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, 'html.parser')
+            matches = []
+            pdf_matches = []
+            other_matches = []
+
+            # Find the results table
+            table = soup.find('table', {'id': 'tablelibgen'})
+            if not table:
+                print("  No results table found - checking for captcha/bot detection")
+                if soup.find(text=re.compile('captcha|bot|automated|security check', re.IGNORECASE)):
+                    print("  WARNING: Possible captcha/bot detection detected")
+                return []
+
+            # Process rows (skip header)
+            rows = table.find_all('tr')[1:]  
+            print(f"Found {len(rows)} results to process")
             
-            # Look for PDF links first
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                if self.is_likely_pdf_url(href):
-                    print(f"  Found PDF link: {href}")
-                    found_link = href
-                    break
-            else:
-                # If no PDF links, try GET button
-                get_button = soup.find('a', href=True, string='GET')
-                if get_button:
-                    found_link = get_button['href']
-                    print(f"  Found GET button link: {found_link}")
-                else:
-                    return []
-
-            # Handle relative URLs in one place
-            if not found_link.startswith(('http://', 'https://')):
-                found_link = urljoin(response.url, found_link)
+            for idx, row in enumerate(rows, start=1):
+                cells = row.find_all('td')
+                if len(cells) < 9:
+                    print(f"  Row {idx}: Skipped - only {len(cells)} cells (need at least 9)")
+                    continue
+                    
+                result_title = cells[0].get_text(strip=True)
+                result_author = cells[1].get_text(strip=True)
+                file_ext = cells[7].get_text(strip=True).lower()
                 
-            return found_link
+                print(f"  Row {idx}: Title='{result_title[:60]}...', Authors='{result_author}', Ext='{file_ext}'")
+                
+                # Skip if it's a review
+                if "Review by:" in result_author:
+                    print("    Skipped - appears to be a review")
+                    continue
+                    
+                # Skip if book title contains review markers
+                if is_book:
+                    review_markers = [
+                        "vol.", "iss.", "pp.", "pages",
+                        "Review of", "Book Review",
+                        ") pp.", ") p.",
+                    ]
+                    if any(marker in result_title for marker in review_markers):
+                        print(f"    Skipped - contains review marker")
+                        continue
+                
+                # Get mirror links
+                mirrors_cell = cells[-1]
+                mirror_links = mirrors_cell.find_all('a')
+                print(f"    Found {len(mirror_links)} mirror links")
+                
+                for link_idx, link in enumerate(mirror_links, start=1):
+                    href = link.get('href', '')
+                    source = link.get('data-original-title', '')
+                    if href:
+                        # Handle relative URLs
+                        if not href.startswith('http'):
+                            href = f"{base_url}{href if href.startswith('/') else '/' + href}"
+                            
+                        match_entry = {
+                            'url': href,
+                            'title': result_title,
+                            'authors': result_author,
+                            'source': f'LibGen ({source})',
+                            'reason': f'{file_ext.upper()} download'
+                        }
+                        
+                        # Separate PDF and non-PDF matches
+                        if file_ext == 'pdf':
+                            pdf_matches.append(match_entry)
+                            print(f"    Mirror {link_idx}: PDF link found - {href[:80]}...")
+                        else:
+                            other_matches.append(match_entry)
+                            print(f"    Mirror {link_idx}: Non-PDF link found - {href[:80]}...")
 
-        except requests.exceptions.RequestException as e:
-            print(f"  Error checking HTML page: {e}")
-            return None
+            # Combine PDF matches first, then other formats
+            matches = pdf_matches + other_matches
+            print(f"Found {len(matches)} non-review download links ({len(pdf_matches)} PDFs)")
+            return matches
+
         except Exception as e:
-            print(f"  Unexpected error checking HTML page: {e}")
-            return None
+            print(f"Error searching LibGen: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return []
             
     def is_likely_pdf_url(self, url):
         """Checks if a URL is likely to point directly to a PDF based on patterns."""
@@ -1053,6 +1250,8 @@ class BibliographyEnhancer:
                 
                 # Check if already in input_references to avoid duplicates from previous partial runs
                 doi = enhanced_ref.get('doi', '').strip().lower() if enhanced_ref.get('doi') else ''
+                ref_id = enhanced_ref.get('id', '')
+                openalex_id_part = ref_id.split('/')[-1] if ref_id and 'openalex.org/' in ref_id else ref_id
                 title = ''.join(enhanced_ref.get('title', '').lower().split()) if enhanced_ref.get('title') else ''
                 authors = [''.join(a.lower().split()) for a in enhanced_ref.get('authors', []) if a] if enhanced_ref.get('authors') else []
                 authors_str = ','.join(sorted(authors)) if authors else ''
@@ -1066,17 +1265,6 @@ class BibliographyEnhancer:
                     if cursor.fetchone():
                         continue
                     cursor.execute("SELECT doi FROM current_references WHERE doi = ?", (doi,))
-                    if cursor.fetchone():
-                        continue
-                
-                if title and authors_str:
-                    cursor.execute("SELECT title, authors FROM input_references WHERE title = ? AND authors = ?", (title, authors_str))
-                    if cursor.fetchone():
-                        continue
-                    cursor.execute("SELECT title, authors FROM previous_references WHERE title = ? AND authors = ?", (title, authors_str))
-                    if cursor.fetchone():
-                        continue
-                    cursor.execute("SELECT title, authors FROM current_references WHERE title = ? AND authors = ?", (title, authors_str))
                     if cursor.fetchone():
                         continue
                 
@@ -1135,20 +1323,14 @@ class BibliographyEnhancer:
 
         # Ensure the directory exists (it should, but good practice)
         downloads_dir.mkdir(parents=True, exist_ok=True)
-
-        # Check if already downloaded using the passed downloads_dir and the thread-local db connection
-        if is_reference_downloaded(ref, downloads_dir, self.db_conn, check_input_table=False):
-            print(f"\nSkipping already downloaded: {ref.get('title','Untitled')}")
-            return None # Indicate skipped/already done
         
+        # Removed duplicate-skip logic at download stage: always attempt download
         # --- Start of main processing logic for the single 'ref' --- 
-        print(f"\nProcessing: {ref.get('title', ref.get('display_name', 'Untitled'))}")
-        # Extract authors from authorships if available, otherwise use authors directly
+        # Combine multiple prints into a single statement to avoid threading issues
+        title = ref.get('title', ref.get('display_name', 'Untitled'))
         authors_list = ref.get('authors', [])
-        print(f"Authors: {', '.join(authors_list)}")
-        # Use publication_year if year is not available
         ref_year = ref.get('year', ref.get('publication_year', None))
-        print(f"Year: {ref_year}")
+        print(f"\nProcessing: {title}\nAuthors: {', '.join(authors_list)}\nYear: {ref_year}")
         
         urls_to_try = []
         
@@ -1211,44 +1393,25 @@ class BibliographyEnhancer:
                 file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
                 print(f"{GREEN}✓ Downloaded from: {url_info['source']} as {Path(file_path).name}{RESET}")
 
-        # 2. If direct methods fail, try combined search and evaluation with Gemini
-        if not download_success:
-            print("Direct methods failed. Trying combined search and evaluation with Gemini...")
-            gemini_matches = self.search_and_evaluate_with_gemini(ref)
-            
-            if gemini_matches:
-                print("\nPotential matches found from Gemini:")
-                for match in gemini_matches:
-                    print(f"- {match.get('title', 'No title')}")
-                    print(f"  URL: {match.get('url', 'No URL')}")
-                    print(f"  Reason: {match.get('reason', 'No reason provided')}")
-                    print(f"  Source: {match.get('source', 'Unknown')}")
-                    
-                    if match.get('url'):  
-                        if self.try_download_url(match['url'], match.get('source', 'Gemini'), ref, downloads_dir):
-                            ref['download_source'] = match.get('source', 'Gemini')
-                            ref['download_reason'] = match.get('reason', 'Successfully downloaded')
-                            download_success = True
-                            file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-                            print(f"{GREEN}✓ Downloaded from: {match.get('source', 'Gemini')} as {Path(file_path).name}{RESET}")
-
-        # 3. If Gemini fails, try Sci-Hub (using DOI)
+        # 2. If direct methods fail, try Sci-Hub (using DOI)
         if not download_success and ref.get('doi'):
-            print("Gemini failed. Trying Sci-Hub...")
+            print("Direct methods failed. Trying Sci-Hub...")
+            self.scihub_limiter.wait_if_needed()
             scihub_result = self.search_with_scihub(ref['doi'])
             
             if scihub_result:
                 print(f"\nFound PDF link on Sci-Hub: {scihub_result['url']}")
                 if self.try_download_url(scihub_result['url'], scihub_result['source'], ref, downloads_dir):
                     ref['download_source'] = scihub_result['source']
-                    ref['download_reason'] = scihub_result['reason']
+                    ref['download_reason'] = scihub_result['reason'] # Keep Sci-Hub reason
                     download_success = True
                     file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
                     print(f"{GREEN}✓ Downloaded from: {scihub_result['source']} as {Path(file_path).name}{RESET}")
 
-        # 4. If Sci-Hub fails, try LibGen
+        # 3. If Sci-Hub fails (or no DOI), try LibGen
         if not download_success:
-            print("Sci-Hub failed. Trying LibGen...")
+            print("Sci-Hub failed (or no DOI). Trying LibGen...")
+            self.libgen_limiter.wait_if_needed()
             libgen_matches = self.search_with_libgen(ref)
             
             if libgen_matches:
@@ -1257,27 +1420,22 @@ class BibliographyEnhancer:
                     print(f"- {match.get('title', 'No title')}")
                     print(f"  URL: {match.get('url', 'No URL')}")
                     print(f"  Reason: {match.get('reason', 'No reason provided')}")
-                    print(f"  Source: {match.get('source', 'Unknown')}")
+                    print(f"  Source: {match.get('source', 'LibGen')}")
                     
                     if match.get('url'):  
                         if self.try_download_url(match['url'], match.get('source', "LibGen"), ref, downloads_dir):
                             ref['download_source'] = match.get('source', "LibGen")
-                            ref['download_reason'] = match.get('reason', 'Successfully downloaded')
+                            ref['download_reason'] = 'Successfully downloaded via LibGen' # More specific reason
                             download_success = True
                             file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
                             print(f"{GREEN}✓ Downloaded from: {match.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
+                            break # Exit LibGen loop on success
 
         # If all methods fail, mark as not found
         if not download_success:
             print(f"  {RED}✗ No valid matches found through any method{RESET}")
             ref['download_status'] = 'not_found'
             ref['download_reason'] = 'No valid matches found through any method'
-
-        if ref.get('referenced_works'):
-            print("\nProcessing referenced works...")
-            self.download_referenced_works(ref, downloads_dir)
-
-        ##input("Press Enter to continue to the next reference...")
 
         # Return the modified ref dictionary if download was successful, otherwise None
         if 'downloaded_file' in ref and ref['downloaded_file']:
@@ -1369,7 +1527,8 @@ class BibliographyEnhancer:
                 added_count += 1
                 work_title = enhanced_ref.get('title', 'Untitled')
                 work_id = enhanced_ref.get('id', 'Unknown ID').split('/')[-1]
-                print(f"    Added referenced work to input_references: {work_title[:60]} (ID: {work_id})")
+                title_for_print = (work_title[:60] + '...') if work_title and len(work_title) > 60 else (work_title or 'Untitled')
+                print(f"    Added referenced work to input_references: {title_for_print} (ID: {work_id or 'Unknown'})")
             except Exception as e:
                 print(f"Error processing referenced work {work_id}: {e}")
                 continue
@@ -1408,7 +1567,7 @@ class BibliographyEnhancer:
                     print(f"  Warning: ID field missing or invalid in reference data.")
                 if title == 'Untitled':
                     print(f"  Warning: Neither 'display_name' nor 'title' found in reference data.")
-                print(f"  Processing reference: {title[:60]} (ID: {ref_id})")
+                print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Processing reference: {title[:60]} (ID: {ref_id})")
 
                 referenced_works_urls = ref.get('referenced_works', [])
                 if not referenced_works_urls:
@@ -1445,9 +1604,8 @@ class BibliographyEnhancer:
                                     db_id = db_id_raw.split('/')[-1] if db_id_raw and isinstance(db_id_raw, str) and db_id_raw.startswith('https://openalex.org/') else db_id_raw
                                     if db_id and db_id == work_id:
                                         duplicate_found = True
-                                        table_title, metadata_json = result
-                                        title_to_show = table_title if table_title and table_title != '' else (json.loads(metadata_json).get('display_name', json.loads(metadata_json).get('title', 'Untitled')) if metadata_json else 'Untitled')
-                                        print(f"          Skipping referenced work already in database ({table}) based on DOI: {title_to_show[:60]} (ID: {work_id})")
+                                        title_to_show = metadata.get('display_name', metadata.get('title', 'Untitled'))
+                                        print(f"          Skipping referenced work already in database ({table}) based on ID match: {title_to_show[:60]} (ID: {work_id})")
                                         break
                                 except json.JSONDecodeError:
                                     continue
@@ -1501,9 +1659,10 @@ class BibliographyEnhancer:
                             continue
                         work_id = referenced_work_data.get('openalex_id', '').split('/')[-1]
                         processed_ids.append(work_id)
-                        print(f"        Processing referenced work ID: {work_id}")
+                        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Processing referenced work ID: {work_id}")
 
                         work_title = referenced_work_data.get('display_name', referenced_work_data.get('title', 'Untitled'))
+                        title_for_print = (work_title[:60] + '...') if work_title and len(work_title) > 60 else (work_title or 'Untitled')
                         ref_doi = referenced_work_data.get('doi', '').strip().lower() if referenced_work_data.get('doi') else ''
                         duplicate_found = False
 
@@ -1516,7 +1675,7 @@ class BibliographyEnhancer:
                                     if result:
                                         duplicate_found = True
                                         table_title, metadata_json = result
-                                        title_to_show = table_title if table_title and table_title != '' else (json.loads(metadata_json).get('display_name', json.loads(metadata_json).get('title', 'Untitled')) if metadata_json else 'Untitled')
+                                        title_to_show = metadata.get('display_name', metadata.get('title', 'Untitled')) if metadata_json else 'Untitled'
                                         print(f"          Skipping referenced work already in database ({table}) based on DOI: {title_to_show[:60]} (ID: {work_id})")
                                         break
                                 except sqlite3.OperationalError as e:
@@ -1544,7 +1703,7 @@ class BibliographyEnhancer:
                                 if author_names:
                                     for table in ['current_references', 'previous_references', 'input_references']:
                                         try:
-                                            cursor.execute("SELECT title, metadata FROM {table}")
+                                            cursor.execute(f"SELECT title, metadata FROM {table}")
                                             for row in cursor.fetchall():
                                                 table_title, metadata_json = row
                                                 if table_title and table_title.lower() == work_title.lower():
@@ -1583,7 +1742,7 @@ class BibliographyEnhancer:
                         # If it passed all checks, add it to the input table for later processing
                         add_reference_to_database(referenced_work_data, self.db_conn, table='input_references')
                         newly_added_count += 1
-                        print(f"          Added referenced work to input_references: {work_title[:60]} (ID: {work_id})")
+                        print(f"          Added referenced work to input_references: {title_for_print} (ID: {work_id})")
 
                     # Note any IDs that were requested but not returned in the results
                     missing_ids = [wid for wid in batch_ids if wid not in processed_ids]
@@ -1600,10 +1759,24 @@ class BibliographyEnhancer:
 
         print(f"--- Expansion complete: Processed {processed_origin_refs} origin refs, added {newly_added_count} new referenced works to input_references ---")
 
+    def enhance_bibliography_thread_safe(self, ref, downloads_dir, force_download=False):
+        """
+        Thread-safe wrapper for enhance_bibliography.
+        Creates a deep copy of the reference to avoid thread conflicts.
+        """
+        # Create a deep copy to avoid potential thread issues with shared data
+        ref_copy = copy.deepcopy(ref)
+        try:
+            return self.enhance_bibliography(ref_copy, downloads_dir, force_download)
+        except Exception as e:
+            print(f"Error in thread processing {ref_copy.get('title', 'Unknown')}: {e}")
+            # Re-raise to be caught by the executor
+            raise
+            
     def process_references_from_database(self, output_dir, max_concurrent=5, force_download=False, skip_referenced_works=False):
         """
-        Process references from the input_references table, checking for duplicates,
-        downloading if necessary, and updating database tables.
+        Process references from the input_references table with parallel downloads
+        maintaining a constant worker pool.
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1614,51 +1787,74 @@ class BibliographyEnhancer:
         cursor.execute("SELECT metadata FROM input_references")
         references_to_process = [json.loads(row[0]) for row in cursor.fetchall()]
         
-        download_tasks = []
-        processed_count = 0
         total_refs = len(references_to_process)
-        updated_references = [] # Store updated references after processing
-
-        print(f"\nProcessing {total_refs} references from database sequentially...")
-
-        # Sequential processing loop
-        for i, ref in enumerate(references_to_process):
-            print(f"\nProcessing reference {i+1}/{total_refs}: {ref.get('title', 'Untitled')}")
-            try: # ADD TRY BLOCK HERE
-                # Ensure downloads_dir is passed correctly as a Path object
-                updated_ref = self.enhance_bibliography(ref, downloads_dir, force_download=force_download)
-                updated_references.append(updated_ref) # Append the potentially modified ref
-            except Exception as e: # CATCH EXCEPTIONS HERE
-                print(f"{RED}!!! Error processing reference {ref.get('title', 'Untitled')}: {e}{RESET}")
-                # Optionally log the full traceback
-                # import traceback
-                # traceback.print_exc()
-                # Append the original ref or a modified one indicating error
-                ref['download_status'] = 'error'
-                ref['error_message'] = str(e)
-                updated_references.append(ref)
-
-            processed_count += 1
-            if processed_count % 10 == 0:
-                print(f"Processed {processed_count}/{total_refs} references...")
-                # Optionally save intermediate results here if needed
-                # self.save_partial_metadata(output_dir, updated_references)
+        updated_references = []
+        
+        # Create a work queue and results list
+        work_queue = Queue()
+        for ref in references_to_process:
+            work_queue.put(ref)
+        
+        print(f"\nProcessing {total_refs} references from database with {max_concurrent} constant workers...")
+        
+        processed_count = 0
+        active_futures = {}
+        
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            # Initialize the worker pool with initial tasks
+            for _ in range(min(max_concurrent, total_refs)):
+                if not work_queue.empty():
+                    ref = work_queue.get()
+                    future = executor.submit(
+                        self.enhance_bibliography_thread_safe, 
+                        ref, 
+                        downloads_dir,
+                        force_download
+                    )
+                    active_futures[future] = ref
+            
+            # Process results and add new tasks as workers become available
+            while active_futures:
+                # Wait for any future to complete
+                done, _ = wait(active_futures.keys(), return_when=FIRST_COMPLETED)
+                
+                for future in done:
+                    ref = active_futures.pop(future)
+                    
+                    try:
+                        updated_ref = future.result()
+                        if updated_ref:
+                            updated_references.append(updated_ref)
+                    except Exception as e:
+                        print(f"{RED}!!! Error processing reference {ref.get('title', 'Untitled')}: {e}{RESET}")
+                        ref['download_status'] = 'error'
+                        ref['error_message'] = str(e)
+                        updated_references.append(ref)
+                    
+                    processed_count += 1
+                    if processed_count % 5 == 0 or processed_count == total_refs:
+                        print(f"Processed {processed_count}/{total_refs} references...")
+                    
+                    # Immediately move ref from input to current after download attempt
+                    if 'downloaded_file' in ref:
+                        add_reference_to_database(ref, self.db_conn, 'current_references')
+                    remove_reference_from_input(ref, self.db_conn)
+                    self.db_conn.commit()
+                    
+                    # Add a new task if there are more references to process
+                    if not work_queue.empty():
+                        next_ref = work_queue.get()
+                        next_future = executor.submit(
+                            self.enhance_bibliography_thread_safe, 
+                            next_ref, 
+                            downloads_dir,
+                            force_download
+                        )
+                        active_futures[next_future] = next_ref
 
         print("\nFinished processing all references.")
 
-        # Update database with processed references
-        for ref in updated_references:
-            if ref:
-                if 'downloaded_file' in ref:
-                    add_reference_to_database(ref, self.db_conn, 'current_references')
-                    remove_reference_from_input(ref, self.db_conn)
-                else:
-                    remove_reference_from_input(ref, self.db_conn)
-        
-        # Commit all database changes made during this batch
-        self.db_conn.commit()
-        print("Database updates committed.")
-
+        print("\nFinished processing all references.")
         return processed_count
 
     def save_final_metadata(self, output_dir):
@@ -1786,49 +1982,99 @@ def process_file(json_file, enhancer, done_dir):
         # Move original file to done directory immediately after loading to database
         done_dir.mkdir(parents=True, exist_ok=True)
         target_path = done_dir / json_file.name
-        json_file.rename(target_path)
+        #json_file.rename(target_path)
         print(f"Moved processed file to {target_path}")
     except Exception as e:
         print(f"Error moving {json_file}: {e}")
 
+def test_scihub_search(doi_to_test):
+    """
+    Helper function to test the BibliographyEnhancer.search_with_scihub method.
+    
+    Args:
+        doi_to_test (str): The DOI to search for on Sci-Hub.
+    """
+    print(f"\n--- Testing Sci-Hub Search for DOI: {doi_to_test} ---")
+    enhancer = None  # Initialize enhancer to None
+    try:
+        # Instantiate the enhancer (using default db file and email)
+        # Make sure BibliographyEnhancer is defined before this point
+        enhancer = BibliographyEnhancer() 
+        
+        # Call the search function
+        # Ensure the necessary rate limiters and network components are ready
+        result = enhancer.search_with_scihub(doi_to_test)
+        
+        # Print the result
+        if result and isinstance(result, str):
+            print(f"{GREEN}Found potential download link:{RESET}")
+            print(f"  - URL: {result}")
+        else:
+            print(f"{YELLOW}No download links found via Sci-Hub for this DOI.{RESET}")
+            
+    except Exception as e:
+        print(f"{RED}An error occurred during the Sci-Hub test: {e}{RESET}")
+    finally:
+        # Explicitly clean up the enhancer instance if created, 
+        # which helps ensure resources like DB connections are closed via __del__.
+        if enhancer:
+            del enhancer
+    print("--- Sci-Hub Test Complete ---")
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Enhance bibliography data and download PDFs.")
-    parser.add_argument("--input", required=True, help="Input directory with JSON files")
-    parser.add_argument("--output", required=True, help="Output directory for enhanced results")
+    # Add the test argument - mutually exclusive with regular operation
+    parser.add_argument("--test-scihub", type=str, metavar='DOI', help="Run Sci-Hub test with the specified DOI and exit.")
+    
+    # Main operation arguments (conditionally required)
+    parser.add_argument("--input", required=False, help="Input directory with JSON files (required for main operation)")
+    parser.add_argument("--output", required=False, help="Output directory for enhanced results (required for main operation)")
     parser.add_argument("--done", default="done", help="Directory for processed input files")
     parser.add_argument("--force", action="store_true", help="Force download even if already downloaded")
     parser.add_argument("--load-metadata", help="Directory containing existing metadata.json files to load into database")
     parser.add_argument("--skip-referenced-works", action="store_true", help="Skip adding referenced works to input references")
     args = parser.parse_args()
     
-    enhancer = BibliographyEnhancer()
-    enhancer.results_dir = args.output
-    input_dir = Path(args.input)
-    done_dir = Path(args.done)
-    
-    # Load existing metadata if specified
-    if args.load_metadata:
-        load_metadata_to_database(args.load_metadata, enhancer.db_conn, 'previous_references')
-    
-    # Load input JSONs into database
-    input_dir.mkdir(parents=True, exist_ok=True)
-    load_input_jsons(str(input_dir), enhancer.db_conn, 'input_references')
-    
-    # Move input files to done directory after loading to database
-    json_files = list(input_dir.glob("*.json"))
-    for json_file in json_files:
-        process_file(json_file, enhancer, done_dir)
-    
-    # Expand input references with their referenced works before processing
-    if not args.skip_referenced_works:
-        enhancer._expand_inputs_with_referenced_works()
-    
-    # Process references from database
-    enhancer.process_references_from_database(args.output, force_download=args.force, skip_referenced_works=args.skip_referenced_works)
-    
-    # Save the final metadata file after all processing is complete
-    enhancer.save_final_metadata(args.output)
+    # --- Conditional Execution: Test or Main --- 
+    if args.test_scihub:
+        # Run the test and exit
+        test_scihub_search(args.test_scihub)
+        return 
+    else:
+        # --- Main Logic Pre-check --- 
+        # Check if required args are present for main logic
+        if not args.input or not args.output:
+            parser.error("The following arguments are required for main operation: --input, --output")
+        
+        # --- Main Logic Execution --- 
+        enhancer = BibliographyEnhancer()
+        enhancer.results_dir = args.output
+        input_dir = Path(args.input)
+        done_dir = Path(args.done)
+        
+        # Load existing metadata if specified
+        if args.load_metadata:
+            load_metadata_to_database(args.load_metadata, enhancer.db_conn, 'previous_references')
+        
+        # Load input JSONs into database
+        input_dir.mkdir(parents=True, exist_ok=True)
+        load_input_jsons(str(input_dir), enhancer.db_conn, 'input_references')
+        
+        # Move input files to done directory after loading to database
+        json_files = list(input_dir.glob("*.json"))
+        for json_file in json_files:
+            process_file(json_file, enhancer, done_dir)
+        
+        # Expand input references with their referenced works before processing
+        if not args.skip_referenced_works:
+            enhancer._expand_inputs_with_referenced_works()
+        
+        # Process references from database
+        enhancer.process_references_from_database(args.output, force_download=args.force, skip_referenced_works=args.skip_referenced_works)
+        
+        # Save the final metadata file after all processing is complete
+        enhancer.save_final_metadata(args.output)
 
 if __name__ == "__main__":
     main()

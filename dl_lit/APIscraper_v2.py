@@ -141,7 +141,7 @@ def upload_pdf_and_extract_bibliography(pdf_path):
         print(f"[DEBUG] Uploaded PDF as URI: {uploaded_file_uri}", flush=True)
         
         # Prepare the prompt for bibliography extraction
-        prompt = BIBLIOGRAPHY_PROMPT<
+        prompt = BIBLIOGRAPHY_PROMPT
         wait_for_rate_limit()
         
         # Send request to API with uploaded file
@@ -270,6 +270,7 @@ def process_directory_v2(input_dir, output_dir, max_workers=5):
     """Processes all PDFs in the input directory concurrently, saving to the specified output dir."""
     print(f"[INFO] Processing directory: {input_dir}", flush=True)
     print(f"[INFO] Using output directory: {output_dir}", flush=True)
+    os.makedirs(output_dir, exist_ok=True) # Ensure output directory exists
 
     # Find all PDFs recursively using glob
     pdf_files = glob.glob(os.path.join(input_dir, "**/*.pdf"), recursive=True)
@@ -359,6 +360,7 @@ if __name__ == "__main__":
         process_directory_v2(input_path, output_dir, max_workers)
     elif os.path.isfile(input_path) and input_path.lower().endswith('.pdf'):
         print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
+        os.makedirs(output_dir, exist_ok=True) # Ensure output directory exists
         summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
         process_single_pdf(input_path, output_dir, summary, Lock())
         print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
