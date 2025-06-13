@@ -354,6 +354,68 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error: {error_msg}{RESET}")
             return "error", None, error_msg
 
+    def get_all_downloaded_references_as_dicts(self) -> list[dict]:
+        """
+        Fetches all entries from the 'downloaded_references' table
+        and returns them as a list of dictionaries.
+        """
+        try:
+            # Ensure row_factory is set to sqlite3.Row for this operation
+            original_row_factory = self.conn.row_factory
+            self.conn.row_factory = sqlite3.Row
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT * FROM downloaded_references")
+            rows = cursor.fetchall()
+            self.conn.row_factory = original_row_factory # Reset row factory
+            return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"Error fetching all downloaded references: {e}")
+            # Ensure row factory is reset in case of error too
+            if hasattr(self, 'conn') and self.conn:
+                 self.conn.row_factory = original_row_factory if 'original_row_factory' in locals() else None
+            return []
+
+    def save_to_disk(self, target_disk_db_path: Path | str) -> bool:
+        """
+        Saves the current in-memory database to a specified disk file.
+        This is typically used if the DatabaseManager was initialized with ':memory:'.
+        It uses SQLite's backup functionality.
+
+        Args:
+            target_disk_db_path: The path to the disk file where the database should be saved.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not self.is_in_memory:
+            print(f"{YELLOW}[DB Manager] Warning: 'save_to_disk' called on a disk-based database. No action taken.{RESET}")
+            # Consider if this should be True or False. If it's not an error, True is fine.
+            return True 
+
+        target_path = Path(target_disk_db_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        print(f"{GREEN}[DB Manager] Attempting to save in-memory database to disk: {target_path.resolve()}{RESET}")
+        
+        disk_conn = None
+        try:
+            disk_conn = sqlite3.connect(str(target_path)) # Ensure path is string for connect
+            self.conn.backup(disk_conn) # self.conn is the in-memory connection
+            # backup implicitly handles transactions, commit on disk_conn might not be strictly needed
+            # but can be good for ensuring data is flushed.
+            disk_conn.commit() 
+            print(f"{GREEN}[DB Manager] Successfully saved database to {target_path.resolve()}{RESET}")
+            return True
+        except sqlite3.Error as e:
+            print(f"{RED}[DB Manager] SQLite error during save_to_disk: {e}{RESET}")
+            return False
+        except Exception as e:
+            print(f"{RED}[DB Manager] UNEXPECTED error during save_to_disk: {type(e).__name__} - {e}{RESET}")
+            return False
+        finally:
+            if disk_conn:
+                disk_conn.close()
+
     def close_connection(self):
         """Closes the database connection."""
         if self.conn:

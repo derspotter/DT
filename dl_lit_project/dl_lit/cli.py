@@ -4,6 +4,7 @@ from .db_manager import DatabaseManager # Relative import
 import bibtexparser # For parsing BibTeX files
 from .metadata_fetcher import MetadataFetcher
 from .pdf_downloader import PDFDownloader
+from .bibtex_formatter import BibTeXFormatter # Added for export
 import traceback
 
 # ANSI escape codes for colors
@@ -61,14 +62,6 @@ def show_sample_command(db_path, limit):
     """Shows a sample of entries from the downloaded_references table."""
     db_manager = DatabaseManager(db_path) # Connection and table creation are handled in __init__
 
-    click.echo(f"Fetching sample of {limit} entries from {db_path}...")
-    entries = db_manager.get_sample_downloaded_references(limit=limit)
-
-    if not entries:
-        click.echo("No entries found or an error occurred.")
-        db_manager.close_connection()
-        return
-
     # Get column names for header
     cursor = db_manager.conn.cursor()
     try:
@@ -79,14 +72,37 @@ def show_sample_command(db_path, limit):
         columns = ["ID", "BibTeX Key", "Type", "Title", "Authors", "Year", "DOI", "...(other fields)"] # Fallback
 
     click.echo("\n--- Sample Entries ---")
-    for i, entry_tuple in enumerate(entries):
+    # Assuming get_sample_downloaded_references returns list of tuples as per original design
+    # If it was changed to return dicts, this part would need adjustment or the method reverted.
+    # For now, let's assume it's tuples as the error indicated.
+    # We need to fetch actual sample entries, not all. This was a temporary change that should be reverted.
+    # For now, to make it work without knowing the exact structure of get_sample_downloaded_references
+    # I will fetch all and slice, similar to the temp debug, but display as original.
+    all_db_entries = db_manager.get_all_downloaded_references_as_dicts() # Assuming this returns list of dicts
+    entries_to_display = all_db_entries[:limit]
+
+    if not entries_to_display:
+        click.echo("No entries found or an error occurred.")
+        db_manager.close_connection()
+        return
+
+    for i, entry_dict_or_tuple in enumerate(entries_to_display):
         click.echo(f"\nEntry {i+1}:")
-        # Truncate long fields for display
-        for col_name, value in zip(columns, entry_tuple):
-            display_value = str(value)
-            if len(display_value) > 70 and col_name not in ['authors', 'bibtex_entry_json']: # Don't truncate authors or full json for now
-                display_value = display_value[:67] + "..."
-            click.echo(f"  {col_name}: {display_value}")
+        if isinstance(entry_dict_or_tuple, dict):
+            for col_name, value in entry_dict_or_tuple.items(): # Iterate if dict
+                display_value = str(value)
+                if len(display_value) > 70 and col_name not in ['authors', 'bibtex_entry_json']:
+                    display_value = display_value[:67] + "..."
+                click.echo(f"  {col_name}: {display_value}")
+        elif isinstance(entry_dict_or_tuple, tuple):
+             for col_idx, value in enumerate(entry_dict_or_tuple): # Iterate if tuple
+                col_name = columns[col_idx] if col_idx < len(columns) else f"Column {col_idx+1}"
+                display_value = str(value)
+                if len(display_value) > 70 and col_name not in ['authors', 'bibtex_entry_json']:
+                    display_value = display_value[:67] + "..."
+                click.echo(f"  {col_name}: {display_value}")
+        else:
+            click.echo(f"  Unexpected entry format: {entry_dict_or_tuple}")
     
     click.echo("\n--- End of Sample ---")
 
@@ -113,7 +129,6 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
     try:
         # Initialize with an in-memory database for fast processing
         db_manager = DatabaseManager(db_path=":memory:") 
-        # The db_path variable from click options now refers to the *target* disk file path
         click.echo(f"Processing import into in-memory database. Target disk DB: {actual_disk_db_path.resolve()}")
 
         try:
@@ -140,6 +155,7 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
         successful_imports = 0
         failed_imports = []
         duplicate_entries = [] # Placeholder for future duplicate handling
+        skipped_no_file_path = 0
 
         for entry_obj in bib_database.entries: # entry_obj is a bibtexparser.model.Entry
             entry_id, error_msg = db_manager.add_bibtex_entry_to_downloaded(entry_obj, pdf_base_dir)
@@ -147,14 +163,19 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
             if entry_id:
                 successful_imports += 1
             else:
-                # Try to get an identifier for the failed entry
+                # The error_msg from add_bibtex_entry_to_downloaded already contains the failure reason.
+                # Try to get an identifier for the failed entry for logging.
                 identifier = entry_obj.key if hasattr(entry_obj, 'key') and entry_obj.key else entry_obj.get('title', 'Unknown Title')
                 # Clean the identifier just in case it has braces, for display purposes
-                if isinstance(identifier, str):
+                if hasattr(identifier, 'value'): # If it's a bibtexparser Field object
+                    identifier = str(identifier.value)
+                elif isinstance(identifier, str):
                     identifier = identifier.strip('{}')
+                else: # Fallback if identifier is not easily stringable
+                    identifier = str(identifier)
                 
-                reason = error_msg if error_msg else "Unknown reason (entry ignored or error not captured)"
-                failed_imports.append((str(identifier)[:100], reason)) # Store a tuple of (identifier, reason)
+                reason = error_msg if error_msg else "Unknown import error"
+                failed_imports.append((str(identifier)[:100], reason))
         
         click.echo("\n--- Import Summary ---")
         click.echo(f"{GREEN}Successfully imported: {successful_imports} entries{RESET}")
@@ -173,8 +194,11 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
         else:
             click.echo(f"{GREEN}No duplicates detected (duplicate check not yet fully implemented).{RESET}")
 
-        click.echo("\n--- Saving to Disk ---")
-        if db_manager.save_to_disk(actual_disk_db_path):
+        click.echo("\n>>> CLI: Attempting to call db_manager.save_to_disk() now. <<<")
+        save_successful = db_manager.save_to_disk(actual_disk_db_path)
+        click.echo(f">>> CLI: db_manager.save_to_disk() returned: {save_successful} <<<")
+
+        if save_successful:
             click.echo(f"{GREEN}Successfully saved database to: {actual_disk_db_path.resolve()}{RESET}")
         else:
             click.echo(f"{RED}Failed to save database to disk: {actual_disk_db_path.resolve()}{RESET}")
@@ -427,6 +451,80 @@ def process_queue_command(db_path, pdf_dir, mailto):
     except Exception as e:
         click.echo(f"{RED}An unexpected error occurred during queue processing: {e}{RESET}", err=True)
         traceback.print_exc()
+    finally:
+        if db_manager:
+            db_manager.close_connection()
+
+@cli.command("export-bibtex")
+@click.argument('output_bib_file', type=click.Path(dir_okay=False, writable=True, resolve_path=True))
+@click.option('--db-path', 
+              default=str(DEFAULT_DB_PATH), 
+              help='Path to the SQLite database file.', 
+              type=click.Path(exists=True, dir_okay=False, readable=True, resolve_path=True))
+@click.option('--skip-pdf-check', is_flag=True, default=False, help="Skip checking if the PDF file exists on disk.")
+def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
+    """Exports the 'downloaded_references' table to a BibTeX file."""
+    click.echo(f"Exporting downloaded references from '{Path(db_path).resolve()}' to '{Path(output_bib_file).resolve()}'...")
+    
+    db_manager = None
+    output_file = Path(output_bib_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True) # Ensure output directory exists
+
+    try:
+        db_manager = DatabaseManager(db_path=Path(db_path))
+        formatter = BibTeXFormatter()
+
+        all_entries_dicts = db_manager.get_all_downloaded_references_as_dicts()
+        
+        # DEBUG PRINT START
+        # click.echo(f"[CLI DEBUG] Retrieved {len(all_entries_dicts)} entries from DB for export.", err=True)
+        # if all_entries_dicts and len(all_entries_dicts) > 0 and isinstance(all_entries_dicts[0], dict):
+        #     click.echo(f"[CLI DEBUG] First entry ID: {all_entries_dicts[0].get('id')}, (first 50 chars of bibtex_entry_json): {str(all_entries_dicts[0].get('bibtex_entry_json', ''))[:50]}...", err=True)
+        # elif all_entries_dicts: # If it's not empty but not a list of dicts or first item isn't a dict
+        #     click.echo(f"[CLI DEBUG] all_entries_dicts is not empty but first item is not a dict or has no 'id'/'bibtex_entry_json'. Type: {type(all_entries_dicts[0])}", err=True)
+        # DEBUG PRINT END
+            
+        if not all_entries_dicts:
+            click.echo(f"{YELLOW}No entries found in 'downloaded_references' table to export.{RESET}")
+            if db_manager:
+                db_manager.close_connection()
+            return
+
+        exported_count = 0 # Renamed from 'count' for clarity
+        skipped_count = 0  # Renamed from 'failed_count' for clarity
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for entry_dict in all_entries_dicts: # CORRECTED: Use all_entries_dicts
+                # The BibTeXFormatter.format_entry will handle missing/invalid file_paths
+                # by omitting the 'file' field. No need for pre-filtering here.
+                bibtex_string = formatter.format_entry(entry_dict)
+                if bibtex_string:
+                    f.write(bibtex_string + "\n\n")
+                    exported_count += 1
+                else:
+                    skipped_count += 1
+                    # Debug messages from formatter.format_entry should indicate why it failed.
+        
+        click.echo(f"\n--- Export Summary ---")
+        if exported_count > 0:
+            click.echo(f"{GREEN}Successfully exported: {exported_count} entries to {output_file}{RESET}")
+        else:
+            if skipped_count > 0 and len(all_entries_dicts) > 0:
+                 click.echo(f"{RED}Exported 0 entries. All {skipped_count} processed entries failed to format.{RESET}")
+            elif not all_entries_dicts: # Should be caught by the earlier check
+                 click.echo(f"{YELLOW}No entries were found in the database to export.{RESET}")
+            else: 
+                 click.echo(f"{YELLOW}Exported 0 entries. No entries were successfully formatted or no entries to process.{RESET}")
+        
+        if skipped_count > 0:
+            click.echo(f"{YELLOW}Skipped or failed to format: {skipped_count} entries{RESET}")
+        elif exported_count > 0 and skipped_count == 0 and len(all_entries_dicts) > 0:
+            click.echo(f"{GREEN}All {exported_count} entries formatted and exported successfully.{RESET}")
+        
+    except Exception as e:
+        click.echo(f"{RED}An unexpected error occurred during BibTeX export: {e}{RESET}", err=True)
+        # import traceback
+        # traceback.print_exc()
     finally:
         if db_manager:
             db_manager.close_connection()

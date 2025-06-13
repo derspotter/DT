@@ -30,7 +30,7 @@ The new script will be designed with modularity in mind. Potential modules/class
 
 *   **`InputProcessor` (`input_processor.py`)**:
     *   Responsible for parsing and processing various input formats.
-    *   **Handles BibTeX files for initial library import into `downloaded_references`.**
+    *   **Handles BibTeX files for initial library import into `downloaded_references`. (Implemented and Verified)**
     *   Handles BibTeX files for checking against an existing library (populating `duplicate_references`).
     *   Handles JSON files (e.g., lists of DOIs, OpenAlex IDs, titles, or URLs to populate `to_download_references`).
     *   Could be extended for other formats (e.g., RIS, CSV) in the future.
@@ -64,6 +64,7 @@ The new script will be designed with modularity in mind. Potential modules/class
     *   Responsible for generating BibTeX entries from the structured data in `downloaded_references`.
     *   Uses `bibtexparser` to construct valid BibTeX entries.
     *   Handles conversion of internal data format (e.g., author lists, keywords) to BibTeX conventions.
+    *   **Correctly formats the `file` field as `{{filename.pdf:PDF}}` using the `file_path` from the database. (Implemented and Verified)**
 
 *   **`WorkflowManager` (or integrated into `main.py` / CLI handlers)**:
     *   Orchestrates the different workflows by coordinating calls between the other components.
@@ -72,11 +73,11 @@ The new script will be designed with modularity in mind. Potential modules/class
     *   Uses `argparse` (or a similar library like Click/Typer) for a user-friendly command-line interface.
     *   Defines subcommands for different operations:
         *   `init-db`: Initializes or updates the database schema.
-        *   **`import-bib <path_to_bib.bib> [--pdf-base-dir <path>]`**: Imports an existing BibTeX library into `downloaded_references`.**
+        *   **`import-bib <path_to_bib.bib> [--pdf-base-dir <path>]`**: Imports an existing BibTeX library into `downloaded_references`. **(Implemented and Verified)**
         *   `add-json <path_to_json>`: Processes a JSON file to add new references to the download queue.
         *   `check-bibtex <path_to_bib>`: Checks an external BibTeX file for duplicates against the existing library.
         *   `process-queue`: Attempts to download and process entries from `to_download_references`.
-        *   `export-bibtex <output_path.bib>`: Exports the `downloaded_references` table to a BibTeX file.
+        *   `export-bibtex <output_path.bib>`: Exports the `downloaded_references` table to a BibTeX file. **(Implemented and Verified)**
         *   `list-table <table_name>`: Utility to view contents of a specific table.
         *   `find-entry <query>`: Search functionality.
         *   `enrich-entry <id_in_downloaded_references>`: (New idea) Command to fetch more metadata/PDF for an existing entry.
@@ -113,10 +114,10 @@ Four main tables with a consistent core structure:
     1.  User runs `dl-lit init-db`.
     2.  `DatabaseManager` creates all tables if they don't exist, applying the defined schema.
 
-*   **Initial Library Import from BibTeX**:
+*   **Initial Library Import from BibTeX (Implemented and Verified)**:
     1.  User runs `dl-lit import-bib metadata.bib [--pdf-base-dir ./my_pdfs/] [--db-path path/to/final.db]</code>.
     2.  The `import-bib` command initializes `DatabaseManager` with an **in-memory database (`:memory:`)** for fast processing.
-    3.  `InputProcessor` (or logic within the CLI command) parses `metadata.bib`.
+    3.  Logic within the CLI command, utilizing `bibtexparser`, parses `metadata.bib`.
     4.  For each entry:
         a.  Extracts all relevant fields (title, author, year, doi, journal, volume, number, pages, publisher, BibTeX key, entry type).
         b.  Parses `file` field to get PDF filename. Combines with `--pdf-base-dir` if provided to form `file_path`.
@@ -124,11 +125,10 @@ Four main tables with a consistent core structure:
         d.  Stores the full parsed entry as `bibtex_entry_json`.
         e.  Sets `metadata_source_type` to `'bibtex_import'`.
         f.  `DatabaseManager` attempts to insert into the in-memory `downloaded_references` table.
-            *   **Title Handling**: If the `title` field is missing from the BibTeX entry, a placeholder title is generated (e.g., `"[Title from Key: {bibtex_key}]"` if the BibTeX key exists, or `"[No Title or Key Available]"` otherwise). This ensures the `NOT NULL` constraint on the `title` column is always satisfied.
-            *   The `DatabaseManager` uses the normalized DOI for these checks and for storing the DOI value. If the entry is otherwise valid and does not violate other constraints (like `UNIQUE` constraints on the normalized `doi` or `openalex_id` if these fields are populated and already exist), it's added.
-            *   If an entry still fails due to a `UNIQUE` constraint violation (e.g., on `doi` or `openalex_id`), the insertion fails, and the **specific SQLite error message is logged** (e.g., "UNIQUE constraint failed: downloaded_references.doi").
-    5.  After processing all entries, the `import-bib` command calls `db_manager.save_to_disk(target_disk_db_path)` to persist the entire contents of the in-memory database to the final target disk file (specified by `--db-path` or its default).
-    6.  **Performance Note**: This in-memory approach significantly speeds up the import of large BibTeX files by minimizing disk I/O during individual entry processing.
+            *   **Title Handling**: If the `title` field is missing from the BibTeX entry, a placeholder title is generated. This ensures the `NOT NULL` constraint on the `title` column is always satisfied.
+            *   The `DatabaseManager` uses the normalized DOI for duplicate checks and for storing the DOI value. If an entry violates `UNIQUE` constraints (e.g., on normalized `doi`), it's skipped and logged.
+    5.  After processing all entries, the `import-bib` command calls `db_manager.save_to_disk(target_disk_db_path)` to persist the entire contents of the in-memory database to the final target disk file.
+    6.  **Performance Note**: This in-memory approach significantly speeds up the import of large BibTeX files.
 
 *   **Adding New Items from JSON (for download queue)**:
     1.  User runs `dl-lit add-json items.json`.
@@ -160,11 +160,11 @@ Four main tables with a consistent core structure:
         d.  If fails:
             i.  `DatabaseManager` moves to `failed_downloads`, removes from `to_download_references`.
 
-*   **Exporting Library to BibTeX**:
+*   **Exporting Library to BibTeX (Implemented and Verified)**:
     1.  User runs `dl-lit export-bibtex library.bib`.
-    2.  `DatabaseManager` fetches from `downloaded_references`.
-    3.  `BibTeXFormatter` generates BibTeX strings from `bibtex_entry_json`.
-    4.  Written to `library.bib`.
+    2.  `DatabaseManager` fetches all entries from `downloaded_references` as dictionaries.
+    3.  `BibTeXFormatter.format_entry` generates BibTeX strings, primarily using `bibtex_entry_json` and supplementing with `file_path` from the database to correctly format the `file` field.
+    4.  Formatted entries are written to `library.bib`.
 
 ## 5. Key Libraries/Dependencies
 
@@ -207,4 +207,6 @@ dl_lit_project/
 1.  Set up the project directory structure.
 2.  Begin implementation with `db_manager.py` and the database schema.
 3.  Develop the CLI structure (`main_cli.py`) with `argparse`, starting with `init-db` and `import-bib`.
-4.  Implement the `import-bib` workflow end-to-end.
+4.  Implement the `import-bib` workflow end-to-end. **(Done)**
+5.  Implement the `export-bibtex` workflow end-to-end. **(Done)**
+6.  Continue with other planned workflows (e.g., `add-json`, `process-queue`).
