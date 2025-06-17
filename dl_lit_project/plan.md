@@ -90,6 +90,7 @@ The new script will be designed with modularity in mind. Potential modules/class
         *   `find-entry <query>`: Search functionality.
         *   `enrich-entry <id_in_downloaded_references>`: (New idea) Command to fetch more metadata/PDF for an existing entry.
         *   `extract-bib-pages <pdf_file_path> [--output-dir <path>]`: Extracts bibliography/reference section pages from a given PDF file. **(Implemented and Verified)**
+        *   `extract-bib-api --input-path <path> --output-dir <path> [--workers <num>]`: Extracts bibliographies from PDF(s) using an API and saves them as JSON files. **(Implemented)**
 
 *   **`Utils` (`utils.py`)**:
     *   Common utility functions:
@@ -189,6 +190,20 @@ Four main tables with a consistent core structure:
         h.  Cleans up temporary files and uploaded AI assets.
     4.  The CLI reports the completion or any errors encountered during the process.
 
+*   **Extracting Bibliographies via API (Implemented)**:
+    1.  User runs `dl-lit extract-bib-api --input-path /path/to/pdf_or_dir --output-dir /path/to/output/ [--workers 5]`.
+    2.  The `extract-bib-api` command in `cli.py` calls `configure_api_client()` from `APIscraper_v2.py`.
+    3.  If API client configuration is successful, it then calls either `process_directory_v2()` or `process_single_pdf()` from `APIscraper_v2.py` based on the `input-path`.
+    4.  `APIscraper_v2.py` handles:
+        a.  Finding PDF files (recursively if `input-path` is a directory).
+        b.  For each PDF, uploading it to the configured Generative AI service.
+        c.  Sending a prompt to extract bibliography entries in a structured JSON format.
+        d.  Managing API rate limits.
+        e.  Saving the returned JSON data to a file in the specified `output-dir`.
+        f.  Concurrent processing using a thread pool.
+    5.  Requires `GOOGLE_API_KEY` environment variable.
+    6.  The CLI reports the progress and summary of the extraction process.
+
 ## 5. Key Libraries/Dependencies
 
 *   `sqlite3`
@@ -200,7 +215,8 @@ Four main tables with a consistent core structure:
 *   `google-generativeai` (for bibliography extraction)
 *   `pikepdf` (for PDF manipulation in bibliography extraction)
 *   `python-dotenv` (for managing API keys)
-*   Standard library: `json`, `logging`, `glob`.
+*   `pdfminer.six` (as a potential local text extraction fallback in APIscraper_v2)
+*   Standard library: `json`, `logging`, `glob`, `concurrent.futures`, `threading`.
 
 ## 6. Proposed Directory Structure
 
@@ -217,6 +233,7 @@ dl_lit_project/
 │   ├── config_manager.py       # (Planned)
 │   ├── utils.py
 │   ├── get_bib_pages.py      # Bibliography extraction logic
+│   ├── APIscraper_v2.py      # API-based bibliography extraction from PDFs
 │   └── models.py               # (Planned) Pydantic models, enums
 ├── data/                       # Default location for database and PDFs
 │   ├── literature.db
@@ -236,5 +253,6 @@ dl_lit_project/
 3.  Develop the CLI structure (`main_cli.py`) with `argparse`, starting with `init-db` and `import-bib`.
 4.  Implement the `import-bib` workflow end-to-end. **(Done)**
 5.  Implement the `export-bibtex` workflow end-to-end. **(Done)**
-6.  Implement bibliography extraction from PDFs. **(Done)**
-7.  Continue with other planned workflows (e.g., `add-json`, `process-queue`).
+6.  Implement bibliography extraction from PDFs using local processing (`extract-bib-pages`). **(Done)**
+7.  Implement bibliography extraction from PDFs using API (`extract-bib-api`). **(Done)**
+8.  Continue with other planned workflows (e.g., `add-json`, `process-queue`).

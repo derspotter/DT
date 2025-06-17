@@ -16,6 +16,11 @@ WHITE = "\033[97m"
 from .pdf_downloader import PDFDownloader
 from .bibtex_formatter import BibTeXFormatter # Added for export
 from .get_bib_pages import extract_reference_sections # Added for bibliography extraction
+from .APIscraper_v2 import configure_api_client, process_directory_v2, process_single_pdf # Added for API scraping
+from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_file, process_bibliography_files # Added for OpenAlex scraping
+import os # Added for API scraping and OpenAlexScraper path checks
+from pathlib import Path # Already imported, but ensure it's available for OpenAlexScraper logic if needed directly in CLI
+from threading import Lock # Added for API scraping
 import traceback
 
 # ANSI escape codes for colors
@@ -636,6 +641,129 @@ def extract_bib_pages_command(pdf_file_path, output_dir):
         # For more detailed debugging, you might want to print the traceback
         # import traceback
         # traceback.print_exc()
+
+@cli.command("extract-bib-api")
+@click.option('--input-path', 
+              type=click.Path(exists=True, readable=True),
+              required=True,
+              help='Path to the input PDF file or directory containing PDF files.')
+@click.option('--output-dir', 
+              type=click.Path(file_okay=False, writable=True),
+              required=True,
+              help='Directory to save output JSON bibliography files.')
+@click.option('--workers', 
+              type=int, 
+              default=5, 
+              show_default=True,
+              help='Maximum number of concurrent worker threads.')
+def extract_bib_api_command(input_path, output_dir, workers):
+    """Extracts bibliographies from PDF(s) using an API and saves them as JSON files."""
+    click.echo(f"{CYAN}--- Starting API Bibliography Extraction ---{RESET}")
+    click.echo(f"Input path: {input_path}")
+    click.echo(f"Output directory: {output_dir}")
+    click.echo(f"Max workers: {workers}")
+
+    # Ensure output directory exists
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        click.echo(f"Ensured output directory exists: {Path(output_dir).resolve()}")
+    except Exception as e:
+        click.echo(f"{RED}Error creating output directory {output_dir}: {e}{RESET}", err=True)
+        return
+
+    click.echo("Configuring API client...")
+    if not configure_api_client():
+        click.echo(f"{RED}Failed to configure API client. Please check your GOOGLE_API_KEY and .env file.{RESET}", err=True)
+        click.echo(f"{RED}Exiting due to API configuration failure.{RESET}", err=True)
+        return
+    click.echo(f"{GREEN}API client configured successfully.{RESET}")
+
+    input_p = Path(input_path)
+    output_d = Path(output_dir)
+
+    try:
+        if input_p.is_dir():
+            click.echo(f"Processing directory: {input_p.resolve()}")
+            process_directory_v2(str(input_p.resolve()), str(output_d.resolve()), workers)
+        elif input_p.is_file() and input_p.name.lower().endswith('.pdf'):
+            click.echo(f"Processing single PDF file: {input_p.resolve()}")
+            # For single_pdf, process_single_pdf expects a summary_dict and a lock
+            summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
+            summary_lock = Lock()
+            process_single_pdf(str(input_p.resolve()), str(output_d.resolve()), summary, summary_lock)
+            # Print summary for single file processing
+            click.echo(f"\n--- Single File Processing Summary ---")
+            click.echo(f"File processed: {summary['processed_files']}")
+            click.echo(f"Successful extraction: {summary['successful_files']}")
+            click.echo(f"Failed extraction: {summary['failed_files']}")
+            if summary['failures']:
+                click.echo(f"{RED}Failure: {summary['failures'][0]['reason']}{RESET}")
+            click.echo("-------------------------")
+        else:
+            click.echo(f"{RED}Error: Input path {input_path} is neither a valid directory nor a PDF file.{RESET}", err=True)
+            return
+        
+        click.echo(f"\n{GREEN}--- API Bibliography Extraction Completed ---{RESET}")
+        click.echo(f"Output JSON files should be in: {output_d.resolve()}")
+
+    except Exception as e:
+        click.echo(f"{RED}An unexpected error occurred during API bibliography extraction: {e}{RESET}", err=True)
+        click.echo(traceback.format_exc(), err=True)
+
+@cli.command("enrich-openalex")
+@click.option('--input-path', 
+              type=click.Path(exists=True, readable=True, resolve_path=True),
+              required=True, 
+              help='Path to the input JSON file or directory containing JSON files to enrich.')
+@click.option('--output-dir', 
+              type=click.Path(file_okay=False, writable=True, resolve_path=True),
+              required=True, 
+              help='Directory to save the enriched JSON output files.')
+@click.option('--mailto', 
+              type=str, 
+              required=True, 
+              help='Your email address for OpenAlex API politeness (User-Agent).')
+@click.option('--fetch-citations/--no-fetch-citations', 
+              default=True, 
+              show_default=True, 
+              help='Fetch citing work IDs from OpenAlex for matched entries.')
+def enrich_openalex_command(input_path, output_dir, mailto, fetch_citations):
+    """Enriches bibliography JSON files with data from OpenAlex and Crossref."""
+    click.echo(f"{CYAN}Starting OpenAlex enrichment process...{RESET}")
+    click.echo(f"Input path: {input_path}")
+    click.echo(f"Output directory: {output_dir}")
+    click.echo(f"Mailto (for API): {mailto}")
+    click.echo(f"Fetch citations: {'Enabled' if fetch_citations else 'Disabled'}")
+
+    input_p = Path(input_path)
+    output_p = Path(output_dir)
+
+    try:
+        output_p.mkdir(parents=True, exist_ok=True)
+        click.echo(f"Ensured output directory exists: {output_p.resolve()}")
+
+        searcher = OpenAlexCrossrefSearcher(mailto=mailto)
+        click.echo("OpenAlexCrossrefSearcher initialized.")
+
+        if input_p.is_file():
+            if input_p.suffix.lower() != '.json':
+                click.echo(f"{RED}Error: Input file must be a .json file.{RESET}")
+                return
+            click.echo(f"Processing single file: {input_p.name}")
+            process_single_file(str(input_p), str(output_p), searcher, fetch_citations)
+        elif input_p.is_dir():
+            click.echo(f"Processing directory: {input_p.resolve()}")
+            process_bibliography_files(str(input_p), str(output_p), searcher, fetch_citations)
+        else:
+            click.echo(f"{RED}Error: Input path is neither a file nor a directory.{RESET}")
+            return
+        
+        click.echo(f"{GREEN}OpenAlex enrichment process completed.{RESET}")
+        click.echo(f"Output saved to: {output_p.resolve()}")
+
+    except Exception as e:
+        click.echo(f"{RED}An error occurred during OpenAlex enrichment: {e}{RESET}")
+        click.echo(f"{YELLOW}Traceback:\n{traceback.format_exc()}{RESET}")
 
 if __name__ == '__main__':
     cli()
