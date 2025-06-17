@@ -66,6 +66,14 @@ The new script will be designed with modularity in mind. Potential modules/class
     *   Handles conversion of internal data format (e.g., author lists, keywords) to BibTeX conventions.
     *   **Correctly formats the `file` field as `{{filename.pdf:PDF}}` using the `file_path` from the database. (Implemented and Verified)**
 
+*   **`BibliographyExtractor` (`get_bib_pages.py`)**: 
+    *   Responsible for identifying and extracting bibliography/reference sections from PDF files.
+    *   Uses Google Generative AI (Gemini models) to analyze PDF content and determine page ranges for reference sections.
+    *   Handles PDF parsing (using `pikepdf`) to extract specific pages.
+    *   Manages API calls to Google AI, including file uploads and prompt engineering for accurate section detection and page number offset calculation.
+    *   Saves the extracted bibliography pages as separate PDF files.
+    *   **Requires `GOOGLE_API_KEY` environment variable for GenAI services. (Implemented and Verified)**
+
 *   **`WorkflowManager` (or integrated into `main.py` / CLI handlers)**:
     *   Orchestrates the different workflows by coordinating calls between the other components.
 
@@ -81,6 +89,7 @@ The new script will be designed with modularity in mind. Potential modules/class
         *   `list-table <table_name>`: Utility to view contents of a specific table.
         *   `find-entry <query>`: Search functionality.
         *   `enrich-entry <id_in_downloaded_references>`: (New idea) Command to fetch more metadata/PDF for an existing entry.
+        *   `extract-bib-pages <pdf_file_path> [--output-dir <path>]`: Extracts bibliography/reference section pages from a given PDF file. **(Implemented and Verified)**
 
 *   **`Utils` (`utils.py`)**:
     *   Common utility functions:
@@ -166,6 +175,20 @@ Four main tables with a consistent core structure:
     3.  `BibTeXFormatter.format_entry` generates BibTeX strings, primarily using `bibtex_entry_json` and supplementing with `file_path` from the database to correctly format the `file` field.
     4.  Formatted entries are written to `library.bib`.
 
+*   **Extracting Bibliography Pages from PDF (Implemented and Verified)**:
+    1.  User runs `dl-lit extract-bib-pages /path/to/document.pdf [--output-dir /path/to/output/] `.
+    2.  The `extract-bib-pages` command in `cli.py` calls the `extract_reference_sections` function from `get_bib_pages.py`.
+    3.  `get_bib_pages.py` script:
+        a.  Initializes Google Generative AI model (e.g., Gemini Flash).
+        b.  Uploads the target PDF to the AI service.
+        c.  Sends prompts to the AI to identify the start and end pages of all reference/bibliography sections within the PDF.
+        d.  Sends prompts to the AI with sample pages to detect any offset between printed page numbers and physical page indices.
+        e.  Adjusts the AI-identified section page numbers based on the detected offset to get correct physical page indices.
+        f.  Uses `pikepdf` to open the original PDF and extract the determined physical page ranges corresponding to the reference sections.
+        g.  Saves each extracted reference section as a new PDF file in the specified output directory (or a default one).
+        h.  Cleans up temporary files and uploaded AI assets.
+    4.  The CLI reports the completion or any errors encountered during the process.
+
 ## 5. Key Libraries/Dependencies
 
 *   `sqlite3`
@@ -174,6 +197,9 @@ Four main tables with a consistent core structure:
 *   `argparse` (or `click`/`typer`)
 *   `pydantic`
 *   `pathlib`
+*   `google-generativeai` (for bibliography extraction)
+*   `pikepdf` (for PDF manipulation in bibliography extraction)
+*   `python-dotenv` (for managing API keys)
 *   Standard library: `json`, `logging`, `glob`.
 
 ## 6. Proposed Directory Structure
@@ -190,6 +216,7 @@ dl_lit_project/
 │   ├── bibtex_formatter.py
 │   ├── config_manager.py       # (Planned)
 │   ├── utils.py
+│   ├── get_bib_pages.py      # Bibliography extraction logic
 │   └── models.py               # (Planned) Pydantic models, enums
 ├── data/                       # Default location for database and PDFs
 │   ├── literature.db
@@ -209,4 +236,5 @@ dl_lit_project/
 3.  Develop the CLI structure (`main_cli.py`) with `argparse`, starting with `init-db` and `import-bib`.
 4.  Implement the `import-bib` workflow end-to-end. **(Done)**
 5.  Implement the `export-bibtex` workflow end-to-end. **(Done)**
-6.  Continue with other planned workflows (e.g., `add-json`, `process-queue`).
+6.  Implement bibliography extraction from PDFs. **(Done)**
+7.  Continue with other planned workflows (e.g., `add-json`, `process-queue`).

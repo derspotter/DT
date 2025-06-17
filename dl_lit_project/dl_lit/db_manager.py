@@ -5,10 +5,12 @@ import re
 from .utils import parse_bibtex_file_field
 
 # ANSI escape codes for colors
-GREEN = '\033[92m'
-RED = '\033[91m'
-YELLOW = '\033[93m'
-RESET = '\033[0m'
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+CYAN = "\033[96m"
+RESET = "\033[0m"
 
 class DatabaseManager:
     """Manages all SQLite database interactions for the literature management tool."""
@@ -39,6 +41,15 @@ class DatabaseManager:
         else:
             print(f"{GREEN}[DB Manager] Connected to database: {self.db_path.resolve()}{RESET}")
         self._create_schema()
+
+    def close_connection(self):
+        """Closes the database connection."""
+        if hasattr(self, 'conn') and self.conn:
+            print(f"{GREEN}[DB Manager] Closing connection to {self.db_path}{RESET}")
+            self.conn.close()
+            self.conn = None # Indicate that the connection is closed
+        else:
+            print(f"{YELLOW}[DB Manager] Connection already closed or not established for {self.db_path}.{RESET}")
 
     def _create_schema(self):
         """Creates the database schema, including all necessary tables if they don't exist."""
@@ -119,29 +130,17 @@ class DatabaseManager:
                 bibtex_key TEXT,
                 entry_type TEXT,
                 title TEXT NOT NULL,
-                authors TEXT,
+                authors TEXT, -- JSON list of strings
                 year INTEGER,
-                doi TEXT,
-                pmid TEXT,
-                arxiv_id TEXT,
-                openalex_id TEXT,
-                semantic_scholar_id TEXT,
-                mag_id TEXT,
-                url_source TEXT, -- Source of this duplicate entry
-                file_path TEXT, -- Path of the file if it was a duplicate file
-                abstract TEXT,
-                keywords TEXT,
-                journal_conference TEXT,
-                volume TEXT,
-                issue TEXT,
-                pages TEXT,
-                publisher TEXT,
-                metadata_source_type TEXT, -- e.g., 'input_bib_parsed'
-                bibtex_entry_json TEXT, -- Bib entry of the duplicate
-                status_notes TEXT, -- e.g., 'Duplicate of downloaded_references.id=X (DOI match)'
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_processed TIMESTAMP,
-                checksum_pdf TEXT
+                doi TEXT, -- Normalized DOI of the duplicate entry
+                openalex_id TEXT, -- Normalized OpenAlex ID of the duplicate entry
+                metadata_source_type TEXT, -- e.g., 'bibtex_import_duplicate'
+                original_bibtex_entry_json TEXT, -- Full original BibTeX entry of the duplicate as JSON
+                source_bibtex_file TEXT, -- Path to the BibTeX file this duplicate came from
+                existing_entry_id INTEGER NOT NULL, -- ID of the entry it duplicates
+                existing_entry_table TEXT NOT NULL, -- Table of the existing entry (e.g., 'downloaded_references')
+                matched_on_field TEXT NOT NULL, -- Field that matched (e.g., 'doi', 'openalex_id')
+                date_detected TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- When the duplicate was detected
             )
         """)
 
@@ -195,10 +194,73 @@ class DatabaseManager:
         match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', doi, re.IGNORECASE)
         if match:
             # Return the matched DOI, standardized to uppercase for consistency.
-            return match.group(1).upper()
+            normalized = match.group(1).upper()
+            return normalized
         # If no URL-like structure is found, assume it might be a bare DOI already.
         # We still standardize it to uppercase.
-        return doi.upper()
+        if doi: # Ensure doi is not None before calling upper()
+            normalized = doi.upper() # Ensure even bare DOIs are uppercased for consistency
+            return normalized
+        return None
+
+    def _normalize_openalex_id(self, openalex_id: str | None) -> str | None:
+        """Normalizes an OpenAlex ID by extracting the core identifier (e.g., W123456789)."""
+        if not openalex_id:
+            return None
+        
+        # Regex to find 'W' followed by digits, possibly at the end of a URL
+        # Example: https://openalex.org/W123456789 -> W123456789
+        # Example: W123456789 -> W123456789
+        match = re.search(r'(W\d+)', openalex_id, re.IGNORECASE)
+        if match:
+            normalized = match.group(1).upper() # Ensure 'W' is uppercase
+            return normalized
+        
+        return None
+
+
+    def load_from_disk(self, disk_db_path: Path) -> bool:
+        """Loads data from an on-disk SQLite database into the current in-memory database.
+
+        This is intended to be used when self.conn is an in-memory database.
+        It effectively clones the content of the disk_db_path into memory.
+
+        Args:
+            disk_db_path: Path to the on-disk SQLite database file to load from.
+
+        Returns:
+            True if loading was successful or if there was nothing to load (e.g., disk_db_path doesn't exist),
+            False if an error occurred during loading.
+        """
+        if not self.is_in_memory:
+            print(f"{RED}[DB Manager] Error: load_from_disk() called on a non-in-memory database instance. Aborting load.{RESET}")
+            return False
+
+        if not disk_db_path.exists() or disk_db_path.stat().st_size == 0:
+            print(f"{YELLOW}[DB Manager] Disk database at {disk_db_path} does not exist or is empty. Nothing to load.{RESET}")
+            return True # Not an error, just nothing to load
+
+        source_disk_conn = None
+        try:
+            print(f"{GREEN}[DB Manager] Attempting to load data from disk database: {disk_db_path} into in-memory DB: {self.db_path}{RESET}")
+            source_disk_conn = sqlite3.connect(disk_db_path)
+            
+            # Backup from the source_disk_conn (on-disk) to self.conn (in-memory)
+            # The backup API will overwrite the destination (self.conn)
+            source_disk_conn.backup(self.conn)
+            
+            print(f"{GREEN}[DB Manager] Successfully loaded data from {disk_db_path} into in-memory database.{RESET}")
+            # After loading, ensure the schema is what we expect (e.g., if disk DB was old/different schema)
+            # This also re-applies PRAGMA foreign_keys = ON if the backup didn't preserve it for the connection.
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self._create_schema() # This ensures tables exist with IF NOT EXISTS, and indices are correct.
+            return True
+        except sqlite3.Error as e:
+            print(f"{RED}[DB Manager] SQLite error during load_from_disk (backup method): {e}{RESET}")
+            return False
+        finally:
+            if source_disk_conn:
+                source_disk_conn.close()
 
     def check_if_exists(self, doi: str | None, openalex_id: str | None) -> tuple[str | None, int | None, str | None]:
         """Checks if an entry with the given DOI or OpenAlex ID exists in relevant tables.
@@ -213,222 +275,59 @@ class DatabaseManager:
             'matched_field_name' can be 'doi' or 'openalex_id'.
         """
         cursor = self.conn.cursor()
-
-        normalized_doi = self._normalize_doi(doi)
-
+        
         # Prioritize DOI if available
-        if normalized_doi:
-            # Check in downloaded_references
-            cursor.execute("SELECT id FROM downloaded_references WHERE doi = ?", (normalized_doi,))
-            row = cursor.fetchone()
-            if row:
-                return "downloaded_references", row[0], "doi"
-            
-            # Check in to_download_references
-            cursor.execute("SELECT id FROM to_download_references WHERE doi = ?", (normalized_doi,))
-            row = cursor.fetchone()
-            if row:
-                return "to_download_references", row[0], "doi"
+        if doi:
+            normalized_doi_to_check = self._normalize_doi(doi)
+            if normalized_doi_to_check: # Ensure DOI is not None after normalization
+                # Check in downloaded_references
+                cursor.execute("SELECT id FROM downloaded_references WHERE doi = ?", (normalized_doi_to_check,))
+                row = cursor.fetchone()
+                if row:
+                    return "downloaded_references", row[0], "doi"
+                
+                # Check in to_download_references
+                cursor.execute("SELECT id FROM to_download_references WHERE doi = ?", (normalized_doi_to_check,))
+                row = cursor.fetchone()
+                if row:
+                    return "to_download_references", row[0], "doi"
 
         # Then check OpenAlex ID if available
         if openalex_id:
-            # Check in downloaded_references
-            cursor.execute("SELECT id FROM downloaded_references WHERE openalex_id = ?", (openalex_id,))
-            row = cursor.fetchone()
-            if row:
-                return "downloaded_references", row[0], "openalex_id"
+            normalized_openalex_id_to_check = self._normalize_openalex_id(openalex_id)
+            if normalized_openalex_id_to_check: # Ensure OpenAlex ID is not None after normalization
+                # Check in downloaded_references
+                cursor.execute("SELECT id FROM downloaded_references WHERE openalex_id = ?", (normalized_openalex_id_to_check,))
+                row = cursor.fetchone()
+                if row:
+                    return "downloaded_references", row[0], "openalex_id"
 
-            # Check in to_download_references
-            cursor.execute("SELECT id FROM to_download_references WHERE openalex_id = ?", (openalex_id,))
-            row = cursor.fetchone()
-            if row:
-                return "to_download_references", row[0], "openalex_id"
-                
+                # Check in to_download_references
+                cursor.execute("SELECT id FROM to_download_references WHERE openalex_id = ?", (normalized_openalex_id_to_check,))
+                row = cursor.fetchone()
+                if row:
+                    return "to_download_references", row[0], "openalex_id"
+        
+        # If no matches were found after checking DOI and OpenAlex ID in both tables
         return None, None, None
 
-    def add_entry_to_duplicates(
+    def add_bibtex_entry_to_downloaded(
         self,
-        entry_data: dict,
-        duplicate_of_table: str,
-        duplicate_of_id: int,
-        matched_on_field: str
+        entry: object, # This is bibtexparser.model.Entry
+        pdf_base_dir: Path | str | None = None,
+        input_doi: str | None = None, # New parameter
+        input_openalex_id: str | None = None, # New parameter
+        original_bibtex_entry_json: str | None = None, # Added based on CLI usage
+        source_bibtex_file: str | None = None # Added based on CLI usage
     ) -> tuple[int | None, str | None]:
-        """Adds an entry to the 'duplicate_references' table."""
-        sql = """
-            INSERT INTO duplicate_references (
-                bibtex_key, entry_type, title, authors, year, doi, openalex_id,
-                metadata_source_type, bibtex_entry_json, status_notes, url_source
-            ) VALUES (
-                :bibtex_key, :entry_type, :title, :authors, :year, :doi, :openalex_id,
-                :metadata_source_type, :bibtex_entry_json, :status_notes, :url_source
-            )
-        """
-        url_source_val = entry_data.get('input_id_field')
-        status_note = f"Duplicate of {duplicate_of_table}.id={duplicate_of_id} (matched on {matched_on_field})"
-        
-        params = {
-            "bibtex_key": entry_data.get('bibtex_key'),
-            "entry_type": entry_data.get('entry_type'),
-            "title": entry_data.get('title', url_source_val or "[Title N/A]"),
-            "authors": json.dumps(entry_data.get('authors_list', [])),
-            "year": entry_data.get('year'),
-            "doi": self._normalize_doi(entry_data.get('doi')),
-            "openalex_id": entry_data.get('openalex_id'),
-            "metadata_source_type": 'json_import_duplicate',
-            "bibtex_entry_json": json.dumps(entry_data.get('original_json_object', {})),
-            "status_notes": status_note,
-            "url_source": url_source_val
-        }
-
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(sql, params)
-            self.conn.commit()
-            inserted_id = cursor.lastrowid
-            print(f"{YELLOW}[DB Manager] Logged duplicate: ID {inserted_id} for input '{url_source_val}'. Reason: {status_note}{RESET}")
-            return inserted_id, None
-        except sqlite3.Error as e:
-            error_msg = f"SQLite error adding to duplicates: {e}"
-            print(f"{RED}[DB Manager] Error: {error_msg} for input '{url_source_val}'{RESET}")
-            return None, error_msg
-
-    def add_entry_to_download_queue(self, entry_data: dict) -> tuple[str, int | None, str | None]:
-        """Adds an entry to the 'to_download_references' table after checking for duplicates."""
-        doi = self._normalize_doi(entry_data.get('doi'))
-        openalex_id = entry_data.get('openalex_id')
-        input_id = entry_data.get('input_id_field', 'N/A')
-
-        # Check for duplicates
-        table_name, existing_id, matched_field = self.check_if_exists(doi, openalex_id)
-        if table_name and existing_id is not None:
-            dup_id, dup_err = self.add_entry_to_duplicates(
-                entry_data, table_name, existing_id, matched_field
-            )
-            if dup_err:
-                return "error", None, f"Failed to log duplicate for '{input_id}': {dup_err}"
-            return "duplicate", dup_id, f"Entry '{input_id}' is a duplicate of {table_name}.id={existing_id} on {matched_field}"
-
-        # Not a duplicate, proceed to add to to_download_references
-        sql = """
-            INSERT INTO to_download_references (
-                bibtex_key, entry_type, title, authors, year, doi, openalex_id,
-                metadata_source_type, bibtex_entry_json, status_notes, url_source
-            ) VALUES (
-                :bibtex_key, :entry_type, :title, :authors, :year, :doi, :openalex_id,
-                :metadata_source_type, :bibtex_entry_json, :status_notes, :url_source
-            )
-        """
-        
-        title = entry_data.get('title')
-        if not title:
-            title = entry_data.get('input_id_field') or "[Title N/A from JSON Import]"
-            print(f"{YELLOW}[DB Manager] Info: Missing title for entry from JSON '{input_id}'. Using placeholder: '{title}'{RESET}")
-
-        params = {
-            "bibtex_key": entry_data.get('bibtex_key'),
-            "entry_type": entry_data.get('entry_type'),
-            "title": title,
-            "authors": json.dumps(entry_data.get('authors_list', [])),
-            "year": entry_data.get('year'),
-            "doi": doi,
-            "openalex_id": openalex_id,
-            "metadata_source_type": 'json_import',
-            "bibtex_entry_json": json.dumps(entry_data.get('original_json_object', {})),
-            "status_notes": 'pending_enrichment',
-            "url_source": entry_data.get('input_id_field')
-        }
-
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(sql, params)
-            self.conn.commit()
-            inserted_id = cursor.lastrowid
-            print(f"{GREEN}[DB Manager] Added to download queue: ID {inserted_id} for input '{input_id}'{RESET}")
-            return "added_to_queue", inserted_id, None
-        except sqlite3.IntegrityError as e:
-            error_msg = f"SQLite integrity error adding to queue for '{input_id}': {e}"
-            print(f"{RED}[DB Manager] Error: {error_msg}{RESET}")
-            return "error", None, error_msg
-        except sqlite3.Error as e:
-            error_msg = f"SQLite error adding to queue for '{input_id}': {e}"
-            print(f"{RED}[DB Manager] Error: {error_msg}{RESET}")
-            return "error", None, error_msg
-
-    def get_all_downloaded_references_as_dicts(self) -> list[dict]:
-        """
-        Fetches all entries from the 'downloaded_references' table
-        and returns them as a list of dictionaries.
-        """
-        try:
-            # Ensure row_factory is set to sqlite3.Row for this operation
-            original_row_factory = self.conn.row_factory
-            self.conn.row_factory = sqlite3.Row
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT * FROM downloaded_references")
-            rows = cursor.fetchall()
-            self.conn.row_factory = original_row_factory # Reset row factory
-            return [dict(row) for row in rows]
-        except sqlite3.Error as e:
-            print(f"Error fetching all downloaded references: {e}")
-            # Ensure row factory is reset in case of error too
-            if hasattr(self, 'conn') and self.conn:
-                 self.conn.row_factory = original_row_factory if 'original_row_factory' in locals() else None
-            return []
-
-    def save_to_disk(self, target_disk_db_path: Path | str) -> bool:
-        """
-        Saves the current in-memory database to a specified disk file.
-        This is typically used if the DatabaseManager was initialized with ':memory:'.
-        It uses SQLite's backup functionality.
-
-        Args:
-            target_disk_db_path: The path to the disk file where the database should be saved.
-
-        Returns:
-            True if successful, False otherwise.
-        """
-        if not self.is_in_memory:
-            print(f"{YELLOW}[DB Manager] Warning: 'save_to_disk' called on a disk-based database. No action taken.{RESET}")
-            # Consider if this should be True or False. If it's not an error, True is fine.
-            return True 
-
-        target_path = Path(target_disk_db_path)
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-
-        print(f"{GREEN}[DB Manager] Attempting to save in-memory database to disk: {target_path.resolve()}{RESET}")
-        
-        disk_conn = None
-        try:
-            disk_conn = sqlite3.connect(str(target_path)) # Ensure path is string for connect
-            self.conn.backup(disk_conn) # self.conn is the in-memory connection
-            # backup implicitly handles transactions, commit on disk_conn might not be strictly needed
-            # but can be good for ensuring data is flushed.
-            disk_conn.commit() 
-            print(f"{GREEN}[DB Manager] Successfully saved database to {target_path.resolve()}{RESET}")
-            return True
-        except sqlite3.Error as e:
-            print(f"{RED}[DB Manager] SQLite error during save_to_disk: {e}{RESET}")
-            return False
-        except Exception as e:
-            print(f"{RED}[DB Manager] UNEXPECTED error during save_to_disk: {type(e).__name__} - {e}{RESET}")
-            return False
-        finally:
-            if disk_conn:
-                disk_conn.close()
-
-    def close_connection(self):
-        """Closes the database connection."""
-        if self.conn:
-            self.conn.close()
-            print(f"{GREEN}[DB Manager] Database connection closed.{RESET}")
-
-    def add_bibtex_entry_to_downloaded(self, entry: object, pdf_base_dir: Path | str | None = None) -> tuple[int | None, str | None]:
         """Adds a parsed BibTeX entry (bibtexparser.model.Entry object)
         to the 'downloaded_references' table.
 
         Args:
             entry: A bibtexparser.model.Entry object.
             pdf_base_dir: Optional base directory for resolving relative PDF paths.
+            input_doi: Optional DOI to use instead of extracting from the entry.
+            input_openalex_id: Optional OpenAlex ID to use instead of extracting from the entry.
 
         Returns:
             A tuple: (row_id, None) on successful insertion,
@@ -485,10 +384,16 @@ class DatabaseManager:
                     print(f"{RED}[DB Manager] Warning: Could not parse year '{year_str_raw}' (cleaned to: '{year_str_cleaned}') as int for entry {bibtex_key_val if bibtex_key_val else 'N/A'}{RESET}")
         
         title_val = self._clean_string_value(get_primitive_val(entry.get('title')))
-        doi_val = self._normalize_doi(self._clean_string_value(get_primitive_val(entry.get('doi'))))
+        
+        # Use passed-in DOI and OpenAlex ID
+        cleaned_doi_val = self._clean_string_value(input_doi)
+        doi_val = self._normalize_doi(cleaned_doi_val)
+
+        cleaned_openalex_id_val = self._clean_string_value(input_openalex_id)
+        openalexid_val = self._normalize_openalex_id(cleaned_openalex_id_val)
+
         pmid_val = self._clean_string_value(get_primitive_val(entry.get('pmid')))
         arxiv_val = self._clean_string_value(get_primitive_val(entry.get('arxiv')))
-        openalexid_val = self._clean_string_value(get_primitive_val(entry.get('openalexid')))
         semanticscholarid_val = self._clean_string_value(get_primitive_val(entry.get('semanticscholarid')))
         magid_val = self._clean_string_value(get_primitive_val(entry.get('magid')))
         url_source_val = self._clean_string_value(get_primitive_val(entry.get('url')) or get_primitive_val(entry.get('link')))
@@ -552,12 +457,114 @@ class DatabaseManager:
             return None, error_msg
         except sqlite3.Error as e:
             error_msg = f"SQLite error: {e}"
-            print(f"{RED}[DB Manager] {error_msg} while adding BibTeX entry {bibtex_key_val if bibtex_key_val else 'N/A'}{RESET}")
-            return None, error_msg
+            print(f"{RED}[DB Manager] Error adding BibTeX entry to downloaded_references: {e} (Entry details: Key='{bibtex_key_val}', Title='{title_val}'){RESET}")
+            return None, str(e)
         except Exception as e:
             error_msg = f"General error: {e}"
             print(f"{RED}[DB Manager] {error_msg} while adding BibTeX entry {bibtex_key_val if bibtex_key_val else 'N/A'}{RESET}")
             return None, error_msg
+
+    def add_entry_to_duplicates(
+        self,
+        entry: object, # bibtexparser.model.Entry
+        input_doi: str | None,
+        input_openalex_id: str | None,
+        source_bibtex_file: str | None,
+        existing_entry_id: int,
+        existing_entry_table: str,
+        matched_on_field: str
+    ) -> tuple[int | None, str | None]:
+        """Adds a detected duplicate entry to the 'duplicate_references' table.
+
+        Args:
+            entry: The bibtexparser.model.Entry object that is a duplicate.
+            input_doi: The DOI extracted from the duplicate entry.
+            input_openalex_id: The OpenAlex ID extracted from the duplicate entry.
+            source_bibtex_file: The path to the BibTeX file from which this duplicate was read.
+            existing_entry_id: The ID of the entry it duplicates in the database.
+            existing_entry_table: The table where the existing entry is stored (e.g., 'downloaded_references').
+            matched_on_field: The field that caused the duplicate detection (e.g., 'doi', 'openalex_id').
+
+        Returns:
+            A tuple: (row_id, None) on successful insertion,
+                     (None, error_message_string) if insertion failed.
+        """
+        cursor = self.conn.cursor()
+
+        def get_primitive_val(data_object, default=None):
+            if data_object is None: return default
+            if hasattr(data_object, 'value'): return str(data_object.value)
+            return str(data_object)
+
+        bibtex_key_val = self._clean_string_value(entry.key if hasattr(entry, 'key') else None)
+        entry_type_val = self._clean_string_value(entry.entry_type if hasattr(entry, 'entry_type') else None)
+        title_val = self._clean_string_value(get_primitive_val(entry.get('title')))
+        
+        authors_list = []
+        raw_author_data = entry.get('author')
+        if raw_author_data:
+            if isinstance(raw_author_data, list):
+                authors_list = [get_primitive_val(author_item) for author_item in raw_author_data]
+            else:
+                author_string = get_primitive_val(raw_author_data)
+                if author_string: authors_list = [name.strip() for name in author_string.split(' and ')]
+        authors_json = json.dumps([self._clean_string_value(str(author)) for author in authors_list if author]) if authors_list else None
+
+        year_str_raw = get_primitive_val(entry.get('year'))
+        year_int = None
+        if year_str_raw:
+            year_str_cleaned = year_str_raw.strip('{}')
+            if year_str_cleaned:
+                try: year_int = int(year_str_cleaned)
+                except ValueError: print(f"{RED}[DB Manager] Warning: Could not parse year '{year_str_raw}' for duplicate entry {bibtex_key_val}{RESET}")
+        
+        normalized_doi = self._normalize_doi(self._clean_string_value(input_doi))
+        normalized_openalex_id = self._normalize_openalex_id(self._clean_string_value(input_openalex_id))
+
+        serializable_entry_dict = {k: get_primitive_val(v) for k, v in entry.items()}
+        original_bibtex_json = json.dumps(serializable_entry_dict)
+
+        # Ensure title is not None for the database constraint
+        if not title_val:
+            title_val = f"[Duplicate Entry: {bibtex_key_val or 'No Key'}]"
+            print(f"{YELLOW}[DB Manager] Info: Missing title for duplicate entry. Using placeholder: '{title_val}'{RESET}")
+
+        sql = """
+            INSERT INTO duplicate_references (
+                bibtex_key, entry_type, title, authors, year, 
+                doi, openalex_id, 
+                metadata_source_type, original_bibtex_entry_json, source_bibtex_file, 
+                existing_entry_id, existing_entry_table, matched_on_field, 
+                date_detected
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """
+        try:
+            cursor.execute(sql, (
+                bibtex_key_val, entry_type_val, title_val, authors_json, year_int,
+                normalized_doi, normalized_openalex_id,
+                'bibtex_import_duplicate', original_bibtex_json, source_bibtex_file,
+                existing_entry_id, existing_entry_table, matched_on_field
+            ))
+            self.conn.commit()
+            # print(f"{GREEN}[DB Manager] Successfully added duplicate entry '{bibtex_key_val}' to duplicate_references. Matched on '{matched_on_field}' with ID {existing_entry_id} in '{existing_entry_table}'.{RESET}") # Keep for potential future, non-debug use
+            return cursor.lastrowid, None
+        except sqlite3.Error as e:
+            print(f"{RED}[DB Manager] Error adding entry to duplicate_references: {e} (Entry: {bibtex_key_val}){RESET}")
+            return None, str(e)
+
+    def get_all_downloaded_references_as_dicts(self) -> list[dict]:
+        """Fetches all entries from the downloaded_references table as a list of dictionaries."""
+        self.conn.row_factory = sqlite3.Row
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM downloaded_references ORDER BY id")
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            print(f"{RED}[DB Manager] Error fetching all downloaded references: {e}{RESET}")
+            return []
+        finally:
+            self.conn.row_factory = None # Reset row_factory
 
     def get_sample_downloaded_references(self, limit: int = 5) -> list[tuple]:
         """Fetches a sample of entries from the downloaded_references table.

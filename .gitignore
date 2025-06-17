@@ -39,3 +39,4 @@ processed_references.db
 dl_lit_project/data/metadata.bib
 dl_lit/exported_bib/current_references.bib
 __pycache__/
+dl_lit_project/inspect_db.py

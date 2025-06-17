@@ -3,8 +3,19 @@ from pathlib import Path
 from .db_manager import DatabaseManager # Relative import
 import bibtexparser # For parsing BibTeX files
 from .metadata_fetcher import MetadataFetcher
+
+# ANSI escape codes for colors
+RESET = "\033[0m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+WHITE = "\033[97m"
 from .pdf_downloader import PDFDownloader
 from .bibtex_formatter import BibTeXFormatter # Added for export
+from .get_bib_pages import extract_reference_sections # Added for bibliography extraction
 import traceback
 
 # ANSI escape codes for colors
@@ -57,56 +68,53 @@ def init_db_command(db_path):
 
 @cli.command("show-sample")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.option('--limit', default=5, type=int, help='Number of entries to display.')
-def show_sample_command(db_path, limit):
-    """Shows a sample of entries from the downloaded_references table."""
-    db_manager = DatabaseManager(db_path) # Connection and table creation are handled in __init__
-
-    # Get column names for header
-    cursor = db_manager.conn.cursor()
+@click.option('--limit', default=10, help='Number of entries to show. Shows all if 0.')
+@click.option('--show-all', is_flag=True, help='Show all entries, overrides --limit.')
+def show_sample_command(db_path, limit, show_all):
+    """Shows entries from the downloaded_references table."""
+    db_manager = DatabaseManager(db_path=db_path)
     try:
-        cursor.execute("PRAGMA table_info(downloaded_references)")
-        columns = [col[1] for col in cursor.fetchall()]
+        click.echo(f"{CYAN}Fetching entries from downloaded_references...{RESET}")
+        all_entries_dicts = db_manager.get_all_downloaded_references_as_dicts()
+        
+        if not all_entries_dicts:
+            click.echo(f"{YELLOW}No entries found in downloaded_references.{RESET}")
+            return
+
+        display_limit = len(all_entries_dicts) if show_all else limit
+        if display_limit == 0 and not show_all: # if limit is 0 and show_all is not set, show all
+            display_limit = len(all_entries_dicts)
+
+        click.echo(f"{GREEN}--- Downloaded References (showing up to {display_limit if display_limit < len(all_entries_dicts) else 'all'}) ---{RESET}")
+        
+        for i, entry_dict in enumerate(all_entries_dicts):
+            if i >= display_limit and not show_all and limit != 0:
+                break
+            click.echo(f"{BLUE}--- Entry {i+1} ---{RESET}")
+            click.echo(f"  {WHITE}ID:{RESET} {entry_dict.get('id')}")
+            click.echo(f"  {WHITE}BibTeX Key:{RESET} {entry_dict.get('bibtex_key')}")
+            click.echo(f"  {WHITE}Title:{RESET} {entry_dict.get('title')}")
+            click.echo(f"  {WHITE}DOI:{RESET} {entry_dict.get('doi')}")
+            click.echo(f"  {WHITE}OpenAlex ID:{RESET} {entry_dict.get('openalex_id')}")
+            click.echo(f"  {WHITE}PDF Path:{RESET} {entry_dict.get('file_path')}")
+            click.echo(f"  {WHITE}Year:{RESET} {entry_dict.get('year')}")
+            authors_json = entry_dict.get('authors')
+            authors_list = []
+            if authors_json:
+                try:
+                    authors_list = json.loads(authors_json)
+                except json.JSONDecodeError:
+                    authors_list = [authors_json] # Treat as single author if not JSON
+            click.echo(f"  {WHITE}Authors:{RESET} {', '.join(authors_list) if authors_list else 'N/A'}")
+            click.echo(f"  {WHITE}Journal/Conf:{RESET} {entry_dict.get('journal_conference')}")
+            click.echo(f"  {WHITE}Date Processed:{RESET} {entry_dict.get('date_processed')}")
+        if display_limit < len(all_entries_dicts) and (limit != 0 or not show_all) :
+            click.echo(f"{YELLOW}... and {len(all_entries_dicts) - display_limit} more entries not shown. Use --show-all or increase --limit.{RESET}")
+
     except Exception as e:
-        click.echo(f"Error fetching column names: {e}", err=True)
-        columns = ["ID", "BibTeX Key", "Type", "Title", "Authors", "Year", "DOI", "...(other fields)"] # Fallback
-
-    click.echo("\n--- Sample Entries ---")
-    # Assuming get_sample_downloaded_references returns list of tuples as per original design
-    # If it was changed to return dicts, this part would need adjustment or the method reverted.
-    # For now, let's assume it's tuples as the error indicated.
-    # We need to fetch actual sample entries, not all. This was a temporary change that should be reverted.
-    # For now, to make it work without knowing the exact structure of get_sample_downloaded_references
-    # I will fetch all and slice, similar to the temp debug, but display as original.
-    all_db_entries = db_manager.get_all_downloaded_references_as_dicts() # Assuming this returns list of dicts
-    entries_to_display = all_db_entries[:limit]
-
-    if not entries_to_display:
-        click.echo("No entries found or an error occurred.")
+        click.echo(f"{RED}Error showing entries: {e}{RESET}")
+    finally:
         db_manager.close_connection()
-        return
-
-    for i, entry_dict_or_tuple in enumerate(entries_to_display):
-        click.echo(f"\nEntry {i+1}:")
-        if isinstance(entry_dict_or_tuple, dict):
-            for col_name, value in entry_dict_or_tuple.items(): # Iterate if dict
-                display_value = str(value)
-                if len(display_value) > 70 and col_name not in ['authors', 'bibtex_entry_json']:
-                    display_value = display_value[:67] + "..."
-                click.echo(f"  {col_name}: {display_value}")
-        elif isinstance(entry_dict_or_tuple, tuple):
-             for col_idx, value in enumerate(entry_dict_or_tuple): # Iterate if tuple
-                col_name = columns[col_idx] if col_idx < len(columns) else f"Column {col_idx+1}"
-                display_value = str(value)
-                if len(display_value) > 70 and col_name not in ['authors', 'bibtex_entry_json']:
-                    display_value = display_value[:67] + "..."
-                click.echo(f"  {col_name}: {display_value}")
-        else:
-            click.echo(f"  Unexpected entry format: {entry_dict_or_tuple}")
-    
-    click.echo("\n--- End of Sample ---")
-
-    db_manager.close_connection()
 
 
 @cli.command("import-bib")
@@ -122,7 +130,7 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
     """Imports references from a BibTeX file into the 'downloaded_references' table."""
     click.echo(f"Attempting to import from BibTeX file: {bibtex_file}")
     if pdf_base_dir:
-        click.echo(f"Using PDF base directory (feature not fully implemented yet): {pdf_base_dir}")
+        click.echo(f"Using PDF base directory: {pdf_base_dir}")
     
     db_manager = None # Initialize to ensure it's defined for finally block
     actual_disk_db_path = Path(db_path) # The final destination for the data
@@ -130,6 +138,17 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
         # Initialize with an in-memory database for fast processing
         db_manager = DatabaseManager(db_path=":memory:") 
         click.echo(f"Processing import into in-memory database. Target disk DB: {actual_disk_db_path.resolve()}")
+
+        # Load existing data from disk into the in-memory DB if the disk DB exists
+        if actual_disk_db_path.exists() and actual_disk_db_path.stat().st_size > 0:
+            click.echo(f"Loading existing data from {actual_disk_db_path.resolve()} into memory...")
+            load_success = db_manager.load_from_disk(actual_disk_db_path)
+            if load_success:
+                click.echo("Successfully loaded existing data into memory.")
+            else:
+                click.echo(f"{RED}Failed to load existing data from {actual_disk_db_path.resolve()} into memory. Proceeding with empty in-memory DB.{RESET}")
+        else:
+            click.echo(f"No existing database found at {actual_disk_db_path.resolve()} or it is empty. Starting fresh in memory.")
 
         try:
             with open(bibtex_file, 'r', encoding='utf-8') as bibfile:
@@ -154,45 +173,112 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
         
         successful_imports = 0
         failed_imports = []
-        duplicate_entries = [] # Placeholder for future duplicate handling
-        skipped_no_file_path = 0
+        duplicates_logged = 0 # For tracking logged duplicates
 
         for entry_obj in bib_database.entries: # entry_obj is a bibtexparser.model.Entry
-            entry_id, error_msg = db_manager.add_bibtex_entry_to_downloaded(entry_obj, pdf_base_dir)
+            # Determine a display identifier for the entry for logging purposes
+            entry_display_identifier = "Unknown Entry"
+            if entry_obj.key: # Use .key for the BibTeX entry ID
+                entry_display_identifier = entry_obj.key
+            elif hasattr(entry_obj, 'fields_dict'):
+                title_field = entry_obj.fields_dict.get('title')
+                if title_field and hasattr(title_field, 'value'):
+                    entry_display_identifier = title_field.value
+                elif title_field: # if title_field is a simple string (less common with bibtexparser v2)
+                    entry_display_identifier = str(title_field)
+            
+            if isinstance(entry_display_identifier, str):
+                 entry_display_identifier = entry_display_identifier.strip('{}')
+
+            
+            # Extract DOI and OpenAlex ID
+            doi_to_check = None
+            openalex_id_to_check = None
+
+            if hasattr(entry_obj, 'fields_dict'):
+                # Check for DOI (common casings: 'doi', 'DOI')
+                doi_field_obj = entry_obj.fields_dict.get('doi') or entry_obj.fields_dict.get('DOI')
+                if doi_field_obj and hasattr(doi_field_obj, 'value'):
+                    doi_to_check = doi_field_obj.value
+                elif doi_field_obj: # Should be a Field object, but value might be missing or it's just a string
+                    doi_to_check = str(doi_field_obj) 
+
+                # Check for OpenAlex ID (common casings: 'openalex', 'OPENALEX', 'openalexid')
+                openalex_field_obj = entry_obj.fields_dict.get('openalex') or \
+                                     entry_obj.fields_dict.get('OPENALEX') or \
+                                     entry_obj.fields_dict.get('openalexid')
+                if openalex_field_obj and hasattr(openalex_field_obj, 'value'):
+                    openalex_id_to_check = openalex_field_obj.value
+                elif openalex_field_obj:
+                    openalex_id_to_check = str(openalex_field_obj)
+
+
+            # 2. Check for duplicates
+            table_name, existing_id, matched_field = db_manager.check_if_exists(
+                doi=doi_to_check, 
+                openalex_id=openalex_id_to_check
+            )
+
+            if table_name and existing_id is not None:
+                # 3. It's a duplicate, log it
+                dup_log_id, dup_log_err = db_manager.add_entry_to_duplicates(
+                    entry=entry_obj,  # Corrected: entry_data_obj -> entry
+                    input_doi=doi_to_check, # Added
+                    input_openalex_id=openalex_id_to_check, # Added
+                    source_bibtex_file=str(Path(bibtex_file).resolve()),
+                    existing_entry_id=existing_id, # Corrected: duplicate_of_id -> existing_entry_id
+                    existing_entry_table=table_name, # Corrected: duplicate_of_table -> existing_entry_table
+                    matched_on_field=matched_field
+                    # Removed entry_source_type as it's handled in db_manager
+                )
+                if dup_log_id:
+                    duplicates_logged += 1
+                else:
+                    click.echo(f"{RED}  Error logging duplicate for '{entry_display_identifier}': {dup_log_err}{RESET}")
+                    failed_imports.append((str(entry_display_identifier)[:100], f"Duplicate logging error: {dup_log_err}"))
+                continue 
+
+            # 4. Not a duplicate, try to add to downloaded_references
+            original_entry_json = json.dumps({
+                'ID': entry_obj.key, 
+                'ENTRYTYPE': entry_obj.entry_type, 
+                **{k: v.value if hasattr(v, 'value') else str(v) for k, v in entry_obj.fields_dict.items()}
+            })
+            pdf_dir_path = Path(pdf_base_dir) if pdf_base_dir else None # pdf_base_dir is the function param from import_bib_command
+
+            entry_id, error_msg = db_manager.add_bibtex_entry_to_downloaded(
+                entry=entry_obj,
+                input_doi=doi_to_check,
+                input_openalex_id=openalex_id_to_check,
+                pdf_base_dir=pdf_dir_path, # Use the Path object or None
+                original_bibtex_entry_json=original_entry_json,
+                source_bibtex_file=str(Path(bibtex_file).resolve()) # Use the correct parameter bibtex_file
+            )
             
             if entry_id:
                 successful_imports += 1
             else:
-                # The error_msg from add_bibtex_entry_to_downloaded already contains the failure reason.
-                # Try to get an identifier for the failed entry for logging.
-                identifier = entry_obj.key if hasattr(entry_obj, 'key') and entry_obj.key else entry_obj.get('title', 'Unknown Title')
-                # Clean the identifier just in case it has braces, for display purposes
-                if hasattr(identifier, 'value'): # If it's a bibtexparser Field object
-                    identifier = str(identifier.value)
-                elif isinstance(identifier, str):
-                    identifier = identifier.strip('{}')
-                else: # Fallback if identifier is not easily stringable
-                    identifier = str(identifier)
-                
                 reason = error_msg if error_msg else "Unknown import error"
-                failed_imports.append((str(identifier)[:100], reason))
+                failed_imports.append((str(entry_display_identifier)[:100], reason))
         
         click.echo("\n--- Import Summary ---")
-        click.echo(f"{GREEN}Successfully imported: {successful_imports} entries{RESET}")
+        click.echo(f"{GREEN}Successfully imported: {successful_imports} new entries{RESET}")
         
-        if failed_imports:
-            click.echo(f"{RED}Failed to import/ignored: {len(failed_imports)} entries{RESET}")
-            for i, (item_id, reason) in enumerate(failed_imports):
-                click.echo(f"  {RED}Failed/Ignored {i+1}: {item_id} - Reason: {reason}{RESET}")
-        else:
-            click.echo(f"{GREEN}No import failures.{RESET}")
+        if duplicates_logged > 0:
+            click.echo(f"{YELLOW}Duplicates found and logged: {duplicates_logged} entries{RESET}")
 
-        if duplicate_entries: # This will be empty for now
-            click.echo(f"{YELLOW}Duplicates found (and skipped): {len(duplicate_entries)} entries{RESET}")
-            for i, item in enumerate(duplicate_entries):
-                click.echo(f"  {YELLOW}Duplicate {i+1}: {item}{RESET}")
-        else:
-            click.echo(f"{GREEN}No duplicates detected (duplicate check not yet fully implemented).{RESET}")
+        if failed_imports:
+            click.echo(f"{RED}Failed to import (or log as duplicate): {len(failed_imports)} entries{RESET}")
+            for i, (item_id, reason) in enumerate(failed_imports):
+                click.echo(f"  {RED}Failure {i+1}: {item_id} - Reason: {reason}{RESET}")
+        elif successful_imports > 0 and duplicates_logged == 0:
+             click.echo(f"{GREEN}No import failures or duplicates encountered among processed entries.{RESET}")
+        elif successful_imports == 0 and duplicates_logged == 0 and not failed_imports and len(bib_database.entries) > 0 :
+             click.echo(f"{YELLOW}No new entries were imported, and no duplicates found among the {len(bib_database.entries)} processed entries.{RESET}")
+        elif len(bib_database.entries) == 0:
+            pass # Already handled by "No entries found in the BibTeX file."
+        elif successful_imports == 0 and duplicates_logged > 0 and not failed_imports:
+             click.echo(f"{GREEN}All processed entries were identified and logged as duplicates. No new entries imported.{RESET}")
 
         click.echo("\n>>> CLI: Attempting to call db_manager.save_to_disk() now. <<<")
         save_successful = db_manager.save_to_disk(actual_disk_db_path)
@@ -528,6 +614,28 @@ def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
     finally:
         if db_manager:
             db_manager.close_connection()
+
+
+@cli.command("extract-bib-pages")
+@click.argument('pdf_file_path', type=click.Path(exists=True, dir_okay=False, readable=True, resolve_path=True))
+@click.option('--output-dir', 
+              type=click.Path(file_okay=False, writable=True, resolve_path=True),
+              default=str(Path.home() / "Nextcloud/DT/papers_extracted_references"), 
+              help='Directory to save extracted reference PDFs. Defaults to ~/Nextcloud/DT/papers_extracted_references.')
+def extract_bib_pages_command(pdf_file_path, output_dir):
+    """Extracts bibliography/reference section pages from a PDF file."""
+    click.echo(f"Attempting to extract bibliography pages from: {pdf_file_path}")
+    click.echo(f"Output will be saved to: {output_dir}")
+    try:
+        # Ensure output directory exists
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        extract_reference_sections(str(pdf_file_path), str(output_dir))
+        click.echo(f"{GREEN}Bibliography page extraction process completed.{RESET}")
+    except Exception as e:
+        click.echo(f"{RED}An error occurred during bibliography page extraction: {e}{RESET}", err=True)
+        # For more detailed debugging, you might want to print the traceback
+        # import traceback
+        # traceback.print_exc()
 
 if __name__ == '__main__':
     cli()
