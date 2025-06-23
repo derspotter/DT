@@ -1,8 +1,15 @@
 import click
 from pathlib import Path
-from .db_manager import DatabaseManager # Relative import
-import bibtexparser # For parsing BibTeX files
+from .db_manager import DatabaseManager
+from .get_bib_pages import extract_reference_sections
 from .metadata_fetcher import MetadataFetcher
+from .utils import ServiceRateLimiter
+from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference, RateLimiter
+import json
+import copy
+import hashlib
+from .new_dl import BibliographyEnhancer
+import bibtexparser # For parsing BibTeX files
 
 # ANSI escape codes for colors
 RESET = "\033[0m"
@@ -308,243 +315,6 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
         if db_manager:
             db_manager.close_connection()
 
-import json # For parsing JSON files
-import re # For OpenAlex ID extraction
-
-def _parse_json_entry(json_obj: dict) -> dict:
-    """Parses a single JSON object from the input file into a standardized dict.
-    
-    Args:
-        json_obj: A dictionary representing a single bibliographic entry from JSON.
-
-    Returns:
-        A dictionary formatted for use with DatabaseManager methods.
-    """
-    entry_data = {}
-    entry_data['original_json_object'] = json_obj # Store the whole thing
-
-    entry_data['input_id_field'] = json_obj.get('id')
-    entry_data['doi'] = json_obj.get('doi')
-    entry_data['title'] = json_obj.get('display_name')
-    entry_data['year'] = json_obj.get('publication_year')
-    entry_data['entry_type'] = json_obj.get('type')
-
-    authors_list = []
-    authorships = json_obj.get('authorships', [])
-    if isinstance(authorships, list):
-        for authorship in authorships:
-            if isinstance(authorship, dict) and 'author' in authorship and isinstance(authorship['author'], dict):
-                author_name = authorship['author'].get('display_name')
-                if author_name:
-                    authors_list.append(author_name)
-    entry_data['authors_list'] = authors_list
-
-    # Attempt to extract OpenAlex ID from the 'id' field
-    openalex_id = None
-    input_id_str = entry_data['input_id_field']
-    if input_id_str and isinstance(input_id_str, str):
-        # Regex to find 'W' followed by 8-11 digits (common OpenAlex ID pattern)
-        match = re.search(r'(W[0-9]{8,11})', input_id_str, re.IGNORECASE)
-        if match:
-            openalex_id = match.group(1).upper()
-    entry_data['openalex_id'] = openalex_id
-    
-    # Add bibtex_key if present in JSON, though unlikely for this format
-    entry_data['bibtex_key'] = json_obj.get('bibtex_key') 
-
-    return entry_data
-
-def process_json_directory(dbm: DatabaseManager, json_dir_path: Path):
-    """Processes all JSON files in a given directory.
-
-    Args:
-        dbm: An instance of DatabaseManager.
-        json_dir_path: Path to the directory containing JSON files.
-    """
-    total_files_processed = 0
-    total_entries_considered = 0
-    total_added_to_queue = 0
-    total_duplicates_logged = 0
-    total_errors = 0
-
-    click.echo(f"Scanning directory: {json_dir_path}")
-    json_files = list(json_dir_path.glob('*.json')) # Non-recursive for now
-
-    if not json_files:
-        click.echo(f"{YELLOW}No .json files found in {json_dir_path}{RESET}")
-        return
-
-    click.echo(f"Found {len(json_files)} JSON files to process.")
-
-    for json_file_path in json_files:
-        total_files_processed += 1
-        click.echo(f"\nProcessing file: {json_file_path.name}...")
-        file_added = 0
-        file_duplicates = 0
-        file_errors = 0
-        try:
-            with open(json_file_path, 'r', encoding='utf-8') as f:
-                content = json.load(f)
-            
-            entries_to_process = []
-            if isinstance(content, list):
-                entries_to_process = content
-            elif isinstance(content, dict):
-                entries_to_process = [content] # Handle single JSON object in a file
-            else:
-                click.echo(f"{RED}  Error: File {json_file_path.name} does not contain a valid JSON list or object.{RESET}")
-                total_errors +=1 # Count this as a file-level error for now
-                continue
-
-            if not entries_to_process:
-                click.echo(f"{YELLOW}  No entries found in {json_file_path.name}.{RESET}")
-                continue
-            
-            click.echo(f"  Found {len(entries_to_process)} potential entries in {json_file_path.name}.")
-
-            for i, entry_obj in enumerate(entries_to_process):
-                total_entries_considered +=1
-                if not isinstance(entry_obj, dict):
-                    click.echo(f"{RED}    Skipping item {i+1} in {json_file_path.name}: not a valid JSON object.{RESET}")
-                    file_errors += 1
-                    continue
-                
-                parsed_data = _parse_json_entry(entry_obj)
-                status_code, item_id, message = dbm.add_entry_to_download_queue(parsed_data)
-
-                if status_code == "added_to_queue":
-                    file_added += 1
-                elif status_code == "duplicate":
-                    file_duplicates += 1
-                    # Message already printed by db_manager for duplicates
-                elif status_code == "error":
-                    file_errors += 1
-                    click.echo(f"{RED}    Error processing entry '{parsed_data.get('input_id_field', 'N/A')}' from {json_file_path.name}: {message}{RESET}")
-            
-            click.echo(f"  File {json_file_path.name} summary: Added: {file_added}, Duplicates: {file_duplicates}, Errors: {file_errors}")
-            total_added_to_queue += file_added
-            total_duplicates_logged += file_duplicates
-            total_errors += file_errors
-
-        except json.JSONDecodeError as e_json:
-            click.echo(f"{RED}  Error decoding JSON from file {json_file_path.name}: {e_json}{RESET}")
-            total_errors +=1 # Count as one error for the file
-        except Exception as e_file:
-            click.echo(f"{RED}  An unexpected error occurred processing file {json_file_path.name}: {e_file}{RESET}")
-            total_errors +=1
-
-    click.echo("\n--- JSON Import Summary ---")
-    click.echo(f"Total files processed: {total_files_processed}")
-    click.echo(f"Total entries considered: {total_entries_considered}")
-    click.echo(f"{GREEN}Total entries added to download queue: {total_added_to_queue}{RESET}")
-    click.echo(f"{YELLOW}Total duplicates logged: {total_duplicates_logged}{RESET}")
-    if total_errors > 0:
-        click.echo(f"{RED}Total errors encountered: {total_errors}{RESET}")
-    else:
-        click.echo(f"{GREEN}No errors encountered.{RESET}")
-
-@cli.command("add-json")
-@click.argument('directory_path', type=click.Path(exists=True, file_okay=False, dir_okay=True, readable=True))
-@click.option('--db-path', 
-              default=str(DEFAULT_DB_PATH), 
-              help='Path to the SQLite database file.', 
-              type=click.Path(dir_okay=False, writable=True))
-def add_json_command(directory_path, db_path):
-    """Processes JSON files from a directory and adds new entries to the download queue."""
-    click.echo(f"Starting JSON import from directory: {directory_path}")
-    db_manager = None
-    try:
-        db_manager = DatabaseManager(db_path=Path(db_path))
-        process_json_directory(db_manager, Path(directory_path))
-    except Exception as e:
-        click.echo(f"{RED}An unexpected error occurred during JSON import setup: {e}{RESET}", err=True)
-    finally:
-        if db_manager:
-            db_manager.close_connection()
-
-@cli.command("process-queue")
-@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.option('--pdf-dir', required=True, type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True), help='Directory to save downloaded PDFs.')
-@click.option('--mailto', default='your.email@example.com', help='Email for API politeness headers.')
-def process_queue_command(db_path, pdf_dir, mailto):
-    """Processes the 'to_download_references' queue: fetches metadata and downloads PDFs."""
-    db_manager = None
-    actual_disk_db_path = Path(db_path).resolve()
-    
-    if not actual_disk_db_path.exists():
-        click.echo(f"{RED}Database file not found at {actual_disk_db_path}. Please run init-db or import-bib first.{RESET}")
-        return
-
-    try:
-        db_manager = DatabaseManager(db_path=actual_disk_db_path)
-        
-        fetcher = MetadataFetcher(mailto=mailto)
-        downloader = PDFDownloader(download_dir=pdf_dir, mailto=mailto)
-
-        queue_entries = db_manager.get_all_from_queue()
-        if not queue_entries:
-            click.echo(f"{GREEN}[CLI] Download queue is empty. Nothing to process.{RESET}")
-            return
-
-        click.echo(f"{YELLOW}[CLI] Found {len(queue_entries)} entries to process in the queue.{RESET}")
-
-        for entry in queue_entries:
-            queue_id = entry['id']
-            click.echo(f"\n--- Processing Queue Entry ID: {queue_id}, Title: {entry.get('title', 'N/A')} ---")
-
-            # 1. Fetch metadata
-            enriched_data = fetcher.fetch_metadata(entry)
-            if not enriched_data:
-                reason = "Failed to fetch metadata from any source."
-                db_manager.move_queue_entry_to_failed(queue_id, reason)
-                continue
-
-            # 2. Find PDF URL from metadata
-            pdf_url = None
-            primary_location = enriched_data.get('primary_location')
-            if primary_location and isinstance(primary_location, dict):
-                pdf_url = primary_location.get('pdf_url')
-            
-            if not pdf_url:
-                reason = "Metadata found, but no PDF URL was available."
-                db_manager.move_queue_entry_to_failed(queue_id, reason)
-                continue
-
-            # 3. Download PDF
-            year = enriched_data.get('publication_year', 'UnknownYear')
-            
-            first_author_lastname = 'UnknownAuthor'
-            authorships = enriched_data.get('authorships')
-            if authorships and isinstance(authorships, list) and len(authorships) > 0:
-                author_info = authorships[0].get('author')
-                if author_info and isinstance(author_info, dict):
-                    display_name = author_info.get('display_name')
-                    if display_name and isinstance(display_name, str):
-                        # Take last word of name as lastname
-                        first_author_lastname = display_name.split()[-1]
-
-            title_short = enriched_data.get('display_name', 'Untitled')[:40]
-            # Sanitize for filesystem
-            safe_title = re.sub(r'[\\/*?:"<>|]',"", title_short)
-            filename = f"{first_author_lastname}{year}_{safe_title}.pdf"
-
-            file_path, checksum, error_msg = downloader.download_pdf(pdf_url, filename)
-            if error_msg:
-                reason = f"PDF download failed: {error_msg}"
-                db_manager.move_queue_entry_to_failed(queue_id, reason)
-                continue
-
-            # 4. Move to downloaded_references
-            db_manager.move_queue_entry_to_downloaded(queue_id, enriched_data, str(file_path), checksum)
-
-        click.echo(f"\n{GREEN}[CLI] Queue processing complete.{RESET}")
-
-    except Exception as e:
-        click.echo(f"{RED}An unexpected error occurred during queue processing: {e}{RESET}", err=True)
-        traceback.print_exc()
-    finally:
-        if db_manager:
-            db_manager.close_connection()
 
 @cli.command("export-bibtex")
 @click.argument('output_bib_file', type=click.Path(dir_okay=False, writable=True, resolve_path=True))
@@ -622,93 +392,327 @@ def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
 
 
 @cli.command("extract-bib-pages")
-@click.argument('pdf_file_path', type=click.Path(exists=True, dir_okay=False, readable=True, resolve_path=True))
+@click.argument('input_path', type=click.Path(exists=True, file_okay=True, dir_okay=True, readable=True, resolve_path=True))
 @click.option('--output-dir', 
               type=click.Path(file_okay=False, writable=True, resolve_path=True),
               default=str(Path.home() / "Nextcloud/DT/papers_extracted_references"), 
               help='Directory to save extracted reference PDFs. Defaults to ~/Nextcloud/DT/papers_extracted_references.')
-def extract_bib_pages_command(pdf_file_path, output_dir):
-    """Extracts bibliography/reference section pages from a PDF file."""
-    click.echo(f"Attempting to extract bibliography pages from: {pdf_file_path}")
-    click.echo(f"Output will be saved to: {output_dir}")
+def extract_bib_pages_command(input_path, output_dir):
+    """Extracts bibliography/reference section pages from a PDF file or all PDFs in a directory."""
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+
+    # Ensure output directory exists
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if input_path.is_dir():
+        pdf_files = list(input_path.glob('**/*.pdf'))
+        click.echo(f"Found {len(pdf_files)} PDF(s) in directory: {input_path}")
+        if not pdf_files:
+            click.echo("No PDF files to process.")
+            return
+    else:
+        pdf_files = [input_path]
+
+    for pdf_file in pdf_files:
+        click.echo(f"\n--- Processing: {pdf_file.name} ---")
+        try:
+            extract_reference_sections(str(pdf_file), str(output_dir))
+            click.echo(f"{GREEN}Successfully processed {pdf_file.name}.{RESET}")
+        except Exception as e:
+            click.echo(f"{RED}An error occurred while processing {pdf_file.name}: {e}{RESET}", err=True)
+
+    click.echo(f"\n{GREEN}Batch bibliography page extraction process completed.{RESET}")
+
+@cli.command("add-to-no-metadata")
+@click.option('--json-file', 
+              type=click.Path(exists=True, dir_okay=False, readable=True), 
+              required=True,
+              help='Path to the JSON file with extracted references.')
+@click.option('--source-pdf', 
+              type=click.Path(exists=True, dir_okay=False, readable=True), 
+              required=False, 
+              help='Path to the original source PDF file.')
+@click.option('--db-path', 
+              default=str(DEFAULT_DB_PATH), 
+              help='Path to the SQLite database file.')
+def add_to_no_metadata_command(json_file, source_pdf, db_path):
+    """Loads extracted bibliography entries from a JSON file into the no_metadata table."""
+    click.echo(f"Loading entries from {json_file} into the database...")
+    db_manager = DatabaseManager(db_path)
     try:
-        # Ensure output directory exists
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        extract_reference_sections(str(pdf_file_path), str(output_dir))
-        click.echo(f"{GREEN}Bibliography page extraction process completed.{RESET}")
+        added, skipped, errors = db_manager.add_entries_to_no_metadata_from_json(json_file, source_pdf)
+        click.echo(f"{GREEN}Successfully added {added} new entries.{RESET}")
+        if skipped > 0:
+            click.echo(f"{YELLOW}Skipped {skipped} entries (duplicates or missing title).{RESET}")
+        if errors:
+            click.echo(f"{RED}Encountered {len(errors)} errors:{RESET}")
+            for error in errors:
+                click.echo(f"  - {error}")
     except Exception as e:
-        click.echo(f"{RED}An error occurred during bibliography page extraction: {e}{RESET}", err=True)
-        # For more detailed debugging, you might want to print the traceback
-        # import traceback
+        click.echo(f"{RED}An unexpected error occurred: {e}{RESET}")
+    finally:
+        db_manager.close_connection()
         # traceback.print_exc()
 
 @cli.command("extract-bib-api")
-@click.option('--input-path', 
-              type=click.Path(exists=True, readable=True),
-              required=True,
-              help='Path to the input PDF file or directory containing PDF files.')
-@click.option('--output-dir', 
-              type=click.Path(file_okay=False, writable=True),
-              required=True,
-              help='Directory to save output JSON bibliography files.')
-@click.option('--workers', 
-              type=int, 
-              default=5, 
-              show_default=True,
-              help='Maximum number of concurrent worker threads.')
-def extract_bib_api_command(input_path, output_dir, workers):
-    """Extracts bibliographies from PDF(s) using an API and saves them as JSON files."""
-    click.echo(f"{CYAN}--- Starting API Bibliography Extraction ---{RESET}")
-    click.echo(f"Input path: {input_path}")
-    click.echo(f"Output directory: {output_dir}")
-    click.echo(f"Max workers: {workers}")
-
-    # Ensure output directory exists
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        click.echo(f"Ensured output directory exists: {Path(output_dir).resolve()}")
-    except Exception as e:
-        click.echo(f"{RED}Error creating output directory {output_dir}: {e}{RESET}", err=True)
-        return
-
-    click.echo("Configuring API client...")
-    if not configure_api_client():
-        click.echo(f"{RED}Failed to configure API client. Please check your GOOGLE_API_KEY and .env file.{RESET}", err=True)
-        click.echo(f"{RED}Exiting due to API configuration failure.{RESET}", err=True)
-        return
-    click.echo(f"{GREEN}API client configured successfully.{RESET}")
-
-    input_p = Path(input_path)
-    output_d = Path(output_dir)
+@click.argument('input_path', type=click.Path(exists=True, resolve_path=True))
+@click.option('--db-path',
+              type=click.Path(dir_okay=False, writable=True, resolve_path=True),
+              default=str(DEFAULT_DB_PATH),
+              help='Path to the SQLite database file to save results.')
+@click.option('--workers', type=int, default=10, help='Number of concurrent workers.')
+def extract_bib_api_command(input_path, db_path, workers):
+    """Extracts bibliographies from PDF(s) using an API and saves them directly to the database."""
+    input_path = Path(input_path)
+    db_manager = None
 
     try:
-        if input_p.is_dir():
-            click.echo(f"Processing directory: {input_p.resolve()}")
-            process_directory_v2(str(input_p.resolve()), str(output_d.resolve()), workers)
-        elif input_p.is_file() and input_p.name.lower().endswith('.pdf'):
-            click.echo(f"Processing single PDF file: {input_p.resolve()}")
-            # For single_pdf, process_single_pdf expects a summary_dict and a lock
-            summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
-            summary_lock = Lock()
-            process_single_pdf(str(input_p.resolve()), str(output_d.resolve()), summary, summary_lock)
-            # Print summary for single file processing
-            click.echo(f"\n--- Single File Processing Summary ---")
-            click.echo(f"File processed: {summary['processed_files']}")
-            click.echo(f"Successful extraction: {summary['successful_files']}")
-            click.echo(f"Failed extraction: {summary['failed_files']}")
-            if summary['failures']:
-                click.echo(f"{RED}Failure: {summary['failures'][0]['reason']}{RESET}")
-            click.echo("-------------------------")
-        else:
-            click.echo(f"{RED}Error: Input path {input_path} is neither a valid directory nor a PDF file.{RESET}", err=True)
+        # Configure API client (ensure GOOGLE_API_KEY is set in .env or environment)
+        if not configure_api_client():
+            click.echo(f"{RED}API client configuration failed. Please check your GOOGLE_API_KEY.{RESET}", err=True)
             return
-        
-        click.echo(f"\n{GREEN}--- API Bibliography Extraction Completed ---{RESET}")
-        click.echo(f"Output JSON files should be in: {output_d.resolve()}")
+        click.echo("Google API client configured successfully.")
+
+        # Initialize DatabaseManager
+        db_manager = DatabaseManager(db_path=db_path)
+        click.echo(f"Database connection established at: {db_path}")
+
+        # Rate limiting and summary logic is now handled inside the scraper functions.
+
+        if input_path.is_dir():
+            click.echo(f"Processing all PDFs in directory: {input_path}")
+            process_directory_v2(
+                input_dir=input_path,
+                db_manager=db_manager,
+                max_workers=workers
+            )
+        elif input_path.is_file() and input_path.suffix.lower() == '.pdf':
+            click.echo(f"Processing single PDF file: {input_path}")
+            # For a single file, we create a summary dict and lock for the function call.
+            summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
+            lock = Lock()
+            process_single_pdf(
+                pdf_path=input_path,
+                db_manager=db_manager,
+                summary_dict=summary,
+                summary_lock=lock
+            )
+            # Optionally, print the summary for the single file for better user feedback
+            click.echo("\n--- Single File Processing Summary ---")
+            success_count = summary.get('successful_files', 0)
+            failure_count = summary.get('failed_files', 0)
+            click.echo(f"Status: {'Success' if success_count > 0 else 'Failed'}")
+            if failure_count > 0 and summary.get('failures'):
+                click.echo(f"Reason: {summary['failures'][0].get('reason', 'Unknown')}")
+            click.echo("------------------------------------")
+        else:
+            click.echo(f"{RED}Error: Input path must be a valid directory or a .pdf file.{RESET}", err=True)
+
+        click.echo(f"{GREEN}API-based bibliography extraction process completed.{RESET}")
 
     except Exception as e:
-        click.echo(f"{RED}An unexpected error occurred during API bibliography extraction: {e}{RESET}", err=True)
-        click.echo(traceback.format_exc(), err=True)
+        click.echo(f"{RED}An error occurred during the process: {e}{RESET}", err=True)
+        traceback.print_exc()
+    finally:
+        if db_manager:
+            db_manager.close_connection()
+            click.echo("Database connection closed.")
+
+@cli.command("enrich-openalex-db")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
+@click.option('--batch-size', default=50, help='Number of entries to process in one batch.')
+@click.option('--mailto', default='spott@wzb.eu', help='Email for API politeness.')
+def enrich_openalex_db_command(db_path, batch_size, mailto):
+    """Fetches metadata from OpenAlex/Crossref for entries in the no_metadata table."""
+    click.echo(f"Starting DB enrichment – DB: {db_path} | Batch: {batch_size}")
+    db_manager = DatabaseManager(db_path)
+    
+    # Use the more advanced searcher from OpenAlexScraper
+    searcher = OpenAlexCrossrefSearcher(mailto=mailto)
+    # The scraper uses its own RateLimiter, let's create one for it.
+    rate_limiter = RateLimiter(max_per_second=5) 
+
+    promoted_count = 0
+    failed_count = 0
+    
+    try:
+        entries_to_process = db_manager.fetch_no_metadata_batch(batch_size)
+        if not entries_to_process:
+            click.echo("No entries found in 'no_metadata' table to process.")
+            return
+
+        for entry in entries_to_process:
+            click.echo(f"\n[ENRICH] Processing ID {entry['id']} – {entry['title'][:50]}")
+            
+            # Adapt the DB entry to the format expected by process_single_reference
+            ref_for_scraper = {
+                'title': entry.get('title'),
+                'authors': entry.get('authors') if entry.get('authors') else [],
+                'doi': entry.get('doi'),
+                'year': None, # Not available in no_metadata
+                'container-title': None, # Not available
+                'abstract': None, # Not available
+                'keywords': None # Not available
+            }
+
+            # Use the powerful multi-step search process
+            enriched_data = process_single_reference(ref_for_scraper, searcher, rate_limiter)
+            
+            if enriched_data:
+                db_manager.promote_to_with_metadata(entry['id'], enriched_data)
+                promoted_count += 1
+                click.echo(f"  -> metadata found, promoted to with_metadata.")
+            else:
+                reason = "Metadata fetch failed (no match found in OpenAlex/Crossref)"
+                failed_id, error_msg = db_manager.move_no_meta_entry_to_failed(entry['id'], reason)
+                if failed_id:
+                    click.echo(f"  ! metadata fetch failed, moved to failed_enrichments.")
+                else:
+                    click.echo(f"  ! FAILED to move entry {entry['id']} to failed_enrichments: {error_msg}")
+                failed_count += 1
+
+    except Exception as e:
+        click.echo(f"{RED}An unexpected error occurred during enrichment: {e}{RESET}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        click.echo(f"\nEnrichment finished: {promoted_count} promoted, {failed_count} failed.")
+        db_manager.close_connection()
+
+
+@cli.command("process-downloads")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, writable=True, resolve_path=True), help='Path to SQLite database file.')
+@click.option('--batch-size', default=50, show_default=True, help='Max number of with_metadata rows to enqueue.')
+def process_downloads_command(db_path, batch_size):
+    """Move enriched references into the download queue (`to_download_references`)."""
+    click.echo(f"Queueing up to {batch_size} items from with_metadata…")
+
+    db = DatabaseManager(db_path)
+    ids = db.fetch_with_metadata_batch(limit=batch_size)
+    if not ids:
+        click.echo("No items in with_metadata.")
+        db.close_connection()
+        return
+
+    added = 0
+    skipped = 0
+    for wid in ids:
+        qid, err = db.enqueue_for_download(wid)
+        if qid:
+            added += 1
+            click.echo(f"  → queued (qid {qid}) from wid {wid}")
+        else:
+            skipped += 1
+            click.echo(f"  ! skipped wid {wid}: {err}")
+
+    click.echo(f"Finished: {added} queued, {skipped} skipped.")
+    db.close_connection()
+
+
+# ----------------------------------------------------------------------
+# Download PDFs Worker
+# ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+
+@cli.command("retry-failed-downloads")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(), help='SQLite database path.')
+def retry_failed_downloads_command(db_path):
+    """Move all entries from failed_downloads back to no_metadata for reprocessing."""
+    click.echo("Retrying failed downloads...")
+    db_manager = DatabaseManager(db_path=db_path)
+    try:
+        moved_count = db_manager.retry_failed_downloads()
+        click.echo(f"Successfully moved {moved_count} entries from 'failed_downloads' to 'no_metadata'.")
+    except Exception as e:
+        click.echo(f"An error occurred: {e}", err=True)
+    finally:
+        db_manager.close_connection()
+
+@cli.command("download-pdfs")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, resolve_path=True), help='SQLite database path.')
+@click.option('--batch-size', default=10, show_default=True, help='Number of queue entries to process per run.')
+@click.option('--download-dir', default=str(Path.cwd() / 'pdf_library'), type=click.Path(file_okay=False, resolve_path=True), help='Directory to store downloaded PDFs.')
+def download_pdfs_command(db_path, batch_size, download_dir):
+    """Process download queue and retrieve PDFs."""
+    download_dir = Path(download_dir)
+    download_dir.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Processing up to {batch_size} queued items…")
+
+    rl = ServiceRateLimiter({
+        'default': {'limit': 2, 'window': 1},
+        'unpaywall': {'limit': 3, 'window': 1},
+        'scihub': {'limit': 1, 'window': 2},
+        'libgen': {'limit': 1, 'window': 2},
+    })
+
+    db = DatabaseManager(db_path)
+    enhancer = BibliographyEnhancer(db_manager=db, rate_limiter=rl, email='spott@wzb.eu', output_folder=download_dir)
+
+    queue = db.get_entries_to_download(limit=batch_size)
+    if not queue:
+        click.echo("Queue is empty.")
+        db.close_connection()
+        return
+
+    ok = 0
+    failed = 0
+    for row in queue:
+
+
+        # Correctly parse author data from the database row
+        author_structs = []
+        author_names_for_display = []
+        try:
+            authors_json = row.get('authors')
+            if authors_json:
+                loaded_json = json.loads(authors_json)
+                if isinstance(loaded_json, list):
+                    author_structs = loaded_json
+                    # Create a simple list of names for display
+                    for author in author_structs:
+                        if isinstance(author, dict):
+                            given = author.get('given', '')
+                            family = author.get('family', '')
+                            if family:
+                                author_names_for_display.append(f"{given} {family}".strip())
+        except (json.JSONDecodeError, TypeError):
+            pass # Keep lists empty if data is malformed
+
+        # Update the user on progress
+        click.echo(f"\n[QID {row['id']}] {row['title'][:80]}")
+        click.echo(f"Authors: {', '.join(author_names_for_display) if author_names_for_display else 'N/A'}")
+        click.echo(f"Year: {row.get('year', 'N/A')}")
+
+        ref = {
+            'title': row.get('title'),
+            'authors': author_structs,  # Pass the structured data for searching
+            'doi': row.get('doi'),
+            'type': row.get('entry_type') or '',
+            'year': row.get('year')
+        }
+
+        result = enhancer.enhance_bibliography(copy.deepcopy(ref), download_dir)
+        if result and result.get('downloaded_file'):
+            fp = result['downloaded_file']
+            checksum = ''
+            try:
+                with open(fp, 'rb') as fh:
+                    checksum = hashlib.sha256(fh.read()).hexdigest()
+            except Exception:
+                pass
+            db.move_entry_to_downloaded(qid, result, fp, checksum, result.get('download_source', 'unknown'))
+            click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
+            ok += 1
+        else:
+            db.move_queue_entry_to_failed(row['id'], 'download_failed')
+            click.echo("  ✗ download failed")
+            failed += 1
+
+    click.echo(f"\nWorker finished: {ok} downloaded, {failed} failed.")
+    db.close_connection()
+
+
 
 @cli.command("enrich-openalex")
 @click.option('--input-path', 
@@ -728,7 +732,7 @@ def extract_bib_api_command(input_path, output_dir, workers):
               show_default=True, 
               help='Fetch citing work IDs from OpenAlex for matched entries.')
 def enrich_openalex_command(input_path, output_dir, mailto, fetch_citations):
-    """Enriches bibliography JSON files with data from OpenAlex and Crossref."""
+    """Enriches bibliography JSON files with metadata from OpenAlex and Crossref."""
     click.echo(f"{CYAN}Starting OpenAlex enrichment process...{RESET}")
     click.echo(f"Input path: {input_path}")
     click.echo(f"Output directory: {output_dir}")

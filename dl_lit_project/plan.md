@@ -1,4 +1,44 @@
-# Plan for dl_lit.py Rewrite
+# Project Plan: `dl_lit` PDF Literature Pipeline
+
+## 1. Project Overview
+
+The goal of the `dl_lit` project is to create an automated, database-centric pipeline for processing academic PDFs. The pipeline starts with a PDF document, extracts its bibliography, enriches the reference metadata using external APIs (OpenAlex, Crossref), downloads the referenced papers, and stores all data and files in a structured way for future use and export.
+
+## 2. Core Components & Scripts
+
+This section documents the key Python scripts and their roles in the pipeline. It serves as a quick reference to prevent overlooking existing functionality.
+
+- **`dl_lit/cli.py`**: The main entry point for all command-line operations. It uses the `click` library to define commands that orchestrate the different pipeline stages.
+
+- **`dl_lit/db_manager.py`**: Contains the `DatabaseManager` class, which handles all interactions with the central SQLite database (`literature.db`). It manages the schema and all data transactions between the pipeline stages.
+
+- **`dl_lit/get_bib_pages.py`**: Provides the `extract-bib-pages` CLI command. Its sole purpose is to identify and extract the specific pages containing the bibliography from a large source PDF, creating smaller, targeted PDFs for the next step.
+
+- **`dl_lit/APIscraper_v2.py`**: **(Mistakenly overlooked previously)**. This script is responsible for the critical text extraction and parsing step. It takes the small, bibliography-only PDFs, sends them to a GenAI model (Gemini) to parse the text into structured JSON data, and then loads this data directly into the `no_metadata` table in the database.
+
+- **`dl_lit/OpenAlexScraper.py`**: Contains the core logic for metadata enrichment. It takes entries from the `no_metadata` table and uses the OpenAlex and Crossref APIs to find comprehensive metadata, including authors, DOIs, and abstracts.
+
+- **`dl_lit/new_dl.py`**: Contains the `BibliographyEnhancer` class, which is responsible for the final download stage: taking an enriched reference and attempting to find and download the corresponding PDF file.
+
+## 3. End-to-End Workflow
+
+This outlines the intended flow of data through the pipeline, from a single source PDF to a fully processed and downloaded set of references.
+
+1.  **Start**: A user provides a source PDF (e.g., a handbook).
+2.  **Extract Bib Pages**: `extract-bib-pages` command is run. It uses GenAI to find the reference sections and creates small PDFs containing only those pages.
+3.  **Extract & Parse Text**: `APIscraper_v2.py` (via a future CLI command) processes these small PDFs. It uses GenAI to parse the references and inserts the structured data into the `no_metadata` table.
+4.  **Enrich Metadata**: `enrich-openalex-db` command is run. It takes entries from `no_metadata`, fetches rich metadata from OpenAlex/Crossref, and on success, moves them to the `with_metadata` table.
+5.  **Queue for Download**: `process-downloads` command is run. It moves entries from `with_metadata` to the `to_download_references` table, making them ready for download.
+6.  **Download PDFs**: `download-pdfs` command is run. It processes the `to_download_references` queue, uses `new_dl.py` to find and save the PDF files, and moves the corresponding entries to the final `downloaded_references` table.
+
+## 4. Current Task List
+
+- [ ] **Fix Pipeline Crash**: Resolve the `ValueError` in `db_manager.py` that occurs during the `process-downloads` step.
+    - [ ] Remove the redundant duplicate check from `add_entry_to_download_queue`.
+- [ ] **Integrate `APIscraper_v2.py`**: Create a new CLI command in `cli.py` to properly run the `APIscraper_v2.py` logic as part of the main pipeline.
+- [ ] **End-to-End Test**: Perform a full pipeline run on a sample PDF, using the newly integrated commands.
+- [ ] **Documentation**: Update the main `README.md` to reflect the new commands and the complete, correct workflow.
+- [ ] **Unit Tests**: Add unit tests for the downloader worker and the full pipeline integration.
 
 ## 1. Overall Goal
 
@@ -247,12 +287,66 @@ dl_lit_project/
 ├── requirements.txt
 └── setup.py                    # If making it an installable package
 
-## 7. Next Steps
-1.  Set up the project directory structure.
-2.  Begin implementation with `db_manager.py` and the database schema.
-3.  Develop the CLI structure (`main_cli.py`) with `argparse`, starting with `init-db` and `import-bib`.
-4.  Implement the `import-bib` workflow end-to-end. **(Done)**
-5.  Implement the `export-bibtex` workflow end-to-end. **(Done)**
-6.  Implement bibliography extraction from PDFs using local processing (`extract-bib-pages`). **(Done)**
-7.  Implement bibliography extraction from PDFs using API (`extract-bib-api`). **(Done)**
-8.  Continue with other planned workflows (e.g., `add-json`, `process-queue`).
+## 7. Progress & Next Steps
+
+### ✅ Completed So Far
+1. Project directory scaffolded.
+2. `db_manager.py` with core schema implemented.
+3. CLI with `init-db`, `import-bib`, `export-bibtex`, `extract-bib-pages`, and `extract-bib-api` commands implemented.
+4. Duplicate-aware BibTeX import & export working.
+5. BibTeX formatter produces JabRef-friendly `file` fields.
+6. Staged-table schema (`no_metadata`, `with_metadata`) added to the database.
+7. Helper methods (`insert_no_metadata`, `promote_to_with_metadata`, `enqueue_for_download`) implemented.
+8. `APIscraper_v2` updated to stream extracted refs directly into `no_metadata` (`--db-path` option).
+
+### 🔜 Upcoming Work
+1. **Enrichment Stage**
+    • Create a batch script / CLI command (`enrich-openalex-db`) that:
+        a. pulls a configurable number of rows from `no_metadata`,
+        b. calls `OpenAlexScraper`/Crossref to fetch metadata,
+        c. uses `promote_to_with_metadata` for each result.
+2. **Download Queue Integration**
+    • Modify `new_dl.py` (or new helper) to dequeue from `to_download_references` and move successful downloads to `downloaded_references` (or `failed_downloads` on error).
+3. **Migration** – one-off script to import any existing JSON bibliography files into `no_metadata` via `insert_no_metadata`.
+4. **Testing** – add unit tests for staged-table helpers and an integration test covering the full pipeline (PDF → DL).
+5. **Documentation** – update README with the new pipeline diagram, CLI usage examples, and environment variable requirements.
+6. **Cleanup / Logging** – replace print statements with `logging` and remove noisy debug output.
+7. **Packaging** – prepare `setup.py`/`pyproject.toml`, pin dependencies, and build Dockerfile for reproducible runs.
+
+
+## 8. Staged Database Workflow (Approved 2025-06-19)
+
+The ingestion and download pipeline now uses three explicit staging tables to keep processing steps isolated and prevent duplicate work:
+
+1. **`no_metadata`** – minimal reference extracted by `APIscraper_v2`.
+   • Columns: `id` (PK), `source_pdf`, `title`, `authors`, `doi`, `normalized_doi`, `normalized_title`, `normalized_authors`, `created_at`.
+
+2. **`with_metadata`** – rows enriched via `OpenAlexScraper`/Crossref.
+   • Adds: `openalex_id`, `crossref_json`, `abstract`, `journal`, `year`, `authors_json`, etc.
+
+3. **`to_download_references`** – final queue for `new_dl.py` downloader; schema matches current definition (with `file_path` NULL initially).
+
+Processing flow:
+
+```mermaid
+flowchart TD
+    S[APIscraper_v2 JSON] -->|dedup & insert| NM(no_metadata)
+    NM -->|enrich| WM(with_metadata)
+    WM -->|dup-check vs downloaded| TD(to_download_references)
+    TD -->|PDF download| DL(downloaded_references)
+    TD -->|fail| FD(failed_downloads)
+```
+
+Transition rules:
+• Each move is performed in a single transaction (`INSERT … SELECT` followed by `DELETE`) so a row lives in only one staging table at any moment.
+• `normalized_doi` **and** `openalex_id` are `UNIQUE` in every table, preventing the same document being queued twice.
+• Additional indexes per table optimise stage-specific queries (e.g., index on `normalized_doi` in `no_metadata`, on `openalex_id` in `with_metadata`).
+
+This structure gives:
+• Clear visibility of pipeline stages.
+• Fast duplicate checks at every step.
+• Easy parallelism (workers operate on their stage’s table).
+• Simpler cleanup—finished rows never remain in earlier stages.
+
+Implementation tasks have been added to the task list to create the two new tables and helper methods in `DatabaseManager`, and to update the relevant scripts to use them.
+

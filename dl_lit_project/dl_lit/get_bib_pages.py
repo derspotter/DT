@@ -11,6 +11,8 @@ import shutil
 import concurrent.futures
 from dotenv import load_dotenv
 import glob
+from .utils import ServiceRateLimiter
+
 
 print("--- Script Top --- ", flush=True)
 
@@ -47,33 +49,37 @@ def clean_json_response(text):
         text = text[:-3]  # Remove ``` suffix
     return text.strip()
 
-def find_reference_section_pages(pdf_path: str, model, uploaded_pdf):
+def find_reference_section_pages(pdf_path: str, model, uploaded_pdf, total_physical_pages: int, rate_limiter: ServiceRateLimiter):
     """Use GenAI to find reference section pages in the PDF."""
     print(f"Attempting to find reference sections in PDF: {pdf_path}", flush=True)
     print("Using pre-uploaded PDF for section finding.", flush=True)
     
     # Prompt asking for 1-based physical page indices
-    prompt = """
+    prompt = f"""
 Your task is to identify ALL bibliography or reference sections in this PDF document.
+
+CONTEXT:
+- The document has a total of {total_physical_pages} physical pages, numbered 1 to {total_physical_pages}.
 
 INSTRUCTIONS:
 1. Find sections containing lists of references, citations, or bibliographic entries. These sections might be titled 'References', 'Bibliography', 'Works Cited', or similar, or they might be untitled but recognizable by their format (lists of authors, years, titles, DOIs, etc.).
 2. **IMPORTANT: You MUST use 1-based physical page indices. The first page of the document is page 1, the second is page 2, and so on, regardless of any printed page numbers.**
-3. 'start_page' is the 1-based physical index of the page where the reference section begins (this could be the page with the section title or the first bibliographic entry). Include this page even if the section starts mid-page or at the end of the page after other content.
+3. **'start_page' MUST be the 1-based physical index of the page containing the section's title (e.g., "References", "Bibliography"). If the title is on a preceding page, you must use the page with the title as the start_page.** This is critical to avoid cutting off the beginning of the section.
 4. 'end_page' is the 1-based physical index of the page where the last entry of that specific reference section ends. Do not include subsequent pages that are empty or contain unrelated content.
 5. Identify ALL such reference sections. Pay close attention to the end of chapters or major parts, as these often have their own reference lists.
 6. Return ONLY a JSON array as shown below. Do not include any explanatory text or markdown formatting outside the JSON structure.
 
 FORMAT:
 [
-    {
+    {{
         "start_page": 250,  // 1-based physical page index where the section starts
         "end_page": 255     // 1-based physical page index where the section's last entry ends
-    }
+    }}
 ]
 
 RULES:
 - Always include 'start_page' and 'end_page' for each identified section.
+- **When in doubt about the start page, be inclusive. It is better to include the page before the first reference item than to miss the section title.**
 - Use INTEGER numbers only for page indices.
 - Ensure 'start_page' correctly identifies the beginning of the section (title or first entry) by its 1-based physical index.
 - Ensure 'end_page' correctly identifies the end of the last entry of that section by its 1-based physical index.
@@ -82,12 +88,13 @@ RULES:
 """
 
     try:
-        # Generate content with timeout
+        rate_limiter.wait_if_needed('gemini')
+        print("Sending request to GenAI...", flush=True)
         response = model.generate_content([prompt, uploaded_pdf], request_options={'timeout': 600})
         print("Raw find_reference_section_pages response: ```json")
         print(response.text)
         print("```", flush=True)
-        
+
         # Extract JSON from response
         import re
         json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response.text)
@@ -111,13 +118,17 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
         print("Skipping extraction: GOOGLE_API_KEY not configured.", flush=True)
         return
 
-    model = genai.GenerativeModel("gemini-1.5-flash-latest", generation_config=genai.types.GenerationConfig(temperature=0.0))
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    service_config = {
+        'gemini': {'limit': 10, 'window': 60}  # 10 requests per 60 seconds
+    }
+    rate_limiter = ServiceRateLimiter(service_config)
     files_to_clean_up = []
     temp_chunk_dir = None
     all_sections = []
 
-    MAX_PAGES_FOR_API = 990 # A safe buffer below the 1000 page limit
-    CHUNK_SIZE = 500
+    MAX_PAGES_FOR_API = 50
+    CHUNK_SIZE = 50
 
     try:
         with pikepdf.Pdf.open(pdf_path) as pdf_doc:
@@ -142,16 +153,20 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                     for page_num in range(start_page, end_page):
                         chunk_pdf.pages.append(pdf_doc.pages[page_num])
                     
-                    chunk_path = os.path.join(temp_chunk_dir, f"chunk_{start_page+1}-{end_page}.pdf")
+                    base_filename = os.path.splitext(os.path.basename(pdf_path))[0]
+                    chunk_display_name = f"{base_filename}_chunk_pages_{start_page+1}-{end_page}.pdf"
+                    chunk_path = os.path.join(temp_chunk_dir, chunk_display_name)
                     chunk_pdf.save(chunk_path)
 
                     # Upload and process the chunk
-                    print(f"Uploading chunk: {chunk_path}")
-                    uploaded_chunk = genai.upload_file(chunk_path)
+                    rate_limiter.wait_if_needed('gemini')
+                    print(f"Uploading chunk: {chunk_display_name}")
+                    uploaded_chunk = genai.upload_file(chunk_path, display_name=chunk_display_name)
                     files_to_clean_up.append(uploaded_chunk)
                     print(f"Uploaded as {uploaded_chunk.name}. Finding reference sections in chunk...")
 
-                    chunk_sections = find_reference_section_pages(chunk_path, model, uploaded_chunk)
+                    chunk_page_count = end_page - start_page
+                    chunk_sections = find_reference_section_pages(chunk_path, model, uploaded_chunk, total_physical_pages=chunk_page_count, rate_limiter=rate_limiter)
                     if chunk_sections:
                         # Adjust page numbers to be absolute to the original PDF
                         for sec in chunk_sections:
@@ -164,12 +179,13 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
 
             else:
                 # --- Standard Logic for Smaller PDFs ---
-                print("PDF is within page limits. Processing as a single file.")
+                print("PDF is within size limits, processing as a single file.")
+                rate_limiter.wait_if_needed('gemini')
                 print("Uploading full PDF...")
                 uploaded_pdf = genai.upload_file(pdf_path)
                 files_to_clean_up.append(uploaded_pdf)
                 print(f"Uploaded as {uploaded_pdf.name}. Finding reference sections...")
-                all_sections = find_reference_section_pages(pdf_path, model, uploaded_pdf)
+                all_sections = find_reference_section_pages(pdf_path, model, uploaded_pdf, total_physical_pages=total_physical_pages, rate_limiter=rate_limiter)
 
         # --- Aggregated Section Processing ---
         if not all_sections:

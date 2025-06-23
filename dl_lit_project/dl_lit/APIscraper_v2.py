@@ -3,6 +3,14 @@ import json
 import time
 import glob
 import argparse
+from pathlib import Path
+
+import sys
+# Add project root to path to allow absolute imports from `dl_lit`
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Import DatabaseManager for staged DB insertion
+from dl_lit.db_manager import DatabaseManager
 from pdfminer.high_level import extract_text
 try:
     import fitz  # PyMuPDF
@@ -210,7 +218,7 @@ def extract_json_from_text(text):
 
 # --- Main Processing Logic ---
 
-def process_single_pdf(pdf_path, output_dir, summary_dict, summary_lock):
+def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summary_lock):
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
     print(f"\n[INFO] Processing {filename}...", flush=True)
@@ -235,20 +243,26 @@ def process_single_pdf(pdf_path, output_dir, summary_dict, summary_lock):
             file_success = True # Treat as success because process completed
             # Don't save an empty file, just report no data found
         else:
-            # Save Output
-            output_filename = f"{os.path.splitext(filename)[0]}_bibliography.json"
-            output_path = os.path.join(output_dir, output_filename)
-            try:
-                write_start = time.time()
-                with open(output_path, 'w', encoding='utf-8') as f_out:
-                    json.dump(bibliography_data, f_out, indent=2, ensure_ascii=False)
-                write_duration = time.time() - write_start
-                print(f"[SUCCESS] Saved bibliography for {filename} to {output_path} (write took {write_duration:.2f} seconds).", flush=True)
-                file_success = True
-            except Exception as e:
-                failure_reason = f"Failed to write JSON output: {e}"
-                print(f"[ERROR] {failure_reason} for {filename}", flush=True)
-                file_success = False
+
+            # Insert each entry into no_metadata stage
+            successes = 0
+            for entry in bibliography_data:
+                minimal_ref = {
+                    "title": entry.get("title"),
+                    "authors": entry.get("authors"),
+                    "doi": entry.get("doi"),
+                    "source_pdf": pdf_path,
+                }
+                row_id, err = db_manager.insert_no_metadata(minimal_ref)
+                if err:
+                    print(f"[WARNING] Skipped entry due to: {err}", flush=True)
+                else:
+                    successes += 1
+            print(f"[SUCCESS] Inserted {successes}/{len(bibliography_data)} entries from {filename} into database.", flush=True)
+            file_success = True if successes else False
+            if not file_success:
+                failure_reason = "All inserts skipped (duplicates or errors)"
+
 
     except Exception as e:
         # Catch errors during API call steps
@@ -266,11 +280,10 @@ def process_single_pdf(pdf_path, output_dir, summary_dict, summary_lock):
             summary_dict["failed_files"] += 1
             summary_dict["failures"].append({"file": filename, "reason": failure_reason})
 
-def process_directory_v2(input_dir, output_dir, max_workers=5):
+def process_directory_v2(input_dir, db_manager: DatabaseManager, max_workers=5):
     """Processes all PDFs in the input directory concurrently, saving to the specified output dir."""
     print(f"[INFO] Processing directory: {input_dir}", flush=True)
-    print(f"[INFO] Using output directory: {output_dir}", flush=True)
-    os.makedirs(output_dir, exist_ok=True) # Ensure output directory exists
+
 
     # Find all PDFs recursively using glob
     pdf_files = glob.glob(os.path.join(input_dir, "**/*.pdf"), recursive=True)
@@ -280,7 +293,6 @@ def process_directory_v2(input_dir, output_dir, max_workers=5):
         return
 
     print(f"[INFO] Starting concurrent processing with up to {max_workers} workers and 15 RPM limit.", flush=True)
-    print(f"[INFO] Results will be saved in: {output_dir}", flush=True)
 
     # Initialize summary for tracking results
     results_summary = {
@@ -294,8 +306,8 @@ def process_directory_v2(input_dir, output_dir, max_workers=5):
     try:
         # Use ThreadPoolExecutor for I/O-bound tasks
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit tasks for each PDF, passing the actual_output_dir
-            futures = [executor.submit(process_single_pdf, pdf_path, output_dir, results_summary, summary_lock)
+            # Submit tasks for each PDF
+            futures = [executor.submit(process_single_pdf, pdf_path, db_manager, results_summary, summary_lock)
                        for pdf_path in pdf_files]
 
             # Wait for all tasks to complete and handle potential exceptions
@@ -346,23 +358,32 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='V2: Extract bibliographies from PDFs using an API.')
     parser.add_argument('--input-dir', required=True, help='Directory containing input PDF files.')
-    parser.add_argument('--output-dir', required=True, help='Directory to save output JSON files.')
     parser.add_argument('--workers', type=int, default=5, help='Maximum number of concurrent worker threads.')
+    parser.add_argument('--db-path', required=True, help='Path to the SQLite database file to insert extracted references into.')
     args = parser.parse_args()
 
     input_path = args.input_dir
-    output_dir = args.output_dir
     max_workers = args.workers
+    db_path_arg = args.db_path
+
+    db_manager = None
+    if not db_path_arg:
+        print("[FATAL] --db-path is a required argument. Exiting.", flush=True)
+        exit(1)
+    else:
+        db_path_resolved = Path(db_path_arg).expanduser().resolve()
+        print(f"[INFO] Using database at: {db_path_resolved}", flush=True)
+        db_manager = DatabaseManager(db_path=db_path_resolved)
+
 
     # Check if input is a directory or single file
     if os.path.isdir(input_path):
         print(f"[INFO] Processing directory: {input_path}", flush=True)
-        process_directory_v2(input_path, output_dir, max_workers)
+        process_directory_v2(input_path, db_manager, max_workers)
     elif os.path.isfile(input_path) and input_path.lower().endswith('.pdf'):
         print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
-        os.makedirs(output_dir, exist_ok=True) # Ensure output directory exists
         summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
-        process_single_pdf(input_path, output_dir, summary, Lock())
+        process_single_pdf(input_path, db_manager, summary, Lock())
         print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
     else:
         print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)

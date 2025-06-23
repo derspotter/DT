@@ -163,91 +163,122 @@ def normalize_name(name):
 def match_author_name(ref_author, result_author):
     """Match academic author names with tolerance for initials and fuzzy logic"""
     ref_first, ref_last = normalize_name(ref_author)
-    result_first, result_last = normalize_name(result_author)
+    res_first, res_last = normalize_name(result_author)
 
-    if not ref_first or not ref_last or not result_first or not result_last:
+    # Last names must match with high similarity
+    if not ref_last or not res_last:
+        return 0.0
+    last_name_similarity = fuzz.ratio(ref_last.lower(), res_last.lower())
+    if last_name_similarity < 85: # Strict threshold for last names
         return 0.0
 
-    # Last name must match at a high similarity level (fuzzy match with a high threshold)
-    last_name_score = fuzz.ratio(ref_last, result_last)
-    if last_name_score < 90:
-        return 0.0
+    # If last names match, check first names
+    if not ref_first or not res_first:
+        # If one has no first name, rely on last name match score
+        score = last_name_similarity / 100.0
+        return score
 
-    # Handle initials and full name comparison for first names
-    ref_initials = ''.join([name[0] for name in ref_first.split() if name])
-    result_initials = ''.join([name[0] for name in result_first.split() if name])
+    # Check for initialism (e.g., "J. R. R." vs "John Ronald Reuel")
+    ref_initials = "".join([name[0] for name in ref_first.split()])
+    res_initials = "".join([name[0] for name in res_first.split()])
 
-    # If the reference first name only has one part, only compare initials
-    if len(ref_first.split()) == 1:
-        if ref_initials and result_initials and ref_initials[0] == result_initials[0]: # check if initials are not empty
-            return 1.0
-    else:
-        # If both names have more than one part, compare the initials fully
-        if ref_initials == result_initials:
-            return 1.0
+    if ref_initials.lower() == res_initials.lower():
+        return 1.0 # Very likely a match
 
-    # Use fuzzy matching to see if the first names are similar enough
-    first_name_score = fuzz.partial_ratio(ref_first, result_first)
-    if first_name_score >= 70:
-        return 1.0
+    # Fuzzy match on full first names
+    first_name_similarity = fuzz.partial_ratio(ref_first.lower(), res_first.lower())
 
-    return 0.0
+    # Combine scores, giving more weight to last name
+    combined_score = (0.7 * last_name_similarity + 0.3 * first_name_similarity) / 100.0
+    
+    return combined_score
 
 def find_best_author_match(ref_authors, result, ref_editors=None):
     """
     Match authors and editors against result authors.
     ref_editors is the list of editors from the reference, if available.
     """
+    if ref_editors is None:
+        ref_editors = []
+
     result_authors = [
-        authorship['author'].get('display_name', '') 
-        for authorship in result.get('authorships', [])
-        if 'author' in authorship
+        author['author']['display_name']
+        for author in result.get('authorships', [])
+        if author.get('author') and author['author'].get('display_name')
     ]
-    
-    if not result_authors:
+
+    # Combine authors and editors for matching
+    all_ref_authors = ref_authors + ref_editors
+
+    if not all_ref_authors:
+        # If no authors in reference, we can't perform a match.
         return 0.0
 
-    # Create two lists: confirmed authors and potential editor-authors
-    confirmed_authors = ref_authors if ref_authors else []
-    editor_authors = ref_editors if ref_editors else []
-    
-    # First try to match confirmed authors in position
-    score = 0.0
-    for ref_author in confirmed_authors:
-        # Try to match this author with any result author
-        for result_author in result_authors:
-            if match_author_name(ref_author, result_author) == 1.0:
-                score += 1
-                break
-    
-    # Then try to match editors in any position
-    for editor in editor_authors:
-        for result_author in result_authors:
-            if match_author_name(editor, result_author) == 1.0:
-                score += 1
-                break
-    
-    # Calculate final score based on maximum possible matches
-    total_people = len(confirmed_authors) + len(editor_authors)
-    if total_people == 0:
+    if not result_authors:
+        # If no authors in result, we can't perform a match.
         return 0.0
-        
-    return score / max(total_people, len(result_authors))
+    
+    # Calculate match scores for all pairs of authors
+    scores = []
+    for ref_author in all_ref_authors:
+        for res_author in result_authors:
+            scores.append(match_author_name(ref_author, res_author))
+
+    if not scores:
+        return 0.0
+
+    # Use the average of the top N scores, where N is the number of authors in the reference.
+    # This rewards results that match multiple authors.
+    scores.sort(reverse=True)
+    num_authors_to_consider = len(all_ref_authors)
+    top_scores = scores[:num_authors_to_consider]
+    
+    # Check for empty top_scores to avoid division by zero
+    if not top_scores:
+        return 0.0
+
+    average_score = sum(top_scores) / len(top_scores)
+    
+    return average_score
 
 def get_authors_and_editors(ref):
-    """Get separate lists of authors and editors from reference"""
-    authors = []
-    editors = []
+    """Get separate lists of authors and editors from reference, expanding multi-author strings."""
     
-    if isinstance(ref.get('authors'), list):
-        authors.extend(ref['authors'])
-    
-    if isinstance(ref.get('editors'), list):
-        editors.extend(ref['editors'])
-    elif isinstance(ref.get('editor'), str):
-        editors.append(ref['editor'])
-    
+    def expand_author_list(author_list_in):
+        if not author_list_in:
+            return []
+        
+        # Ensure it's a list to start with
+        if isinstance(author_list_in, str):
+            author_list_in = [author_list_in]
+
+        expanded_list = []
+        for item in author_list_in:
+            if not isinstance(item, str):
+                continue
+
+            # Heuristic: if a string contains multiple commas, it might be a list of authors
+            # in the format "Last1, F1., Last2, F2."
+            if item.count(',') > 1:
+                # This is a brittle parser for "Last, F., Last, F." format
+                # It assumes an even number of comma-separated parts.
+                sub_parts = [p.strip() for p in item.split(',')]
+                if len(sub_parts) % 2 == 0:
+                    it = iter(sub_parts)
+                    for last, first in zip(it, it):
+                        expanded_list.append(f"{last}, {first}")
+                    continue # Go to next item in author_list_in
+            
+            # If not a multi-author string, or if parsing failed, add the original item
+            expanded_list.append(item)
+            
+        return expanded_list
+
+    authors = expand_author_list(ref.get('authors', []))
+    editors = expand_author_list(ref.get('editor', []))
+        
     return authors, editors
+
 
 class OpenAlexCrossrefSearcher:
     def __init__(self, mailto='spott@wzb.eu'):
@@ -488,36 +519,26 @@ def process_single_reference(ref, searcher, rate_limiter):
     keywords = ref.get('keywords') # For future use
 
     if not title:
+        # This print is useful, so we keep it.
         print(f"Skipping reference due to missing title: {ref.get('id', 'Unknown ID')}")
-        return ref # Return original if no title
+        return None # Return None on failure
 
     all_results = {} # Store unique results by ID
     first_success_step = None
     
-    # Try all steps 1-9 in order
-    print("\nTrying all search steps:")
+    # Try all steps 1-9 in order, collecting all possible results
     for step in range(1, 10):
-        # Pass abstract and keywords to search
         results = searcher.search(title, year, container_title, abstract, keywords, step, rate_limiter=rate_limiter)
         
         if results['success']:
-            print(f"Step {step}: Found {len(results['results'])} results")
-            if first_success_step is None:
+            if first_success_step is None and len(results['results']) > 0:
                 first_success_step = step
             
-            # Add new results to our collection
             for result in results['results']:
                 result_id = result.get('id')
                 if result_id and result_id not in all_results:
                     all_results[result_id] = result
                     all_results[result_id]['first_found_in_step'] = step
-        else:
-            error_msg = results.get('error', 'Unknown error')
-            if error_msg == 'Unknown error' and results.get('meta', {}).get('count', 0) == 0:
-                print(f"Step {step}: No results found for this query")
-            else:
-                print(f"Step {step}: Failed - {error_msg}")
-                print(f"[DEBUG] Detailed error info for step {step}: {results}")
     
     unique_results = list(all_results.values())
     
@@ -535,11 +556,9 @@ def process_single_reference(ref, searcher, rate_limiter):
 
         matched_results.sort(key=lambda x: (-x['author_match_score'], x['first_found_in_step']))
 
-        accept_result = matched_results[0]['author_match_score'] > 0.0
-        
-        if accept_result:
+        # Accept the result only if the best score is high enough.
+        if matched_results and matched_results[0]['author_match_score'] > 0.85:
             best_match = matched_results[0]
-            print(f"Best match for '{title[:50]}...': {best_match['result'].get('display_name', 'N/A')[:50]}... (Score: {best_match['author_match_score']:.2f}, Step: {best_match['first_found_in_step']})")
             
             # Add abstract if available from OpenAlex
             if best_match['result'].get('abstract_inverted_index'):
@@ -553,27 +572,9 @@ def process_single_reference(ref, searcher, rate_limiter):
                 "first_successful_step": first_success_step,
                 "all_potential_matches_count": len(unique_results)
             }
-        else:
-            print(f"No acceptable match found for '{title[:50]}...' after trying all steps.")
-            return {
-                "original_reference": ref,
-                "best_match_result": None,
-                "author_match_score": 0.0,
-                "search_steps_tried": list(range(1,10)),
-                "first_successful_step": first_success_step,
-                "all_potential_matches_count": len(unique_results),
-                "note": "No good author match found among OpenAlex/Crossref results."
-            }
-    else:
-        print(f"No results found for '{title[:50]}...' in any step.")
-        return {
-            "original_reference": ref,
-            "best_match_result": None,
-            "search_steps_tried": list(range(1,10)),
-            "first_successful_step": None,
-            "all_potential_matches_count": 0,
-            "note": "No results returned from OpenAlex/Crossref search steps."
-        }
+
+    # If no high-confidence match is found or no results at all, return None.
+    return None
 
 def process_bibliography_files(bib_dir, output_dir, searcher, fetch_citations=True):
     """Process all JSON bibliography files in a directory using ThreadPoolExecutor."""
