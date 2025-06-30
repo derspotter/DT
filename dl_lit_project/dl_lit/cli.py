@@ -1,15 +1,22 @@
 import click
+import json
+import os
+import logging
+import traceback
 from pathlib import Path
+from datetime import datetime
+import pprint
+import copy
+from tqdm import tqdm
+
+# Local application imports
 from .db_manager import DatabaseManager
 from .get_bib_pages import extract_reference_sections
-from .metadata_fetcher import MetadataFetcher
-from .utils import ServiceRateLimiter
 from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference, RateLimiter
-import json
-import copy
-import hashlib
 from .new_dl import BibliographyEnhancer
-import bibtexparser # For parsing BibTeX files
+from .utils import ServiceRateLimiter
+from .pdf_downloader import PDFDownloader
+from .bibtex_formatter import BibTeXFormatter
 
 # ANSI escape codes for colors
 RESET = "\033[0m"
@@ -20,21 +27,6 @@ BLUE = "\033[94m"
 MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 WHITE = "\033[97m"
-from .pdf_downloader import PDFDownloader
-from .bibtex_formatter import BibTeXFormatter # Added for export
-from .get_bib_pages import extract_reference_sections # Added for bibliography extraction
-from .APIscraper_v2 import configure_api_client, process_directory_v2, process_single_pdf # Added for API scraping
-from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_file, process_bibliography_files # Added for OpenAlex scraping
-import os # Added for API scraping and OpenAlexScraper path checks
-from pathlib import Path # Already imported, but ensure it's available for OpenAlexScraper logic if needed directly in CLI
-from threading import Lock # Added for API scraping
-import traceback
-
-# ANSI escape codes for colors
-GREEN = '\033[92m'
-RED = '\033[91m'
-YELLOW = '\033[93m'
-RESET = '\033[0m'
 
 # Define project root for default DB path calculation if needed elsewhere
 # Or rely on db_manager's default path logic
@@ -563,6 +555,10 @@ def enrich_openalex_db_command(db_path, batch_size, mailto):
                 db_manager.promote_to_with_metadata(entry['id'], enriched_data)
                 promoted_count += 1
                 click.echo(f"  -> metadata found, promoted to with_metadata.")
+                # Pretty print the enriched data for immediate review
+                click.echo(f"{BLUE}--- Enriched Data ---{RESET}")
+                click.echo(pprint.pformat(enriched_data))
+                click.echo(f"{BLUE}-----------------------{RESET}")
             else:
                 reason = "Metadata fetch failed (no match found in OpenAlex/Crossref)"
                 failed_id, error_msg = db_manager.move_no_meta_entry_to_failed(entry['id'], reason)
@@ -581,10 +577,26 @@ def enrich_openalex_db_command(db_path, batch_size, mailto):
         db_manager.close_connection()
 
 
+@cli.command("retry-failed-enrichments")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
+def retry_failed_enrichments_command(db_path):
+    """Moves all entries from failed_enrichments back to no_metadata."""
+    click.echo("Retrying failed enrichments...")
+    db_manager = DatabaseManager(db_path)
+    try:
+        moved_count, error = db_manager.retry_failed_enrichments()
+        if error:
+            click.echo(f"{RED}An error occurred: {error}{RESET}")
+        # The success message is already printed by the db_manager method
+    finally:
+        db_manager.close_connection()
+
+
 @cli.command("process-downloads")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, writable=True, resolve_path=True), help='Path to SQLite database file.')
 @click.option('--batch-size', default=50, show_default=True, help='Max number of with_metadata rows to enqueue.')
 def process_downloads_command(db_path, batch_size):
+    click.echo("!!!!!!!!!! DEBUG: ATTEMPTING TO RUN PROCESS-DOWNLOADS !!!!!!!!!!")
     """Move enriched references into the download queue (`to_download_references`)."""
     click.echo(f"Queueing up to {batch_size} items from with_metadata…")
 
@@ -631,13 +643,13 @@ def retry_failed_downloads_command(db_path):
 
 @cli.command("download-pdfs")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, resolve_path=True), help='SQLite database path.')
-@click.option('--batch-size', default=10, show_default=True, help='Number of queue entries to process per run.')
+@click.option('--limit', default=10, show_default=True, help='Number of queue entries to process per run.')
 @click.option('--download-dir', default=str(Path.cwd() / 'pdf_library'), type=click.Path(file_okay=False, resolve_path=True), help='Directory to store downloaded PDFs.')
-def download_pdfs_command(db_path, batch_size, download_dir):
+def download_pdfs_command(db_path, limit, download_dir):
     """Process download queue and retrieve PDFs."""
     download_dir = Path(download_dir)
     download_dir.mkdir(parents=True, exist_ok=True)
-    click.echo(f"Processing up to {batch_size} queued items…")
+    click.echo(f"Processing up to {limit} queued items…")
 
     rl = ServiceRateLimiter({
         'default': {'limit': 2, 'window': 1},
@@ -649,7 +661,7 @@ def download_pdfs_command(db_path, batch_size, download_dir):
     db = DatabaseManager(db_path)
     enhancer = BibliographyEnhancer(db_manager=db, rate_limiter=rl, email='spott@wzb.eu', output_folder=download_dir)
 
-    queue = db.get_entries_to_download(limit=batch_size)
+    queue = db.get_entries_to_download(limit=limit)
     if not queue:
         click.echo("Queue is empty.")
         db.close_connection()
@@ -658,26 +670,50 @@ def download_pdfs_command(db_path, batch_size, download_dir):
     ok = 0
     failed = 0
     for row in queue:
+        # --- DEBUG: Print the raw row from the database ---
+        click.echo("\n--- DEBUG: Raw row from DB ---")
+        click.echo(dict(row))
+        click.echo("--- END DEBUG ---\n")
 
-
-        # Correctly parse author data from the database row
+        # Correctly parse author data from the database row, prioritizing rich JSON
         author_structs = []
         author_names_for_display = []
-        try:
-            authors_json = row.get('authors')
-            if authors_json:
-                loaded_json = json.loads(authors_json)
-                if isinstance(loaded_json, list):
-                    author_structs = loaded_json
-                    # Create a simple list of names for display
-                    for author in author_structs:
-                        if isinstance(author, dict):
-                            given = author.get('given', '')
-                            family = author.get('family', '')
-                            if family:
-                                author_names_for_display.append(f"{given} {family}".strip())
-        except (json.JSONDecodeError, TypeError):
-            pass # Keep lists empty if data is malformed
+
+        # 1. Try to get authors from the full OpenAlex JSON first
+        openalex_json_str = row.get('openalex_json')
+        if openalex_json_str:
+            try:
+                openalex_data = json.loads(openalex_json_str)
+                if openalex_data and 'authorships' in openalex_data:
+                    for authorship in openalex_data['authorships']:
+                        author_name = authorship.get('author', {}).get('display_name')
+                        if author_name:
+                            author_names_for_display.append(author_name)
+                            # Also populate author_structs for the downloader, which needs 'family' for LibGen
+                            name_parts = author_name.split()
+                            author_structs.append({
+                                'raw': author_name,
+                                'family': name_parts[-1] if name_parts else ''
+                            })
+            except (json.JSONDecodeError, TypeError):
+                pass # Fallback to simple authors field if JSON is malformed
+
+        # 2. Fallback to the basic 'authors' column if OpenAlex data was not available or failed
+        if not author_structs:
+            try:
+                authors_json = row.get('authors')
+                if authors_json:
+                    loaded_json = json.loads(authors_json)
+                    if isinstance(loaded_json, list):
+                        author_structs = loaded_json  # Assume it's a list of dicts with 'family', 'given'
+                        for author in author_structs:
+                            if isinstance(author, dict):
+                                given = author.get('given', '')
+                                family = author.get('family', '')
+                                if family:
+                                    author_names_for_display.append(f"{given} {family}".strip())
+            except (json.JSONDecodeError, TypeError):
+                pass # Keep lists empty if data is malformed
 
         # Update the user on progress
         click.echo(f"\n[QID {row['id']}] {row['title'][:80]}")
@@ -701,7 +737,7 @@ def download_pdfs_command(db_path, batch_size, download_dir):
                     checksum = hashlib.sha256(fh.read()).hexdigest()
             except Exception:
                 pass
-            db.move_entry_to_downloaded(qid, result, fp, checksum, result.get('download_source', 'unknown'))
+            db.move_entry_to_downloaded(row['id'], result, fp, checksum, result.get('download_source', 'unknown'))
             click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
             ok += 1
         else:

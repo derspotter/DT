@@ -3,6 +3,7 @@ import time
 import requests
 import os
 import threading
+import re
 from .db_manager import DatabaseManager
 import sqlite3  
 import copy
@@ -342,7 +343,7 @@ class BibliographyEnhancer:
 
         query = f"{search_author} {title}".strip()
         
-        base_url = "https://libgen.rs"
+        base_url = "https://libgen.li"
         search_url = f"{base_url}/index.php"
         params = {
             "req": query,
@@ -367,49 +368,77 @@ class BibliographyEnhancer:
         results = self.parse_libgen_results(soup, is_book, base_url)
         return results
 
-    def parse_libgen_results(self, soup, is_book, base_url="https://libgen.rs"):
-        """Parses the LibGen search results page HTML (soup) and returns a list of download URLs."""
-        table = soup.find("table", class_="c")
-        if not table:
-            print("  No results table found (class='c')")
+    def parse_libgen_results(self, soup, is_book, base_url="https://libgen.li"):
+        """
+        Parses the LibGen search results page HTML (soup) and returns a list of download URLs.
+        This version is more robust to HTML structure changes by finding the table via its headers.
+        """
+        results_table = None
+        # LibGen results tables have a very specific set of headers.
+        # We look for a table that contains a header row with at least 'Author(s)', 'Title', and 'Mirrors'.
+        expected_headers = ['author', 'title', 'mirrors']
+        
+        all_tables = soup.find_all("table")
+        for table in all_tables:
+            header_row = table.find('tr')
+            if not header_row:
+                continue
+            
+            # Headers can be in <th> or <td> tags
+            headers = [h.get_text(strip=True).lower() for h in header_row.find_all(['th', 'td'])]
+            
+            if all(any(expected in h for h in headers) for expected in expected_headers):
+                results_table = table
+                break
+
+        if not results_table:
+            print("  No results table found by header inspection.")
             if soup.find(text=re.compile(r"captcha|bot|security check", re.I)):
                 print("  WARNING: possible CAPTCHA/bot check")
             return []
 
-        rows = table.find_all("tr")[1:]
+        # The first row is the header, skip it.
+        rows = results_table.find_all("tr")[1:]
         print(f"Found {len(rows)} results to process")
 
         pdf_links = []
         for row in rows:
             cells = row.find_all("td")
+            # Expecting at least 10 columns for a valid entry with mirrors
             if len(cells) < 10:
                 continue
 
+            # Column 8: Extension
             file_ext = cells[8].get_text(strip=True).lower()
             if file_ext != "pdf":
                 continue
-            
-            result_title = cells[0].get_text(strip=True)
-            result_author = cells[1].get_text(strip=True)
 
+            # Column 1: Author(s)
+            result_author = cells[1].get_text(strip=True)
+            # Column 2: Title (it contains links and other tags, so get text robustly)
+            result_title = cells[2].get_text(strip=True)
+            
+            # Column 9: Mirrors
             mirror_td = cells[9]
             links = mirror_td.find_all("a", href=True)
             
             for a in links:
-                href = a["href"]
-                source = a.get("data-original-title", "") or a.get_text(strip=True)
+                href = a.get("href")
                 if not href:
                     continue
                 
-                if not href.startswith("http"):
-                    href = f"{base_url}{href if href.startswith('/') else '/' + href}"
+                source = a.get_text(strip=True)
                 
+                # Construct absolute URL if it's relative
+                if not href.startswith("http"):
+                    href = urljoin(base_url, href)
+
                 entry = {
                     "url": href,
                     "title": result_title,
                     "authors": result_author,
                     "source": f"LibGen ({source})",
-                    "reason": f"PDF download"
+                    "reason": f"PDF download link"
                 }
                 pdf_links.append(entry)
 
@@ -598,6 +627,9 @@ class BibliographyEnhancer:
 
     def enhance_bibliography(self, ref, downloads_dir, force_download=False):
         """Enhances a single reference dictionary, attempts download, and returns the modified ref or None."""
+        import pprint
+        print("DEBUG: ref received:")
+        pprint.pprint(ref)
         # Ensure downloads_dir is a Path object (it should be, but double-check)
         if not isinstance(downloads_dir, Path):
             print(f"ERROR: downloads_dir passed to enhance_bibliography is not a Path object: {type(downloads_dir)}")
@@ -607,70 +639,93 @@ class BibliographyEnhancer:
                 print("ERROR: Cannot convert downloads_dir to Path. Aborting enhance_bibliography for this ref.")
                 return None # Indicate failure
 
-        # Ensure the directory exists (it should, but good practice)
-        downloads_dir.mkdir(parents=True, exist_ok=True)
-
-        # --- Start of main processing logic for the single 'ref' --- 
-        # Combine multiple prints into a single statement to avoid threading issues
-        title = ref.get('title', 'Untitled')
-        author_structs = ref.get('authors', [])
-        ref_year = ref.get('year')
-
-        # Prepare author info for display and searching
-        author_surnames = []
-        if isinstance(author_structs, list):
-            for author in author_structs:
-                if isinstance(author, dict) and 'family' in author:
-                    author_surnames.append(author['family'])
 
         # The CLI now handles the user-facing print, so it's removed from here.
+
+        bib_entry = ref.get('bib_entry', {})
+        print("DEBUG: bib_entry extracted:")
+        pprint.pprint(bib_entry)
+
+        # Handle both original and enriched data structures
+        if 'enriched_data' in bib_entry and bib_entry['enriched_data']:
+            # Enriched structure from OpenAlex/Crossref
+            enriched = bib_entry['enriched_data']
+            title = enriched.get('title') or enriched.get('display_name', '')
+            doi = enriched.get('doi')
+            year = enriched.get('publication_year')
+            authorships = enriched.get('authorships', [])
+            authors = [item.get('raw_author_name') for item in authorships if item.get('raw_author_name')] if authorships else []
+            # Get open access URL from enriched data
+            open_access_url = enriched.get('open_access', {}).get('oa_url') if enriched.get('open_access') else None
+
+        elif 'original_reference' in bib_entry and bib_entry['original_reference']:
+             # Fallback to original reference data
+            original_ref = bib_entry['original_reference']
+            title = original_ref.get('title', '')
+            authors = original_ref.get('authors', [])
+            year = original_ref.get('year', None)
+            doi = original_ref.get('doi', None)
+            open_access_url = original_ref.get('open_access_url')
+        else:
+            # Fallback for entries that were not enriched or from other sources
+            title = bib_entry.get('title', '')
+            authors = bib_entry.get('authors', [])
+            year = bib_entry.get('year', None)
+            doi = bib_entry.get('doi', None)
+            open_access_url = bib_entry.get('open_access_url')
+
+        # Ensure title and authors are not None
+        title = title or ''
+        authors = authors or []
+        print(f"DEBUG: authors extracted: {authors}")
         
         urls_to_try = []
         
         # 1. Try direct URL first if it exists
-        if ref.get('url'):
+        direct_url = bib_entry.get('url')
+        if direct_url:
             print("Found direct URL in reference")
             urls_to_try.append({
-                'url': ref['url'],
-                'title': ref.get('title', ''),
+                'url': direct_url,
+                'title': title,
                 'snippet': '',
                 'source': 'Direct URL',
                 'reason': 'Direct URL from reference'
             })
         
         # 1. Try DOI resolution
-        if ref.get('doi'):
-            doi_url = self.clean_doi_url(ref['doi'])
+        if doi:
+            doi_url = self.clean_doi_url(doi)
             urls_to_try.append({
                 'url': doi_url,
-                'title': ref.get('title', ''),
+                'title': title,
                 'snippet': '',
                 'source': 'DOI',
                 'reason': 'DOI resolution'
             })
             
             # 1. Check Unpaywall for open access versions
-            unpaywall_result = self.check_unpaywall(ref['doi'])
+            unpaywall_result = self.check_unpaywall(doi)
             if unpaywall_result and unpaywall_result.get('best_oa_location'):
                 oa_location = unpaywall_result['best_oa_location']
                 if oa_location.get('url_for_pdf'):
                     print(f"  Unpaywall found OA PDF URL: {oa_location['url_for_pdf']}")
                     urls_to_try.append({
                         'url': oa_location['url_for_pdf'],
-                        'title': ref.get('title', ''),
+                        'title': title,
                         'snippet': '',
                         'source': oa_location.get('host_type', 'Unpaywall OA'),
                         'reason': 'Found via Unpaywall DOI lookup'
                     })
                 else:
-                    print(f"  Unpaywall found OA location but no direct PDF URL for DOI {ref['doi']}.")
+                    print(f"  Unpaywall found OA location but no direct PDF URL for DOI {doi}.")
             else:
-                 print(f"  Unpaywall found no OA location for DOI {ref['doi']}.")
+                 print(f"  Unpaywall found no OA location for DOI {doi}.")
 
-        if ref.get('open_access_url'):
+        if open_access_url:
             urls_to_try.append({
-                'url': ref['open_access_url'],
-                'title': ref.get('title', ''),
+                'url': open_access_url,
+                'title': title,
                 'snippet': '',
                 'source': 'OpenAlex',
                 'reason': 'Open access URL from OpenAlex'
@@ -702,6 +757,16 @@ class BibliographyEnhancer:
 
         # 3. If Sci-Hub fails (or no DOI), try LibGen
         if not download_success:
+            # Extract surnames for LibGen search
+            author_surnames = []
+            if authors:
+                for author_name in authors:
+                    # A simple approach: take the last part of the name as the surname
+                    parts = author_name.split()
+                    if parts:
+                        surname = parts[-1]
+                        author_surnames.append(surname)
+
             print("Sci-Hub failed (or no DOI). Trying LibGen...")
             libgen_results = self.search_libgen(title, author_surnames, ref.get('type', ''))
             if libgen_results:
@@ -715,14 +780,7 @@ class BibliographyEnhancer:
                         file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
                         print(f"{GREEN}✓ Downloaded from: {url_info.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
                         break # Exit LibGen loop on success
-                    if match.get('url'):  
-                        if self.try_download_url(match['url'], match.get('source', "LibGen"), ref, downloads_dir):
-                            ref['download_source'] = match.get('source', "LibGen")
-                            ref['download_reason'] = 'Successfully downloaded via LibGen' # More specific reason
-                            download_success = True
-                            file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-                            print(f"{GREEN}✓ Downloaded from: {match.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
-                            break # Exit LibGen loop on success
+
 
         # If all methods fail, mark as not found
         if not download_success:
@@ -1350,9 +1408,34 @@ class BibliographyEnhancer:
         # Normalize essential fields
         norm_doi = self._norm_doi(ref.get('doi'))
         norm_title = self._norm_title(ref.get('title'))
-        norm_authors = self._norm_authors(ref.get('authors'))
-        year = ref.get('year')
-        metadata = json.dumps(ref) # Store original metadata
+          # Handle both original and enriched data structures
+        if 'enriched_data' in ref and ref['enriched_data']:
+            # Enriched structure from OpenAlex/Crossref
+            enriched = ref['enriched_data']
+            title = enriched.get('title') or enriched.get('display_name', '')
+            doi = enriched.get('doi')
+            year = enriched.get('publication_year')
+            authorships = enriched.get('authorships', [])
+            authors = [item.get('raw_author_name') for item in authorships if item.get('raw_author_name')] if authorships else []
+
+        elif 'original_reference' in ref and ref['original_reference']:
+             # Fallback to original reference data
+            original_ref = ref['original_reference']
+            title = original_ref.get('title', '')
+            authors = original_ref.get('authors', [])
+            year = original_ref.get('year', None)
+            doi = original_ref.get('doi', None)
+        else:
+            # Fallback for entries that were not enriched (e.g. from bibtex import)
+            title = bib_entry.get('title', '')
+            authors = bib_entry.get('authors', [])
+            year = bib_entry.get('year', None)
+            doi = bib_entry.get('doi', None)
+
+        # Ensure title and authors are not None
+        title = title or ''
+        authors = authors or []
+        meta = json.dumps(ref) # Store original metadata
         # Get filename/position if available in ref (e.g., from primary JSON ingestion)
         filename = ref.get('filename') 
         position = ref.get('position') 

@@ -4,7 +4,19 @@
 
 The goal of the `dl_lit` project is to create an automated, database-centric pipeline for processing academic PDFs. The pipeline starts with a PDF document, extracts its bibliography, enriches the reference metadata using external APIs (OpenAlex, Crossref), downloads the referenced papers, and stores all data and files in a structured way for future use and export.
 
-## 2. Core Components & Scripts
+## 2. Execution Environment
+
+**IMPORTANT**: All `dl-lit` commands must be run from within the project's activated Python virtual environment. This ensures that the correct Python interpreter and all required dependencies are used.
+
+```bash
+# Example: Activating the virtual environment
+source /path/to/your/venv/bin/activate
+
+# Now you can run the commands
+python -m dl_lit.cli init-db
+```
+
+## 3. Core Components & Scripts
 
 This section documents the key Python scripts and their roles in the pipeline. It serves as a quick reference to prevent overlooking existing functionality.
 
@@ -298,20 +310,27 @@ dl_lit_project/
 6. Staged-table schema (`no_metadata`, `with_metadata`) added to the database.
 7. Helper methods (`insert_no_metadata`, `promote_to_with_metadata`, `enqueue_for_download`) implemented.
 8. `APIscraper_v2` updated to stream extracted refs directly into `no_metadata` (`--db-path` option).
+9. **Integrated API scraper and fixed download pipeline:**
+    - Integrated `APIscraper_v2` with the database to eliminate JSON file outputs.
+    - Refactored and fixed multiple bugs in the download pipeline, including command registration, variable name errors, and incorrect method calls.
+    - Added a `.gitignore` file to exclude data and temporary files.
+    - Pushed all changes to the remote git repository.
 
 ### 🔜 Upcoming Work
-1. **Enrichment Stage**
+1. **Final Download Test**
+    - Conduct a final end-to-end test of the download pipeline on a machine with a stable network connection to confirm all bug fixes and the successful download of PDFs.
+2. **Enrichment Stage**
     • Create a batch script / CLI command (`enrich-openalex-db`) that:
         a. pulls a configurable number of rows from `no_metadata`,
         b. calls `OpenAlexScraper`/Crossref to fetch metadata,
         c. uses `promote_to_with_metadata` for each result.
-2. **Download Queue Integration**
+3. **Download Queue Integration**
     • Modify `new_dl.py` (or new helper) to dequeue from `to_download_references` and move successful downloads to `downloaded_references` (or `failed_downloads` on error).
-3. **Migration** – one-off script to import any existing JSON bibliography files into `no_metadata` via `insert_no_metadata`.
-4. **Testing** – add unit tests for staged-table helpers and an integration test covering the full pipeline (PDF → DL).
-5. **Documentation** – update README with the new pipeline diagram, CLI usage examples, and environment variable requirements.
-6. **Cleanup / Logging** – replace print statements with `logging` and remove noisy debug output.
-7. **Packaging** – prepare `setup.py`/`pyproject.toml`, pin dependencies, and build Dockerfile for reproducible runs.
+4. **Migration** – one-off script to import any existing JSON bibliography files into `no_metadata` via `insert_no_metadata`.
+5. **Testing** – add unit tests for staged-table helpers and an integration test covering the full pipeline (PDF → DL).
+6. **Documentation** – update README with the new pipeline diagram, CLI usage examples, and environment variable requirements.
+7. **Cleanup / Logging** – replace print statements with `logging` and remove noisy debug output.
+8. **Packaging** – prepare `setup.py`/`pyproject.toml`, pin dependencies, and build Dockerfile for reproducible runs.
 
 
 ## 8. Staged Database Workflow (Approved 2025-06-19)

@@ -510,6 +510,20 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
         json.dump(enriched_references, f, indent=2)
     print(f"Enriched data saved to {output_path}")
 
+def get_abstract(inverted_index):
+    """Converts an OpenAlex inverted index to a string."""
+    if not inverted_index:
+        return None
+    
+    word_positions = {}
+    for word, positions in inverted_index.items():
+        for pos in positions:
+            word_positions[pos] = word
+            
+    # Sort by position and join the words
+    sorted_words = [word_positions[i] for i in sorted(word_positions.keys())]
+    return " ".join(sorted_words)
+
 def process_single_reference(ref, searcher, rate_limiter):
     """Process a single reference to find its OpenAlex entry and potentially citing works."""
     title = ref.get('title')
@@ -556,22 +570,36 @@ def process_single_reference(ref, searcher, rate_limiter):
 
         matched_results.sort(key=lambda x: (-x['author_match_score'], x['first_found_in_step']))
 
+        # --- DEBUG: Print all match scores ---
+        print("DEBUG: Evaluating potential matches...")
+        for match in matched_results:
+            original_authors = ref.get('authors', 'N/A')
+            result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
+            print(f"  - Score: {match['author_match_score']:.2f} | Step: {match['first_found_in_step']} | Title: {match['result']['display_name'][:60]}")
+            print(f"    Original Ref Authors: {original_authors}")
+            print(f"    API Result Authors:   {result_authors}")
+        # --- END DEBUG ---
+
         # Accept the result only if the best score is high enough.
         if matched_results and matched_results[0]['author_match_score'] > 0.85:
-            best_match = matched_results[0]
-            
-            # Add abstract if available from OpenAlex
-            if best_match['result'].get('abstract_inverted_index'):
-                best_match['result']['abstract'] = convert_inverted_index_to_text(best_match['result']['abstract_inverted_index'])
-            
-            return {
-                "original_reference": ref,
-                "best_match_result": best_match['result'],
-                "author_match_score": best_match['author_match_score'],
-                "search_steps_tried": list(range(1,10)),
-                "first_successful_step": first_success_step,
-                "all_potential_matches_count": len(unique_results)
+            best_result = matched_results[0]['result']
+
+            # CRITICAL FIX: Construct a clean dict with all necessary data.
+            # The original `best_result` is the raw JSON, which is good.
+            # We need to ensure all keys the DB expects are present, even if None.
+            final_enrichment = {
+                'title': best_result.get('display_name'),
+                'authors': [a.get('author', {}).get('display_name') for a in best_result.get('authorships', [])],
+                'year': best_result.get('publication_year'),
+                'doi': best_result.get('doi'),
+                'openalex_id': best_result.get('id'),
+                'abstract': get_abstract(best_result.get('abstract_inverted_index')),
+                
+                # The raw JSON blobs are the most important part.
+                'openalex_json': best_result,
+                'crossref_json': best_result.get('crossref_data'), # Assuming searcher puts it here
             }
+            return final_enrichment
 
     # If no high-confidence match is found or no results at all, return None.
     return None

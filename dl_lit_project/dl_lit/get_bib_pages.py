@@ -270,19 +270,9 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
 def process_pdf(pdf_path, output_dir):
     extract_reference_sections(pdf_path, output_dir)
 
-if __name__ == "__main__":
-    print("--- get_bib_pages.py script started ---", flush=True)
-    # --- Argument Parsing Setup ---
-    parser = argparse.ArgumentParser(description='Extract reference sections from PDF files using GenAI.')
-    parser.add_argument('input_path', type=str, help='Path to a PDF file or a directory containing PDF files.')
-    parser.add_argument('--output_dir', type=str, default=os.path.join(os.path.expanduser("~"), "Nextcloud/DT/papers_extracted_references"), 
-                        help='Directory to save extracted reference PDFs. Defaults to ~/Nextcloud/DT/papers_extracted_references')
-    # Add --version argument
-    parser.add_argument(
-        "--version",
-        action="version",
-        version="%(prog)s 0.1.0_gemini_flash_batch_offset_v5_centralized_upload_and_config_fix"
-    )
+def main(input_path, output_dir):
+    print(f"Input path: {input_path}", flush=True)
+    print(f"Output directory: {output_dir}", flush=True)
     args = parser.parse_args()
 
     print(f"Input path: {args.input_path}", flush=True)

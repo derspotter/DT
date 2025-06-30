@@ -44,31 +44,51 @@ class DatabaseManager:
         self._create_schema()
 
     def retry_failed_downloads(self):
-        """Moves all entries from the failed_downloads table back to no_metadata."""
-        self.connect()
+        """Moves all entries from the failed_downloads table back to no_metadata for reprocessing."""
+        # Use a local cursor and set row_factory to get dict-like access
+        self.conn.row_factory = sqlite3.Row
+        cursor = self.conn.cursor()
+        
         try:
             # Select all entries from failed_downloads
-            select_query = "SELECT * FROM failed_downloads;"
-            failed_entries = self.cursor.execute(select_query).fetchall()
+            cursor.execute("SELECT * FROM failed_downloads")
+            failed_entries = cursor.fetchall()
 
             if not failed_entries:
+                self.conn.row_factory = None # Reset row_factory
                 return 0
 
-            # Prepare entries for no_metadata table
             entries_to_move = []
+            ids_to_delete = []
             for entry in failed_entries:
-                # The no_metadata table expects a tuple of (title, authors_json, year)
-                # We will extract the title and provide None for authors and year
-                # as they are not available in the failed_downloads table.
-                entries_to_move.append((entry['title'], None, None))
+                # Prepare data for no_metadata table
+                title = entry['title']
+                authors = entry['authors']
+                doi = entry['doi']
+                
+                normalized_doi = self._normalize_doi(doi)
+                normalized_title = self._normalize_text(title)
+                normalized_authors = self._normalize_text(authors)
 
-            # Insert entries into no_metadata
-            insert_query = "INSERT INTO no_metadata (title, authors, year) VALUES (?, ?, ?);"
-            self.cursor.executemany(insert_query, entries_to_move)
+                # no_metadata columns: (source_pdf, title, authors, doi, normalized_doi, normalized_title, normalized_authors)
+                # source_pdf is not in failed_downloads, so we use None.
+                entries_to_move.append((
+                    None, title, authors, doi, normalized_doi, normalized_title, normalized_authors
+                ))
+                ids_to_delete.append((entry['id'],))
+
+            # Use INSERT OR IGNORE to avoid crashing on UNIQUE constraint violations
+            # if a retried item somehow already exists in no_metadata.
+            insert_query = """
+                INSERT OR IGNORE INTO no_metadata 
+                (source_pdf, title, authors, doi, normalized_doi, normalized_title, normalized_authors) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """
+            cursor.executemany(insert_query, entries_to_move)
 
             # Delete entries from failed_downloads
-            delete_query = "DELETE FROM failed_downloads;"
-            self.cursor.execute(delete_query)
+            delete_query = "DELETE FROM failed_downloads WHERE id = ?"
+            cursor.executemany(delete_query, ids_to_delete)
 
             self.conn.commit()
             return len(failed_entries)
@@ -77,6 +97,9 @@ class DatabaseManager:
             print(f"An error occurred while retrying failed downloads: {e}")
             self.conn.rollback()
             raise
+        finally:
+            # It's good practice to reset the row_factory
+            self.conn.row_factory = None
 
     def close_connection(self):
         """Closes the database connection."""
@@ -121,6 +144,7 @@ class DatabaseManager:
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 date_processed TIMESTAMP,
                 checksum_pdf TEXT,
+                source_of_download TEXT, -- e.g., 'scihub', 'libgen', 'unpaywall'
                 UNIQUE(doi),
                 UNIQUE(openalex_id)
             )
@@ -152,6 +176,8 @@ class DatabaseManager:
                 publisher TEXT,
                 metadata_source_type TEXT, -- e.g., 'input_json_list', 'user_added_doi'
                 bibtex_entry_json TEXT, -- Minimal, or to be populated
+                crossref_json TEXT, -- Full CrossRef JSON blob
+                openalex_json TEXT, -- Full OpenAlex JSON blob
                 status_notes TEXT, -- e.g., 'Pending download', 'Attempt 1 failed - network error'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 date_processed TIMESTAMP,
@@ -221,12 +247,37 @@ class DatabaseManager:
                 publisher TEXT,
                 metadata_source_type TEXT,
                 bibtex_entry_json TEXT, -- Data available before failure
-                status_notes TEXT NOT NULL, -- Reason for failure
+                crossref_json TEXT,
+                openalex_json TEXT,
+                status_notes TEXT, -- e.g., 'Download failed: 404 Not Found'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_processed TIMESTAMP,
                 checksum_pdf TEXT -- NULL
             )
         """)
+
+        # 6. With Metadata (Enriched, Ready for Download Queue)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS with_metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                authors TEXT, -- JSON list of strings
+                year INTEGER,
+                doi TEXT,
+                normalized_doi TEXT,
+                openalex_id TEXT,
+                abstract TEXT,
+                bibtex_key TEXT,
+                entry_type TEXT,
+                crossref_json TEXT,
+                openalex_json TEXT,
+                bibtex_entry_json TEXT,
+                source_of_data TEXT, -- e.g., 'openalex', 'crossref'
+                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                original_json_object TEXT -- The full original JSON from which this entry was created
+            )
+        """)
+
+
         # 6. No-Metadata Staging Table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS no_metadata (
@@ -386,7 +437,8 @@ class DatabaseManager:
         for entry in entries:
             title = entry.get('title')
             authors_list = entry.get('authors', [])
-            authors_str = ', '.join(authors_list) if authors_list else None
+            # Store authors as a JSON string of a list to preserve individual names
+            authors_str = json.dumps(authors_list) if authors_list else None
             doi = entry.get('doi')
 
             if not title:
@@ -462,67 +514,61 @@ class DatabaseManager:
             if source_disk_conn:
                 source_disk_conn.close()
 
-    def check_if_exists(self, doi: str | None, openalex_id: str | None) -> tuple[str | None, int | None, str | None]:
+    def check_if_exists(
+        self,
+        doi: str | None,
+        openalex_id: str | None,
+        exclude_id: int | None = None,
+        exclude_table: str | None = None
+    ) -> tuple[str | None, int | None, str | None]:
         """Checks if an entry with the given DOI or OpenAlex ID exists in relevant tables.
+
+        Can exclude a specific entry ID from a specific table from the check,
+        which is useful for checking for duplicates of an existing entry.
 
         Args:
             doi: The DOI to check.
             openalex_id: The OpenAlex ID to check (e.g., 'W12345').
+            exclude_id: An entry ID to exclude from the search.
+            exclude_table: The table name associated with exclude_id.
 
         Returns:
             A tuple (table_name, entry_id, matched_field_name) if found, else (None, None, None).
-            'table_name' can be 'downloaded_references' or 'to_download_references'.
-            'matched_field_name' can be 'doi' or 'openalex_id'.
         """
         cursor = self.conn.cursor()
-        
+
+        def _execute_check(table, field, value):
+            query = f"SELECT id FROM {table} WHERE {field} = ?"
+            params = [value]
+            if table == exclude_table and exclude_id is not None:
+                query += " AND id != ?"
+                params.append(exclude_id)
+            
+            cursor.execute(query, tuple(params))
+            row = cursor.fetchone()
+            if row:
+                return table, row[0], field
+            return None, None, None
+
         # Prioritize DOI if available
         if doi:
-            normalized_doi_to_check = self._normalize_doi(doi)
-            if normalized_doi_to_check: # Ensure DOI is not None after normalization
-                # Check in downloaded_references
-                cursor.execute("SELECT id FROM downloaded_references WHERE doi = ?", (normalized_doi_to_check,))
-                row = cursor.fetchone()
-                if row:
-                    return "downloaded_references", row[0], "doi"
-                
-                # Check in to_download_references
-                cursor.execute("SELECT id FROM to_download_references WHERE doi = ?", (normalized_doi_to_check,))
-                row = cursor.fetchone()
-                if row:
-                    return "to_download_references", row[0], "doi"
+            normalized_doi = self._normalize_doi(doi)
+            if normalized_doi:
+                for table in ["downloaded_references", "to_download_references"]:
+                    tbl, eid, fld = _execute_check(table, "doi", normalized_doi)
+                    if tbl: return tbl, eid, fld
+                for table in ["no_metadata", "with_metadata"]:
+                    tbl, eid, fld = _execute_check(table, "normalized_doi", normalized_doi)
+                    if tbl: return tbl, eid, fld
 
         # Then check OpenAlex ID if available
         if openalex_id:
-            normalized_openalex_id_to_check = self._normalize_openalex_id(openalex_id)
-            if normalized_openalex_id_to_check: # Ensure OpenAlex ID is not None after normalization
-                # Check in downloaded_references
-                cursor.execute("SELECT id FROM downloaded_references WHERE openalex_id = ?", (normalized_openalex_id_to_check,))
-                row = cursor.fetchone()
-                if row:
-                    return "downloaded_references", row[0], "openalex_id"
-
-                # Check in to_download_references
-                cursor.execute("SELECT id FROM to_download_references WHERE openalex_id = ?", (normalized_openalex_id_to_check,))
-                row = cursor.fetchone()
-                if row:
-                    return "to_download_references", row[0], "openalex_id"
+            normalized_openalex_id = self._normalize_openalex_id(openalex_id)
+            if normalized_openalex_id:
+                for table in ["downloaded_references", "to_download_references", "no_metadata", "with_metadata"]:
+                    tbl, eid, fld = _execute_check(table, "openalex_id", normalized_openalex_id)
+                    if tbl: return tbl, eid, fld
         
-        # Also check staged tables to prevent duplicate ingestion
-        if doi and normalized_doi_to_check:
-            for tbl in ["no_metadata", "with_metadata"]:
-                cursor.execute(f"SELECT id FROM {tbl} WHERE normalized_doi = ?", (normalized_doi_to_check,))
-                r = cursor.fetchone()
-                if r:
-                    return tbl, r[0], "doi"
-        if openalex_id and normalized_openalex_id_to_check:
-            for tbl in ["no_metadata", "with_metadata"]:
-                cursor.execute(f"SELECT id FROM {tbl} WHERE openalex_id = ?", (normalized_openalex_id_to_check,))
-                r = cursor.fetchone()
-                if r:
-                    return tbl, r[0], "openalex_id"
-
-        # If no matches were found after checking all tables
         return None, None, None
 
     # ------------------------------------------------------------------
@@ -632,103 +678,138 @@ class DatabaseManager:
             (new_id, None) on success or (None, error_msg).
         """
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM no_metadata WHERE id = ?", (no_meta_id,))
-        row = cur.fetchone()
-        if not row:
-            return None, "Row not found in no_metadata"
-
-        columns = [d[0] for d in cur.description]
-        base = dict(zip(columns, row))
-
-        # Merge enrichment – simple overlay
-        merged: dict = {
-            **base,
-            **enrichment,
-            "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
-            "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id")),
-        }
         try:
-            with self.conn:
-                cur.execute(
-                    """INSERT INTO with_metadata (source_pdf,title,authors,year,doi,normalized_doi,openalex_id,
-                                                   normalized_title,normalized_authors,abstract,crossref_json,openalex_json)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        merged.get("source_pdf"),
-                        merged.get("title"),
-                        json.dumps(merged.get("authors")) if merged.get("authors") is not None else None,
-                        merged.get("year"),
-                        merged.get("doi"),
-                        merged.get("normalized_doi"),
-                        merged.get("openalex_id"),
-                        merged.get("normalized_title"),
-                        merged.get("normalized_authors"),
-                        merged.get("abstract"),
-                        json.dumps(merged.get("crossref_json")) if merged.get("crossref_json") is not None else None,
-                        json.dumps(merged.get("openalex_json")) if merged.get("openalex_json") is not None else None,
-                    ),
-                )
-                new_id = cur.lastrowid
-                cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
+            cur.execute("BEGIN")
+            cur.execute("SELECT * FROM no_metadata WHERE id = ?", (no_meta_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("ROLLBACK")
+                return None, "Row not found in no_metadata"
+
+            columns = [d[0] for d in cur.description]
+            base = dict(zip(columns, row))
+
+            # Merge enrichment – simple overlay
+            merged: dict = {
+                **base,
+                **enrichment,
+                "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
+                "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id")),
+            }
+
+            cur.execute(
+                """INSERT INTO with_metadata (source_pdf,title,authors,year,doi,normalized_doi,openalex_id,
+                                               normalized_title,normalized_authors,abstract,crossref_json,openalex_json)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    merged.get("source_pdf"),
+                    merged.get("title"),
+                    json.dumps(merged.get("authors")) if merged.get("authors") is not None else None,
+                    merged.get("year"),
+                    merged.get("doi"),
+                    merged.get("normalized_doi"),
+                    merged.get("openalex_id"),
+                    merged.get("normalized_title"),
+                    merged.get("normalized_authors"),
+                    merged.get("abstract"),
+                    json.dumps(merged.get("crossref_json")) if merged.get("crossref_json") is not None else None,
+                    json.dumps(merged.get("openalex_json")) if merged.get("openalex_json") is not None else None,
+                ),
+            )
+            new_id = cur.lastrowid
+            cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
+            cur.execute("COMMIT")
             return new_id, None
-        except sqlite3.IntegrityError as e:
-            return None, f"IntegrityError promoting to with_metadata: {e}"
+        except sqlite3.Error as e:
+            cur.execute("ROLLBACK")
+            return None, f"A database error occurred during promotion: {e}"
 
     def enqueue_for_download(self, with_meta_id: int) -> tuple[int | None, str | None]:
-        """Move row from with_metadata into to_download_references after duplicate check."""
+        """Move row from with_metadata into to_download_references, ensuring atomicity."""
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM with_metadata WHERE id = ?", (with_meta_id,))
-        row = cur.fetchone()
-        if not row:
-            return None, "Row not found in with_metadata"
+        try:
+            cur.execute("BEGIN")
+            cur.execute("SELECT * FROM with_metadata WHERE id = ?", (with_meta_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("ROLLBACK")
+                return None, "Row not found in with_metadata"
 
-        columns = [d[0] for d in cur.description]
-        data = dict(zip(columns, row))
+            columns = [d[0] for d in cur.description]
+            data = dict(zip(columns, row))
 
-        # Prepare dict for the queue inserter. The inserter function now handles
-        # duplicate checks itself, so the check here is removed.
-        authors_json = data.get("authors")
-        if authors_json:
-            try:
-                authors_list = json.loads(authors_json)
-            except json.JSONDecodeError:
-                authors_list = []
-        else:
-            authors_list = []
+            # Prepare a dictionary with all data needed for the download queue.
+            queue_dict = {
+                "title": data.get("title"),
+                "authors": data.get("authors"),
+                "year": data.get("year"),
+                "doi": data.get("doi"),
+                "openalex_id": data.get("openalex_id"),
+                "abstract": data.get("abstract"),
+                "crossref_json": data.get("crossref_json"),
+                "openalex_json": data.get("openalex_json"),
+                "bibtex_key": data.get("bibtex_key"),
+                "entry_type": data.get("entry_type"),
+                "bibtex_entry_json": data.get("bibtex_entry_json"),
+            }
 
-        queue_dict = {
-            "title": data.get("title"),
-            "authors_list": authors_list, # Note: key is authors_list
-            "year": data.get("year"),
-            "entry_type": data.get("type"),
-            "bibtex_key": data.get("bibtex_key"),
-            "doi": data.get("doi"),
-            "openalex_id": data.get("openalex_id"),
-            "original_json_object": data.get("bibtex_entry_json")
-        }
+            status, item_id, message = self.add_entry_to_download_queue(
+                queue_dict, exclude_id=with_meta_id, exclude_table='with_metadata'
+            )
 
-        status, item_id, message = self.add_entry_to_download_queue(queue_dict)
-
-        if status in ('added_to_queue', 'duplicate'):
-            # If successfully queued or found as duplicate, remove from with_metadata
-            cur.execute("DELETE FROM with_metadata WHERE id = ?", (with_meta_id,))
-            self.conn.commit()
-            if status == 'duplicate':
-                # Return None, message to indicate it was skipped as a duplicate
+            if status in ('added_to_queue', 'duplicate'):
+                cur.execute("DELETE FROM with_metadata WHERE id = ?", (with_meta_id,))
+                cur.execute("COMMIT")
+                if status == 'duplicate':
+                    return None, message
+                return item_id, None
+            else:  # 'error'
+                cur.execute("ROLLBACK")
                 return None, message
-            # Return item_id, None for success
-            return item_id, None
-        else: # 'error'
-            # Do not remove from with_metadata, return the error
-            return None, message
-
+        except Exception as e:
+            cur.execute("ROLLBACK")
+            print(f"{RED}[DB Manager] Transaction failed in enqueue_for_download: {e}{RESET}")
+            return None, f"Transaction failed: {e}"
     def get_entries_to_download(self, limit: int = 10) -> list[dict]:
         """Fetches a batch of entries from the 'to_download_references' table."""
         cursor = self.conn.cursor()
         cursor.row_factory = sqlite3.Row
-        cursor.execute("SELECT * FROM to_download_references ORDER BY date_added ASC LIMIT ?", (limit,))
+        # Explicitly select all columns to ensure consistent data retrieval
+        query = """
+            SELECT id, bibtex_key, entry_type, title, authors, year, doi, pmid, 
+                   arxiv_id, openalex_id, semantic_scholar_id, mag_id, url_source, 
+                   file_path, abstract, keywords, journal_conference, volume, issue, 
+                   pages, publisher, metadata_source_type, bibtex_entry_json, 
+                   crossref_json, openalex_json, status_notes, date_added, 
+                   date_processed, checksum_pdf
+            FROM to_download_references 
+            ORDER BY date_added ASC 
+            LIMIT ?
+        """
+        cursor.execute(query, (limit,))
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
+
+    def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
+        """Convert OpenAlex abstract_inverted_index dict to continuous text, or return None if input is None."""
+        if not inverted_index:
+            return None
+        
+        max_index = -1
+        for indices in inverted_index.values():
+            if indices:
+                max_index = max(max_index, *indices)
+        
+        if max_index == -1:
+            return ""
+
+        word_list = [''] * (max_index + 1)
+        
+        for word, indices in inverted_index.items():
+            for index in indices:
+                word_list[index] = word
+                
+        return ' '.join(word_list)
 
     def move_entry_to_downloaded(self, source_id: int, enriched_metadata: dict, file_path: str, checksum: str, source_of_download: str):
         """Moves an entry from the queue to the downloaded table after successful download."""
@@ -739,25 +820,54 @@ class DatabaseManager:
             if not original_entry:
                 raise sqlite3.Error(f"No entry found in to_download_references with ID {source_id}")
 
-            # Combine original data with new enriched data
+            # Combine original data with new enriched data. Prioritize enriched data.
             authorships = enriched_metadata.get('authorships', [])
-            authors = json.dumps([author['author']['display_name'] for author in authorships])
-            keywords = json.dumps([kw['display_name'] for kw in enriched_metadata.get('keywords', [])])
+            authors = json.dumps([author['author']['display_name'] for author in authorships]) if authorships else original_entry.get('authors')
+            
+            keywords_list = enriched_metadata.get('keywords', [])
+            keywords = json.dumps([kw.get('display_name') for kw in keywords_list if kw.get('display_name')]) if keywords_list else original_entry.get('keywords')
+
+            abstract = self._convert_inverted_index_to_text(enriched_metadata.get('abstract_inverted_index'))
+
+            # Safely get biblio data
+            biblio = enriched_metadata.get('biblio', {})
+            pages = f"{biblio.get('first_page')}--{biblio.get('last_page')}" if biblio.get('first_page') and biblio.get('last_page') else original_entry.get('pages')
+            
+            # Safely get primary_location data
+            primary_location = enriched_metadata.get('primary_location', {})
+            source_info = primary_location.get('source', {}) if primary_location and primary_location.get('source') else {}
 
             data_to_insert = {
-                'bibtex_key': original_entry.get('bibtex_key'),
-                'file_path': file_path,
-                'checksum_pdf': checksum,
-                'date_added': datetime.now().isoformat(),
-                'source_of_download': source_of_download,
-                'source_bibtex_file': original_entry.get('source_bibtex_file'),
-                'source_pdf_file': original_entry.get('source_pdf_file'),
                 'bibtex_key': enriched_metadata.get('bibtex_key', original_entry.get('bibtex_key')),
+                'entry_type': enriched_metadata.get('type', original_entry.get('entry_type')),
+                'title': enriched_metadata.get('title', original_entry.get('title')),
+                'authors': authors,
+                'year': enriched_metadata.get('publication_year', original_entry.get('year')),
+                'doi': enriched_metadata.get('doi', original_entry.get('doi')),
+                'openalex_id': enriched_metadata.get('id', original_entry.get('openalex_id')),
+                'url_source': enriched_metadata.get('url_source', original_entry.get('url_source')),
+                'file_path': file_path,
+                'abstract': abstract,
+                'keywords': keywords,
+                'journal_conference': source_info.get('display_name', original_entry.get('journal_conference')),
+                'volume': biblio.get('volume', original_entry.get('volume')),
+                'issue': biblio.get('issue', original_entry.get('issue')),
+                'pages': pages,
+                'publisher': source_info.get('publisher', original_entry.get('publisher')),
+                'metadata_source_type': 'openalex_api', # Since it's enriched
+                'bibtex_entry_json': json.dumps(enriched_metadata), # Store the full enriched metadata
+                'status_notes': 'Successfully downloaded and processed',
+                'date_processed': datetime.now().isoformat(),
+                'checksum_pdf': checksum,
+                'source_of_download': source_of_download
             }
+            
+            final_data = {k: v for k, v in data_to_insert.items() if v is not None}
 
-            cols = ', '.join(data_to_insert.keys())
-            placeholders = ', '.join(['?'] * len(data_to_insert))
-            cursor.execute(f"INSERT INTO downloaded_references ({cols}) VALUES ({placeholders})", list(data_to_insert.values()))
+            cols = ', '.join(final_data.keys())
+            placeholders = ', '.join(['?'] * len(final_data))
+            
+            cursor.execute(f"INSERT INTO downloaded_references ({cols}) VALUES ({placeholders})", list(final_data.values()))
             new_id = cursor.lastrowid
 
             cursor.execute("DELETE FROM to_download_references WHERE id = ?", (source_id,))
@@ -956,17 +1066,19 @@ class DatabaseManager:
 
     def add_entry_to_download_queue(
         self,
-        parsed_data: dict
+        parsed_data: dict,
+        exclude_id: int | None = None,
+        exclude_table: str | None = None
     ) -> tuple[str, int | None, str]:
-        """Adds a parsed entry from JSON to the 'to_download_references' table.
+        """Adds a parsed entry to the 'to_download_references' table.
 
+        Handles entries from both direct JSON import and from the 'with_metadata' table.
         Checks for duplicates before adding. If a duplicate is found, it's logged.
 
         Args:
-            parsed_data: A dictionary containing the entry data, typically from
-                         _parse_json_entry in cli.py. Expected keys include:
-                         'doi', 'openalex_id', 'title', 'authors_list', 'year',
-                         'entry_type', 'bibtex_key', 'original_json_object'.
+            parsed_data: A dictionary containing the entry data.
+            exclude_id: An entry ID to exclude from the duplicate check.
+            exclude_table: The table name associated with exclude_id.
 
         Returns:
             A tuple: (status_code, item_id, message)
@@ -983,77 +1095,109 @@ class DatabaseManager:
         if not title:
             return "error", None, "Entry is missing a title."
 
-        # Check for duplicates
         table_name, existing_id, matched_field = self.check_if_exists(
-            doi=input_doi,
-            openalex_id=input_openalex_id
+            doi=input_doi, openalex_id=input_openalex_id, exclude_id=exclude_id, exclude_table=exclude_table
         )
 
         if table_name and existing_id is not None:
-            # Log the duplicate
-            # We need to pass the original JSON object for 'original_bibtex_entry_json'
-            # and source_bibtex_file can be None or a placeholder for JSON imports.
             dup_log_id, dup_log_err = self.add_entry_to_duplicates(
-                entry=parsed_data.get('original_json_object'), # Pass the original JSON
+                entry=parsed_data.get('original_json_object', parsed_data),
                 input_doi=input_doi,
                 input_openalex_id=input_openalex_id,
-                source_bibtex_file=None, # Or some identifier for JSON source
+                source_bibtex_file=None,
                 existing_entry_id=existing_id,
                 existing_entry_table=table_name,
-                matched_on_field=matched_field,
-                entry_source_type='json_import' # Indicate source is JSON
+                matched_on_field=matched_field
             )
             if dup_log_id:
-                msg = f"Duplicate of entry ID {existing_id} in '{table_name}' (matched on {matched_field}). Logged as duplicate ID {dup_log_id}."
-                print(f"{YELLOW}[DB Manager] {msg}{RESET}")
+                msg = f"Duplicate of entry ID {existing_id} in '{table_name}'. Logged as duplicate ID {dup_log_id}."
                 return "duplicate", existing_id, msg
             else:
                 err_msg = f"Duplicate of entry ID {existing_id} in '{table_name}' but failed to log: {dup_log_err}"
-                print(f"{RED}[DB Manager] {err_msg}{RESET}")
                 return "error", None, err_msg
 
-        # Not a duplicate, add to to_download_references
         try:
-            authors_json = json.dumps(parsed_data.get('authors_list', [])) if parsed_data.get('authors_list') else None
-            bibtex_entry_json_str = json.dumps(parsed_data.get('original_json_object', {}))
+            # Prepare all fields for insertion, using .get() to avoid KeyErrors
+            authors_json = parsed_data.get('authors')
+            if isinstance(authors_json, list):
+                authors_json = json.dumps(authors_json)
+
+            insert_data = {
+                "bibtex_key": parsed_data.get('bibtex_key'),
+                "entry_type": parsed_data.get('entry_type'),
+                "title": parsed_data.get('title'),
+                "authors": authors_json,
+                "year": parsed_data.get('year'),
+                "doi": self._normalize_doi(parsed_data.get('doi')),
+                "openalex_id": self._normalize_openalex_id(parsed_data.get('openalex_id')),
+                "abstract": parsed_data.get('abstract'),
+                "bibtex_entry_json": parsed_data.get('bibtex_entry_json'),
+                "crossref_json": parsed_data.get('crossref_json'),
+                "openalex_json": parsed_data.get('openalex_json'),
+                "date_added": datetime.now().isoformat(),
+            }
+
+            columns = ', '.join(insert_data.keys())
+            placeholders = ', '.join(['?' for _ in insert_data.values()])
+            sql = f"INSERT INTO to_download_references ({columns}) VALUES ({placeholders})"
+
+            cursor.execute(sql, tuple(insert_data.values()))
+            last_id = cursor.lastrowid
+            self.conn.commit()
+            return "added_to_queue", last_id, "Entry added to download queue."
+
+            bibtex_entry_json_str = parsed_data.get('bibtex_entry_json')
+            if bibtex_entry_json_str is None and 'original_json_object' in parsed_data:
+                bibtex_entry_json_str = json.dumps(parsed_data.get('original_json_object', {}))
+
             year_val = parsed_data.get('year')
             if year_val is not None:
                 try:
                     year_val = int(year_val)
                 except (ValueError, TypeError):
-                    print(f"{YELLOW}[DB Manager] Warning: Could not parse year '{year_val}' as int for title '{title}'. Storing as NULL.{RESET}")
                     year_val = None
+
+            crossref_json_str = parsed_data.get('crossref_json')
+            openalex_json_str = parsed_data.get('openalex_json')
+
+            if crossref_json_str or openalex_json_str:
+                metadata_source_type = 'enriched'
+                status_notes = 'Pending PDF download'
+            else:
+                metadata_source_type = 'json_import'
+                status_notes = 'Pending metadata enrichment and PDF download'
 
             cursor.execute("""
                 INSERT INTO to_download_references (
                     bibtex_key, entry_type, title, authors, year, doi, openalex_id,
+                    abstract, crossref_json, openalex_json,
                     metadata_source_type, bibtex_entry_json, status_notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 parsed_data.get('bibtex_key'),
                 parsed_data.get('entry_type'),
                 title,
                 authors_json,
                 year_val,
-                self._normalize_doi(input_doi), # Store normalized DOI
-                self._normalize_openalex_id(input_openalex_id), # Store normalized OpenAlex ID
-                'json_import', # metadata_source_type
-                bibtex_entry_json_str, # bibtex_entry_json
-                'Pending metadata enrichment and PDF download' # status_notes
+                self._normalize_doi(input_doi),
+                self._normalize_openalex_id(input_openalex_id),
+                parsed_data.get('abstract'),
+                crossref_json_str,
+                openalex_json_str,
+                metadata_source_type,
+                bibtex_entry_json_str,
+                status_notes
             ))
-            self.conn.commit()
+
             new_id = cursor.lastrowid
             msg = f"Entry '{title}' added to download queue with ID {new_id}."
-            print(f"{GREEN}[DB Manager] {msg}{RESET}")
             return "added_to_queue", new_id, msg
         except sqlite3.Error as e:
-            self.conn.rollback()
-            err_msg = f"SQLite error adding entry '{title}' to to_download_references: {e}"
-            print(f"{RED}[DB Manager] {err_msg}{RESET}")
+            err_msg = f"SQLite error adding entry '{title}' to queue: {e}"
             return "error", None, err_msg
         except Exception as e:
-            self.conn.rollback()
+            err_msg = f"General error adding entry '{title}' to queue: {e}"
             err_msg = f"Unexpected error adding entry '{title}' to to_download_references: {e}"
             print(f"{RED}[DB Manager] {err_msg}{RESET}")
             return "error", None, err_msg
@@ -1122,7 +1266,7 @@ class DatabaseManager:
         if not title_val:
             title_val = f"[Duplicate Entry: {bibtex_key_val or 'No Key'}]"
             print(f"{YELLOW}[DB Manager] Info: Missing title for duplicate entry. Using placeholder: '{title_val}'{RESET}")
-
+            
         sql = """
             INSERT INTO duplicate_references (
                 bibtex_key, entry_type, title, authors, year, 
@@ -1132,6 +1276,7 @@ class DatabaseManager:
                 date_detected
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """
+        
         try:
             cursor.execute(sql, (
                 bibtex_key_val, entry_type_val, title_val, authors_json, year_int,
@@ -1277,8 +1422,8 @@ class DatabaseManager:
             INSERT INTO downloaded_references (
                 entry_type, title, authors, year, doi, openalex_id, url_source, file_path,
                 abstract, keywords, journal_conference, volume, issue, pages,
-                metadata_source_type, bibtex_entry_json, status_notes, date_processed, checksum_pdf
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                metadata_source_type, bibtex_entry_json, status_notes, date_processed, checksum_pdf, source_of_download
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
         """
         
         sql_delete = "DELETE FROM to_download_references WHERE id = ?"
@@ -1306,6 +1451,40 @@ class DatabaseManager:
             error_msg = f"Transaction failed: {e}"
             print(f"{RED}[DB Manager] {error_msg}{RESET}")
             return None, error_msg
+
+    def retry_failed_enrichments(self) -> tuple[int, str | None]:
+        """Moves all entries from the failed_enrichments table back to no_metadata for reprocessing."""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("BEGIN")
+
+            # Fetch all failed enrichments
+            cursor.execute("SELECT title, authors, doi FROM failed_enrichments")
+            failed_entries = cursor.fetchall()
+
+            if not failed_entries:
+                print(f"{YELLOW}[DB Manager] No failed enrichments to retry.{RESET}")
+                return 0, None
+
+            sql_insert = "INSERT INTO no_metadata (title, authors, doi) VALUES (?, ?, ?)"
+
+            moved_count = 0
+            for entry in failed_entries:
+                cursor.execute(sql_insert, entry)
+                moved_count += 1
+
+            # Clear the failed_enrichments table
+            cursor.execute("DELETE FROM failed_enrichments")
+
+            self.conn.commit()
+            print(f"{GREEN}[DB Manager] Successfully moved {moved_count} entries from 'failed_enrichments' to 'no_metadata'.{RESET}")
+            return moved_count, None
+
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            error_msg = f"Transaction failed during retry_failed_enrichments: {e}"
+            print(f"{RED}[DB Manager] {error_msg}{RESET}")
+            return 0, error_msg
 
     def move_queue_entry_to_failed(self, queue_id: int, reason: str) -> tuple[int | None, str | None]:
         """Moves a failed entry from the queue to failed_downloads, preserving its data."""

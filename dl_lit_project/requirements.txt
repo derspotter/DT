@@ -1,0 +1,8 @@
+click
+google-generativeai
+requests
+beautifulsoup4
+pikepdf
+PyMuPDF
+bibtexparser
+tqdm
