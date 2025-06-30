@@ -4,5 +4,9 @@ requests
 beautifulsoup4
 pikepdf
 PyMuPDF
-bibtexparser
+bibtexparser>=2.0.0b8
 tqdm
+python-dotenv
+rapidfuzz
+colorama
+google-cloud-aiplatform

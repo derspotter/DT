@@ -251,32 +251,10 @@ class DatabaseManager:
                 openalex_json TEXT,
                 status_notes TEXT, -- e.g., 'Download failed: 404 Not Found'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                date_processed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 checksum_pdf TEXT -- NULL
             )
         """)
-
-        # 6. With Metadata (Enriched, Ready for Download Queue)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS with_metadata (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                authors TEXT, -- JSON list of strings
-                year INTEGER,
-                doi TEXT,
-                normalized_doi TEXT,
-                openalex_id TEXT,
-                abstract TEXT,
-                bibtex_key TEXT,
-                entry_type TEXT,
-                crossref_json TEXT,
-                openalex_json TEXT,
-                bibtex_entry_json TEXT,
-                source_of_data TEXT, -- e.g., 'openalex', 'crossref'
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                original_json_object TEXT -- The full original JSON from which this entry was created
-            )
-        """)
-
 
         # 6. No-Metadata Staging Table
         cursor.execute("""
@@ -293,7 +271,7 @@ class DatabaseManager:
             )
         """)
 
-        # 7. With-Metadata Staging Table
+        # 7. With-Metadata Staging Table (Enriched, Ready for Download Queue)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS with_metadata (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -565,7 +543,7 @@ class DatabaseManager:
         if openalex_id:
             normalized_openalex_id = self._normalize_openalex_id(openalex_id)
             if normalized_openalex_id:
-                for table in ["downloaded_references", "to_download_references", "no_metadata", "with_metadata"]:
+                for table in ["downloaded_references", "to_download_references", "with_metadata"]:
                     tbl, eid, fld = _execute_check(table, "openalex_id", normalized_openalex_id)
                     if tbl: return tbl, eid, fld
         

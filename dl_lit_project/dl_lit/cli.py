@@ -3,6 +3,7 @@ import json
 import os
 import logging
 import traceback
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 import pprint
@@ -804,6 +805,124 @@ def enrich_openalex_command(input_path, output_dir, mailto, fetch_citations):
     except Exception as e:
         click.echo(f"{RED}An error occurred during OpenAlex enrichment: {e}{RESET}")
         click.echo(f"{YELLOW}Traceback:\n{traceback.format_exc()}{RESET}")
+
+@cli.command("inspect-tables")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
+@click.option('--table', type=click.Choice(['all', 'no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references', 'failed_enrichments', 'failed_downloads', 'duplicate_references']), default='all', help='Specific table to inspect.')
+@click.option('--limit', default=5, help='Number of entries to show per table.')
+def inspect_tables_command(db_path, table, limit):
+    """Inspects database tables to debug data flow issues."""
+    try:
+        db_manager = DatabaseManager(db_path=db_path)
+        cursor = db_manager.conn.cursor()
+        cursor.row_factory = sqlite3.Row
+        
+        # Define workflow tables
+        workflow_tables = [
+            ("no_metadata", "Raw extracted references (before enrichment)"),
+            ("with_metadata", "Enriched references (after OpenAlex/Crossref lookup)"),
+            ("to_download_references", "Queue for PDF downloads"),
+            ("downloaded_references", "Successfully downloaded papers"),
+            ("failed_enrichments", "References that failed metadata enrichment"),
+            ("failed_downloads", "References that failed PDF download"),
+            ("duplicate_references", "Detected duplicates")
+        ]
+        
+        tables_to_check = workflow_tables if table == 'all' else [(table, "Selected table")]
+        
+        click.echo(f"{CYAN}Database Inspection: {Path(db_path).resolve()}{RESET}")
+        click.echo("=" * 80)
+        
+        total_items = 0
+        
+        for table_name, description in tables_to_check:
+            # Skip if specific table requested but doesn't match
+            if table != 'all' and table_name != table:
+                continue
+                
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            count = cursor.fetchone()[0]
+            total_items += count
+            
+            status_icon = "✅" if count > 0 else "📭"
+            click.echo(f"\n{status_icon} {BLUE}{table_name.upper()}{RESET} ({count} rows)")
+            click.echo(f"    {description}")
+            
+            if count > 0:
+                # Get column names
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns = cursor.fetchall()
+                col_names = [col[1] for col in columns]
+                
+                # Show sample rows
+                display_limit = min(limit, count)
+                cursor.execute(f"SELECT * FROM {table_name} LIMIT {display_limit}")
+                rows = cursor.fetchall()
+                
+                click.echo(f"    {WHITE}Columns:{RESET} {', '.join(col_names)}")
+                click.echo(f"    {WHITE}Sample entries (showing {display_limit} of {count}):{RESET}")
+                
+                for i, row in enumerate(rows, 1):
+                    click.echo(f"\n    {GREEN}Entry {i}:{RESET}")
+                    for col_name in col_names:
+                        value = row[col_name]
+                        # Handle special formatting for different column types
+                        if value is None:
+                            display_value = f"{YELLOW}None{RESET}"
+                        elif isinstance(value, str):
+                            if col_name in ['authors', 'keywords', 'crossref_json', 'openalex_json', 'bibtex_entry_json']:
+                                # JSON fields - show truncated
+                                if len(value) > 100:
+                                    display_value = f"{value[:97]}..."
+                                else:
+                                    display_value = value
+                            elif col_name in ['title', 'abstract']:
+                                # Text fields - show truncated
+                                if len(value) > 80:
+                                    display_value = f"{value[:77]}..."
+                                else:
+                                    display_value = value
+                            else:
+                                display_value = value
+                        else:
+                            display_value = str(value)
+                        
+                        click.echo(f"      {CYAN}{col_name}:{RESET} {display_value}")
+            else:
+                click.echo(f"    {YELLOW}Empty table{RESET}")
+        
+        if table == 'all':
+            click.echo(f"\n{CYAN}Total items across workflow: {total_items}{RESET}")
+            
+            # Check for potential workflow issues
+            cursor.execute("SELECT COUNT(*) FROM no_metadata")
+            no_meta_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM with_metadata")
+            with_meta_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM to_download_references")
+            queue_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM downloaded_references")
+            downloaded_count = cursor.fetchone()[0]
+            
+            click.echo(f"\n{YELLOW}Workflow Analysis:{RESET}")
+            if no_meta_count > 0 and with_meta_count == 0:
+                click.echo(f"  ⚠️  {no_meta_count} items stuck in no_metadata (enrichment may have failed)")
+            elif with_meta_count > 0 and queue_count == 0:
+                click.echo(f"  ⚠️  {with_meta_count} items stuck in with_metadata (run process-downloads)")
+            elif queue_count > 0:
+                click.echo(f"  📥 {queue_count} items ready for download (run download-pdfs)")
+            elif downloaded_count > 0:
+                click.echo(f"  ✅ {downloaded_count} items successfully processed")
+            else:
+                click.echo(f"  📭 No items in the workflow pipeline")
+        
+    except Exception as e:
+        click.echo(f"{RED}Error inspecting tables: {e}{RESET}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if 'db_manager' in locals():
+            db_manager.close_connection()
 
 if __name__ == '__main__':
     cli()

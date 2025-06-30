@@ -333,117 +333,116 @@ class BibliographyEnhancer:
         return None
 
     def search_libgen(self, title: str, author_surnames: list[str], ref_type: str = ''):
-        """Searches LibGen using title and the first author's surname for better accuracy."""
+        """Search for publications on LibGen and extract working download links, prioritizing PDFs."""
         search_author = author_surnames[0] if author_surnames else ''
-        print(f"Searching LibGen for: {title}")
-        print(f"  Using author surname: '{search_author}'")
+        is_book = ref_type.lower() in ['book', 'monograph']
 
-        is_book = 'book' in ref_type.lower() or 'monograph' in ref_type.lower()
-        print(f"  Book type detection: is_book={is_book}, ref_type='{ref_type}'")
-
-        query = f"{search_author} {title}".strip()
-        
+        query = f'{title} {search_author}'.strip()
+        query = query.replace(' ', '+')
         base_url = "https://libgen.li"
-        search_url = f"{base_url}/index.php"
-        params = {
-            "req": query,
-            "lg_topic": "libgen", "open": "0", "view": "simple",
-            "res": "25", "phrase": "1", "column": "def"
-        }
-        full_url = f"{search_url}?{urlencode(params)}"
-        print(f"  LibGen URL: {full_url}")
+        libgen_url = f"{base_url}/index.php?req={query}&lg_topic=libgen&open=0&view=simple&res=25&phrase=1&column=def"
+        
+        print(f"Searching LibGen for: {title}")
+        print(f"  Book type detection: is_book={is_book}, ref_type='{ref_type}'")
+        print(f"  Using author surname: '{search_author}'")
+        print(f"  LibGen URL: {libgen_url}")
 
         try:
             self.rate_limiter.wait_if_needed('libgen')
-            response = requests.get(full_url, headers=self.headers, timeout=30, proxies=self.proxies)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
+            }
+            response = requests.get(libgen_url, headers=headers, timeout=30, proxies=self.proxies)
             response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            matches = []
+            pdf_matches = []
+            other_matches = []
+
+            # Find the results table
+            table = soup.find('table', {'id': 'tablelibgen'})
+            if not table:
+                print("  No results table found - checking for captcha/bot detection")
+                if soup.find(text=re.compile('captcha|bot|automated|security check', re.IGNORECASE)):
+                    print("  WARNING: Possible captcha/bot detection detected")
+                return []
+
+            # Process rows (skip header)
+            rows = table.find_all('tr')[1:]  
+            print(f"Found {len(rows)} results to process")
+            
+            for idx, row in enumerate(rows, start=1):
+                cells = row.find_all('td')
+                if len(cells) < 9:
+                    print(f"  Row {idx}: Skipped - only {len(cells)} cells (need at least 9)")
+                    continue
+                    
+                result_title = cells[0].get_text(strip=True)
+                result_author = cells[1].get_text(strip=True)
+                file_ext = cells[7].get_text(strip=True).lower()
+                
+                print(f"  Row {idx}: Title='{result_title[:60]}...', Authors='{result_author}', Ext='{file_ext}'")
+                
+                # Skip if it's a review
+                if "Review by:" in result_author:
+                    print("    Skipped - appears to be a review")
+                    continue
+                    
+                # Skip if book title contains review markers
+                if is_book:
+                    review_markers = [
+                        "vol.", "iss.", "pp.", "pages",
+                        "Review of", "Book Review",
+                        ") pp.", ") p.",
+                    ]
+                    if any(marker in result_title for marker in review_markers):
+                        print(f"    Skipped - contains review marker")
+                        continue
+                
+                # Get mirror links from the last column
+                mirrors_cell = cells[-1]
+                mirror_links = mirrors_cell.find_all('a')
+                print(f"    Found {len(mirror_links)} mirror links")
+                
+                for link_idx, link in enumerate(mirror_links, start=1):
+                    href = link.get('href', '')
+                    source = link.get('data-original-title', link.get_text(strip=True))
+                    if href:
+                        # Handle relative URLs
+                        if not href.startswith('http'):
+                            href = f"{base_url}{href if href.startswith('/') else '/' + href}"
+                            
+                        match_entry = {
+                            'url': href,
+                            'title': result_title,
+                            'authors': result_author,
+                            'source': f'LibGen ({source})',
+                            'reason': f'{file_ext.upper()} download'
+                        }
+                        
+                        # Separate PDF and non-PDF matches
+                        if file_ext == 'pdf':
+                            pdf_matches.append(match_entry)
+                            print(f"    Mirror {link_idx}: PDF link found - {href[:80]}...")
+                        else:
+                            other_matches.append(match_entry)
+                            print(f"    Mirror {link_idx}: Non-PDF link found - {href[:80]}...")
+
+            # Combine PDF matches first, then other formats
+            matches = pdf_matches + other_matches
+            print(f"Found {len(matches)} non-review download links ({len(pdf_matches)} PDFs)")
+            return matches
+
         except requests.exceptions.RequestException as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 429:
                 print("LibGen rate limit exceeded. Skipping...")
                 return []
-            print(f"Error during LibGen request: {e}")
+            print(f"Error searching LibGen: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return []
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        results = self.parse_libgen_results(soup, is_book, base_url)
-        return results
-
-    def parse_libgen_results(self, soup, is_book, base_url="https://libgen.li"):
-        """
-        Parses the LibGen search results page HTML (soup) and returns a list of download URLs.
-        This version is more robust to HTML structure changes by finding the table via its headers.
-        """
-        results_table = None
-        # LibGen results tables have a very specific set of headers.
-        # We look for a table that contains a header row with at least 'Author(s)', 'Title', and 'Mirrors'.
-        expected_headers = ['author', 'title', 'mirrors']
-        
-        all_tables = soup.find_all("table")
-        for table in all_tables:
-            header_row = table.find('tr')
-            if not header_row:
-                continue
-            
-            # Headers can be in <th> or <td> tags
-            headers = [h.get_text(strip=True).lower() for h in header_row.find_all(['th', 'td'])]
-            
-            if all(any(expected in h for h in headers) for expected in expected_headers):
-                results_table = table
-                break
-
-        if not results_table:
-            print("  No results table found by header inspection.")
-            if soup.find(text=re.compile(r"captcha|bot|security check", re.I)):
-                print("  WARNING: possible CAPTCHA/bot check")
-            return []
-
-        # The first row is the header, skip it.
-        rows = results_table.find_all("tr")[1:]
-        print(f"Found {len(rows)} results to process")
-
-        pdf_links = []
-        for row in rows:
-            cells = row.find_all("td")
-            # Expecting at least 10 columns for a valid entry with mirrors
-            if len(cells) < 10:
-                continue
-
-            # Column 8: Extension
-            file_ext = cells[8].get_text(strip=True).lower()
-            if file_ext != "pdf":
-                continue
-
-            # Column 1: Author(s)
-            result_author = cells[1].get_text(strip=True)
-            # Column 2: Title (it contains links and other tags, so get text robustly)
-            result_title = cells[2].get_text(strip=True)
-            
-            # Column 9: Mirrors
-            mirror_td = cells[9]
-            links = mirror_td.find_all("a", href=True)
-            
-            for a in links:
-                href = a.get("href")
-                if not href:
-                    continue
-                
-                source = a.get_text(strip=True)
-                
-                # Construct absolute URL if it's relative
-                if not href.startswith("http"):
-                    href = urljoin(base_url, href)
-
-                entry = {
-                    "url": href,
-                    "title": result_title,
-                    "authors": result_author,
-                    "source": f"LibGen ({source})",
-                    "reason": f"PDF download link"
-                }
-                pdf_links.append(entry)
-
-        print(f"Finished: {len(pdf_links)} PDF links collected")
-        return pdf_links
 
     def is_likely_pdf_url(self, url):
         """Checks if a URL is likely to point directly to a PDF based on patterns."""
@@ -642,7 +641,8 @@ class BibliographyEnhancer:
 
         # The CLI now handles the user-facing print, so it's removed from here.
 
-        bib_entry = ref.get('bib_entry', {})
+        # Use ref directly since it already contains the data we need
+        bib_entry = ref
         print("DEBUG: bib_entry extracted:")
         pprint.pprint(bib_entry)
 
@@ -667,7 +667,7 @@ class BibliographyEnhancer:
             doi = original_ref.get('doi', None)
             open_access_url = original_ref.get('open_access_url')
         else:
-            # Fallback for entries that were not enriched or from other sources
+            # Extract directly from ref structure (this is the case we're in)
             title = bib_entry.get('title', '')
             authors = bib_entry.get('authors', [])
             year = bib_entry.get('year', None)
@@ -760,11 +760,21 @@ class BibliographyEnhancer:
             # Extract surnames for LibGen search
             author_surnames = []
             if authors:
-                for author_name in authors:
-                    # A simple approach: take the last part of the name as the surname
-                    parts = author_name.split()
-                    if parts:
-                        surname = parts[-1]
+                for author in authors:
+                    # Handle both string and dict formats
+                    if isinstance(author, dict):
+                        # Use the 'family' field if available, otherwise extract from 'raw'
+                        surname = author.get('family')
+                        if not surname and author.get('raw'):
+                            # Fallback: take the last part of the name as the surname
+                            parts = author['raw'].split()
+                            surname = parts[-1] if parts else ''
+                    else:
+                        # Handle string format
+                        parts = str(author).split()
+                        surname = parts[-1] if parts else ''
+                    
+                    if surname:
                         author_surnames.append(surname)
 
             print("Sci-Hub failed (or no DOI). Trying LibGen...")

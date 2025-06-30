@@ -29,7 +29,7 @@ class ServiceRateLimiter:
         # Get the config for the service, or fall back to default
         config = self.service_config.get(service_name, self.service_config.get('default'))
         if not config:
-            return
+            return True  # If no config, allow the request to proceed
 
         # Ensure the service is initialized in our logs and locks
         if service_name not in self.locks:
@@ -57,6 +57,9 @@ class ServiceRateLimiter:
 
             # Log the new request time
             self.request_logs[service_name].append(datetime.now())
+            
+            # Return True to indicate the request can proceed
+            return True
 
 
 def parse_bibtex_file_field(file_field_str: str | None) -> str | None:
