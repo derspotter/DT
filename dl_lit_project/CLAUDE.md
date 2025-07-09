@@ -78,13 +78,14 @@ to_download_references → download-pdfs → downloaded_references
 Core libraries: `click`, `sqlite3`, `requests`, `bibtexparser>=2.0.0b8`, `google-generativeai`, `pikepdf`, `PyMuPDF`, `beautifulsoup4`, `tqdm`, `python-dotenv`, `rapidfuzz`, `colorama`, `google-cloud-aiplatform`
 
 ### Database Schema
-All tables share common columns: `id`, `title`, `authors`, `doi`, `normalized_doi`, `openalex_id`, `bibtex_key`, `year`, `journal_conference`, `abstract`, `file_path`, `metadata_source_type`, `bibtex_entry_json`, `date_added`, etc.
+All tables share common columns: `id`, `title`, `authors`, `editors`, `doi`, `normalized_doi`, `openalex_id`, `bibtex_key`, `year`, `journal_conference`, `abstract`, `file_path`, `metadata_source_type`, `bibtex_entry_json`, `date_added`, etc.
 
 Key features:
 - DOI normalization for consistent duplicate detection
 - UNIQUE constraints on `doi` and `openalex_id` in final tables
 - Transaction-based moves between staging tables
 - In-memory database support for bulk imports
+- **Editor extraction**: Separate `editors` field for book/volume editors to improve matching accuracy
 
 ### File Structure
 - `dl_lit/` - Main package with all modules
@@ -93,9 +94,47 @@ Key features:
 - `requirements.txt` - Python dependencies
 - `plan.md` - Detailed project documentation and roadmap
 
-## Recent Fixes (2025-06-30)
+## Recent Updates
 
-### Critical Bug Fixes Applied:
+### Editor Extraction Implementation (2025-01-09)
+
+**New Feature**: Complete editor extraction and matching system for improved bibliographic accuracy.
+
+#### Key Improvements:
+1. **Enhanced Gemini Extraction**: Updated `APIscraper_v2.py` prompt to:
+   - Extract editors as separate field from authors
+   - Properly handle series editors (e.g., "Obst/Hintner") vs. actual source titles
+   - Clean source title extraction without editor contamination
+
+2. **Database Schema Enhancement**: Added `editors` field to all pipeline tables:
+   - `no_metadata`, `with_metadata`, `to_download_references`, `downloaded_references`
+   - `failed_downloads`, `duplicate_references`
+   - JSON array format for consistency with authors field
+
+3. **Improved Author Matching**: Enhanced `OpenAlexScraper.py` with:
+   - Separate matching for authors vs. editors
+   - **Smart OR logic**: Match succeeds if EITHER authors OR editors match well (>0.85)
+   - German name particle handling ("von", "van", "de", etc.)
+   - Rate limiter fixes for proper service name handling
+
+4. **Enhanced Matching Accuracy**: Now successfully matches:
+   - Book chapters by their container's editors when chapter isn't indexed separately
+   - German academic names with nobility particles
+   - Citations with different author/editor role assignments
+
+#### Technical Details:
+- **Container Matching**: When specific chapters aren't in OpenAlex, system matches parent book via editors
+- **Bibliographic Relationships**: Handles chapter authors ≠ book editors scenarios
+- **Quality Threshold**: Maintains 0.85 matching threshold for high precision
+- **Progressive Search**: 9-step search strategy from specific to broad matching
+
+#### Example Success Case:
+- **Input**: "Das Finanzsystem in Deutschland" by Alexander V., Bohl, M. (editors: von Hagen, J., von Stein, J. H.)
+- **Match**: "Geld-, Bank- und Börsenwesen : Handbuch des Finanzsystems" via perfect editor matching
+- **Result**: Successful enrichment with OpenAlex metadata and relationship tracking
+
+### Previous Critical Fixes (2025-06-30)
+
 1. **Metadata Access**: Fixed `bib_entry` extraction in `new_dl.py:645` - downloader now properly accesses enriched metadata
 2. **Rate Limiting**: Fixed `ServiceRateLimiter.wait_if_needed()` in `utils.py` to return `True` instead of `None`
 3. **Author Handling**: Fixed LibGen author surname extraction to handle both dict and string formats
@@ -108,8 +147,9 @@ Key features:
    - PDF validation and automatic fallback to real download links
 
 ### Pipeline Status:
-✅ **Full end-to-end functionality restored**:
+✅ **Full end-to-end functionality with enhanced matching**:
 - JSON bibliography extraction → metadata enrichment → PDF downloads
 - All download sources working: DOI, Sci-Hub (all mirrors), LibGen (with smart parsing)
+- **NEW**: Editor-based matching for improved bibliographic accuracy
 - Proper error handling and fallback mechanisms
 - Transaction-safe database operations

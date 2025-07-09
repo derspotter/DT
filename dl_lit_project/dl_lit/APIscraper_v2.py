@@ -11,72 +11,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Import DatabaseManager for staged DB insertion
 from dl_lit.db_manager import DatabaseManager
+from dl_lit.utils import get_global_rate_limiter
 from pdfminer.high_level import extract_text
 try:
     import fitz  # PyMuPDF
     PYMUPDF_AVAILABLE = True
-    print("[INFO] PyMuPDF (fitz) is available for text extraction.", flush=True)
 except ImportError:
     PYMUPDF_AVAILABLE = False
-    print("[WARNING] PyMuPDF (fitz) not installed. Falling back to pdfminer for text extraction.", flush=True)
 try:
     from PyPDF2 import PdfReader
     PYPDF2_AVAILABLE = True
 except ImportError:
     PYPDF2_AVAILABLE = False
-    print("[WARNING] PyPDF2 not installed. Secondary fallback text extraction will not be available.", flush=True)
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
 import concurrent.futures
-from collections import deque
 from threading import Lock
-from datetime import datetime, timedelta
 
 # --- Configuration ---
-# Use Gemini standard Flash model for speed
-DEFAULT_MODEL_NAME = 'gemini-2.0-flash'
+# Use Gemini 2.5 Flash model for speed
+DEFAULT_MODEL_NAME = 'gemini-2.5-flash'
 
 # Global client/model variable
 api_model = None
 
-# --- Rate Limiter --- (Respecting 15 RPM = 0.25 RPS)
-MAX_REQUESTS_PER_MINUTE = 15
-MIN_INTERVAL_SECONDS = 60.0 / MAX_REQUESTS_PER_MINUTE
-request_timestamps = deque()
-rate_limiter_lock = Lock()
-
-def wait_for_rate_limit():
-    """Blocks until it's safe to make another API request based on 15 RPM."""
-    with rate_limiter_lock:
-        now = datetime.now()
-        # Remove timestamps older than 1 minute
-        while request_timestamps and (now - request_timestamps[0]) > timedelta(minutes=1):
-            request_timestamps.popleft()
-
-        # If we've made max requests in the last minute, wait
-        if len(request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
-            time_since_oldest = (now - request_timestamps[0]).total_seconds()
-            wait_time = 60.0 - time_since_oldest
-            if wait_time > 0:
-                print(f"[RATE LIMIT] Reached {MAX_REQUESTS_PER_MINUTE} RPM. Waiting {wait_time:.2f} seconds...", flush=True)
-                time.sleep(wait_time)
-
-        # Check minimum interval between requests
-        if request_timestamps:
-             time_since_last = (now - request_timestamps[-1]).total_seconds()
-             if time_since_last < MIN_INTERVAL_SECONDS:
-                 interval_wait = MIN_INTERVAL_SECONDS - time_since_last
-                 # print(f"[RATE LIMIT] Minimum interval not met. Waiting {interval_wait:.2f} seconds...", flush=True)
-                 time.sleep(interval_wait)
-
-        # Record this request's timestamp
-        request_timestamps.append(datetime.now())
+# --- Rate Limiter --- (Shared global instance)
+rate_limiter = get_global_rate_limiter()
 
 # --- Bibliography Prompt ---
 BIBLIOGRAPHY_PROMPT = """You are an expert research assistant specializing in academic literature. Your task is to extract bibliography or reference list entries from the provided text, which is a page from a PDF document containing academic references. Return the bibliography entries as a JSON array of objects. Each object should represent a single bibliography entry and include the following fields where available, regardless of the citation style (APA, MLA, Chicago, etc.) or language:
 
 - authors: array of author names (strings, split multiple authors into separate entries in the array)
+- editors: array of editor names if present (strings, for books/edited volumes/conference proceedings)
 - year: publication year (integer or string)
 - title: title of the work (string)
 - source: journal name, book title, conference name, etc. (string)
@@ -97,8 +64,16 @@ BIBLIOGRAPHY_PROMPT = """You are an expert research assistant specializing in ac
 INSTRUCTIONS:
 1. Recognize bibliography entries even if they are in different formats or languages. Look for patterns like author names followed by years, titles in quotes or italics, and publication details.
 2. Extract as many fields as possible, even partial entries. Make educated guesses for the 'type' field based on context.
-3. If no clear bibliography entries are found, return an empty JSON array [].
-4. Return ONLY the JSON array. Do not include introductory text, explanations, apologies, or markdown formatting like ```json.
+3. For the 'source' field, extract ONLY the actual title of the journal, book, or conference. DO NOT include:
+   - Series editors' names (e.g., "Smith/Jones" in "Smith/Jones Economics Handbook")
+   - Original editors' names that precede the title (e.g., "Obst/Hintner" in "Obst/Hintner Geld-, Bank- und Börsenwesen")
+   - Edition information (e.g., "40th edn.")
+   - Publisher information
+   Examples: 
+   - From "in J. Doe (ed.), Smith/Jones Financial Systems, 3rd edn." → source: "Financial Systems"
+   - From "Obst/Hintner Geld-, Bank- und Börsenwesen" → source: "Geld-, Bank- und Börsenwesen"
+4. If no clear bibliography entries are found, return an empty JSON array [].
+5. Return ONLY the JSON array. Do not include introductory text, explanations, apologies, or markdown formatting like ```json.
 """
 
 # --- Helper Functions ---
@@ -150,7 +125,8 @@ def upload_pdf_and_extract_bibliography(pdf_path):
         
         # Prepare the prompt for bibliography extraction
         prompt = BIBLIOGRAPHY_PROMPT
-        wait_for_rate_limit()
+        rate_limiter.wait_if_needed('gemini')
+        rate_limiter.wait_if_needed('gemini_daily')
         
         # Send request to API with uploaded file
         response = api_model.generate_content(
@@ -250,8 +226,21 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
                 minimal_ref = {
                     "title": entry.get("title"),
                     "authors": entry.get("authors"),
+                    "editors": entry.get("editors"),
+                    "year": entry.get("year"),
                     "doi": entry.get("doi"),
-                    "source_pdf": pdf_path,
+                    "source": entry.get("source"),  # journal/conference/book title
+                    "volume": entry.get("volume"),
+                    "issue": entry.get("issue"),
+                    "pages": entry.get("pages"),
+                    "publisher": entry.get("publisher"),
+                    "type": entry.get("type"),
+                    "url": entry.get("url"),
+                    "isbn": entry.get("isbn"),
+                    "issn": entry.get("issn"),
+                    "abstract": entry.get("abstract"),
+                    "keywords": entry.get("keywords"),
+                    "source_pdf": str(pdf_path),
                 }
                 row_id, err = db_manager.insert_no_metadata(minimal_ref)
                 if err:

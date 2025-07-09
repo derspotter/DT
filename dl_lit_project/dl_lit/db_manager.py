@@ -122,6 +122,7 @@ class DatabaseManager:
                 entry_type TEXT,
                 title TEXT NOT NULL,
                 authors TEXT, -- JSON list of strings
+                editors TEXT, -- JSON list of strings for book/volume editors
                 year INTEGER,
                 doi TEXT,
                 pmid TEXT,
@@ -140,6 +141,8 @@ class DatabaseManager:
                 publisher TEXT,
                 metadata_source_type TEXT, -- e.g., 'bibtex_import', 'openalex_api', 'grobid'
                 bibtex_entry_json TEXT, -- Full bib entry as JSON from bibtexparser
+                source_work_id INTEGER, -- ID of the work this entry references or cites
+                relationship_type TEXT, -- 'references' or 'cited_by'
                 status_notes TEXT, -- e.g., 'Successfully downloaded and processed'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 date_processed TIMESTAMP,
@@ -158,6 +161,7 @@ class DatabaseManager:
                 entry_type TEXT,
                 title TEXT NOT NULL,
                 authors TEXT,
+                editors TEXT, -- JSON list of strings for book/volume editors
                 year INTEGER,
                 doi TEXT,
                 pmid TEXT,
@@ -178,6 +182,8 @@ class DatabaseManager:
                 bibtex_entry_json TEXT, -- Minimal, or to be populated
                 crossref_json TEXT, -- Full CrossRef JSON blob
                 openalex_json TEXT, -- Full OpenAlex JSON blob
+                source_work_id INTEGER, -- ID of the work this entry references or cites
+                relationship_type TEXT, -- 'references' or 'cited_by'
                 status_notes TEXT, -- e.g., 'Pending download', 'Attempt 1 failed - network error'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 date_processed TIMESTAMP,
@@ -193,6 +199,7 @@ class DatabaseManager:
                 entry_type TEXT,
                 title TEXT NOT NULL,
                 authors TEXT, -- JSON list of strings
+                editors TEXT, -- JSON list of strings for book/volume editors
                 year INTEGER,
                 doi TEXT, -- Normalized DOI of the duplicate entry
                 openalex_id TEXT, -- Normalized OpenAlex ID of the duplicate entry
@@ -229,6 +236,7 @@ class DatabaseManager:
                 entry_type TEXT,
                 title TEXT NOT NULL,
                 authors TEXT,
+                editors TEXT, -- JSON list of strings for book/volume editors
                 year INTEGER,
                 doi TEXT,
                 pmid TEXT,
@@ -263,10 +271,25 @@ class DatabaseManager:
                 source_pdf TEXT,
                 title TEXT NOT NULL,
                 authors TEXT,
+                editors TEXT, -- JSON list of strings for book/volume editors
+                year INTEGER,
                 doi TEXT,
+                source TEXT, -- journal/conference/book title (container_title)
+                volume TEXT,
+                issue TEXT,
+                pages TEXT,
+                publisher TEXT,
+                type TEXT,
+                url TEXT,
+                isbn TEXT,
+                issn TEXT,
+                abstract TEXT,
+                keywords TEXT,
                 normalized_doi TEXT UNIQUE,
                 normalized_title TEXT,
                 normalized_authors TEXT,
+                source_work_id INTEGER, -- ID of the work this entry references or cites
+                relationship_type TEXT, -- 'references' or 'cited_by'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -278,6 +301,7 @@ class DatabaseManager:
                 source_pdf TEXT,
                 title TEXT NOT NULL,
                 authors TEXT,
+                editors TEXT, -- JSON list of strings for book/volume editors
                 year INTEGER,
                 doi TEXT,
                 normalized_doi TEXT UNIQUE,
@@ -287,9 +311,12 @@ class DatabaseManager:
                 abstract TEXT,
                 crossref_json TEXT,
                 openalex_json TEXT,
+                source_work_id INTEGER, -- ID of the work this entry references or cites
+                relationship_type TEXT, -- 'references' or 'cited_by'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
 
         # Helpful indices for quick look-ups
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
@@ -436,9 +463,9 @@ class DatabaseManager:
 
             try:
                 cursor.execute("""
-                    INSERT INTO no_metadata (source_pdf, title, authors, doi, normalized_doi, normalized_title, normalized_authors)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (source_pdf, title, authors_str, doi, normalized_doi, normalized_title, normalized_authors))
+                    INSERT INTO no_metadata (source_pdf, title, authors, editors, doi, normalized_doi, normalized_title, normalized_authors)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (source_pdf, title, authors_str, json.dumps(entry.get('editors')) if entry.get('editors') else None, doi, normalized_doi, normalized_title, normalized_authors))
                 added_count += 1
             except sqlite3.IntegrityError as e:
                 skipped_count += 1
@@ -554,12 +581,13 @@ class DatabaseManager:
     # ------------------------------------------------------------------
 
     def insert_no_metadata(self, ref: dict) -> tuple[int | None, str | None]:
-        """Insert a minimal reference produced by APIscraper_v2 into the
+        """Insert a reference produced by APIscraper_v2 into the
         ``no_metadata`` table, performing duplicate checks across all tables.
 
         Args:
-            ref: Dict with at least title/doi/authors. Keys recognised:
-                 title, authors (list[str] or str), doi, source_pdf.
+            ref: Dict with at least title. Keys recognised:
+                 title, authors (list[str] or str), year, doi, source, volume, issue, 
+                 pages, publisher, type, url, isbn, issn, abstract, keywords, source_pdf.
 
         Returns:
             (row_id, None) on success or (None, error_msg) if duplicate/failed.
@@ -584,14 +612,28 @@ class DatabaseManager:
         cursor = self.conn.cursor()
         try:
             cursor.execute(
-                """INSERT INTO no_metadata (source_pdf, title, authors, doi, normalized_doi,
-                                            normalized_title, normalized_authors)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO no_metadata (source_pdf, title, authors, editors, year, doi, source, volume, 
+                                            issue, pages, publisher, type, url, isbn, issn, abstract, 
+                                            keywords, normalized_doi, normalized_title, normalized_authors)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ref.get("source_pdf"),
                     title,
                     json.dumps(authors_raw),
+                    json.dumps(ref.get("editors")) if ref.get("editors") else None,
+                    ref.get("year"),
                     doi_raw,
+                    ref.get("source"),
+                    ref.get("volume"),
+                    ref.get("issue"),
+                    ref.get("pages"),
+                    ref.get("publisher"),
+                    ref.get("type"),
+                    ref.get("url"),
+                    ref.get("isbn"),
+                    ref.get("issn"),
+                    ref.get("abstract"),
+                    json.dumps(ref.get("keywords")) if ref.get("keywords") else None,
                     norm_doi,
                     norm_title,
                     norm_authors,
@@ -620,25 +662,34 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, title, authors, doi, source_pdf FROM no_metadata ORDER BY id LIMIT ?",
+            "SELECT id, title, authors, editors, doi, source_pdf FROM no_metadata ORDER BY id LIMIT ?",
             (limit,),
         )
         rows = cursor.fetchall()
 
         result: list[dict] = []
         for row in rows:
-            row_id, title, authors_json, doi, source_pdf = row
+            row_id, title, authors_json, editors_json, doi, source_pdf = row
             authors: list[str] | None = None
             if authors_json:
                 try:
                     authors = json.loads(authors_json)
                 except json.JSONDecodeError:
                     authors = [authors_json]  # fall back to raw string
+            
+            editors: list[str] | None = None
+            if editors_json:
+                try:
+                    editors = json.loads(editors_json)
+                except json.JSONDecodeError:
+                    editors = [editors_json]  # fall back to raw string
+            
             result.append(
                 {
                     "id": row_id,
                     "title": title,
                     "authors": authors,
+                    "editors": editors,
                     "doi": doi,
                     "source_pdf": source_pdf,
                 }
@@ -677,8 +728,9 @@ class DatabaseManager:
 
             cur.execute(
                 """INSERT INTO with_metadata (source_pdf,title,authors,year,doi,normalized_doi,openalex_id,
-                                               normalized_title,normalized_authors,abstract,crossref_json,openalex_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                               normalized_title,normalized_authors,abstract,crossref_json,openalex_json,
+                                               source_work_id,relationship_type)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     merged.get("source_pdf"),
                     merged.get("title"),
@@ -692,9 +744,19 @@ class DatabaseManager:
                     merged.get("abstract"),
                     json.dumps(merged.get("crossref_json")) if merged.get("crossref_json") is not None else None,
                     json.dumps(merged.get("openalex_json")) if merged.get("openalex_json") is not None else None,
+                    merged.get("source_work_id"),
+                    merged.get("relationship_type"),
                 ),
             )
             new_id = cur.lastrowid
+            
+            # Store related works as separate entries in with_metadata table
+            if enrichment.get('referenced_works'):
+                self.add_referenced_works_to_with_metadata(new_id, enrichment['referenced_works'])
+            
+            if enrichment.get('citing_works'):
+                self.add_citing_works_to_with_metadata(new_id, enrichment['citing_works'])
+            
             cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
             cur.execute("COMMIT")
             return new_id, None
@@ -1506,6 +1568,122 @@ class DatabaseManager:
             error_msg = f"Transaction failed while moving to failed: {e}"
             print(f"{RED}[DB Manager] {error_msg}{RESET}")
             return None, error_msg
+
+    def add_referenced_works_to_with_metadata(self, source_work_id: int, referenced_works: list) -> int:
+        """Add referenced works as separate entries in the with_metadata table."""
+        if not referenced_works:
+            return 0
+            
+        cursor = self.conn.cursor()
+        stored_count = 0
+        
+        try:
+            for ref_work in referenced_works:
+                if not isinstance(ref_work, dict):
+                    continue
+                    
+                # Extract relevant fields from the referenced work
+                title = ref_work.get('title')
+                if not title:
+                    continue
+                    
+                authors_json = json.dumps(ref_work.get('authors', [])) if ref_work.get('authors') else None
+                year = ref_work.get('year')
+                doi = ref_work.get('doi')
+                openalex_id = ref_work.get('openalex_id')
+                normalized_doi = self._normalize_doi(doi)
+                normalized_openalex_id = self._normalize_openalex_id(openalex_id)
+                normalized_title = self._normalize_text(title)
+                normalized_authors = self._normalize_text(str(ref_work.get('authors', [])))
+                
+                # Create a mock OpenAlex JSON entry for the referenced work
+                openalex_json = {
+                    'id': openalex_id,
+                    'title': title,
+                    'display_name': title,
+                    'authorships': [{'author': {'display_name': author}} for author in ref_work.get('authors', [])],
+                    'publication_year': year,
+                    'doi': doi,
+                    'type': ref_work.get('type')
+                }
+                
+                # Insert into with_metadata table with relationship info
+                cursor.execute("""
+                    INSERT OR IGNORE INTO with_metadata 
+                    (source_pdf, title, authors, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, 
+                     abstract, crossref_json, openalex_json, source_work_id, relationship_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (None, title, authors_json, year, doi, normalized_doi, normalized_openalex_id, 
+                      normalized_title, normalized_authors, None, None, json.dumps(openalex_json), 
+                      source_work_id, 'references'))
+                
+                if cursor.rowcount > 0:
+                    stored_count += 1
+            
+            print(f"{GREEN}[DB Manager] Added {stored_count} referenced works to with_metadata for work ID {source_work_id}{RESET}")
+            return stored_count
+            
+        except sqlite3.Error as e:
+            print(f"{RED}[DB Manager] Error adding referenced works to with_metadata: {e}{RESET}")
+            return 0
+
+    def add_citing_works_to_with_metadata(self, source_work_id: int, citing_works: list) -> int:
+        """Add citing works as separate entries in the with_metadata table."""
+        if not citing_works:
+            return 0
+            
+        cursor = self.conn.cursor()
+        stored_count = 0
+        
+        try:
+            for citing_work in citing_works:
+                if not isinstance(citing_work, dict):
+                    continue
+                    
+                # Extract relevant fields from the citing work
+                title = citing_work.get('title')
+                if not title:
+                    continue
+                    
+                authors_json = json.dumps(citing_work.get('authors', [])) if citing_work.get('authors') else None
+                year = citing_work.get('year')
+                doi = citing_work.get('doi')
+                openalex_id = citing_work.get('openalex_id')
+                normalized_doi = self._normalize_doi(doi)
+                normalized_openalex_id = self._normalize_openalex_id(openalex_id)
+                normalized_title = self._normalize_text(title)
+                normalized_authors = self._normalize_text(str(citing_work.get('authors', [])))
+                
+                # Create a mock OpenAlex JSON entry for the citing work
+                openalex_json = {
+                    'id': openalex_id,
+                    'title': title,
+                    'display_name': title,
+                    'authorships': [{'author': {'display_name': author}} for author in citing_work.get('authors', [])],
+                    'publication_year': year,
+                    'doi': doi,
+                    'type': citing_work.get('type')
+                }
+                
+                # Insert into with_metadata table with relationship info
+                cursor.execute("""
+                    INSERT OR IGNORE INTO with_metadata 
+                    (source_pdf, title, authors, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, 
+                     abstract, crossref_json, openalex_json, source_work_id, relationship_type)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (None, title, authors_json, year, doi, normalized_doi, normalized_openalex_id, 
+                      normalized_title, normalized_authors, None, None, json.dumps(openalex_json), 
+                      source_work_id, 'cited_by'))
+                
+                if cursor.rowcount > 0:
+                    stored_count += 1
+            
+            print(f"{GREEN}[DB Manager] Added {stored_count} citing works to with_metadata for work ID {source_work_id}{RESET}")
+            return stored_count
+            
+        except sqlite3.Error as e:
+            print(f"{RED}[DB Manager] Error adding citing works to with_metadata: {e}{RESET}")
+            return 0
 
 if __name__ == '__main__':
     # Example usage: Initialize and create DB if run directly

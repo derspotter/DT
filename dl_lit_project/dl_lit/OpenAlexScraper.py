@@ -42,7 +42,8 @@ def clean_search_term(term):
     """Remove commas and clean up the search term."""
     if term is None:
         return None
-    return term.replace(',', ' ')
+    # Replace commas with spaces and normalize multiple spaces to single spaces
+    return ' '.join(term.replace(',', ' ').split())
 
 def convert_inverted_index_to_text(inverted_index):
     """Convert an abstract_inverted_index to readable text"""
@@ -62,7 +63,7 @@ def convert_inverted_index_to_text(inverted_index):
     text = " ".join(word for word, _ in word_positions)
     return text
 
-def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu"):
+def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max_citations=100):
     """
     Fetches the OpenAlex IDs of works that cite the work at the given URL.
     Handles pagination to get all citing work IDs.
@@ -71,15 +72,15 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu"):
         return []
 
     citing_work_ids = []
-    url = f"{cited_by_url}&select=id&per-page=100&mailto={mailto}" # Request only ID, increase per-page limit
+    url = f"{cited_by_url}&select=id,title,display_name,authorships,publication_year,doi,type&per-page=100&mailto={mailto}"
     page = 1
 
-    print(f"Fetching citing work IDs from: {cited_by_url}")
+    print(f"Fetching citing works from: {cited_by_url} (max: {max_citations})")
 
-    while url:
+    while url and len(citing_work_ids) < max_citations:
         try:
             # Apply rate limiting
-            rate_limiter.wait_if_needed()
+            rate_limiter.wait_if_needed('openalex')
 
             response = requests.get(url, headers={"Accept": "application/json"})
             response.raise_for_status()
@@ -87,18 +88,28 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu"):
 
             results = data.get("results", [])
             for work in results:
-                work_id = work.get("id")
-                if work_id:
-                    citing_work_ids.append(work_id)
+                if len(citing_work_ids) >= max_citations:
+                    break
+                    
+                # Extract work details, not just ID
+                work_details = {
+                    'openalex_id': work.get("id"),
+                    'title': work.get("display_name"),
+                    'authors': [a.get('author', {}).get('display_name') for a in work.get('authorships', [])],
+                    'year': work.get("publication_year"),
+                    'doi': work.get("doi"),
+                    'type': work.get("type")
+                }
+                citing_work_ids.append(work_details)
 
             # Check for next page
             meta = data.get("meta", {})
-            if meta.get("next_page"):
+            if meta.get("next_page") and len(citing_work_ids) < max_citations:
                 url = meta["next_page"]
                 page += 1
                 print(f"Fetching next page of citing works: Page {page}")
             else:
-                url = None # No more pages
+                url = None # No more pages or reached limit
 
         except requests.exceptions.RequestException as e:
             print(f"Error fetching citing works from {url}: {str(e)}")
@@ -108,8 +119,64 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu"):
             print(f"Unexpected error fetching citing works from {url}: {str(e)}")
             url = None
 
-    print(f"Finished fetching citing work IDs. Found {len(citing_work_ids)}")
+    print(f"Finished fetching citing works. Found {len(citing_work_ids)}")
     return citing_work_ids
+
+def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spott@wzb.eu"):
+    """
+    Fetches detailed metadata for a list of referenced work OpenAlex IDs.
+    Uses batch requests to efficiently get details for multiple works.
+    """
+    if not referenced_work_ids:
+        return []
+
+    referenced_works = []
+    
+    # Process in batches of 50 (OpenAlex limit for pipe queries)
+    batch_size = 50
+    for i in range(0, len(referenced_work_ids), batch_size):
+        batch = referenced_work_ids[i:i+batch_size]
+        
+        # Extract just the work IDs for the batch query
+        work_ids = []
+        for work_id in batch:
+            if isinstance(work_id, str):
+                work_ids.append(work_id)
+            elif isinstance(work_id, dict) and work_id.get('id'):
+                work_ids.append(work_id['id'])
+        
+        if not work_ids:
+            continue
+            
+        # Create pipe-separated query for batch request
+        ids_query = "|".join(work_ids)
+        url = f"https://api.openalex.org/works?filter=openalex_id:{ids_query}&select=id,title,display_name,authorships,publication_year,doi,type&per-page=50&mailto={mailto}"
+        
+        try:
+            rate_limiter.wait_if_needed('openalex')
+            response = requests.get(url, headers={"Accept": "application/json"})
+            response.raise_for_status()
+            data = response.json()
+            
+            results = data.get("results", [])
+            for work in results:
+                work_details = {
+                    'openalex_id': work.get("id"),
+                    'title': work.get("display_name"),
+                    'authors': [a.get('author', {}).get('display_name') for a in work.get('authorships', [])],
+                    'year': work.get("publication_year"),
+                    'doi': work.get("doi"),
+                    'type': work.get("type")
+                }
+                referenced_works.append(work_details)
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching referenced work details: {str(e)}")
+        except Exception as e:
+            print(f"Unexpected error fetching referenced work details: {str(e)}")
+    
+    print(f"Fetched details for {len(referenced_works)} referenced works")
+    return referenced_works
 
 def get_authors_from_ref(ref):
     """
@@ -139,6 +206,9 @@ def normalize_name(name):
 
     name = name.lower().strip()
     
+    # Handle nobility particles that can appear in different positions
+    particles = ['von', 'van', 'de', 'du', 'der', 'la', 'le', 'da', 'dos', 'del']
+    
     # Check if name is in "LastName, FirstNames" format
     if ',' in name:
         parts = [part.strip() for part in name.split(',')]
@@ -152,8 +222,24 @@ def normalize_name(name):
         parts = name.split()
         if len(parts) == 0:
             return None, None
-        last_name = parts[-1]
-        first_names = ' '.join(parts[:-1])
+        
+        # Handle particles: move them to the last name
+        name_parts = []
+        particle_parts = []
+        
+        for part in parts:
+            if part in particles:
+                particle_parts.append(part)
+            else:
+                name_parts.append(part)
+        
+        if len(name_parts) == 0:
+            return None, None
+        
+        # Last name includes particles + actual last name
+        last_name_parts = particle_parts + [name_parts[-1]]
+        last_name = ' '.join(last_name_parts)
+        first_names = ' '.join(name_parts[:-1])
 
     # Remove non-alphabetic characters from first names (like initials)
     first_names = ''.join(c for c in first_names if c.isalpha() or c.isspace()).strip()
@@ -196,7 +282,7 @@ def match_author_name(ref_author, result_author):
 def find_best_author_match(ref_authors, result, ref_editors=None):
     """
     Match authors and editors against result authors.
-    ref_editors is the list of editors from the reference, if available.
+    If either authors OR editors match well (>0.85), return the best score.
     """
     if ref_editors is None:
         ref_editors = []
@@ -207,39 +293,45 @@ def find_best_author_match(ref_authors, result, ref_editors=None):
         if author.get('author') and author['author'].get('display_name')
     ]
 
-    # Combine authors and editors for matching
-    all_ref_authors = ref_authors + ref_editors
-
-    if not all_ref_authors:
-        # If no authors in reference, we can't perform a match.
-        return 0.0
-
     if not result_authors:
         # If no authors in result, we can't perform a match.
         return 0.0
-    
-    # Calculate match scores for all pairs of authors
+
     scores = []
-    for ref_author in all_ref_authors:
-        for res_author in result_authors:
-            scores.append(match_author_name(ref_author, res_author))
+    
+    # Match reference authors separately
+    if ref_authors:
+        author_scores = []
+        for ref_author in ref_authors:
+            for res_author in result_authors:
+                author_scores.append(match_author_name(ref_author, res_author))
+        
+        if author_scores:
+            # Use the average of the top N scores, where N is the number of reference authors
+            author_scores.sort(reverse=True)
+            top_author_scores = author_scores[:len(ref_authors)]
+            author_match_score = sum(top_author_scores) / len(top_author_scores)
+            scores.append(author_match_score)
+    
+    # Match reference editors separately  
+    if ref_editors:
+        editor_scores = []
+        for ref_editor in ref_editors:
+            for res_author in result_authors:
+                editor_scores.append(match_author_name(ref_editor, res_author))
+        
+        if editor_scores:
+            # Use the average of the top N scores, where N is the number of reference editors
+            editor_scores.sort(reverse=True)
+            top_editor_scores = editor_scores[:len(ref_editors)]
+            editor_match_score = sum(top_editor_scores) / len(top_editor_scores)
+            scores.append(editor_match_score)
 
     if not scores:
         return 0.0
 
-    # Use the average of the top N scores, where N is the number of authors in the reference.
-    # This rewards results that match multiple authors.
-    scores.sort(reverse=True)
-    num_authors_to_consider = len(all_ref_authors)
-    top_scores = scores[:num_authors_to_consider]
-    
-    # Check for empty top_scores to avoid division by zero
-    if not top_scores:
-        return 0.0
-
-    average_score = sum(top_scores) / len(top_scores)
-    
-    return average_score
+    # Return the BEST score (either authors or editors)
+    return max(scores)
 
 def get_authors_and_editors(ref):
     """Get separate lists of authors and editors from reference, expanding multi-author strings."""
@@ -275,7 +367,10 @@ def get_authors_and_editors(ref):
         return expanded_list
 
     authors = expand_author_list(ref.get('authors', []))
-    editors = expand_author_list(ref.get('editor', []))
+    editors = expand_author_list(ref.get('editors', []))
+    # Also check for singular 'editor' field for backward compatibility
+    if ref.get('editor') and not editors:
+        editors = expand_author_list(ref.get('editor', []))
         
     return authors, editors
 
@@ -313,7 +408,7 @@ class OpenAlexCrossrefSearcher:
         url = f'https://api.crossref.org/works?query={"+".join(query)}&rows=5'
         
         try:
-            self.rate_limiter.wait_if_needed()
+            rate_limiter.wait_if_needed('crossref')
             response = requests.get(url, headers=self.crossref_headers)
             response.raise_for_status()
             data = response.json()
@@ -345,13 +440,47 @@ class OpenAlexCrossrefSearcher:
             print(f"Crossref error: {e}")
             return []
 
-    def search(self, title, year, container_title, abstract, keywords, step, rate_limiter):
+    def search(self, title, year, container_title, abstract, keywords, step, rate_limiter, doi=None):
         """
         Search OpenAlex and Crossref with different strategies based on step number.
+        Step 0: DOI-first search (if DOI available)
         Steps 1-7: use OpenAlex filter queries
         Step 8: use Crossref search
         Step 9: use OpenAlex search parameter for container_title
         """
+        # Step 0: DOI-first search - highest priority
+        if step == 0:
+            if not doi:
+                return {"step": step, "results": [], "success": False, "error": "DOI required for step 0"}
+            
+            # Direct DOI lookup in OpenAlex
+            params = {
+                'filter': f'doi:{doi}',
+                'select': self.fields,
+                'per-page': 1
+            }
+            
+            try:
+                print(f"\nStep {step}: DOI Direct Search")
+                print(f"DOI: {doi}")
+                rate_limiter.wait_if_needed('openalex')
+                response = requests.get(self.base_url, headers=self.headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                results = data.get('results', [])
+                if results:
+                    print(f"DOI match found: {results[0].get('display_name', 'N/A')}")
+                    return {"step": step, "results": results, "success": True, "meta": data.get('meta')}
+                else:
+                    print(f"No DOI match found in OpenAlex")
+                    return {"step": step, "results": [], "success": True} # Success but no results
+                    
+            except requests.exceptions.RequestException as e:
+                return {"step": step, "results": [], "success": False, "error": str(e)}
+            except Exception as e:
+                return {"step": step, "results": [], "success": False, "error": f"Unexpected DOI search error: {str(e)}"}
+        
         if not title and not container_title:
             return {"step": step, "results": [], "success": False}
 
@@ -403,7 +532,7 @@ class OpenAlexCrossrefSearcher:
                 
                 print(f"Crossref Query: {url}")
                 
-                rate_limiter.wait_if_needed()
+                rate_limiter.wait_if_needed('openalex')
                 response = requests.get(url, headers=self.crossref_headers)
                 response.raise_for_status()
                 data = response.json()
@@ -465,7 +594,7 @@ class OpenAlexCrossrefSearcher:
         if step != 8:
             if step in [1,2,3,4,5,6]: # Filter based queries
                  params = {
-                    'filter': query + (f",publication_year:{year}" if year and step in [4,5,6] else ""),
+                    'filter': query + (f",publication_year:{year}" if year and step in [1,2,3] else ""),
                     'select': self.fields,
                     'per-page': 10
                 }
@@ -473,7 +602,7 @@ class OpenAlexCrossrefSearcher:
             try:
                 print(f"\nStep {step}: OpenAlex Query")
                 print(f"Params: {params}")
-                rate_limiter.wait_if_needed()
+                rate_limiter.wait_if_needed('openalex')
                 response = requests.get(self.base_url, headers=self.headers, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -524,21 +653,55 @@ def get_abstract(inverted_index):
     sorted_words = [word_positions[i] for i in sorted(word_positions.keys())]
     return " ".join(sorted_words)
 
-def process_single_reference(ref, searcher, rate_limiter):
+def process_single_reference(ref, searcher, rate_limiter, fetch_references=True, fetch_citations=False, max_citations=100):
     """Process a single reference to find its OpenAlex entry and potentially citing works."""
     title = ref.get('title')
     year = ref.get('year')
     container_title = ref.get('container-title') # Journal or book title
     abstract = ref.get('abstract') # For future use, not directly in search now
     keywords = ref.get('keywords') # For future use
+    doi = ref.get('doi')
 
-    if not title:
+    if not title and not doi:
         # This print is useful, so we keep it.
-        print(f"Skipping reference due to missing title: {ref.get('id', 'Unknown ID')}")
+        print(f"Skipping reference due to missing title and DOI: {ref.get('id', 'Unknown ID')}")
         return None # Return None on failure
 
     all_results = {} # Store unique results by ID
     first_success_step = None
+    
+    # Step 0: DOI-first search if DOI is available
+    if doi:
+        print(f"\nProcessing reference with DOI: {doi}")
+        results = searcher.search(title, year, container_title, abstract, keywords, 0, rate_limiter=rate_limiter, doi=doi)
+        
+        if results['success'] and results['results']:
+            # DOI match found - accept immediately without author matching
+            best_result = results['results'][0]
+            print(f"DOI match accepted: {best_result.get('display_name', 'N/A')}")
+            
+            final_enrichment = {
+                'title': best_result.get('display_name'),
+                'authors': [a.get('author', {}).get('display_name') for a in best_result.get('authorships', [])],
+                'year': best_result.get('publication_year'),
+                'doi': best_result.get('doi'),
+                'openalex_id': best_result.get('id'),
+                'abstract': get_abstract(best_result.get('abstract_inverted_index')),
+                'openalex_json': best_result,
+                'crossref_json': best_result.get('crossref_data'),
+            }
+            
+            # Fetch related works if requested
+            final_enrichment = _fetch_related_works(final_enrichment, best_result, searcher, rate_limiter, 
+                                                  fetch_references, fetch_citations, max_citations)
+            return final_enrichment
+        else:
+            print(f"DOI search failed or no results, proceeding with regular search")
+    
+    # If no DOI or DOI search failed, proceed with regular steps 1-9
+    if not title:
+        print(f"Skipping reference due to missing title: {ref.get('id', 'Unknown ID')}")
+        return None
     
     # Try all steps 1-9 in order, collecting all possible results
     for step in range(1, 10):
@@ -575,7 +738,7 @@ def process_single_reference(ref, searcher, rate_limiter):
         for match in matched_results:
             original_authors = ref.get('authors', 'N/A')
             result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
-            print(f"  - Score: {match['author_match_score']:.2f} | Step: {match['first_found_in_step']} | Title: {match['result']['display_name'][:60]}")
+            print(f"  - Score: {match['author_match_score']:.2f} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
             print(f"    Original Ref Authors: {original_authors}")
             print(f"    API Result Authors:   {result_authors}")
         # --- END DEBUG ---
@@ -599,10 +762,43 @@ def process_single_reference(ref, searcher, rate_limiter):
                 'openalex_json': best_result,
                 'crossref_json': best_result.get('crossref_data'), # Assuming searcher puts it here
             }
+            
+            # Fetch related works if requested
+            final_enrichment = _fetch_related_works(final_enrichment, best_result, searcher, rate_limiter, 
+                                                  fetch_references, fetch_citations, max_citations)
             return final_enrichment
 
     # If no high-confidence match is found or no results at all, return None.
     return None
+
+def _fetch_related_works(enrichment_data, openalex_result, searcher, rate_limiter, 
+                        fetch_references=True, fetch_citations=False, max_citations=100):
+    """Helper function to fetch referenced works and citing works for an enriched entry."""
+    
+    # Initialize related works fields
+    enrichment_data['referenced_works'] = []
+    enrichment_data['citing_works'] = []
+    
+    # Fetch referenced works if requested
+    if fetch_references and openalex_result.get('referenced_works'):
+        print(f"Fetching details for {len(openalex_result['referenced_works'])} referenced works...")
+        enrichment_data['referenced_works'] = fetch_referenced_work_details(
+            openalex_result['referenced_works'], 
+            rate_limiter,
+            searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1]
+        )
+    
+    # Fetch citing works if requested
+    if fetch_citations and openalex_result.get('cited_by_api_url'):
+        print(f"Fetching citing works (max: {max_citations})...")
+        enrichment_data['citing_works'] = fetch_citing_work_ids(
+            openalex_result['cited_by_api_url'],
+            rate_limiter,
+            searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
+            max_citations
+        )
+    
+    return enrichment_data
 
 def process_bibliography_files(bib_dir, output_dir, searcher, fetch_citations=True):
     """Process all JSON bibliography files in a directory using ThreadPoolExecutor."""
