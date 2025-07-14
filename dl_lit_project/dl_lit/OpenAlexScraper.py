@@ -15,28 +15,6 @@ try:
 except ImportError:
     raise ImportError("Module 'rapidfuzz' not found. Install with 'pip install rapidfuzz'")
 
-class RateLimiter:
-    def __init__(self, max_per_second):
-        self.max_per_second = max_per_second
-        self.request_times = deque()
-        self.lock = threading.Lock()
-    
-    def wait_if_needed(self):
-        now = datetime.now()
-        
-        with self.lock:
-            # Remove timestamps older than 1 second
-            while self.request_times and (now - self.request_times[0]) > timedelta(seconds=1):
-                self.request_times.popleft()
-            
-            # If we've hit the limit, wait
-            if len(self.request_times) >= self.max_per_second:
-                wait_time = 1 - (now - self.request_times[0]).total_seconds()
-                if wait_time > 0:
-                    time.sleep(wait_time)
-            
-            # Record this request
-            self.request_times.append(now)
 
 def clean_search_term(term):
     """Remove commas and clean up the search term."""
@@ -387,7 +365,6 @@ class OpenAlexCrossrefSearcher:
             'Accept': 'application/json',
             'User-Agent': f'OpenAlexScraper/1.0 (mailto:{mailto})'
         }
-        self.rate_limiter = RateLimiter(max_per_second=5)  # Very conservative rate limit
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
 

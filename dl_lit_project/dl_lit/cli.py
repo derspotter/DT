@@ -9,15 +9,18 @@ from datetime import datetime
 import pprint
 import copy
 from tqdm import tqdm
+from threading import Lock
+import hashlib
 
 # Local application imports
 from .db_manager import DatabaseManager
-from .get_bib_pages import extract_reference_sections
-from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference, RateLimiter
+# from .get_bib_pages import extract_reference_sections  # Lazy import to avoid debug prints
+from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from .new_dl import BibliographyEnhancer
-from .utils import ServiceRateLimiter
+from .utils import get_global_rate_limiter
 from .pdf_downloader import PDFDownloader
 from .bibtex_formatter import BibTeXFormatter
+from .APIscraper_v2 import process_directory_v2, process_single_pdf
 
 # ANSI escape codes for colors
 RESET = "\033[0m"
@@ -392,6 +395,9 @@ def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
               help='Directory to save extracted reference PDFs. Defaults to ~/Nextcloud/DT/papers_extracted_references.')
 def extract_bib_pages_command(input_path, output_dir):
     """Extracts bibliography/reference section pages from a PDF file or all PDFs in a directory."""
+    # Lazy import to avoid debug prints at module level
+    from .get_bib_pages import extract_reference_sections
+    
     input_path = Path(input_path)
     output_dir = Path(output_dir)
 
@@ -461,7 +467,8 @@ def extract_bib_api_command(input_path, db_path, workers):
     db_manager = None
 
     try:
-        # Configure API client (ensure GOOGLE_API_KEY is set in .env or environment)
+        # Import and configure API client for APIscraper_v2
+        from .APIscraper_v2 import configure_api_client
         if not configure_api_client():
             click.echo(f"{RED}API client configuration failed. Please check your GOOGLE_API_KEY.{RESET}", err=True)
             return
@@ -516,15 +523,18 @@ def extract_bib_api_command(input_path, db_path, workers):
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
 @click.option('--batch-size', default=50, help='Number of entries to process in one batch.')
 @click.option('--mailto', default='spott@wzb.eu', help='Email for API politeness.')
-def enrich_openalex_db_command(db_path, batch_size, mailto):
+@click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works for enriched papers.')
+@click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works for enriched papers (API intensive).')
+@click.option('--max-citations', default=100, show_default=True, help='Maximum number of citing works to fetch per paper.')
+def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fetch_citations, max_citations):
     """Fetches metadata from OpenAlex/Crossref for entries in the no_metadata table."""
     click.echo(f"Starting DB enrichment – DB: {db_path} | Batch: {batch_size}")
     db_manager = DatabaseManager(db_path)
     
     # Use the more advanced searcher from OpenAlexScraper
     searcher = OpenAlexCrossrefSearcher(mailto=mailto)
-    # The scraper uses its own RateLimiter, let's create one for it.
-    rate_limiter = RateLimiter(max_per_second=5) 
+    # Use the global rate limiter shared across all components
+    rate_limiter = get_global_rate_limiter() 
 
     promoted_count = 0
     failed_count = 0
@@ -543,14 +553,22 @@ def enrich_openalex_db_command(db_path, batch_size, mailto):
                 'title': entry.get('title'),
                 'authors': entry.get('authors') if entry.get('authors') else [],
                 'doi': entry.get('doi'),
-                'year': None, # Not available in no_metadata
-                'container-title': None, # Not available
-                'abstract': None, # Not available
-                'keywords': None # Not available
+                'year': entry.get('year'),  # Use extracted year
+                'container-title': entry.get('source'),  # Use extracted source/journal
+                'volume': entry.get('volume'),
+                'issue': entry.get('issue'),
+                'pages': entry.get('pages'),
+                'abstract': entry.get('abstract'),
+                'keywords': entry.get('keywords')
             }
 
-            # Use the powerful multi-step search process
-            enriched_data = process_single_reference(ref_for_scraper, searcher, rate_limiter)
+            # Use the powerful multi-step search process with related works options
+            enriched_data = process_single_reference(
+                ref_for_scraper, searcher, rate_limiter, 
+                fetch_references=fetch_references,
+                fetch_citations=fetch_citations,
+                max_citations=max_citations
+            )
             
             if enriched_data:
                 db_manager.promote_to_with_metadata(entry['id'], enriched_data)
@@ -652,12 +670,7 @@ def download_pdfs_command(db_path, limit, download_dir):
     download_dir.mkdir(parents=True, exist_ok=True)
     click.echo(f"Processing up to {limit} queued items…")
 
-    rl = ServiceRateLimiter({
-        'default': {'limit': 2, 'window': 1},
-        'unpaywall': {'limit': 3, 'window': 1},
-        'scihub': {'limit': 1, 'window': 2},
-        'libgen': {'limit': 1, 'window': 2},
-    })
+    rl = get_global_rate_limiter()
 
     db = DatabaseManager(db_path)
     enhancer = BibliographyEnhancer(db_manager=db, rate_limiter=rl, email='spott@wzb.eu', output_folder=download_dir)

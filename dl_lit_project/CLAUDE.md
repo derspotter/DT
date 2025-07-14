@@ -115,7 +115,7 @@ Key features:
    - Separate matching for authors vs. editors
    - **Smart OR logic**: Match succeeds if EITHER authors OR editors match well (>0.85)
    - German name particle handling ("von", "van", "de", etc.)
-   - Rate limiter fixes for proper service name handling
+   - **Standardized Rate Limiting**: All components now use shared global rate limiter with proper service names
 
 4. **Enhanced Matching Accuracy**: Now successfully matches:
    - Book chapters by their container's editors when chapter isn't indexed separately

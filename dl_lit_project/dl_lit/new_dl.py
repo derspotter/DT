@@ -26,17 +26,8 @@ YELLOW = colorama.Fore.YELLOW
 RESET = colorama.Style.RESET_ALL # Use colorama's reset
 
 import google.cloud.aiplatform as aiplatform
-from google import genai
-from google.genai.types import (
-    FunctionDeclaration,
-    GenerateContentConfig,
-    GoogleSearch,
-    Part,
-    Retrieval,
-    SafetySetting,
-    Tool,
-    VertexAISearch,
-)
+import google.generativeai as genai
+# Removed incompatible google.genai.types imports
 
 import json
 import traceback
@@ -48,7 +39,7 @@ import hashlib
 
 
 from .db_manager import DatabaseManager
-from .utils import ServiceRateLimiter
+from .utils import ServiceRateLimiter, get_global_rate_limiter
 
 
 class BibliographyEnhancer:
@@ -80,11 +71,12 @@ class BibliographyEnhancer:
         #)
 
         # Set model ID
-        self.MODEL_ID = "gemini-2.0-flash-exp"
+        self.MODEL_ID = "gemini-2.5-flash"
 
-        self.client = genai.Client(api_key=os.getenv('GOOGLE_API_KEY'))
-        # Use Google Search for grounding
-        self.google_search_tool = Tool(google_search=GoogleSearch())
+        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+        self.client = genai.GenerativeModel(self.MODEL_ID)
+        # Google Search for grounding (disabled for compatibility)
+        # self.google_search_tool = Tool(google_search=GoogleSearch())
         self.proxies = proxies
         self.output_folder = Path(output_folder) if output_folder else None
 
@@ -1514,8 +1506,8 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
     if not work_ids:
         return []
     if limiter is None:
-        # Default limiter if none provided
-        limiter = ServiceRateLimiter(rps_limit=10, rpd_limit=100000)
+        # Use the global rate limiter shared across all components
+        limiter = get_global_rate_limiter()
 
     all_results: list[dict] = []
     batch_size = 50 # OpenAlex recommended max batch size for filter
@@ -1677,7 +1669,7 @@ def ingest_json_directory(input_dir: str | Path, db: DatabaseManager, email: str
         return
 
     # Fetch their metadata via OpenAlex
-    limiter = ServiceRateLimiter(rps_limit=10, rpd_limit=100000) # Use configured limits
+    limiter = get_global_rate_limiter() # Use the global rate limiter shared across all components
     openalex_results = fetch_openalex_batch(list(work_ids_to_fetch), email=email, limiter=limiter)
     added_ref_works = 0
     
