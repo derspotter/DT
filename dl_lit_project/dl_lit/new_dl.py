@@ -79,6 +79,9 @@ class BibliographyEnhancer:
         # self.google_search_tool = Tool(google_search=GoogleSearch())
         self.proxies = proxies
         self.output_folder = Path(output_folder) if output_folder else None
+        
+        # Initialize Sci-Hub mirror rotation
+        self.current_mirror_index = 0
 
     def escape_bibtex(self, text: str | None) -> str:
         """Escapes characters with special meaning in BibTeX/LaTeX."""
@@ -249,9 +252,14 @@ class BibliographyEnhancer:
 
         # Try multiple Sci-Hub mirrors
         scihub_mirrors = [
-            "https://sci-hub.se",
-            "https://sci-hub.st",
-            "https://sci-hub.ru"
+            "https://sci-hub.al",
+            "https://www.tesble.com",
+            "https://sci-hub.shop",
+            "https://sci-hub.vg",
+            "https://sci-hub.ren",
+            "https://sci-hub.wf",
+            "https://sci-hub.ee",
+            "https://sci-hub.mksa.top"
         ]
 
         headers = {
@@ -263,7 +271,14 @@ class BibliographyEnhancer:
             print("Sci-Hub rate limit exceeded. Skipping...")
             return None
 
-        for mirror in scihub_mirrors:
+        # Implement mirror rotation: start with next mirror in rotation
+        start_index = self.current_mirror_index
+        self.current_mirror_index = (self.current_mirror_index + 1) % len(scihub_mirrors)
+        
+        # Try mirrors starting from current index
+        for i in range(len(scihub_mirrors)):
+            mirror_index = (start_index + i) % len(scihub_mirrors)
+            mirror = scihub_mirrors[mirror_index]
             scihub_url = f"{mirror}/{clean_doi}"
             print(f"  Trying Sci-Hub mirror: {mirror}")
             
@@ -769,26 +784,28 @@ class BibliographyEnhancer:
                     if surname:
                         author_surnames.append(surname)
 
-            print("Sci-Hub failed (or no DOI). Trying LibGen...")
-            libgen_results = self.search_libgen(title, author_surnames, ref.get('type', ''))
-            if libgen_results:
-                print(f"Found {len(libgen_results)} results on LibGen")
-                urls_to_try.extend(libgen_results)
-                for url_info in urls_to_try:
-                    if self.try_download_url(url_info['url'], url_info.get('source', "LibGen"), ref, downloads_dir):
-                        ref['download_source'] = url_info.get('source', "LibGen")
-                        ref['download_reason'] = 'Successfully downloaded via LibGen' # More specific reason
-                        download_success = True
-                        file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-                        print(f"{GREEN}✓ Downloaded from: {url_info.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
-                        break # Exit LibGen loop on success
+            # LibGen is currently down - commented out but preserved for future use
+            # print("Sci-Hub failed (or no DOI). Trying LibGen...")
+            # libgen_results = self.search_libgen(title, author_surnames, ref.get('type', ''))
+            # if libgen_results:
+            #     print(f"Found {len(libgen_results)} results on LibGen")
+            #     urls_to_try.extend(libgen_results)
+            #     for url_info in urls_to_try:
+            #         if self.try_download_url(url_info['url'], url_info.get('source', "LibGen"), ref, downloads_dir):
+            #             ref['download_source'] = url_info.get('source', "LibGen")
+            #             ref['download_reason'] = 'Successfully downloaded via LibGen' # More specific reason
+            #             download_success = True
+            #             file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
+            #             print(f"{GREEN}✓ Downloaded from: {url_info.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
+            #             break # Exit LibGen loop on success
+            print("Sci-Hub failed (or no DOI). LibGen is currently unavailable.")
 
 
         # If all methods fail, mark as not found
         if not download_success:
             print(f"  {RED}✗ No valid matches found through any method{RESET}")
             ref['download_status'] = 'not_found'
-            ref['download_reason'] = 'No valid matches found through any method'
+            ref['download_reason'] = 'No valid matches found through DOI, Unpaywall, or Sci-Hub'
 
         # Return the modified ref dictionary if download was successful, otherwise None
         if 'downloaded_file' in ref and ref['downloaded_file']:

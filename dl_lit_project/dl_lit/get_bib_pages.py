@@ -11,7 +11,7 @@ import shutil
 import concurrent.futures
 from dotenv import load_dotenv
 import glob
-from .utils import ServiceRateLimiter
+from .utils import get_global_rate_limiter, ServiceRateLimiter
 
 
 print("--- Script Top --- ", flush=True)
@@ -89,6 +89,7 @@ RULES:
 
     try:
         rate_limiter.wait_if_needed('gemini')
+        rate_limiter.wait_if_needed('gemini_daily')
         print("Sending request to GenAI...", flush=True)
         response = model.generate_content([prompt, uploaded_pdf], request_options={'timeout': 600})
         print("Raw find_reference_section_pages response: ```json")
@@ -119,10 +120,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
         return
 
     model = genai.GenerativeModel("gemini-2.5-flash")
-    service_config = {
-        'gemini': {'limit': 10, 'window': 60}  # 10 requests per 60 seconds
-    }
-    rate_limiter = ServiceRateLimiter(service_config)
+    rate_limiter = get_global_rate_limiter()
     files_to_clean_up = []
     temp_chunk_dir = None
     all_sections = []
@@ -160,6 +158,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
 
                     # Upload and process the chunk
                     rate_limiter.wait_if_needed('gemini')
+                    rate_limiter.wait_if_needed('gemini_daily')
                     print(f"Uploading chunk: {chunk_display_name}")
                     uploaded_chunk = genai.upload_file(chunk_path, display_name=chunk_display_name)
                     files_to_clean_up.append(uploaded_chunk)
@@ -181,6 +180,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                 # --- Standard Logic for Smaller PDFs ---
                 print("PDF is within size limits, processing as a single file.")
                 rate_limiter.wait_if_needed('gemini')
+                rate_limiter.wait_if_needed('gemini_daily')
                 print("Uploading full PDF...")
                 uploaded_pdf = genai.upload_file(pdf_path)
                 files_to_clean_up.append(uploaded_pdf)
@@ -212,7 +212,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
             except (ValueError, TypeError) as e:
                 print(f"Warning: Invalid page number format in section {sec} (Error: {e}). Skipping.")
 
-        # --- Extraction Logic (remains mostly the same) ---
+        # --- Extraction Logic (Modified to always output individual pages) ---
         output_base_filename = os.path.splitext(os.path.basename(pdf_path))[0]
         final_extracted_files = []
         print(f"\n--- Validating and Extracting Pages from original PDF ---")
@@ -227,19 +227,25 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                 if not (0 <= start_idx < total_physical_pages and 0 <= end_idx < total_physical_pages):
                     print(f"    - Error: Invalid page range. Skipping section.")
                     continue
-                try:
-                    new_pdf = pikepdf.Pdf.new()
-                    for page_num in range(start_idx, end_idx + 1):
-                        new_pdf.pages.append(pdf_doc.pages[page_num])
-                    expanded_output_dir = os.path.expanduser(output_dir)
-                    os.makedirs(expanded_output_dir, exist_ok=True)
-                    output_filename = f"{output_base_filename}_refs_physical_p{phys_start_1_based_for_naming}-{phys_end_1_based_for_naming}.pdf"
-                    output_path = os.path.join(expanded_output_dir, output_filename)
-                    new_pdf.save(output_path)
-                    final_extracted_files.append(output_path)
-                    print(f"    - Successfully extracted pages to {output_path}")
-                except Exception as e:
-                    print(f"    - Error extracting pages {start_idx}-{end_idx}: {e}. Skipping section.")
+                
+                # Extract each page individually instead of as a continuous section
+                total_pages_in_section = end_idx - start_idx + 1
+                for page_offset in range(total_pages_in_section):
+                    current_page_idx = start_idx + page_offset
+                    current_page_1_based = current_page_idx + 1
+                    
+                    try:
+                        new_pdf = pikepdf.Pdf.new()
+                        new_pdf.pages.append(pdf_doc.pages[current_page_idx])
+                        expanded_output_dir = os.path.expanduser(output_dir)
+                        os.makedirs(expanded_output_dir, exist_ok=True)
+                        output_filename = f"{output_base_filename}_refs_physical_p{current_page_1_based}.pdf"
+                        output_path = os.path.join(expanded_output_dir, output_filename)
+                        new_pdf.save(output_path)
+                        final_extracted_files.append(output_path)
+                        print(f"    - Successfully extracted page {current_page_1_based} to {output_path}")
+                    except Exception as e:
+                        print(f"    - Error extracting page {current_page_1_based}: {e}. Skipping page.")
 
         print("\n--- Final Extracted Files ---")
         if final_extracted_files:

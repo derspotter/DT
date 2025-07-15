@@ -1,11 +1,17 @@
-include:
-  - path: ./frontend/docker-compose.yml
-    project_directory: ./frontend
-  - path: ./backend/docker-compose.yml
-    project_directory: ./backend
+services:
+  rag_feeder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_feeder_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - rag-network
 
-# You can define shared resources like networks here if needed,
-# although Compose often handles network merging automatically.
-# networks:
-#   documentalyze-network:
-#     driver: bridge
+networks:
+  rag-network:
+    external: true
