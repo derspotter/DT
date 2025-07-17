@@ -26,12 +26,42 @@ The main CLI entry point is `python -m dl_lit.cli`. Key commands:
 - `python -m dl_lit.cli clear-downloaded [--db-path PATH]` - Clear downloaded_references table
 - `python -m dl_lit.cli show-sample [--limit N] [--show-all]` - View downloaded entries
 
-### Bibliography Processing Pipeline
+### Automated Pipeline (Recommended)
+**NEW: Complete end-to-end processing in one command**
+
+**Single PDF Processing:**
+```bash
+python -m dl_lit.cli process-pdf <pdf_file> [options]
+```
+
+**Batch Folder Processing:**
+```bash
+# Process all PDFs in folder once
+python -m dl_lit.cli process-folder <folder> [options]
+
+# Watch folder continuously for new PDFs
+python -m dl_lit.cli process-folder <folder> --watch [options]
+```
+
+**Drop-folder Workflow:**
+1. Place PDFs in the `inbox/` folder
+2. Run: `python -m dl_lit.cli process-folder inbox/ --watch`
+3. Processed PDFs automatically move to `completed/` or `failed/` folders
+4. Downloaded papers appear in `pdf_library/`
+
+**Options for automated commands:**
+- `--fetch-references` / `--no-fetch-references` (default: fetch referenced works)
+- `--fetch-citations` / `--no-fetch-citations` (default: don't fetch citing works)
+- `--max-citations N` - Limit citing works to fetch (default: 100)
+- `--move-completed` / `--no-move-completed` - Auto-move processed PDFs (default: false)
+- `--interval N` - Watch mode check interval in seconds (default: 5)
+
+### Manual Step-by-Step Pipeline (Advanced)
 1. `python -m dl_lit.cli extract-bib-pages <pdf_file> [--output-dir DIR]` - Extract reference pages from PDF
-2. `python -m dl_lit.cli extract-bib-api --input-path <path> --output-dir <dir> [--workers N]` - Parse references to JSON using GenAI
-3. `python -m dl_lit.cli enrich-openalex-db [--limit N] [--db-path PATH]` - Enrich metadata via OpenAlex/Crossref APIs  
-4. `python -m dl_lit.cli process-downloads [--limit N] [--db-path PATH]` - Queue enriched entries for download
-5. `python -m dl_lit.cli download-pdfs [--limit N] [--db-path PATH]` - Download PDF files
+2. `python -m dl_lit.cli extract-bib-api <input_path> [--workers N]` - Parse references to JSON using GenAI
+3. `python -m dl_lit.cli enrich-openalex-db [--batch-size N]` - Enrich metadata via OpenAlex/Crossref APIs  
+4. `python -m dl_lit.cli process-downloads [--batch-size N]` - Queue enriched entries for download
+5. `python -m dl_lit.cli download-pdfs [--limit N]` - Download PDF files
 
 ### Import/Export
 - `python -m dl_lit.cli import-bib <bibtex_file> [--pdf-base-dir DIR] [--db-path PATH]` - Import existing BibTeX library
@@ -59,7 +89,8 @@ The pipeline uses a 4-stage SQLite database approach to prevent duplicate work:
 Additional tables: `duplicate_references`, `failed_downloads`
 
 ### Key Components
-- **`cli.py`**: Click-based CLI with all commands
+- **`cli.py`**: Click-based CLI with all commands (manual and automated)
+- **`pipeline.py`**: PipelineOrchestrator class for automated end-to-end processing
 - **`db_manager.py`**: DatabaseManager class handling all SQL operations and schema
 - **`get_bib_pages.py`**: GenAI-powered bibliography page extraction from PDFs
 - **`APIscraper_v2.py`**: GenAI text parsing to structured JSON, streams to `no_metadata` table
@@ -68,10 +99,25 @@ Additional tables: `duplicate_references`, `failed_downloads`
 - **`bibtex_formatter.py`**: BibTeX export formatting with JabRef-compatible `file` fields
 
 ### Processing Flow
+
+**Automated Pipeline (via PipelineOrchestrator):**
+```
+PDF → [All steps automatically] → completed/failed folders + pdf_library/
+```
+
+**Manual Step-by-Step Pipeline:**
 ```
 PDF → extract-bib-pages → extract-bib-api → no_metadata → 
 enrich-openalex-db → with_metadata → process-downloads → 
 to_download_references → download-pdfs → downloaded_references
+```
+
+**Folder Structure for Automated Pipeline:**
+```
+inbox/          # Drop PDFs here
+completed/      # Successfully processed PDFs
+failed/         # PDFs with processing errors  
+pdf_library/    # Downloaded referenced papers
 ```
 
 ### Dependencies
@@ -95,6 +141,54 @@ Key features:
 - `plan.md` - Detailed project documentation and roadmap
 
 ## Recent Updates
+
+### Automated Pipeline Implementation (2025-07-17)
+
+**New Feature**: Complete automated processing pipeline with folder watching capability.
+
+#### Key Features:
+1. **PipelineOrchestrator Class**: New `pipeline.py` module coordinates all processing steps:
+   - Single PDF processing: `process_pdf_complete()`
+   - Batch folder processing: `process_folder()`
+   - Continuous folder monitoring: `watch_folder()`
+   - Real-time progress reporting with color-coded console output
+
+2. **Enhanced CLI Commands**: 
+   - `process-pdf` - Process single PDF through entire pipeline
+   - `process-folder` - Process all PDFs in folder, with optional watch mode
+   - Configurable options for reference/citation fetching
+   - Automatic file management (move to completed/failed folders)
+
+3. **Drop-folder Workflow**:
+   - Simple `inbox/` folder for PDF input
+   - Automatic processing and organization
+   - Progress tracking and error reporting
+   - No external dependencies for folder watching (simple polling)
+
+4. **Robust Error Handling**:
+   - Per-step error tracking and reporting
+   - Graceful cleanup of temporary files
+   - Transaction-safe database operations
+   - Detailed processing statistics
+
+#### Technical Implementation:
+- **ProgressReporter**: Real-time status updates with ANSI color coding
+- **File Management**: Automatic organization into completed/failed folders
+- **Rate Limiting**: Integrated with existing global rate limiter
+- **Statistics Tracking**: Comprehensive metrics for each processing step
+- **Cleanup**: Automatic removal of temporary extracted reference files
+
+#### Usage Examples:
+```bash
+# Process single PDF
+python -m dl_lit.cli process-pdf paper.pdf --fetch-citations
+
+# Process folder once  
+python -m dl_lit.cli process-folder inbox/ --move-completed
+
+# Watch folder continuously
+python -m dl_lit.cli process-folder inbox/ --watch --fetch-citations --max-citations 50
+```
 
 ### Editor Extraction Implementation (2025-01-09)
 
@@ -147,9 +241,10 @@ Key features:
    - PDF validation and automatic fallback to real download links
 
 ### Pipeline Status:
-✅ **Full end-to-end functionality with enhanced matching**:
-- JSON bibliography extraction → metadata enrichment → PDF downloads
-- All download sources working: DOI, Sci-Hub (all mirrors), LibGen (with smart parsing)
-- **NEW**: Editor-based matching for improved bibliographic accuracy
-- Proper error handling and fallback mechanisms
-- Transaction-safe database operations
+✅ **Complete automated end-to-end functionality**:
+- **Automated Processing**: Single-command PDF processing with folder watching
+- **Enhanced Matching**: Editor-based matching for improved bibliographic accuracy  
+- **Full Pipeline**: JSON bibliography extraction → metadata enrichment → PDF downloads
+- **All Download Sources**: DOI, Sci-Hub (all mirrors), LibGen (with smart parsing)
+- **Robust Operations**: Error handling, fallback mechanisms, transaction-safe database operations
+- **User-Friendly**: Drop-folder workflow with automatic file organization and progress reporting

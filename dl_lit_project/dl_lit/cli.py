@@ -937,5 +937,146 @@ def inspect_tables_command(db_path, table, limit):
         if 'db_manager' in locals():
             db_manager.close_connection()
 
+@cli.command("process-pdf")
+@click.argument('pdf_path', type=click.Path(exists=True))
+@click.option('--fetch-references/--no-fetch-references', default=True, 
+              help='Fetch referenced works from enriched papers.')
+@click.option('--fetch-citations/--no-fetch-citations', default=False,
+              help='Fetch citing works for enriched papers.')
+@click.option('--max-citations', default=100, type=int,
+              help='Maximum number of citing works to fetch per paper.')
+@click.option('--move-completed/--no-move-completed', default=False,
+              help='Move PDF to completed/failed folder after processing.')
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), 
+              help='Path to the SQLite database file.')
+def process_pdf_command(pdf_path, fetch_references, fetch_citations, max_citations, 
+                       move_completed, db_path):
+    """Process a single PDF through the entire pipeline."""
+    from .pipeline import PipelineOrchestrator
+    
+    click.echo(f"\n{CYAN}Processing PDF: {pdf_path}{RESET}")
+    
+    # Set up options
+    options = {
+        'fetch_references': fetch_references,
+        'fetch_citations': fetch_citations,
+        'max_citations': max_citations,
+        'move_on_complete': move_completed,
+        'completed_folder': 'completed',
+        'failed_folder': 'failed'
+    }
+    
+    try:
+        # Create orchestrator and process PDF
+        orchestrator = PipelineOrchestrator(db_path=db_path)
+        result = orchestrator.process_pdf_complete(pdf_path, options)
+        
+        # Display summary
+        click.echo(f"\n{'='*60}")
+        click.echo(f"{CYAN}Processing Complete{RESET}")
+        click.echo(f"{'='*60}")
+        
+        if result['success']:
+            click.echo(f"{GREEN}✓ Success{RESET}")
+        else:
+            click.echo(f"{RED}✗ Failed{RESET}")
+            
+        click.echo(f"\nStatistics:")
+        click.echo(f"  Extracted references: {result['extracted_refs']}")
+        click.echo(f"  Parsed references: {result['parsed_refs']}")
+        click.echo(f"  Enriched references: {result['enriched_refs']}")
+        click.echo(f"  Queued for download: {result['queued_downloads']}")
+        click.echo(f"  Successfully downloaded: {result['successful_downloads']}")
+        click.echo(f"  Failed downloads: {result['failed_downloads']}")
+        
+        if result['errors']:
+            click.echo(f"\n{RED}Errors:{RESET}")
+            for error in result['errors']:
+                click.echo(f"  • {error}")
+                
+        # Processing time
+        summary = result.get('processing_summary', {})
+        if summary:
+            click.echo(f"\nTotal processing time: {summary['total_time']:.1f} seconds")
+            
+    except Exception as e:
+        click.echo(f"{RED}Error: {e}{RESET}")
+        import traceback
+        traceback.print_exc()
+
+@cli.command("process-folder")
+@click.argument('folder_path', type=click.Path(exists=True))
+@click.option('--watch/--no-watch', default=False,
+              help='Continuously watch folder for new PDFs.')
+@click.option('--interval', default=5, type=int,
+              help='Watch interval in seconds (only with --watch).')
+@click.option('--fetch-references/--no-fetch-references', default=True,
+              help='Fetch referenced works from enriched papers.')
+@click.option('--fetch-citations/--no-fetch-citations', default=False,
+              help='Fetch citing works for enriched papers.')
+@click.option('--max-citations', default=100, type=int,
+              help='Maximum number of citing works to fetch per paper.')
+@click.option('--db-path', default=str(DEFAULT_DB_PATH),
+              help='Path to the SQLite database file.')
+def process_folder_command(folder_path, watch, interval, fetch_references, 
+                          fetch_citations, max_citations, db_path):
+    """Process all PDFs in a folder (optionally with continuous watching)."""
+    from .pipeline import PipelineOrchestrator
+    
+    # Set up options
+    options = {
+        'fetch_references': fetch_references,
+        'fetch_citations': fetch_citations,
+        'max_citations': max_citations,
+        'move_on_complete': watch,  # Only move files when watching
+        'completed_folder': 'completed',
+        'failed_folder': 'failed'
+    }
+    
+    try:
+        orchestrator = PipelineOrchestrator(db_path=db_path)
+        
+        if watch:
+            # Continuous watching mode
+            click.echo(f"\n{CYAN}Starting folder watch: {folder_path}{RESET}")
+            click.echo(f"Check interval: {interval} seconds")
+            click.echo(f"Press Ctrl+C to stop...\n")
+            
+            orchestrator.watch_folder(folder_path, options, interval)
+        else:
+            # One-time processing
+            click.echo(f"\n{CYAN}Processing all PDFs in: {folder_path}{RESET}")
+            
+            results = orchestrator.process_folder(folder_path, options)
+            
+            # Display summary
+            if results:
+                successful = sum(1 for r in results if r['success'])
+                failed = len(results) - successful
+                
+                click.echo(f"\n{'='*60}")
+                click.echo(f"{CYAN}Batch Processing Complete{RESET}")
+                click.echo(f"{'='*60}")
+                click.echo(f"Total PDFs processed: {len(results)}")
+                click.echo(f"  {GREEN}✓ Successful: {successful}{RESET}")
+                click.echo(f"  {RED}✗ Failed: {failed}{RESET}")
+                
+                # Aggregate statistics
+                total_refs = sum(r['parsed_refs'] for r in results)
+                total_enriched = sum(r['enriched_refs'] for r in results)
+                total_downloaded = sum(r['successful_downloads'] for r in results)
+                
+                click.echo(f"\nAggregate Statistics:")
+                click.echo(f"  Total references parsed: {total_refs}")
+                click.echo(f"  Total references enriched: {total_enriched}")
+                click.echo(f"  Total papers downloaded: {total_downloaded}")
+                
+    except KeyboardInterrupt:
+        click.echo(f"\n{YELLOW}Processing interrupted by user.{RESET}")
+    except Exception as e:
+        click.echo(f"{RED}Error: {e}{RESET}")
+        import traceback
+        traceback.print_exc()
+
 if __name__ == '__main__':
     cli()
