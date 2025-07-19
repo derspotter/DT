@@ -661,7 +661,7 @@ class BibliographyEnhancer:
             doi = enriched.get('doi')
             year = enriched.get('publication_year')
             authorships = enriched.get('authorships', [])
-            authors = [item.get('raw_author_name') for item in authorships if item.get('raw_author_name')] if authorships else []
+            authors = [item.get('author', {}).get('display_name') for item in authorships if item.get('author', {}).get('display_name')] if authorships else []
             # Get open access URL from enriched data
             open_access_url = enriched.get('open_access', {}).get('oa_url') if enriched.get('open_access') else None
 
@@ -774,8 +774,11 @@ class BibliographyEnhancer:
                         surname = author.get('family')
                         if not surname and author.get('raw'):
                             # Fallback: take the last part of the name as the surname
-                            parts = author['raw'].split()
-                            surname = parts[-1] if parts else ''
+                            if isinstance(author['raw'], str):
+                                parts = author['raw'].split()
+                                surname = parts[-1] if parts else ''
+                            else:
+                                surname = str(author['raw'])
                     else:
                         # Handle string format
                         parts = str(author).split()
@@ -1181,7 +1184,7 @@ class BibliographyEnhancer:
     # ----------------------------------------------------------------------
     # Download stage: process refs and move from input to current
     # ----------------------------------------------------------------------
-    def process_references_from_database(self, output_dir: str | Path, max_concurrent: int = 5,
+    def process_references_from_database(self, output_dir: str | Path, max_concurrent: int = 10,
                                          force_download: bool = False,
                                          skip_referenced_works: bool = False) -> int:
         """Download all refs in input_references, move to current_references immediately."""
@@ -1435,7 +1438,7 @@ class BibliographyEnhancer:
             doi = enriched.get('doi')
             year = enriched.get('publication_year')
             authorships = enriched.get('authorships', [])
-            authors = [item.get('raw_author_name') for item in authorships if item.get('raw_author_name')] if authorships else []
+            authors = [item.get('author', {}).get('display_name') for item in authorships if item.get('author', {}).get('display_name')] if authorships else []
 
         elif 'original_reference' in ref and ref['original_reference']:
              # Fallback to original reference data

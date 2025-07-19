@@ -313,60 +313,28 @@ class BibliographyEnhancer:
         return self.local_storage.db_conn
 
     def _setup_database(self):
-        """Setup the SQLite database with necessary tables for previous, current, and input references."""
-        cursor = self.db_conn.cursor()
-        # Table for references from previous sessions
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS previous_references (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doi TEXT,
-                title TEXT,
-                year TEXT,
-                authors TEXT,
-                metadata TEXT,
-                filename TEXT,
-                position INTEGER,
-                normalized_doi TEXT,
-                normalized_title TEXT,
-                normalized_authors TEXT,
-                processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Table for references from the current session
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS current_references (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doi TEXT,
-                title TEXT,
-                year TEXT,
-                authors TEXT,
-                metadata TEXT,
-                filename TEXT,
-                position INTEGER,
-                normalized_doi TEXT,
-                normalized_title TEXT,
-                normalized_authors TEXT,
-                processed_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Table for input references to be processed
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS input_references (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                doi TEXT,
-                title TEXT,
-                year TEXT,
-                authors TEXT,
-                metadata TEXT,
-                filename TEXT,
-                position INTEGER,
-                normalized_doi TEXT,
-                normalized_title TEXT,
-                normalized_authors TEXT,
-                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self.db_conn.commit()
+        """Initialise the SQLite database using the shared DatabaseManager.
+
+        This delegates all schema creation to the authoritative implementation
+        in ``dl_lit_project.dl_lit.db_manager`` (or ``dl_lit.db_manager`` when
+        the package is imported directly). Doing so guarantees that
+        BibliographyEnhancer works with the exact same table definitions and
+        avoids the risk of schema drift.
+        """
+        # Import lazily to avoid circular-import issues.
+        try:
+            from dl_lit_project.dl_lit.db_manager import DatabaseManager  # type: ignore
+        except ModuleNotFoundError:
+            # Fallback when executed inside the dl_lit_project package itself.
+            from dl_lit.db_manager import DatabaseManager  # type: ignore
+
+        # Create/attach the database using the canonical manager; its constructor
+        # will create the schema if it does not yet exist.
+        self.db_manager = DatabaseManager(db_path=self.db_file)
+
+        # Re-use the same SQLite connection for thread-local operations so that
+        # other methods in this class continue to access ``self.db_conn``.
+        self.local_storage.db_conn = self.db_manager.conn
 
     def __del__(self):
         """Destructor to close database connection."""

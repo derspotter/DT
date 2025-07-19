@@ -32,6 +32,7 @@ testdir
 dl_lit/scraped
 **/*.db
 **/*.bib
+**/*.pdf
 *.sqlite
 processed_references.db
 dl_lit/bib_output/MM_IGZA_Bd-5-GT-1-6-2023-2/MM_IGZA_Bd-5-GT-1-6-2023-2_bibliography_pages.json

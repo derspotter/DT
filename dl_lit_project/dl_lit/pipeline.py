@@ -7,6 +7,7 @@ import os
 import time
 import shutil
 import traceback
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -154,18 +155,19 @@ class PipelineOrchestrator:
             # Step 2: Parse references to database
             progress.update("Parse References", "processing")
             try:
-                import threading
+                from .APIscraper_v2 import process_directory_v2, configure_api_client
+                
+                # Configure API client if not already done
+                if not configure_api_client():
+                    raise Exception("Failed to configure API client")
                 
                 # Process the extracted reference pages
                 cursor = self.db_manager.conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM no_metadata")
                 initial_count = cursor.fetchone()[0]
                 
-                # Create dummy summary dict and lock for the function call
-                summary_dict = {}
-                summary_lock = threading.Lock()
-                
-                process_single_pdf(str(extracted_refs_dir), self.db_manager, summary_dict, summary_lock)
+                # Use process_directory_v2 to handle all extracted PDF files
+                process_directory_v2(str(extracted_refs_dir), self.db_manager, max_workers=5)
                 
                 cursor.execute("SELECT COUNT(*) FROM no_metadata")
                 final_count = cursor.fetchone()[0]
@@ -187,17 +189,35 @@ class PipelineOrchestrator:
                 
                 # Get unprocessed entries
                 cursor = self.db_manager.conn.cursor()
-                cursor.execute("SELECT * FROM no_metadata ORDER BY date_added DESC LIMIT 100")
+                cursor.execute("SELECT * FROM no_metadata ORDER BY date_added DESC")
                 entries = cursor.fetchall()
+                total_entries = len(entries)
                 
-                enriched_count = 0
-                for entry in entries:
+                def process_pipeline_entry(entry):
+                    """Process a single pipeline entry for enrichment."""
                     try:
                         # Convert row to dict format
+                        import json
+                        
+                        # Parse authors JSON string to list
+                        authors_json = entry[3] if len(entry) > 3 else '[]'
+                        try:
+                            authors = json.loads(authors_json) if authors_json else []
+                        except (json.JSONDecodeError, TypeError):
+                            authors = []
+                        
+                        # Parse editors JSON string to list
+                        editors_json = entry[4] if len(entry) > 4 else '[]'
+                        try:
+                            editors = json.loads(editors_json) if editors_json else []
+                        except (json.JSONDecodeError, TypeError):
+                            editors = []
+                        
                         entry_dict = {
                             'id': entry[0],
-                            'title': entry[3] if len(entry) > 3 else '',
-                            'authors': entry[4] if len(entry) > 4 else '[]',
+                            'title': entry[2] if len(entry) > 2 else '',
+                            'authors': authors,
+                            'editors': editors,
                             'year': entry[5] if len(entry) > 5 else None
                         }
                         
@@ -209,13 +229,39 @@ class PipelineOrchestrator:
                             fetch_citations=fetch_citations,
                             max_citations=max_citations
                         )
-                        if result:
-                            enriched_count += 1
+                        return entry, result
                     except Exception as e:
                         print(f"Error enriching entry {entry[0]}: {e}")
+                        return entry, None
+                
+                # Process entries in parallel using ThreadPoolExecutor
+                # Database operations happen on main thread to avoid connection issues
+                import concurrent.futures
+                enriched_count = 0
+                total_entries = len(entries)
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    futures = [executor.submit(process_pipeline_entry, entry) for entry in entries]
+                    
+                    for future in concurrent.futures.as_completed(futures):
+                        entry, result = future.result()
+                        if result:
+                            # Promote to with_metadata table (on main thread)
+                            promoted_id, error = self.db_manager.promote_to_with_metadata(entry[0], result)
+                            if promoted_id:
+                                enriched_count += 1
+                                percentage = (enriched_count / total_entries) * 100
+                                print(f"  ✓ Enriched {enriched_count}/{total_entries} ({percentage:.1f}%): {result.get('title', 'No title')[:50]}...")
+                            else:
+                                print(f"  ✗ Failed to promote entry {entry[0]}: {error}")
                         
                 stats['enriched_refs'] = enriched_count
-                progress.update("Enrich Metadata", "success", f"{enriched_count} references")
+                # Show enrichment progress with percentage
+                if total_entries > 0:
+                    percentage = (enriched_count / total_entries) * 100
+                    progress.update("Enrich Metadata", "success", f"{enriched_count}/{total_entries} ({percentage:.1f}%)")
+                else:
+                    progress.update("Enrich Metadata", "success", f"{enriched_count}/0 (0%)")
             except Exception as e:
                 progress.update("Enrich Metadata", "failed", str(e))
                 stats['errors'].append(f"Metadata enrichment: {str(e)}")
@@ -225,7 +271,7 @@ class PipelineOrchestrator:
             try:
                 # Move enriched entries to download queue
                 cursor = self.db_manager.conn.cursor()
-                cursor.execute("SELECT * FROM with_metadata LIMIT 100")
+                cursor.execute("SELECT * FROM with_metadata")
                 with_meta_entries = cursor.fetchall()
                 
                 queued = 0
@@ -253,7 +299,8 @@ class PipelineOrchestrator:
                 )
                 
                 # Get entries from download queue
-                download_entries = self.db_manager.get_entries_to_download(limit=50)
+                download_entries = self.db_manager.get_entries_to_download()
+                total_downloads = len(download_entries)
                 
                 successful = 0
                 failed = 0
@@ -261,6 +308,13 @@ class PipelineOrchestrator:
                 for entry in download_entries:
                     try:
                         # Convert entry to dictionary format expected by enhancer
+                        openalex_json = entry.get('openalex_json')
+                        if openalex_json and isinstance(openalex_json, str):
+                            try:
+                                openalex_json = json.loads(openalex_json)
+                            except (json.JSONDecodeError, TypeError):
+                                openalex_json = None
+                        
                         ref = {
                             'id': entry['id'],
                             'title': entry['title'],
@@ -268,15 +322,28 @@ class PipelineOrchestrator:
                             'year': entry['year'],
                             'doi': entry['doi'],
                             'openalex_id': entry.get('openalex_id'),
-                            'openalex_json': entry.get('openalex_json')
+                            'openalex_json': openalex_json
                         }
                         
                         result = enhancer.enhance_bibliography(ref, Path(self.output_folder))
                         
                         if result and 'downloaded_file' in result:
+                            # Calculate checksum for the downloaded file
+                            checksum = ''
+                            try:
+                                with open(result['downloaded_file'], 'rb') as fh:
+                                    checksum = hashlib.sha256(fh.read()).hexdigest()
+                            except Exception:
+                                pass
+                            
                             # Move to downloaded_references using existing method
-                            self.db_manager.move_queue_entry_to_downloaded(
-                                entry['id'], result, result['downloaded_file'], ''
+                            # Pass the original OpenAlex data, not the result from enhance_bibliography
+                            self.db_manager.move_entry_to_downloaded(
+                                entry['id'], 
+                                openalex_json or {},  # Use the OpenAlex data we parsed earlier
+                                result['downloaded_file'], 
+                                checksum,
+                                result.get('download_source', 'unknown')
                             )
                             successful += 1
                         else:
@@ -292,8 +359,14 @@ class PipelineOrchestrator:
                         
                 stats['successful_downloads'] = successful
                 stats['failed_downloads'] = failed
-                progress.update("Download PDFs", "success", 
-                              f"{successful} downloaded, {failed} failed")
+                
+                # Show download progress with percentage
+                if total_downloads > 0:
+                    success_percentage = (successful / total_downloads) * 100
+                    progress.update("Download PDFs", "success", 
+                                  f"{successful}/{total_downloads} ({success_percentage:.1f}%) downloaded, {failed} failed")
+                else:
+                    progress.update("Download PDFs", "success", "0/0 (0%) downloaded, 0 failed")
                 
             except Exception as e:
                 progress.update("Download PDFs", "failed", str(e))

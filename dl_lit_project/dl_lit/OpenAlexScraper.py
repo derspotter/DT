@@ -10,6 +10,14 @@ import concurrent.futures
 import threading
 import os
 
+# ANSI color codes
+RESET = "\033[0m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+CYAN = "\033[96m"
+
 try:
     from rapidfuzz import fuzz
 except ImportError:
@@ -41,7 +49,7 @@ def convert_inverted_index_to_text(inverted_index):
     text = " ".join(word for word, _ in word_positions)
     return text
 
-def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max_citations=100):
+def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max_citations=1000):
     """
     Fetches the OpenAlex IDs of works that cite the work at the given URL.
     Handles pagination to get all citing work IDs.
@@ -630,7 +638,7 @@ def get_abstract(inverted_index):
     sorted_words = [word_positions[i] for i in sorted(word_positions.keys())]
     return " ".join(sorted_words)
 
-def process_single_reference(ref, searcher, rate_limiter, fetch_references=True, fetch_citations=False, max_citations=100):
+def process_single_reference(ref, searcher, rate_limiter, fetch_references=True, fetch_citations=False, max_citations=1000):
     """Process a single reference to find its OpenAlex entry and potentially citing works."""
     title = ref.get('title')
     year = ref.get('year')
@@ -715,7 +723,16 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
         for match in matched_results:
             original_authors = ref.get('authors', 'N/A')
             result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
-            print(f"  - Score: {match['author_match_score']:.2f} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
+            
+            # Color successful matches (>0.85) in green
+            if match['author_match_score'] > 0.85:
+                score_color = GREEN
+            elif match['author_match_score'] > 0.5:
+                score_color = YELLOW
+            else:
+                score_color = RED
+                
+            print(f"  - {score_color}Score: {match['author_match_score']:.2f}{RESET} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
             print(f"    Original Ref Authors: {original_authors}")
             print(f"    API Result Authors:   {result_authors}")
         # --- END DEBUG ---
@@ -723,6 +740,7 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
         # Accept the result only if the best score is high enough.
         if matched_results and matched_results[0]['author_match_score'] > 0.85:
             best_result = matched_results[0]['result']
+            print(f"\n{GREEN}✓ MATCH FOUND! Score: {matched_results[0]['author_match_score']:.2f} - {best_result.get('display_name', 'N/A')}{RESET}\n")
 
             # CRITICAL FIX: Construct a clean dict with all necessary data.
             # The original `best_result` is the raw JSON, which is good.
@@ -787,9 +805,9 @@ def process_bibliography_files(bib_dir, output_dir, searcher, fetch_citations=Tr
         return
 
     # Using ThreadPoolExecutor to process files in parallel
-    # Adjust max_workers based on your system and API limits
+    # Increased to 10 workers to utilize OpenAlex rate limits (10 requests/second)
     # Since RateLimiter is thread-safe, this should be fine.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for json_file in json_files:
             futures.append(executor.submit(process_single_file, json_file, output_dir, searcher, fetch_citations))

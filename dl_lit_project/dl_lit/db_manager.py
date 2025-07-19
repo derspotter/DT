@@ -257,6 +257,8 @@ class DatabaseManager:
                 bibtex_entry_json TEXT, -- Data available before failure
                 crossref_json TEXT,
                 openalex_json TEXT,
+                source_work_id INTEGER, -- ID of the work this entry references or cites
+                relationship_type TEXT, -- 'references' or 'cited_by'
                 status_notes TEXT, -- e.g., 'Download failed: 404 Not Found'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 date_processed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -321,9 +323,69 @@ class DatabaseManager:
         # Helpful indices for quick look-ups
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_openalex ON with_metadata(openalex_id)")
+        
+        # Add indexes for title/author/year duplicate detection
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_title_year ON downloaded_references(normalized_title, year)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_authors ON downloaded_references(normalized_authors)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_title_year ON with_metadata(normalized_title, year)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_authors ON with_metadata(normalized_authors)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_title_year ON no_metadata(normalized_title, year)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_authors ON no_metadata(normalized_authors)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_title_year ON to_download_references(normalized_title, year)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_authors ON to_download_references(normalized_authors)")
+
+        # Add missing columns to failed_downloads if they don't exist
+        self._add_missing_columns_to_failed_downloads()
+        
+        # Add missing normalized columns to to_download_references if they don't exist
+        self._add_normalized_columns_to_download_queue()
 
         self.conn.commit()
         print(f"{GREEN}[DB Manager] Schema created/verified successfully.{RESET}")
+
+    def _add_missing_columns_to_failed_downloads(self):
+        """Add missing columns to failed_downloads table if they don't exist."""
+        cursor = self.conn.cursor()
+        
+        # Check if source_work_id column exists
+        cursor.execute("PRAGMA table_info(failed_downloads)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'source_work_id' not in columns:
+            try:
+                cursor.execute("ALTER TABLE failed_downloads ADD COLUMN source_work_id INTEGER")
+                print(f"{GREEN}[DB Manager] Added source_work_id column to failed_downloads table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add source_work_id column: {e}{RESET}")
+        
+        if 'relationship_type' not in columns:
+            try:
+                cursor.execute("ALTER TABLE failed_downloads ADD COLUMN relationship_type TEXT")
+                print(f"{GREEN}[DB Manager] Added relationship_type column to failed_downloads table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add relationship_type column: {e}{RESET}")
+
+    def _add_normalized_columns_to_download_queue(self):
+        """Add missing normalized columns to to_download_references table if they don't exist."""
+        cursor = self.conn.cursor()
+        
+        # Check if normalized columns exist
+        cursor.execute("PRAGMA table_info(to_download_references)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'normalized_title' not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_title TEXT")
+                print(f"{GREEN}[DB Manager] Added normalized_title column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_title column: {e}{RESET}")
+        
+        if 'normalized_authors' not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_authors TEXT")
+                print(f"{GREEN}[DB Manager] Added normalized_authors column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_authors column: {e}{RESET}")
 
     def move_no_meta_entry_to_failed(self, no_meta_id: int, reason: str) -> tuple[int | None, str | None]:
         """Moves an entry from no_metadata to failed_enrichments."""
@@ -523,10 +585,13 @@ class DatabaseManager:
         self,
         doi: str | None,
         openalex_id: str | None,
+        title: str | None = None,
+        authors: list | str | None = None,
+        year: int | str | None = None,
         exclude_id: int | None = None,
         exclude_table: str | None = None
     ) -> tuple[str | None, int | None, str | None]:
-        """Checks if an entry with the given DOI or OpenAlex ID exists in relevant tables.
+        """Checks if an entry with the given DOI, OpenAlex ID, or title/authors/year exists in relevant tables.
 
         Can exclude a specific entry ID from a specific table from the check,
         which is useful for checking for duplicates of an existing entry.
@@ -534,6 +599,9 @@ class DatabaseManager:
         Args:
             doi: The DOI to check.
             openalex_id: The OpenAlex ID to check (e.g., 'W12345').
+            title: The title to check (will be normalized).
+            authors: The authors to check (list or JSON string, will be normalized).
+            year: The year to check.
             exclude_id: An entry ID to exclude from the search.
             exclude_table: The table name associated with exclude_id.
 
@@ -574,6 +642,36 @@ class DatabaseManager:
                     tbl, eid, fld = _execute_check(table, "openalex_id", normalized_openalex_id)
                     if tbl: return tbl, eid, fld
         
+        # Fallback to title/authors/year matching if no identifier match found
+        if title and authors and year:
+            # Normalize inputs
+            normalized_title = self._normalize_text(title)
+            if isinstance(authors, list):
+                authors = json.dumps(authors)
+            normalized_authors = self._normalize_text(authors)
+            
+            # Convert year to string for consistent comparison
+            year_str = str(year)
+            
+            # Check each table for title/authors/year match
+            for table in ["downloaded_references", "to_download_references", "with_metadata", "no_metadata"]:
+                query = f"""
+                    SELECT id FROM {table} 
+                    WHERE normalized_title = ? 
+                    AND normalized_authors = ? 
+                    AND CAST(year AS TEXT) = ?
+                """
+                params = [normalized_title, normalized_authors, year_str]
+                
+                if table == exclude_table and exclude_id is not None:
+                    query += " AND id != ?"
+                    params.append(exclude_id)
+                
+                cursor.execute(query, params)
+                row = cursor.fetchone()
+                if row:
+                    return table, row[0], "title_authors_year"
+        
         return None, None, None
 
     # ------------------------------------------------------------------
@@ -605,7 +703,14 @@ class DatabaseManager:
         norm_authors = json.dumps([a.strip().upper() for a in authors_raw])
 
         # Duplicate search using existing helper (will search downloaded & queue)
-        tbl, eid, field = self.check_if_exists(norm_doi, None)
+        # Pass title, authors, and year for comprehensive duplicate detection
+        tbl, eid, field = self.check_if_exists(
+            doi=norm_doi, 
+            openalex_id=None,
+            title=title,
+            authors=authors_raw,
+            year=ref.get("year")
+        )
         if tbl:
             return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
 
@@ -726,6 +831,21 @@ class DatabaseManager:
                 "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id")),
             }
 
+            # Check for duplicates before promotion
+            tbl, eid, field = self.check_if_exists(
+                doi=merged.get("doi"),
+                openalex_id=merged.get("openalex_id"),
+                title=merged.get("title"),
+                authors=merged.get("authors"),
+                year=merged.get("year"),
+                exclude_id=no_meta_id,
+                exclude_table="no_metadata"
+            )
+            
+            if tbl and tbl in ["downloaded_references", "to_download_references"]:
+                cur.execute("ROLLBACK")
+                return None, f"Entry already exists in {tbl} (ID {eid}) on {field}"
+
             cur.execute(
                 """INSERT INTO with_metadata (source_pdf,title,authors,year,doi,normalized_doi,openalex_id,
                                                normalized_title,normalized_authors,abstract,crossref_json,openalex_json,
@@ -810,7 +930,7 @@ class DatabaseManager:
             cur.execute("ROLLBACK")
             print(f"{RED}[DB Manager] Transaction failed in enqueue_for_download: {e}{RESET}")
             return None, f"Transaction failed: {e}"
-    def get_entries_to_download(self, limit: int = 10) -> list[dict]:
+    def get_entries_to_download(self, limit: int = None) -> list[dict]:
         """Fetches a batch of entries from the 'to_download_references' table."""
         cursor = self.conn.cursor()
         cursor.row_factory = sqlite3.Row
@@ -824,9 +944,13 @@ class DatabaseManager:
                    date_processed, checksum_pdf
             FROM to_download_references 
             ORDER BY date_added ASC 
-            LIMIT ?
         """
-        cursor.execute(query, (limit,))
+        
+        if limit is not None:
+            query += " LIMIT ?"
+            cursor.execute(query, (limit,))
+        else:
+            cursor.execute(query)
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
@@ -1136,7 +1260,13 @@ class DatabaseManager:
             return "error", None, "Entry is missing a title."
 
         table_name, existing_id, matched_field = self.check_if_exists(
-            doi=input_doi, openalex_id=input_openalex_id, exclude_id=exclude_id, exclude_table=exclude_table
+            doi=input_doi, 
+            openalex_id=input_openalex_id, 
+            title=title,
+            authors=parsed_data.get('authors'),
+            year=parsed_data.get('year'),
+            exclude_id=exclude_id, 
+            exclude_table=exclude_table
         )
 
         if table_name and existing_id is not None:
@@ -1162,6 +1292,10 @@ class DatabaseManager:
             if isinstance(authors_json, list):
                 authors_json = json.dumps(authors_json)
 
+            # Normalize title and authors for duplicate detection
+            normalized_title = self._normalize_text(parsed_data.get('title'))
+            normalized_authors = self._normalize_text(authors_json)
+            
             insert_data = {
                 "bibtex_key": parsed_data.get('bibtex_key'),
                 "entry_type": parsed_data.get('entry_type'),
@@ -1174,6 +1308,8 @@ class DatabaseManager:
                 "bibtex_entry_json": parsed_data.get('bibtex_entry_json'),
                 "crossref_json": parsed_data.get('crossref_json'),
                 "openalex_json": parsed_data.get('openalex_json'),
+                "normalized_title": normalized_title,
+                "normalized_authors": normalized_authors,
                 "date_added": datetime.now().isoformat(),
             }
 
@@ -1185,59 +1321,10 @@ class DatabaseManager:
             last_id = cursor.lastrowid
             self.conn.commit()
             return "added_to_queue", last_id, "Entry added to download queue."
-
-            bibtex_entry_json_str = parsed_data.get('bibtex_entry_json')
-            if bibtex_entry_json_str is None and 'original_json_object' in parsed_data:
-                bibtex_entry_json_str = json.dumps(parsed_data.get('original_json_object', {}))
-
-            year_val = parsed_data.get('year')
-            if year_val is not None:
-                try:
-                    year_val = int(year_val)
-                except (ValueError, TypeError):
-                    year_val = None
-
-            crossref_json_str = parsed_data.get('crossref_json')
-            openalex_json_str = parsed_data.get('openalex_json')
-
-            if crossref_json_str or openalex_json_str:
-                metadata_source_type = 'enriched'
-                status_notes = 'Pending PDF download'
-            else:
-                metadata_source_type = 'json_import'
-                status_notes = 'Pending metadata enrichment and PDF download'
-
-            cursor.execute("""
-                INSERT INTO to_download_references (
-                    bibtex_key, entry_type, title, authors, year, doi, openalex_id,
-                    abstract, crossref_json, openalex_json,
-                    metadata_source_type, bibtex_entry_json, status_notes
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                parsed_data.get('bibtex_key'),
-                parsed_data.get('entry_type'),
-                title,
-                authors_json,
-                year_val,
-                self._normalize_doi(input_doi),
-                self._normalize_openalex_id(input_openalex_id),
-                parsed_data.get('abstract'),
-                crossref_json_str,
-                openalex_json_str,
-                metadata_source_type,
-                bibtex_entry_json_str,
-                status_notes
-            ))
-
-            new_id = cursor.lastrowid
-            msg = f"Entry '{title}' added to download queue with ID {new_id}."
-            return "added_to_queue", new_id, msg
         except sqlite3.Error as e:
             err_msg = f"SQLite error adding entry '{title}' to queue: {e}"
             return "error", None, err_msg
         except Exception as e:
-            err_msg = f"General error adding entry '{title}' to queue: {e}"
             err_msg = f"Unexpected error adding entry '{title}' to to_download_references: {e}"
             print(f"{RED}[DB Manager] {err_msg}{RESET}")
             return "error", None, err_msg
