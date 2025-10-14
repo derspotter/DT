@@ -72,13 +72,10 @@ def get_global_rate_limiter():
         _global_rate_limiter = ServiceRateLimiter({
             'default': {'limit': 2, 'window': 1},           # 2 requests per second
             'unpaywall': {'limit': 3, 'window': 1},         # 3 requests per second  
-            'scihub': {'limit': 3, 'window': 1},            # 3 requests per second (8 mirrors rotating)
+            'scihub': {'limit': 1, 'window': 2},            # 1 request per 2 seconds
             'libgen': {'limit': 1, 'window': 2},            # 1 request per 2 seconds
             'gemini': {'limit': 10, 'window': 60},          # 10 requests per minute
-            'gemini_daily': {'limit': 250, 'window': 86400}, # 250 requests per day
-            'openalex': {'limit': 10, 'window': 1},         # 10 requests per second (OpenAlex rate limit)
-            'openalex_daily': {'limit': 100000, 'window': 86400}, # 100,000 requests per day (OpenAlex daily limit)
-            'crossref': {'limit': 50, 'window': 1}          # 50 requests per second (Crossref rate limit)
+            'gemini_daily': {'limit': 250, 'window': 86400} # 250 requests per day
         })
     return _global_rate_limiter
 

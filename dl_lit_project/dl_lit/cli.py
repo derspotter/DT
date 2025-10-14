@@ -11,7 +11,6 @@ import copy
 from tqdm import tqdm
 from threading import Lock
 import hashlib
-import bibtexparser
 
 # Local application imports
 from .db_manager import DatabaseManager
@@ -56,32 +55,6 @@ def clear_downloaded_command(db_path):
         click.echo(f"Successfully cleared all entries from 'downloaded_references' in {db_path}.")
     except Exception as e:
         click.echo(f"Error clearing table: {e}", err=True)
-    finally:
-        db_manager.close_connection()
-
-@cli.command("clear-all-tables")
-@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.confirmation_option(prompt='Are you sure you want to clear ALL tables in the database?')
-def clear_all_tables_command(db_path):
-    """Clears all tables in the database."""
-    db_manager = DatabaseManager(db_path)
-    try:
-        cursor = db_manager.conn.cursor()
-        
-        # Get all table names
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = cursor.fetchall()
-        
-        # Drop all tables except sqlite_sequence
-        for table in tables:
-            if table[0] != 'sqlite_sequence':
-                cursor.execute(f"DROP TABLE IF EXISTS {table[0]}")
-                click.echo(f"Dropped table: {table[0]}")
-        
-        db_manager.conn.commit()
-        click.echo(f"Successfully cleared all tables in {db_path}.")
-    except Exception as e:
-        click.echo(f"Error clearing tables: {e}", err=True)
     finally:
         db_manager.close_connection()
 
@@ -552,7 +525,7 @@ def extract_bib_api_command(input_path, db_path, workers):
 @click.option('--mailto', default='spott@wzb.eu', help='Email for API politeness.')
 @click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works for enriched papers.')
 @click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works for enriched papers (API intensive).')
-@click.option('--max-citations', default=1000, show_default=True, help='Maximum number of citing works to fetch per paper.')
+@click.option('--max-citations', default=100, show_default=True, help='Maximum number of citing works to fetch per paper.')
 def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fetch_citations, max_citations):
     """Fetches metadata from OpenAlex/Crossref for entries in the no_metadata table."""
     click.echo(f"Starting DB enrichment – DB: {db_path} | Batch: {batch_size}")
@@ -572,15 +545,13 @@ def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fe
             click.echo("No entries found in 'no_metadata' table to process.")
             return
 
-        def process_single_entry(entry):
-            """Process a single entry for enrichment."""
+        for entry in entries_to_process:
             click.echo(f"\n[ENRICH] Processing ID {entry['id']} – {entry['title'][:50]}")
             
             # Adapt the DB entry to the format expected by process_single_reference
             ref_for_scraper = {
                 'title': entry.get('title'),
                 'authors': entry.get('authors') if entry.get('authors') else [],
-                'editors': entry.get('editors') if entry.get('editors') else [],
                 'doi': entry.get('doi'),
                 'year': entry.get('year'),  # Use extracted year
                 'container-title': entry.get('source'),  # Use extracted source/journal
@@ -599,33 +570,22 @@ def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fe
                 max_citations=max_citations
             )
             
-            return entry, enriched_data
-
-        # Process entries in parallel using ThreadPoolExecutor
-        # Use 10 workers to match OpenAlex rate limits
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(process_single_entry, entry) for entry in entries_to_process]
-            
-            for future in concurrent.futures.as_completed(futures):
-                entry, enriched_data = future.result()
-                
-                if enriched_data:
-                    db_manager.promote_to_with_metadata(entry['id'], enriched_data)
-                    promoted_count += 1
-                    click.echo(f"  -> metadata found, promoted to with_metadata.")
-                    # Pretty print the enriched data for immediate review
-                    click.echo(f"{BLUE}--- Enriched Data ---{RESET}")
-                    click.echo(pprint.pformat(enriched_data))
-                    click.echo(f"{BLUE}-----------------------{RESET}")
+            if enriched_data:
+                db_manager.promote_to_with_metadata(entry['id'], enriched_data)
+                promoted_count += 1
+                click.echo(f"  -> metadata found, promoted to with_metadata.")
+                # Pretty print the enriched data for immediate review
+                click.echo(f"{BLUE}--- Enriched Data ---{RESET}")
+                click.echo(pprint.pformat(enriched_data))
+                click.echo(f"{BLUE}-----------------------{RESET}")
+            else:
+                reason = "Metadata fetch failed (no match found in OpenAlex/Crossref)"
+                failed_id, error_msg = db_manager.move_no_meta_entry_to_failed(entry['id'], reason)
+                if failed_id:
+                    click.echo(f"  ! metadata fetch failed, moved to failed_enrichments.")
                 else:
-                    reason = "Metadata fetch failed (no match found in OpenAlex/Crossref)"
-                    failed_id, error_msg = db_manager.move_no_meta_entry_to_failed(entry['id'], reason)
-                    if failed_id:
-                        click.echo(f"  ! metadata fetch failed, moved to failed_enrichments.")
-                    else:
-                        click.echo(f"  ! FAILED to move entry {entry['id']} to failed_enrichments: {error_msg}")
-                    failed_count += 1
+                    click.echo(f"  ! FAILED to move entry {entry['id']} to failed_enrichments: {error_msg}")
+                failed_count += 1
 
     except Exception as e:
         click.echo(f"{RED}An unexpected error occurred during enrichment: {e}{RESET}")
@@ -702,7 +662,7 @@ def retry_failed_downloads_command(db_path):
 
 @cli.command("download-pdfs")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, resolve_path=True), help='SQLite database path.')
-@click.option('--limit', default=1000, show_default=True, help='Number of queue entries to process per run.')
+@click.option('--limit', default=10, show_default=True, help='Number of queue entries to process per run.')
 @click.option('--download-dir', default=str(Path.cwd() / 'pdf_library'), type=click.Path(file_okay=False, resolve_path=True), help='Directory to store downloaded PDFs.')
 def download_pdfs_command(db_path, limit, download_dir):
     """Process download queue and retrieve PDFs."""
@@ -983,7 +943,7 @@ def inspect_tables_command(db_path, table, limit):
               help='Fetch referenced works from enriched papers.')
 @click.option('--fetch-citations/--no-fetch-citations', default=False,
               help='Fetch citing works for enriched papers.')
-@click.option('--max-citations', default=1000, type=int,
+@click.option('--max-citations', default=100, type=int,
               help='Maximum number of citing works to fetch per paper.')
 @click.option('--move-completed/--no-move-completed', default=False,
               help='Move PDF to completed/failed folder after processing.')
@@ -1054,7 +1014,7 @@ def process_pdf_command(pdf_path, fetch_references, fetch_citations, max_citatio
               help='Fetch referenced works from enriched papers.')
 @click.option('--fetch-citations/--no-fetch-citations', default=False,
               help='Fetch citing works for enriched papers.')
-@click.option('--max-citations', default=1000, type=int,
+@click.option('--max-citations', default=100, type=int,
               help='Maximum number of citing works to fetch per paper.')
 @click.option('--db-path', default=str(DEFAULT_DB_PATH),
               help='Path to the SQLite database file.')
