@@ -26,7 +26,7 @@ YELLOW = colorama.Fore.YELLOW
 RESET = colorama.Style.RESET_ALL # Use colorama's reset
 
 import google.cloud.aiplatform as aiplatform
-import google.generativeai as genai
+from google import genai
 # Removed incompatible google.genai.types imports
 
 import json
@@ -73,8 +73,8 @@ class BibliographyEnhancer:
         # Set model ID
         self.MODEL_ID = "gemini-2.5-flash"
 
-        genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-        self.client = genai.GenerativeModel(self.MODEL_ID)
+        api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+        self.client = genai.Client(api_key=api_key) if api_key else None
         # Google Search for grounding (disabled for compatibility)
         # self.google_search_tool = Tool(google_search=GoogleSearch())
         self.proxies = proxies
@@ -183,6 +183,7 @@ class BibliographyEnhancer:
                     # Check if the response is HTML and look for PDF links
                     if 'html' in content_type or 'text' in content_type:
                         soup = BeautifulSoup(response.text, 'html.parser')
+                        pdf_link = None
                         
                         # Check embed tag first
                         embed = soup.find('embed', {'type': 'application/pdf'})
@@ -209,20 +210,20 @@ class BibliographyEnhancer:
                             if not pdf_link.startswith(('http://', 'https://')):
                                 if pdf_link.startswith('//'):
                                     pdf_link = f"https:{pdf_link}"
-                                elif pdf_link.startswith('/'):
-                                    pdf_link = f"{mirror}{pdf_link}"
                                 else:
-                                    pdf_link = f"{mirror}/{pdf_link}"
+                                    pdf_link = urljoin(url, pdf_link)
+                            else:
+                                pdf_link = urljoin(url, pdf_link)
                                     
-                            print(f"Found PDF link via {mirror}: {pdf_link}")
+                            print(f"Found PDF link via {url_info['source']}: {pdf_link}")
                             # Return dictionary when we find a working mirror
                             return {
                                 'url': pdf_link,
                                 'source': 'Sci-Hub',
-                                'reason': f'DOI resolved to PDF via {mirror}'
+                                'reason': f"DOI resolved to PDF via {url_info['source']}"
                             }
                         
-                        print(f"No PDF link found on {mirror}. Stopping search as content is likely the same across mirrors.")
+                        print(f"No PDF link found via {url_info['source']}.")
                         return None
             else:
                 return {'success': False, 'reason': f'HTTP {response.status_code}'}

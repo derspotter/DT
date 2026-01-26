@@ -1,4 +1,5 @@
 import json
+import re
 from urllib.parse import quote_plus
 import requests
 import time
@@ -9,6 +10,7 @@ import argparse
 import concurrent.futures
 import threading
 import os
+from .utils import get_global_rate_limiter
 
 try:
     from rapidfuzz import fuzz
@@ -354,7 +356,7 @@ def get_authors_and_editors(ref):
 
 
 class OpenAlexCrossrefSearcher:
-    def __init__(self, mailto='spott@wzb.eu'):
+    def __init__(self, mailto='spott@wzb.eu', rate_limiter=None):
         self.base_url = 'https://api.openalex.org/works'
         self.headers = {
             'Accept': 'application/json',
@@ -365,6 +367,7 @@ class OpenAlexCrossrefSearcher:
             'Accept': 'application/json',
             'User-Agent': f'OpenAlexScraper/1.0 (mailto:{mailto})'
         }
+        self.rate_limiter = rate_limiter or get_global_rate_limiter()
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
 
@@ -385,7 +388,7 @@ class OpenAlexCrossrefSearcher:
         url = f'https://api.crossref.org/works?query={"+".join(query)}&rows=5'
         
         try:
-            rate_limiter.wait_if_needed('crossref')
+            self.rate_limiter.wait_if_needed('crossref')
             response = requests.get(url, headers=self.crossref_headers)
             response.raise_for_status()
             data = response.json()
@@ -417,7 +420,7 @@ class OpenAlexCrossrefSearcher:
             print(f"Crossref error: {e}")
             return []
 
-    def search(self, title, year, container_title, abstract, keywords, step, rate_limiter, doi=None):
+    def search(self, title, year, container_title, abstract, keywords, step, rate_limiter=None, doi=None):
         """
         Search OpenAlex and Crossref with different strategies based on step number.
         Step 0: DOI-first search (if DOI available)
@@ -425,8 +428,10 @@ class OpenAlexCrossrefSearcher:
         Step 8: use Crossref search
         Step 9: use OpenAlex search parameter for container_title
         """
+        rate_limiter = rate_limiter or self.rate_limiter
         # Step 0: DOI-first search - highest priority
         if step == 0:
+            doi = normalize_doi(doi)
             if not doi:
                 return {"step": step, "results": [], "success": False, "error": "DOI required for step 0"}
             
@@ -509,7 +514,7 @@ class OpenAlexCrossrefSearcher:
                 
                 print(f"Crossref Query: {url}")
                 
-                rate_limiter.wait_if_needed('openalex')
+                rate_limiter.wait_if_needed('crossref')
                 response = requests.get(url, headers=self.crossref_headers)
                 response.raise_for_status()
                 data = response.json()
@@ -589,6 +594,26 @@ class OpenAlexCrossrefSearcher:
             except Exception as e:
                 return {"step": step, "results": [], "success": False, "error": f"Unexpected OpenAlex error: {str(e)}"}
 
+def normalize_doi(raw_doi: str | None) -> str | None:
+    """Normalize DOI strings to a bare, lowercase form."""
+    if not raw_doi:
+        return None
+    doi = raw_doi.strip().lower()
+    doi = re.sub(r'^(https?://)?(dx\.)?doi\.org/', '', doi)
+    doi = re.sub(r'^doi:\s*', '', doi)
+    doi = doi.strip().strip(' .;,')
+    return doi or None
+
+def normalize_title_for_match(title: str | None) -> str | None:
+    """Normalize titles for exact-ish comparisons."""
+    if not title:
+        return None
+    normalized = title.lower()
+    normalized = re.sub(r'[\u2010-\u2015]', '-', normalized)
+    normalized = re.sub(r'[^a-z0-9]+', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    return normalized or None
+
 def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
     """Process a single JSON bibliography file."""
     output_path = Path(output_dir) / Path(json_file).name
@@ -630,6 +655,44 @@ def get_abstract(inverted_index):
     sorted_words = [word_positions[i] for i in sorted(word_positions.keys())]
     return " ".join(sorted_words)
 
+def _build_enrichment_payload(ref, best_result):
+    """Build a consistent enrichment payload for downstream consumers."""
+    # Extract best-effort source/biblio metadata
+    primary_location = best_result.get('primary_location') or {}
+    source_info = primary_location.get('source') or {}
+    biblio = best_result.get('biblio') or {}
+
+    pages = None
+    first_page = biblio.get('first_page')
+    last_page = biblio.get('last_page')
+    if first_page and last_page:
+        pages = f"{first_page}--{last_page}"
+
+    return {
+        'title': best_result.get('display_name'),
+        'authors': [a.get('author', {}).get('display_name') for a in best_result.get('authorships', [])],
+        'year': best_result.get('publication_year'),
+        'doi': best_result.get('doi'),
+        'openalex_id': best_result.get('id'),
+        'abstract': get_abstract(best_result.get('abstract_inverted_index')),
+        'keywords': [kw.get('display_name') for kw in best_result.get('keywords', []) if kw.get('display_name')],
+        'source': source_info.get('display_name'),
+        'volume': biblio.get('volume'),
+        'issue': biblio.get('issue'),
+        'pages': pages,
+        'publisher': source_info.get('publisher'),
+        'type': best_result.get('type'),
+        'url': best_result.get('id'),
+        'open_access_url': best_result.get('open_access', {}).get('oa_url'),
+        'openalex_json': best_result,
+        'crossref_json': None,
+        'source_work_id': ref.get('source_work_id'),
+        'relationship_type': ref.get('relationship_type'),
+        'ingest_source': ref.get('ingest_source'),
+        'run_id': ref.get('run_id'),
+    }
+
+
 def process_single_reference(ref, searcher, rate_limiter, fetch_references=True, fetch_citations=False, max_citations=100):
     """Process a single reference to find its OpenAlex entry and potentially citing works."""
     title = ref.get('title')
@@ -648,25 +711,17 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
     first_success_step = None
     
     # Step 0: DOI-first search if DOI is available
-    if doi:
-        print(f"\nProcessing reference with DOI: {doi}")
-        results = searcher.search(title, year, container_title, abstract, keywords, 0, rate_limiter=rate_limiter, doi=doi)
+    normalized_doi = normalize_doi(doi)
+    if normalized_doi:
+        print(f"\nProcessing reference with DOI: {normalized_doi}")
+        results = searcher.search(title, year, container_title, abstract, keywords, 0, rate_limiter=rate_limiter, doi=normalized_doi)
         
         if results['success'] and results['results']:
             # DOI match found - accept immediately without author matching
             best_result = results['results'][0]
             print(f"DOI match accepted: {best_result.get('display_name', 'N/A')}")
             
-            final_enrichment = {
-                'title': best_result.get('display_name'),
-                'authors': [a.get('author', {}).get('display_name') for a in best_result.get('authorships', [])],
-                'year': best_result.get('publication_year'),
-                'doi': best_result.get('doi'),
-                'openalex_id': best_result.get('id'),
-                'abstract': get_abstract(best_result.get('abstract_inverted_index')),
-                'openalex_json': best_result,
-                'crossref_json': best_result.get('crossref_data'),
-            }
+            final_enrichment = _build_enrichment_payload(ref, best_result)
             
             # Fetch related works if requested
             final_enrichment = _fetch_related_works(final_enrichment, best_result, searcher, rate_limiter, 
@@ -694,6 +749,22 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
                     all_results[result_id] = result
                     all_results[result_id]['first_found_in_step'] = step
     
+    unique_results = list(all_results.values())
+
+    # If Crossref returned a DOI, try resolving to OpenAlex via DOI lookup.
+    crossref_dois = {
+        normalize_doi(result.get('doi'))
+        for result in unique_results
+        if result.get('id', '').startswith('crossref:') and result.get('doi')
+    }
+    for crossref_doi in sorted({d for d in crossref_dois if d}):
+        doi_lookup = searcher.search(None, None, None, None, None, 0, rate_limiter=rate_limiter, doi=crossref_doi)
+        if doi_lookup.get('success') and doi_lookup.get('results'):
+            for result in doi_lookup['results']:
+                result_id = result.get('id')
+                if result_id and result_id not in all_results:
+                    result['first_found_in_step'] = 0
+                    all_results[result_id] = result
     unique_results = list(all_results.values())
     
     if unique_results:
@@ -723,22 +794,28 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
         # Accept the result only if the best score is high enough.
         if matched_results and matched_results[0]['author_match_score'] > 0.85:
             best_result = matched_results[0]['result']
+            top_score = matched_results[0]['author_match_score']
+            tie_candidates = [m for m in matched_results if top_score - m['author_match_score'] <= 0.05]
+
+            if len(tie_candidates) > 1:
+                ref_title_norm = normalize_title_for_match(ref.get('title'))
+                ref_year = ref.get('year')
+
+                def tie_key(match):
+                    result_title = match['result'].get('display_name') or match['result'].get('title')
+                    result_title_norm = normalize_title_for_match(result_title)
+                    title_match = 1 if ref_title_norm and result_title_norm and ref_title_norm == result_title_norm else 0
+                    result_year = match['result'].get('publication_year')
+                    year_distance = abs(ref_year - result_year) if ref_year and result_year else 999
+                    return (-match['author_match_score'], -title_match, year_distance, match['first_found_in_step'])
+
+                tie_candidates.sort(key=tie_key)
+                best_result = tie_candidates[0]['result']
 
             # CRITICAL FIX: Construct a clean dict with all necessary data.
             # The original `best_result` is the raw JSON, which is good.
             # We need to ensure all keys the DB expects are present, even if None.
-            final_enrichment = {
-                'title': best_result.get('display_name'),
-                'authors': [a.get('author', {}).get('display_name') for a in best_result.get('authorships', [])],
-                'year': best_result.get('publication_year'),
-                'doi': best_result.get('doi'),
-                'openalex_id': best_result.get('id'),
-                'abstract': get_abstract(best_result.get('abstract_inverted_index')),
-                
-                # The raw JSON blobs are the most important part.
-                'openalex_json': best_result,
-                'crossref_json': best_result.get('crossref_data'), # Assuming searcher puts it here
-            }
+            final_enrichment = _build_enrichment_payload(ref, best_result)
             
             # Fetch related works if requested
             final_enrichment = _fetch_related_works(final_enrichment, best_result, searcher, rate_limiter, 

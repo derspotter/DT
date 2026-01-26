@@ -519,6 +519,131 @@ def extract_bib_api_command(input_path, db_path, workers):
             db_manager.close_connection()
             click.echo("Database connection closed.")
 
+
+@cli.command("run-pipeline")
+@click.argument('input_path', type=click.Path(exists=True, resolve_path=True))
+@click.option('--db-path',
+              type=click.Path(dir_okay=False, writable=True, resolve_path=True),
+              default=str(DEFAULT_DB_PATH),
+              help='Path to the SQLite database file.')
+@click.option('--output-dir',
+              type=click.Path(file_okay=False, writable=True, resolve_path=True),
+              default=str(Path.cwd() / "extracted_refs"),
+              help='Directory to store extracted reference pages.')
+@click.option('--json-dir',
+              type=click.Path(file_okay=False, writable=True, resolve_path=True),
+              default=None,
+              help='Directory to store extracted bibliography JSON files.')
+@click.option('--batch-size', default=50, show_default=True, help='Batch size for enrichment.')
+@click.option('--queue-batch', default=50, show_default=True, help='Batch size for enqueueing downloads.')
+@click.option('--mailto', default='spott@wzb.eu', show_default=True, help='Email for API politeness.')
+@click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works during enrichment.')
+@click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works during enrichment.')
+@click.option('--max-citations', default=100, show_default=True, help='Maximum citing works to fetch per paper.')
+@click.option('--max-ref-pages', type=int, default=None, help='Limit the number of extracted reference pages per PDF.')
+def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, queue_batch, mailto, fetch_references, fetch_citations, max_citations, max_ref_pages):
+    """Run extract → enrich → queue pipeline for PDFs (no download step)."""
+    try:
+        from .pipeline import run_pipeline
+
+        summary = run_pipeline(
+            input_path=input_path,
+            db_path=db_path,
+            output_dir=output_dir,
+            json_dir=json_dir,
+            batch_size=batch_size,
+            queue_batch=queue_batch,
+            mailto=mailto,
+            fetch_references=fetch_references,
+            fetch_citations=fetch_citations,
+            max_citations=max_citations,
+            max_ref_pages=max_ref_pages,
+        )
+
+        click.echo("\n--- Pipeline Summary ---")
+        for key in [
+            "processed_files",
+            "extracted_pages",
+            "extracted_entries",
+            "inserted_entries",
+            "skipped_entries",
+            "enriched_promoted",
+            "enriched_failed",
+            "queued",
+            "skipped_queue",
+        ]:
+            click.echo(f"{key.replace('_', ' ').title()}: {summary.get(key, 0)}")
+        if summary.get("errors"):
+            click.echo(f"{RED}Errors:{RESET}")
+            for err in summary["errors"]:
+                click.echo(f"  - {err}")
+        click.echo(f"{GREEN}Pipeline complete.{RESET}")
+    finally:
+        pass
+
+
+@cli.command("keyword-search")
+@click.option('--query', required=True, help='Boolean keyword query (AND/OR/NOT).')
+@click.option('--max-results', default=200, show_default=True, help='Maximum number of OpenAlex results to fetch.')
+@click.option('--year-from', type=int, default=None, help='Filter: publication year >= year-from.')
+@click.option('--year-to', type=int, default=None, help='Filter: publication year <= year-to.')
+@click.option('--mailto', default='spott@wzb.eu', show_default=True, help='Email for API politeness.')
+@click.option('--db-path',
+              type=click.Path(dir_okay=False, writable=True, resolve_path=True),
+              default=str(DEFAULT_DB_PATH),
+              help='Path to the SQLite database file.')
+@click.option('--enqueue/--no-enqueue', default=False, show_default=True, help='Enqueue results for download.')
+def keyword_search_command(query, max_results, year_from, year_to, mailto, db_path, enqueue):
+    """Run a keyword search against OpenAlex and persist results."""
+    from .keyword_search import search_openalex, openalex_result_to_record, dedupe_results
+
+    db = DatabaseManager(db_path=db_path)
+    try:
+        filters = {
+            "year_from": year_from,
+            "year_to": year_to,
+            "max_results": max_results,
+            "mailto": mailto,
+        }
+        run_id = db.create_search_run(query=query, filters=filters)
+        click.echo(f"Search run created (id={run_id}). Fetching results...")
+
+        raw_results = search_openalex(
+            query=query,
+            max_results=max_results,
+            year_from=year_from,
+            year_to=year_to,
+            mailto=mailto,
+        )
+
+        records = [openalex_result_to_record(item, run_id=run_id) for item in raw_results]
+        records = dedupe_results(records)
+
+        stored = db.add_search_results(run_id, [
+            {
+                "openalex_id": r.get("openalex_id"),
+                "doi": r.get("doi"),
+                "title": r.get("title"),
+                "year": r.get("year"),
+                "raw_json": r.get("openalex_json"),
+            }
+            for r in records
+        ])
+        click.echo(f"Stored {stored} search results.")
+
+        if enqueue:
+            added = 0
+            skipped = 0
+            for record in records:
+                status, _, _ = db.add_entry_to_download_queue(record)
+                if status == "added_to_queue":
+                    added += 1
+                else:
+                    skipped += 1
+            click.echo(f"Enqueue complete: {added} added, {skipped} skipped.")
+        click.echo(f"{GREEN}Keyword search complete.{RESET}")
+    finally:
+        db.close_connection()
 @cli.command("enrich-openalex-db")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
 @click.option('--batch-size', default=50, help='Number of entries to process in one batch.')

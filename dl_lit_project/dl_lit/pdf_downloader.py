@@ -72,7 +72,7 @@ class PDFDownloader:
     def attempt_download(self, metadata: dict) -> tuple[Path | None, str | None, str | None]:
         """
         Tries to download a PDF using various sources based on the provided metadata.
-        The metadata should be the enriched data from MetadataFetcher.
+        The metadata should be the enriched data from OpenAlexScraper.
         
         Returns:
             A tuple of (path_to_file, checksum, source_of_download).

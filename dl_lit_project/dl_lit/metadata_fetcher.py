@@ -7,7 +7,12 @@ YELLOW = '\033[93m'
 RESET = '\033[0m'
 
 class MetadataFetcher:
-    """Fetches and normalizes metadata from external APIs like OpenAlex and Unpaywall."""
+    """Deprecated: use OpenAlexScraper.process_single_reference instead.
+
+    This class remains only for compatibility with older scripts. The current
+    CLI and pipeline paths use OpenAlexScraper for enrichment and handle
+    Unpaywall directly during download.
+    """
 
     def __init__(self, rate_limiter: ServiceRateLimiter, mailto: str = "your.email@example.com"):
         """

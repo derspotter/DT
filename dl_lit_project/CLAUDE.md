@@ -121,7 +121,7 @@ pdf_library/    # Downloaded referenced papers
 ```
 
 ### Dependencies
-Core libraries: `click`, `sqlite3`, `requests`, `bibtexparser>=2.0.0b8`, `google-generativeai`, `pikepdf`, `PyMuPDF`, `beautifulsoup4`, `tqdm`, `python-dotenv`, `rapidfuzz`, `colorama`, `google-cloud-aiplatform`
+Core libraries: `click`, `sqlite3`, `requests`, `bibtexparser>=2.0.0b8`, `google-genai`, `pikepdf`, `PyMuPDF`, `beautifulsoup4`, `tqdm`, `python-dotenv`, `rapidfuzz`, `colorama`, `google-cloud-aiplatform`
 
 ### Database Schema
 All tables share common columns: `id`, `title`, `authors`, `editors`, `doi`, `normalized_doi`, `openalex_id`, `bibtex_key`, `year`, `journal_conference`, `abstract`, `file_path`, `metadata_source_type`, `bibtex_entry_json`, `date_added`, etc.

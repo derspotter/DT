@@ -7,6 +7,7 @@ import os
 import time
 import shutil
 import traceback
+import sqlite3
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -14,8 +15,8 @@ import json
 
 from .db_manager import DatabaseManager
 from .get_bib_pages import extract_reference_sections
-from .APIscraper_v2 import process_single_pdf
-from .OpenAlexScraper import OpenAlexCrossrefSearcher
+from .APIscraper_v2 import process_single_pdf, configure_api_client, upload_pdf_and_extract_bibliography
+from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from .new_dl import BibliographyEnhancer
 from .utils import get_global_rate_limiter
 
@@ -160,16 +161,17 @@ class PipelineOrchestrator:
                 cursor = self.db_manager.conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM no_metadata")
                 initial_count = cursor.fetchone()[0]
-                
+
                 # Create dummy summary dict and lock for the function call
                 summary_dict = {}
                 summary_lock = threading.Lock()
-                
-                process_single_pdf(str(extracted_refs_dir), self.db_manager, summary_dict, summary_lock)
-                
+
+                for ref_pdf in extracted_files:
+                    process_single_pdf(str(ref_pdf), self.db_manager, summary_dict, summary_lock)
+
                 cursor.execute("SELECT COUNT(*) FROM no_metadata")
                 final_count = cursor.fetchone()[0]
-                
+
                 parsed_refs = final_count - initial_count
                 stats['parsed_refs'] = parsed_refs
                 progress.update("Parse References", "success", f"{parsed_refs} references")
@@ -196,8 +198,8 @@ class PipelineOrchestrator:
                         # Convert row to dict format
                         entry_dict = {
                             'id': entry[0],
-                            'title': entry[3] if len(entry) > 3 else '',
-                            'authors': entry[4] if len(entry) > 4 else '[]',
+                            'title': entry[2] if len(entry) > 2 else '',
+                            'authors': entry[3] if len(entry) > 3 else '[]',
                             'year': entry[5] if len(entry) > 5 else None
                         }
                         
@@ -440,3 +442,218 @@ class PipelineOrchestrator:
         except KeyboardInterrupt:
             print("\n\nStopping folder watch...")
             print(f"Processed {len(processed_files)} files total.")
+
+
+def run_pipeline(
+    input_path: str | Path,
+    db_path: str | Path,
+    output_dir: str | Path,
+    json_dir: str | Path | None = None,
+    batch_size: int = 50,
+    queue_batch: int = 50,
+    mailto: str = "spott@wzb.eu",
+    fetch_references: bool = True,
+    fetch_citations: bool = False,
+    max_citations: int = 100,
+    max_ref_pages: int | None = None,
+) -> dict:
+    """Run extract → enrich → queue pipeline for PDFs (no download step)."""
+    input_path = Path(input_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    json_dir = Path(json_dir) if json_dir else output_dir / "bib_jsons"
+    json_dir.mkdir(parents=True, exist_ok=True)
+
+    if not configure_api_client():
+        raise RuntimeError("API client configuration failed. Check GOOGLE_API_KEY.")
+
+    db_manager = DatabaseManager(db_path=db_path)
+    rate_limiter = get_global_rate_limiter()
+    searcher = OpenAlexCrossrefSearcher(mailto=mailto, rate_limiter=rate_limiter)
+
+    run_id = None
+    summary = {
+        "processed_files": 0,
+        "extracted_pages": 0,
+        "extracted_entries": 0,
+        "inserted_entries": 0,
+        "skipped_entries": 0,
+        "enriched_promoted": 0,
+        "enriched_failed": 0,
+        "queued": 0,
+        "skipped_queue": 0,
+        "errors": [],
+    }
+
+    def _chunked(items: list[int], size: int) -> list[list[int]]:
+        if size <= 0:
+            return [items]
+        return [items[i:i + size] for i in range(0, len(items), size)]
+
+    try:
+        params = {
+            "output_dir": str(output_dir),
+            "json_dir": str(json_dir),
+            "batch_size": batch_size,
+            "queue_batch": queue_batch,
+            "mailto": mailto,
+            "fetch_references": fetch_references,
+            "fetch_citations": fetch_citations,
+            "max_citations": max_citations,
+            "max_ref_pages": max_ref_pages,
+        }
+        cur = db_manager.conn.cursor()
+        cur.execute(
+            "INSERT INTO pipeline_runs (input_path, parameters_json, status) VALUES (?, ?, ?)",
+            (str(input_path), json.dumps(params), "running"),
+        )
+        run_id = cur.lastrowid
+        db_manager.conn.commit()
+
+        if input_path.is_dir():
+            pdf_files = list(input_path.glob("**/*.pdf"))
+        else:
+            pdf_files = [input_path]
+
+        if not pdf_files:
+            return summary
+
+        inserted_ids: list[int] = []
+        with_metadata_ids: list[int] = []
+
+        for pdf_file in pdf_files:
+            summary["processed_files"] += 1
+            extract_reference_sections(str(pdf_file), str(output_dir))
+            extracted_pages = sorted(output_dir.glob(f"{pdf_file.stem}_refs_*.pdf"))
+            if max_ref_pages and max_ref_pages > 0:
+                extracted_pages = extracted_pages[:max_ref_pages]
+            summary["extracted_pages"] += len(extracted_pages)
+
+            for ref_pdf in extracted_pages:
+                entries = upload_pdf_and_extract_bibliography(str(ref_pdf))
+                if not isinstance(entries, list):
+                    entries = []
+
+                summary["extracted_entries"] += len(entries)
+
+                json_path = json_dir / f"{ref_pdf.stem}.json"
+                with open(json_path, "w", encoding="utf-8") as handle:
+                    json.dump(entries, handle, indent=2)
+
+                for entry in entries:
+                    minimal_ref = {
+                        "title": entry.get("title"),
+                        "authors": entry.get("authors"),
+                        "editors": entry.get("editors"),
+                        "year": entry.get("year"),
+                        "doi": entry.get("doi"),
+                        "source": entry.get("source"),
+                        "volume": entry.get("volume"),
+                        "issue": entry.get("issue"),
+                        "pages": entry.get("pages"),
+                        "publisher": entry.get("publisher"),
+                        "type": entry.get("type"),
+                        "url": entry.get("url"),
+                        "isbn": entry.get("isbn"),
+                        "issn": entry.get("issn"),
+                        "abstract": entry.get("abstract"),
+                        "keywords": entry.get("keywords"),
+                        "source_pdf": str(ref_pdf),
+                        "translated_title": entry.get("translated_title"),
+                        "translated_year": entry.get("translated_year"),
+                        "translated_language": entry.get("translated_language"),
+                        "translation_relationship": entry.get("translation_relationship"),
+                        "ingest_source": "pipeline",
+                        "run_id": run_id,
+                    }
+                    row_id, err = db_manager.insert_no_metadata(minimal_ref)
+                    if err:
+                        summary["skipped_entries"] += 1
+                    else:
+                        summary["inserted_entries"] += 1
+                        if row_id:
+                            inserted_ids.append(row_id)
+
+        if inserted_ids:
+            db_manager.conn.row_factory = sqlite3.Row
+            for batch in _chunked(inserted_ids, batch_size):
+                for entry_id in batch:
+                    row_cursor = db_manager.conn.cursor()
+                    row_cursor.execute("SELECT * FROM no_metadata WHERE id = ?", (entry_id,))
+                    row = row_cursor.fetchone()
+                    if not row:
+                        continue
+                    entry = dict(row)
+                    authors = []
+                    if entry.get("authors"):
+                        try:
+                            authors = json.loads(entry["authors"])
+                        except json.JSONDecodeError:
+                            authors = [entry["authors"]]
+
+                    ref_for_scraper = {
+                        "title": entry.get("title"),
+                        "authors": authors,
+                        "doi": entry.get("doi"),
+                        "year": entry.get("year"),
+                        "container-title": entry.get("source"),
+                        "volume": entry.get("volume"),
+                        "issue": entry.get("issue"),
+                        "pages": entry.get("pages"),
+                        "abstract": entry.get("abstract"),
+                        "keywords": entry.get("keywords"),
+                        "source_work_id": entry.get("source_work_id"),
+                        "relationship_type": entry.get("relationship_type"),
+                        "ingest_source": entry.get("ingest_source"),
+                        "run_id": entry.get("run_id"),
+                    }
+
+                    enriched_data = process_single_reference(
+                        ref_for_scraper,
+                        searcher,
+                        rate_limiter,
+                        fetch_references=fetch_references,
+                        fetch_citations=fetch_citations,
+                        max_citations=max_citations,
+                    )
+
+                    if enriched_data:
+                        new_id, err = db_manager.promote_to_with_metadata(entry_id, enriched_data)
+                        if new_id:
+                            summary["enriched_promoted"] += 1
+                            with_metadata_ids.append(new_id)
+                        else:
+                            summary["skipped_entries"] += 1
+                    else:
+                        reason = "Metadata fetch failed (no match found in OpenAlex/Crossref)"
+                        db_manager.move_no_meta_entry_to_failed(entry_id, reason)
+                        summary["enriched_failed"] += 1
+
+        for wid in with_metadata_ids:
+            qid, _ = db_manager.enqueue_for_download(wid)
+            if qid:
+                summary["queued"] += 1
+            else:
+                summary["skipped_queue"] += 1
+
+        if run_id:
+            cur = db_manager.conn.cursor()
+            cur.execute(
+                "UPDATE pipeline_runs SET finished_at = CURRENT_TIMESTAMP, status = ?, notes = ? WHERE id = ?",
+                ("completed", json.dumps(summary), run_id),
+            )
+            db_manager.conn.commit()
+        return summary
+    except Exception as exc:
+        summary["errors"].append(str(exc))
+        if run_id:
+            cur = db_manager.conn.cursor()
+            cur.execute(
+                "UPDATE pipeline_runs SET finished_at = CURRENT_TIMESTAMP, status = ?, notes = ? WHERE id = ?",
+                ("failed", json.dumps(summary), run_id),
+            )
+            db_manager.conn.commit()
+        raise
+    finally:
+        db_manager.close_connection()

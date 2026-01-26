@@ -1,8 +1,10 @@
 import os
 import json
+import concurrent.futures
 import time
 import glob
 import argparse
+from typing import Optional, List
 from pathlib import Path
 
 import sys
@@ -24,17 +26,27 @@ try:
 except ImportError:
     PYPDF2_AVAILABLE = False
 from dotenv import load_dotenv
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+from google import genai
+from google.genai import types
 import concurrent.futures
 from threading import Lock
+try:
+    from pydantic import BaseModel, ValidationError
+    try:
+        from pydantic import ConfigDict
+    except Exception:
+        ConfigDict = None
+except ImportError:
+    BaseModel = None
+    ValidationError = Exception
+    ConfigDict = None
 
 # --- Configuration ---
-# Use Gemini 2.5 Flash model for speed
-DEFAULT_MODEL_NAME = 'gemini-2.5-flash'
+# Use Gemini 3 Flash Preview model
+DEFAULT_MODEL_NAME = 'gemini-3-flash-preview'
 
-# Global client/model variable
-api_model = None
+# Global client
+api_client = None
 
 # --- Rate Limiter --- (Shared global instance)
 rate_limiter = get_global_rate_limiter()
@@ -60,11 +72,16 @@ BIBLIOGRAPHY_PROMPT = """You are an expert research assistant specializing in ac
 - abstract: abstract if present (string)
 - keywords: array of keywords if present (strings)
 - language: language of publication if not English (string)
+- translated_title: translated or alternate-language title if the citation explicitly mentions a translation (string)
+- translated_year: year associated with the translated title if mentioned (integer or string)
+- translated_language: language code for the translated title if known (string, e.g., "de" for German)
+- translation_relationship: relationship label for the translated title (string, e.g., "translation")
 
 INSTRUCTIONS:
 1. Recognize bibliography entries even if they are in different formats or languages. Look for patterns like author names followed by years, titles in quotes or italics, and publication details.
 2. Extract as many fields as possible, even partial entries. Make educated guesses for the 'type' field based on context.
-3. For the 'source' field, extract ONLY the actual title of the journal, book, or conference. DO NOT include:
+3. If a citation explicitly mentions a translated or alternate-language edition, keep the primary (original) work as the main entry and populate the translated_* fields rather than replacing the main title. Use translation_relationship="translation".
+4. For the 'source' field, extract ONLY the actual title of the journal, book, or conference. DO NOT include:
    - Series editors' names (e.g., "Smith/Jones" in "Smith/Jones Economics Handbook")
    - Original editors' names that precede the title (e.g., "Obst/Hintner" in "Obst/Hintner Geld-, Bank- und Börsenwesen")
    - Edition information (e.g., "40th edn.")
@@ -72,71 +89,137 @@ INSTRUCTIONS:
    Examples: 
    - From "in J. Doe (ed.), Smith/Jones Financial Systems, 3rd edn." → source: "Financial Systems"
    - From "Obst/Hintner Geld-, Bank- und Börsenwesen" → source: "Geld-, Bank- und Börsenwesen"
-4. If no clear bibliography entries are found, return an empty JSON array [].
-5. Return ONLY the JSON array. Do not include introductory text, explanations, apologies, or markdown formatting like ```json.
+5. If no clear bibliography entries are found, return an empty JSON array [].
+6. Return ONLY the JSON array. Do not include introductory text, explanations, apologies, or markdown formatting like ```json.
 """
+
+if BaseModel:
+    if ConfigDict:
+        class BibliographyEntry(BaseModel):
+            model_config = ConfigDict(extra="ignore")
+            authors: Optional[List[str]] = None
+            editors: Optional[List[str]] = None
+            year: Optional[int | str] = None
+            title: Optional[str] = None
+            source: Optional[str] = None
+            volume: Optional[int | str] = None
+            issue: Optional[int | str] = None
+            pages: Optional[str] = None
+            publisher: Optional[str] = None
+            location: Optional[str] = None
+            type: Optional[str] = None
+            doi: Optional[str] = None
+            url: Optional[str] = None
+            isbn: Optional[str] = None
+            issn: Optional[str] = None
+            abstract: Optional[str] = None
+            keywords: Optional[List[str]] = None
+            language: Optional[str] = None
+            translated_title: Optional[str] = None
+            translated_year: Optional[int | str] = None
+            translated_language: Optional[str] = None
+            translation_relationship: Optional[str] = None
+    else:
+        class BibliographyEntry(BaseModel):
+            class Config:
+                extra = "ignore"
+            authors: Optional[List[str]] = None
+            editors: Optional[List[str]] = None
+            year: Optional[int | str] = None
+            title: Optional[str] = None
+            source: Optional[str] = None
+            volume: Optional[int | str] = None
+            issue: Optional[int | str] = None
+            pages: Optional[str] = None
+            publisher: Optional[str] = None
+            location: Optional[str] = None
+            type: Optional[str] = None
+            doi: Optional[str] = None
+            url: Optional[str] = None
+            isbn: Optional[str] = None
+            issn: Optional[str] = None
+            abstract: Optional[str] = None
+            keywords: Optional[List[str]] = None
+            language: Optional[str] = None
+            translated_title: Optional[str] = None
+            translated_year: Optional[int | str] = None
+            translated_language: Optional[str] = None
+            translation_relationship: Optional[str] = None
 
 # --- Helper Functions ---
 
 def load_api_key():
     """Loads the appropriate API key based on the chosen model."""
     load_dotenv() # Load .env for local execution
-    if 'google' in DEFAULT_MODEL_NAME or 'gemini' in DEFAULT_MODEL_NAME:
-        key = os.getenv('GOOGLE_API_KEY')
-        if not key:
-            print("[ERROR] GOOGLE_API_KEY not found.", flush=True)
-        return key
-    else:
-        print(f"[ERROR] Unknown model type in DEFAULT_MODEL_NAME: {DEFAULT_MODEL_NAME}", flush=True)
-        return None
+    key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+    if not key:
+        print("[ERROR] GEMINI_API_KEY (or GOOGLE_API_KEY) not found.", flush=True)
+    return key
 
 def configure_api_client():
     """Configures the API client/model."""
-    global api_model
+    global api_client
     api_key = load_api_key()
     if not api_key:
         return False
 
     try:
-        if 'google' in DEFAULT_MODEL_NAME or 'gemini' in DEFAULT_MODEL_NAME:
-            genai.configure(api_key=api_key)
-            api_model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
-            print(f"[INFO] Successfully configured Google client ({DEFAULT_MODEL_NAME}).", flush=True)
-            return True
-        else:
-            return False
+        api_client = genai.Client(api_key=api_key)
+        print(f"[INFO] Successfully configured Google client ({DEFAULT_MODEL_NAME}).", flush=True)
+        return True
     except Exception as e:
         print(f"[ERROR] Failed to configure API client: {e}", flush=True)
-        api_model = None
+        api_client = None
         return False
 
-def upload_pdf_and_extract_bibliography(pdf_path):
+def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
     """Uploads a PDF file directly to the API and attempts to extract bibliography entries."""
     print(f"[INFO] Uploading PDF directly for bibliography extraction: {pdf_path}", flush=True)
     start_time = time.time()
     bibliography_data = []
     uploaded_file = None
+
+    if api_client is None:
+        if not configure_api_client():
+            print("[ERROR] API client not configured; aborting extraction.", flush=True)
+            return []
     
     try:
         # Upload the PDF file
-        uploaded_file = genai.upload_file(pdf_path)
-        uploaded_file_uri = uploaded_file.uri
-        print(f"[DEBUG] Uploaded PDF as URI: {uploaded_file_uri}", flush=True)
+        with open(pdf_path, "rb") as file_handle:
+            uploaded_file = api_client.files.upload(
+                file=file_handle,
+                config={
+                    "mime_type": "application/pdf",
+                    "display_name": Path(pdf_path).name,
+                },
+            )
+        print(f"[DEBUG] Uploaded PDF as name: {uploaded_file.name}", flush=True)
         
         # Prepare the prompt for bibliography extraction
         prompt = BIBLIOGRAPHY_PROMPT
         rate_limiter.wait_if_needed('gemini')
         rate_limiter.wait_if_needed('gemini_daily')
         
-        # Send request to API with uploaded file
-        response = api_model.generate_content(
-            contents=[{"role": "user", "parts": [{"text": prompt}, {"file_data": {"file_uri": uploaded_file_uri, "mime_type": "application/pdf"}}]}],
-            generation_config=GenerationConfig(
-                temperature=0.0,
-                response_mime_type="application/json"
+        def _call_model():
+            return api_client.models.generate_content(
+                model=DEFAULT_MODEL_NAME,
+                contents=[prompt, uploaded_file],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json"
+                )
             )
-        )
-        
+
+        # Send request to API with uploaded file (timeout guard)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call_model)
+            try:
+                response = future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError as e:
+                future.cancel()
+                raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
+
         response_text = response.text
         print(f"[DEBUG] Raw API response content: {response_text[:200]}...", flush=True)
         
@@ -160,6 +243,9 @@ def upload_pdf_and_extract_bibliography(pdf_path):
                 bibliography_data = extracted_data
             else:
                 bibliography_data = []
+
+        if isinstance(bibliography_data, list):
+            bibliography_data = validate_bibliography_entries(bibliography_data)
     except Exception as e:
         print(f"[ERROR] API error while processing {pdf_path}: {e}", flush=True)
         bibliography_data = []
@@ -167,7 +253,7 @@ def upload_pdf_and_extract_bibliography(pdf_path):
         # Attempt to delete the uploaded file
         if uploaded_file:
             try:
-                genai.delete_file(uploaded_file.name)
+                api_client.files.delete(name=uploaded_file.name)
                 print(f"[DEBUG] Deleted uploaded file: {uploaded_file.name}", flush=True)
             except Exception as delete_error:
                 print(f"[WARNING] Failed to delete uploaded file {uploaded_file.name if uploaded_file else 'unknown'}: {delete_error}", flush=True)
@@ -191,6 +277,40 @@ def extract_json_from_text(text):
         except json.JSONDecodeError:
             pass
     return None
+
+def validate_bibliography_entries(entries):
+    """Validate/normalize model output against the bibliography schema."""
+    if os.getenv("DISABLE_BIBLIO_PYDANTIC", "").lower() in {"1", "true", "yes"}:
+        print("[INFO] Pydantic validation disabled via DISABLE_BIBLIO_PYDANTIC.", flush=True)
+        return entries
+    if not BaseModel:
+        print("[WARNING] pydantic not available; skipping bibliography validation.", flush=True)
+        return entries
+
+    validated = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            if hasattr(BibliographyEntry, "model_validate"):
+                model = BibliographyEntry.model_validate(entry)
+                data = model.model_dump(exclude_none=True)
+            else:
+                model = BibliographyEntry.parse_obj(entry)
+                data = model.dict(exclude_none=True)
+
+            # Normalize numeric fields to strings for storage consistency
+            for key in ("volume", "issue", "pages"):
+                if key in data and data[key] is not None and not isinstance(data[key], str):
+                    data[key] = str(data[key])
+            if "year" in data and isinstance(data["year"], int):
+                data["year"] = data["year"]
+
+            validated.append(data)
+        except ValidationError as e:
+            print(f"[WARNING] Skipping invalid entry: {e}", flush=True)
+            validated.append(entry)
+    return validated
 
 # --- Main Processing Logic ---
 
@@ -241,6 +361,10 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
                     "abstract": entry.get("abstract"),
                     "keywords": entry.get("keywords"),
                     "source_pdf": str(pdf_path),
+                    "translated_title": entry.get("translated_title"),
+                    "translated_year": entry.get("translated_year"),
+                    "translated_language": entry.get("translated_language"),
+                    "translation_relationship": entry.get("translation_relationship"),
                 }
                 row_id, err = db_manager.insert_no_metadata(minimal_ref)
                 if err:

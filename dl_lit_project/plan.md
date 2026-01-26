@@ -87,7 +87,7 @@ The new script will be designed with modularity in mind. Potential modules/class
     *   Handles JSON files (e.g., lists of DOIs, OpenAlex IDs, titles, or URLs to populate `to_download_references`).
     *   Could be extended for other formats (e.g., RIS, CSV) in the future.
 
-*   **`MetadataFetcher` (`metadata_fetcher.py`)**:
+*   **Deprecated: `MetadataFetcher` (`metadata_fetcher.py`)**:
     *   Fetches and normalizes metadata from external APIs:
         *   OpenAlex (primary, especially for its comprehensive linking)
         *   Crossref (good for DOI resolution and metadata)
@@ -196,7 +196,7 @@ Four main tables with a consistent core structure:
     1.  User runs `dl-lit add-json items.json`.
     2.  `InputProcessor` parses `items.json`.
     3.  For each item:
-        a.  (Optional) `MetadataFetcher` enriches minimal input.
+        a.  (Optional) deprecated: `MetadataFetcher` enriches minimal input.
         b.  `DatabaseManager.check_if_exists` (which uses normalized DOIs) checks against existing tables.
         c.  If duplicate: `DatabaseManager` adds to `duplicate_references`.
         d.  If not duplicate: `DatabaseManager` adds to `to_download_references`.
@@ -213,7 +213,7 @@ Four main tables with a consistent core structure:
     1.  User runs `dl-lit process-queue`.
     2.  `DatabaseManager` fetches entries from `to_download_references`.
     3.  For each entry:
-        a.  `MetadataFetcher` ensures metadata is complete.
+        a.  deprecated: `MetadataFetcher` ensures metadata is complete.
         b.  `PDFDownloader` attempts to download PDF.
         c.  If successful:
             i.  PDF saved, checksum calculated.
@@ -264,7 +264,7 @@ Four main tables with a consistent core structure:
 *   `argparse` (or `click`/`typer`)
 *   `pydantic`
 *   `pathlib`
-*   `google-generativeai` (for bibliography extraction)
+*   `google-genai` (for bibliography extraction)
 *   `pikepdf` (for PDF manipulation in bibliography extraction)
 *   `python-dotenv` (for managing API keys)
 *   `pdfminer.six` (as a potential local text extraction fallback in APIscraper_v2)
@@ -368,4 +368,3 @@ This structure gives:
 • Simpler cleanup—finished rows never remain in earlier stages.
 
 Implementation tasks have been added to the task list to create the two new tables and helper methods in `DatabaseManager`, and to update the relevant scripts to use them.
-

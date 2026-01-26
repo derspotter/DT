@@ -14,11 +14,16 @@ def mock_db_manager(mocker):
     return instance
 
 @pytest.fixture
-def mock_metadata_fetcher(mocker):
-    """Mocks the MetadataFetcher."""
-    mock_fetcher_class = mocker.patch('dl_lit.cli.MetadataFetcher', autospec=True)
-    instance = mock_fetcher_class.return_value
+def mock_searcher(mocker):
+    """Mocks the OpenAlexCrossrefSearcher."""
+    mock_searcher_class = mocker.patch('dl_lit.cli.OpenAlexCrossrefSearcher', autospec=True)
+    instance = mock_searcher_class.return_value
     return instance
+
+@pytest.fixture
+def mock_process_single_reference(mocker):
+    """Mocks the OpenAlexScraper.process_single_reference call used by the CLI."""
+    return mocker.patch('dl_lit.cli.process_single_reference', autospec=True)
 
 
 def test_enrich_empty_db(mock_db_manager, tmp_path):
@@ -30,17 +35,17 @@ def test_enrich_empty_db(mock_db_manager, tmp_path):
     ])
 
     assert result.exit_code == 0
-    assert "No rows in no_metadata – nothing to enrich." in result.output
+    assert "No entries found in 'no_metadata' table to process." in result.output
     mock_db_manager.fetch_no_metadata_batch.assert_called_once()
 
-def test_enrich_success(mock_db_manager, mock_metadata_fetcher, tmp_path):
+def test_enrich_success(mock_db_manager, mock_searcher, mock_process_single_reference, tmp_path):
     """Test a successful enrichment workflow."""
     # 1. Setup Mocks
     mock_entry = {'id': 1, 'title': 'Test Title 1', 'doi': '10.1000/test', 'openalex_id': 'W123'}
     mock_db_manager.fetch_no_metadata_batch.return_value = [mock_entry]
 
     enrichment_result = {'title': 'Enriched Title'}
-    mock_metadata_fetcher.fetch_metadata.return_value = enrichment_result
+    mock_process_single_reference.return_value = enrichment_result
     mock_db_manager.promote_to_with_metadata.return_value = (1, None)
 
     # 2. Run Command
@@ -54,10 +59,10 @@ def test_enrich_success(mock_db_manager, mock_metadata_fetcher, tmp_path):
     assert result.exit_code == 0
     assert "Enrichment finished: 1 promoted, 0 failed." in result.output
 
-    mock_metadata_fetcher.fetch_metadata.assert_called_once_with(mock_entry)
+    mock_process_single_reference.assert_called_once()
     mock_db_manager.promote_to_with_metadata.assert_called_once_with(1, enrichment_result)
 
-def test_enrich_partial_failure(mock_db_manager, mock_metadata_fetcher, tmp_path):
+def test_enrich_partial_failure(mock_db_manager, mock_searcher, mock_process_single_reference, tmp_path):
     """Test workflow where some entries fail to enrich."""
     # 1. Setup Mocks
     mock_entries = [
@@ -68,7 +73,7 @@ def test_enrich_partial_failure(mock_db_manager, mock_metadata_fetcher, tmp_path
 
     # Simulate one success, one failure by configuring side_effect
     enrichment_result = {'title': 'Enriched Title'}
-    mock_metadata_fetcher.fetch_metadata.side_effect = [enrichment_result, None]
+    mock_process_single_reference.side_effect = [enrichment_result, None]
     mock_db_manager.promote_to_with_metadata.return_value = (1, None)
 
     # 2. Run Command
@@ -84,5 +89,6 @@ def test_enrich_partial_failure(mock_db_manager, mock_metadata_fetcher, tmp_path
 
     # Assertions
     mock_db_manager.promote_to_with_metadata.assert_called_once_with(1, enrichment_result)
-    mock_db_manager.move_no_meta_entry_to_failed.assert_called_once_with(2, 'metadata_fetch_failed')
-
+    mock_db_manager.move_no_meta_entry_to_failed.assert_called_once_with(
+        2, 'Metadata fetch failed (no match found in OpenAlex/Crossref)'
+    )

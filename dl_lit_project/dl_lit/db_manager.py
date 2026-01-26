@@ -148,6 +148,8 @@ class DatabaseManager:
                 date_processed TIMESTAMP,
                 checksum_pdf TEXT,
                 source_of_download TEXT, -- e.g., 'scihub', 'libgen', 'unpaywall'
+                ingest_source TEXT,
+                run_id INTEGER,
                 UNIQUE(doi),
                 UNIQUE(openalex_id)
             )
@@ -164,6 +166,7 @@ class DatabaseManager:
                 editors TEXT, -- JSON list of strings for book/volume editors
                 year INTEGER,
                 doi TEXT,
+                normalized_doi TEXT,
                 pmid TEXT,
                 arxiv_id TEXT,
                 openalex_id TEXT,
@@ -184,10 +187,14 @@ class DatabaseManager:
                 openalex_json TEXT, -- Full OpenAlex JSON blob
                 source_work_id INTEGER, -- ID of the work this entry references or cites
                 relationship_type TEXT, -- 'references' or 'cited_by'
+                normalized_title TEXT,
+                normalized_authors TEXT,
                 status_notes TEXT, -- e.g., 'Pending download', 'Attempt 1 failed - network error'
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 date_processed TIMESTAMP,
-                checksum_pdf TEXT -- NULL initially
+                checksum_pdf TEXT, -- NULL initially
+                ingest_source TEXT,
+                run_id INTEGER
             )
         """)
 
@@ -292,6 +299,8 @@ class DatabaseManager:
                 normalized_authors TEXT,
                 source_work_id INTEGER, -- ID of the work this entry references or cites
                 relationship_type TEXT, -- 'references' or 'cited_by'
+                ingest_source TEXT,
+                run_id INTEGER,
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -313,16 +322,90 @@ class DatabaseManager:
                 abstract TEXT,
                 crossref_json TEXT,
                 openalex_json TEXT,
+                source TEXT,
+                volume TEXT,
+                issue TEXT,
+                pages TEXT,
+                publisher TEXT,
+                type TEXT,
+                url TEXT,
+                isbn TEXT,
+                issn TEXT,
+                keywords TEXT,
                 source_work_id INTEGER, -- ID of the work this entry references or cites
                 relationship_type TEXT, -- 'references' or 'cited_by'
+                ingest_source TEXT,
+                run_id INTEGER,
                 date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
+        # 8. Work Aliases (translations / alternate titles)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS work_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_table TEXT NOT NULL, -- 'no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references'
+                work_id INTEGER NOT NULL,
+                alias_title TEXT NOT NULL,
+                normalized_alias_title TEXT NOT NULL,
+                alias_language TEXT,
+                alias_year INTEGER,
+                relationship_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-        # Helpful indices for quick look-ups
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                finished_at TIMESTAMP,
+                input_path TEXT,
+                parameters_json TEXT,
+                status TEXT,
+                notes TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                filters_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_run_id INTEGER NOT NULL,
+                openalex_id TEXT,
+                doi TEXT,
+                title TEXT,
+                year INTEGER,
+                raw_json TEXT,
+                FOREIGN KEY(search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE
+            )
+        """)
+
+
+        # Add missing columns to failed_downloads if they don't exist
+        self._add_missing_columns_to_failed_downloads()
+        
+        # Add missing normalized columns to to_download_references if they don't exist
+        self._add_normalized_columns_to_download_queue()
+        self._add_missing_columns_to_no_metadata()
+        self._add_missing_columns_to_with_metadata()
+        self._add_missing_columns_to_downloaded_references()
+
+        # Helpful indices for quick look-ups (after ensuring columns exist)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_openalex ON with_metadata(openalex_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_openalex ON to_download_references(openalex_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_doi ON to_download_references(normalized_doi)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_openalex ON search_results(openalex_id)")
         
         # Add indexes for title/author/year duplicate detection
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_title_year ON downloaded_references(normalized_title, year)")
@@ -333,12 +416,8 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_authors ON no_metadata(normalized_authors)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_title_year ON to_download_references(normalized_title, year)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_authors ON to_download_references(normalized_authors)")
-
-        # Add missing columns to failed_downloads if they don't exist
-        self._add_missing_columns_to_failed_downloads()
-        
-        # Add missing normalized columns to to_download_references if they don't exist
-        self._add_normalized_columns_to_download_queue()
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_norm_title ON work_aliases(normalized_alias_title)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_owner ON work_aliases(work_table, work_id)")
 
         self.conn.commit()
         print(f"{GREEN}[DB Manager] Schema created/verified successfully.{RESET}")
@@ -373,6 +452,13 @@ class DatabaseManager:
         cursor.execute("PRAGMA table_info(to_download_references)")
         columns = [col[1] for col in cursor.fetchall()]
         
+        if 'normalized_doi' not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_doi TEXT")
+                print(f"{GREEN}[DB Manager] Added normalized_doi column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_doi column: {e}{RESET}")
+
         if 'normalized_title' not in columns:
             try:
                 cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_title TEXT")
@@ -386,6 +472,84 @@ class DatabaseManager:
                 print(f"{GREEN}[DB Manager] Added normalized_authors column to to_download_references table.{RESET}")
             except sqlite3.Error as e:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_authors column: {e}{RESET}")
+
+        if 'ingest_source' not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN ingest_source TEXT")
+                print(f"{GREEN}[DB Manager] Added ingest_source column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add ingest_source column: {e}{RESET}")
+
+        if 'run_id' not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN run_id INTEGER")
+                print(f"{GREEN}[DB Manager] Added run_id column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add run_id column: {e}{RESET}")
+
+    def _add_missing_columns_to_no_metadata(self):
+        """Add missing provenance columns to no_metadata table if they don't exist."""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(no_metadata)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        if 'ingest_source' not in columns:
+            try:
+                cursor.execute("ALTER TABLE no_metadata ADD COLUMN ingest_source TEXT")
+                print(f"{GREEN}[DB Manager] Added ingest_source column to no_metadata table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add ingest_source column: {e}{RESET}")
+
+        if 'run_id' not in columns:
+            try:
+                cursor.execute("ALTER TABLE no_metadata ADD COLUMN run_id INTEGER")
+                print(f"{GREEN}[DB Manager] Added run_id column to no_metadata table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add run_id column: {e}{RESET}")
+
+    def _add_missing_columns_to_with_metadata(self):
+        """Add missing source/provenance columns to with_metadata table if they don't exist."""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(with_metadata)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        for col_name, col_type in [
+            ('source', 'TEXT'),
+            ('volume', 'TEXT'),
+            ('issue', 'TEXT'),
+            ('pages', 'TEXT'),
+            ('publisher', 'TEXT'),
+            ('type', 'TEXT'),
+            ('url', 'TEXT'),
+            ('isbn', 'TEXT'),
+            ('issn', 'TEXT'),
+            ('keywords', 'TEXT'),
+            ('ingest_source', 'TEXT'),
+            ('run_id', 'INTEGER'),
+        ]:
+            if col_name not in columns:
+                try:
+                    cursor.execute(f"ALTER TABLE with_metadata ADD COLUMN {col_name} {col_type}")
+                    print(f"{GREEN}[DB Manager] Added {col_name} column to with_metadata table.{RESET}")
+                except sqlite3.Error as e:
+                    print(f"{YELLOW}[DB Manager] Warning: Could not add {col_name} column: {e}{RESET}")
+
+    def _add_missing_columns_to_downloaded_references(self):
+        """Add missing provenance columns to downloaded_references table if they don't exist."""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(downloaded_references)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        for col_name, col_type in [
+            ('ingest_source', 'TEXT'),
+            ('run_id', 'INTEGER'),
+        ]:
+            if col_name not in columns:
+                try:
+                    cursor.execute(f"ALTER TABLE downloaded_references ADD COLUMN {col_name} {col_type}")
+                    print(f"{GREEN}[DB Manager] Added {col_name} column to downloaded_references table.{RESET}")
+                except sqlite3.Error as e:
+                    print(f"{YELLOW}[DB Manager] Warning: Could not add {col_name} column: {e}{RESET}")
 
     def move_no_meta_entry_to_failed(self, no_meta_id: int, reason: str) -> tuple[int | None, str | None]:
         """Moves an entry from no_metadata to failed_enrichments."""
@@ -419,6 +583,7 @@ class DatabaseManager:
 
             # 3. Delete from no_metadata
             cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
+            self.delete_work_aliases("no_metadata", no_meta_id)
 
             self.conn.commit()
             return failed_id, None
@@ -471,6 +636,16 @@ class DatabaseManager:
             return None
         # Lowercase, remove non-alphanumeric characters (except spaces)
         return re.sub(r'[^a-z0-9\s]', '', text.lower()).strip()
+
+    def _normalize_authors_value(self, authors: list | str | None) -> str | None:
+        """Normalize authors input (list or string) into a comparable text token."""
+        if not authors:
+            return None
+        if isinstance(authors, list):
+            joined = " ".join([str(a) for a in authors if a])
+        else:
+            joined = str(authors)
+        return self._normalize_text(joined)
 
     def add_entries_to_no_metadata_from_json(self, json_file_path: str | Path, source_pdf: str | None = None) -> tuple[int, int, list]:
         """
@@ -610,6 +785,23 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
 
+        def _normalize_authors_input(authors_value: list | str | None) -> str | None:
+            if not authors_value:
+                return None
+            if isinstance(authors_value, list):
+                return self._normalize_authors_value(authors_value)
+            if isinstance(authors_value, str):
+                authors_str = authors_value.strip()
+                if authors_str.startswith("[") and authors_str.endswith("]"):
+                    try:
+                        parsed = json.loads(authors_str)
+                        if isinstance(parsed, list):
+                            return self._normalize_authors_value(parsed)
+                    except json.JSONDecodeError:
+                        pass
+                return self._normalize_authors_value(authors_str)
+            return self._normalize_authors_value(authors_value)
+
         def _execute_check(table, field, value):
             query = f"SELECT id FROM {table} WHERE {field} = ?"
             params = [value]
@@ -628,8 +820,10 @@ class DatabaseManager:
             normalized_doi = self._normalize_doi(doi)
             if normalized_doi:
                 for table in ["downloaded_references", "to_download_references"]:
-                    tbl, eid, fld = _execute_check(table, "doi", normalized_doi)
-                    if tbl: return tbl, eid, fld
+                    field = "normalized_doi" if table == "to_download_references" else "doi"
+                    tbl, eid, fld = _execute_check(table, field, normalized_doi)
+                    if tbl:
+                        return tbl, eid, fld
                 for table in ["no_metadata", "with_metadata"]:
                     tbl, eid, fld = _execute_check(table, "normalized_doi", normalized_doi)
                     if tbl: return tbl, eid, fld
@@ -641,14 +835,27 @@ class DatabaseManager:
                 for table in ["downloaded_references", "to_download_references", "with_metadata"]:
                     tbl, eid, fld = _execute_check(table, "openalex_id", normalized_openalex_id)
                     if tbl: return tbl, eid, fld
-        
-        # Fallback to title/authors/year matching if no identifier match found
+
+        # Check aliases by normalized title
+        if title:
+            normalized_title = self._normalize_text(title)
+            cursor.execute(
+                "SELECT work_table, work_id FROM work_aliases WHERE normalized_alias_title = ?",
+                (normalized_title,),
+            )
+            row = cursor.fetchone()
+            if row:
+                alias_table, alias_id = row
+                if alias_table == exclude_table and exclude_id is not None and alias_id == exclude_id:
+                    pass
+                else:
+                    return alias_table, alias_id, "alias_title"
+
+        # Fallbacks using normalized title/authors/year when identifiers are missing
         if title and authors and year:
             # Normalize inputs
             normalized_title = self._normalize_text(title)
-            if isinstance(authors, list):
-                authors = json.dumps(authors)
-            normalized_authors = self._normalize_text(authors)
+            normalized_authors = _normalize_authors_input(authors)
             
             # Convert year to string for consistent comparison
             year_str = str(year)
@@ -671,8 +878,108 @@ class DatabaseManager:
                 row = cursor.fetchone()
                 if row:
                     return table, row[0], "title_authors_year"
+
+        # If year is missing but we have authors, use title+authors to avoid punctuation-only duplicates.
+        if title and authors and not year:
+            normalized_title = self._normalize_text(title)
+            normalized_authors = _normalize_authors_input(authors)
+            if normalized_title and normalized_authors:
+                for table in ["downloaded_references", "to_download_references", "with_metadata", "no_metadata"]:
+                    query = f"""
+                        SELECT id FROM {table}
+                        WHERE normalized_title = ?
+                        AND normalized_authors = ?
+                    """
+                    params = [normalized_title, normalized_authors]
+                    if table == exclude_table and exclude_id is not None:
+                        query += " AND id != ?"
+                        params.append(exclude_id)
+                    cursor.execute(query, params)
+                    row = cursor.fetchone()
+                    if row:
+                        return table, row[0], "title_authors"
+
+        # If authors are missing but we have a year, use title+year.
+        if title and year and not authors:
+            normalized_title = self._normalize_text(title)
+            year_str = str(year)
+            if normalized_title:
+                for table in ["downloaded_references", "to_download_references", "with_metadata", "no_metadata"]:
+                    query = f"""
+                        SELECT id FROM {table}
+                        WHERE normalized_title = ?
+                        AND CAST(year AS TEXT) = ?
+                    """
+                    params = [normalized_title, year_str]
+                    if table == exclude_table and exclude_id is not None:
+                        query += " AND id != ?"
+                        params.append(exclude_id)
+                    cursor.execute(query, params)
+                    row = cursor.fetchone()
+                    if row:
+                        return table, row[0], "title_year"
         
         return None, None, None
+
+    def add_work_alias(
+        self,
+        work_table: str,
+        work_id: int,
+        alias_title: str | None,
+        alias_year: int | str | None = None,
+        alias_language: str | None = None,
+        relationship_type: str | None = None,
+    ) -> tuple[int | None, str | None]:
+        """Add an alternate title/translation for a work."""
+        if not alias_title:
+            return None, "Alias title is required"
+
+        normalized_alias = self._normalize_text(alias_title)
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """INSERT OR IGNORE INTO work_aliases
+                   (work_table, work_id, alias_title, normalized_alias_title, alias_language, alias_year, relationship_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    work_table,
+                    work_id,
+                    alias_title,
+                    normalized_alias,
+                    alias_language,
+                    int(alias_year) if isinstance(alias_year, str) and alias_year.isdigit() else alias_year,
+                    relationship_type,
+                ),
+            )
+            self.conn.commit()
+            return cur.lastrowid, None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            return None, str(e)
+
+    def update_work_alias_owner(self, old_table: str, old_id: int, new_table: str, new_id: int) -> None:
+        """Move aliases from one work record to another."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
+                (new_table, new_id, old_table, old_id),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
+
+    def delete_work_aliases(self, work_table: str, work_id: int) -> None:
+        """Remove aliases for a work record."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                "DELETE FROM work_aliases WHERE work_table = ? AND work_id = ?",
+                (work_table, work_id),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
 
     # ------------------------------------------------------------------
     # NEW: Staged-table helper methods (no_metadata → with_metadata → queue)
@@ -685,7 +992,8 @@ class DatabaseManager:
         Args:
             ref: Dict with at least title. Keys recognised:
                  title, authors (list[str] or str), year, doi, source, volume, issue, 
-                 pages, publisher, type, url, isbn, issn, abstract, keywords, source_pdf.
+                 pages, publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
+                 translated_title, translated_year, translated_language, translation_relationship.
 
         Returns:
             (row_id, None) on success or (None, error_msg) if duplicate/failed.
@@ -696,11 +1004,11 @@ class DatabaseManager:
 
         doi_raw = ref.get("doi")
         norm_doi = self._normalize_doi(doi_raw)
-        norm_title = (title or "").strip().upper()
+        norm_title = self._normalize_text(title)
         authors_raw = ref.get("authors") or []
         if isinstance(authors_raw, str):
             authors_raw = [authors_raw]
-        norm_authors = json.dumps([a.strip().upper() for a in authors_raw])
+        norm_authors = self._normalize_authors_value(authors_raw)
 
         # Duplicate search using existing helper (will search downloaded & queue)
         # Pass title, authors, and year for comprehensive duplicate detection
@@ -719,8 +1027,9 @@ class DatabaseManager:
             cursor.execute(
                 """INSERT INTO no_metadata (source_pdf, title, authors, editors, year, doi, source, volume, 
                                             issue, pages, publisher, type, url, isbn, issn, abstract, 
-                                            keywords, normalized_doi, normalized_title, normalized_authors)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                            keywords, normalized_doi, normalized_title, normalized_authors,
+                                            ingest_source, run_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ref.get("source_pdf"),
                     title,
@@ -742,10 +1051,25 @@ class DatabaseManager:
                     norm_doi,
                     norm_title,
                     norm_authors,
+                    ref.get("ingest_source"),
+                    ref.get("run_id"),
                 ),
             )
             self.conn.commit()
-            return cursor.lastrowid, None
+            new_id = cursor.lastrowid
+
+            translated_title = ref.get("translated_title")
+            if translated_title:
+                self.add_work_alias(
+                    work_table="no_metadata",
+                    work_id=new_id,
+                    alias_title=translated_title,
+                    alias_year=ref.get("translated_year"),
+                    alias_language=ref.get("translated_language"),
+                    relationship_type=ref.get("translation_relationship") or "translation",
+                )
+
+            return new_id, None
         except sqlite3.IntegrityError as e:
             return None, f"IntegrityError inserting into no_metadata: {e}"
 
@@ -767,14 +1091,19 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, title, authors, editors, doi, source_pdf FROM no_metadata ORDER BY id LIMIT ?",
+            """SELECT id, title, authors, editors, year, doi, source, volume, issue, pages,
+                      publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
+                      ingest_source, run_id
+               FROM no_metadata ORDER BY id LIMIT ?""",
             (limit,),
         )
         rows = cursor.fetchall()
 
         result: list[dict] = []
         for row in rows:
-            row_id, title, authors_json, editors_json, doi, source_pdf = row
+            (row_id, title, authors_json, editors_json, year, doi, source, volume, issue, pages,
+             publisher, entry_type, url, isbn, issn, abstract, keywords_json, source_pdf,
+             ingest_source, run_id) = row
             authors: list[str] | None = None
             if authors_json:
                 try:
@@ -788,6 +1117,13 @@ class DatabaseManager:
                     editors = json.loads(editors_json)
                 except json.JSONDecodeError:
                     editors = [editors_json]  # fall back to raw string
+
+            keywords: list[str] | None = None
+            if keywords_json:
+                try:
+                    keywords = json.loads(keywords_json)
+                except json.JSONDecodeError:
+                    keywords = [keywords_json]
             
             result.append(
                 {
@@ -795,8 +1131,22 @@ class DatabaseManager:
                     "title": title,
                     "authors": authors,
                     "editors": editors,
+                    "year": year,
                     "doi": doi,
+                    "source": source,
+                    "volume": volume,
+                    "issue": issue,
+                    "pages": pages,
+                    "publisher": publisher,
+                    "type": entry_type,
+                    "url": url,
+                    "isbn": isbn,
+                    "issn": issn,
+                    "abstract": abstract,
+                    "keywords": keywords,
                     "source_pdf": source_pdf,
+                    "ingest_source": ingest_source,
+                    "run_id": run_id,
                 }
             )
         return result
@@ -830,6 +1180,8 @@ class DatabaseManager:
                 "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
                 "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id")),
             }
+            merged["normalized_title"] = self._normalize_text(merged.get("title"))
+            merged["normalized_authors"] = self._normalize_authors_value(merged.get("authors"))
 
             # Check for duplicates before promotion
             tbl, eid, field = self.check_if_exists(
@@ -843,18 +1195,26 @@ class DatabaseManager:
             )
             
             if tbl and tbl in ["downloaded_references", "to_download_references"]:
-                cur.execute("ROLLBACK")
+                # Attach any aliases to the existing canonical record and drop the staging row
+                cur.execute(
+                    "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
+                    (tbl, eid, "no_metadata", no_meta_id),
+                )
+                cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
+                cur.execute("COMMIT")
                 return None, f"Entry already exists in {tbl} (ID {eid}) on {field}"
 
             cur.execute(
-                """INSERT INTO with_metadata (source_pdf,title,authors,year,doi,normalized_doi,openalex_id,
+                """INSERT INTO with_metadata (source_pdf,title,authors,editors,year,doi,normalized_doi,openalex_id,
                                                normalized_title,normalized_authors,abstract,crossref_json,openalex_json,
-                                               source_work_id,relationship_type)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                               source,volume,issue,pages,publisher,type,url,isbn,issn,keywords,
+                                               source_work_id,relationship_type,ingest_source,run_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     merged.get("source_pdf"),
                     merged.get("title"),
                     json.dumps(merged.get("authors")) if merged.get("authors") is not None else None,
+                    json.dumps(merged.get("editors")) if merged.get("editors") is not None else None,
                     merged.get("year"),
                     merged.get("doi"),
                     merged.get("normalized_doi"),
@@ -864,8 +1224,20 @@ class DatabaseManager:
                     merged.get("abstract"),
                     json.dumps(merged.get("crossref_json")) if merged.get("crossref_json") is not None else None,
                     json.dumps(merged.get("openalex_json")) if merged.get("openalex_json") is not None else None,
+                    merged.get("source"),
+                    merged.get("volume"),
+                    merged.get("issue"),
+                    merged.get("pages"),
+                    merged.get("publisher"),
+                    merged.get("type"),
+                    merged.get("url"),
+                    merged.get("isbn"),
+                    merged.get("issn"),
+                    json.dumps(merged.get("keywords")) if merged.get("keywords") is not None else None,
                     merged.get("source_work_id"),
                     merged.get("relationship_type"),
+                    merged.get("ingest_source"),
+                    merged.get("run_id"),
                 ),
             )
             new_id = cur.lastrowid
@@ -876,7 +1248,8 @@ class DatabaseManager:
             
             if enrichment.get('citing_works'):
                 self.add_citing_works_to_with_metadata(new_id, enrichment['citing_works'])
-            
+
+            self.update_work_alias_owner("no_metadata", no_meta_id, "with_metadata", new_id)
             cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
             cur.execute("COMMIT")
             return new_id, None
@@ -906,11 +1279,22 @@ class DatabaseManager:
                 "doi": data.get("doi"),
                 "openalex_id": data.get("openalex_id"),
                 "abstract": data.get("abstract"),
+                "keywords": data.get("keywords"),
+                "source": data.get("source"),
+                "volume": data.get("volume"),
+                "issue": data.get("issue"),
+                "pages": data.get("pages"),
+                "publisher": data.get("publisher"),
+                "url": data.get("url"),
+                "source_work_id": data.get("source_work_id"),
+                "relationship_type": data.get("relationship_type"),
                 "crossref_json": data.get("crossref_json"),
                 "openalex_json": data.get("openalex_json"),
                 "bibtex_key": data.get("bibtex_key"),
                 "entry_type": data.get("entry_type"),
                 "bibtex_entry_json": data.get("bibtex_entry_json"),
+                "ingest_source": data.get("ingest_source"),
+                "run_id": data.get("run_id"),
             }
 
             status, item_id, message = self.add_entry_to_download_queue(
@@ -918,6 +1302,10 @@ class DatabaseManager:
             )
 
             if status in ('added_to_queue', 'duplicate'):
+                if status == 'added_to_queue':
+                    self.update_work_alias_owner("with_metadata", with_meta_id, "to_download_references", item_id)
+                else:
+                    self.delete_work_aliases("with_metadata", with_meta_id)
                 cur.execute("DELETE FROM with_metadata WHERE id = ?", (with_meta_id,))
                 cur.execute("COMMIT")
                 if status == 'duplicate':
@@ -1023,7 +1411,9 @@ class DatabaseManager:
                 'status_notes': 'Successfully downloaded and processed',
                 'date_processed': datetime.now().isoformat(),
                 'checksum_pdf': checksum,
-                'source_of_download': source_of_download
+                'source_of_download': source_of_download,
+                'ingest_source': original_entry.get('ingest_source'),
+                'run_id': original_entry.get('run_id'),
             }
             
             final_data = {k: v for k, v in data_to_insert.items() if v is not None}
@@ -1034,6 +1424,7 @@ class DatabaseManager:
             cursor.execute(f"INSERT INTO downloaded_references ({cols}) VALUES ({placeholders})", list(final_data.values()))
             new_id = cursor.lastrowid
 
+            self.update_work_alias_owner("to_download_references", source_id, "downloaded_references", new_id)
             cursor.execute("DELETE FROM to_download_references WHERE id = ?", (source_id,))
 
             self.conn.commit()
@@ -1060,6 +1451,7 @@ class DatabaseManager:
             placeholders = ', '.join(['?'] * len(original_entry))
 
             cursor.execute(f"INSERT INTO failed_downloads ({cols}) VALUES ({placeholders})", list(original_entry.values()))
+            self.delete_work_aliases("to_download_references", source_id)
             cursor.execute("DELETE FROM to_download_references WHERE id = ?", (source_id,))
             self.conn.commit()
             print(f"{GREEN}[DB Manager] Moved entry ID {source_id} to failed_downloads.{RESET}")
@@ -1288,14 +1680,15 @@ class DatabaseManager:
 
         try:
             # Prepare all fields for insertion, using .get() to avoid KeyErrors
-            authors_json = parsed_data.get('authors')
+            authors_value = parsed_data.get('authors')
+            authors_json = authors_value
             if isinstance(authors_json, list):
                 authors_json = json.dumps(authors_json)
 
             # Normalize title and authors for duplicate detection
             normalized_title = self._normalize_text(parsed_data.get('title'))
-            normalized_authors = self._normalize_text(authors_json)
-            
+            normalized_authors = self._normalize_authors_value(authors_value)
+
             insert_data = {
                 "bibtex_key": parsed_data.get('bibtex_key'),
                 "entry_type": parsed_data.get('entry_type'),
@@ -1305,11 +1698,23 @@ class DatabaseManager:
                 "doi": self._normalize_doi(parsed_data.get('doi')),
                 "openalex_id": self._normalize_openalex_id(parsed_data.get('openalex_id')),
                 "abstract": parsed_data.get('abstract'),
+                "keywords": json.dumps(parsed_data.get('keywords')) if isinstance(parsed_data.get('keywords'), list) else parsed_data.get('keywords'),
+                "journal_conference": parsed_data.get('source'),
+                "volume": parsed_data.get('volume'),
+                "issue": parsed_data.get('issue'),
+                "pages": parsed_data.get('pages'),
+                "publisher": parsed_data.get('publisher'),
+                "url_source": parsed_data.get('url'),
+                "source_work_id": parsed_data.get('source_work_id'),
+                "relationship_type": parsed_data.get('relationship_type'),
                 "bibtex_entry_json": parsed_data.get('bibtex_entry_json'),
                 "crossref_json": parsed_data.get('crossref_json'),
                 "openalex_json": parsed_data.get('openalex_json'),
                 "normalized_title": normalized_title,
                 "normalized_authors": normalized_authors,
+                "normalized_doi": self._normalize_doi(parsed_data.get('doi')),
+                "ingest_source": parsed_data.get('ingest_source'),
+                "run_id": parsed_data.get('run_id'),
                 "date_added": datetime.now().isoformat(),
             }
 
@@ -1417,6 +1822,41 @@ class DatabaseManager:
         except sqlite3.Error as e:
             print(f"{RED}[DB Manager] Error adding entry to duplicate_references: {e} (Entry: {bibtex_key_val}){RESET}")
             return None, str(e)
+
+    def create_search_run(self, query: str, filters: dict | None = None) -> int:
+        """Create a new search run record and return its ID."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO search_runs (query, filters_json) VALUES (?, ?)",
+            (query, json.dumps(filters) if filters else None),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def add_search_results(self, search_run_id: int, results: list[dict]) -> int:
+        """Insert search results for a run. Returns number of inserted rows."""
+        if not results:
+            return 0
+        cursor = self.conn.cursor()
+        rows = []
+        for result in results:
+            rows.append(
+                (
+                    search_run_id,
+                    result.get('openalex_id'),
+                    result.get('doi'),
+                    result.get('title'),
+                    result.get('year'),
+                    json.dumps(result.get('raw_json')) if result.get('raw_json') is not None else None,
+                )
+            )
+        cursor.executemany(
+            """INSERT INTO search_results (search_run_id, openalex_id, doi, title, year, raw_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        self.conn.commit()
+        return len(rows)
 
     def get_all_downloaded_references_as_dicts(self) -> list[dict]:
         """Fetches all entries from the downloaded_references table as a list of dictionaries."""
@@ -1586,23 +2026,61 @@ class DatabaseManager:
             cursor.execute("BEGIN")
 
             # Fetch all failed enrichments
-            cursor.execute("SELECT title, authors, doi FROM failed_enrichments")
+            cursor.execute("SELECT id, source_pdf, title, authors, year, doi FROM failed_enrichments")
             failed_entries = cursor.fetchall()
 
             if not failed_entries:
                 print(f"{YELLOW}[DB Manager] No failed enrichments to retry.{RESET}")
                 return 0, None
 
-            sql_insert = "INSERT INTO no_metadata (title, authors, doi) VALUES (?, ?, ?)"
-
             moved_count = 0
             for entry in failed_entries:
-                cursor.execute(sql_insert, entry)
+                entry_id, source_pdf, title, authors, year, doi = entry
+
+                # Parse authors if stored as JSON string
+                authors_value = authors
+                if isinstance(authors_value, str):
+                    authors_str = authors_value.strip()
+                    if authors_str.startswith("[") and authors_str.endswith("]"):
+                        try:
+                            authors_value = json.loads(authors_str)
+                        except json.JSONDecodeError:
+                            authors_value = authors
+
+                tbl, eid, field = self.check_if_exists(
+                    doi=doi,
+                    openalex_id=None,
+                    title=title,
+                    authors=authors_value,
+                    year=year,
+                )
+                if tbl:
+                    cursor.execute("DELETE FROM failed_enrichments WHERE id = ?", (entry_id,))
+                    continue
+
+                normalized_doi = self._normalize_doi(doi)
+                normalized_title = self._normalize_text(title)
+                normalized_authors = self._normalize_authors_value(authors_value)
+
+                cursor.execute(
+                    """INSERT INTO no_metadata (source_pdf, title, authors, year, doi,
+                                                normalized_doi, normalized_title, normalized_authors)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        source_pdf,
+                        title,
+                        json.dumps(authors_value) if isinstance(authors_value, list) else authors_value,
+                        year,
+                        doi,
+                        normalized_doi,
+                        normalized_title,
+                        normalized_authors,
+                    ),
+                )
+                cursor.execute("DELETE FROM failed_enrichments WHERE id = ?", (entry_id,))
                 moved_count += 1
 
             # Clear the failed_enrichments table
-            cursor.execute("DELETE FROM failed_enrichments")
-
             self.conn.commit()
             print(f"{GREEN}[DB Manager] Successfully moved {moved_count} entries from 'failed_enrichments' to 'no_metadata'.{RESET}")
             return moved_count, None

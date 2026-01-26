@@ -1,5 +1,5 @@
 click
-google-generativeai
+google-genai
 requests
 beautifulsoup4
 pikepdf
@@ -10,3 +10,4 @@ python-dotenv
 rapidfuzz
 colorama
 google-cloud-aiplatform
+pydantic

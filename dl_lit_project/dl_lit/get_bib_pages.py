@@ -1,4 +1,5 @@
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from google.api_core import exceptions as google_exceptions
 import pikepdf
 import json
@@ -21,19 +22,17 @@ print("--- Imports Done --- ", flush=True)
 # --- Added: Configure Google API Key ---
 print("--- Configuring GenAI --- ", flush=True)
 load_dotenv()
-api_key = os.getenv('GOOGLE_API_KEY')
+api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
 if not api_key:
-    print("Error: GOOGLE_API_KEY environment variable not set.", flush=True)
-    # Consider exiting or raising an error if the key is essential
-    # sys.exit(1) # Uncomment to exit if key is missing
+    print("Error: GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable not set.", flush=True)
+    api_client = None
 else:
     try:
-        genai.configure(api_key=api_key)
-        print("Successfully configured Google Generative AI with API key.")
+        api_client = genai.Client(api_key=api_key)
+        print("Successfully configured Google GenAI client with API key.")
     except Exception as e:
-        print(f"Error configuring Google Generative AI: {e}")
-        # Consider exiting or raising an error
-        # sys.exit(1)
+        api_client = None
+        print(f"Error configuring Google GenAI client: {e}")
 print("--- GenAI Configured (or skipped) --- ", flush=True)
 # --- End Added Section ---
 
@@ -49,7 +48,14 @@ def clean_json_response(text):
         text = text[:-3]  # Remove ``` suffix
     return text.strip()
 
-def find_reference_section_pages(pdf_path: str, model, uploaded_pdf, total_physical_pages: int, rate_limiter: ServiceRateLimiter):
+def find_reference_section_pages(
+    pdf_path: str,
+    client,
+    uploaded_pdf,
+    total_physical_pages: int,
+    rate_limiter: ServiceRateLimiter,
+    timeout_seconds: int = 180,
+):
     """Use GenAI to find reference section pages in the PDF."""
     print(f"Attempting to find reference sections in PDF: {pdf_path}", flush=True)
     print("Using pre-uploaded PDF for section finding.", flush=True)
@@ -91,7 +97,23 @@ RULES:
         rate_limiter.wait_if_needed('gemini')
         rate_limiter.wait_if_needed('gemini_daily')
         print("Sending request to GenAI...", flush=True)
-        response = model.generate_content([prompt, uploaded_pdf], request_options={'timeout': 600})
+        def _call_model():
+            return client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=[prompt, uploaded_pdf],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call_model)
+            try:
+                response = future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError as e:
+                future.cancel()
+                raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
         print("Raw find_reference_section_pages response: ```json")
         print(response.text)
         print("```", flush=True)
@@ -115,11 +137,9 @@ RULES:
 def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/papers"):
     """Main function to find, adjust, validate, and extract reference sections, with chunking for large PDFs."""
     print("--- Entered extract_reference_sections --- ", flush=True)
-    if not api_key:
-        print("Skipping extraction: GOOGLE_API_KEY not configured.", flush=True)
+    if not api_client:
+        print("Skipping extraction: GEMINI_API_KEY (or GOOGLE_API_KEY) not configured.", flush=True)
         return
-
-    model = genai.GenerativeModel("gemini-2.5-flash")
     rate_limiter = get_global_rate_limiter()
     files_to_clean_up = []
     temp_chunk_dir = None
@@ -160,12 +180,25 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                     rate_limiter.wait_if_needed('gemini')
                     rate_limiter.wait_if_needed('gemini_daily')
                     print(f"Uploading chunk: {chunk_display_name}")
-                    uploaded_chunk = genai.upload_file(chunk_path, display_name=chunk_display_name)
+                    with open(chunk_path, "rb") as file_handle:
+                        uploaded_chunk = api_client.files.upload(
+                            file=file_handle,
+                            config={
+                                "mime_type": "application/pdf",
+                                "display_name": chunk_display_name,
+                            },
+                        )
                     files_to_clean_up.append(uploaded_chunk)
                     print(f"Uploaded as {uploaded_chunk.name}. Finding reference sections in chunk...")
 
                     chunk_page_count = end_page - start_page
-                    chunk_sections = find_reference_section_pages(chunk_path, model, uploaded_chunk, total_physical_pages=chunk_page_count, rate_limiter=rate_limiter)
+                    chunk_sections = find_reference_section_pages(
+                        chunk_path,
+                        api_client,
+                        uploaded_chunk,
+                        total_physical_pages=chunk_page_count,
+                        rate_limiter=rate_limiter,
+                    )
                     if chunk_sections:
                         # Adjust page numbers to be absolute to the original PDF
                         for sec in chunk_sections:
@@ -182,10 +215,23 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                 rate_limiter.wait_if_needed('gemini')
                 rate_limiter.wait_if_needed('gemini_daily')
                 print("Uploading full PDF...")
-                uploaded_pdf = genai.upload_file(pdf_path)
+                with open(pdf_path, "rb") as file_handle:
+                    uploaded_pdf = api_client.files.upload(
+                        file=file_handle,
+                        config={
+                            "mime_type": "application/pdf",
+                            "display_name": os.path.basename(pdf_path),
+                        },
+                    )
                 files_to_clean_up.append(uploaded_pdf)
                 print(f"Uploaded as {uploaded_pdf.name}. Finding reference sections...")
-                all_sections = find_reference_section_pages(pdf_path, model, uploaded_pdf, total_physical_pages=total_physical_pages, rate_limiter=rate_limiter)
+                all_sections = find_reference_section_pages(
+                    pdf_path,
+                    api_client,
+                    uploaded_pdf,
+                    total_physical_pages=total_physical_pages,
+                    rate_limiter=rate_limiter,
+                )
 
         # --- Aggregated Section Processing ---
         if not all_sections:
@@ -264,7 +310,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
             print(f"\nCleaning up {len(files_to_clean_up)} uploaded file(s)...")
             for f in files_to_clean_up:
                 try:
-                    genai.delete_file(f.name)
+                    api_client.files.delete(name=f.name)
                     print(f"  - Successfully deleted {f.name}.")
                 except Exception as e:
                     print(f"  - Failed to delete {f.name}: {e}")

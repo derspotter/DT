@@ -2,7 +2,7 @@ requests
 PyMuPDF
 beautifulsoup4
 google-cloud-aiplatform
-google-generativeai
+google-genai
 pikepdf
 python-dotenv
 rapidfuzz
