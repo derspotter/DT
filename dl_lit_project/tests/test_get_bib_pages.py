@@ -51,19 +51,19 @@ class TestGetBibPages(unittest.TestCase):
                 call(pdf2_path, output_dir)
             ], any_order=True)
 
-    @patch('dl_lit.get_bib_pages.genai')
+    @patch('dl_lit.get_bib_pages.api_client')
     @patch('dl_lit.get_bib_pages.pikepdf')
     @patch('dl_lit.get_bib_pages.os.makedirs')
     @patch('dl_lit.get_bib_pages.open', new_callable=unittest.mock.mock_open)
-    def test_extract_reference_sections_small_pdf(self, mock_open, mock_makedirs, mock_pikepdf, mock_genai):
+    def test_extract_reference_sections_small_pdf(self, mock_open, mock_makedirs, mock_pikepdf, mock_api_client):
         """Test the core extraction logic for a small PDF that doesn't need chunking."""
         # Mock Gemini API response
-        mock_model = MagicMock()
         mock_response = MagicMock()
         mock_response.text = json.dumps([{'start_page': 10, 'end_page': 15}])
-        mock_model.generate_content.return_value = mock_response
-        mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.upload_file.return_value = MagicMock(name='uploaded_file')
+        mock_api_client.models.generate_content.return_value = mock_response
+        uploaded_file = MagicMock(name='uploaded_file')
+        uploaded_file.name = 'files/test'
+        mock_api_client.files.upload.return_value = uploaded_file
 
         # Mock Pikepdf
         mock_pdf_doc_opened = MagicMock()
@@ -76,27 +76,29 @@ class TestGetBibPages(unittest.TestCase):
         extract_reference_sections('dummy.pdf', 'out')
 
         # Verify GenAI was called correctly
-        mock_genai.upload_file.assert_called_once_with('dummy.pdf')
-        mock_model.generate_content.assert_called_once()
+        self.assertEqual(mock_api_client.files.upload.call_count, 1)
+        mock_api_client.models.generate_content.assert_called_once()
 
-        # Verify PDF was created
-        mock_pdf_doc_new.save.assert_called_once()
+        # Verify output pages were created (10-15 inclusive => 6 pages)
+        out_calls = [c for c in mock_pdf_doc_new.save.call_args_list if c.args[0].startswith('out/')]
+        self.assertEqual(len(out_calls), 6)
 
-    @patch('dl_lit.get_bib_pages.genai')
+    @patch('dl_lit.get_bib_pages.api_client')
     @patch('dl_lit.get_bib_pages.pikepdf')
     @patch('dl_lit.get_bib_pages.tempfile.mkdtemp')
     @patch('dl_lit.get_bib_pages.os.makedirs')
-    def test_extract_reference_sections_large_pdf_with_chunking(self, mock_makedirs, mock_mkdtemp, mock_pikepdf, mock_genai):
+    @patch('dl_lit.get_bib_pages.open', new_callable=unittest.mock.mock_open)
+    def test_extract_reference_sections_large_pdf_with_chunking(self, mock_open, mock_makedirs, mock_mkdtemp, mock_pikepdf, mock_api_client):
         """Test the core extraction logic for a large PDF that requires chunking."""
         mock_mkdtemp.return_value = '/tmp/dummy_dir'
 
         # Mock Gemini API response
-        mock_model = MagicMock()
         mock_response = MagicMock()
         mock_response.text = json.dumps([{'start_page': 5, 'end_page': 10}])
-        mock_model.generate_content.return_value = mock_response
-        mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.upload_file.return_value = MagicMock(name='uploaded_file')
+        mock_api_client.models.generate_content.return_value = mock_response
+        uploaded_file = MagicMock(name='uploaded_file')
+        uploaded_file.name = 'files/test'
+        mock_api_client.files.upload.return_value = uploaded_file
 
         # Mock Pikepdf for a large PDF (e.g., 75 pages, CHUNK_SIZE=50)
         mock_pdf_doc_opened = MagicMock()
@@ -109,26 +111,20 @@ class TestGetBibPages(unittest.TestCase):
         extract_reference_sections('large_dummy.pdf', 'out')
 
         # Verify chunking logic was triggered
-        self.assertEqual(mock_genai.upload_file.call_count, 2) # Called for 2 chunks
-        self.assertEqual(mock_model.generate_content.call_count, 2)
+        self.assertEqual(mock_api_client.files.upload.call_count, 2) # Called for 2 chunks
+        self.assertEqual(mock_api_client.models.generate_content.call_count, 2)
 
-        # Check that the final PDF was saved twice (one for each extracted section)
-        # This depends on how many sections are found in each chunk.
-        # In this mock, one section is found per chunk.
-        # Assert that the final extracted PDFs are saved correctly by checking the filenames.
-        # This is more robust than checking the total save count, which includes temp files.
+        # Check that the final PDFs were saved for each page in each section.
         final_save_calls = [
             c for c in mock_pdf_doc_new.save.call_args_list
             if c.args[0].startswith('out/')
         ]
-        self.assertEqual(len(final_save_calls), 2)
+        self.assertEqual(len(final_save_calls), 12)
 
         # Also check that the correct filenames were used
         saved_files = {c.args[0] for c in final_save_calls}
-        expected_files = {
-            'out/large_dummy_refs_physical_p5-10.pdf',
-            'out/large_dummy_refs_physical_p55-60.pdf'
-        }
+        expected_files = {f'out/large_dummy_refs_physical_p{n}.pdf' for n in range(5, 11)}
+        expected_files |= {f'out/large_dummy_refs_physical_p{n}.pdf' for n in range(55, 61)}
         self.assertEqual(saved_files, expected_files)
 
 if __name__ == '__main__':

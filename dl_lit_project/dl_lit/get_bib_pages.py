@@ -140,6 +140,9 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
     if not api_client:
         print("Skipping extraction: GEMINI_API_KEY (or GOOGLE_API_KEY) not configured.", flush=True)
         return
+    password_error = getattr(pikepdf, "PasswordError", Exception)
+    if not isinstance(password_error, type) or not issubclass(password_error, BaseException):
+        password_error = Exception
     rate_limiter = get_global_rate_limiter()
     files_to_clean_up = []
     temp_chunk_dir = None
@@ -300,7 +303,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
         else:
             print("  No files were extracted.")
 
-    except (FileNotFoundError, pikepdf.PasswordError, Exception) as e:
+    except (FileNotFoundError, password_error, Exception) as e:
         print(f"An unexpected error occurred in extract_reference_sections: {e}", flush=True)
         import traceback
         traceback.print_exc()

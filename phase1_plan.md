@@ -101,6 +101,19 @@
 - Pipeline smoke attempt (Jan 26, 2026): run on `2008_Corporate Moral Legitimacy and the Legitimacy of M.pdf` with `--max-ref-pages 1` hung in Gemini extraction; run marked aborted in `pipeline_runs`.
 - Gemini hang fix (Jan 26, 2026): added a timeout guard (default 120s) around `generate_content` in `upload_pdf_and_extract_bibliography` to avoid indefinite stalls.
 - Gemini SDK update (Jan 26, 2026): switched to the new Google GenAI Python SDK + Files API (`google-genai`), including `client.files.upload/delete` and `client.models.generate_content` with JSON output config.
+- Download pipeline hygiene (Jan 26, 2026): `BibliographyEnhancer` now uses `PDFDownloader` for OpenAlex/OA downloads before falling back to direct URL/Sci‑Hub logic.
+- Download pipeline hygiene (Jan 26, 2026): centralized PDF validation in `pdf_downloader.py` and reuse it for direct URL downloads; queue worker now drops entries already present in `downloaded_references`.
+- Duplicate handling (Jan 26, 2026): `promote_to_with_metadata` now drops duplicates found in `with_metadata` too; JSON ingestion now checks title/authors/year in `check_if_exists`.
+- Duplicate handling tests (Jan 27, 2026): added db-level tests covering `promote_to_with_metadata` dedupe and JSON ingestion title/author/year skips.
+- Duplicate handling upgrades (Jan 27, 2026): alias matching now allows ±1 year; new `merge_log` table records dedupe decisions; duplicates are merged into the highest-priority survivor (downloaded > queue > with_metadata > no_metadata) with field backfill; pipeline ingestion can resolve identifiers for potential duplicates before insertion.
+- Duplicate handling tests (Jan 28, 2026): added tests for alias-year tolerance and merge_log entries.
+- CLI inspection update (Jan 28, 2026): `inspect-tables` now includes `merge_log` for dedupe auditing.
+- Pipeline smoke test (Jan 28, 2026): `run-pipeline completed/2004_kapitel-02.pdf --max-ref-pages 1 --no-fetch-references` extracted refs and started enrichment; run manually aborted to avoid long OpenAlex batch, status recorded as `aborted` in `pipeline_runs`.
+- Pipeline helper update (Jan 28, 2026): `run-pipeline` supports `--max-entries` to cap processed references for faster smoke tests.
+- Pipeline helper update (Jan 28, 2026): `run-pipeline` supports `--no-enrich` to skip OpenAlex enrichment and queueing for fast extraction-only smoke tests.
+- Pipeline smoke test (Jan 28, 2026): `run-pipeline completed/2004_kapitel-02.pdf --max-ref-pages 1 --max-entries 5 --no-fetch-references --no-fetch-citations` completed on `literature_smoke.db` (5 inserted, 1 enriched failed, 0 queued).
+- Pipeline smoke test (Jan 28, 2026): `run-pipeline completed/2004_kapitel-02.pdf --max-ref-pages 1 --max-entries 5 --no-enrich` completed on `literature_smoke.db` (5 inserted, 0 enriched, 0 queued).
+- Test sweep (Jan 28, 2026): `pytest dl_lit_project/tests` → 20 passed after updating CLI/test mocks for new GenAI Files API and extract‑pages behavior.
 
 ## Proposed PR/Commit Sequence
 1) OpenAlex enrichment fixes + rate limiter normalization.

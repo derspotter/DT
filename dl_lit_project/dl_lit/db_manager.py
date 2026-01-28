@@ -16,6 +16,13 @@ RESET = "\033[0m"
 class DatabaseManager:
     """Manages all SQLite database interactions for the literature management tool."""
 
+    TABLE_PRIORITY = {
+        "downloaded_references": 4,
+        "to_download_references": 3,
+        "with_metadata": 2,
+        "no_metadata": 1,
+    }
+
     def __init__(self, db_path: str | Path = "data/literature.db"):
         """Initializes the DatabaseManager, connects to the SQLite database,
         and ensures the necessary table schema is created.
@@ -355,6 +362,22 @@ class DatabaseManager:
             )
         """)
 
+        # 9. Merge log for deduplication decisions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS merge_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_table TEXT NOT NULL,
+                canonical_id INTEGER NOT NULL,
+                duplicate_table TEXT NOT NULL,
+                duplicate_id INTEGER,
+                match_field TEXT,
+                action TEXT NOT NULL,
+                notes TEXT,
+                updates_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pipeline_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -543,6 +566,8 @@ class DatabaseManager:
         for col_name, col_type in [
             ('ingest_source', 'TEXT'),
             ('run_id', 'INTEGER'),
+            ('normalized_title', 'TEXT'),
+            ('normalized_authors', 'TEXT'),
         ]:
             if col_name not in columns:
                 try:
@@ -647,7 +672,15 @@ class DatabaseManager:
             joined = str(authors)
         return self._normalize_text(joined)
 
-    def add_entries_to_no_metadata_from_json(self, json_file_path: str | Path, source_pdf: str | None = None) -> tuple[int, int, list]:
+    def add_entries_to_no_metadata_from_json(
+        self,
+        json_file_path: str | Path,
+        source_pdf: str | None = None,
+        *,
+        searcher=None,
+        rate_limiter=None,
+        resolve_potential_duplicates: bool = False
+    ) -> tuple[int, int, list]:
         """
         Adds entries from a JSON file (from API extraction) into the no_metadata table.
 
@@ -674,43 +707,24 @@ class DatabaseManager:
         added_count = 0
         skipped_count = 0
         errors = []
-        cursor = self.conn.cursor()
-
         for entry in entries:
-            title = entry.get('title')
-            authors_list = entry.get('authors', [])
-            # Store authors as a JSON string of a list to preserve individual names
-            authors_str = json.dumps(authors_list) if authors_list else None
-            doi = entry.get('doi')
+            entry = dict(entry)
+            if source_pdf:
+                entry["source_pdf"] = source_pdf
 
-            if not title:
-                skipped_count += 1
-                continue
-
-            # Check for duplicates before inserting
-            table, eid, field = self.check_if_exists(doi=doi, openalex_id=None)
-            if eid is not None:
-                print(f"{YELLOW}[DB Manager] Skipping entry '{title[:50]}...' as it already exists in '{table}' (ID: {eid}) based on '{field}'.{RESET}")
-                skipped_count += 1
-                continue
-
-            normalized_title = self._normalize_text(title)
-            normalized_authors = self._normalize_text(authors_str)
-            normalized_doi = self._normalize_doi(doi)
-
-            try:
-                cursor.execute("""
-                    INSERT INTO no_metadata (source_pdf, title, authors, editors, doi, normalized_doi, normalized_title, normalized_authors)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (source_pdf, title, authors_str, json.dumps(entry.get('editors')) if entry.get('editors') else None, doi, normalized_doi, normalized_title, normalized_authors))
+            row_id, err = self.insert_no_metadata(
+                entry,
+                searcher=searcher,
+                rate_limiter=rate_limiter,
+                resolve_potential_duplicates=resolve_potential_duplicates,
+            )
+            if row_id:
                 added_count += 1
-            except sqlite3.IntegrityError as e:
+            else:
                 skipped_count += 1
-                errors.append(f"Integrity error for '{title[:50]}...': {e}")
-            except sqlite3.Error as e:
-                errors.append(f"Database error for '{title[:50]}...': {e}")
+                if err and "Duplicate already exists" not in err and "Title is required" not in err:
+                    errors.append(err)
 
-        self.conn.commit()
         return added_count, skipped_count, errors
 
     def load_from_disk(self, disk_db_path: Path) -> bool:
@@ -815,18 +829,20 @@ class DatabaseManager:
                 return table, row[0], field
             return None, None, None
 
+        priority_tables = ["downloaded_references", "to_download_references", "with_metadata", "no_metadata"]
+
         # Prioritize DOI if available
         if doi:
             normalized_doi = self._normalize_doi(doi)
             if normalized_doi:
-                for table in ["downloaded_references", "to_download_references"]:
-                    field = "normalized_doi" if table == "to_download_references" else "doi"
+                for table in priority_tables:
+                    if table == "downloaded_references":
+                        field = "doi"
+                    else:
+                        field = "normalized_doi"
                     tbl, eid, fld = _execute_check(table, field, normalized_doi)
                     if tbl:
                         return tbl, eid, fld
-                for table in ["no_metadata", "with_metadata"]:
-                    tbl, eid, fld = _execute_check(table, "normalized_doi", normalized_doi)
-                    if tbl: return tbl, eid, fld
 
         # Then check OpenAlex ID if available
         if openalex_id:
@@ -839,17 +855,41 @@ class DatabaseManager:
         # Check aliases by normalized title
         if title:
             normalized_title = self._normalize_text(title)
-            cursor.execute(
-                "SELECT work_table, work_id FROM work_aliases WHERE normalized_alias_title = ?",
-                (normalized_title,),
-            )
-            row = cursor.fetchone()
-            if row:
-                alias_table, alias_id = row
-                if alias_table == exclude_table and exclude_id is not None and alias_id == exclude_id:
-                    pass
-                else:
-                    return alias_table, alias_id, "alias_title"
+            year_int = None
+            if year is not None:
+                try:
+                    year_int = int(year)
+                except (TypeError, ValueError):
+                    year_int = None
+
+            if year_int is not None:
+                cursor.execute(
+                    """SELECT work_table, work_id, alias_year
+                       FROM work_aliases
+                       WHERE normalized_alias_title = ?
+                       AND (alias_year IS NULL OR alias_year BETWEEN ? AND ?)""",
+                    (normalized_title, year_int - 1, year_int + 1),
+                )
+                row = cursor.fetchone()
+                if row:
+                    alias_table, alias_id, alias_year = row
+                    if alias_table == exclude_table and exclude_id is not None and alias_id == exclude_id:
+                        pass
+                    else:
+                        field = "alias_title_year" if alias_year is not None else "alias_title"
+                        return alias_table, alias_id, field
+            else:
+                cursor.execute(
+                    "SELECT work_table, work_id FROM work_aliases WHERE normalized_alias_title = ?",
+                    (normalized_title,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    alias_table, alias_id = row
+                    if alias_table == exclude_table and exclude_id is not None and alias_id == exclude_id:
+                        pass
+                    else:
+                        return alias_table, alias_id, "alias_title"
 
         # Fallbacks using normalized title/authors/year when identifiers are missing
         if title and authors and year:
@@ -981,11 +1021,362 @@ class DatabaseManager:
         except sqlite3.Error:
             self.conn.rollback()
 
+    def _log_merge(
+        self,
+        canonical_table: str,
+        canonical_id: int,
+        duplicate_table: str,
+        duplicate_id: int | None,
+        match_field: str | None,
+        action: str,
+        notes: str | None = None,
+        updates: dict | None = None,
+    ) -> None:
+        """Record a dedupe/merge decision."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """INSERT INTO merge_log
+                   (canonical_table, canonical_id, duplicate_table, duplicate_id, match_field, action, notes, updates_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    canonical_table,
+                    canonical_id,
+                    duplicate_table,
+                    duplicate_id,
+                    match_field,
+                    action,
+                    notes,
+                    json.dumps(updates) if updates else None,
+                ),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            self.conn.rollback()
+
+    def _fetch_record_dict(self, table: str, record_id: int) -> dict | None:
+        """Fetch a record by table + id as a dict."""
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT * FROM {table} WHERE id = ?", (record_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        columns = [d[0] for d in cur.description]
+        return dict(zip(columns, row))
+
+    def _prepare_resolution_ref(self, ref: dict) -> dict:
+        """Build a minimal ref dict for OpenAlex/Crossref resolution."""
+        authors_raw = ref.get("authors") or []
+        if isinstance(authors_raw, str):
+            authors_str = authors_raw.strip()
+            if authors_str.startswith("[") and authors_str.endswith("]"):
+                try:
+                    parsed = json.loads(authors_str)
+                    if isinstance(parsed, list):
+                        authors_raw = parsed
+                except json.JSONDecodeError:
+                    authors_raw = [authors_raw]
+            else:
+                authors_raw = [authors_raw]
+
+        return {
+            "title": ref.get("title"),
+            "authors": authors_raw,
+            "year": ref.get("year"),
+            "doi": ref.get("doi"),
+            "container-title": ref.get("source") or ref.get("container-title") or ref.get("journal_conference"),
+            "source": ref.get("source") or ref.get("journal_conference"),
+            "volume": ref.get("volume"),
+            "issue": ref.get("issue"),
+            "pages": ref.get("pages"),
+            "abstract": ref.get("abstract"),
+            "keywords": ref.get("keywords"),
+        }
+
+    def _resolve_identifiers_for_ref(self, ref: dict, searcher, rate_limiter) -> dict:
+        """Resolve DOI/OpenAlex ID for a ref using OpenAlex/Crossref."""
+        if not searcher:
+            return {}
+        try:
+            from .OpenAlexScraper import process_single_reference
+        except Exception:
+            return {}
+
+        ref_for_scraper = self._prepare_resolution_ref(ref)
+        resolved = process_single_reference(
+            ref_for_scraper,
+            searcher,
+            rate_limiter,
+            fetch_references=False,
+            fetch_citations=False,
+            max_citations=0,
+        )
+        if not resolved:
+            return {}
+
+        return {
+            "doi": self._normalize_doi(resolved.get("doi")),
+            "openalex_id": self._normalize_openalex_id(resolved.get("openalex_id")),
+        }
+
+    def _merge_records(
+        self,
+        canonical_table: str,
+        canonical_id: int,
+        duplicate_table: str,
+        duplicate_id: int,
+        match_field: str | None,
+        notes: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Merge duplicate into canonical record and log the action."""
+        cur = self.conn.cursor()
+        canonical = self._fetch_record_dict(canonical_table, canonical_id)
+        duplicate = self._fetch_record_dict(duplicate_table, duplicate_id)
+        if not canonical or not duplicate:
+            return False, "Record not found for merge"
+
+        try:
+            cur.execute("BEGIN")
+
+            # Determine safe columns to backfill.
+            cur.execute(f"PRAGMA table_info({canonical_table})")
+            canonical_cols = {row[1] for row in cur.fetchall()}
+            cur.execute(f"PRAGMA table_info({duplicate_table})")
+            duplicate_cols = {row[1] for row in cur.fetchall()}
+
+            merge_fields = [
+                "doi",
+                "normalized_doi",
+                "openalex_id",
+                "year",
+                "source",
+                "journal_conference",
+                "volume",
+                "issue",
+                "pages",
+                "publisher",
+                "type",
+                "url",
+                "isbn",
+                "issn",
+                "abstract",
+                "keywords",
+                "authors",
+                "editors",
+                "normalized_title",
+                "normalized_authors",
+                "source_pdf",
+                "source_work_id",
+                "relationship_type",
+                "ingest_source",
+                "run_id",
+            ]
+
+            updates: dict[str, object] = {}
+            for field in merge_fields:
+                if field not in canonical_cols or field not in duplicate_cols:
+                    continue
+                canon_val = canonical.get(field)
+                dup_val = duplicate.get(field)
+                if (canon_val is None or canon_val == "") and dup_val not in (None, ""):
+                    updates[field] = dup_val
+
+            # Maintain normalized fields when updating DOI/title/authors.
+            if "doi" in updates and "normalized_doi" in canonical_cols and not updates.get("normalized_doi"):
+                updates["normalized_doi"] = self._normalize_doi(updates.get("doi"))
+            if "title" in updates and "normalized_title" in canonical_cols:
+                updates["normalized_title"] = self._normalize_text(updates.get("title"))
+            if "authors" in updates and "normalized_authors" in canonical_cols:
+                updates["normalized_authors"] = self._normalize_authors_value(updates.get("authors"))
+
+            if updates:
+                set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+                cur.execute(
+                    f"UPDATE {canonical_table} SET {set_clause} WHERE id = ?",
+                    list(updates.values()) + [canonical_id],
+                )
+
+            # Move aliases to canonical record
+            cur.execute(
+                "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
+                (canonical_table, canonical_id, duplicate_table, duplicate_id),
+            )
+
+            # Add duplicate title as alias if different
+            duplicate_title = duplicate.get("title")
+            if duplicate_title:
+                canonical_title = canonical.get("title")
+                if self._normalize_text(duplicate_title) != self._normalize_text(canonical_title):
+                    cur.execute(
+                        """INSERT OR IGNORE INTO work_aliases
+                           (work_table, work_id, alias_title, normalized_alias_title, alias_year, relationship_type)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            canonical_table,
+                            canonical_id,
+                            duplicate_title,
+                            self._normalize_text(duplicate_title),
+                            duplicate.get("year"),
+                            "alias",
+                        ),
+                    )
+
+            # Delete duplicate row
+            cur.execute(f"DELETE FROM {duplicate_table} WHERE id = ?", (duplicate_id,))
+
+            cur.execute("COMMIT")
+            self._log_merge(
+                canonical_table=canonical_table,
+                canonical_id=canonical_id,
+                duplicate_table=duplicate_table,
+                duplicate_id=duplicate_id,
+                match_field=match_field,
+                action="merged",
+                notes=notes,
+                updates=updates,
+            )
+            return True, None
+        except sqlite3.Error as e:
+            cur.execute("ROLLBACK")
+            self._log_merge(
+                canonical_table=canonical_table,
+                canonical_id=canonical_id,
+                duplicate_table=duplicate_table,
+                duplicate_id=duplicate_id,
+                match_field=match_field,
+                action="merge_failed",
+                notes=str(e),
+                updates=None,
+            )
+            return False, str(e)
+
+    def _merge_incoming_into_existing(
+        self,
+        existing_table: str,
+        existing_id: int,
+        incoming_ref: dict,
+        match_field: str | None,
+        notes: str | None = None,
+        action: str = "skipped_duplicate",
+    ) -> tuple[bool, str | None]:
+        """Merge incoming (not yet inserted) data into an existing record."""
+        cur = self.conn.cursor()
+        existing = self._fetch_record_dict(existing_table, existing_id)
+        if not existing:
+            return False, "Existing record not found"
+
+        try:
+            cur.execute("BEGIN")
+
+            cur.execute(f"PRAGMA table_info({existing_table})")
+            existing_cols = {row[1] for row in cur.fetchall()}
+
+            merge_fields = [
+                "doi",
+                "normalized_doi",
+                "openalex_id",
+                "year",
+                "source",
+                "journal_conference",
+                "volume",
+                "issue",
+                "pages",
+                "publisher",
+                "type",
+                "url",
+                "isbn",
+                "issn",
+                "abstract",
+                "keywords",
+                "authors",
+                "editors",
+                "normalized_title",
+                "normalized_authors",
+                "source_pdf",
+                "source_work_id",
+                "relationship_type",
+                "ingest_source",
+                "run_id",
+            ]
+
+            updates: dict[str, object] = {}
+            for field in merge_fields:
+                if field not in existing_cols:
+                    continue
+                canon_val = existing.get(field)
+                incoming_val = incoming_ref.get(field)
+                if (canon_val is None or canon_val == "") and incoming_val not in (None, ""):
+                    updates[field] = incoming_val
+
+            if "doi" in updates and "normalized_doi" in existing_cols and not updates.get("normalized_doi"):
+                updates["normalized_doi"] = self._normalize_doi(updates.get("doi"))
+            if "title" in updates and "normalized_title" in existing_cols:
+                updates["normalized_title"] = self._normalize_text(updates.get("title"))
+            if "authors" in updates and "normalized_authors" in existing_cols:
+                updates["normalized_authors"] = self._normalize_authors_value(updates.get("authors"))
+
+            if updates:
+                set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+                cur.execute(
+                    f"UPDATE {existing_table} SET {set_clause} WHERE id = ?",
+                    list(updates.values()) + [existing_id],
+                )
+
+            # Add incoming title as alias if it differs
+            incoming_title = incoming_ref.get("title")
+            if incoming_title and self._normalize_text(incoming_title) != self._normalize_text(existing.get("title")):
+                cur.execute(
+                    """INSERT OR IGNORE INTO work_aliases
+                       (work_table, work_id, alias_title, normalized_alias_title, alias_year, relationship_type)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        existing_table,
+                        existing_id,
+                        incoming_title,
+                        self._normalize_text(incoming_title),
+                        incoming_ref.get("year"),
+                        "alias",
+                    ),
+                )
+
+            cur.execute("COMMIT")
+            self._log_merge(
+                canonical_table=existing_table,
+                canonical_id=existing_id,
+                duplicate_table="incoming",
+                duplicate_id=None,
+                match_field=match_field,
+                action=action,
+                notes=notes,
+                updates=updates,
+            )
+            return True, None
+        except sqlite3.Error as e:
+            cur.execute("ROLLBACK")
+            self._log_merge(
+                canonical_table=existing_table,
+                canonical_id=existing_id,
+                duplicate_table="incoming",
+                duplicate_id=None,
+                match_field=match_field,
+                action="merge_failed",
+                notes=str(e),
+                updates=None,
+            )
+            return False, str(e)
+
     # ------------------------------------------------------------------
     # NEW: Staged-table helper methods (no_metadata → with_metadata → queue)
     # ------------------------------------------------------------------
 
-    def insert_no_metadata(self, ref: dict) -> tuple[int | None, str | None]:
+    def insert_no_metadata(
+        self,
+        ref: dict,
+        *,
+        searcher=None,
+        rate_limiter=None,
+        resolve_potential_duplicates: bool = False
+    ) -> tuple[int | None, str | None]:
         """Insert a reference produced by APIscraper_v2 into the
         ``no_metadata`` table, performing duplicate checks across all tables.
 
@@ -1020,7 +1411,89 @@ class DatabaseManager:
             year=ref.get("year")
         )
         if tbl:
-            return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
+            high_confidence = field in {"doi", "openalex_id", "title_authors_year", "alias_title_year"}
+            incoming_ref_for_merge = {
+                **ref,
+                "authors": json.dumps(authors_raw) if authors_raw else None,
+                "editors": json.dumps(ref.get("editors")) if ref.get("editors") else None,
+                "keywords": json.dumps(ref.get("keywords")) if ref.get("keywords") else None,
+                "normalized_doi": norm_doi,
+                "normalized_title": norm_title,
+                "normalized_authors": norm_authors,
+            }
+            resolved_conflict = False
+            # If potential duplicate and both are missing identifiers, resolve both.
+            if resolve_potential_duplicates and searcher and field not in {"doi", "openalex_id"}:
+                existing = self._fetch_record_dict(tbl, eid)
+                incoming_missing_id = not norm_doi and not self._normalize_openalex_id(ref.get("openalex_id"))
+                existing_missing_id = existing and not self._normalize_doi(existing.get("doi")) and not self._normalize_openalex_id(existing.get("openalex_id"))
+
+                if existing and incoming_missing_id and existing_missing_id:
+                    incoming_resolved = self._resolve_identifiers_for_ref(ref, searcher, rate_limiter)
+                    existing_resolved = self._resolve_identifiers_for_ref(existing, searcher, rate_limiter)
+
+                    if incoming_resolved and existing_resolved:
+                        if (
+                            incoming_resolved.get("doi")
+                            and incoming_resolved.get("doi") == existing_resolved.get("doi")
+                        ) or (
+                            incoming_resolved.get("openalex_id")
+                            and incoming_resolved.get("openalex_id") == existing_resolved.get("openalex_id")
+                        ):
+                            # Confirmed duplicate via resolved IDs
+                            if incoming_resolved.get("doi"):
+                                incoming_ref_for_merge["doi"] = incoming_resolved.get("doi")
+                                incoming_ref_for_merge["normalized_doi"] = self._normalize_doi(incoming_resolved.get("doi"))
+                            if incoming_resolved.get("openalex_id"):
+                                incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
+                            self._merge_incoming_into_existing(
+                                tbl,
+                                eid,
+                                incoming_ref_for_merge,
+                                field,
+                                notes="resolved_ids_match",
+                                action="merged",
+                            )
+                            return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
+                        else:
+                            # Resolved IDs disagree; keep both and log.
+                            self._log_merge(
+                                canonical_table=tbl,
+                                canonical_id=eid,
+                                duplicate_table="incoming",
+                                duplicate_id=None,
+                                match_field=field,
+                                action="conflict",
+                                notes="resolved_ids_conflict",
+                                updates=None,
+                            )
+                            resolved_conflict = True
+                    else:
+                        # Resolution failed; fall through to high-confidence check.
+                        pass
+
+            if high_confidence and not resolved_conflict:
+                self._merge_incoming_into_existing(
+                    tbl,
+                    eid,
+                    incoming_ref_for_merge,
+                    field,
+                    notes="high_confidence_duplicate",
+                    action="merged",
+                )
+                return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
+
+            # Low-confidence duplicates are logged but allowed to insert.
+            self._log_merge(
+                canonical_table=tbl,
+                canonical_id=eid,
+                duplicate_table="incoming",
+                duplicate_id=None,
+                match_field=field,
+                action="possible_duplicate",
+                notes="low_confidence_match_inserted",
+                updates=None,
+            )
 
         cursor = self.conn.cursor()
         try:
@@ -1194,14 +1667,16 @@ class DatabaseManager:
                 exclude_table="no_metadata"
             )
             
-            if tbl and tbl in ["downloaded_references", "to_download_references"]:
-                # Attach any aliases to the existing canonical record and drop the staging row
-                cur.execute(
-                    "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
-                    (tbl, eid, "no_metadata", no_meta_id),
+            if tbl and tbl in ["downloaded_references", "to_download_references", "with_metadata"]:
+                cur.execute("ROLLBACK")
+                self._merge_records(
+                    canonical_table=tbl,
+                    canonical_id=eid,
+                    duplicate_table="no_metadata",
+                    duplicate_id=no_meta_id,
+                    match_field=field,
+                    notes="promote_duplicate",
                 )
-                cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
-                cur.execute("COMMIT")
                 return None, f"Entry already exists in {tbl} (ID {eid}) on {field}"
 
             cur.execute(
@@ -2133,6 +2608,33 @@ class DatabaseManager:
             error_msg = f"Transaction failed while moving to failed: {e}"
             print(f"{RED}[DB Manager] {error_msg}{RESET}")
             return None, error_msg
+
+    def drop_queue_entry_as_duplicate(
+        self,
+        queue_id: int,
+        existing_table: str,
+        existing_id: int,
+        matched_field: str | None = None
+    ) -> tuple[bool, str | None]:
+        """Delete a queue entry when it's a duplicate of an existing record."""
+        if not self._fetch_record_dict("to_download_references", queue_id):
+            return False, f"Queue entry {queue_id} not found."
+
+        ok, err = self._merge_records(
+            canonical_table=existing_table,
+            canonical_id=existing_id,
+            duplicate_table="to_download_references",
+            duplicate_id=queue_id,
+            match_field=matched_field,
+            notes="queue_duplicate",
+        )
+        if not ok:
+            return False, f"SQLite error dropping duplicate queue entry {queue_id}: {err}"
+
+        msg = f"Queue entry {queue_id} is duplicate of {existing_table} ID {existing_id}"
+        if matched_field:
+            msg += f" (matched on {matched_field})"
+        return True, msg
 
     def add_referenced_works_to_with_metadata(self, source_work_id: int, referenced_works: list) -> int:
         """Add referenced works as separate entries in the with_metadata table."""

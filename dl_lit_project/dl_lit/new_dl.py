@@ -11,7 +11,6 @@ import datetime
 from urllib.parse import urljoin, urlparse, urlencode
 from pathlib import Path
 from collections import deque
-import fitz  
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from queue import Queue
@@ -40,6 +39,7 @@ import hashlib
 
 from .db_manager import DatabaseManager
 from .utils import ServiceRateLimiter, get_global_rate_limiter
+from .pdf_downloader import PDFDownloader
 
 
 class BibliographyEnhancer:
@@ -79,9 +79,22 @@ class BibliographyEnhancer:
         # self.google_search_tool = Tool(google_search=GoogleSearch())
         self.proxies = proxies
         self.output_folder = Path(output_folder) if output_folder else None
+        self._pdf_downloader = None
         
         # Initialize Sci-Hub mirror rotation
         self.current_mirror_index = 0
+
+    def _get_pdf_downloader(self, downloads_dir: Path) -> PDFDownloader:
+        """Lazily create a PDFDownloader for the current download directory."""
+        if not isinstance(downloads_dir, Path):
+            downloads_dir = Path(downloads_dir)
+        if self._pdf_downloader is None or self._pdf_downloader.download_dir != downloads_dir:
+            self._pdf_downloader = PDFDownloader(
+                download_dir=downloads_dir,
+                rate_limiter=self.rate_limiter,
+                mailto=self.email,
+            )
+        return self._pdf_downloader
 
     def escape_bibtex(self, text: str | None) -> str:
         """Escapes characters with special meaning in BibTeX/LaTeX."""
@@ -513,44 +526,6 @@ class BibliographyEnhancer:
             print(f"  Unexpected error checking HTML page: {e}")
             return None
             
-    def is_valid_pdf(self, content, ref_type):
-        """Validate PDF using PyMuPDF with improved error handling for CSS issues."""
-        try:
-            # Handle string/bytes conversion
-            if isinstance(content, str):
-                content = content.encode('utf-8')
-
-            # Use context manager to ensure proper cleanup
-            with fitz.open(stream=content, filetype="pdf") as doc:
-                # Check if PDF is encrypted
-                if doc.is_encrypted:
-                    print("  PDF is encrypted")
-                    return False
-
-                # Basic page count validation
-                num_pages = doc.page_count
-                min_pages = 50 if ref_type.lower() == 'book' else 5
-                
-                if num_pages < min_pages:
-                    print(f"  PDF too short ({num_pages} pages, minimum {min_pages})")
-                    return False
-
-                # Success - valid PDF
-                print(f"  Valid PDF with {num_pages} pages")
-                return True
-
-        except fitz.FileDataError as e:
-            error_msg = str(e).lower()
-            # Ignore CSS-related errors as they don't affect PDF validity
-            if "css syntax error" in error_msg:
-                print("  Ignoring CSS validation warnings")
-                return True
-            print(f"  PDF parsing error: {str(e)}")
-            return False
-        except Exception as e:
-            print(f"  Unexpected error validating PDF: {str(e)}")
-            return False
-
     def download_paper(self, url, filename, ref_type):
         """Enhanced paper downloader with better error handling"""
         if not url:
@@ -583,8 +558,9 @@ class BibliographyEnhancer:
                     
             content = response.content
             
-            # Enhanced PDF validation
-            if self.is_valid_pdf(content, ref_type):
+            # Enhanced PDF validation (shared)
+            downloader = self._get_pdf_downloader(Path(filename).parent)
+            if downloader.validate_pdf(content, ref_type):
                 with open(filename, 'wb') as f:
                     f.write(content)
                 print("  Direct download successful - Valid complete PDF")
@@ -687,8 +663,33 @@ class BibliographyEnhancer:
         authors = authors or []
         print(f"DEBUG: authors extracted: {authors}")
         
+        ref_type = ref.get('type', '')
         urls_to_try = []
-        
+        download_success = False
+
+        # Try consolidated downloader first (OpenAlex OA / primary_location / unpaywall if present)
+        openalex_payload = bib_entry.get('openalex_json')
+        if openalex_payload and isinstance(openalex_payload, str):
+            try:
+                openalex_payload = json.loads(openalex_payload)
+            except json.JSONDecodeError:
+                openalex_payload = None
+
+        if not openalex_payload and open_access_url:
+            openalex_payload = {"open_access": {"oa_url": open_access_url}}
+
+        if openalex_payload:
+            downloader = self._get_pdf_downloader(downloads_dir)
+            path, checksum, source = downloader.attempt_download(openalex_payload, ref_type=ref_type)
+            if path:
+                ref['downloaded_file'] = str(path)
+                ref['download_source'] = source
+                ref['download_reason'] = 'Downloaded via PDFDownloader'
+                ref['checksum'] = checksum
+                download_success = True
+                if not force_download:
+                    return ref
+
         # 1. Try direct URL first if it exists
         direct_url = bib_entry.get('url')
         if direct_url:
@@ -740,7 +741,6 @@ class BibliographyEnhancer:
             })
         
         # Try downloading from direct sources first
-        download_success = False
         for url_info in urls_to_try:
             if self.try_download_url(url_info['url'], url_info['source'], ref, downloads_dir):
                 ref['download_source'] = url_info['source']
@@ -867,8 +867,9 @@ class BibliographyEnhancer:
                     
             content = response.content
             
-            # Enhanced PDF validation
-            if self.is_valid_pdf(content, ref_type):
+            # Enhanced PDF validation (shared)
+            downloader = self._get_pdf_downloader(downloads_dir)
+            if downloader.validate_pdf(content, ref_type):
                 with open(filename, 'wb') as f:
                     f.write(content)
                 print("  Direct download successful - Valid complete PDF")

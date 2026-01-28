@@ -2,6 +2,11 @@ import requests
 import hashlib
 from pathlib import Path
 from .utils import ServiceRateLimiter
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
 
 # ANSI escape codes for colors
 GREEN = '\033[92m'
@@ -31,7 +36,34 @@ class PDFDownloader:
         """Calculates the SHA256 checksum of the file content."""
         return hashlib.sha256(content).hexdigest()
 
-    def _download_and_save(self, pdf_url: str, destination_filename: str, source: str) -> tuple[Path | None, str | None, str | None]:
+    def validate_pdf(self, content: bytes, ref_type: str | None = None) -> bool:
+        """Validate PDF bytes with PyMuPDF when available."""
+        if not content:
+            return False
+        if not content.lstrip().startswith(b"%PDF-"):
+            return False
+        if not PYMUPDF_AVAILABLE:
+            return True
+
+        ref_type_val = (ref_type or "").lower()
+        min_pages = 50 if ref_type_val == "book" else 5
+
+        try:
+            with fitz.open(stream=content, filetype="pdf") as doc:
+                if doc.is_encrypted:
+                    return False
+                if doc.page_count < min_pages:
+                    return False
+                return True
+        except fitz.FileDataError as e:
+            error_msg = str(e).lower()
+            if "css syntax error" in error_msg:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _download_and_save(self, pdf_url: str, destination_filename: str, source: str, ref_type: str | None = None) -> tuple[Path | None, str | None, str | None]:
         """
         Generic internal method to download a PDF from a URL and save it.
         """
@@ -45,13 +77,13 @@ class PDFDownloader:
             response = requests.get(pdf_url, headers=self.headers, timeout=60, allow_redirects=True)
             response.raise_for_status()
 
-            content_type = response.headers.get('Content-Type', '')
-            if 'application/pdf' not in content_type:
-                return None, None, f"URL from {source} did not point to a PDF. Content-Type: {content_type}"
-
             pdf_content = response.content
             if not pdf_content:
                  return None, None, f"Downloaded empty file from {source}."
+
+            if not self.validate_pdf(pdf_content, ref_type=ref_type):
+                content_type = response.headers.get('Content-Type', '')
+                return None, None, f"Downloaded file from {source} failed PDF validation. Content-Type: {content_type}"
 
             checksum = self._calculate_checksum(pdf_content)
             
@@ -69,7 +101,7 @@ class PDFDownloader:
             print(f"{RED}[Downloader] {error_msg}{RESET}")
             return None, None, error_msg
 
-    def attempt_download(self, metadata: dict) -> tuple[Path | None, str | None, str | None]:
+    def attempt_download(self, metadata: dict, ref_type: str | None = None) -> tuple[Path | None, str | None, str | None]:
         """
         Tries to download a PDF using various sources based on the provided metadata.
         The metadata should be the enriched data from OpenAlexScraper.
@@ -92,7 +124,7 @@ class PDFDownloader:
         if unpaywall_meta and unpaywall_meta.get('best_oa_location'):
             pdf_url = unpaywall_meta['best_oa_location'].get('url_for_pdf')
             if pdf_url:
-                path, checksum, err = self._download_and_save(pdf_url, filename, "Unpaywall")
+                path, checksum, err = self._download_and_save(pdf_url, filename, "Unpaywall", ref_type=ref_type)
                 if path:
                     return path, checksum, "Unpaywall"
                 else:
@@ -101,7 +133,7 @@ class PDFDownloader:
         # Strategy 2: Try OpenAlex's open_access.oa_url
         oa_url = metadata.get('open_access', {}).get('oa_url')
         if oa_url:
-            path, checksum, err = self._download_and_save(oa_url, filename, "OpenAlex OA URL")
+            path, checksum, err = self._download_and_save(oa_url, filename, "OpenAlex OA URL", ref_type=ref_type)
             if path:
                 return path, checksum, "OpenAlex OA URL"
             else:
@@ -110,7 +142,7 @@ class PDFDownloader:
         # Strategy 3: Try OpenAlex primary_location's pdf_url
         pdf_url = metadata.get('primary_location', {}).get('pdf_url')
         if pdf_url:
-            path, checksum, err = self._download_and_save(pdf_url, filename, "OpenAlex PDF URL")
+            path, checksum, err = self._download_and_save(pdf_url, filename, "OpenAlex PDF URL", ref_type=ref_type)
             if path:
                 return path, checksum, "OpenAlex PDF URL"
             else:

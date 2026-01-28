@@ -12,6 +12,7 @@ def mock_db_manager(mocker):
     mock_db_class = mocker.patch('dl_lit.cli.DatabaseManager', autospec=True)
     instance = mock_db_class.return_value
     instance.get_entries_to_download.return_value = []  # Default to empty
+    instance.check_if_exists.return_value = (None, None, None)
     return instance
 
 @pytest.fixture

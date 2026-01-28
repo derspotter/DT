@@ -456,6 +456,8 @@ def run_pipeline(
     fetch_citations: bool = False,
     max_citations: int = 100,
     max_ref_pages: int | None = None,
+    max_entries: int | None = None,
+    run_enrichment: bool = True,
 ) -> dict:
     """Run extract → enrich → queue pipeline for PDFs (no download step)."""
     input_path = Path(input_path)
@@ -502,6 +504,8 @@ def run_pipeline(
             "fetch_citations": fetch_citations,
             "max_citations": max_citations,
             "max_ref_pages": max_ref_pages,
+            "max_entries": max_entries,
+            "run_enrichment": run_enrichment,
         }
         cur = db_manager.conn.cursor()
         cur.execute(
@@ -523,6 +527,8 @@ def run_pipeline(
         with_metadata_ids: list[int] = []
 
         for pdf_file in pdf_files:
+            if max_entries and summary["inserted_entries"] >= max_entries:
+                break
             summary["processed_files"] += 1
             extract_reference_sections(str(pdf_file), str(output_dir))
             extracted_pages = sorted(output_dir.glob(f"{pdf_file.stem}_refs_*.pdf"))
@@ -531,6 +537,8 @@ def run_pipeline(
             summary["extracted_pages"] += len(extracted_pages)
 
             for ref_pdf in extracted_pages:
+                if max_entries and summary["inserted_entries"] >= max_entries:
+                    break
                 entries = upload_pdf_and_extract_bibliography(str(ref_pdf))
                 if not isinstance(entries, list):
                     entries = []
@@ -542,6 +550,8 @@ def run_pipeline(
                     json.dump(entries, handle, indent=2)
 
                 for entry in entries:
+                    if max_entries and summary["inserted_entries"] >= max_entries:
+                        break
                     minimal_ref = {
                         "title": entry.get("title"),
                         "authors": entry.get("authors"),
@@ -567,7 +577,12 @@ def run_pipeline(
                         "ingest_source": "pipeline",
                         "run_id": run_id,
                     }
-                    row_id, err = db_manager.insert_no_metadata(minimal_ref)
+                    row_id, err = db_manager.insert_no_metadata(
+                        minimal_ref,
+                        searcher=searcher,
+                        rate_limiter=rate_limiter,
+                        resolve_potential_duplicates=run_enrichment,
+                    )
                     if err:
                         summary["skipped_entries"] += 1
                     else:
@@ -575,7 +590,7 @@ def run_pipeline(
                         if row_id:
                             inserted_ids.append(row_id)
 
-        if inserted_ids:
+        if run_enrichment and inserted_ids:
             db_manager.conn.row_factory = sqlite3.Row
             for batch in _chunked(inserted_ids, batch_size):
                 for entry_id in batch:
@@ -630,12 +645,13 @@ def run_pipeline(
                         db_manager.move_no_meta_entry_to_failed(entry_id, reason)
                         summary["enriched_failed"] += 1
 
-        for wid in with_metadata_ids:
-            qid, _ = db_manager.enqueue_for_download(wid)
-            if qid:
-                summary["queued"] += 1
-            else:
-                summary["skipped_queue"] += 1
+        if run_enrichment:
+            for wid in with_metadata_ids:
+                qid, _ = db_manager.enqueue_for_download(wid)
+                if qid:
+                    summary["queued"] += 1
+                else:
+                    summary["skipped_queue"] += 1
 
         if run_id:
             cur = db_manager.conn.cursor()

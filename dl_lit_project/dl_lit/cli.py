@@ -14,7 +14,8 @@ import hashlib
 
 # Local application imports
 from .db_manager import DatabaseManager
-# from .get_bib_pages import extract_reference_sections  # Lazy import to avoid debug prints
+# For tests: patched in test_get_bib_pages. Lazy import in handler for runtime.
+extract_reference_sections = None
 from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from .new_dl import BibliographyEnhancer
 from .utils import get_global_rate_limiter
@@ -396,7 +397,10 @@ def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
 def extract_bib_pages_command(input_path, output_dir):
     """Extracts bibliography/reference section pages from a PDF file or all PDFs in a directory."""
     # Lazy import to avoid debug prints at module level
-    from .get_bib_pages import extract_reference_sections
+    global extract_reference_sections
+    if extract_reference_sections is None:
+        from .get_bib_pages import extract_reference_sections as _extract_reference_sections
+        extract_reference_sections = _extract_reference_sections
     
     input_path = Path(input_path)
     output_dir = Path(output_dir)
@@ -541,7 +545,9 @@ def extract_bib_api_command(input_path, db_path, workers):
 @click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works during enrichment.')
 @click.option('--max-citations', default=100, show_default=True, help='Maximum citing works to fetch per paper.')
 @click.option('--max-ref-pages', type=int, default=None, help='Limit the number of extracted reference pages per PDF.')
-def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, queue_batch, mailto, fetch_references, fetch_citations, max_citations, max_ref_pages):
+@click.option('--max-entries', type=int, default=None, help='Limit the number of extracted entries processed per run.')
+@click.option('--enrich/--no-enrich', default=True, show_default=True, help='Run OpenAlex/Crossref enrichment after insertion.')
+def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, queue_batch, mailto, fetch_references, fetch_citations, max_citations, max_ref_pages, max_entries, enrich):
     """Run extract → enrich → queue pipeline for PDFs (no download step)."""
     try:
         from .pipeline import run_pipeline
@@ -558,6 +564,8 @@ def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, 
             fetch_citations=fetch_citations,
             max_citations=max_citations,
             max_ref_pages=max_ref_pages,
+            max_entries=max_entries,
+            run_enrichment=enrich,
         )
 
         click.echo("\n--- Pipeline Summary ---")
@@ -854,6 +862,21 @@ def download_pdfs_command(db_path, limit, download_dir):
             except (json.JSONDecodeError, TypeError):
                 pass # Keep lists empty if data is malformed
 
+        # Drop queue entry if it is already in downloaded_references
+        dup_table, dup_id, dup_field = db.check_if_exists(
+            doi=row.get('doi'),
+            openalex_id=row.get('openalex_id'),
+            title=row.get('title'),
+            authors=author_structs or row.get('authors'),
+            year=row.get('year'),
+            exclude_id=row['id'],
+            exclude_table='to_download_references'
+        )
+        if dup_table == 'downloaded_references' and dup_id is not None:
+            ok, msg = db.drop_queue_entry_as_duplicate(row['id'], dup_table, dup_id, dup_field)
+            click.echo(f"  ↺ duplicate detected: {msg}")
+            continue
+
         # Update the user on progress
         click.echo(f"\n[QID {row['id']}] {row['title'][:80]}")
         click.echo(f"Authors: {', '.join(author_names_for_display) if author_names_for_display else 'N/A'}")
@@ -946,7 +969,7 @@ def enrich_openalex_command(input_path, output_dir, mailto, fetch_citations):
 
 @cli.command("inspect-tables")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.option('--table', type=click.Choice(['all', 'no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references', 'failed_enrichments', 'failed_downloads', 'duplicate_references']), default='all', help='Specific table to inspect.')
+@click.option('--table', type=click.Choice(['all', 'no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references', 'failed_enrichments', 'failed_downloads', 'duplicate_references', 'merge_log']), default='all', help='Specific table to inspect.')
 @click.option('--limit', default=5, help='Number of entries to show per table.')
 def inspect_tables_command(db_path, table, limit):
     """Inspects database tables to debug data flow issues."""
@@ -963,7 +986,8 @@ def inspect_tables_command(db_path, table, limit):
             ("downloaded_references", "Successfully downloaded papers"),
             ("failed_enrichments", "References that failed metadata enrichment"),
             ("failed_downloads", "References that failed PDF download"),
-            ("duplicate_references", "Detected duplicates")
+            ("duplicate_references", "Detected duplicates"),
+            ("merge_log", "Deduplication merge decisions")
         ]
         
         tables_to_check = workflow_tables if table == 'all' else [(table, "Selected table")]
@@ -1056,6 +1080,53 @@ def inspect_tables_command(db_path, table, limit):
         
     except Exception as e:
         click.echo(f"{RED}Error inspecting tables: {e}{RESET}")
+
+
+@cli.command("merge-log")
+@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
+@click.option('--limit', default=20, show_default=True, help='Number of merge_log rows to show.')
+@click.option('--action', default=None, help='Filter by action (e.g., merged, conflict, possible_duplicate).')
+@click.option('--table', 'table_filter', default=None, help='Filter by canonical_table or duplicate_table.')
+def merge_log_command(db_path, limit, action, table_filter):
+    """Show recent merge_log entries for dedupe auditing."""
+    try:
+        db_manager = DatabaseManager(db_path=db_path)
+        cursor = db_manager.conn.cursor()
+        cursor.row_factory = sqlite3.Row
+
+        query = "SELECT * FROM merge_log"
+        params = []
+        clauses = []
+        if action:
+            clauses.append("action = ?")
+            params.append(action)
+        if table_filter:
+            clauses.append("(canonical_table = ? OR duplicate_table = ?)")
+            params.extend([table_filter, table_filter])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        if not rows:
+            click.echo(f"{YELLOW}No merge_log entries found.{RESET}")
+            return
+
+        click.echo(f"{CYAN}merge_log (showing {len(rows)} rows){RESET}")
+        for row in rows:
+            click.echo(
+                f"[{row['id']}] {row['action']} | "
+                f"{row['canonical_table']}:{row['canonical_id']} "
+                f"<- {row['duplicate_table']}:{row['duplicate_id']} "
+                f"| match={row['match_field']} | {row['created_at']}"
+            )
+            if row["notes"]:
+                click.echo(f"  notes: {row['notes']}")
+    except Exception as e:
+        click.echo(f"{RED}Error reading merge_log: {e}{RESET}")
         import traceback
         traceback.print_exc()
     finally:
