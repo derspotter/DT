@@ -595,13 +595,18 @@ def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, 
 @click.option('--max-results', default=200, show_default=True, help='Maximum number of OpenAlex results to fetch.')
 @click.option('--year-from', type=int, default=None, help='Filter: publication year >= year-from.')
 @click.option('--year-to', type=int, default=None, help='Filter: publication year <= year-to.')
+@click.option('--field',
+              type=click.Choice(['default', 'title', 'abstract', 'title_and_abstract', 'fulltext'], case_sensitive=False),
+              default='default',
+              show_default=True,
+              help='Search scope field (default uses OpenAlex search across fields).')
 @click.option('--mailto', default='spott@wzb.eu', show_default=True, help='Email for API politeness.')
 @click.option('--db-path',
               type=click.Path(dir_okay=False, writable=True, resolve_path=True),
               default=str(DEFAULT_DB_PATH),
               help='Path to the SQLite database file.')
 @click.option('--enqueue/--no-enqueue', default=False, show_default=True, help='Enqueue results for download.')
-def keyword_search_command(query, max_results, year_from, year_to, mailto, db_path, enqueue):
+def keyword_search_command(query, max_results, year_from, year_to, field, mailto, db_path, enqueue):
     """Run a keyword search against OpenAlex and persist results."""
     from .keyword_search import search_openalex, openalex_result_to_record, dedupe_results
 
@@ -611,6 +616,7 @@ def keyword_search_command(query, max_results, year_from, year_to, mailto, db_pa
             "year_from": year_from,
             "year_to": year_to,
             "max_results": max_results,
+            "field": field,
             "mailto": mailto,
         }
         run_id = db.create_search_run(query=query, filters=filters)
@@ -621,6 +627,7 @@ def keyword_search_command(query, max_results, year_from, year_to, mailto, db_pa
             max_results=max_results,
             year_from=year_from,
             year_to=year_to,
+            field=field,
             mailto=mailto,
         )
 

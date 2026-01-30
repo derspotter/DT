@@ -104,17 +104,35 @@ def search_openalex(query: str,
                     max_results: int = 200,
                     year_from: int | None = None,
                     year_to: int | None = None,
-                    mailto: str | None = None) -> list[dict]:
+                    mailto: str | None = None,
+                    field: str | None = "default") -> list[dict]:
     normalized_query = normalize_query(query)
     rate_limiter = get_global_rate_limiter()
 
     params = {
-        "search": normalized_query,
         "per-page": 200,
         "select": "id,doi,display_name,authorships,publication_year,type,abstract_inverted_index,keywords,primary_location,open_access,biblio",
     }
     if mailto:
         params["mailto"] = mailto
+
+    field_key = None
+    if field:
+        field_key = {
+            "default": None,
+            "search": None,
+            "title": "title.search",
+            "abstract": "abstract.search",
+            "title_and_abstract": "title_and_abstract.search",
+            "fulltext": "fulltext.search",
+        }.get(field.strip().lower())
+        if field_key is None and field.strip().lower() not in ("default", "search"):
+            raise ValueError(f"Unknown search field: {field}")
+
+    if field_key:
+        params["filter"] = f"{field_key}:{normalized_query}"
+    else:
+        params["search"] = normalized_query
 
     filters = []
     if year_from:
@@ -122,7 +140,10 @@ def search_openalex(query: str,
     if year_to:
         filters.append(f"publication_year:<={year_to}")
     if filters:
-        params["filter"] = ",".join(filters)
+        if "filter" in params:
+            params["filter"] = ",".join([params["filter"], *filters])
+        else:
+            params["filter"] = ",".join(filters)
 
     # Use cursor-based pagination for robustness
     params["cursor"] = "*"

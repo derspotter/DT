@@ -50,6 +50,52 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - Dedupe hardening, merge logging, and alias handling implemented.
 - Full test suite passes (`pytest dl_lit_project/tests`).
 
+## 3.1) Milestone 2 Plan — Visualization (Apr 2026)
+**Goal:** deliver a D3‑based citation/cluster visualization wired to real corpus data.
+
+### Scope
+- Graph dataset generation (nodes + edges) from the DB
+- Backend API to serve graph JSON
+- Frontend visualization with filters + clustering
+
+### Tasks
+1) **Graph data model**
+   - Define node schema: work id, title, year, type, source, DOI/OpenAlex ID
+   - Define edge schema: source_work_id → referenced_work_id (directional)
+   - Add a `graph_exports` table to persist snapshots if needed
+
+2) **Data extraction**
+   - Build a graph builder that converts `with_metadata` + `downloaded_references` + `work_aliases` into nodes
+   - Use `source_work_id` + `relationship_type` to generate citation edges
+   - Add filters: time range, source PDF, run_id, max nodes
+
+3) **Backend API**
+   - Add endpoint: `GET /api/graph?run_id=...&max_nodes=...`
+   - Support JSON response with `{ nodes, edges, stats }`
+   - Implement caching for large runs (store JSON blobs in DB or disk)
+
+4) **Frontend (D3)**
+   - D3 force‑layout graph with zoom/pan
+   - Toggle: citations only / seed‑centric view
+   - Cluster coloring (by year, source, or keyword)
+   - Node tooltip with metadata + download status
+
+5) **Tests + validation**
+   - Unit tests for graph builder
+   - Snapshot test for API output shape
+   - Smoke test: run on `literature_smoke.db` and render
+
+### Deliverables
+- `graph_builder.py` (or integrated into backend service)
+- `GET /api/graph` endpoint
+- D3 visualization page wired to API
+- Documentation for graph generation + filters
+
+### Acceptance (MS2)
+- Graph renders with >100 nodes without crashing
+- Nodes are clickable + show core metadata
+- Clustering toggle works and is visible
+
 ## 4) Workstreams & Deliverables
 
 ### A) Pipeline & Data Layer
@@ -109,4 +155,3 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - React/Vite frontend supports upload/search/download
 - Docker deployment with persistent state
 - Documentation complete, tests pass, final acceptance by AG
-
