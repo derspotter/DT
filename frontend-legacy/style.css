@@ -167,3 +167,39 @@ footer {
     border-radius: 3px;
     font-size: 0.9em;
 }
+
+/* --- Graph Visualization --- */
+.graph-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
+.graph-controls select,
+.graph-controls button {
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid #ccc;
+    background-color: #fff;
+}
+
+.graph-status {
+    color: #666;
+    font-style: italic;
+}
+
+.graph-stats {
+    margin: 8px 0 4px;
+    color: #555;
+    font-size: 0.9em;
+}
+
+.graph-canvas {
+    height: 420px;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background-color: #fff;
+    overflow: hidden;
+}

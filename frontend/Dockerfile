@@ -1,24 +1,27 @@
-# Use the official Node.js 23 Alpine image as the base
-FROM node:23-alpine
+# syntax=docker/dockerfile:1
 
-# Set environment variable to indicate we're in Docker
-ENV DOCKER_ENV=true
-ENV NODE_ENV=development
-
-# Set the working directory inside the container
+FROM node:22.12.0-alpine AS build
 WORKDIR /app
 
-# Copy package.json (and package-lock.json if available)
-COPY package*.json ./
+RUN npm install -g npm@11.8.0
 
-# Install dependencies
-RUN npm install
+ARG VITE_API_BASE
+ENV VITE_API_BASE=${VITE_API_BASE}
 
-# Copy the rest of your frontend source code
+COPY package.json package-lock.json ./
+RUN npm ci
+
 COPY . .
+RUN npm run build
 
-# Expose the port Vite uses (default is 3000 now)
-EXPOSE 3000
+FROM node:22.12.0-alpine AS runner
+WORKDIR /app
 
-# Run Vite in development mode (hot-reload enabled)
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"]
+ENV NODE_ENV=production
+
+RUN npm install -g npm@11.8.0 serve
+
+COPY --from=build /app/dist ./dist
+
+EXPOSE 5175
+CMD ["serve", "-s", "dist", "-l", "5175"]

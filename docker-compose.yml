@@ -1,17 +1,38 @@
 services:
+  rag_backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag_feeder_backend
+    ports:
+      - "4000:4000"
+    environment:
+      - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
+      - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175
+    volumes:
+      - ./dl_lit:/usr/src/app/dl_lit
+      - ./dl_lit_project:/usr/src/app/dl_lit_project
+      - rag_feeder_uploads:/usr/src/app/uploads
+    restart: unless-stopped
+    networks:
+      - rag-network
+
   rag_feeder:
     build:
-      context: .
+      context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: http://localhost:4000
     container_name: rag_feeder_frontend
     ports:
-      - "5173:5173"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
+      - "5175:5175"
+    restart: unless-stopped
     networks:
       - rag-network
 
 networks:
   rag-network:
     external: true
+
+volumes:
+  rag_feeder_uploads:

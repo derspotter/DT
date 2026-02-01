@@ -379,6 +379,22 @@ class DatabaseManager:
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS citation_edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relationship_type TEXT NOT NULL,
+                source_table TEXT,
+                target_table TEXT,
+                source_row_id INTEGER,
+                target_row_id INTEGER,
+                run_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source_id, target_id, relationship_type)
+            )
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS pipeline_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -441,6 +457,8 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_authors ON to_download_references(normalized_authors)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_norm_title ON work_aliases(normalized_alias_title)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_owner ON work_aliases(work_table, work_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
 
         self.conn.commit()
         print(f"{GREEN}[DB Manager] Schema created/verified successfully.{RESET}")
@@ -654,6 +672,52 @@ class DatabaseManager:
             return normalized
         
         return None
+
+    def _make_node_id(self, openalex_id: str | None, doi: str | None, table: str | None, row_id: int | None) -> str | None:
+        normalized_openalex = self._normalize_openalex_id(openalex_id)
+        if normalized_openalex:
+            return normalized_openalex
+        normalized_doi = self._normalize_doi(doi)
+        if normalized_doi:
+            return normalized_doi
+        if table and row_id:
+            return f"{table}:{row_id}"
+        return None
+
+    def _fetch_with_metadata_identifiers(self, row_id: int) -> tuple[str | None, str | None, int | None]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT openalex_id, doi, run_id FROM with_metadata WHERE id = ?", (row_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None, None, None
+        return row[0], row[1], row[2]
+
+    def _insert_citation_edge(
+        self,
+        source_id: str | None,
+        target_id: str | None,
+        relationship_type: str,
+        *,
+        source_table: str | None = None,
+        target_table: str | None = None,
+        source_row_id: int | None = None,
+        target_row_id: int | None = None,
+        run_id: int | None = None,
+    ) -> None:
+        if not source_id or not target_id or source_id == target_id:
+            return
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO citation_edges
+                (source_id, target_id, relationship_type, source_table, target_table, source_row_id, target_row_id, run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (source_id, target_id, relationship_type, source_table, target_table, source_row_id, target_row_id, run_id),
+            )
+        except sqlite3.Error as e:
+            print(f"{YELLOW}[DB Manager] Warning: Failed to insert citation edge: {e}{RESET}")
 
     def _normalize_text(self, text: str | None) -> str | None:
         """Basic normalization for text fields like title and authors."""
@@ -2643,6 +2707,8 @@ class DatabaseManager:
             
         cursor = self.conn.cursor()
         stored_count = 0
+        source_openalex_id, source_doi, source_run_id = self._fetch_with_metadata_identifiers(source_work_id)
+        source_node_id = self._make_node_id(source_openalex_id, source_doi, "with_metadata", source_work_id)
         
         try:
             for ref_work in referenced_works:
@@ -2684,8 +2750,33 @@ class DatabaseManager:
                       normalized_title, normalized_authors, None, None, json.dumps(openalex_json), 
                       source_work_id, 'references'))
                 
+                target_row_id = None
                 if cursor.rowcount > 0:
                     stored_count += 1
+                    target_row_id = cursor.lastrowid
+                else:
+                    if normalized_openalex_id:
+                        cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (normalized_openalex_id,))
+                        row = cursor.fetchone()
+                        if row:
+                            target_row_id = row[0]
+                    elif normalized_doi:
+                        cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (normalized_doi,))
+                        row = cursor.fetchone()
+                        if row:
+                            target_row_id = row[0]
+
+                target_node_id = self._make_node_id(normalized_openalex_id, doi, "with_metadata", target_row_id)
+                self._insert_citation_edge(
+                    source_node_id,
+                    target_node_id,
+                    "references",
+                    source_table="with_metadata",
+                    target_table="with_metadata",
+                    source_row_id=source_work_id,
+                    target_row_id=target_row_id,
+                    run_id=source_run_id,
+                )
             
             print(f"{GREEN}[DB Manager] Added {stored_count} referenced works to with_metadata for work ID {source_work_id}{RESET}")
             return stored_count
@@ -2701,6 +2792,8 @@ class DatabaseManager:
             
         cursor = self.conn.cursor()
         stored_count = 0
+        source_openalex_id, source_doi, source_run_id = self._fetch_with_metadata_identifiers(source_work_id)
+        source_node_id = self._make_node_id(source_openalex_id, source_doi, "with_metadata", source_work_id)
         
         try:
             for citing_work in citing_works:
@@ -2742,8 +2835,33 @@ class DatabaseManager:
                       normalized_title, normalized_authors, None, None, json.dumps(openalex_json), 
                       source_work_id, 'cited_by'))
                 
+                target_row_id = None
                 if cursor.rowcount > 0:
                     stored_count += 1
+                    target_row_id = cursor.lastrowid
+                else:
+                    if normalized_openalex_id:
+                        cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (normalized_openalex_id,))
+                        row = cursor.fetchone()
+                        if row:
+                            target_row_id = row[0]
+                    elif normalized_doi:
+                        cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (normalized_doi,))
+                        row = cursor.fetchone()
+                        if row:
+                            target_row_id = row[0]
+
+                target_node_id = self._make_node_id(normalized_openalex_id, doi, "with_metadata", target_row_id)
+                self._insert_citation_edge(
+                    source_node_id,
+                    target_node_id,
+                    "cited_by",
+                    source_table="with_metadata",
+                    target_table="with_metadata",
+                    source_row_id=source_work_id,
+                    target_row_id=target_row_id,
+                    run_id=source_run_id,
+                )
             
             print(f"{GREEN}[DB Manager] Added {stored_count} citing works to with_metadata for work ID {source_work_id}{RESET}")
             return stored_count

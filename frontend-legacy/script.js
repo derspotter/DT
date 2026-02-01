@@ -1,6 +1,145 @@
+import * as d3 from 'd3';
+
 // Basic JavaScript for the Digital Library Frontend
 
 console.log("Digital Library frontend script loaded.");
+
+const GRAPH_API_URL = '/api/graph?max_nodes=200';
+const GRAPH_SAMPLE_URL = '/graph-sample.json';
+const GRAPH_COLORS = ['#2c7fb8', '#7fcdbb', '#fdae61', '#d7191c', '#8c6bb1', '#636363'];
+
+function normalizeGraphPayload(payload) {
+    if (!payload) {
+        return { nodes: [], edges: [] };
+    }
+    const nodesRaw = Array.isArray(payload.nodes) ? payload.nodes : [];
+    const edgesRaw = Array.isArray(payload.edges)
+        ? payload.edges
+        : Array.isArray(payload.links)
+            ? payload.links
+            : [];
+
+    const nodes = nodesRaw.map((node, index) => ({
+        ...node,
+        id: node.id ?? node.work_id ?? node.openalex_id ?? `node-${index}`,
+        group: node.type ?? node.source ?? 'work'
+    }));
+
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const edges = edgesRaw
+        .map((edge) => {
+            const source = edge.source?.id ?? edge.source ?? edge.from ?? edge.source_work_id;
+            const target = edge.target?.id ?? edge.target ?? edge.to ?? edge.referenced_work_id;
+            return source && target ? { ...edge, source, target } : null;
+        })
+        .filter((edge) => edge && nodeIds.has(edge.source) && nodeIds.has(edge.target));
+
+    return { nodes, edges };
+}
+
+function summarizeGraph(nodes, edges) {
+    const typeCounts = new Map();
+    nodes.forEach((node) => {
+        const key = node.group || 'work';
+        typeCounts.set(key, (typeCounts.get(key) || 0) + 1);
+    });
+    const typeSummary = Array.from(typeCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([key, count]) => `${key}: ${count}`)
+        .join(', ');
+    return {
+        totalNodes: nodes.length,
+        totalEdges: edges.length,
+        typeSummary
+    };
+}
+
+function renderGraph(container, nodes, edges) {
+    container.innerHTML = '';
+    const bounds = container.getBoundingClientRect();
+    const width = bounds.width || 800;
+    const height = bounds.height || 420;
+
+    const svg = d3
+        .select(container)
+        .append('svg')
+        .attr('width', width)
+        .attr('height', height)
+        .attr('viewBox', `0 0 ${width} ${height}`);
+
+    const graphLayer = svg.append('g');
+
+    const color = d3
+        .scaleOrdinal()
+        .domain(Array.from(new Set(nodes.map((node) => node.group))))
+        .range(GRAPH_COLORS);
+
+    const link = graphLayer
+        .append('g')
+        .attr('stroke', '#bdbdbd')
+        .attr('stroke-opacity', 0.6)
+        .selectAll('line')
+        .data(edges)
+        .join('line')
+        .attr('stroke-width', 1);
+
+    const simulation = d3
+        .forceSimulation(nodes)
+        .force(
+            'link',
+            d3.forceLink(edges).id((d) => d.id).distance(60).strength(0.5)
+        )
+        .force('charge', d3.forceManyBody().strength(-130))
+        .force('center', d3.forceCenter(width / 2, height / 2));
+
+    const drag = d3.drag()
+        .on('start', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        })
+        .on('drag', (event, d) => {
+            d.fx = event.x;
+            d.fy = event.y;
+        })
+        .on('end', (event, d) => {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        });
+
+    const node = graphLayer
+        .append('g')
+        .attr('stroke', '#fff')
+        .attr('stroke-width', 1.2)
+        .selectAll('circle')
+        .data(nodes)
+        .join('circle')
+        .attr('r', nodes.length > 150 ? 3.5 : 5)
+        .attr('fill', (d) => color(d.group))
+        .call(drag);
+
+    node.append('title').text((d) => {
+        const year = d.year ? ` (${d.year})` : '';
+        return `${d.title || d.display_name || d.id}${year}`;
+    });
+
+    simulation.on('tick', () => {
+        link
+            .attr('x1', (d) => d.source.x)
+            .attr('y1', (d) => d.source.y)
+            .attr('x2', (d) => d.target.x)
+            .attr('y2', (d) => d.target.y);
+        node.attr('cx', (d) => d.x).attr('cy', (d) => d.y);
+    });
+
+    svg.call(
+        d3.zoom().scaleExtent([0.3, 4]).on('zoom', (event) => {
+            graphLayer.attr('transform', event.transform);
+        })
+    );
+}
 
 // --- Function to render bibliography data ---
 // Moved to top level for broader scope
@@ -294,6 +433,55 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Call the initial load function
     loadInitialBibliographies();
+
+    // --- Graph UI ---
+    const graphContainer = document.getElementById('graph-canvas');
+    const graphStatus = document.getElementById('graph-status');
+    const graphStats = document.getElementById('graph-stats');
+    const graphSource = document.getElementById('graph-source');
+    const graphLoadButton = document.getElementById('graph-load');
+
+    async function loadGraphData(source) {
+        if (!graphContainer || !graphStatus || !graphStats) {
+            return;
+        }
+        graphStatus.textContent = 'Loading...';
+        graphStats.textContent = '';
+
+        const url = source === 'api' ? GRAPH_API_URL : GRAPH_SAMPLE_URL;
+        try {
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const payload = await response.json();
+            const { nodes, edges } = normalizeGraphPayload(payload);
+            if (!nodes.length) {
+                throw new Error('No nodes returned');
+            }
+            const summary = summarizeGraph(nodes, edges);
+            renderGraph(graphContainer, nodes, edges);
+            graphStatus.textContent = source === 'api' ? 'Loaded from API.' : 'Loaded sample data.';
+            graphStats.textContent = `Nodes: ${summary.totalNodes} · Edges: ${summary.totalEdges}${
+                summary.typeSummary ? ` · ${summary.typeSummary}` : ''
+            }`;
+        } catch (error) {
+            if (source === 'api') {
+                graphStatus.textContent = 'API unavailable. Falling back to sample data.';
+                await loadGraphData('sample');
+            } else {
+                graphStatus.textContent = `Failed to load graph: ${error.message}`;
+            }
+        }
+    }
+
+    if (graphLoadButton) {
+        graphLoadButton.addEventListener('click', () => {
+            const source = graphSource ? graphSource.value : 'sample';
+            loadGraphData(source);
+        });
+        loadGraphData('sample');
+    }
 
     // Handle files being selected or dropped
     function handleFiles(files) {

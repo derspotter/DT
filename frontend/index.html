@@ -1,56 +1,17 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Digital Library Frontend</title>
-    <link rel="stylesheet" href="style.css">
-</head>
-<body>
-    <header>
-        <h1>Digital Library</h1>
-    </header>
-    <main>
-        <p>Welcome to the Digital Library.</p>
-        
-        <div class="upload-container">
-            <div id="drop-zone">
-                <div class="drop-zone-content">
-                    <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='64' height='64' viewBox='0 0 24 24' fill='none' stroke='%23666' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z'%3E%3C/path%3E%3Cpolyline points='14 2 14 8 20 8'%3E%3C/polyline%3E%3Cline x1='16' y1='13' x2='8' y2='13'%3E%3C/line%3E%3Cline x1='16' y1='17' x2='8' y2='17'%3E%3C/line%3E%3Cpolyline points='10 9 9 9 8 9'%3E%3C/polyline%3E%3C/svg%3E" alt="PDF icon" class="pdf-icon">
-                    <p>Drag &amp; drop PDF files here</p>
-                    <p>or</p>
-                    <label for="file-input" class="file-input-label">Select Files</label>
-                    <input type="file" id="file-input" accept=".pdf" multiple hidden>
-                </div>
-            </div>
-        </div>
-        
-        <div class="file-list-container">
-            <h2>Uploaded Files</h2>
-            <ul id="file-list"></ul>
-        </div>
-        <div class="file-list-container">
-            <h2>Bibliography</h2>
-            <button id="consolidate-button" style="margin-left: 10px;">Consolidate Bibliographies</button>
-            <span id="consolidate-status" style="margin-left: 10px; font-style: italic;"></span>
-            <div id="bib-list" class="bibliography-output-box">
-                <!-- Bibliography entries will be populated here by script.js -->
-            </div>
-        </div>
-        <div class="file-list-container">
-            <h2>Processed Bibliographies</h2>
-            <ul id="bibliographyList"></ul>
-        </div>
-        <div class="file-list-container">
-            <h2>Server Logs</h2>
-            <div id="logOutput" style="height: 300px; overflow-y: scroll; border: 1px solid #ccc; background-color: #f8f8f8; padding: 10px; font-family: monospace; white-space: pre-wrap;">
-                Connecting to server logs...
-            </div>
-        </div>
-    </main>
-    <footer>
-        <p>&copy; 2025 Digital Library Project</p>
-    </footer>
-    <script src="script.js"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap"
+    />
+    <title>Korpus Builder</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
 </html>

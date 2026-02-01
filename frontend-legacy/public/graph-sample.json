@@ -1,0 +1,17 @@
+{
+  "nodes": [
+    { "id": "W1", "title": "The New Institutional Economics", "year": 2002, "type": "book-chapter" },
+    { "id": "W2", "title": "The Nature of the Firm", "year": 1937, "type": "journal-article" },
+    { "id": "W3", "title": "The Problem of Social Cost", "year": 1960, "type": "journal-article" },
+    { "id": "W4", "title": "Markets and Hierarchies", "year": 1975, "type": "book" },
+    { "id": "W5", "title": "Transaction Cost Economics", "year": 1985, "type": "journal-article" },
+    { "id": "W6", "title": "Institutions, Institutional Change and Economic Performance", "year": 1990, "type": "book" }
+  ],
+  "edges": [
+    { "source": "W1", "target": "W2" },
+    { "source": "W1", "target": "W3" },
+    { "source": "W4", "target": "W2" },
+    { "source": "W5", "target": "W4" },
+    { "source": "W6", "target": "W3" }
+  ]
+}
