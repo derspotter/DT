@@ -2,6 +2,7 @@ import argparse
 import json
 import sqlite3
 import os
+import re
 
 STUB_GRAPH = {
     'nodes': [
@@ -12,6 +13,20 @@ STUB_GRAPH = {
         { 'source': 'W2175056322', 'target': 'W2015930340', 'relationship_type': 'references' },
     ],
 }
+
+def normalize_openalex_id(value):
+    if not value:
+        return None
+    match = re.search(r"(W\\d+)", str(value), re.IGNORECASE)
+    return match.group(1).upper() if match else None
+
+def normalize_doi(value):
+    if not value:
+        return None
+    match = re.search(r"(10\\.\\d{4,9}/[-._;()/:A-Z0-9]+)", str(value), re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return str(value).upper()
 
 
 def main():
@@ -53,7 +68,7 @@ def main():
         return row is not None
 
     def add_node(table, row, status):
-        raw_id = row.get('openalex_id') or row.get('doi') or f"{table}:{row.get('id')}"
+        raw_id = normalize_openalex_id(row.get('openalex_id')) or normalize_doi(row.get('doi')) or f"{table}:{row.get('id')}"
         node_key = f"{table}:{row.get('id')}"
         if node_key in node_map:
             return node_map[node_key]
@@ -92,7 +107,8 @@ def main():
 
     wanted_ids = None
     edge_rows = []
-    if has_table("citation_edges"):
+    use_edge_table = False
+    if has_table("citation_edges") and args.status in ("all", "with_metadata"):
         try:
             raw_edges = conn.execute(
                 "SELECT source_id, target_id, relationship_type FROM citation_edges"
@@ -101,7 +117,8 @@ def main():
             raw_edges = []
 
         if raw_edges:
-            wanted_ids = set()
+            degree_counts = {}
+            filtered_edges = []
             for row in raw_edges:
                 rel = row["relationship_type"]
                 if args.relationship != "both" and rel != args.relationship:
@@ -110,61 +127,123 @@ def main():
                 target_id = row["target_id"]
                 if source_id == target_id:
                     continue
-                if len(wanted_ids) < args.max_nodes:
-                    wanted_ids.add(source_id)
-                if len(wanted_ids) < args.max_nodes:
-                    wanted_ids.add(target_id)
-                if source_id in wanted_ids and target_id in wanted_ids:
-                    edge_rows.append({
-                        "source": source_id,
-                        "target": target_id,
-                        "relationship_type": rel,
-                    })
+                filtered_edges.append((source_id, target_id, rel))
+                degree_counts[source_id] = degree_counts.get(source_id, 0) + 1
+                degree_counts[target_id] = degree_counts.get(target_id, 0) + 1
 
-    all_rows = []
-    for table, status in tables:
-        try:
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
-        except sqlite3.Error:
-            continue
-        for row in rows:
+            if filtered_edges:
+                adjacency = {}
+                for source_id, target_id, rel in filtered_edges:
+                    adjacency.setdefault(source_id, set()).add(target_id)
+                    adjacency.setdefault(target_id, set()).add(source_id)
+
+                top_nodes = sorted(
+                    degree_counts.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+                seed_count = max(5, min(50, max(1, args.max_nodes // 10)))
+                wanted_ids = set()
+                queue = []
+                for node_id, _count in top_nodes[:seed_count]:
+                    if node_id in wanted_ids:
+                        continue
+                    wanted_ids.add(node_id)
+                    queue.append(node_id)
+
+                queue_index = 0
+                while queue_index < len(queue) and len(wanted_ids) < args.max_nodes:
+                    current = queue[queue_index]
+                    queue_index += 1
+                    for neighbor in adjacency.get(current, []):
+                        if neighbor in wanted_ids:
+                            continue
+                        wanted_ids.add(neighbor)
+                        queue.append(neighbor)
+                        if len(wanted_ids) >= args.max_nodes:
+                            break
+
+                for source_id, target_id, rel in filtered_edges:
+                    if source_id in wanted_ids and target_id in wanted_ids:
+                        edge_rows.append({
+                            "source": source_id,
+                            "target": target_id,
+                            "relationship_type": rel,
+                        })
+                if wanted_ids:
+                    use_edge_table = True
+
+    if use_edge_table:
+        meta_rows = conn.execute(
+            "SELECT id, title, year, type, openalex_id, doi FROM with_metadata"
+        ).fetchall()
+        meta_by_id = {}
+        for row in meta_rows:
+            norm_openalex = normalize_openalex_id(row["openalex_id"])
+            norm_doi = normalize_doi(row["doi"])
+            if norm_openalex:
+                meta_by_id[norm_openalex] = row
+            if norm_doi:
+                meta_by_id[norm_doi] = row
+
+        for node_id in sorted(wanted_ids):
+            meta = meta_by_id.get(node_id)
+            node = {
+                "id": node_id,
+                "title": meta["title"] if meta else node_id,
+                "year": meta["year"] if meta else None,
+                "type": meta["type"] if meta else None,
+                "status": "with_metadata" if meta else "unknown",
+            }
+            nodes.append(node)
+            node_by_id[node_id] = node
+
+        edges = edge_rows
+    else:
+        all_rows = []
+        for table, status in tables:
+            try:
+                rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            except sqlite3.Error:
+                continue
+            for row in rows:
+                if len(nodes) >= args.max_nodes:
+                    break
+                data = dict(row)
+                if not include_row(data):
+                    continue
+                raw_id = normalize_openalex_id(data.get("openalex_id")) or normalize_doi(data.get("doi")) or f"{table}:{data.get('id')}"
+                if wanted_ids is not None and raw_id not in wanted_ids:
+                    continue
+                all_rows.append((table, status, data))
+                add_node(table, data, status)
             if len(nodes) >= args.max_nodes:
                 break
-            data = dict(row)
-            if not include_row(data):
-                continue
-            raw_id = data.get("openalex_id") or data.get("doi") or f"{table}:{data.get('id')}"
-            if wanted_ids is not None and raw_id not in wanted_ids:
-                continue
-            all_rows.append((table, status, data))
-            add_node(table, data, status)
-        if len(nodes) >= args.max_nodes:
-            break
 
-    if edge_rows:
-        edges = [
-            edge for edge in edge_rows
-            if edge["source"] in node_by_id and edge["target"] in node_by_id
-        ]
-    else:
-        for table, _status, data in all_rows:
-            node_id = node_map.get(f"{table}:{data.get('id')}")
-            if not node_id:
-                continue
-            source_work_id = data.get('source_work_id')
-            if not source_work_id:
-                continue
-            source_node = node_map.get(f"{table}:{source_work_id}")
-            if not source_node:
-                continue
-            relationship_type = data.get('relationship_type') or 'references'
-            if args.relationship != 'both' and relationship_type != args.relationship:
-                continue
-            edges.append({
-                'source': source_node,
-                'target': node_id,
-                'relationship_type': relationship_type,
-            })
+        if edge_rows:
+            edges = [
+                edge for edge in edge_rows
+                if edge["source"] in node_by_id and edge["target"] in node_by_id
+            ]
+        else:
+            for table, _status, data in all_rows:
+                node_id = node_map.get(f"{table}:{data.get('id')}")
+                if not node_id:
+                    continue
+                source_work_id = data.get('source_work_id')
+                if not source_work_id:
+                    continue
+                source_node = node_map.get(f"{table}:{source_work_id}")
+                if not source_node:
+                    continue
+                relationship_type = data.get('relationship_type') or 'references'
+                if args.relationship != 'both' and relationship_type != args.relationship:
+                    continue
+                edges.append({
+                    'source': source_node,
+                    'target': node_id,
+                    'relationship_type': relationship_type,
+                })
 
     conn.close()
 

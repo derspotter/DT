@@ -103,6 +103,8 @@ class PipelineOrchestrator:
                 - fetch_references: bool (default True)
                 - fetch_citations: bool (default False)
                 - max_citations: int (default 100)
+                - related_depth: int (default 2)
+                - max_related: int (default 40)
                 - move_on_complete: bool (default False)
                 - completed_folder: str (default "completed")
                 - failed_folder: str (default "failed")
@@ -115,6 +117,8 @@ class PipelineOrchestrator:
         fetch_references = options.get('fetch_references', True)
         fetch_citations = options.get('fetch_citations', False)
         max_citations = options.get('max_citations', 100)
+        related_depth = options.get('related_depth', 2)
+        max_related = options.get('max_related', 40)
         move_on_complete = options.get('move_on_complete', False)
         completed_folder = options.get('completed_folder', 'completed')
         failed_folder = options.get('failed_folder', 'failed')
@@ -209,7 +213,9 @@ class PipelineOrchestrator:
                             self.rate_limiter,
                             fetch_references=fetch_references,
                             fetch_citations=fetch_citations,
-                            max_citations=max_citations
+                            max_citations=max_citations,
+                            related_depth=related_depth,
+                            max_related_per_reference=max_related,
                         )
                         if result:
                             enriched_count += 1
@@ -455,6 +461,8 @@ def run_pipeline(
     fetch_references: bool = True,
     fetch_citations: bool = False,
     max_citations: int = 100,
+    related_depth: int = 2,
+    max_related: int = 40,
     max_ref_pages: int | None = None,
     max_entries: int | None = None,
     run_enrichment: bool = True,
@@ -503,6 +511,8 @@ def run_pipeline(
             "fetch_references": fetch_references,
             "fetch_citations": fetch_citations,
             "max_citations": max_citations,
+            "related_depth": related_depth,
+            "max_related": max_related,
             "max_ref_pages": max_ref_pages,
             "max_entries": max_entries,
             "run_enrichment": run_enrichment,
@@ -631,10 +641,17 @@ def run_pipeline(
                         fetch_references=fetch_references,
                         fetch_citations=fetch_citations,
                         max_citations=max_citations,
+                        related_depth=related_depth,
+                        max_related_per_reference=max_related,
                     )
 
                     if enriched_data:
-                        new_id, err = db_manager.promote_to_with_metadata(entry_id, enriched_data)
+                        new_id, err = db_manager.promote_to_with_metadata(
+                            entry_id,
+                            enriched_data,
+                            expand_related=related_depth > 1,
+                            max_related_per_source=max_related,
+                        )
                         if new_id:
                             summary["enriched_promoted"] += 1
                             with_metadata_ids.append(new_id)

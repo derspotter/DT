@@ -102,7 +102,7 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max
     print(f"Finished fetching citing works. Found {len(citing_work_ids)}")
     return citing_work_ids
 
-def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spott@wzb.eu"):
+def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spott@wzb.eu", include_links: bool = False):
     """
     Fetches detailed metadata for a list of referenced work OpenAlex IDs.
     Uses batch requests to efficiently get details for multiple works.
@@ -130,7 +130,10 @@ def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spo
             
         # Create pipe-separated query for batch request
         ids_query = "|".join(work_ids)
-        url = f"https://api.openalex.org/works?filter=openalex_id:{ids_query}&select=id,title,display_name,authorships,publication_year,doi,type&per-page=50&mailto={mailto}"
+        select_fields = "id,title,display_name,authorships,publication_year,doi,type"
+        if include_links:
+            select_fields += ",referenced_works,cited_by_api_url"
+        url = f"https://api.openalex.org/works?filter=openalex_id:{ids_query}&select={select_fields}&per-page=50&mailto={mailto}"
         
         try:
             rate_limiter.wait_if_needed('openalex')
@@ -146,8 +149,11 @@ def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spo
                     'authors': [a.get('author', {}).get('display_name') for a in work.get('authorships', [])],
                     'year': work.get("publication_year"),
                     'doi': work.get("doi"),
-                    'type': work.get("type")
+                    'type': work.get("type"),
                 }
+                if include_links:
+                    work_details['referenced_works'] = work.get("referenced_works") or []
+                    work_details['cited_by_api_url'] = work.get("cited_by_api_url")
                 referenced_works.append(work_details)
                 
         except requests.exceptions.RequestException as e:
@@ -693,7 +699,16 @@ def _build_enrichment_payload(ref, best_result):
     }
 
 
-def process_single_reference(ref, searcher, rate_limiter, fetch_references=True, fetch_citations=False, max_citations=100):
+def process_single_reference(
+    ref,
+    searcher,
+    rate_limiter,
+    fetch_references=True,
+    fetch_citations=False,
+    max_citations=100,
+    related_depth: int = 1,
+    max_related_per_reference: int = 40,
+):
     """Process a single reference to find its OpenAlex entry and potentially citing works."""
     title = ref.get('title')
     year = ref.get('year')
@@ -724,8 +739,17 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
             final_enrichment = _build_enrichment_payload(ref, best_result)
             
             # Fetch related works if requested
-            final_enrichment = _fetch_related_works(final_enrichment, best_result, searcher, rate_limiter, 
-                                                  fetch_references, fetch_citations, max_citations)
+            final_enrichment = _fetch_related_works(
+                final_enrichment,
+                best_result,
+                searcher,
+                rate_limiter,
+                fetch_references,
+                fetch_citations,
+                max_citations,
+                related_depth=related_depth,
+                max_related_per_reference=max_related_per_reference,
+            )
             return final_enrichment
         else:
             print(f"DOI search failed or no results, proceeding with regular search")
@@ -818,15 +842,41 @@ def process_single_reference(ref, searcher, rate_limiter, fetch_references=True,
             final_enrichment = _build_enrichment_payload(ref, best_result)
             
             # Fetch related works if requested
-            final_enrichment = _fetch_related_works(final_enrichment, best_result, searcher, rate_limiter, 
-                                                  fetch_references, fetch_citations, max_citations)
+            final_enrichment = _fetch_related_works(
+                final_enrichment,
+                best_result,
+                searcher,
+                rate_limiter,
+                fetch_references,
+                fetch_citations,
+                max_citations,
+                related_depth=related_depth,
+                max_related_per_reference=max_related_per_reference,
+            )
             return final_enrichment
 
     # If no high-confidence match is found or no results at all, return None.
     return None
 
-def _fetch_related_works(enrichment_data, openalex_result, searcher, rate_limiter, 
-                        fetch_references=True, fetch_citations=False, max_citations=100):
+def _normalize_openalex_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    if value.startswith("http"):
+        return value.rstrip("/").split("/")[-1]
+    return value
+
+
+def _fetch_related_works(
+    enrichment_data,
+    openalex_result,
+    searcher,
+    rate_limiter,
+    fetch_references=True,
+    fetch_citations=False,
+    max_citations=100,
+    related_depth: int = 1,
+    max_related_per_reference: int = 40,
+):
     """Helper function to fetch referenced works and citing works for an enriched entry."""
     
     # Initialize related works fields
@@ -839,8 +889,51 @@ def _fetch_related_works(enrichment_data, openalex_result, searcher, rate_limite
         enrichment_data['referenced_works'] = fetch_referenced_work_details(
             openalex_result['referenced_works'], 
             rate_limiter,
-            searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1]
+            searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
+            include_links=related_depth > 1,
         )
+
+        if related_depth > 1 and enrichment_data['referenced_works']:
+            ref_map: dict[str, list[str]] = {}
+            secondary_ids: set[str] = set()
+            for ref in enrichment_data['referenced_works']:
+                ref_id = _normalize_openalex_id(ref.get('openalex_id'))
+                if not ref_id:
+                    continue
+                raw_ids = ref.get('referenced_works') or []
+                cleaned_ids = []
+                for item in raw_ids:
+                    if isinstance(item, str):
+                        cleaned_ids.append(_normalize_openalex_id(item))
+                    elif isinstance(item, dict) and item.get('id'):
+                        cleaned_ids.append(_normalize_openalex_id(item.get('id')))
+                cleaned_ids = [cid for cid in cleaned_ids if cid]
+                if max_related_per_reference:
+                    cleaned_ids = cleaned_ids[:max_related_per_reference]
+                if not cleaned_ids:
+                    continue
+                ref_map[ref_id] = cleaned_ids
+                secondary_ids.update(cleaned_ids)
+
+            if secondary_ids:
+                secondary_details = fetch_referenced_work_details(
+                    list(secondary_ids),
+                    rate_limiter,
+                    searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
+                    include_links=False,
+                )
+                detail_map = {
+                    _normalize_openalex_id(item.get('openalex_id')): item for item in secondary_details
+                }
+                for ref in enrichment_data['referenced_works']:
+                    ref_id = _normalize_openalex_id(ref.get('openalex_id'))
+                    if not ref_id or ref_id not in ref_map:
+                        continue
+                    ref['referenced_works_expanded'] = [
+                        detail_map[child_id]
+                        for child_id in ref_map[ref_id]
+                        if child_id in detail_map
+                    ]
     
     # Fetch citing works if requested
     if fetch_citations and openalex_result.get('cited_by_api_url'):

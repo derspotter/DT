@@ -544,10 +544,12 @@ def extract_bib_api_command(input_path, db_path, workers):
 @click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works during enrichment.')
 @click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works during enrichment.')
 @click.option('--max-citations', default=100, show_default=True, help='Maximum citing works to fetch per paper.')
+@click.option('--related-depth', default=2, show_default=True, help='Reference expansion depth (1 = direct refs only).')
+@click.option('--max-related', default=40, show_default=True, help='Max nested references per work when depth > 1.')
 @click.option('--max-ref-pages', type=int, default=None, help='Limit the number of extracted reference pages per PDF.')
 @click.option('--max-entries', type=int, default=None, help='Limit the number of extracted entries processed per run.')
 @click.option('--enrich/--no-enrich', default=True, show_default=True, help='Run OpenAlex/Crossref enrichment after insertion.')
-def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, queue_batch, mailto, fetch_references, fetch_citations, max_citations, max_ref_pages, max_entries, enrich):
+def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, queue_batch, mailto, fetch_references, fetch_citations, max_citations, related_depth, max_related, max_ref_pages, max_entries, enrich):
     """Run extract → enrich → queue pipeline for PDFs (no download step)."""
     try:
         from .pipeline import run_pipeline
@@ -563,6 +565,8 @@ def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, 
             fetch_references=fetch_references,
             fetch_citations=fetch_citations,
             max_citations=max_citations,
+            related_depth=related_depth,
+            max_related=max_related,
             max_ref_pages=max_ref_pages,
             max_entries=max_entries,
             run_enrichment=enrich,
@@ -666,7 +670,9 @@ def keyword_search_command(query, max_results, year_from, year_to, field, mailto
 @click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works for enriched papers.')
 @click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works for enriched papers (API intensive).')
 @click.option('--max-citations', default=100, show_default=True, help='Maximum number of citing works to fetch per paper.')
-def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fetch_citations, max_citations):
+@click.option('--related-depth', default=2, show_default=True, help='Reference expansion depth (1 = direct refs only).')
+@click.option('--max-related', default=40, show_default=True, help='Max nested references per work when depth > 1.')
+def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fetch_citations, max_citations, related_depth, max_related):
     """Fetches metadata from OpenAlex/Crossref for entries in the no_metadata table."""
     click.echo(f"Starting DB enrichment – DB: {db_path} | Batch: {batch_size}")
     db_manager = DatabaseManager(db_path)
@@ -704,14 +710,23 @@ def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fe
 
             # Use the powerful multi-step search process with related works options
             enriched_data = process_single_reference(
-                ref_for_scraper, searcher, rate_limiter, 
+                ref_for_scraper,
+                searcher,
+                rate_limiter,
                 fetch_references=fetch_references,
                 fetch_citations=fetch_citations,
-                max_citations=max_citations
+                max_citations=max_citations,
+                related_depth=related_depth,
+                max_related_per_reference=max_related,
             )
             
             if enriched_data:
-                db_manager.promote_to_with_metadata(entry['id'], enriched_data)
+                db_manager.promote_to_with_metadata(
+                    entry['id'],
+                    enriched_data,
+                    expand_related=related_depth > 1,
+                    max_related_per_source=max_related,
+                )
                 promoted_count += 1
                 click.echo(f"  -> metadata found, promoted to with_metadata.")
                 # Pretty print the enriched data for immediate review
@@ -1207,6 +1222,75 @@ def process_pdf_command(pdf_path, fetch_references, fetch_citations, max_citatio
         import traceback
         traceback.print_exc()
 
+
+@cli.command("expand-openalex-links")
+@click.option("--db-path", default=str(DEFAULT_DB_PATH), show_default=True, help="Path to the SQLite database.")
+@click.option("--mailto", required=True, help="Email address for OpenAlex API politeness.")
+@click.option("--limit", default=50, show_default=True, help="Maximum number of works to expand.")
+@click.option("--offset", default=0, show_default=True, help="Offset into the with_metadata table.")
+@click.option(
+    "--include-related/--primary-only",
+    default=False,
+    show_default=True,
+    help="Include related works (references/cited_by) as expansion targets.",
+)
+@click.option(
+    "--fetch-references/--no-fetch-references",
+    default=True,
+    show_default=True,
+    help="Fetch referenced works for each target.",
+)
+@click.option(
+    "--fetch-citations/--no-fetch-citations",
+    default=False,
+    show_default=True,
+    help="Fetch citing works for each target.",
+)
+@click.option("--max-citations", default=50, show_default=True, help="Max citing works per target.")
+@click.option("--force", is_flag=True, help="Re-fetch even if citation edges already exist.")
+@click.option(
+    "--update-openalex-json/--no-update-openalex-json",
+    default=True,
+    show_default=True,
+    help="Persist refreshed OpenAlex JSON on the source work.",
+)
+def expand_openalex_links(
+    db_path,
+    mailto,
+    limit,
+    offset,
+    include_related,
+    fetch_references,
+    fetch_citations,
+    max_citations,
+    force,
+    update_openalex_json,
+):
+    """Expand graph links by fetching references/citations for works already in the database."""
+    from .expand_openalex import expand_openalex_links as expand_links
+
+    stats = expand_links(
+        db_path=db_path,
+        mailto=mailto,
+        limit=limit,
+        offset=offset,
+        include_related=include_related,
+        fetch_references=fetch_references,
+        fetch_citations=fetch_citations,
+        max_citations=max_citations,
+        force=force,
+        update_openalex_json=update_openalex_json,
+    )
+
+    click.echo(f"{CYAN}Expansion complete{RESET}")
+    click.echo(f"  Processed: {stats.processed}")
+    click.echo(f"  Skipped (existing): {stats.skipped_existing}")
+    click.echo(f"  Skipped (invalid): {stats.skipped_invalid}")
+    click.echo(f"  Fetched: {stats.fetched}")
+    click.echo(f"  Added refs: {stats.added_refs}")
+    click.echo(f"  Added citations: {stats.added_citations}")
+    click.echo(f"  Errors: {stats.errors}")
+
 @cli.command("process-folder")
 @click.argument('folder_path', type=click.Path(exists=True))
 @click.option('--watch/--no-watch', default=False,
@@ -1219,10 +1303,12 @@ def process_pdf_command(pdf_path, fetch_references, fetch_citations, max_citatio
               help='Fetch citing works for enriched papers.')
 @click.option('--max-citations', default=100, type=int,
               help='Maximum number of citing works to fetch per paper.')
+@click.option('--related-depth', default=2, show_default=True, help='Reference expansion depth (1 = direct refs only).')
+@click.option('--max-related', default=40, show_default=True, help='Max nested references per work when depth > 1.')
 @click.option('--db-path', default=str(DEFAULT_DB_PATH),
               help='Path to the SQLite database file.')
 def process_folder_command(folder_path, watch, interval, fetch_references, 
-                          fetch_citations, max_citations, db_path):
+                          fetch_citations, max_citations, related_depth, max_related, db_path):
     """Process all PDFs in a folder (optionally with continuous watching)."""
     from .pipeline import PipelineOrchestrator
     
@@ -1231,6 +1317,8 @@ def process_folder_command(folder_path, watch, interval, fetch_references,
         'fetch_references': fetch_references,
         'fetch_citations': fetch_citations,
         'max_citations': max_citations,
+        'related_depth': related_depth,
+        'max_related': max_related,
         'move_on_complete': watch,  # Only move files when watching
         'completed_folder': 'completed',
         'failed_folder': 'failed'

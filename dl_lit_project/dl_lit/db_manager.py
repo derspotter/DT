@@ -703,9 +703,9 @@ class DatabaseManager:
         source_row_id: int | None = None,
         target_row_id: int | None = None,
         run_id: int | None = None,
-    ) -> None:
+    ) -> bool:
         if not source_id or not target_id or source_id == target_id:
-            return
+            return False
         cursor = self.conn.cursor()
         try:
             cursor.execute(
@@ -716,8 +716,10 @@ class DatabaseManager:
                 """,
                 (source_id, target_id, relationship_type, source_table, target_table, source_row_id, target_row_id, run_id),
             )
+            return cursor.rowcount > 0
         except sqlite3.Error as e:
             print(f"{YELLOW}[DB Manager] Warning: Failed to insert citation edge: {e}{RESET}")
+            return False
 
     def _normalize_text(self, text: str | None) -> str | None:
         """Basic normalization for text fields like title and authors."""
@@ -1688,7 +1690,14 @@ class DatabaseManager:
             )
         return result
 
-    def promote_to_with_metadata(self, no_meta_id: int, enrichment: dict) -> tuple[int | None, str | None]:
+    def promote_to_with_metadata(
+        self,
+        no_meta_id: int,
+        enrichment: dict,
+        *,
+        expand_related: bool = False,
+        max_related_per_source: int = 40,
+    ) -> tuple[int | None, str | None]:
         """Move a row from ``no_metadata`` to ``with_metadata`` adding enrichment.
 
         Args:
@@ -1783,7 +1792,12 @@ class DatabaseManager:
             
             # Store related works as separate entries in with_metadata table
             if enrichment.get('referenced_works'):
-                self.add_referenced_works_to_with_metadata(new_id, enrichment['referenced_works'])
+                self.add_referenced_works_to_with_metadata(
+                    new_id,
+                    enrichment['referenced_works'],
+                    expand_related=expand_related,
+                    max_related_per_source=max_related_per_source,
+                )
             
             if enrichment.get('citing_works'):
                 self.add_citing_works_to_with_metadata(new_id, enrichment['citing_works'])
@@ -2700,74 +2714,102 @@ class DatabaseManager:
             msg += f" (matched on {matched_field})"
         return True, msg
 
-    def add_referenced_works_to_with_metadata(self, source_work_id: int, referenced_works: list) -> int:
+    def add_referenced_works_to_with_metadata(
+        self,
+        source_work_id: int,
+        referenced_works: list,
+        *,
+        expand_related: bool = False,
+        max_related_per_source: int = 40,
+    ) -> int:
         """Add referenced works as separate entries in the with_metadata table."""
         if not referenced_works:
             return 0
             
         cursor = self.conn.cursor()
         stored_count = 0
+        edge_count = 0
         source_openalex_id, source_doi, source_run_id = self._fetch_with_metadata_identifiers(source_work_id)
         source_node_id = self._make_node_id(source_openalex_id, source_doi, "with_metadata", source_work_id)
         
+        def _insert_related_work(ref_work: dict, parent_work_id: int, relationship: str) -> tuple[int | None, str | None, str | None]:
+            title = ref_work.get('title')
+            if not title:
+                return None, None, None
+
+            authors_json = json.dumps(ref_work.get('authors', [])) if ref_work.get('authors') else None
+            year = ref_work.get('year')
+            doi = ref_work.get('doi')
+            openalex_id = ref_work.get('openalex_id')
+            normalized_doi = self._normalize_doi(doi)
+            normalized_openalex_id = self._normalize_openalex_id(openalex_id)
+            normalized_title = self._normalize_text(title)
+            normalized_authors = self._normalize_text(str(ref_work.get('authors', [])))
+
+            openalex_json = {
+                'id': openalex_id,
+                'title': title,
+                'display_name': title,
+                'authorships': [{'author': {'display_name': author}} for author in ref_work.get('authors', [])],
+                'publication_year': year,
+                'doi': doi,
+                'type': ref_work.get('type'),
+            }
+
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO with_metadata
+                (source_pdf, title, authors, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors,
+                 abstract, crossref_json, openalex_json, source_work_id, relationship_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    None,
+                    title,
+                    authors_json,
+                    year,
+                    doi,
+                    normalized_doi,
+                    normalized_openalex_id,
+                    normalized_title,
+                    normalized_authors,
+                    None,
+                    None,
+                    json.dumps(openalex_json),
+                    parent_work_id,
+                    relationship,
+                ),
+            )
+
+            target_row_id = None
+            if cursor.rowcount > 0:
+                target_row_id = cursor.lastrowid
+            else:
+                if normalized_openalex_id:
+                    cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (normalized_openalex_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        target_row_id = row[0]
+                elif normalized_doi:
+                    cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (normalized_doi,))
+                    row = cursor.fetchone()
+                    if row:
+                        target_row_id = row[0]
+            return target_row_id, normalized_openalex_id, doi
+
         try:
             for ref_work in referenced_works:
                 if not isinstance(ref_work, dict):
                     continue
-                    
-                # Extract relevant fields from the referenced work
-                title = ref_work.get('title')
-                if not title:
-                    continue
-                    
-                authors_json = json.dumps(ref_work.get('authors', [])) if ref_work.get('authors') else None
-                year = ref_work.get('year')
-                doi = ref_work.get('doi')
-                openalex_id = ref_work.get('openalex_id')
-                normalized_doi = self._normalize_doi(doi)
-                normalized_openalex_id = self._normalize_openalex_id(openalex_id)
-                normalized_title = self._normalize_text(title)
-                normalized_authors = self._normalize_text(str(ref_work.get('authors', [])))
-                
-                # Create a mock OpenAlex JSON entry for the referenced work
-                openalex_json = {
-                    'id': openalex_id,
-                    'title': title,
-                    'display_name': title,
-                    'authorships': [{'author': {'display_name': author}} for author in ref_work.get('authors', [])],
-                    'publication_year': year,
-                    'doi': doi,
-                    'type': ref_work.get('type')
-                }
-                
-                # Insert into with_metadata table with relationship info
-                cursor.execute("""
-                    INSERT OR IGNORE INTO with_metadata 
-                    (source_pdf, title, authors, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, 
-                     abstract, crossref_json, openalex_json, source_work_id, relationship_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (None, title, authors_json, year, doi, normalized_doi, normalized_openalex_id, 
-                      normalized_title, normalized_authors, None, None, json.dumps(openalex_json), 
-                      source_work_id, 'references'))
-                
-                target_row_id = None
-                if cursor.rowcount > 0:
+
+                target_row_id, normalized_openalex_id, doi = _insert_related_work(
+                    ref_work, source_work_id, "references"
+                )
+                if target_row_id:
                     stored_count += 1
-                    target_row_id = cursor.lastrowid
-                else:
-                    if normalized_openalex_id:
-                        cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (normalized_openalex_id,))
-                        row = cursor.fetchone()
-                        if row:
-                            target_row_id = row[0]
-                    elif normalized_doi:
-                        cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (normalized_doi,))
-                        row = cursor.fetchone()
-                        if row:
-                            target_row_id = row[0]
 
                 target_node_id = self._make_node_id(normalized_openalex_id, doi, "with_metadata", target_row_id)
-                self._insert_citation_edge(
+                if self._insert_citation_edge(
                     source_node_id,
                     target_node_id,
                     "references",
@@ -2776,9 +2818,37 @@ class DatabaseManager:
                     source_row_id=source_work_id,
                     target_row_id=target_row_id,
                     run_id=source_run_id,
-                )
+                ):
+                    edge_count += 1
+
+                if (
+                    expand_related
+                    and target_row_id
+                    and ref_work.get("referenced_works_expanded")
+                ):
+                    child_source_node_id = self._make_node_id(
+                        normalized_openalex_id, doi, "with_metadata", target_row_id
+                    )
+                    for child in ref_work.get("referenced_works_expanded", [])[:max_related_per_source]:
+                        child_row_id, child_openalex_id, child_doi = _insert_related_work(
+                            child, target_row_id, "references"
+                        )
+                        child_node_id = self._make_node_id(
+                            child_openalex_id, child_doi, "with_metadata", child_row_id
+                        )
+                        if self._insert_citation_edge(
+                            child_source_node_id,
+                            child_node_id,
+                            "references",
+                            source_table="with_metadata",
+                            target_table="with_metadata",
+                            source_row_id=target_row_id,
+                            target_row_id=child_row_id,
+                            run_id=source_run_id,
+                        ):
+                            edge_count += 1
             
-            print(f"{GREEN}[DB Manager] Added {stored_count} referenced works to with_metadata for work ID {source_work_id}{RESET}")
+            print(f"{GREEN}[DB Manager] Added {stored_count} referenced works and {edge_count} edges for work ID {source_work_id}{RESET}")
             return stored_count
             
         except sqlite3.Error as e:
@@ -2792,6 +2862,7 @@ class DatabaseManager:
             
         cursor = self.conn.cursor()
         stored_count = 0
+        edge_count = 0
         source_openalex_id, source_doi, source_run_id = self._fetch_with_metadata_identifiers(source_work_id)
         source_node_id = self._make_node_id(source_openalex_id, source_doi, "with_metadata", source_work_id)
         
@@ -2852,7 +2923,7 @@ class DatabaseManager:
                             target_row_id = row[0]
 
                 target_node_id = self._make_node_id(normalized_openalex_id, doi, "with_metadata", target_row_id)
-                self._insert_citation_edge(
+                if self._insert_citation_edge(
                     source_node_id,
                     target_node_id,
                     "cited_by",
@@ -2861,14 +2932,79 @@ class DatabaseManager:
                     source_row_id=source_work_id,
                     target_row_id=target_row_id,
                     run_id=source_run_id,
-                )
+                ):
+                    edge_count += 1
             
-            print(f"{GREEN}[DB Manager] Added {stored_count} citing works to with_metadata for work ID {source_work_id}{RESET}")
+            print(f"{GREEN}[DB Manager] Added {stored_count} citing works and {edge_count} edges for work ID {source_work_id}{RESET}")
             return stored_count
             
         except sqlite3.Error as e:
             print(f"{RED}[DB Manager] Error adding citing works to with_metadata: {e}{RESET}")
             return 0
+
+    def backfill_citation_edges(
+        self,
+        *,
+        source_table: str = "with_metadata",
+        limit: int | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Populate citation_edges from existing relationship rows."""
+        if source_table != "with_metadata":
+            raise ValueError("Only with_metadata backfill is supported currently.")
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, openalex_id, doi, run_id FROM with_metadata")
+        row_map = {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+
+        cursor.execute(
+            "SELECT id, source_work_id, relationship_type, openalex_id, doi, run_id "
+            "FROM with_metadata WHERE source_work_id IS NOT NULL"
+        )
+        rows = cursor.fetchall()
+        if limit is not None:
+            rows = rows[:limit]
+
+        inserted = 0
+        skipped = 0
+        for row_id, source_work_id, relationship_type, openalex_id, doi, run_id in rows:
+            source_info = row_map.get(source_work_id)
+            if not source_info:
+                skipped += 1
+                continue
+            source_openalex, source_doi, source_run_id = source_info
+            source_node_id = self._make_node_id(source_openalex, source_doi, "with_metadata", source_work_id)
+            target_node_id = self._make_node_id(openalex_id, doi, "with_metadata", row_id)
+            rel = relationship_type or "references"
+            if dry_run:
+                if source_node_id and target_node_id and source_node_id != target_node_id:
+                    inserted += 1
+                else:
+                    skipped += 1
+                continue
+
+            if self._insert_citation_edge(
+                source_node_id,
+                target_node_id,
+                rel,
+                source_table="with_metadata",
+                target_table="with_metadata",
+                source_row_id=source_work_id,
+                target_row_id=row_id,
+                run_id=source_run_id or run_id,
+            ):
+                inserted += 1
+            else:
+                skipped += 1
+
+        if not dry_run:
+            self.conn.commit()
+
+        return {
+            "rows_seen": len(rows),
+            "edges_inserted": inserted,
+            "edges_skipped": skipped,
+        }
 
 if __name__ == '__main__':
     # Example usage: Initialize and create DB if run directly

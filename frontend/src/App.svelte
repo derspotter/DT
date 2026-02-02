@@ -52,11 +52,12 @@
   let graphEdges = []
   let graphStats = null
   let graphRelationship = 'both'
-  let graphStatusFilter = 'with_metadata'
+  let graphStatusFilter = 'all'
   let graphYearFrom = ''
   let graphYearTo = ''
   let graphMaxNodes = 200
   let graphHideIsolates = true
+  let graphFocusConnected = true
   let hoveredNodeId = null
   let graphLayout = []
   let graphNodeMap = new Map()
@@ -195,7 +196,10 @@
     graphStatus = source === 'api' ? 'Loaded from API.' : 'Sample graph loaded.'
     const degreeMap = buildDegreeMap(graphNodes, graphEdges)
     graphDegreeMap = degreeMap
-    graphLayout = buildGraphLayout(graphNodes, graphEdges, degreeMap)
+    const { layoutEdges } = buildLayoutEdges(graphNodes, graphEdges, degreeMap)
+    graphLayout = buildGraphLayout(graphNodes, graphEdges, layoutEdges, degreeMap, {
+      focusConnected: graphFocusConnected,
+    })
     graphNodeMap = new Map(graphLayout.map((node) => [node.id, node]))
     graphCanvasSize = graphLayout[0]?.canvasSize || 440
     graphViewBox = { x: 0, y: 0, size: graphCanvasSize }
@@ -234,19 +238,32 @@
   }
 
   function computeNodeSize(degree) {
-    const base = 12
-    const scaled = Math.sqrt(Math.max(0, degree)) * 4
-    return Math.min(28, base + scaled)
+    const base = 14
+    const scaled = Math.sqrt(Math.max(0, degree)) * 5
+    return Math.min(42, base + scaled)
   }
 
-  function runForceLayout(nodes, edges, degreeMap, canvasSize) {
+  function runForceLayout(nodes, edges, degreeMap, canvasSize, options = {}) {
+    const {
+      initialPositions,
+      repulsion = 5200,
+      springLength = Math.max(120, Math.min(200, Math.sqrt(nodes.length) * 18)),
+      springStrength = 0.03,
+      centerStrength = 0.06,
+      damping = 0.85,
+      iterations = Math.min(200, 100 + nodes.length * 0.45),
+      collisionStrength = 0.7,
+      radialRings,
+      radialStrength = 0.06,
+    } = options
     const center = canvasSize / 2
     const layout = nodes.map((node) => {
       const degree = degreeMap.get(node.id) || 0
+      const seeded = initialPositions?.get(node.id)
       return {
         ...node,
-        x: center + (Math.random() - 0.5) * canvasSize * 0.6,
-        y: center + (Math.random() - 0.5) * canvasSize * 0.6,
+        x: seeded?.x ?? center + (Math.random() - 0.5) * canvasSize * 0.6,
+        y: seeded?.y ?? center + (Math.random() - 0.5) * canvasSize * 0.6,
         vx: 0,
         vy: 0,
         size: computeNodeSize(degree),
@@ -256,18 +273,18 @@
 
     const indexById = new Map(layout.map((node, idx) => [node.id, idx]))
     const springs = edges
-      .map((edge) => ({
-        source: indexById.get(edge.source),
-        target: indexById.get(edge.target),
-      }))
-      .filter((edge) => edge.source !== undefined && edge.target !== undefined)
-
-    const repulsion = 5200
-    const springLength = Math.max(120, Math.min(200, Math.sqrt(nodes.length) * 18))
-    const springStrength = 0.03
-    const centerStrength = 0.06
-    const damping = 0.85
-    const iterations = Math.min(180, 90 + nodes.length * 0.4)
+      .map((edge) => {
+        const source = indexById.get(edge.source)
+        const target = indexById.get(edge.target)
+        if (source === undefined || target === undefined) return null
+        return {
+          source,
+          target,
+          length: edge.length ?? 1,
+          strength: edge.weight ?? 1,
+        }
+      })
+      .filter(Boolean)
 
     for (let iter = 0; iter < iterations; iter += 1) {
       for (let i = 0; i < layout.length; i += 1) {
@@ -288,6 +305,15 @@
           fy += ny * force
           other.vx -= nx * force
           other.vy -= ny * force
+          const minDist = node.size + other.size + 10
+          if (dist < minDist) {
+            const overlap = (minDist - dist) / minDist
+            const push = overlap * collisionStrength * 12
+            fx += nx * push
+            fy += ny * push
+            other.vx -= nx * push
+            other.vy -= ny * push
+          }
         }
         node.vx += fx
         node.vy += fy
@@ -299,14 +325,30 @@
         let dx = target.x - source.x
         let dy = target.y - source.y
         let dist = Math.sqrt(dx * dx + dy * dy) || 1
-        const displacement = dist - springLength
-        const force = displacement * springStrength
+        const desired = springLength * edge.length
+        const displacement = dist - desired
+        const force = displacement * springStrength * edge.strength
         const nx = dx / dist
         const ny = dy / dist
         source.vx += nx * force
         source.vy += ny * force
         target.vx -= nx * force
         target.vy -= ny * force
+      }
+
+      if (radialRings) {
+        for (const node of layout) {
+          const targetRadius = radialRings.get(node.id)
+          if (targetRadius === undefined) continue
+          const dx = node.x - center
+          const dy = node.y - center
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1
+          const diff = dist - targetRadius
+          const nx = dx / dist
+          const ny = dy / dist
+          node.vx -= nx * diff * radialStrength
+          node.vy -= ny * diff * radialStrength
+        }
       }
 
       for (const node of layout) {
@@ -316,15 +358,105 @@
         node.vy += dy * centerStrength
         node.vx *= damping
         node.vy *= damping
-        node.x = Math.min(canvasSize - 40, Math.max(40, node.x + node.vx))
-        node.y = Math.min(canvasSize - 40, Math.max(40, node.y + node.vy))
+        const margin = Math.max(30, node.size + 10)
+        node.x = Math.min(canvasSize - margin, Math.max(margin, node.x + node.vx))
+        node.y = Math.min(canvasSize - margin, Math.max(margin, node.y + node.vy))
       }
     }
 
     return layout.map((node) => ({ ...node, canvasSize }))
   }
 
-  function buildGraphLayout(nodes, edges, degreeMap) {
+  function buildRadialLayout(nodes, edges, layoutEdges, degreeMap, canvasSize) {
+    const center = canvasSize / 2
+    if (nodes.length <= 2) {
+      return runForceLayout(nodes, layoutEdges, degreeMap, canvasSize, { centerStrength: 0.12 })
+    }
+
+    const adjacency = new Map()
+    for (const node of nodes) adjacency.set(node.id, [])
+    for (const edge of edges) {
+      if (adjacency.has(edge.source) && adjacency.has(edge.target)) {
+        adjacency.get(edge.source).push(edge.target)
+        adjacency.get(edge.target).push(edge.source)
+      }
+    }
+
+    const anchors = [...nodes]
+      .sort((a, b) => (degreeMap.get(b.id) || 0) - (degreeMap.get(a.id) || 0))
+      .slice(0, Math.min(3, nodes.length))
+    const anchorIds = anchors.map((node) => node.id)
+    const anchorIndex = new Map(anchorIds.map((id, index) => [id, index]))
+
+    const distance = new Map()
+    const anchorFor = new Map()
+    const queue = []
+    for (const id of anchorIds) {
+      distance.set(id, 0)
+      anchorFor.set(id, id)
+      queue.push(id)
+    }
+    while (queue.length) {
+      const current = queue.shift()
+      const nextDistance = (distance.get(current) || 0) + 1
+      for (const neighbor of adjacency.get(current) || []) {
+        if (!distance.has(neighbor)) {
+          distance.set(neighbor, nextDistance)
+          anchorFor.set(neighbor, anchorFor.get(current))
+          queue.push(neighbor)
+        }
+      }
+    }
+
+    const maxDistance = Math.max(0, ...distance.values())
+    const ringGap = Math.max(90, Math.min(160, 60 + Math.sqrt(nodes.length) * 7))
+    const baseRadius = 40
+    const ringGroups = new Map()
+    for (const node of nodes) {
+      const dist = distance.get(node.id) ?? maxDistance + 1
+      if (!ringGroups.has(dist)) ringGroups.set(dist, [])
+      ringGroups.get(dist).push(node)
+    }
+
+    const initialPositions = new Map()
+    const radialRings = new Map()
+    for (const [dist, group] of ringGroups.entries()) {
+      const radius = baseRadius + dist * ringGap
+      const anchorCount = Math.max(1, anchorIds.length)
+      const segmentSpan = (Math.PI * 2) / anchorCount
+      const ringRotation = (dist % 2) * (Math.PI / anchorCount)
+      const groupedByAnchor = new Map()
+      for (const node of group) {
+        const anchor = anchorFor.get(node.id) || anchorIds[0]
+        if (!groupedByAnchor.has(anchor)) groupedByAnchor.set(anchor, [])
+        groupedByAnchor.get(anchor).push(node)
+      }
+      for (const [anchor, nodesForAnchor] of groupedByAnchor.entries()) {
+        nodesForAnchor.sort((a, b) => (degreeMap.get(b.id) || 0) - (degreeMap.get(a.id) || 0))
+        const anchorIdx = anchorIndex.get(anchor) ?? 0
+        nodesForAnchor.forEach((node, idx) => {
+          const slot = (idx + 1) / (nodesForAnchor.length + 1)
+          const angle = ringRotation + anchorIdx * segmentSpan + slot * segmentSpan
+          const jitter = (Math.random() - 0.5) * ringGap * 0.08
+          const x = center + (radius + jitter) * Math.cos(angle)
+          const y = center + (radius + jitter) * Math.sin(angle)
+          initialPositions.set(node.id, { x, y })
+          radialRings.set(node.id, radius)
+        })
+      }
+    }
+
+    return runForceLayout(nodes, layoutEdges, degreeMap, canvasSize, {
+      initialPositions,
+      radialRings,
+      radialStrength: 0.08,
+      repulsion: 6800,
+      springStrength: 0.04,
+      springLength: Math.max(120, ringGap * 0.9),
+    })
+  }
+
+  function buildGraphLayout(nodes, edges, layoutEdges, degreeMap, { focusConnected = true } = {}) {
     const count = nodes.length
     if (count === 0) return []
     const orderedNodes = [...nodes].sort((a, b) => (degreeMap.get(b.id) || 0) - (degreeMap.get(a.id) || 0))
@@ -384,11 +516,32 @@
       components.push(component)
     }
 
+    if (focusConnected) {
+      components.sort((a, b) => b.length - a.length)
+      const largest = components[0] || []
+      const componentNodes = orderedNodes.filter((node) => largest.includes(node.id))
+      const componentEdges = edges.filter((edge) => largest.includes(edge.source) && largest.includes(edge.target))
+      const componentLayoutEdges = layoutEdges.filter(
+        (edge) => largest.includes(edge.source) && largest.includes(edge.target)
+      )
+      const componentSize = Math.min(1200, Math.max(420, 320 + Math.sqrt(componentNodes.length) * 200))
+      if (componentNodes.length >= 12) {
+        return buildRadialLayout(componentNodes, componentEdges, componentLayoutEdges, degreeMap, componentSize)
+      }
+      return runForceLayout(componentNodes, componentLayoutEdges, degreeMap, componentSize, { centerStrength: 0.1 })
+    }
+
     const componentLayouts = components.map((ids) => {
       const componentNodes = orderedNodes.filter((node) => ids.includes(node.id))
       const componentEdges = edges.filter((edge) => ids.includes(edge.source) && ids.includes(edge.target))
-      const componentSize = Math.min(900, Math.max(320, 240 + Math.sqrt(componentNodes.length) * 160))
-      const layout = runForceLayout(componentNodes, componentEdges, degreeMap, componentSize)
+      const componentLayoutEdges = layoutEdges.filter(
+        (edge) => ids.includes(edge.source) && ids.includes(edge.target)
+      )
+      const componentSize = Math.min(1000, Math.max(320, 260 + Math.sqrt(componentNodes.length) * 170))
+      const layout =
+        componentNodes.length >= 12
+          ? buildRadialLayout(componentNodes, componentEdges, componentLayoutEdges, degreeMap, componentSize)
+          : runForceLayout(componentNodes, componentLayoutEdges, degreeMap, componentSize, { centerStrength: 0.1 })
       return { ids, layout, size: componentSize }
     })
 
@@ -413,6 +566,71 @@
     })
 
     return combined
+  }
+
+  function buildLayoutEdges(nodes, edges, degreeMap) {
+    const similarityEdges = buildSimilarityEdges(nodes, edges, degreeMap)
+    return { layoutEdges: [...edges, ...similarityEdges], similarityEdges }
+  }
+
+  function buildSimilarityEdges(nodes, edges, degreeMap) {
+    const count = nodes.length
+    if (count < 8 || count > 280) return []
+    const adjacency = new Map()
+    for (const node of nodes) adjacency.set(node.id, new Set())
+    for (const edge of edges) {
+      if (adjacency.has(edge.source) && adjacency.has(edge.target)) {
+        adjacency.get(edge.source).add(edge.target)
+        adjacency.get(edge.target).add(edge.source)
+      }
+    }
+
+    const ids = nodes.map((node) => node.id)
+    const candidates = new Map()
+    for (const id of ids) candidates.set(id, [])
+    const sharedThreshold = count > 140 ? 2 : 1
+    for (let i = 0; i < ids.length; i += 1) {
+      const a = ids[i]
+      const setA = adjacency.get(a)
+      if (!setA || setA.size === 0) continue
+      for (let j = i + 1; j < ids.length; j += 1) {
+        const b = ids[j]
+        const setB = adjacency.get(b)
+        if (!setB || setB.size === 0) continue
+        const [small, large] = setA.size < setB.size ? [setA, setB] : [setB, setA]
+        let shared = 0
+        for (const neighbor of small) {
+          if (large.has(neighbor)) shared += 1
+        }
+        if (shared < sharedThreshold) continue
+        const denom = Math.sqrt((degreeMap.get(a) || 1) * (degreeMap.get(b) || 1))
+        const score = shared / denom
+        if (!Number.isFinite(score) || score <= 0) continue
+        candidates.get(a).push({ target: b, score, shared })
+        candidates.get(b).push({ target: a, score, shared })
+      }
+    }
+
+    const perNode = count > 160 ? 3 : 4
+    const selected = new Map()
+    for (const [id, list] of candidates.entries()) {
+      list.sort((a, b) => b.score - a.score)
+      for (const item of list.slice(0, perNode)) {
+        const key = id < item.target ? `${id}|${item.target}` : `${item.target}|${id}`
+        const existing = selected.get(key)
+        if (!existing || existing.score < item.score) {
+          selected.set(key, { source: id, target: item.target, score: item.score })
+        }
+      }
+    }
+
+    return [...selected.values()].map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      relationship_type: 'similarity',
+      weight: Math.min(0.9, Math.max(0.4, edge.score * 1.4)),
+      length: 0.7,
+    }))
   }
 
   function clamp(value, min, max) {
@@ -785,6 +1003,10 @@
             <label class="graph-toggle">
               <span>Hide isolates</span>
               <input type="checkbox" bind:checked={graphHideIsolates} />
+            </label>
+            <label class="graph-toggle">
+              <span>Largest cluster only</span>
+              <input type="checkbox" bind:checked={graphFocusConnected} />
             </label>
             <div class="graph-controls-actions">
               <button class="secondary" type="button" on:click={loadGraph}>Apply filters</button>
