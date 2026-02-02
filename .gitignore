@@ -40,8 +40,10 @@ processed_references.db
 dl_lit_project/data/metadata.bib
 dl_lit/exported_bib/current_references.bib
 __pycache__/
+dl_lit_project/dl_lit/__pycache__/*.pyc
 dl_lit_project/inspect_db.py
 extracted_refs/
+kanzlei.py
 
 # OCR output directories
 ocr/ocr_results/
