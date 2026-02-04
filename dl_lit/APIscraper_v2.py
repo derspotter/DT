@@ -18,8 +18,8 @@ except ImportError:
     PYPDF2_AVAILABLE = False
     print("[WARNING] PyPDF2 not installed. Secondary fallback text extraction will not be available.", flush=True)
 from dotenv import load_dotenv
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+from google import genai
+from google.genai import types
 import concurrent.futures
 from collections import deque
 from threading import Lock
@@ -27,10 +27,10 @@ from datetime import datetime, timedelta
 
 # --- Configuration ---
 # Use Gemini standard Flash model for speed
-DEFAULT_MODEL_NAME = 'gemini-2.0-flash'
+DEFAULT_MODEL_NAME = 'gemini-3-flash-preview'
 
 # Global client/model variable
-api_model = None
+api_client = None
 
 # --- Rate Limiter --- (Respecting 15 RPM = 0.25 RPS)
 MAX_REQUESTS_PER_MINUTE = 15
@@ -99,9 +99,9 @@ def load_api_key():
     """Loads the appropriate API key based on the chosen model."""
     load_dotenv() # Load .env for local execution
     if 'google' in DEFAULT_MODEL_NAME or 'gemini' in DEFAULT_MODEL_NAME:
-        key = os.getenv('GOOGLE_API_KEY')
+        key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
         if not key:
-            print("[ERROR] GOOGLE_API_KEY not found.", flush=True)
+            print("[ERROR] GEMINI_API_KEY (or GOOGLE_API_KEY) not found.", flush=True)
         return key
     else:
         print(f"[ERROR] Unknown model type in DEFAULT_MODEL_NAME: {DEFAULT_MODEL_NAME}", flush=True)
@@ -109,22 +109,21 @@ def load_api_key():
 
 def configure_api_client():
     """Configures the API client/model."""
-    global api_model
+    global api_client
     api_key = load_api_key()
     if not api_key:
         return False
 
     try:
         if 'google' in DEFAULT_MODEL_NAME or 'gemini' in DEFAULT_MODEL_NAME:
-            genai.configure(api_key=api_key)
-            api_model = genai.GenerativeModel(DEFAULT_MODEL_NAME)
-            print(f"[INFO] Successfully configured Google client ({DEFAULT_MODEL_NAME}).", flush=True)
+            api_client = genai.Client(api_key=api_key)
+            print(f"[INFO] Successfully configured Google GenAI client ({DEFAULT_MODEL_NAME}).", flush=True)
             return True
         else:
             return False
     except Exception as e:
         print(f"[ERROR] Failed to configure API client: {e}", flush=True)
-        api_model = None
+        api_client = None
         return False
 
 def upload_pdf_and_extract_bibliography(pdf_path):
@@ -136,21 +135,23 @@ def upload_pdf_and_extract_bibliography(pdf_path):
     
     try:
         # Upload the PDF file
-        uploaded_file = genai.upload_file(pdf_path)
-        uploaded_file_uri = uploaded_file.uri
-        print(f"[DEBUG] Uploaded PDF as URI: {uploaded_file_uri}", flush=True)
+        if api_client is None:
+            raise RuntimeError("GenAI client not configured.")
+        uploaded_file = api_client.files.upload(file=pdf_path)
+        print(f"[DEBUG] Uploaded PDF as URI: {uploaded_file.name}", flush=True)
         
         # Prepare the prompt for bibliography extraction
         prompt = BIBLIOGRAPHY_PROMPT
         wait_for_rate_limit()
         
         # Send request to API with uploaded file
-        response = api_model.generate_content(
-            contents=[{"role": "user", "parts": [{"text": prompt}, {"file_data": {"file_uri": uploaded_file_uri, "mime_type": "application/pdf"}}]}],
-            generation_config=GenerationConfig(
+        response = api_client.models.generate_content(
+            model=DEFAULT_MODEL_NAME,
+            contents=[prompt, uploaded_file],
+            config=types.GenerateContentConfig(
                 temperature=0.0,
-                response_mime_type="application/json"
-            )
+                response_mime_type="application/json",
+            ),
         )
         
         response_text = response.text
@@ -183,7 +184,7 @@ def upload_pdf_and_extract_bibliography(pdf_path):
         # Attempt to delete the uploaded file
         if uploaded_file:
             try:
-                genai.delete_file(uploaded_file.name)
+                api_client.files.delete(name=uploaded_file.name)
                 print(f"[DEBUG] Deleted uploaded file: {uploaded_file.name}", flush=True)
             except Exception as delete_error:
                 print(f"[WARNING] Failed to delete uploaded file {uploaded_file.name if uploaded_file else 'unknown'}: {delete_error}", flush=True)

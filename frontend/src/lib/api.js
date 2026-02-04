@@ -7,11 +7,12 @@ import {
 } from './sample-data'
 
 const DEFAULT_TIMEOUT = 8_000
+const UPLOAD_TIMEOUT = 120_000
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
 
-async function fetchWithTimeout(url, options = {}) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(url, { ...options, signal: controller.signal })
     return response
@@ -36,10 +37,14 @@ export async function fetchBibliographyList() {
 export async function uploadPdf(file) {
   const formData = new FormData()
   formData.append('file', file)
-  const response = await fetchWithTimeout(`${API_BASE}/api/process_pdf`, {
-    method: 'POST',
-    body: formData,
-  })
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/process_pdf`,
+    {
+      method: 'POST',
+      body: formData,
+    },
+    UPLOAD_TIMEOUT
+  )
   if (!response.ok) {
     const message = await response.text()
     throw new Error(message || 'Upload failed')
@@ -69,6 +74,17 @@ export async function consolidateBibliographies() {
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Consolidation failed')
+  }
+  return response.json()
+}
+
+export async function fetchBibliographyEntries(baseName) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/bibliographies/${encodeURIComponent(baseName)}/all`
+  )
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load bibliography entries')
   }
   return response.json()
 }

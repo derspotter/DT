@@ -5,6 +5,7 @@
     uploadPdf,
     extractBibliography,
     consolidateBibliographies,
+    fetchBibliographyEntries,
     runKeywordSearch,
     fetchCorpus,
     fetchDownloadQueue,
@@ -30,6 +31,9 @@
   let bibliographySource = 'sample'
   let bibliographyStatus = ''
   let consolidateStatus = ''
+  let latestEntries = []
+  let latestEntriesStatus = ''
+  let latestEntriesBase = ''
 
   let searchQuery = ''
   let searchField = 'default'
@@ -81,6 +85,43 @@
     uploads = uploads.map((item) => (item.id === id ? { ...item, ...patch } : item))
   }
 
+  function formatAuthors(entry) {
+    if (!entry) return ''
+    if (Array.isArray(entry.authors)) return entry.authors.join(', ')
+    if (Array.isArray(entry.author)) return entry.author.join(', ')
+    return entry.authors || entry.author || ''
+  }
+
+  function formatTitle(entry) {
+    return entry?.title || entry?.source || entry?.url || 'Untitled'
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  async function loadLatestEntries(baseName) {
+    latestEntriesBase = baseName
+    latestEntriesStatus = 'Waiting for extracted entries...'
+    latestEntries = []
+    const attempts = 20
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        const data = await fetchBibliographyEntries(baseName)
+        if (Array.isArray(data) && data.length > 0) {
+          latestEntries = data
+          latestEntriesStatus = `Loaded ${data.length} entries.`
+          return
+        }
+      } catch (error) {
+        // Keep waiting; extraction can take time.
+      }
+      latestEntriesStatus = `Waiting for extracted entries... (${i + 1}/${attempts})`
+      await sleep(5000)
+    }
+    latestEntriesStatus = 'No entries found yet.'
+  }
+
   function handleFiles(event) {
     const files = Array.from(event.target.files || [])
     const newItems = files.map((file) => ({
@@ -127,6 +168,8 @@
       await extractBibliography(item.backendFilename)
       updateUpload(item.id, { status: 'extracted', message: 'Extraction started' })
       await loadBibliographyList()
+      const baseName = item.backendFilename.replace(/\.pdf$/i, '')
+      await loadLatestEntries(baseName)
     } catch (error) {
       updateUpload(item.id, { status: 'failed', message: error.message || 'Extraction failed' })
     }
@@ -849,18 +892,47 @@
         </div>
 
         <div class="card">
-          <h3>Bibliography files</h3>
-          <p class="muted">{bibliographyStatus} ({bibliographySource})</p>
+          <h3>Extracted entries</h3>
+          <p class="muted">{latestEntriesStatus}</p>
+          {#if latestEntriesBase}
+            <p class="muted">Source: {latestEntriesBase}</p>
+          {/if}
           <div class="split">
             <button class="secondary" type="button" on:click={loadBibliographyList}>Refresh</button>
             <button class="primary" type="button" on:click={consolidate}>Consolidate</button>
             <span class="muted">{consolidateStatus}</span>
           </div>
-          <ul class="file-list">
-            {#each bibliographyFiles as file}
-              <li>{file}</li>
-            {/each}
-          </ul>
+          {#if latestEntries.length === 0}
+            <p class="muted">No extracted entries yet.</p>
+          {:else}
+            <div class="table">
+              <div class="table-row header">
+                <span>Title</span>
+                <span>Authors</span>
+                <span>Year</span>
+                <span>Source</span>
+                <span>DOI</span>
+              </div>
+              {#each latestEntries as entry}
+                <div class="table-row">
+                  <span>{formatTitle(entry)}</span>
+                  <span>{formatAuthors(entry)}</span>
+                  <span>{entry.year || ''}</span>
+                  <span>{entry.source || entry.publisher || ''}</span>
+                  <span>{entry.doi || ''}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+          <details class="file-list">
+            <summary>Show raw bibliography files</summary>
+            <ul>
+              {#each bibliographyFiles as file}
+                <li>{file}</li>
+              {/each}
+            </ul>
+          </details>
+          <p class="muted">{bibliographyStatus} ({bibliographySource})</p>
         </div>
       {/if}
 

@@ -81,7 +81,7 @@ def upload_pdf(path: str, display_name: str | None = None):
 def delete_uploaded(name: str):
     if api_client is None:
         return
-    api_client.files.delete(name)
+    api_client.files.delete(name=name)
 
 def clean_json_response(text):
     """Clean JSON response from markdown formatting."""
@@ -225,9 +225,8 @@ def detect_page_number_offset(pdf_path: str, model: GenAIModel, total_pages: int
                     'file_object': uploaded_file
                 }
                 upload_parts.append(uploaded_file) # Add file object for the prompt
-            if len(upload_parts) < 2: # Need at least 2 samples for reliable offset
-                print("    - Insufficient pages successfully uploaded for offset detection.", flush=True)
-                return None
+            if len(upload_parts) < 2:
+                print("    - Only one page uploaded; proceeding with single-sample offset detection.", flush=True)
 
             # --- Single Prompt Construction (strict JSON schema) --- 
             uris = list(uploaded_files_info.keys())
@@ -328,11 +327,12 @@ No markdown or extra text.
 
     # Find the most common offset
     most_common_offset = max(set(offsets), key=offsets.count)
+    if len(offsets) == 1:
+        return {"offset": offsets[0], "samples": samples, "frequencies": {offsets[0]: 1}}
     if offsets.count(most_common_offset) >= 2:  # At least 2 pages agree on offset
         return {"offset": most_common_offset, "samples": samples, "frequencies": {offset: offsets.count(offset) for offset in set(offsets)}}
-    else:
-        print("Insufficient agreement on page number offset.", flush=True)
-        return None
+    print("Insufficient agreement on page number offset.", flush=True)
+    return None
 
 def get_printed_page_number(pdf_doc: pikepdf.Pdf, page_index: int, model: GenAIModel, uploaded_full_pdf) -> int | None:
     """Gets the printed page number from a specific physical page index within an already uploaded PDF.
@@ -422,7 +422,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
     # Ensure genai is configured before calling functions that use it
     if not api_key:
         print("Skipping extraction: GOOGLE_API_KEY not configured.", flush=True)
-        return
+        return []
         
     try:
         # --- Centralized Initialization --- 
@@ -690,7 +690,26 @@ Output Format:
             validation_threshold = min(3, len(sections_to_validate)) if len(sections_to_validate) == 4 else len(sections_to_validate)
             if validated_count >= validation_threshold:
                 print(f"Validation successful: {validated_count}/{len(sections_to_validate)} sections validated. Extracting all sections.", flush=True)
-                adjusted_sections = sections
+                adjusted_sections = []
+                for section in sections:
+                    reported_start = section.get("start_page")
+                    reported_end = section.get("end_page")
+                    if reported_start is None or reported_end is None:
+                        continue
+
+                    physical_start = reported_start - offset
+                    physical_end = reported_end - offset
+                    if not (0 <= physical_start < total_pages and 0 <= physical_end < total_pages and physical_start <= physical_end):
+                        physical_start = reported_start - 1
+                        physical_end = reported_end - 1
+                        if not (0 <= physical_start < total_pages and 0 <= physical_end < total_pages and physical_start <= physical_end):
+                            print(f"    - Skipping section with invalid physical indices after adjustment: start={reported_start}, end={reported_end}", flush=True)
+                            continue
+
+                    adjusted_sections.append({
+                        "start_page": physical_start,
+                        "end_page": physical_end,
+                    })
             else:
                 print(f"Validation failed: Only {validated_count}/{len(sections_to_validate)} sections validated. Skipping extraction.", flush=True)
                 return
@@ -795,11 +814,17 @@ if __name__ == "__main__":
     # --- Argument Parsing Setup ---
     print("--- Setting up ArgParser --- ", flush=True)
     parser = argparse.ArgumentParser(description='Extract bibliography pages from PDFs.')
-    parser.add_argument('input', help='Path to a PDF file or directory containing PDFs')
+    parser.add_argument('input', nargs='?', help='Path to a PDF file or directory containing PDFs')
+    parser.add_argument('--input-pdf', dest='input_pdf', help='Path to a single PDF file')
+    parser.add_argument('--input-dir', dest='input_dir', help='Path to a directory containing PDFs')
     parser.add_argument('--output-dir', default='bib_output', help='Output directory for extracted pages and JSON files')
     args = parser.parse_args()
     print("--- Parsing Arguments --- ", flush=True)
     print("--- Arguments Parsed --- ", flush=True)
+
+    if not api_key:
+        print("Error: GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable not set.", flush=True)
+        sys.exit(1)
 
     # --- Setup Output Directory ---
     output_dir = os.path.abspath(args.output_dir)
@@ -807,7 +832,12 @@ if __name__ == "__main__":
     print(f"Output directory set to: {output_dir}", flush=True)
 
     # --- Determine Input Type (File or Directory) ---
-    input_path = os.path.abspath(args.input)
+    input_source = args.input_pdf or args.input_dir or args.input
+    if not input_source:
+        print("Error: No input provided. Use --input-pdf, --input-dir, or the positional input.", flush=True)
+        sys.exit(1)
+
+    input_path = os.path.abspath(input_source)
     if os.path.isdir(input_path):
         pdf_files = glob.glob(os.path.join(input_path, '*.pdf'))
         print(f"Found {len(pdf_files)} PDF files in directory: {input_path}", flush=True)

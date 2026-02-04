@@ -363,7 +363,7 @@ export function createApp({ broadcast } = {}) {
       ];
 
       console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
-      const getPagesProcess = spawn('python', [GET_BIB_PAGES_SCRIPT, ...getPagesArgs]);
+      const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs]);
 
       getPagesProcess.stdout.on('data', (data) => {
         const message = data.toString();
@@ -421,10 +421,10 @@ export function createApp({ broadcast } = {}) {
         console.log(`[/api/extract-bibliography] Spawning: python ${API_SCRAPER_SCRIPT} ...`);
         // Correct arguments based on APIscraper_v2.py's argparse
         const scrapeApiArgs = [
-          '--input-dir', jsonSubDir,       // Directory containing the JSON from get_bib_pages.py
-          '--base-output-dir', BIB_OUTPUT_DIR // The main output directory
+          '--input-dir', jsonSubDir,       // Directory containing the PDFs from get_bib_pages.py
+          '--output-dir', jsonSubDir       // Write JSON next to the extracted pages
         ];
-        const apiScraperProcess = spawn('python', [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
+        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
 
         // Stream output via WebSocket (Already correctly implemented in previous step)
         apiScraperProcess.stdout.on('data', (data) => {
@@ -481,10 +481,9 @@ export function createApp({ broadcast } = {}) {
     const inputDir = BIB_OUTPUT_DIR;
     const outputFile = path.join(inputDir, 'master_bibliography.json');
 
-    console.log(`[/api/bibliographies/consolidate] Attempting to execute python3 with script: ${pythonScriptPath}`);
+    console.log(`[/api/bibliographies/consolidate] Attempting to execute ${PYTHON_EXEC} with script: ${pythonScriptPath}`);
 
-    // Execute python3 - PATH in Dockerfile ensures /opt/venv/bin/python3 is used
-    const pythonProcess = spawn('python3', [
+    const pythonProcess = spawn(PYTHON_EXEC, [
       pythonScriptPath,
       inputDir,
       outputFile

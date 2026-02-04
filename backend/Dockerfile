@@ -9,7 +9,7 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Install necessary Python packages in one command
-RUN pip install --no-cache-dir google-genai pikepdf pdfminer.six openai python-dotenv PyPDF2 rapidfuzz
+RUN pip install --no-cache-dir google-genai google-api-core pikepdf pdfminer.six openai python-dotenv PyPDF2 rapidfuzz
 
 # Set the working directory inside the container
 WORKDIR /usr/src/app
