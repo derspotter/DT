@@ -73,14 +73,9 @@ class GenAIModel:
 def upload_pdf(path: str, display_name: str | None = None):
     if api_client is None:
         raise RuntimeError("GenAI client not configured.")
-    with open(path, "rb") as file_handle:
-        return api_client.files.upload(
-            file=file_handle,
-            config={
-                "mime_type": "application/pdf",
-                "display_name": display_name or os.path.basename(path),
-            },
-        )
+    # Follow current Gemini Files API docs: pass the path or file-like object.
+    # Display names are optional; omit for simplicity to match the reference example.
+    return api_client.files.upload(file=path)
 
 
 def delete_uploaded(name: str):
