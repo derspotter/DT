@@ -1,11 +1,10 @@
 <script>
   import { onMount } from 'svelte'
   import {
-    fetchBibliographyList,
     uploadPdf,
     extractBibliography,
-    consolidateBibliographies,
     fetchBibliographyEntries,
+    fetchIngestStats,
     runKeywordSearch,
     fetchCorpus,
     fetchDownloadQueue,
@@ -27,10 +26,13 @@
   let apiStatus = 'unknown'
 
   let uploads = []
-  let bibliographyFiles = []
-  let bibliographySource = 'sample'
-  let bibliographyStatus = ''
-  let consolidateStatus = ''
+  let ingestStats = {
+    no_metadata: 0,
+    with_metadata: 0,
+    to_download_references: 0,
+    downloaded_references: 0,
+  }
+  let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
   let latestEntriesBase = ''
@@ -88,6 +90,14 @@
   function formatAuthors(entry) {
     if (!entry) return ''
     if (Array.isArray(entry.authors)) return entry.authors.join(', ')
+    if (typeof entry.authors === 'string') {
+      try {
+        const parsed = JSON.parse(entry.authors)
+        if (Array.isArray(parsed)) return parsed.join(', ')
+      } catch (error) {
+        // fall through
+      }
+    }
     if (Array.isArray(entry.author)) return entry.author.join(', ')
     return entry.authors || entry.author || ''
   }
@@ -107,10 +117,11 @@
     const attempts = 20
     for (let i = 0; i < attempts; i += 1) {
       try {
-        const data = await fetchBibliographyEntries(baseName)
-        if (Array.isArray(data) && data.length > 0) {
-          latestEntries = data
-          latestEntriesStatus = `Loaded ${data.length} entries.`
+        const payload = await fetchBibliographyEntries(baseName)
+        const items = payload.items || []
+        if (Array.isArray(items) && items.length > 0) {
+          latestEntries = items
+          latestEntriesStatus = `Loaded ${items.length} entries.`
           return
         }
       } catch (error) {
@@ -167,33 +178,24 @@
     try {
       await extractBibliography(item.backendFilename)
       updateUpload(item.id, { status: 'extracted', message: 'Extraction started' })
-      await loadBibliographyList()
       const baseName = item.backendFilename.replace(/\.pdf$/i, '')
       await loadLatestEntries(baseName)
+      await loadIngestStats()
     } catch (error) {
       updateUpload(item.id, { status: 'failed', message: error.message || 'Extraction failed' })
     }
   }
 
-  async function consolidate() {
-    consolidateStatus = 'Consolidating...'
+  async function loadIngestStats() {
+    ingestStatsStatus = 'Loading ingest stats...'
     try {
-      await consolidateBibliographies()
-      consolidateStatus = 'Consolidation completed.'
-      await loadBibliographyList()
-    } catch (error) {
-      consolidateStatus = `Consolidation failed: ${error.message || 'Unknown error'}`
-    }
-  }
-
-  async function loadBibliographyList() {
-    bibliographyStatus = 'Loading bibliography files...'
-    const { data, source } = await fetchBibliographyList()
-    bibliographyFiles = data
-    bibliographySource = source
-    bibliographyStatus = source === 'api' ? 'Loaded from API.' : 'Sample data loaded.'
-    if (source === 'api') {
+      const payload = await fetchIngestStats()
+      ingestStats = payload.stats || ingestStats
+      ingestStatsStatus = 'Loaded ingest stats.'
       apiStatus = 'online'
+    } catch (error) {
+      ingestStatsStatus = 'Failed to load ingest stats.'
+      apiStatus = 'offline'
     }
   }
 
@@ -767,7 +769,7 @@
   }
 
   onMount(async () => {
-    await loadBibliographyList()
+    await loadIngestStats()
     await loadCorpus()
     await loadDownloads()
     await loadGraph()
@@ -813,7 +815,7 @@
             <div class="stat-row">
               <div>
                 <span class="stat-label">Bibliographies</span>
-                <strong>{bibliographyFiles.length}</strong>
+                <strong>{ingestStats.no_metadata}</strong>
               </div>
               <div>
                 <span class="stat-label">Corpus works</span>
@@ -898,9 +900,14 @@
             <p class="muted">Source: {latestEntriesBase}</p>
           {/if}
           <div class="split">
-            <button class="secondary" type="button" on:click={loadBibliographyList}>Refresh</button>
-            <button class="primary" type="button" on:click={consolidate}>Consolidate</button>
-            <span class="muted">{consolidateStatus}</span>
+            <button class="secondary" type="button" on:click={loadIngestStats}>Refresh stats</button>
+            <span class="muted">{ingestStatsStatus}</span>
+          </div>
+          <div class="pill-row">
+            <span class="pill">Raw: {ingestStats.no_metadata}</span>
+            <span class="pill">Enriched: {ingestStats.with_metadata}</span>
+            <span class="pill">Queued: {ingestStats.to_download_references}</span>
+            <span class="pill">Downloaded: {ingestStats.downloaded_references}</span>
           </div>
           {#if latestEntries.length === 0}
             <p class="muted">No extracted entries yet.</p>
@@ -924,15 +931,6 @@
               {/each}
             </div>
           {/if}
-          <details class="file-list">
-            <summary>Show raw bibliography files</summary>
-            <ul>
-              {#each bibliographyFiles as file}
-                <li>{file}</li>
-              {/each}
-            </ul>
-          </details>
-          <p class="muted">{bibliographyStatus} ({bibliographySource})</p>
         </div>
       {/if}
 

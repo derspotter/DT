@@ -17,7 +17,7 @@ const DL_LIT_DIR = '/usr/src/app/dl_lit'; // Mounted from ../dl_lit
 const TEMP_PAGES_BASE_DIR = path.join(DL_LIT_DIR, 'temp_pages');
 const BIB_OUTPUT_DIR = path.join(DL_LIT_DIR, 'bibliographies');
 const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_DIR, 'get_bib_pages.py');
-const API_SCRAPER_SCRIPT = path.join(DL_LIT_DIR, 'APIscraper_v2.py'); // Updated script name
+const API_SCRAPER_SCRIPT = path.join(__dirname, '..', 'dl_lit_project', 'dl_lit', 'APIscraper_v2.py');
 
 const DL_LIT_PROJECT_DIR = path.join(__dirname, '..', '..', 'dl_lit_project');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
@@ -26,6 +26,8 @@ const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py')
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
+const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
+const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
 
 const STUB_RESULTS = {
@@ -397,32 +399,31 @@ export function createApp({ broadcast } = {}) {
         // **Proceed to Step 2: Call API Scraper only if Step 1 succeeded**
         const baseName = path.basename(filename, path.extname(filename)); // Extract base name from original filename
         // Construct the expected JSON path based on the *output* structure of get_bib_pages
-        // It should be in BIB_OUTPUT_DIR/<baseName>/<baseName>_bibliography_pages.json
         const jsonSubDir = path.join(BIB_OUTPUT_DIR, baseName); // Subdirectory named after the base PDF name
-        const jsonInputPath = path.join(jsonSubDir, `${baseName}_bibliography_pages.json`);
+        const pageFiles = fs.existsSync(jsonSubDir)
+          ? fs.readdirSync(jsonSubDir).filter((file) => file.endsWith('.pdf'))
+          : [];
 
-        console.log(`[/api/extract-bibliography] Looking for input JSON for API scraper: ${jsonInputPath}`);
-
-        // Check if the expected JSON file exists
-        if (!fs.existsSync(jsonInputPath)) {
-          const errorMessage = `[/api/extract-bibliography] Input JSON for API scraper not found: ${jsonInputPath}`;
+        if (pageFiles.length === 0) {
+          const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}`;
           console.error(errorMessage);
-          send(errorMessage); // Broadcast error
-          // Clean up temporary directory as processing cannot continue
+          send(errorMessage);
           fs.rm(tempPagesDir, { recursive: true, force: true }, (rmErr) => {
             if (rmErr) console.error(`[/api/extract-bibliography] Error cleaning up temp dir ${tempPagesDir}:`, rmErr);
           });
           if (!res.headersSent) {
-            return res.status(500).json({ error: 'Intermediate JSON file not found after page extraction.' });
+            return res.status(500).json({ error: 'No extracted page PDFs found after page extraction.' });
           }
           return;
         }
 
         console.log(`[/api/extract-bibliography] Spawning: python ${API_SCRAPER_SCRIPT} ...`);
         // Correct arguments based on APIscraper_v2.py's argparse
+        const dbPath = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
         const scrapeApiArgs = [
-          '--input-dir', jsonSubDir,       // Directory containing the PDFs from get_bib_pages.py
-          '--output-dir', jsonSubDir       // Write JSON next to the extracted pages
+          '--input-dir', jsonSubDir,
+          '--db-path', dbPath,
+          '--ingest-source', baseName
         ];
         const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
 
@@ -628,6 +629,36 @@ export function createApp({ broadcast } = {}) {
     } catch (error) {
       console.error('[/api/graph] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to build graph' });
+    }
+  });
+
+  app.get('/api/ingest/latest', async (req, res) => {
+    const baseName = req.query?.baseName || '';
+    const limit = coerceInt(req.query?.limit, 200);
+    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+
+    const args = ['--db-path', dbPath, '--limit', String(limit)];
+    if (baseName) {
+      args.push('--base-name', String(baseName));
+    }
+    try {
+      const payload = await runPythonJson(INGEST_LATEST_SCRIPT, args, { dbPath });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[/api/ingest/latest] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to fetch ingest entries' });
+    }
+  });
+
+  app.get('/api/ingest/stats', async (req, res) => {
+    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+    const args = ['--db-path', dbPath];
+    try {
+      const payload = await runPythonJson(INGEST_STATS_SCRIPT, args, { dbPath });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[/api/ingest/stats] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to fetch ingest stats' });
     }
   });
 

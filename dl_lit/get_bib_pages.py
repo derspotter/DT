@@ -40,7 +40,7 @@ print("--- GenAI Configured (or skipped) --- ", flush=True)
 
 
 class GenAIModel:
-    def __init__(self, model_name: str, temperature: float = 0.0):
+    def __init__(self, model_name: str, temperature: float = 1.0):
         self.model_name = model_name
         self.temperature = temperature
 
@@ -427,7 +427,7 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
     try:
         # --- Centralized Initialization --- 
         print("Initializing Generative Models and uploading PDF...")
-        model = GenAIModel("gemini-3-flash-preview", temperature=0.0)
+        model = GenAIModel("gemini-2.5-flash", temperature=1.0)
         uploaded_pdf = upload_pdf(pdf_path)
         print("Initialization complete.")
         # --- End Initialization --- 
@@ -770,19 +770,8 @@ Output Format:
                         finally:
                             new_pdf_page.close() # Close the single-page PDF object
 
-            # --- ADDED: Create the manifest JSON file if pages were generated --- 
-            if generated_page_pdf_filenames:
-                manifest_json_path = os.path.join(specific_output_dir, f"{base_name}_bibliography_pages.json")
-                manifest_data = {"pages": generated_page_pdf_filenames}
-                try:
-                    with open(manifest_json_path, 'w') as f_json:
-                        json.dump(manifest_data, f_json, indent=2)
-                    print(f"--- Created manifest JSON: {manifest_json_path} ---", flush=True)
-                except Exception as json_err:
-                    print(f"--- Error creating manifest JSON {manifest_json_path}: {json_err} ---", flush=True)
-            else:
-                print("--- No page PDFs were generated, skipping manifest JSON creation. ---", flush=True)
-            # --- END ADDED ---
+            if not generated_page_pdf_filenames:
+                print("--- No page PDFs were generated. ---", flush=True)
         
         print("--- Extraction Complete (if any sections were valid) ---", flush=True)
         # --- End Step 4 ---

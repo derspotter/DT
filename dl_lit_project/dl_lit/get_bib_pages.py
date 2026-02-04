@@ -99,7 +99,7 @@ RULES:
         print("Sending request to GenAI...", flush=True)
         def _call_model():
             return client.models.generate_content(
-                model="gemini-3-flash-preview",
+                model="gemini-2.5-flash",
                 contents=[prompt, uploaded_pdf],
                 config=types.GenerateContentConfig(
                     temperature=0.0,

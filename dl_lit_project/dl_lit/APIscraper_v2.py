@@ -42,8 +42,8 @@ except ImportError:
     ConfigDict = None
 
 # --- Configuration ---
-# Use Gemini 3 Flash Preview model
-DEFAULT_MODEL_NAME = 'gemini-3-flash-preview'
+# Use Gemini 2.5 Flash model (fast + reliable)
+DEFAULT_MODEL_NAME = 'gemini-2.5-flash'
 
 # Global client
 api_client = None
@@ -52,46 +52,11 @@ api_client = None
 rate_limiter = get_global_rate_limiter()
 
 # --- Bibliography Prompt ---
-BIBLIOGRAPHY_PROMPT = """You are an expert research assistant specializing in academic literature. Your task is to extract bibliography or reference list entries from the provided text, which is a page from a PDF document containing academic references. Return the bibliography entries as a JSON array of objects. Each object should represent a single bibliography entry and include the following fields where available, regardless of the citation style (APA, MLA, Chicago, etc.) or language:
-
-- authors: array of author names (strings, split multiple authors into separate entries in the array)
-- editors: array of editor names if present (strings, for books/edited volumes/conference proceedings)
-- year: publication year (integer or string)
-- title: title of the work (string)
-- source: journal name, book title, conference name, etc. (string)
-- volume: journal volume (integer or string)
-- issue: journal issue (integer or string)
-- pages: page range (string, e.g., "123-145")
-- publisher: publisher name if present (string)
-- location: place of publication if present (string)
-- type: type of document (e.g., 'journal article', 'book', 'book chapter', 'conference paper', etc.) (string)
-- doi: DOI if present (string)
-- url: URL if present (string)
-- isbn: ISBN if present for books (string)
-- issn: ISSN if present for journals (string)
-- abstract: abstract if present (string)
-- keywords: array of keywords if present (strings)
-- language: language of publication if not English (string)
-- translated_title: translated or alternate-language title if the citation explicitly mentions a translation (string)
-- translated_year: year associated with the translated title if mentioned (integer or string)
-- translated_language: language code for the translated title if known (string, e.g., "de" for German)
-- translation_relationship: relationship label for the translated title (string, e.g., "translation")
-
-INSTRUCTIONS:
-1. Recognize bibliography entries even if they are in different formats or languages. Look for patterns like author names followed by years, titles in quotes or italics, and publication details.
-2. Extract as many fields as possible, even partial entries. Make educated guesses for the 'type' field based on context.
-3. If a citation explicitly mentions a translated or alternate-language edition, keep the primary (original) work as the main entry and populate the translated_* fields rather than replacing the main title. Use translation_relationship="translation".
-4. For the 'source' field, extract ONLY the actual title of the journal, book, or conference. DO NOT include:
-   - Series editors' names (e.g., "Smith/Jones" in "Smith/Jones Economics Handbook")
-   - Original editors' names that precede the title (e.g., "Obst/Hintner" in "Obst/Hintner Geld-, Bank- und Börsenwesen")
-   - Edition information (e.g., "40th edn.")
-   - Publisher information
-   Examples: 
-   - From "in J. Doe (ed.), Smith/Jones Financial Systems, 3rd edn." → source: "Financial Systems"
-   - From "Obst/Hintner Geld-, Bank- und Börsenwesen" → source: "Geld-, Bank- und Börsenwesen"
-5. If no clear bibliography entries are found, return an empty JSON array [].
-6. Return ONLY the JSON array. Do not include introductory text, explanations, apologies, or markdown formatting like ```json.
-"""
+BIBLIOGRAPHY_PROMPT = (
+    "Extract bibliography entries from the attached PDF page. "
+    "Return JSON that matches the provided schema. "
+    "If no entries are found, return an empty list."
+)
 
 if BaseModel:
     if ConfigDict:
@@ -119,6 +84,11 @@ if BaseModel:
             translated_year: Optional[int | str] = None
             translated_language: Optional[str] = None
             translation_relationship: Optional[str] = None
+
+        class BibliographyEntryList(BaseModel):
+            model_config = ConfigDict(extra="ignore")
+            items: List[BibliographyEntry] = []
+
     else:
         class BibliographyEntry(BaseModel):
             class Config:
@@ -145,6 +115,12 @@ if BaseModel:
             translated_year: Optional[int | str] = None
             translated_language: Optional[str] = None
             translation_relationship: Optional[str] = None
+
+        class BibliographyEntryList(BaseModel):
+            class Config:
+                extra = "ignore"
+            items: List[BibliographyEntry] = []
+
 
 # --- Helper Functions ---
 
@@ -202,29 +178,37 @@ def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
         rate_limiter.wait_if_needed('gemini_daily')
         
         def _call_model():
+            config = types.GenerateContentConfig(
+                temperature=1.0,
+                response_mime_type="application/json",
+            )
+            if BaseModel:
+                config.response_schema = BibliographyEntryList
             return api_client.models.generate_content(
                 model=DEFAULT_MODEL_NAME,
                 contents=[prompt, uploaded_file],
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json"
-                )
+                config=config,
             )
 
         # Send request to API with uploaded file (timeout guard)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_call_model)
-            try:
-                response = future.result(timeout=timeout_seconds)
-            except concurrent.futures.TimeoutError as e:
-                future.cancel()
-                raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_call_model)
+        try:
+            response = future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError as e:
+            future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         response_text = response.text
         print(f"[DEBUG] Raw API response content: {response_text[:200]}...", flush=True)
         
         try:
             bibliography_data = json.loads(response_text)
+            if isinstance(bibliography_data, dict) and "items" in bibliography_data:
+                bibliography_data = bibliography_data.get("items") or []
             if isinstance(bibliography_data, list):
                 print(f"[DEBUG] Parsed JSON successfully as list.", flush=True)
             else:
@@ -314,7 +298,7 @@ def validate_bibliography_entries(entries):
 
 # --- Main Processing Logic ---
 
-def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summary_lock):
+def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summary_lock, ingest_source: str | None = None):
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
     print(f"\n[INFO] Processing {filename}...", flush=True)
@@ -340,7 +324,7 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
             # Don't save an empty file, just report no data found
         else:
 
-            # Insert each entry into no_metadata stage
+            # Record entries for UI display and insert into no_metadata stage
             successes = 0
             for entry in bibliography_data:
                 minimal_ref = {
@@ -365,7 +349,9 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
                     "translated_year": entry.get("translated_year"),
                     "translated_language": entry.get("translated_language"),
                     "translation_relationship": entry.get("translation_relationship"),
+                    "ingest_source": ingest_source,
                 }
+                db_manager.insert_ingest_entry(minimal_ref, ingest_source=ingest_source)
                 row_id, err = db_manager.insert_no_metadata(minimal_ref)
                 if err:
                     print(f"[WARNING] Skipped entry due to: {err}", flush=True)
@@ -393,7 +379,7 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
             summary_dict["failed_files"] += 1
             summary_dict["failures"].append({"file": filename, "reason": failure_reason})
 
-def process_directory_v2(input_dir, db_manager: DatabaseManager, max_workers=5):
+def process_directory_v2(input_dir, db_manager: DatabaseManager, max_workers=5, ingest_source: str | None = None):
     """Processes all PDFs in the input directory concurrently, saving to the specified output dir."""
     print(f"[INFO] Processing directory: {input_dir}", flush=True)
 
@@ -420,7 +406,7 @@ def process_directory_v2(input_dir, db_manager: DatabaseManager, max_workers=5):
         # Use ThreadPoolExecutor for I/O-bound tasks
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit tasks for each PDF
-            futures = [executor.submit(process_single_pdf, pdf_path, db_manager, results_summary, summary_lock)
+            futures = [executor.submit(process_single_pdf, pdf_path, db_manager, results_summary, summary_lock, ingest_source)
                        for pdf_path in pdf_files]
 
             # Wait for all tasks to complete and handle potential exceptions
@@ -473,11 +459,13 @@ if __name__ == "__main__":
     parser.add_argument('--input-dir', required=True, help='Directory containing input PDF files.')
     parser.add_argument('--workers', type=int, default=5, help='Maximum number of concurrent worker threads.')
     parser.add_argument('--db-path', required=True, help='Path to the SQLite database file to insert extracted references into.')
+    parser.add_argument('--ingest-source', default=None, help='Identifier for this ingest run (e.g., base filename).')
     args = parser.parse_args()
 
     input_path = args.input_dir
     max_workers = args.workers
     db_path_arg = args.db_path
+    ingest_source = args.ingest_source
 
     db_manager = None
     if not db_path_arg:
@@ -492,11 +480,11 @@ if __name__ == "__main__":
     # Check if input is a directory or single file
     if os.path.isdir(input_path):
         print(f"[INFO] Processing directory: {input_path}", flush=True)
-        process_directory_v2(input_path, db_manager, max_workers)
+        process_directory_v2(input_path, db_manager, max_workers, ingest_source)
     elif os.path.isfile(input_path) and input_path.lower().endswith('.pdf'):
         print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
         summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
-        process_single_pdf(input_path, db_manager, summary, Lock())
+        process_single_pdf(input_path, db_manager, summary, Lock(), ingest_source)
         print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
     else:
         print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)

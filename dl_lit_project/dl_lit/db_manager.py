@@ -407,6 +407,23 @@ class DatabaseManager:
         """)
 
         cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ingest_source TEXT,
+                source_pdf TEXT,
+                title TEXT,
+                authors TEXT,
+                year INTEGER,
+                doi TEXT,
+                source TEXT,
+                publisher TEXT,
+                url TEXT,
+                entry_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS search_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 query TEXT NOT NULL,
@@ -444,6 +461,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_openalex ON to_download_references(openalex_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_doi ON to_download_references(normalized_doi)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_openalex ON search_results(openalex_id)")
         
         # Add indexes for title/author/year duplicate detection
@@ -1611,6 +1629,35 @@ class DatabaseManager:
             return new_id, None
         except sqlite3.IntegrityError as e:
             return None, f"IntegrityError inserting into no_metadata: {e}"
+
+    def insert_ingest_entry(self, ref: dict, ingest_source: str | None = None) -> None:
+        """Insert raw extracted entry for UI display, without dedupe enforcement."""
+        cursor = self.conn.cursor()
+        authors_raw = ref.get("authors") or ref.get("author") or []
+        if isinstance(authors_raw, str):
+            authors_raw = [authors_raw]
+        try:
+            cursor.execute(
+                """INSERT INTO ingest_entries (
+                    ingest_source, source_pdf, title, authors, year, doi, source,
+                    publisher, url, entry_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ingest_source,
+                    ref.get("source_pdf"),
+                    ref.get("title"),
+                    json.dumps(authors_raw) if authors_raw else None,
+                    ref.get("year"),
+                    ref.get("doi"),
+                    ref.get("source"),
+                    ref.get("publisher"),
+                    ref.get("url"),
+                    json.dumps(ref, ensure_ascii=False),
+                ),
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"{YELLOW}[DB Manager] Warning: failed to insert ingest entry: {e}{RESET}")
 
     # ------------------------------------------------------------------
     # Convenience method: fetch a batch of rows from no_metadata for enrichment

@@ -80,11 +80,20 @@ export async function consolidateBibliographies() {
 
 export async function fetchBibliographyEntries(baseName) {
   const response = await fetchWithTimeout(
-    `${API_BASE}/api/bibliographies/${encodeURIComponent(baseName)}/all`
+    `${API_BASE}/api/ingest/latest?baseName=${encodeURIComponent(baseName)}`
   )
   if (!response.ok) {
     const payload = await response.text()
-    throw new Error(payload || 'Failed to load bibliography entries')
+    throw new Error(payload || 'Failed to load ingest entries')
+  }
+  return response.json()
+}
+
+export async function fetchIngestStats() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/stats`)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load ingest stats')
   }
   return response.json()
 }
