@@ -1,4 +1,5 @@
-import google.generativeai as genai
+from google import genai as google_genai
+from google.genai import types
 from google.api_core import exceptions as google_exceptions
 import pikepdf
 import json
@@ -20,21 +21,72 @@ print("--- Imports Done --- ", flush=True)
 # --- Added: Configure Google API Key ---
 print("--- Configuring GenAI --- ", flush=True)
 load_dotenv()
-api_key = os.getenv('GOOGLE_API_KEY')
+api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+api_client = None
 if not api_key:
-    print("Error: GOOGLE_API_KEY environment variable not set.", flush=True)
+    print("Error: GEMINI_API_KEY (or GOOGLE_API_KEY) environment variable not set.", flush=True)
     # Consider exiting or raising an error if the key is essential
     # sys.exit(1) # Uncomment to exit if key is missing
 else:
     try:
-        genai.configure(api_key=api_key)
-        print("Successfully configured Google Generative AI with API key.")
+        api_client = google_genai.Client(api_key=api_key)
+        print("Successfully configured Google GenAI client with API key.")
     except Exception as e:
-        print(f"Error configuring Google Generative AI: {e}")
+        print(f"Error configuring Google GenAI client: {e}")
         # Consider exiting or raising an error
         # sys.exit(1)
 print("--- GenAI Configured (or skipped) --- ", flush=True)
 # --- End Added Section ---
+
+
+class GenAIModel:
+    def __init__(self, model_name: str, temperature: float = 0.0):
+        self.model_name = model_name
+        self.temperature = temperature
+
+    def generate_content(self, contents, request_options=None):
+        if api_client is None:
+            raise RuntimeError("GenAI client not configured.")
+        config = types.GenerateContentConfig(temperature=self.temperature)
+
+        def _call():
+            return api_client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=config,
+            )
+
+        timeout = None
+        if request_options and isinstance(request_options, dict):
+            timeout = request_options.get("timeout")
+        if timeout:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_call)
+                try:
+                    return future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError as exc:
+                    future.cancel()
+                    raise TimeoutError(f"Gemini request timed out after {timeout}s") from exc
+        return _call()
+
+
+def upload_pdf(path: str, display_name: str | None = None):
+    if api_client is None:
+        raise RuntimeError("GenAI client not configured.")
+    with open(path, "rb") as file_handle:
+        return api_client.files.upload(
+            file=file_handle,
+            config={
+                "mime_type": "application/pdf",
+                "display_name": display_name or os.path.basename(path),
+            },
+        )
+
+
+def delete_uploaded(name: str):
+    if api_client is None:
+        return
+    api_client.files.delete(name)
 
 def clean_json_response(text):
     """Clean JSON response from markdown formatting."""
@@ -103,7 +155,7 @@ RULES:
         print(f"Error in find_reference_section_pages: {e}", flush=True)
         return []
 
-def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total_pages: int):
+def detect_page_number_offset(pdf_path: str, model: GenAIModel, total_pages: int):
     """
     Sample pages at 20/40/60/80%, extract them, upload as a batch, 
     and use a single prompt to detect the offset.
@@ -171,7 +223,7 @@ def detect_page_number_offset(pdf_path: str, model: genai.GenerativeModel, total
                 print(f"    - Uploading temp page for index {page_index}...", flush=True)
                 # Use a display name that's simple for the model
                 display_name = f"page{chr(ord('A') + i)}.pdf" 
-                uploaded_file = genai.upload_file(path=temp_pdf_path, display_name=display_name)
+                uploaded_file = upload_pdf(temp_pdf_path, display_name=display_name)
                 print(f"      - Uploaded as URI: {uploaded_file.name}", flush=True)
                 uploaded_files_info[uploaded_file.name] = {
                     'physical_index': page_index,
@@ -262,7 +314,7 @@ No markdown or extra text.
         for upload_name, info in uploaded_files_info.items():
             try:
                 print(f"    - Deleting {info['file_object'].name}...", flush=True)
-                genai.delete_file(info['file_object'].name)
+                delete_uploaded(info['file_object'].name)
             except Exception as del_err:
                 print(f"    - Warning: Failed to delete {info['file_object'].name}: {del_err}", flush=True)
         # Delete local temporary files/dirs
@@ -287,7 +339,7 @@ No markdown or extra text.
         print("Insufficient agreement on page number offset.", flush=True)
         return None
 
-def get_printed_page_number(pdf_doc: pikepdf.Pdf, page_index: int, model: genai.GenerativeModel, uploaded_full_pdf) -> int | None:
+def get_printed_page_number(pdf_doc: pikepdf.Pdf, page_index: int, model: GenAIModel, uploaded_full_pdf) -> int | None:
     """Gets the printed page number from a specific physical page index within an already uploaded PDF.
     
     NOTE: This function is no longer used by the primary validation flow as of the last refactor.
@@ -297,7 +349,7 @@ def get_printed_page_number(pdf_doc: pikepdf.Pdf, page_index: int, model: genai.
         pdf_doc: The opened pikepdf document (used for context/fallback if needed, but not for primary extraction).
         page_index: The 0-based physical index of the page to check.
         model: The configured GenerativeModel instance.
-        uploaded_full_pdf: The File object returned by genai.upload_file() for the complete PDF.
+        uploaded_full_pdf: The File object returned by upload_pdf() for the complete PDF.
 
     Returns:
         The detected printed page number as an integer, or None if not found or error.
@@ -380,8 +432,8 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
     try:
         # --- Centralized Initialization --- 
         print("Initializing Generative Models and uploading PDF...")
-        model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17", generation_config=genai.types.GenerationConfig(temperature=0.0))
-        uploaded_pdf = genai.upload_file(pdf_path)
+        model = GenAIModel("gemini-3-flash-preview", temperature=0.0)
+        uploaded_pdf = upload_pdf(pdf_path)
         print("Initialization complete.")
         # --- End Initialization --- 
 
@@ -498,13 +550,13 @@ def extract_reference_sections(pdf_path: str, output_dir: str = "~/Nextcloud/DT/
                     validation_upload_parts = []
                     try:
                         print(f"    - Uploading validation page: Start (physical {physical_start_to_validate})...", flush=True)
-                        uploaded_start = genai.upload_file(path=temp_start_file_path, display_name=f"start_page_{i+1}.pdf")
+                        uploaded_start = upload_pdf(temp_start_file_path, display_name=f"start_page_{i+1}.pdf")
                         uploaded_validation_files['start'] = {'file_object': uploaded_start, 'temp_path': temp_start_file_path}
                         validation_upload_parts.append(uploaded_start)
                         print(f"      - Uploaded as URI: {uploaded_start.name}", flush=True)
 
                         print(f"    - Uploading validation page: End (physical {physical_end_to_validate})...", flush=True)
-                        uploaded_end = genai.upload_file(path=temp_end_file_path, display_name=f"end_page_{i+1}.pdf")
+                        uploaded_end = upload_pdf(temp_end_file_path, display_name=f"end_page_{i+1}.pdf")
                         uploaded_validation_files['end'] = {'file_object': uploaded_end, 'temp_path': temp_end_file_path}
                         validation_upload_parts.append(uploaded_end)
                         print(f"      - Uploaded as URI: {uploaded_end.name}", flush=True)
@@ -623,7 +675,7 @@ Output Format:
                         # Delete uploaded file
                         try:
                             print(f"      - Deleting uploaded file: {info['file_object'].name}...", flush=True)
-                            genai.delete_file(info['file_object'].name)
+                            delete_uploaded(info['file_object'].name)
                         except Exception as del_err:
                             print(f"      - Warning: Failed to delete uploaded {key} file {info['file_object'].name}: {del_err}", flush=True)
                         # Delete local temp file
@@ -730,7 +782,7 @@ Output Format:
         if 'uploaded_pdf' in locals() and uploaded_pdf is not None:
             try:
                 print(f"\n--- Final Cleanup: Deleting main uploaded file '{uploaded_pdf.name}' ---", flush=True)
-                genai.delete_file(uploaded_pdf.name)
+                delete_uploaded(uploaded_pdf.name)
                 print("Main uploaded file deleted successfully.", flush=True)
             except Exception as del_err:
                 print(f"Warning: Failed to delete main uploaded file '{uploaded_pdf.name}': {del_err}", flush=True)
