@@ -1,8 +1,14 @@
-# Use the official Node.js 23 Alpine image as the base
-FROM node:23-alpine
+# Use a Debian-based Node.js image to support native modules like better-sqlite3
+FROM node:22-bookworm-slim
 
-# Install Python, pip, and virtualenv tools
-RUN apk add --no-cache python3 py3-pip py3-virtualenv
+# Install Python, pip, and build tools
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    python3-pip \
+    build-essential \
+  && rm -rf /var/lib/apt/lists/*
 
 # Create and activate a virtual environment
 RUN python3 -m venv /opt/venv
