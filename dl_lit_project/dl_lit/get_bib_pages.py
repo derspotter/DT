@@ -1,10 +1,8 @@
 from google import genai
 from google.genai import types
-from google.api_core import exceptions as google_exceptions
 import pikepdf
 import json
 import os
-from collections import defaultdict
 import sys
 import argparse
 import tempfile
@@ -60,37 +58,23 @@ def find_reference_section_pages(
     print(f"Attempting to find reference sections in PDF: {pdf_path}", flush=True)
     print("Using pre-uploaded PDF for section finding.", flush=True)
     
-    # Prompt asking for 1-based physical page indices
     prompt = f"""
-Your task is to identify ALL bibliography or reference sections in this PDF document.
+Identify ALL bibliography/reference sections in this PDF.
 
-CONTEXT:
-- The document has a total of {total_physical_pages} physical pages, numbered 1 to {total_physical_pages}.
+Use 1-based PHYSICAL page indices (first PDF page = 1) and ignore any printed page numbers.
+Return only a JSON array of objects with start_page and end_page.
 
-INSTRUCTIONS:
-1. Find sections containing lists of references, citations, or bibliographic entries. These sections might be titled 'References', 'Bibliography', 'Works Cited', or similar, or they might be untitled but recognizable by their format (lists of authors, years, titles, DOIs, etc.).
-2. **IMPORTANT: You MUST use 1-based physical page indices. The first page of the document is page 1, the second is page 2, and so on, regardless of any printed page numbers.**
-3. **'start_page' MUST be the 1-based physical index of the page containing the section's title (e.g., "References", "Bibliography"). If the title is on a preceding page, you must use the page with the title as the start_page.** This is critical to avoid cutting off the beginning of the section.
-4. 'end_page' is the 1-based physical index of the page where the last entry of that specific reference section ends. Do not include subsequent pages that are empty or contain unrelated content.
-5. Identify ALL such reference sections. Pay close attention to the end of chapters or major parts, as these often have their own reference lists.
-6. Return ONLY a JSON array as shown below. Do not include any explanatory text or markdown formatting outside the JSON structure.
+Rules:
+- start_page = page where the references section begins (title or first entry). Be inclusive.
+- end_page = page where the last reference entry ends (do not include unrelated pages after).
+- Include every distinct bibliography/reference section, especially after chapters.
 
-FORMAT:
+Document has {total_physical_pages} physical pages.
+
+Format:
 [
-    {{
-        "start_page": 250,  // 1-based physical page index where the section starts
-        "end_page": 255     // 1-based physical page index where the section's last entry ends
-    }}
+  {{"start_page": 12, "end_page": 15}}
 ]
-
-RULES:
-- Always include 'start_page' and 'end_page' for each identified section.
-- **When in doubt about the start page, be inclusive. It is better to include the page before the first reference item than to miss the section title.**
-- Use INTEGER numbers only for page indices.
-- Ensure 'start_page' correctly identifies the beginning of the section (title or first entry) by its 1-based physical index.
-- Ensure 'end_page' correctly identifies the end of the last entry of that section by its 1-based physical index.
-- Include EVERY distinct bibliography/reference section found throughout the document.
-- The output must be ONLY the valid JSON array.
 """
 
     try:
@@ -99,10 +83,10 @@ RULES:
         print("Sending request to GenAI...", flush=True)
         def _call_model():
             return client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3-flash-preview",
                 contents=[prompt, uploaded_pdf],
                 config=types.GenerateContentConfig(
-                    temperature=0.0,
+                    temperature=1.0,
                     response_mime_type="application/json",
                 ),
             )
