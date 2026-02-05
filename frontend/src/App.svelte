@@ -343,6 +343,12 @@
       })
       apiStatus = 'online'
     } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
+        return
+      }
       updateUpload(item.id, { status: 'failed', message: error.message || 'Upload failed' })
       apiStatus = 'offline'
     }
@@ -367,6 +373,12 @@
       await loadIngestStats()
       await loadIngestRuns()
     } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
+        return
+      }
       updateUpload(item.id, { status: 'failed', message: error.message || 'Extraction failed' })
     }
   }

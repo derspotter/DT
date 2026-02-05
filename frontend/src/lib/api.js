@@ -7,7 +7,8 @@ import {
 } from './sample-data'
 
 const DEFAULT_TIMEOUT = 8_000
-const UPLOAD_TIMEOUT = 120_000
+// Uploads can be large over SSH port-forwarding; keep this generous.
+const UPLOAD_TIMEOUT = 600_000
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
 let authToken = localStorage.getItem('rag_feeder_token') || ''
 
