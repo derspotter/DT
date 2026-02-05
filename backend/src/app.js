@@ -635,6 +635,8 @@ export function createApp({ broadcast } = {}) {
     const { filename } = req.params;
     const corpusId = req.corpusId;
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
+    const baseName = path.basename(filename, path.extname(filename)); // stable ingest_source
+    const existingPagesDir = path.join(BIB_OUTPUT_DIR, baseName);
     const uniqueSuffix = crypto.randomBytes(8).toString('hex');
     const tempPagesDir = path.join(TEMP_PAGES_BASE_DIR, `${Date.now()}-${uniqueSuffix}`);
 
@@ -643,20 +645,64 @@ export function createApp({ broadcast } = {}) {
     console.log(`[/api/extract-bibliography] Temp pages dir: ${tempPagesDir}`);
     console.log(`[/api/extract-bibliography] Final bib output dir: ${BIB_OUTPUT_DIR}`);
 
-    // 1. Check if input PDF exists
-    if (!fs.existsSync(inputPdfPath)) {
+    const inputExists = fs.existsSync(inputPdfPath);
+    const pagesExist =
+      fs.existsSync(existingPagesDir) &&
+      fs.readdirSync(existingPagesDir).some((file) => file.toLowerCase().endsWith('.pdf'));
+
+    // 1. Check if we can proceed: either we have the uploaded PDF, or we can reuse extracted pages.
+    if (!inputExists && !pagesExist) {
       console.error(`[/api/extract-bibliography] Input PDF not found: ${inputPdfPath}`);
-      // Return error immediately
-      return res.status(404).json({ error: 'Uploaded PDF not found.' });
+      console.error(`[/api/extract-bibliography] No existing extracted pages found in: ${existingPagesDir}`);
+      return res.status(404).json({
+        error: 'Uploaded PDF not found (and no extracted pages exist). Please re-upload the PDF.',
+      });
     }
 
     // --- Send Immediate Response ---
-    res.status(202).json({ message: 'Bibliography extraction process started.' });
+    res.status(202).json({
+      message: inputExists
+        ? 'Bibliography extraction process started.'
+        : 'Bibliography parsing started (reusing previously extracted reference pages).',
+    });
     // Status 202 Accepted indicates the request is accepted for processing, but is not complete.
     // --- End Immediate Response ---
 
     // --- Run Scripts in Background ---
     try {
+      // Fast-path: if the upload is missing but we already have extracted page PDFs, run the scraper only.
+      if (!inputExists && pagesExist) {
+        console.log(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
+        send(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
+        const dbPath = DB_PATH;
+        const scrapeApiArgs = ['--input-dir', existingPagesDir, '--db-path', dbPath, '--ingest-source', baseName];
+        if (corpusId) {
+          scrapeApiArgs.push('--corpus-id', String(corpusId));
+        }
+        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
+
+        apiScraperProcess.stdout.on('data', (data) => {
+          const message = data.toString();
+          console.log(`[APIscraper stdout]: ${message}`);
+          send(`[APIscraper] ${message}`);
+        });
+
+        apiScraperProcess.stderr.on('data', (data) => {
+          const message = data.toString();
+          console.error(`[APIscraper stderr]: ${message}`);
+          send(`[APIscraper ERROR] ${message}`);
+        });
+
+        apiScraperProcess.on('close', (code) => {
+          if (code !== 0) {
+            console.error(`[/api/extract-bibliography] ${API_SCRAPER_SCRIPT} exited with code ${code}`);
+            return;
+          }
+          console.log(`[/api/extract-bibliography] Finished ${API_SCRAPER_SCRIPT} (reused pages).`);
+        });
+        return;
+      }
+
       // 2. Create unique temporary directory for pages
       fs.mkdirSync(tempPagesDir, { recursive: true });
       console.log(`[/api/extract-bibliography] Created temp directory: ${tempPagesDir}`);
@@ -700,9 +746,8 @@ export function createApp({ broadcast } = {}) {
         }
 
         // **Proceed to Step 2: Call API Scraper only if Step 1 succeeded**
-        const baseName = path.basename(filename, path.extname(filename)); // Extract base name from original filename
-        // Construct the expected JSON path based on the *output* structure of get_bib_pages
-        const jsonSubDir = path.join(BIB_OUTPUT_DIR, baseName); // Subdirectory named after the base PDF name
+        // Construct the expected output dir based on the *output* structure of get_bib_pages
+        const jsonSubDir = existingPagesDir; // Subdirectory named after the base PDF name
         const pageFiles = fs.existsSync(jsonSubDir)
           ? fs.readdirSync(jsonSubDir).filter((file) => file.endsWith('.pdf'))
           : [];
