@@ -768,12 +768,54 @@
     return label.length > max ? `${label.slice(0, max - 1)}…` : label
   }
 
-  onMount(async () => {
-    await loadIngestStats()
-    await loadCorpus()
-    await loadDownloads()
-    await loadGraph()
-    connectLogs()
+  const tabIds = new Set(tabs.map((tab) => tab.id))
+
+  function readTabFromHash() {
+    if (typeof window === 'undefined') return null
+    const raw = window.location.hash || ''
+    const cleaned = raw.replace(/^#\/?/, '').trim()
+    return tabIds.has(cleaned) ? cleaned : null
+  }
+
+  function updateHash(tabId, replace = false) {
+    if (typeof window === 'undefined') return
+    const next = `#/${tabId}`
+    if (window.location.hash === next) return
+    if (replace && window.history?.replaceState) {
+      window.history.replaceState(null, '', next)
+    } else {
+      window.location.hash = next
+    }
+  }
+
+  function setActiveTab(tabId, { replace = false } = {}) {
+    const safeTab = tabIds.has(tabId) ? tabId : 'dashboard'
+    activeTab = safeTab
+    updateHash(safeTab, replace)
+  }
+
+  onMount(() => {
+    const initialTab = readTabFromHash() || activeTab
+    setActiveTab(initialTab, { replace: true })
+
+    const onHashChange = () => {
+      const tab = readTabFromHash()
+      if (tab && tab !== activeTab) {
+        activeTab = tab
+      }
+    }
+    window.addEventListener('hashchange', onHashChange)
+
+    const boot = async () => {
+      await loadIngestStats()
+      await loadCorpus()
+      await loadDownloads()
+      await loadGraph()
+      connectLogs()
+    }
+    boot()
+
+    return () => window.removeEventListener('hashchange', onHashChange)
   })
 </script>
 
@@ -797,7 +839,7 @@
       {#each tabs as tab}
         <button
           class:active={activeTab === tab.id}
-          on:click={() => (activeTab = tab.id)}
+          on:click={() => setActiveTab(tab.id)}
           type="button"
           data-testid={`tab-${tab.id}`}
         >
