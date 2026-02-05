@@ -30,6 +30,7 @@ def main():
     parser.add_argument('--db-path', required=True)
     parser.add_argument('--limit', type=int, default=200)
     parser.add_argument('--offset', type=int, default=0)
+    parser.add_argument('--corpus-id', type=int, default=None)
     args = parser.parse_args()
 
     if 'RAG_FEEDER_STUB' in __import__('os').environ:
@@ -49,7 +50,16 @@ def main():
     items = []
     for table, status in tables:
         try:
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            if args.corpus_id is not None:
+                rows = conn.execute(
+                    f"""SELECT t.* FROM {table} t
+                        JOIN corpus_items ci
+                          ON ci.table_name = ? AND ci.row_id = t.id
+                       WHERE ci.corpus_id = ?""",
+                    (table, args.corpus_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(f"SELECT * FROM {table}").fetchall()
         except sqlite3.Error:
             continue
         for row in rows:

@@ -9,21 +9,108 @@ import {
 const DEFAULT_TIMEOUT = 8_000
 const UPLOAD_TIMEOUT = 120_000
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
+let authToken = localStorage.getItem('rag_feeder_token') || ''
+
+export function setAuthToken(token) {
+  authToken = token || ''
+  if (authToken) {
+    localStorage.setItem('rag_feeder_token', authToken)
+  } else {
+    localStorage.removeItem('rag_feeder_token')
+  }
+}
+
+export function getAuthToken() {
+  return authToken
+}
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const response = await fetch(url, { ...options, signal: controller.signal })
+    const headers = { ...(options.headers || {}) }
+    if (authToken) {
+      headers.Authorization = `Bearer ${authToken}`
+    }
+    const response = await fetch(url, { ...options, headers, signal: controller.signal })
     return response
   } finally {
     clearTimeout(timeout)
   }
 }
 
+async function throwIfUnauthorized(response) {
+  if (response.status === 401) {
+    const payload = await response.text()
+    const error = new Error(payload || 'Unauthorized')
+    error.status = 401
+    throw error
+  }
+}
+
+export async function login({ username, password }) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Login failed')
+  }
+  const payload = await response.json()
+  if (payload.token) {
+    setAuthToken(payload.token)
+  }
+  return payload
+}
+
+export async function fetchMe() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/auth/me`)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load user')
+  }
+  return response.json()
+}
+
+export async function fetchCorpora() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora`)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load corpora')
+  }
+  return response.json()
+}
+
+export async function selectCorpus(corpusId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/select`, {
+    method: 'POST',
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to select corpus')
+  }
+  return response.json()
+}
+
+export async function createCorpus(name) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to create corpus')
+  }
+  return response.json()
+}
+
 export async function fetchBibliographyList() {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/bibliographies/all-current`)
+    await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
     }
@@ -45,6 +132,7 @@ export async function uploadPdf(file) {
     },
     UPLOAD_TIMEOUT
   )
+  await throwIfUnauthorized(response)
   if (!response.ok) {
     const message = await response.text()
     throw new Error(message || 'Upload failed')
@@ -60,6 +148,7 @@ export async function extractBibliography(filename) {
       method: 'POST',
     }
   )
+  await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Extraction failed')
@@ -71,6 +160,7 @@ export async function consolidateBibliographies() {
   const response = await fetchWithTimeout(`${API_BASE}/api/bibliographies/consolidate`, {
     method: 'POST',
   })
+  await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Consolidation failed')
@@ -82,6 +172,7 @@ export async function fetchBibliographyEntries(baseName) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/ingest/latest?baseName=${encodeURIComponent(baseName)}`
   )
+  await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Failed to load ingest entries')
@@ -91,6 +182,7 @@ export async function fetchBibliographyEntries(baseName) {
 
 export async function fetchIngestStats() {
   const response = await fetchWithTimeout(`${API_BASE}/api/ingest/stats`)
+  await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Failed to load ingest stats')
@@ -105,6 +197,7 @@ export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, field, yearFrom, yearTo }),
     })
+    await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
     }
@@ -112,6 +205,9 @@ export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
     const data = Array.isArray(payload) ? payload : payload.results || []
     return { data, source: payload.source || 'api', runId: payload.runId }
   } catch (error) {
+    if (error?.status === 401) {
+      throw error
+    }
     return { data: sampleSearchResults, source: 'sample', error }
   }
 }
@@ -119,6 +215,7 @@ export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
 export async function fetchCorpus() {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/corpus`)
+    await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
     }
@@ -126,6 +223,9 @@ export async function fetchCorpus() {
     const data = Array.isArray(payload) ? payload : payload.items || []
     return { data, source: payload.source || 'api' }
   } catch (error) {
+    if (error?.status === 401) {
+      throw error
+    }
     return { data: sampleCorpus, source: 'sample', error }
   }
 }
@@ -133,6 +233,7 @@ export async function fetchCorpus() {
 export async function fetchDownloadQueue() {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/downloads`)
+    await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
     }
@@ -140,6 +241,9 @@ export async function fetchDownloadQueue() {
     const data = Array.isArray(payload) ? payload : payload.items || []
     return { data, source: payload.source || 'api' }
   } catch (error) {
+    if (error?.status === 401) {
+      throw error
+    }
     return { data: sampleDownloads, source: 'sample', error }
   }
 }
@@ -165,6 +269,7 @@ export async function fetchGraph({
       params.set('year_to', String(yearTo))
     }
     const response = await fetchWithTimeout(`${API_BASE}/api/graph?${params.toString()}`)
+    await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
     }
@@ -172,6 +277,9 @@ export async function fetchGraph({
     const data = payload.nodes ? payload : payload.data || payload
     return { data, source: payload.source || 'api' }
   } catch (error) {
+    if (error?.status === 401) {
+      throw error
+    }
     return { data: sampleGraph, source: 'sample', error }
   }
 }

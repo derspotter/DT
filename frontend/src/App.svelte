@@ -1,6 +1,11 @@
 <script>
   import { onMount } from 'svelte'
   import {
+    login,
+    fetchMe,
+    selectCorpus,
+    createCorpus,
+    setAuthToken,
     uploadPdf,
     extractBibliography,
     fetchBibliographyEntries,
@@ -24,6 +29,13 @@
 
   let activeTab = 'dashboard'
   let apiStatus = 'unknown'
+  let authStatus = 'loading'
+  let authError = ''
+  let authUser = null
+  let corpora = []
+  let currentCorpusId = null
+  let loginUsername = ''
+  let loginPassword = ''
 
   let uploads = []
   let ingestStats = {
@@ -72,6 +84,7 @@
   let graphViewBox = { x: 0, y: 0, size: 440 }
   let isGraphPanning = false
   let graphPanStart = { x: 0, y: 0, viewX: 0, viewY: 0 }
+  let creatingCorpus = false
 
   const maxLogs = 200
 
@@ -110,6 +123,91 @@
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  async function bootstrapAuth() {
+    authStatus = 'loading'
+    authError = ''
+    try {
+      const payload = await fetchMe()
+      authUser = payload.user
+      corpora = payload.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || (corpora[0]?.id ?? null)
+      authStatus = 'authenticated'
+      await refreshAll()
+      connectLogs()
+    } catch (error) {
+      authStatus = 'unauthenticated'
+      authError = ''
+      authUser = null
+      corpora = []
+      currentCorpusId = null
+      setAuthToken('')
+    }
+  }
+
+  async function handleLogin(event) {
+    event?.preventDefault?.()
+    authError = ''
+    try {
+      const payload = await login({ username: loginUsername.trim(), password: loginPassword })
+      if (payload?.user) {
+        authUser = payload.user
+        currentCorpusId = payload.user.last_corpus_id || null
+      }
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
+      authStatus = 'authenticated'
+      await refreshAll()
+      connectLogs()
+    } catch (error) {
+      authError = error.message || 'Login failed'
+      authStatus = 'unauthenticated'
+      setAuthToken('')
+    }
+  }
+
+  async function refreshAll() {
+    await loadIngestStats()
+    await loadCorpus()
+    await loadDownloads()
+    await loadGraph()
+  }
+
+  async function handleSelectCorpus(event) {
+    const nextId = Number(event.target.value)
+    if (!nextId) return
+    try {
+      await selectCorpus(nextId)
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || nextId
+      await refreshAll()
+    } catch (error) {
+      authError = error.message || 'Failed to select corpus'
+    }
+  }
+
+  async function handleCreateCorpus() {
+    if (creatingCorpus) return
+    const name = window.prompt('New corpus name')
+    if (!name) return
+    creatingCorpus = true
+    try {
+      await createCorpus(name.trim())
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || currentCorpusId
+      await refreshAll()
+    } catch (error) {
+      authError = error.message || 'Failed to create corpus'
+    } finally {
+      creatingCorpus = false
+    }
+  }
+
   async function loadLatestEntries(baseName) {
     latestEntriesBase = baseName
     latestEntriesStatus = 'Waiting for extracted entries...'
@@ -125,6 +223,11 @@
           return
         }
       } catch (error) {
+        if (error?.status === 401) {
+          authStatus = 'unauthenticated'
+          setAuthToken('')
+          return
+        }
         // Keep waiting; extraction can take time.
       }
       latestEntriesStatus = `Waiting for extracted entries... (${i + 1}/${attempts})`
@@ -194,6 +297,10 @@
       ingestStatsStatus = 'Loaded ingest stats.'
       apiStatus = 'online'
     } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      }
       ingestStatsStatus = 'Failed to load ingest stats.'
       apiStatus = 'offline'
     }
@@ -201,53 +308,83 @@
 
   async function runSearch() {
     searchStatus = 'Searching...'
-    const { data, source } = await runKeywordSearch({
-      query: searchQuery,
-      field: searchField,
-      yearFrom,
-      yearTo,
-    })
-    searchResults = data
-    searchSource = source
-    searchStatus = source === 'api' ? 'Results loaded from API.' : 'Sample results loaded.'
+    try {
+      const { data, source } = await runKeywordSearch({
+        query: searchQuery,
+        field: searchField,
+        yearFrom,
+        yearTo,
+      })
+      searchResults = data
+      searchSource = source
+      searchStatus = source === 'api' ? 'Results loaded from API.' : 'Sample results loaded.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      }
+      searchStatus = 'Search failed.'
+    }
   }
 
   async function loadCorpus() {
-    const { data, source } = await fetchCorpus()
-    corpusItems = data
-    corpusSource = source
+    try {
+      const { data, source } = await fetchCorpus()
+      corpusItems = data
+      corpusSource = source
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      }
+    }
   }
 
   async function loadDownloads() {
-    const { data, source } = await fetchDownloadQueue()
-    downloads = data
-    downloadsSource = source
+    try {
+      const { data, source } = await fetchDownloadQueue()
+      downloads = data
+      downloadsSource = source
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      }
+    }
   }
 
   async function loadGraph() {
     graphStatus = 'Loading graph...'
-    const { data, source } = await fetchGraph({
-      maxNodes: graphMaxNodes,
-      relationship: graphRelationship,
-      status: graphStatusFilter,
-      yearFrom: graphYearFrom ? Number(graphYearFrom) : null,
-      yearTo: graphYearTo ? Number(graphYearTo) : null,
-      hideIsolates: graphHideIsolates,
-    })
-    graphNodes = data.nodes || []
-    graphEdges = data.edges || []
-    graphStats = data.stats || null
-    graphSource = source
-    graphStatus = source === 'api' ? 'Loaded from API.' : 'Sample graph loaded.'
-    const degreeMap = buildDegreeMap(graphNodes, graphEdges)
-    graphDegreeMap = degreeMap
-    const { layoutEdges } = buildLayoutEdges(graphNodes, graphEdges, degreeMap)
-    graphLayout = buildGraphLayout(graphNodes, graphEdges, layoutEdges, degreeMap, {
-      focusConnected: graphFocusConnected,
-    })
-    graphNodeMap = new Map(graphLayout.map((node) => [node.id, node]))
-    graphCanvasSize = graphLayout[0]?.canvasSize || 440
-    graphViewBox = { x: 0, y: 0, size: graphCanvasSize }
+    try {
+      const { data, source } = await fetchGraph({
+        maxNodes: graphMaxNodes,
+        relationship: graphRelationship,
+        status: graphStatusFilter,
+        yearFrom: graphYearFrom ? Number(graphYearFrom) : null,
+        yearTo: graphYearTo ? Number(graphYearTo) : null,
+        hideIsolates: graphHideIsolates,
+      })
+      graphNodes = data.nodes || []
+      graphEdges = data.edges || []
+      graphStats = data.stats || null
+      graphSource = source
+      graphStatus = source === 'api' ? 'Loaded from API.' : 'Sample graph loaded.'
+      const degreeMap = buildDegreeMap(graphNodes, graphEdges)
+      graphDegreeMap = degreeMap
+      const { layoutEdges } = buildLayoutEdges(graphNodes, graphEdges, degreeMap)
+      graphLayout = buildGraphLayout(graphNodes, graphEdges, layoutEdges, degreeMap, {
+        focusConnected: graphFocusConnected,
+      })
+      graphNodeMap = new Map(graphLayout.map((node) => [node.id, node]))
+      graphCanvasSize = graphLayout[0]?.canvasSize || 440
+      graphViewBox = { x: 0, y: 0, size: graphCanvasSize }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      }
+      graphStatus = 'Failed to load graph.'
+    }
   }
 
   function connectLogs() {
@@ -807,11 +944,7 @@
     window.addEventListener('hashchange', onHashChange)
 
     const boot = async () => {
-      await loadIngestStats()
-      await loadCorpus()
-      await loadDownloads()
-      await loadGraph()
-      connectLogs()
+      await bootstrapAuth()
     }
     boot()
 
@@ -819,20 +952,62 @@
   })
 </script>
 
-<div class="app-shell">
-  <header class="app-header">
-    <div>
+{#if authStatus !== 'authenticated'}
+  <div class="login-shell">
+    <div class="login-card">
       <p class="eyebrow">Korpus Builder</p>
-      <h1>Corpus orchestration workspace</h1>
-      <p class="subtitle">
-        Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
-      </p>
+      <h1>Sign in</h1>
+      <p class="subtitle">Use your username and password to access corpora.</p>
+      <form class="login-form" on:submit={handleLogin}>
+        <label>
+          Username
+          <input type="text" bind:value={loginUsername} autocomplete="username" required />
+        </label>
+        <label>
+          Password
+          <input type="password" bind:value={loginPassword} autocomplete="current-password" required />
+        </label>
+        {#if authError}
+          <p class="error">{authError}</p>
+        {/if}
+        <button type="submit">Sign in</button>
+      </form>
     </div>
-    <div class="header-badge">
-      <span>Milestone 2 prep</span>
-      <strong>Frontend · Svelte</strong>
-    </div>
-  </header>
+  </div>
+{:else}
+  <div class="app-shell">
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">Korpus Builder</p>
+        <h1>Corpus orchestration workspace</h1>
+        <p class="subtitle">
+          Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
+        </p>
+      </div>
+      <div class="header-meta">
+        <div class="header-badge">
+          <span>Milestone 2 prep</span>
+          <strong>Frontend · Svelte</strong>
+        </div>
+        <div class="header-user">
+          <span class="eyebrow">Signed in</span>
+          <strong>{authUser?.username}</strong>
+        </div>
+        <div class="header-corpus">
+          <label>
+            Corpus
+            <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
+              {#each corpora as corpus}
+                <option value={corpus.id}>{corpus.name}</option>
+              {/each}
+            </select>
+          </label>
+          <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus}>
+            New corpus
+          </button>
+        </div>
+      </div>
+    </header>
 
   <div class="layout">
     <aside class="side-nav" data-testid="side-nav">
@@ -1218,3 +1393,4 @@
     </section>
   </div>
 </div>
+{/if}

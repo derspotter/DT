@@ -44,6 +44,9 @@ dl_lit_project/dl_lit/__pycache__/*.pyc
 dl_lit_project/inspect_db.py
 extracted_refs/
 kanzlei.py
+.playwright-cache/
+.playwright-cli/
+dl_lit_project/extracted_refs_tmp/
 
 # OCR output directories
 ocr/ocr_results/

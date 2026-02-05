@@ -409,6 +409,7 @@ class DatabaseManager:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ingest_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                corpus_id INTEGER,
                 ingest_source TEXT,
                 source_pdf TEXT,
                 title TEXT,
@@ -419,6 +420,55 @@ class DatabaseManager:
                 publisher TEXT,
                 url TEXT,
                 entry_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS corpus_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                corpus_id INTEGER NOT NULL,
+                table_name TEXT NOT NULL,
+                row_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(corpus_id, table_name, row_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                last_corpus_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS corpora (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_corpora (
+                user_id INTEGER NOT NULL,
+                corpus_id INTEGER NOT NULL,
+                role TEXT DEFAULT 'viewer',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, corpus_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                checksum TEXT UNIQUE,
+                file_path TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -454,6 +504,7 @@ class DatabaseManager:
         self._add_missing_columns_to_no_metadata()
         self._add_missing_columns_to_with_metadata()
         self._add_missing_columns_to_downloaded_references()
+        self._add_missing_columns_to_ingest_entries()
 
         # Helpful indices for quick look-ups (after ensuring columns exist)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
@@ -462,6 +513,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_doi ON to_download_references(normalized_doi)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_corpus ON ingest_entries(corpus_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_openalex ON search_results(openalex_id)")
         
         # Add indexes for title/author/year duplicate detection
@@ -477,6 +529,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_owner ON work_aliases(work_table, work_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_items_lookup ON corpus_items(corpus_id, table_name, row_id)")
 
         self.conn.commit()
         print(f"{GREEN}[DB Manager] Schema created/verified successfully.{RESET}")
@@ -502,6 +555,18 @@ class DatabaseManager:
                 print(f"{GREEN}[DB Manager] Added relationship_type column to failed_downloads table.{RESET}")
             except sqlite3.Error as e:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add relationship_type column: {e}{RESET}")
+
+    def _add_missing_columns_to_ingest_entries(self):
+        """Add missing corpus_id column to ingest_entries table if it doesn't exist."""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(ingest_entries)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if 'corpus_id' not in columns:
+            try:
+                cursor.execute("ALTER TABLE ingest_entries ADD COLUMN corpus_id INTEGER")
+                print(f"{GREEN}[DB Manager] Added corpus_id column to ingest_entries table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add corpus_id column: {e}{RESET}")
 
     def _add_normalized_columns_to_download_queue(self):
         """Add missing normalized columns to to_download_references table if they don't exist."""
@@ -1148,6 +1213,58 @@ class DatabaseManager:
         columns = [d[0] for d in cur.description]
         return dict(zip(columns, row))
 
+    def add_corpus_item(self, corpus_id: int, table_name: str, row_id: int) -> None:
+        """Associate a record with a corpus, if corpus_id is provided."""
+        if not corpus_id:
+            return
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
+                   VALUES (?, ?, ?)""",
+                (corpus_id, table_name, row_id),
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"{YELLOW}[DB Manager] Warning: failed to add corpus item: {e}{RESET}")
+            self.conn.rollback()
+
+    def _get_corpus_ids_for_item(self, table_name: str, row_id: int) -> list[int]:
+        """Fetch all corpus IDs that include the given table+row."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT corpus_id FROM corpus_items WHERE table_name = ? AND row_id = ?",
+            (table_name, row_id),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+    def reassign_corpus_items(
+        self,
+        old_table: str,
+        old_row_id: int,
+        new_table: str,
+        new_row_id: int,
+    ) -> None:
+        """Move corpus associations from one table/row to another."""
+        cur = self.conn.cursor()
+        try:
+            corpus_ids = self._get_corpus_ids_for_item(old_table, old_row_id)
+            if not corpus_ids:
+                return
+            cur.executemany(
+                """INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
+                   VALUES (?, ?, ?)""",
+                [(cid, new_table, new_row_id) for cid in corpus_ids],
+            )
+            cur.execute(
+                "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
+                (old_table, old_row_id),
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"{YELLOW}[DB Manager] Warning: failed to reassign corpus items: {e}{RESET}")
+            self.conn.rollback()
+
     def _prepare_resolution_ref(self, ref: dict) -> dict:
         """Build a minimal ref dict for OpenAlex/Crossref resolution."""
         authors_raw = ref.get("authors") or []
@@ -1468,7 +1585,8 @@ class DatabaseManager:
             ref: Dict with at least title. Keys recognised:
                  title, authors (list[str] or str), year, doi, source, volume, issue, 
                  pages, publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
-                 translated_title, translated_year, translated_language, translation_relationship.
+                 translated_title, translated_year, translated_language, translation_relationship,
+                 corpus_id.
 
         Returns:
             (row_id, None) on success or (None, error_msg) if duplicate/failed.
@@ -1477,6 +1595,7 @@ class DatabaseManager:
         if not title:
             return None, "Title is required"
 
+        corpus_id = ref.get("corpus_id")
         doi_raw = ref.get("doi")
         norm_doi = self._normalize_doi(doi_raw)
         norm_title = self._normalize_text(title)
@@ -1530,6 +1649,8 @@ class DatabaseManager:
                                 incoming_ref_for_merge["normalized_doi"] = self._normalize_doi(incoming_resolved.get("doi"))
                             if incoming_resolved.get("openalex_id"):
                                 incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
+                            if corpus_id:
+                                self.add_corpus_item(corpus_id, tbl, eid)
                             self._merge_incoming_into_existing(
                                 tbl,
                                 eid,
@@ -1557,6 +1678,8 @@ class DatabaseManager:
                         pass
 
             if high_confidence and not resolved_conflict:
+                if corpus_id:
+                    self.add_corpus_item(corpus_id, tbl, eid)
                 self._merge_incoming_into_existing(
                     tbl,
                     eid,
@@ -1615,6 +1738,9 @@ class DatabaseManager:
             self.conn.commit()
             new_id = cursor.lastrowid
 
+            if corpus_id:
+                self.add_corpus_item(corpus_id, "no_metadata", new_id)
+
             translated_title = ref.get("translated_title")
             if translated_title:
                 self.add_work_alias(
@@ -1639,10 +1765,11 @@ class DatabaseManager:
         try:
             cursor.execute(
                 """INSERT INTO ingest_entries (
-                    ingest_source, source_pdf, title, authors, year, doi, source,
+                    corpus_id, ingest_source, source_pdf, title, authors, year, doi, source,
                     publisher, url, entry_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
+                    ref.get("corpus_id"),
                     ingest_source,
                     ref.get("source_pdf"),
                     ref.get("title"),
@@ -1836,6 +1963,8 @@ class DatabaseManager:
                 ),
             )
             new_id = cur.lastrowid
+
+            self.reassign_corpus_items("no_metadata", no_meta_id, "with_metadata", new_id)
             
             # Store related works as separate entries in with_metadata table
             if enrichment.get('referenced_works'):
@@ -1897,15 +2026,18 @@ class DatabaseManager:
                 "run_id": data.get("run_id"),
             }
 
-            status, item_id, message = self.add_entry_to_download_queue(
+            status, item_id, message, existing_table = self.add_entry_to_download_queue(
                 queue_dict, exclude_id=with_meta_id, exclude_table='with_metadata'
             )
 
             if status in ('added_to_queue', 'duplicate'):
                 if status == 'added_to_queue':
                     self.update_work_alias_owner("with_metadata", with_meta_id, "to_download_references", item_id)
+                    self.reassign_corpus_items("with_metadata", with_meta_id, "to_download_references", item_id)
                 else:
                     self.delete_work_aliases("with_metadata", with_meta_id)
+                    if existing_table and item_id is not None:
+                        self.reassign_corpus_items("with_metadata", with_meta_id, existing_table, item_id)
                 cur.execute("DELETE FROM with_metadata WHERE id = ?", (with_meta_id,))
                 cur.execute("COMMIT")
                 if status == 'duplicate':
@@ -2025,6 +2157,7 @@ class DatabaseManager:
             new_id = cursor.lastrowid
 
             self.update_work_alias_owner("to_download_references", source_id, "downloaded_references", new_id)
+            self.reassign_corpus_items("to_download_references", source_id, "downloaded_references", new_id)
             cursor.execute("DELETE FROM to_download_references WHERE id = ?", (source_id,))
 
             self.conn.commit()
@@ -2052,6 +2185,10 @@ class DatabaseManager:
 
             cursor.execute(f"INSERT INTO failed_downloads ({cols}) VALUES ({placeholders})", list(original_entry.values()))
             self.delete_work_aliases("to_download_references", source_id)
+            cursor.execute(
+                "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
+                ("to_download_references", source_id),
+            )
             cursor.execute("DELETE FROM to_download_references WHERE id = ?", (source_id,))
             self.conn.commit()
             print(f"{GREEN}[DB Manager] Moved entry ID {source_id} to failed_downloads.{RESET}")
@@ -2224,8 +2361,9 @@ class DatabaseManager:
         self,
         parsed_data: dict,
         exclude_id: int | None = None,
-        exclude_table: str | None = None
-    ) -> tuple[str, int | None, str]:
+        exclude_table: str | None = None,
+        corpus_id: int | None = None,
+    ) -> tuple[str, int | None, str, str | None]:
         """Adds a parsed entry to the 'to_download_references' table.
 
         Handles entries from both direct JSON import and from the 'with_metadata' table.
@@ -2235,14 +2373,18 @@ class DatabaseManager:
             parsed_data: A dictionary containing the entry data.
             exclude_id: An entry ID to exclude from the duplicate check.
             exclude_table: The table name associated with exclude_id.
+            corpus_id: Optional corpus ID for assigning to corpus_items.
 
         Returns:
-            A tuple: (status_code, item_id, message)
+            A tuple: (status_code, item_id, message, existing_table)
             status_code can be 'added_to_queue', 'duplicate', 'error'.
             item_id is the ID of the added/duplicate entry, or None on error.
             message provides details.
+            existing_table is set when status_code is 'duplicate'.
         """
         cursor = self.conn.cursor()
+        if corpus_id is None:
+            corpus_id = parsed_data.get("corpus_id")
 
         input_doi = parsed_data.get('doi')
         input_openalex_id = parsed_data.get('openalex_id')
@@ -2273,10 +2415,12 @@ class DatabaseManager:
             )
             if dup_log_id:
                 msg = f"Duplicate of entry ID {existing_id} in '{table_name}'. Logged as duplicate ID {dup_log_id}."
-                return "duplicate", existing_id, msg
+                if corpus_id:
+                    self.add_corpus_item(corpus_id, table_name, existing_id)
+                return "duplicate", existing_id, msg, table_name
             else:
                 err_msg = f"Duplicate of entry ID {existing_id} in '{table_name}' but failed to log: {dup_log_err}"
-                return "error", None, err_msg
+                return "error", None, err_msg, None
 
         try:
             # Prepare all fields for insertion, using .get() to avoid KeyErrors
@@ -2325,14 +2469,16 @@ class DatabaseManager:
             cursor.execute(sql, tuple(insert_data.values()))
             last_id = cursor.lastrowid
             self.conn.commit()
-            return "added_to_queue", last_id, "Entry added to download queue."
+            if corpus_id:
+                self.add_corpus_item(corpus_id, "to_download_references", last_id)
+            return "added_to_queue", last_id, "Entry added to download queue.", None
         except sqlite3.Error as e:
             err_msg = f"SQLite error adding entry '{title}' to queue: {e}"
-            return "error", None, err_msg
+            return "error", None, err_msg, None
         except Exception as e:
             err_msg = f"Unexpected error adding entry '{title}' to to_download_references: {e}"
             print(f"{RED}[DB Manager] {err_msg}{RESET}")
-            return "error", None, err_msg
+            return "error", None, err_msg, None
 
     def add_entry_to_duplicates(
         self,

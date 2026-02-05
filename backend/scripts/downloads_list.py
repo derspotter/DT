@@ -36,6 +36,7 @@ def main():
     parser.add_argument('--db-path', required=True)
     parser.add_argument('--limit', type=int, default=200)
     parser.add_argument('--offset', type=int, default=0)
+    parser.add_argument('--corpus-id', type=int, default=None)
     args = parser.parse_args()
 
     if os.environ.get('RAG_FEEDER_STUB') == '1':
@@ -47,7 +48,16 @@ def main():
 
     items = []
     try:
-        rows = conn.execute("SELECT * FROM to_download_references").fetchall()
+        if args.corpus_id is not None:
+            rows = conn.execute(
+                """SELECT t.* FROM to_download_references t
+                   JOIN corpus_items ci
+                     ON ci.table_name = 'to_download_references' AND ci.row_id = t.id
+                  WHERE ci.corpus_id = ?""",
+                (args.corpus_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM to_download_references").fetchall()
         for row in rows:
             data = dict(row)
             status_notes = data.get('status_notes')

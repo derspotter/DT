@@ -38,6 +38,7 @@ def main():
     parser.add_argument('--year-from', type=int, default=None)
     parser.add_argument('--year-to', type=int, default=None)
     parser.add_argument('--hide-isolates', type=int, default=1)
+    parser.add_argument('--corpus-id', type=int, default=None)
     args = parser.parse_args()
 
     if os.environ.get('RAG_FEEDER_STUB') == '1':
@@ -46,6 +47,19 @@ def main():
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
+
+    allowed_rows = None
+    if args.corpus_id is not None:
+        allowed_rows = {}
+        try:
+            rows = conn.execute(
+                "SELECT table_name, row_id FROM corpus_items WHERE corpus_id = ?",
+                (args.corpus_id,),
+            ).fetchall()
+            for row in rows:
+                allowed_rows.setdefault(row["table_name"], set()).add(row["row_id"])
+        except sqlite3.Error:
+            allowed_rows = None
 
     tables = []
     if args.status in ('all', 'with_metadata'):
@@ -117,6 +131,24 @@ def main():
             raw_edges = []
 
         if raw_edges:
+            allowed_node_ids = None
+            if allowed_rows is not None:
+                allowed_meta_ids = allowed_rows.get("with_metadata", set())
+                allowed_node_ids = set()
+                if allowed_meta_ids:
+                    meta_rows = conn.execute(
+                        "SELECT id, openalex_id, doi FROM with_metadata"
+                    ).fetchall()
+                    for row in meta_rows:
+                        if row["id"] not in allowed_meta_ids:
+                            continue
+                        norm_openalex = normalize_openalex_id(row["openalex_id"])
+                        norm_doi = normalize_doi(row["doi"])
+                        if norm_openalex:
+                            allowed_node_ids.add(norm_openalex)
+                        if norm_doi:
+                            allowed_node_ids.add(norm_doi)
+
             degree_counts = {}
             filtered_edges = []
             for row in raw_edges:
@@ -127,6 +159,9 @@ def main():
                 target_id = row["target_id"]
                 if source_id == target_id:
                     continue
+                if allowed_node_ids is not None:
+                    if source_id not in allowed_node_ids or target_id not in allowed_node_ids:
+                        continue
                 filtered_edges.append((source_id, target_id, rel))
                 degree_counts[source_id] = degree_counts.get(source_id, 0) + 1
                 degree_counts[target_id] = degree_counts.get(target_id, 0) + 1
@@ -179,6 +214,10 @@ def main():
         ).fetchall()
         meta_by_id = {}
         for row in meta_rows:
+            if allowed_rows is not None:
+                allowed_meta_ids = allowed_rows.get("with_metadata", set())
+                if row["id"] not in allowed_meta_ids:
+                    continue
             norm_openalex = normalize_openalex_id(row["openalex_id"])
             norm_doi = normalize_doi(row["doi"])
             if norm_openalex:
@@ -210,6 +249,10 @@ def main():
                 if len(nodes) >= args.max_nodes:
                     break
                 data = dict(row)
+                if allowed_rows is not None:
+                    allowed_ids = allowed_rows.get(table, set())
+                    if data.get("id") not in allowed_ids:
+                        continue
                 if not include_row(data):
                     continue
                 raw_id = normalize_openalex_id(data.get("openalex_id")) or normalize_doi(data.get("doi")) or f"{table}:{data.get('id')}"

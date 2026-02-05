@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--db-path", required=True, help="Path to SQLite DB.")
     parser.add_argument("--base-name", default="", help="Base filename (without .pdf) to filter source_pdf.")
     parser.add_argument("--limit", type=int, default=200, help="Max number of entries to return.")
+    parser.add_argument("--corpus-id", type=int, default=None, help="Corpus ID to filter entries.")
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db_path)
@@ -33,37 +34,44 @@ def main():
     has_ingest_entries = cur.fetchone() is not None
 
     if has_ingest_entries:
+        conditions = []
+        params = []
         if args.base_name:
-            query = """
-                SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, created_at AS date_added
-                FROM ingest_entries
-                WHERE ingest_source = ?
-                ORDER BY created_at DESC LIMIT ?
-            """
-            params = (args.base_name, args.limit)
-        else:
-            query = """
-                SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, created_at AS date_added
-                FROM ingest_entries
-                ORDER BY created_at DESC LIMIT ?
-            """
-            params = (args.limit,)
+            conditions.append("ingest_source = ?")
+            params.append(args.base_name)
+        if args.corpus_id is not None:
+            conditions.append("corpus_id = ?")
+            params.append(args.corpus_id)
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, created_at AS date_added
+            FROM ingest_entries
+            {where_clause}
+            ORDER BY created_at DESC LIMIT ?
+        """
+        params.append(args.limit)
     else:
+        joins = ""
+        conditions = []
+        params = []
+        if args.corpus_id is not None:
+            joins = "JOIN corpus_items ci ON ci.table_name = 'no_metadata' AND ci.row_id = no_metadata.id"
+            conditions.append("ci.corpus_id = ?")
+            params.append(args.corpus_id)
         if args.base_name:
-            query = """
-                SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, date_added
-                FROM no_metadata
-                WHERE source_pdf LIKE ?
-                ORDER BY date_added DESC LIMIT ?
-            """
-            params = (f"%{args.base_name}%", args.limit)
-        else:
-            query = """
-                SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, date_added
-                FROM no_metadata
-                ORDER BY date_added DESC LIMIT ?
-            """
-            params = (args.limit,)
+            conditions.append("no_metadata.source_pdf LIKE ?")
+            params.append(f"%{args.base_name}%")
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            SELECT no_metadata.id, no_metadata.title, no_metadata.authors, no_metadata.year, no_metadata.doi,
+                   no_metadata.source, no_metadata.publisher, no_metadata.url, no_metadata.source_pdf,
+                   no_metadata.date_added
+            FROM no_metadata
+            {joins}
+            {where_clause}
+            ORDER BY no_metadata.date_added DESC LIMIT ?
+        """
+        params.append(args.limit)
 
     cur.execute(query, params)
     rows = [dict(row) for row in cur.fetchall()]

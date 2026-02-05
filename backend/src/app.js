@@ -7,6 +7,9 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
+import Database from 'better-sqlite3';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -21,6 +24,10 @@ const API_SCRAPER_SCRIPT = path.join(__dirname, '..', 'dl_lit_project', 'dl_lit'
 
 const DL_LIT_PROJECT_DIR = path.join(__dirname, '..', '..', 'dl_lit_project');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
+const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+const JWT_SECRET = process.env.RAG_FEEDER_JWT_SECRET || crypto.randomUUID();
+const ADMIN_USERNAME = process.env.RAG_ADMIN_USER || 'admin';
+const ADMIN_PASSWORD = process.env.RAG_ADMIN_PASSWORD || 'admin';
 const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
@@ -99,6 +106,156 @@ const STUB_RESULTS = {
   },
 };
 
+function tableExists(db, tableName) {
+  const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName);
+  return Boolean(row);
+}
+
+function ensureColumn(db, tableName, columnName, columnType) {
+  const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name);
+  if (!columns.includes(columnName)) {
+    db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`).run();
+  }
+}
+
+function ensureAuthSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      last_corpus_id INTEGER,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS corpora (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      owner_user_id INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS user_corpora (
+      user_id INTEGER NOT NULL,
+      corpus_id INTEGER NOT NULL,
+      role TEXT DEFAULT 'viewer',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (user_id, corpus_id)
+    );
+    CREATE TABLE IF NOT EXISTS corpus_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      corpus_id INTEGER NOT NULL,
+      table_name TEXT NOT NULL,
+      row_id INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(corpus_id, table_name, row_id)
+    );
+  `);
+  if (tableExists(db, 'ingest_entries')) {
+    ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_items_lookup ON corpus_items(corpus_id, table_name, row_id);`);
+}
+
+function bootstrapDefaultCorpus(db) {
+  const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(ADMIN_USERNAME);
+  let adminId = admin?.id;
+  if (!adminId) {
+    const hash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+    const result = db
+      .prepare('INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)')
+      .run(ADMIN_USERNAME, hash);
+    if (result.changes === 0) {
+      adminId = db.prepare('SELECT id FROM users WHERE username = ?').get(ADMIN_USERNAME)?.id;
+    } else {
+      adminId = result.lastInsertRowid;
+    }
+  }
+
+  let corpus = db
+    .prepare('SELECT id FROM corpora WHERE owner_user_id = ? ORDER BY id LIMIT 1')
+    .get(adminId);
+  if (!corpus) {
+    const result = db
+      .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+      .run('Default Corpus', adminId);
+    corpus = { id: result.lastInsertRowid };
+  }
+
+  db.prepare(
+    "INSERT OR IGNORE INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')"
+  ).run(adminId, corpus.id);
+
+  if (!admin?.last_corpus_id) {
+    db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpus.id, adminId);
+  }
+
+  return corpus.id;
+}
+
+function migrateExistingToCorpus(db, corpusId) {
+  const tables = [
+    'no_metadata',
+    'with_metadata',
+    'to_download_references',
+    'downloaded_references',
+  ];
+  tables.forEach((tableName) => {
+    if (!tableExists(db, tableName)) return;
+    db.exec(
+      `INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
+       SELECT ${corpusId}, '${tableName}', id FROM ${tableName}`
+    );
+  });
+
+  if (tableExists(db, 'ingest_entries')) {
+    db.prepare('UPDATE ingest_entries SET corpus_id = ? WHERE corpus_id IS NULL').run(corpusId);
+  }
+}
+
+function listCorporaForUser(db, userId) {
+  return db
+    .prepare(
+      `SELECT c.id, c.name, c.owner_user_id, uc.role, c.created_at
+       FROM corpora c
+       JOIN user_corpora uc ON uc.corpus_id = c.id
+       WHERE uc.user_id = ?
+       ORDER BY c.created_at DESC`
+    )
+    .all(userId);
+}
+
+function getUserById(db, userId) {
+  return db
+    .prepare('SELECT id, username, last_corpus_id FROM users WHERE id = ?')
+    .get(userId);
+}
+
+function requireAuth(db) {
+  return (req, res, next) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      req.user = { id: 0, username: 'stub', last_corpus_id: null };
+      req.corpusId = null;
+      return next();
+    }
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) {
+      return res.status(401).json({ error: 'Missing Authorization header' });
+    }
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      const user = getUserById(db, payload.sub);
+      if (!user) {
+        return res.status(401).json({ error: 'Unknown user' });
+      }
+      req.user = user;
+      req.corpusId = user.last_corpus_id || null;
+      return next();
+    } catch (error) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+  };
+}
+
 function parseJsonFromOutput(output) {
   const lines = output.trim().split(/\r?\n/).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -111,15 +268,19 @@ function parseJsonFromOutput(output) {
   throw new Error(`No JSON output from python. Output was: ${output}`);
 }
 
-function runPythonJson(scriptPath, args, { dbPath } = {}) {
+function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
   return new Promise((resolve, reject) => {
     const env = {
       ...process.env,
       PYTHONPATH: DL_LIT_PROJECT_DIR,
-      RAG_FEEDER_DB_PATH: dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH,
+      RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
     };
 
-    const child = spawn(PYTHON_EXEC, [scriptPath, ...args], { env });
+    const finalArgs = [...args];
+    if (corpusId !== undefined && corpusId !== null) {
+      finalArgs.push('--corpus-id', String(corpusId));
+    }
+    const child = spawn(PYTHON_EXEC, [scriptPath, ...finalArgs], { env });
     let stdout = '';
     let stderr = '';
 
@@ -161,6 +322,16 @@ export function createApp({ broadcast } = {}) {
   fs.mkdirSync(TEMP_PAGES_BASE_DIR, { recursive: true });
   fs.mkdirSync(BIB_OUTPUT_DIR, { recursive: true });
 
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  const authDb = new Database(DB_PATH);
+  ensureAuthSchema(authDb);
+  const defaultCorpusId = bootstrapDefaultCorpus(authDb);
+  migrateExistingToCorpus(authDb, defaultCorpusId);
+  if (!process.env.RAG_FEEDER_JWT_SECRET) {
+    console.warn('[auth] RAG_FEEDER_JWT_SECRET not set; tokens will reset on restart.');
+  }
+  const requireAuthMiddleware = requireAuth(authDb);
+
   // Ensure uploads directory exists (already present, keeping for clarity)
   const uploadDir = UPLOADS_DIR;
   if (!fs.existsSync(uploadDir)) {
@@ -186,8 +357,119 @@ export function createApp({ broadcast } = {}) {
   app.use(cors(corsOptions));
   app.use(express.json());
 
+  // --- Auth endpoints ---
+  app.post('/api/auth/login', (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Missing username or password' });
+    }
+    const user = authDb
+      .prepare('SELECT id, username, password_hash, last_corpus_id FROM users WHERE username = ?')
+      .get(username);
+    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    let lastCorpusId = user.last_corpus_id;
+    if (!lastCorpusId) {
+      const corpus = authDb
+        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
+        .get(user.id);
+      lastCorpusId = corpus?.corpus_id || defaultCorpusId;
+      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
+    }
+    const token = jwt.sign({ sub: user.id, username: user.username }, JWT_SECRET, {
+      expiresIn: '7d',
+    });
+    return res.json({ token, user: { id: user.id, username: user.username, last_corpus_id: lastCorpusId } });
+  });
+
+  app.post('/api/auth/register', (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Missing username or password' });
+    }
+    const existing = authDb.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    if (existing) {
+      return res.status(409).json({ error: 'User already exists' });
+    }
+    const hash = bcrypt.hashSync(password, 10);
+    const result = authDb
+      .prepare('INSERT INTO users (username, password_hash) VALUES (?, ?)')
+      .run(username, hash);
+    const userId = result.lastInsertRowid;
+    const corpus = authDb
+      .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+      .run('Default Corpus', userId);
+    authDb
+      .prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')")
+      .run(userId, corpus.lastInsertRowid);
+    authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpus.lastInsertRowid, userId);
+    return res.status(201).json({ id: userId, username });
+  });
+
+  app.get('/api/auth/me', requireAuthMiddleware, (req, res) => {
+    const corpora = listCorporaForUser(authDb, req.user.id);
+    return res.json({ user: req.user, corpora });
+  });
+
+  // --- Corpus management ---
+  app.get('/api/corpora', requireAuthMiddleware, (req, res) => {
+    const corpora = listCorporaForUser(authDb, req.user.id);
+    return res.json({ corpora });
+  });
+
+  app.post('/api/corpora', requireAuthMiddleware, (req, res) => {
+    const { name } = req.body || {};
+    if (!name) {
+      return res.status(400).json({ error: 'Missing corpus name' });
+    }
+    const result = authDb
+      .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+      .run(name, req.user.id);
+    const corpusId = result.lastInsertRowid;
+    authDb
+      .prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')")
+      .run(req.user.id, corpusId);
+    authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusId, req.user.id);
+    return res.status(201).json({ id: corpusId, name });
+  });
+
+  app.post('/api/corpora/:id/select', requireAuthMiddleware, (req, res) => {
+    const corpusId = Number(req.params.id);
+    const access = authDb
+      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
+      .get(req.user.id, corpusId);
+    if (!access) {
+      return res.status(403).json({ error: 'No access to corpus' });
+    }
+    authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusId, req.user.id);
+    return res.json({ selected: corpusId });
+  });
+
+  app.post('/api/corpora/:id/share', requireAuthMiddleware, (req, res) => {
+    const corpusId = Number(req.params.id);
+    const { username, role = 'viewer' } = req.body || {};
+    if (!username) {
+      return res.status(400).json({ error: 'Missing username' });
+    }
+    const access = authDb
+      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
+      .get(req.user.id, corpusId);
+    if (!access || access.role !== 'owner') {
+      return res.status(403).json({ error: 'Only owners can share corpora' });
+    }
+    const target = authDb.prepare('SELECT id FROM users WHERE username = ?').get(username);
+    if (!target) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    authDb
+      .prepare('INSERT OR REPLACE INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, ?)')
+      .run(target.id, corpusId, role);
+    return res.json({ shared: true });
+  });
+
   // Dynamic route to fetch bibliography JSON by basename
-  app.get('/api/bibliographies/:baseName/data', (req, res) => {
+  app.get('/api/bibliographies/:baseName/data', requireAuthMiddleware, (req, res) => {
     const base = req.params.baseName;
     function findFile(dir) {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -209,10 +491,10 @@ export function createApp({ broadcast } = {}) {
     res.sendFile(filePath);
   });
 
-  app.use('/api/bibliographies', express.static(BIB_OUTPUT_DIR));
+  app.use('/api/bibliographies', requireAuthMiddleware, express.static(BIB_OUTPUT_DIR));
 
   // GET combined bibliography entries for a given baseName
-  app.get('/api/bibliographies/:baseName/all', (req, res) => {
+  app.get('/api/bibliographies/:baseName/all', requireAuthMiddleware, (req, res) => {
     const base = req.params.baseName;
     const combined = [];
     function walk(dir) {
@@ -236,7 +518,7 @@ export function createApp({ broadcast } = {}) {
   });
 
   // --- NEW: GET ALL current bibliography entries ---
-  app.get('/api/bibliographies/all-current', (req, res) => {
+  app.get('/api/bibliographies/all-current', requireAuthMiddleware, (req, res) => {
     console.log('[/api/bibliographies/all-current] Received request for file list.');
     const fileList = [];
     function walk(dir, relativePath = '') {
@@ -286,7 +568,7 @@ export function createApp({ broadcast } = {}) {
 
   // --- MODIFIED ENDPOINT: Upload PDF ---
   // Renamed conceptually, but keeping path for minimal frontend changes initially
-  app.post('/api/process_pdf', upload.single('file'), (req, res) => { // Made non-async
+  app.post('/api/process_pdf', requireAuthMiddleware, upload.single('file'), (req, res) => { // Made non-async
     console.log('[/api/process_pdf -> /api/upload] Received upload request');
     try {
       console.log('[/api/upload] Inside TRY block.');
@@ -329,8 +611,9 @@ export function createApp({ broadcast } = {}) {
   // --- END MODIFIED UPLOAD ENDPOINT ---
 
   // --- NEW ENDPOINT: Extract Bibliography ---
-  app.post('/api/extract-bibliography/:filename', (req, res) => {
+  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, (req, res) => {
     const { filename } = req.params;
+    const corpusId = req.corpusId;
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
     const uniqueSuffix = crypto.randomBytes(8).toString('hex');
     const tempPagesDir = path.join(TEMP_PAGES_BASE_DIR, `${Date.now()}-${uniqueSuffix}`);
@@ -419,12 +702,15 @@ export function createApp({ broadcast } = {}) {
 
         console.log(`[/api/extract-bibliography] Spawning: python ${API_SCRAPER_SCRIPT} ...`);
         // Correct arguments based on APIscraper_v2.py's argparse
-        const dbPath = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+        const dbPath = DB_PATH;
         const scrapeApiArgs = [
           '--input-dir', jsonSubDir,
           '--db-path', dbPath,
           '--ingest-source', baseName
         ];
+        if (corpusId) {
+          scrapeApiArgs.push('--corpus-id', String(corpusId));
+        }
         const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
 
         // Stream output via WebSocket (Already correctly implemented in previous step)
@@ -475,7 +761,7 @@ export function createApp({ broadcast } = {}) {
   // --- END NEW ENDPOINT ---
 
   // --- NEW: POST endpoint to trigger consolidation ---
-  app.post('/api/bibliographies/consolidate', (req, res) => {
+  app.post('/api/bibliographies/consolidate', requireAuthMiddleware, (req, res) => {
     console.log('[/api/bibliographies/consolidate] Received request.');
 
     const pythonScriptPath = path.join(__dirname, '..', 'dl_lit', 'consolidate_bibs.py');
@@ -524,7 +810,7 @@ export function createApp({ broadcast } = {}) {
     });
   });
 
-  app.post('/api/keyword-search', async (req, res) => {
+  app.post('/api/keyword-search', requireAuthMiddleware, async (req, res) => {
     const query = req.body?.query?.trim();
     if (!query) {
       return res.status(400).json({ error: 'query is required' });
@@ -540,7 +826,7 @@ export function createApp({ broadcast } = {}) {
     const yearTo = coerceInt(req.body?.yearTo, null);
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
-    const dbPath = req.body?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+    const dbPath = DB_PATH;
 
     const args = ['--query', query, '--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
     if (yearFrom) args.push('--year-from', String(yearFrom));
@@ -549,7 +835,7 @@ export function createApp({ broadcast } = {}) {
     if (enqueue) args.push('--enqueue');
 
     try {
-      const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath });
+      const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/keyword-search] Error:', error);
@@ -557,17 +843,17 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
-  app.get('/api/corpus', async (req, res) => {
+  app.get('/api/corpus', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.corpus, total: STUB_RESULTS.corpus.length, source: 'stub' });
     }
     const limit = coerceInt(req.query?.limit, 200);
     const offset = coerceInt(req.query?.offset, 0);
-    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+    const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
     try {
-      const payload = await runPythonJson(CORPUS_LIST_SCRIPT, args, { dbPath });
+      const payload = await runPythonJson(CORPUS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
@@ -575,17 +861,17 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
-  app.get('/api/downloads', async (req, res) => {
+  app.get('/api/downloads', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.downloads, total: STUB_RESULTS.downloads.length, source: 'stub' });
     }
     const limit = coerceInt(req.query?.limit, 200);
     const offset = coerceInt(req.query?.offset, 0);
-    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+    const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
     try {
-      const payload = await runPythonJson(DOWNLOADS_LIST_SCRIPT, args, { dbPath });
+      const payload = await runPythonJson(DOWNLOADS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/downloads] Error:', error);
@@ -593,7 +879,7 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
-  app.get('/api/graph', async (req, res) => {
+  app.get('/api/graph', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
     }
@@ -603,7 +889,7 @@ export function createApp({ broadcast } = {}) {
     const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
     const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
     const hideIsolates = req.query?.hide_isolates !== '0' && req.query?.hideIsolates !== '0';
-    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+    const dbPath = DB_PATH;
 
     const args = [
       '--db-path',
@@ -624,7 +910,7 @@ export function createApp({ broadcast } = {}) {
       args.push('--year-to', String(yearTo));
     }
     try {
-      const payload = await runPythonJson(GRAPH_EXPORT_SCRIPT, args, { dbPath });
+      const payload = await runPythonJson(GRAPH_EXPORT_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/graph] Error:', error);
@@ -632,17 +918,17 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
-  app.get('/api/ingest/latest', async (req, res) => {
+  app.get('/api/ingest/latest', requireAuthMiddleware, async (req, res) => {
     const baseName = req.query?.baseName || '';
     const limit = coerceInt(req.query?.limit, 200);
-    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+    const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--limit', String(limit)];
     if (baseName) {
       args.push('--base-name', String(baseName));
     }
     try {
-      const payload = await runPythonJson(INGEST_LATEST_SCRIPT, args, { dbPath });
+      const payload = await runPythonJson(INGEST_LATEST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/ingest/latest] Error:', error);
@@ -650,11 +936,11 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
-  app.get('/api/ingest/stats', async (req, res) => {
-    const dbPath = req.query?.dbPath || process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+  app.get('/api/ingest/stats', requireAuthMiddleware, async (req, res) => {
+    const dbPath = DB_PATH;
     const args = ['--db-path', dbPath];
     try {
-      const payload = await runPythonJson(INGEST_STATS_SCRIPT, args, { dbPath });
+      const payload = await runPythonJson(INGEST_STATS_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/ingest/stats] Error:', error);

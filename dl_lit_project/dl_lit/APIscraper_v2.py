@@ -298,7 +298,14 @@ def validate_bibliography_entries(entries):
 
 # --- Main Processing Logic ---
 
-def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summary_lock, ingest_source: str | None = None):
+def process_single_pdf(
+    pdf_path,
+    db_manager: DatabaseManager,
+    summary_dict,
+    summary_lock,
+    ingest_source: str | None = None,
+    corpus_id: int | None = None,
+):
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
     print(f"\n[INFO] Processing {filename}...", flush=True)
@@ -350,6 +357,7 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
                     "translated_language": entry.get("translated_language"),
                     "translation_relationship": entry.get("translation_relationship"),
                     "ingest_source": ingest_source,
+                    "corpus_id": corpus_id,
                 }
                 db_manager.insert_ingest_entry(minimal_ref, ingest_source=ingest_source)
                 row_id, err = db_manager.insert_no_metadata(minimal_ref)
@@ -379,7 +387,13 @@ def process_single_pdf(pdf_path, db_manager: DatabaseManager, summary_dict, summ
             summary_dict["failed_files"] += 1
             summary_dict["failures"].append({"file": filename, "reason": failure_reason})
 
-def process_directory_v2(input_dir, db_manager: DatabaseManager, max_workers=5, ingest_source: str | None = None):
+def process_directory_v2(
+    input_dir,
+    db_manager: DatabaseManager,
+    max_workers=5,
+    ingest_source: str | None = None,
+    corpus_id: int | None = None,
+):
     """Processes all PDFs in the input directory concurrently, saving to the specified output dir."""
     print(f"[INFO] Processing directory: {input_dir}", flush=True)
 
@@ -406,8 +420,17 @@ def process_directory_v2(input_dir, db_manager: DatabaseManager, max_workers=5, 
         # Use ThreadPoolExecutor for I/O-bound tasks
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit tasks for each PDF
-            futures = [executor.submit(process_single_pdf, pdf_path, db_manager, results_summary, summary_lock, ingest_source)
-                       for pdf_path in pdf_files]
+            futures = [
+                executor.submit(
+                    process_single_pdf,
+                    pdf_path,
+                    db_manager,
+                    results_summary,
+                    summary_lock,
+                    ingest_source,
+                    corpus_id,
+                )
+                for pdf_path in pdf_files]
 
             # Wait for all tasks to complete and handle potential exceptions
             for future in concurrent.futures.as_completed(futures):
@@ -460,12 +483,14 @@ if __name__ == "__main__":
     parser.add_argument('--workers', type=int, default=5, help='Maximum number of concurrent worker threads.')
     parser.add_argument('--db-path', required=True, help='Path to the SQLite database file to insert extracted references into.')
     parser.add_argument('--ingest-source', default=None, help='Identifier for this ingest run (e.g., base filename).')
+    parser.add_argument('--corpus-id', type=int, default=None, help='Corpus ID to associate with inserted entries.')
     args = parser.parse_args()
 
     input_path = args.input_dir
     max_workers = args.workers
     db_path_arg = args.db_path
     ingest_source = args.ingest_source
+    corpus_id = args.corpus_id
 
     db_manager = None
     if not db_path_arg:
@@ -480,11 +505,11 @@ if __name__ == "__main__":
     # Check if input is a directory or single file
     if os.path.isdir(input_path):
         print(f"[INFO] Processing directory: {input_path}", flush=True)
-        process_directory_v2(input_path, db_manager, max_workers, ingest_source)
+        process_directory_v2(input_path, db_manager, max_workers, ingest_source, corpus_id)
     elif os.path.isfile(input_path) and input_path.lower().endswith('.pdf'):
         print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
         summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
-        process_single_pdf(input_path, db_manager, summary, Lock(), ingest_source)
+        process_single_pdf(input_path, db_manager, summary, Lock(), ingest_source, corpus_id)
         print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
     else:
         print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)

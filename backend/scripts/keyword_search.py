@@ -62,6 +62,7 @@ def main():
     parser.add_argument('--field', default='default')
     parser.add_argument('--mailto', default=None)
     parser.add_argument('--enqueue', action='store_true')
+    parser.add_argument('--corpus-id', type=int, default=None)
     args = parser.parse_args()
 
     if os.environ.get('RAG_FEEDER_STUB') == '1':
@@ -105,7 +106,7 @@ def main():
 
         if args.enqueue:
             for record in records:
-                db.add_entry_to_download_queue(record)
+                db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
 
         db.close_connection()
 
