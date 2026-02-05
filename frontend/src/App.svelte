@@ -298,10 +298,10 @@
       enqueueStatus = 'Select at least one entry.'
       return
     }
-    enqueueStatus = `Queueing ${ids.length} entries...`
+    enqueueStatus = `Marking ${ids.length} entries for enrichment...`
     try {
       const payload = await enqueueIngestEntries(ids)
-      enqueueStatus = `Queued ${payload.queued} (duplicates: ${payload.duplicates}).`
+      enqueueStatus = `Marked ${payload.marked} (staged: ${payload.staged}, already processed: ${payload.already_processed}, duplicates: ${payload.duplicates}).`
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -1270,7 +1270,7 @@
               </div>
               <div class="table-toolbar-right">
                 <button class="primary" type="button" on:click={enqueueSelectedLatest} disabled={latestSelection.size === 0}>
-                  Queue selected
+                  Mark selected
                 </button>
               </div>
             </div>

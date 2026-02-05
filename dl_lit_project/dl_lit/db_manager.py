@@ -631,6 +631,13 @@ class DatabaseManager:
             except sqlite3.Error as e:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add run_id column: {e}{RESET}")
 
+        if 'selected_for_enrichment' not in columns:
+            try:
+                cursor.execute("ALTER TABLE no_metadata ADD COLUMN selected_for_enrichment INTEGER DEFAULT 0")
+                print(f"{GREEN}[DB Manager] Added selected_for_enrichment column to no_metadata table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add selected_for_enrichment column: {e}{RESET}")
+
     def _add_missing_columns_to_with_metadata(self):
         """Add missing source/provenance columns to with_metadata table if they don't exist."""
         cursor = self.conn.cursor()
@@ -1807,7 +1814,9 @@ class DatabaseManager:
             """SELECT id, title, authors, editors, year, doi, source, volume, issue, pages,
                       publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
                       ingest_source, run_id
-               FROM no_metadata ORDER BY id LIMIT ?""",
+               FROM no_metadata
+               ORDER BY selected_for_enrichment DESC, id
+               LIMIT ?""",
             (limit,),
         )
         rows = cursor.fetchall()
