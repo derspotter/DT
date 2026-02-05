@@ -46,6 +46,16 @@ extracted_refs/
 kanzlei.py
 .playwright-cache/
 .playwright-cli/
+# Playwright screenshots (local)
+/dashboard-*.png
+/graph-*.png
+/corpus-*.png
+/mobile-*.png
+/corpus-share.png
+/ingest-*.png
+/playwright-*.yaml
+/playwright-*.yml
+/playwright-*.png
 dl_lit_project/extracted_refs_tmp/
 
 # OCR output directories

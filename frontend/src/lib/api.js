@@ -213,6 +213,20 @@ export async function fetchIngestRuns(limit = 20) {
   return response.json()
 }
 
+export async function enqueueIngestEntries(entryIds) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/enqueue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entryIds }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to enqueue entries')
+  }
+  return response.json()
+}
+
 export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search`, {

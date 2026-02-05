@@ -12,6 +12,7 @@
     fetchBibliographyEntries,
     fetchIngestStats,
     fetchIngestRuns,
+    enqueueIngestEntries,
     runKeywordSearch,
     fetchCorpus,
     fetchDownloadQueue,
@@ -50,6 +51,8 @@
   let latestEntries = []
   let latestEntriesStatus = ''
   let latestEntriesBase = ''
+  let latestSelection = new Set()
+  let enqueueStatus = ''
   let ingestRuns = []
   let ingestRunsStatus = ''
 
@@ -240,6 +243,7 @@
     latestEntriesBase = baseName
     latestEntriesStatus = 'Waiting for extracted entries...'
     latestEntries = []
+    latestSelection = new Set()
     // Extraction + parsing can easily take a couple of minutes for multi-page reference sections.
     const attempts = 36
     for (let i = 0; i < attempts; i += 1) {
@@ -263,6 +267,54 @@
       await sleep(5000)
     }
     latestEntriesStatus = 'No entries found yet.'
+  }
+
+  function isLatestSelected(id) {
+    return latestSelection.has(id)
+  }
+
+  function toggleLatestSelection(id) {
+    const next = new Set(latestSelection)
+    if (next.has(id)) {
+      next.delete(id)
+    } else {
+      next.add(id)
+    }
+    latestSelection = next
+  }
+
+  function clearLatestSelection() {
+    latestSelection = new Set()
+  }
+
+  function selectAllLatest() {
+    latestSelection = new Set((latestEntries || []).map((e) => e.id))
+  }
+
+  async function enqueueSelectedLatest() {
+    enqueueStatus = ''
+    const ids = [...latestSelection]
+    if (ids.length === 0) {
+      enqueueStatus = 'Select at least one entry.'
+      return
+    }
+    enqueueStatus = `Queueing ${ids.length} entries...`
+    try {
+      const payload = await enqueueIngestEntries(ids)
+      enqueueStatus = `Queued ${payload.queued} (duplicates: ${payload.duplicates}).`
+      await loadDownloads()
+      await loadIngestStats()
+    } catch (error) {
+      let message = error?.message || 'Failed to enqueue entries.'
+      try {
+        // Avoid dumping raw JSON/tracebacks into the UI.
+        const parsed = JSON.parse(message)
+        if (parsed?.error) message = parsed.error
+      } catch {
+        // ignore
+      }
+      enqueueStatus = message
+    }
   }
 
   function handleFiles(event) {
@@ -1210,8 +1262,31 @@
           {#if latestEntries.length === 0}
             <p class="muted">No extracted entries yet.</p>
           {:else}
+            <div class="table-toolbar">
+              <div class="table-toolbar-left">
+                <span class="muted">Selected: {latestSelection.size}</span>
+                <button class="secondary" type="button" on:click={selectAllLatest}>Select all</button>
+                <button class="secondary" type="button" on:click={clearLatestSelection}>Clear</button>
+              </div>
+              <div class="table-toolbar-right">
+                <button class="primary" type="button" on:click={enqueueSelectedLatest} disabled={latestSelection.size === 0}>
+                  Queue selected
+                </button>
+              </div>
+            </div>
+            {#if enqueueStatus}
+              <p class="muted">{enqueueStatus}</p>
+            {/if}
             <div class="table">
-              <div class="table-row header cols-5">
+              <div class="table-row header cols-6">
+                <span>
+                  <input
+                    type="checkbox"
+                    aria-label="Select all"
+                    checked={latestSelection.size > 0 && latestSelection.size === latestEntries.length}
+                    on:change={(e) => (e.target.checked ? selectAllLatest() : clearLatestSelection())}
+                  />
+                </span>
                 <span>Title</span>
                 <span>Authors</span>
                 <span>Year</span>
@@ -1219,7 +1294,15 @@
                 <span>DOI</span>
               </div>
               {#each latestEntries as entry}
-                <div class="table-row cols-5">
+                <div class={`table-row cols-6 ${isLatestSelected(entry.id) ? 'selected' : ''}`}>
+                  <span>
+                    <input
+                      type="checkbox"
+                      checked={isLatestSelected(entry.id)}
+                      aria-label={`Select ${formatTitle(entry)}`}
+                      on:change={() => toggleLatestSelection(entry.id)}
+                    />
+                  </span>
                   <span>{formatTitle(entry)}</span>
                   <span>{formatAuthors(entry)}</span>
                   <span>{entry.year || ''}</span>

@@ -14,15 +14,33 @@ import jwt from 'jsonwebtoken';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+function findUpwards(startDir, childName) {
+  // Walk up parents until we find a directory or file named `childName`.
+  // This keeps paths working both in Docker (/usr/src/app/...) and locally.
+  let current = startDir;
+  while (true) {
+    const candidate = path.join(current, childName);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
 // --- Define Container Paths ---
 const UPLOADS_DIR = '/usr/src/app/uploads'; // Reverted path
 const DL_LIT_DIR = '/usr/src/app/dl_lit'; // Mounted from ../dl_lit
 const TEMP_PAGES_BASE_DIR = path.join(DL_LIT_DIR, 'temp_pages');
 const BIB_OUTPUT_DIR = path.join(DL_LIT_DIR, 'bibliographies');
 const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_DIR, 'get_bib_pages.py');
-const API_SCRAPER_SCRIPT = path.join(__dirname, '..', 'dl_lit_project', 'dl_lit', 'APIscraper_v2.py');
-
-const DL_LIT_PROJECT_DIR = path.join(__dirname, '..', '..', 'dl_lit_project');
+const DL_LIT_PROJECT_DIR =
+  findUpwards(__dirname, 'dl_lit_project') || path.join(__dirname, '..', '..', 'dl_lit_project');
+const API_SCRAPER_SCRIPT = path.join(DL_LIT_PROJECT_DIR, 'dl_lit', 'APIscraper_v2.py');
+const REPO_ROOT = path.dirname(DL_LIT_PROJECT_DIR);
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
 const JWT_SECRET = process.env.RAG_FEEDER_JWT_SECRET || crypto.randomUUID();
@@ -34,6 +52,7 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
+const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
@@ -273,7 +292,7 @@ function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
   return new Promise((resolve, reject) => {
     const env = {
       ...process.env,
-      PYTHONPATH: DL_LIT_PROJECT_DIR,
+      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
       RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
     };
 
@@ -934,6 +953,27 @@ export function createApp({ broadcast } = {}) {
     } catch (error) {
       console.error('[/api/ingest/latest] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest entries' });
+    }
+  });
+
+  app.post('/api/ingest/enqueue', requireAuthMiddleware, async (req, res) => {
+    const rawIds = req.body?.entryIds;
+    if (!Array.isArray(rawIds) || rawIds.length === 0) {
+      return res.status(400).json({ error: 'entryIds must be a non-empty array' });
+    }
+    const ids = [...new Set(rawIds.map((v) => Number(v)).filter((v) => Number.isFinite(v) && v > 0))];
+    if (ids.length === 0) {
+      return res.status(400).json({ error: 'No valid entry ids provided' });
+    }
+
+    const dbPath = DB_PATH;
+    const args = ['--db-path', dbPath, '--entry-ids', ids.join(',')];
+    try {
+      const payload = await runPythonJson(INGEST_ENQUEUE_SCRIPT, args, { dbPath, corpusId: req.corpusId });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[/api/ingest/enqueue] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to enqueue ingest entries' });
     }
   });
 
