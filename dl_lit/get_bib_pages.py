@@ -301,6 +301,11 @@ if __name__ == "__main__":
     parser.add_argument('--input-pdf', dest='input_pdf', help='Path to a single PDF file')
     parser.add_argument('--input-dir', dest='input_dir', help='Path to a directory containing PDFs')
     parser.add_argument('--output-dir', default='bib_output', help='Output directory for extracted pages and JSON files')
+    parser.add_argument(
+        '--move-to-done',
+        action='store_true',
+        help="Move processed PDFs into OUTPUT_DIR/done_bibs/ after extraction. Disabled by default.",
+    )
     args = parser.parse_args()
 
     if not api_key:
@@ -332,9 +337,10 @@ if __name__ == "__main__":
 
     total_bib_pages = 0
     processed_count = 0
-
-    done_bibs_dir = os.path.join(output_dir, 'done_bibs')
-    os.makedirs(done_bibs_dir, exist_ok=True)
+    done_bibs_dir = None
+    if args.move_to_done:
+        done_bibs_dir = os.path.join(output_dir, 'done_bibs')
+        os.makedirs(done_bibs_dir, exist_ok=True)
 
     for pdf_path in pdf_files:
         bib_pages = process_pdf(pdf_path, output_dir)
@@ -342,7 +348,7 @@ if __name__ == "__main__":
         processed_count += 1
         print(f"Completed {processed_count}/{len(pdf_files)} PDFs: {os.path.basename(pdf_path)} - {len(bib_pages)} bibliography pages found.", flush=True)
 
-        if bib_pages:
+        if args.move_to_done and done_bibs_dir and bib_pages:
             dest_path = os.path.join(done_bibs_dir, os.path.basename(pdf_path))
             try:
                 shutil.move(pdf_path, dest_path)

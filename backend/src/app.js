@@ -34,6 +34,7 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
+const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
 
@@ -933,6 +934,19 @@ export function createApp({ broadcast } = {}) {
     } catch (error) {
       console.error('[/api/ingest/latest] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest entries' });
+    }
+  });
+
+  app.get('/api/ingest/runs', requireAuthMiddleware, async (req, res) => {
+    const limit = coerceInt(req.query?.limit, 20);
+    const dbPath = DB_PATH;
+    const args = ['--db-path', dbPath, '--limit', String(limit)];
+    try {
+      const payload = await runPythonJson(INGEST_RUNS_SCRIPT, args, { dbPath, corpusId: req.corpusId });
+      return res.json(payload);
+    } catch (error) {
+      console.error('[/api/ingest/runs] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to fetch ingest runs' });
     }
   });
 

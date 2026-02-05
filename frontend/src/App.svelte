@@ -11,6 +11,7 @@
     extractBibliography,
     fetchBibliographyEntries,
     fetchIngestStats,
+    fetchIngestRuns,
     runKeywordSearch,
     fetchCorpus,
     fetchDownloadQueue,
@@ -49,6 +50,8 @@
   let latestEntries = []
   let latestEntriesStatus = ''
   let latestEntriesBase = ''
+  let ingestRuns = []
+  let ingestRunsStatus = ''
 
   let searchQuery = ''
   let searchField = 'default'
@@ -173,6 +176,7 @@
 
   async function refreshAll() {
     await loadIngestStats()
+    await loadIngestRuns()
     await loadCorpus()
     await loadDownloads()
     await loadGraph()
@@ -236,7 +240,8 @@
     latestEntriesBase = baseName
     latestEntriesStatus = 'Waiting for extracted entries...'
     latestEntries = []
-    const attempts = 20
+    // Extraction + parsing can easily take a couple of minutes for multi-page reference sections.
+    const attempts = 36
     for (let i = 0; i < attempts; i += 1) {
       try {
         const payload = await fetchBibliographyEntries(baseName)
@@ -308,8 +313,24 @@
       const baseName = item.backendFilename.replace(/\.pdf$/i, '')
       await loadLatestEntries(baseName)
       await loadIngestStats()
+      await loadIngestRuns()
     } catch (error) {
       updateUpload(item.id, { status: 'failed', message: error.message || 'Extraction failed' })
+    }
+  }
+
+  async function loadIngestRuns() {
+    ingestRunsStatus = 'Loading ingest runs...'
+    try {
+      const payload = await fetchIngestRuns(20)
+      ingestRuns = payload.runs || []
+      ingestRunsStatus = ingestRuns.length ? `Loaded ${ingestRuns.length} runs.` : 'No ingest runs found.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      }
+      ingestRunsStatus = 'Failed to load ingest runs.'
     }
   }
 
@@ -413,7 +434,15 @@
 
   function connectLogs() {
     try {
-      const ws = new WebSocket('ws://localhost:4000')
+      const rawBase = import.meta.env.VITE_API_BASE || window.location.origin
+      let wsUrl = 'ws://localhost:4000'
+      try {
+        const u = new URL(rawBase, window.location.origin)
+        wsUrl = `${u.protocol === 'https:' ? 'wss' : 'ws'}://${u.host}`
+      } catch (error) {
+        // fall back to localhost default
+      }
+      const ws = new WebSocket(wsUrl)
       ws.onopen = () => {
         logsStatus = 'connected'
       }
@@ -1013,22 +1042,24 @@
           <span>Milestone 2 prep</span>
           <strong>Frontend · Svelte</strong>
         </div>
-        <div class="header-user">
-          <span class="eyebrow">Signed in</span>
-          <strong>{authUser?.username}</strong>
-        </div>
-        <div class="header-corpus">
-          <label>
-            Corpus
-            <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
-              {#each corpora as corpus}
-                <option value={corpus.id}>{corpus.name}</option>
-              {/each}
-            </select>
-          </label>
-          <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus}>
-            New corpus
-          </button>
+        <div class="header-panel">
+          <div class="header-user">
+            <span class="eyebrow">Signed in</span>
+            <strong>{authUser?.username}</strong>
+          </div>
+          <div class="header-corpus">
+            <label>
+              Corpus
+              <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
+                {#each corpora as corpus}
+                  <option value={corpus.id}>{corpus.name}</option>
+                {/each}
+              </select>
+            </label>
+            <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus}>
+              New corpus
+            </button>
+          </div>
         </div>
       </div>
     </header>
@@ -1142,6 +1173,7 @@
           {/if}
           <div class="split">
             <button class="secondary" type="button" on:click={loadIngestStats}>Refresh stats</button>
+            <button class="secondary" type="button" on:click={loadIngestRuns}>Refresh runs</button>
             <span class="muted">{ingestStatsStatus}</span>
           </div>
           <div class="pill-row">
@@ -1150,11 +1182,36 @@
             <span class="pill">Queued: {ingestStats.to_download_references}</span>
             <span class="pill">Downloaded: {ingestStats.downloaded_references}</span>
           </div>
+          <div class="split">
+            <span class="muted">{ingestRunsStatus}</span>
+          </div>
+          {#if ingestRuns.length > 0}
+            <div class="table">
+              <div class="table-row header cols-4">
+                <span>Run</span>
+                <span>Entries</span>
+                <span>Last seen</span>
+                <span>Source PDF</span>
+              </div>
+              {#each ingestRuns as run}
+                <div class="table-row cols-4">
+                  <span>
+                    <button class="link" type="button" on:click={() => loadLatestEntries(run.ingest_source)}>
+                      {run.ingest_source}
+                    </button>
+                  </span>
+                  <span>{run.entry_count}</span>
+                  <span>{run.last_created_at || ''}</span>
+                  <span>{run.source_pdf || ''}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
           {#if latestEntries.length === 0}
             <p class="muted">No extracted entries yet.</p>
           {:else}
             <div class="table">
-              <div class="table-row header">
+              <div class="table-row header cols-5">
                 <span>Title</span>
                 <span>Authors</span>
                 <span>Year</span>
@@ -1162,7 +1219,7 @@
                 <span>DOI</span>
               </div>
               {#each latestEntries as entry}
-                <div class="table-row">
+                <div class="table-row cols-5">
                   <span>{formatTitle(entry)}</span>
                   <span>{formatAuthors(entry)}</span>
                   <span>{entry.year || ''}</span>
@@ -1199,14 +1256,14 @@
           </form>
           <p class="muted">{searchStatus} ({searchSource})</p>
           <div class="table">
-            <div class="table-row header">
+            <div class="table-row header cols-4">
               <span>Title</span>
               <span>Authors</span>
               <span>Year</span>
               <span>Type</span>
             </div>
             {#each searchResults as result}
-              <div class="table-row">
+              <div class="table-row cols-4">
                 <span>{result.title}</span>
                 <span>{result.authors}</span>
                 <span>{result.year}</span>
@@ -1244,14 +1301,14 @@
             {/if}
           </form>
           <div class="table">
-            <div class="table-row header">
+            <div class="table-row header cols-4">
               <span>Title</span>
               <span>Year</span>
               <span>Source</span>
               <span>Status</span>
             </div>
             {#each corpusItems as item}
-              <div class="table-row">
+              <div class="table-row cols-4">
                 <span>{item.title}</span>
                 <span>{item.year}</span>
                 <span>{item.source}</span>
@@ -1267,13 +1324,13 @@
           <h2>Download queue</h2>
           <p class="muted">{downloadsSource === 'api' ? 'Live queue from API.' : 'Sample queue data.'}</p>
           <div class="table">
-            <div class="table-row header">
+            <div class="table-row header cols-3">
               <span>Work</span>
               <span>Status</span>
               <span>Attempts</span>
             </div>
             {#each downloads as item}
-              <div class="table-row">
+              <div class="table-row cols-3">
                 <span>{item.title}</span>
                 <span class={`tag ${item.status}`}>{item.status}</span>
                 <span>{item.attempts}</span>

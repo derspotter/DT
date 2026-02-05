@@ -203,6 +203,16 @@ export async function fetchIngestStats() {
   return response.json()
 }
 
+export async function fetchIngestRuns(limit = 20) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/runs?limit=${encodeURIComponent(String(limit))}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load ingest runs')
+  }
+  return response.json()
+}
+
 export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search`, {
