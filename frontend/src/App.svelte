@@ -5,6 +5,7 @@
     fetchMe,
     selectCorpus,
     createCorpus,
+    shareCorpus,
     setAuthToken,
     uploadPdf,
     extractBibliography,
@@ -85,6 +86,9 @@
   let isGraphPanning = false
   let graphPanStart = { x: 0, y: 0, viewX: 0, viewY: 0 }
   let creatingCorpus = false
+  let shareUsername = ''
+  let shareRole = 'viewer'
+  let shareStatus = ''
 
   const maxLogs = 200
 
@@ -205,6 +209,26 @@
       authError = error.message || 'Failed to create corpus'
     } finally {
       creatingCorpus = false
+    }
+  }
+
+  async function handleShareCorpus(event) {
+    event?.preventDefault?.()
+    shareStatus = ''
+    if (!currentCorpusId) {
+      shareStatus = 'Select a corpus first.'
+      return
+    }
+    if (!shareUsername.trim()) {
+      shareStatus = 'Enter a username to share with.'
+      return
+    }
+    try {
+      await shareCorpus(currentCorpusId, { username: shareUsername.trim(), role: shareRole })
+      shareStatus = `Shared with ${shareUsername.trim()} (${shareRole}).`
+      shareUsername = ''
+    } catch (error) {
+      shareStatus = error.message || 'Failed to share corpus.'
     }
   }
 
@@ -1197,6 +1221,28 @@
         <div class="card" data-testid="corpus-panel">
           <h2>Corpus</h2>
           <p class="muted">{corpusSource === 'api' ? 'Live corpus from API.' : 'Sample corpus data.'}</p>
+          <form class="corpus-share" on:submit|preventDefault={handleShareCorpus}>
+            <div>
+              <label>
+                Share with
+                <input type="text" placeholder="username" bind:value={shareUsername} />
+              </label>
+            </div>
+            <div>
+              <label>
+                Role
+                <select bind:value={shareRole}>
+                  <option value="viewer">Viewer</option>
+                  <option value="editor">Editor</option>
+                  <option value="owner">Owner</option>
+                </select>
+              </label>
+            </div>
+            <button class="secondary" type="submit">Share corpus</button>
+            {#if shareStatus}
+              <span class="muted">{shareStatus}</span>
+            {/if}
+          </form>
           <div class="table">
             <div class="table-row header">
               <span>Title</span>

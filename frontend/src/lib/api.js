@@ -107,6 +107,19 @@ export async function createCorpus(name) {
   return response.json()
 }
 
+export async function shareCorpus(corpusId, { username, role }) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/share`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, role }),
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to share corpus')
+  }
+  return response.json()
+}
+
 export async function fetchBibliographyList() {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/bibliographies/all-current`)
