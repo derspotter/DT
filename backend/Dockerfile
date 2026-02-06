@@ -14,8 +14,11 @@ RUN apt-get update \
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install necessary Python packages in one command
-RUN pip install --no-cache-dir google-genai google-api-core pikepdf pdfminer.six openai python-dotenv PyPDF2 rapidfuzz
+# Install necessary Python packages in one command.
+# Keep this aligned with dl_lit_project runtime imports used by the backend scripts.
+RUN pip install --no-cache-dir \
+  google-genai google-api-core pikepdf pdfminer.six openai python-dotenv PyPDF2 rapidfuzz \
+  requests beautifulsoup4 colorama bibtexparser lxml
 
 # Set the working directory inside the container
 WORKDIR /usr/src/app

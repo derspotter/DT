@@ -16,7 +16,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from queue import Queue
 import colorama
 import bibtexparser
-from bibtexparser.middlewares import SeparateCoAuthors, LatexEncodingMiddleware
+try:
+    # bibtexparser 1.x does not ship middlewares; keep optional so downloads can run without it.
+    from bibtexparser.middlewares import SeparateCoAuthors, LatexEncodingMiddleware  # type: ignore
+except Exception:  # pragma: no cover
+    SeparateCoAuthors = None
+    LatexEncodingMiddleware = None
 colorama.init(autoreset=True) # Makes colors reset automatically
 # BibtexParserError import removed for debugging, will be re-added once identified.
 GREEN = colorama.Fore.GREEN
@@ -24,7 +29,13 @@ RED = colorama.Fore.RED
 YELLOW = colorama.Fore.YELLOW
 RESET = colorama.Style.RESET_ALL # Use colorama's reset
 
-import google.cloud.aiplatform as aiplatform
+# Optional: only needed for Vertex AI flows. Keep import soft so the downloader
+# can run in lightweight environments (like the web backend container).
+try:
+    import google.cloud.aiplatform as aiplatform  # type: ignore
+except Exception:  # pragma: no cover
+    aiplatform = None
+
 from google import genai
 # Removed incompatible google.genai.types imports
 
@@ -1740,10 +1751,12 @@ def ingest_bib_file(bib_file_path: str | Path, db: DatabaseManager):
 
     print(f"{GREEN}[INGEST] Parsing BibTeX file: {bib_file_path.name} ...{RESET}")
 
-    middlewares = [
-        LatexEncodingMiddleware(allow_inplace_modification=True),      # Converts LaTeX characters (e.g., \\"o) to unicode
-        SeparateCoAuthors(allow_inplace_modification=True)             # Splits 'author' field by 'and'
-    ]
+    middlewares = []
+    if LatexEncodingMiddleware and SeparateCoAuthors:
+        middlewares = [
+            LatexEncodingMiddleware(allow_inplace_modification=True),      # Converts LaTeX characters (e.g., \\"o) to unicode
+            SeparateCoAuthors(allow_inplace_modification=True)             # Splits 'author' field by 'and'
+        ]
 
     try:
         with open(bib_file_path, 'r', encoding='utf-8') as bibtex_file_handle:
@@ -1751,7 +1764,10 @@ def ingest_bib_file(bib_file_path: str | Path, db: DatabaseManager):
             # Handle potential Byte Order Mark (BOM)
             if bib_content.startswith('\ufeff'):
                 bib_content = bib_content[1:]
-            library = bibtexparser.loads(bib_content, append_middleware=middlewares)
+            if middlewares:
+                library = bibtexparser.loads(bib_content, append_middleware=middlewares)
+            else:
+                library = bibtexparser.loads(bib_content)
     except Exception as e: # Broadened for debugging
         print(f"  {RED}[INGEST DEBUG] Caught exception during parsing. Type: {type(e)}, Message: {e}{RESET}") # Debug print
         print(f"  {RED}[INGEST ERROR] Failed to parse {bib_file_path.name} (BibtexParserError): {e}{RESET}")

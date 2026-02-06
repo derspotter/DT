@@ -9,6 +9,8 @@ import {
 const DEFAULT_TIMEOUT = 8_000
 // Uploads can be large over SSH port-forwarding; keep this generous.
 const UPLOAD_TIMEOUT = 600_000
+// Enrichment / ingestion steps can take a while (OpenAlex + DB IO).
+const PIPELINE_TIMEOUT = 600_000
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
 let authToken = localStorage.getItem('rag_feeder_token') || ''
 
@@ -215,15 +217,37 @@ export async function fetchIngestRuns(limit = 20) {
 }
 
 export async function enqueueIngestEntries(entryIds) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/enqueue`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ entryIds }),
-  })
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/ingest/enqueue`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entryIds }),
+    },
+    PIPELINE_TIMEOUT
+  )
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Failed to enqueue entries')
+  }
+  return response.json()
+}
+
+export async function processMarkedIngestEntries({ limit = 10 } = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/ingest/process-marked`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to process marked entries')
   }
   return response.json()
 }
@@ -284,6 +308,70 @@ export async function fetchDownloadQueue() {
     }
     return { data: sampleDownloads, source: 'sample', error }
   }
+}
+
+export async function fetchDownloadWorkerStatus() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/downloads/worker/status`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load download worker status')
+  }
+  return response.json()
+}
+
+export async function startDownloadWorker({ intervalSeconds = 60, batchSize = 3 } = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/downloads/worker/start`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ intervalSeconds, batchSize }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to start download worker')
+  }
+  return response.json()
+}
+
+export async function stopDownloadWorker({ force = false } = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/downloads/worker/stop`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to stop download worker')
+  }
+  return response.json()
+}
+
+export async function runDownloadWorkerOnce({ batchSize = 3 } = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/downloads/worker/run-once`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batchSize }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to run download worker')
+  }
+  return response.json()
 }
 
 export async function fetchGraph({

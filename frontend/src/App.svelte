@@ -13,9 +13,14 @@
     fetchIngestStats,
     fetchIngestRuns,
     enqueueIngestEntries,
+    processMarkedIngestEntries,
     runKeywordSearch,
     fetchCorpus,
     fetchDownloadQueue,
+    fetchDownloadWorkerStatus,
+    startDownloadWorker,
+    stopDownloadWorker,
+    runDownloadWorkerOnce,
     fetchGraph,
   } from './lib/api'
   import { sampleActivity } from './lib/sample-data'
@@ -53,6 +58,9 @@
   let latestEntriesBase = ''
   let latestSelection = new Set()
   let enqueueStatus = ''
+  let processMarkedLimit = 10
+  let processMarkedStatus = ''
+  let processingMarked = false
   let ingestRuns = []
   let ingestRunsStatus = ''
 
@@ -68,6 +76,19 @@
   let corpusSource = ''
   let downloads = []
   let downloadsSource = ''
+  let downloadWorker = {
+    running: false,
+    in_flight: false,
+    started_at: null,
+    last_tick_at: null,
+    last_result: null,
+    last_error: null,
+    config: { intervalSeconds: 60, batchSize: 3 },
+  }
+  let downloadWorkerStatus = ''
+  let downloadWorkerIntervalSeconds = 60
+  let downloadWorkerBatchSize = 3
+  let downloadWorkerBusy = false
 
   let logs = []
   let logsStatus = 'connecting'
@@ -182,6 +203,7 @@
     await loadIngestRuns()
     await loadCorpus()
     await loadDownloads()
+    await loadDownloadWorkerStatus()
     await loadGraph()
   }
 
@@ -314,6 +336,41 @@
         // ignore
       }
       enqueueStatus = message
+    }
+  }
+
+  async function processMarkedBatch() {
+    processMarkedStatus = ''
+    if (processingMarked) return
+    const limit = Number(processMarkedLimit)
+    if (!Number.isFinite(limit) || limit <= 0) {
+      processMarkedStatus = 'Limit must be a positive number.'
+      return
+    }
+    processingMarked = true
+    processMarkedStatus = `Processing up to ${limit} marked entries (enrich -> queue)...`
+    try {
+      const payload = await processMarkedIngestEntries({ limit })
+      processMarkedStatus = `Processed ${payload.processed} (promoted: ${payload.promoted}, queued: ${payload.queued}, failed: ${payload.failed}).`
+      await loadDownloads()
+      await loadIngestStats()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        processMarkedStatus = 'Session expired. Please sign in again.'
+        return
+      }
+      let message = error?.message || 'Failed to process marked entries.'
+      try {
+        const parsed = JSON.parse(message)
+        if (parsed?.error) message = parsed.error
+      } catch {
+        // ignore
+      }
+      processMarkedStatus = message
+    } finally {
+      processingMarked = false
     }
   }
 
@@ -459,6 +516,88 @@
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
+    }
+  }
+
+  async function loadDownloadWorkerStatus() {
+    downloadWorkerStatus = 'Loading worker status...'
+    try {
+      const payload = await fetchDownloadWorkerStatus()
+      downloadWorker = payload
+      downloadWorkerIntervalSeconds = payload?.config?.intervalSeconds ?? downloadWorkerIntervalSeconds
+      downloadWorkerBatchSize = payload?.config?.batchSize ?? downloadWorkerBatchSize
+      downloadWorkerStatus = ''
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      downloadWorkerStatus = error?.message || 'Failed to load worker status.'
+    }
+  }
+
+  async function handleStartDownloadWorker() {
+    if (downloadWorkerBusy) return
+    downloadWorkerBusy = true
+    downloadWorkerStatus = 'Starting worker...'
+    try {
+      await startDownloadWorker({
+        intervalSeconds: Number(downloadWorkerIntervalSeconds) || 60,
+        batchSize: Number(downloadWorkerBatchSize) || 3,
+      })
+      await loadDownloadWorkerStatus()
+      downloadWorkerStatus = 'Worker started.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      downloadWorkerStatus = error?.message || 'Failed to start worker.'
+    } finally {
+      downloadWorkerBusy = false
+    }
+  }
+
+  async function handleStopDownloadWorker(force = false) {
+    if (downloadWorkerBusy) return
+    downloadWorkerBusy = true
+    downloadWorkerStatus = 'Stopping worker...'
+    try {
+      await stopDownloadWorker({ force })
+      await loadDownloadWorkerStatus()
+      downloadWorkerStatus = 'Worker stopped.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      downloadWorkerStatus = error?.message || 'Failed to stop worker.'
+    } finally {
+      downloadWorkerBusy = false
+    }
+  }
+
+  async function handleRunDownloadOnce() {
+    if (downloadWorkerBusy) return
+    downloadWorkerBusy = true
+    downloadWorkerStatus = 'Running one batch...'
+    try {
+      await runDownloadWorkerOnce({ batchSize: Number(downloadWorkerBatchSize) || 3 })
+      await loadDownloadWorkerStatus()
+      await loadDownloads()
+      downloadWorkerStatus = 'Batch completed.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      downloadWorkerStatus = error?.message || 'Batch failed.'
+    } finally {
+      downloadWorkerBusy = false
     }
   }
 
@@ -1281,13 +1420,30 @@
                 <button class="secondary" type="button" on:click={clearLatestSelection}>Clear</button>
               </div>
               <div class="table-toolbar-right">
-                <button class="primary" type="button" on:click={enqueueSelectedLatest} disabled={latestSelection.size === 0}>
-                  Mark selected
-                </button>
+                <div class="toolbar-actions">
+                  <label class="inline-field">
+                    <span class="muted">Batch</span>
+                    <input type="number" min="1" max="200" step="1" bind:value={processMarkedLimit} />
+                  </label>
+                  <button class="secondary" type="button" on:click={processMarkedBatch} disabled={processingMarked}>
+                    Enrich + queue
+                  </button>
+                  <button
+                    class="primary"
+                    type="button"
+                    on:click={enqueueSelectedLatest}
+                    disabled={latestSelection.size === 0}
+                  >
+                    Mark selected
+                  </button>
+                </div>
               </div>
             </div>
             {#if enqueueStatus}
               <p class="muted">{enqueueStatus}</p>
+            {/if}
+            {#if processMarkedStatus}
+              <p class="muted">{processMarkedStatus}</p>
             {/if}
             <div class="table">
               <div class="table-row header cols-6">
@@ -1418,6 +1574,57 @@
         <div class="card" data-testid="downloads-panel">
           <h2>Download queue</h2>
           <p class="muted">{downloadsSource === 'api' ? 'Live queue from API.' : 'Sample queue data.'}</p>
+
+          <div class="worker-card">
+            <div class="worker-card__header">
+              <div>
+                <span class="eyebrow">Download worker</span>
+                <strong>{downloadWorker.running ? 'Running' : 'Stopped'}</strong>
+                {#if downloadWorker.in_flight}
+                  <span class="tag queued">in progress</span>
+                {/if}
+              </div>
+              <div class="worker-card__actions">
+                <label class="inline-field">
+                  <span class="muted">Every</span>
+                  <input type="number" min="10" step="10" bind:value={downloadWorkerIntervalSeconds} />
+                  <span class="muted">s</span>
+                </label>
+                <label class="inline-field">
+                  <span class="muted">Batch</span>
+                  <input type="number" min="1" max="25" step="1" bind:value={downloadWorkerBatchSize} />
+                </label>
+                <button class="secondary" type="button" on:click={handleRunDownloadOnce} disabled={downloadWorkerBusy}>
+                  Run once
+                </button>
+                {#if downloadWorker.running}
+                  <button class="secondary" type="button" on:click={() => handleStopDownloadWorker(false)} disabled={downloadWorkerBusy}>
+                    Stop
+                  </button>
+                  <button class="danger" type="button" on:click={() => handleStopDownloadWorker(true)} disabled={downloadWorkerBusy}>
+                    Force stop
+                  </button>
+                {:else}
+                  <button class="primary" type="button" on:click={handleStartDownloadWorker} disabled={downloadWorkerBusy}>
+                    Start
+                  </button>
+                {/if}
+              </div>
+            </div>
+            <div class="worker-card__meta">
+              <span class="muted">{downloadWorkerStatus}</span>
+              {#if downloadWorker.last_error}
+                <span class="error">{downloadWorker.last_error}</span>
+              {/if}
+              {#if downloadWorker.last_result}
+                <span class="muted">
+                  Last batch: processed {downloadWorker.last_result.processed}, downloaded {downloadWorker.last_result.downloaded},
+                  failed {downloadWorker.last_result.failed}, skipped {downloadWorker.last_result.skipped}.
+                </span>
+              {/if}
+            </div>
+          </div>
+
           <div class="table">
             <div class="table-row header cols-3">
               <span>Work</span>

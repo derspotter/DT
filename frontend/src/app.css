@@ -480,6 +480,82 @@ select {
   flex-wrap: wrap;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: #fff;
+}
+
+.inline-field input[type="number"] {
+  width: 86px;
+  padding: 8px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: #fff;
+}
+
+.worker-card {
+  margin: 14px 0 18px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke);
+  background: linear-gradient(135deg, #ffffff 0%, #f8f4ef 100%);
+  box-shadow: 0 12px 28px rgba(31, 41, 51, 0.08);
+  padding: 14px 16px;
+  display: grid;
+  gap: 10px;
+}
+
+.worker-card__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.worker-card__header strong {
+  font-size: 1rem;
+}
+
+.worker-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.worker-card__meta {
+  display: grid;
+  gap: 6px;
+}
+
+button.danger {
+  padding: 10px 16px;
+  border-radius: 999px;
+  border: none;
+  background: #b42318;
+  color: white;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+button.danger:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .table-row {
   display: grid;
   gap: 12px;
