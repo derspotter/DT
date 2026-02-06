@@ -572,6 +572,11 @@ button.danger:disabled {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+.table-row.cols-corpus {
+  grid-template-columns: minmax(0, 2.4fr) 92px minmax(0, 1.2fr) 140px;
+  align-items: center;
+}
+
 .table-row.cols-5 {
   grid-template-columns: minmax(0, 2fr) minmax(0, 1.4fr) minmax(0, 0.5fr) minmax(0, 1fr) minmax(0, 1fr);
 }
@@ -613,13 +618,23 @@ button.danger:disabled {
 }
 
 .tag {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 4px 8px;
   border-radius: 999px;
   background: #e0f2f1;
   color: #0f766e;
   font-size: 0.75rem;
-  width: max-content;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag.pipeline {
+  justify-self: start;
+  font-weight: 650;
 }
 
 .tag.completed {

@@ -150,6 +150,35 @@
     return entry?.title || entry?.source || entry?.url || 'Untitled'
   }
 
+  function formatPipelineStatus(statusRaw) {
+    const status = String(statusRaw || '').trim()
+    const map = {
+      no_metadata: { label: 'Raw', tone: 'queued' },
+      with_metadata: { label: 'Enriched', tone: 'completed' },
+      to_download_references: { label: 'Queued', tone: 'queued' },
+      downloaded_references: { label: 'Downloaded', tone: 'completed' },
+      failed_enrichments: { label: 'Enrich failed', tone: 'in_progress' },
+      failed_downloads: { label: 'Download failed', tone: 'in_progress' },
+    }
+    if (map[status]) return { ...map[status], raw: status }
+    if (!status) return { label: 'Unknown', tone: 'in_progress', raw: '' }
+    // Fall back to a shortened label.
+    return { label: status.replace(/_/g, ' '), tone: 'in_progress', raw: status }
+  }
+
+  function pipelineStatusLabel(statusRaw) {
+    return formatPipelineStatus(statusRaw).label
+  }
+
+  function pipelineStatusTone(statusRaw) {
+    return formatPipelineStatus(statusRaw).tone
+  }
+
+  function pipelineStatusTitle(statusRaw) {
+    const st = formatPipelineStatus(statusRaw)
+    return st.raw || st.label
+  }
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
@@ -1552,18 +1581,23 @@
             {/if}
           </form>
           <div class="table">
-            <div class="table-row header cols-4">
+            <div class="table-row header cols-corpus">
               <span>Title</span>
               <span>Year</span>
               <span>Source</span>
               <span>Status</span>
             </div>
             {#each corpusItems as item}
-              <div class="table-row cols-4">
+              <div class="table-row cols-corpus">
                 <span>{item.title}</span>
                 <span>{item.year}</span>
-                <span>{item.source}</span>
-                <span class="tag">{item.status}</span>
+                <span class="muted">{item.source || '—'}</span>
+                <span
+                  class={`tag pipeline ${pipelineStatusTone(item.status)}`}
+                  title={pipelineStatusTitle(item.status)}
+                >
+                  {pipelineStatusLabel(item.status)}
+                </span>
               </div>
             {/each}
           </div>
