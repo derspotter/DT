@@ -463,6 +463,19 @@ select {
   gap: 6px;
 }
 
+.table.table-scroll {
+  max-height: 70vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.table.table-scroll .table-row.header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
 .table-toolbar {
   display: flex;
   justify-content: space-between;
@@ -498,7 +511,7 @@ select {
 }
 
 .inline-field input[type="number"] {
-  width: 86px;
+  width: 60px;
   padding: 8px 10px;
   border-radius: 999px;
   border: 1px solid var(--stroke);
@@ -543,7 +556,7 @@ select {
 
 button.danger {
   padding: 10px 16px;
-  border-radius: 999px;
+  border-radius: 10px;
   border: none;
   background: #b42318;
   color: white;
@@ -562,10 +575,21 @@ button.danger:disabled {
   padding: 10px 12px;
   border-radius: 10px;
   background: #f9f7f4;
+  border: 1px solid transparent;
+}
+
+.table-row:not(.header):nth-child(even) {
+  background: #f4f0eb;
+}
+
+.table-row:not(.header):hover {
+  background: #fdfbf8;
+  border-color: var(--stroke);
 }
 
 .table-row.cols-3 {
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 0.6fr);
+  grid-template-columns: minmax(0, 3fr) minmax(0, 0.8fr) minmax(0, 0.5fr);
+  align-items: center;
 }
 
 .table-row.cols-4 {
@@ -591,6 +615,37 @@ button.danger:disabled {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: 0.75rem;
+}
+
+.work-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attempts-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 650;
+  background: #efe9e2;
+  color: var(--ink);
+  justify-self: start;
+}
+
+.attempts-badge.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.attempts-badge.danger {
+  background: #fee2e2;
+  color: #991b1b;
 }
 
 .table-row.selected {
@@ -650,6 +705,25 @@ button.danger:disabled {
 .tag.queued {
   background: #e0f2fe;
   color: #0369a1;
+}
+
+.tag.failed {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.empty-state {
+  display: grid;
+  gap: 6px;
+  padding: 16px 14px;
+  border-radius: 12px;
+  border: 1px dashed var(--stroke);
+  background: rgba(255, 255, 255, 0.6);
+  text-align: center;
+}
+
+.empty-state strong {
+  font-size: 0.95rem;
 }
 
 .log-box {

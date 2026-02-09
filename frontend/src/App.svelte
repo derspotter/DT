@@ -1659,17 +1659,27 @@
             </div>
           </div>
 
-          <div class="table">
+          <div class="table table-scroll">
             <div class="table-row header cols-3">
               <span>Work</span>
               <span>Status</span>
               <span>Attempts</span>
             </div>
-            {#each downloads as item}
+            {#each downloads as item (item.id)}
               <div class="table-row cols-3">
-                <span>{item.title}</span>
+                <span class="work-title" title={item.title}>{item.title}</span>
                 <span class={`tag ${item.status}`}>{item.status}</span>
-                <span>{item.attempts}</span>
+                <span
+                  class={`attempts-badge ${item.attempts >= 4 ? 'danger' : item.attempts >= 2 ? 'warn' : ''}`}
+                  title={item.attempts > 0 ? `Attempts: ${item.attempts}` : 'No attempts yet'}
+                >
+                  {item.attempts}
+                </span>
+              </div>
+            {:else}
+              <div class="empty-state">
+                <strong>Queue is empty.</strong>
+                <span class="muted">Add works to the download queue via ingest or keyword search.</span>
               </div>
             {/each}
           </div>
