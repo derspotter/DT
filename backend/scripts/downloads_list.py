@@ -61,25 +61,33 @@ def main():
         for row in rows:
             data = dict(row)
             status_notes = data.get('status_notes')
-            status = 'queued'
-            if status_notes:
-                lowered = status_notes.lower()
-                if 'failed' in lowered or 'error' in lowered:
-                    status = 'failed'
-                elif 'processing' in lowered or 'downloading' in lowered:
-                    status = 'in_progress'
+            status = (data.get('download_state') or '').strip() or None
+            # Back-compat for older DBs that don't have download_state yet.
+            if not status:
+                status = 'queued'
+                if status_notes:
+                    lowered = status_notes.lower()
+                    if 'failed' in lowered or 'error' in lowered:
+                        status = 'failed'
+                    elif 'processing' in lowered or 'downloading' in lowered:
+                        status = 'in_progress'
+
+            attempts = data.get('download_attempt_count')
+            if attempts is None:
+                attempts = parse_attempts(status_notes)
             items.append({
                 'id': data.get('id'),
                 'title': data.get('title'),
                 'status': status,
-                'attempts': parse_attempts(status_notes),
+                'attempts': int(attempts or 0),
             })
     except sqlite3.Error:
         items = []
     finally:
         conn.close()
 
-    items.sort(key=lambda x: x.get('id') or 0, reverse=True)
+    status_rank = {'in_progress': 0, 'queued': 1, 'failed': 2}
+    items.sort(key=lambda x: (status_rank.get(x.get('status') or '', 99), -int(x.get('id') or 0)))
     total = len(items)
     start = max(args.offset, 0)
     end = start + max(args.limit, 0)
