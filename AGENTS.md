@@ -35,3 +35,8 @@ Run commands from the relevant directory.
 ## Configuration & Security Notes
 - Store secrets in `.env` files; `backend` already uses `dotenv`.
 - Avoid committing generated PDFs, test artifacts, or large model outputs unless explicitly required.
+
+## Agent-Specific Notes
+- Claude Code CLI (Max subscription): if an invalid/stale `ANTHROPIC_API_KEY` is set in the shell, `claude` may fail with “Invalid API key”. Prefer unsetting it for Claude runs:
+  - `env -u ANTHROPIC_API_KEY claude "<prompt>"`
+  - `env -u ANTHROPIC_API_KEY claude --dangerously-skip-permissions "<prompt>"`
