@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import re
 from datetime import datetime
+import time
 from dl_lit.utils import parse_bibtex_file_field
 
 # ANSI escape codes for colors
@@ -501,6 +502,8 @@ class DatabaseManager:
         
         # Add missing normalized columns to to_download_references if they don't exist
         self._add_normalized_columns_to_download_queue()
+        # Add missing worker-claim columns to to_download_references (for safe parallel processing)
+        self._add_claim_columns_to_download_queue()
         self._add_missing_columns_to_no_metadata()
         self._add_missing_columns_to_with_metadata()
         self._add_missing_columns_to_downloaded_references()
@@ -525,6 +528,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_authors ON no_metadata(normalized_authors)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_title_year ON to_download_references(normalized_title, year)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_authors ON to_download_references(normalized_authors)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_state_lease ON to_download_references(download_state, download_lease_expires_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_norm_title ON work_aliases(normalized_alias_title)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_owner ON work_aliases(work_table, work_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)")
@@ -610,6 +614,66 @@ class DatabaseManager:
                 print(f"{GREEN}[DB Manager] Added run_id column to to_download_references table.{RESET}")
             except sqlite3.Error as e:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add run_id column: {e}{RESET}")
+
+    def _add_claim_columns_to_download_queue(self) -> None:
+        """Add missing worker-claim/lease columns to to_download_references table if they don't exist.
+
+        These fields allow atomic claiming of queue rows so concurrent workers cannot process the
+        same item, and interrupted workers don't immediately churn the same bad rows.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(to_download_references)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        # State machine: queued -> in_progress (row removed on success/fail)
+        if "download_state" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_state TEXT DEFAULT 'queued'")
+                print(f"{GREEN}[DB Manager] Added download_state column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_state column: {e}{RESET}")
+
+        if "download_claimed_by" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_claimed_by TEXT")
+                print(f"{GREEN}[DB Manager] Added download_claimed_by column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_claimed_by column: {e}{RESET}")
+
+        if "download_claimed_at" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_claimed_at INTEGER")
+                print(f"{GREEN}[DB Manager] Added download_claimed_at column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_claimed_at column: {e}{RESET}")
+
+        if "download_lease_expires_at" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_lease_expires_at INTEGER")
+                print(f"{GREEN}[DB Manager] Added download_lease_expires_at column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_lease_expires_at column: {e}{RESET}")
+
+        if "download_attempt_count" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_attempt_count INTEGER DEFAULT 0")
+                print(f"{GREEN}[DB Manager] Added download_attempt_count column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_attempt_count column: {e}{RESET}")
+
+        if "download_last_attempt_at" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_last_attempt_at INTEGER")
+                print(f"{GREEN}[DB Manager] Added download_last_attempt_at column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_last_attempt_at column: {e}{RESET}")
+
+        if "download_last_error" not in columns:
+            try:
+                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_last_error TEXT")
+                print(f"{GREEN}[DB Manager] Added download_last_error column to to_download_references table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add download_last_error column: {e}{RESET}")
 
     def _add_missing_columns_to_no_metadata(self):
         """Add missing provenance columns to no_metadata table if they don't exist."""
@@ -2701,6 +2765,148 @@ class DatabaseManager:
             return []
         finally:
             self.conn.row_factory = None # Reset row factory to default
+
+    def claim_download_batch(
+        self,
+        *,
+        limit: int,
+        corpus_id: int | None,
+        claimed_by: str,
+        lease_seconds: int = 15 * 60,
+        max_attempts: int | None = None,
+    ) -> list[dict]:
+        """Atomically claim up to `limit` rows from to_download_references for download processing.
+
+        Why this exists:
+        - Prevents two workers from processing the same row (DB-level claim).
+        - Prevents immediate "churn" on crash/force-stop by marking rows in_progress with a lease.
+          Rows are only eligible again after the lease expires.
+
+        Notes:
+        - SQLite has coarse write locking; we use BEGIN IMMEDIATE to serialize claim operations.
+        - Older rows may have NULL download_state; we treat them as queued.
+        """
+        if limit <= 0:
+            return []
+
+        now = int(time.time())
+        lease_expires_at = now + int(max(1, lease_seconds))
+
+        # Eligible: queued (or NULL) OR in_progress but lease expired.
+        eligible_state_sql = """
+            (
+              download_state IS NULL
+              OR download_state = 'queued'
+              OR (
+                   download_state = 'in_progress'
+                   AND download_lease_expires_at IS NOT NULL
+                   AND download_lease_expires_at <= ?
+                 )
+            )
+        """
+        attempts_sql = ""
+        params: list = [now]
+        if max_attempts is not None:
+            attempts_sql = " AND COALESCE(download_attempt_count, 0) < ?"
+            params.append(int(max_attempts))
+
+        cur = self.conn.cursor()
+        try:
+            # Serialize claim operations across workers.
+            cur.execute("BEGIN IMMEDIATE")
+
+            if corpus_id is not None:
+                cur.execute(
+                    f"""
+                    SELECT t.id
+                    FROM to_download_references t
+                    JOIN corpus_items ci
+                      ON ci.table_name = 'to_download_references'
+                     AND ci.row_id = t.id
+                    WHERE ci.corpus_id = ?
+                      AND {eligible_state_sql}
+                      {attempts_sql}
+                    ORDER BY t.date_added ASC
+                    LIMIT ?
+                    """,
+                    [int(corpus_id)] + params + [int(limit)],
+                )
+            else:
+                cur.execute(
+                    f"""
+                    SELECT t.id
+                    FROM to_download_references t
+                    WHERE {eligible_state_sql}
+                      {attempts_sql}
+                    ORDER BY t.date_added ASC
+                    LIMIT ?
+                    """,
+                    params + [int(limit)],
+                )
+
+            ids = [int(r[0]) for r in cur.fetchall()]
+            if not ids:
+                self.conn.commit()
+                return []
+
+            placeholders = ",".join(["?"] * len(ids))
+            # Claim rows. If a row was claimed by another worker between SELECT and UPDATE,
+            # it will no longer match eligible_state_sql; the UPDATE will skip it.
+            claim_sql = f"""
+                UPDATE to_download_references
+                   SET download_state = 'in_progress',
+                       download_claimed_by = ?,
+                       download_claimed_at = ?,
+                       download_lease_expires_at = ?,
+                       download_attempt_count = COALESCE(download_attempt_count, 0) + 1,
+                       download_last_attempt_at = ?,
+                       download_last_error = NULL
+                 WHERE id IN ({placeholders})
+                   AND {eligible_state_sql}
+                   {attempts_sql}
+            """
+
+            # UPDATE params: claim fields + ids + eligible_state_sql param(s)
+            cur.execute(
+                claim_sql,
+                [claimed_by, now, lease_expires_at, now] + ids + params,
+            )
+
+            # Re-fetch only rows we actually claimed (download_claimed_by matches).
+            fetch_sql = f"""
+                SELECT id, title, authors, year, doi, openalex_id, entry_type
+                  FROM to_download_references
+                 WHERE id IN ({placeholders})
+                   AND download_claimed_by = ?
+                   AND download_claimed_at = ?
+                 ORDER BY date_added ASC
+            """
+            cur.execute(fetch_sql, ids + [claimed_by, now])
+            rows = cur.fetchall()
+            self.conn.commit()
+
+            out: list[dict] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r[0],
+                        "title": r[1],
+                        "authors": r[2],
+                        "year": r[3],
+                        "doi": r[4],
+                        "openalex_id": r[5],
+                        "entry_type": r[6],
+                    }
+                )
+            return out
+
+        except sqlite3.Error:
+            # Common when another worker holds a write lock.
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return []
 
     def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
         """Converts an OpenAlex abstract_inverted_index to readable text."""

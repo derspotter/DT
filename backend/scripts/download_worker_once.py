@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import sys
+import socket
+import time
 from pathlib import Path
 
 
@@ -49,47 +51,8 @@ def _parse_authors(value) -> list[str]:
     return [str(value)]
 
 
-def _fetch_queue_rows(db: DatabaseManager, *, corpus_id: int | None, limit: int) -> list[dict]:
-    cur = db.conn.cursor()
-    cur.row_factory = None
-    if corpus_id is not None:
-        cur.execute(
-            """
-            SELECT t.id, t.title, t.authors, t.year, t.doi, t.entry_type
-            FROM to_download_references t
-            JOIN corpus_items ci
-              ON ci.table_name = 'to_download_references'
-             AND ci.row_id = t.id
-            WHERE ci.corpus_id = ?
-            ORDER BY t.date_added ASC
-            LIMIT ?
-            """,
-            (corpus_id, limit),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT id, title, authors, year, doi, entry_type
-            FROM to_download_references
-            ORDER BY date_added ASC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-    rows = cur.fetchall()
-    out = []
-    for r in rows:
-        out.append(
-            {
-                "id": r[0],
-                "title": r[1],
-                "authors": r[2],
-                "year": r[3],
-                "doi": r[4],
-                "entry_type": r[5],
-            }
-        )
-    return out
+def _default_claimed_by() -> str:
+    return f"backend:{socket.gethostname()}:{os.getpid()}:{int(time.time())}"
 
 
 def main() -> None:
@@ -97,6 +60,8 @@ def main() -> None:
     parser.add_argument("--db-path", required=True, help="Path to SQLite DB.")
     parser.add_argument("--limit", type=int, default=3, help="Number of queue entries to process.")
     parser.add_argument("--corpus-id", type=int, default=None, help="Corpus ID to scope the operation.")
+    parser.add_argument("--lease-seconds", type=int, default=15 * 60, help="Claim lease duration to avoid churn on crash/stop.")
+    parser.add_argument("--claimed-by", default="", help="Identifier for the worker claiming rows.")
     parser.add_argument(
         "--download-dir",
         default="",
@@ -135,9 +100,15 @@ def main() -> None:
 
     enhancer = BibliographyEnhancer(db_manager=db, rate_limiter=rl, email=args.mailto, output_folder=download_dir_path)
 
-    rows = _fetch_queue_rows(db, corpus_id=args.corpus_id, limit=limit)
+    claimed_by = (args.claimed_by or "").strip() or _default_claimed_by()
+    rows = db.claim_download_batch(
+        limit=limit,
+        corpus_id=args.corpus_id,
+        claimed_by=claimed_by,
+        lease_seconds=int(args.lease_seconds),
+    )
     if not rows:
-        print(json.dumps({"processed": 0, "downloaded": 0, "failed": 0, "skipped": 0, "source": "db"}))
+        print(json.dumps({"processed": 0, "downloaded": 0, "failed": 0, "skipped": 0, "source": "db", "claimed_by": claimed_by}))
         db.close_connection()
         return
 
@@ -218,6 +189,7 @@ def main() -> None:
                 "errors": errors,
                 "results": results,
                 "source": "db",
+                "claimed_by": claimed_by,
             }
         )
     )
@@ -225,4 +197,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

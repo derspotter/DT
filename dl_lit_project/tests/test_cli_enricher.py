@@ -60,7 +60,11 @@ def test_enrich_success(mock_db_manager, mock_searcher, mock_process_single_refe
     assert "Enrichment finished: 1 promoted, 0 failed." in result.output
 
     mock_process_single_reference.assert_called_once()
-    mock_db_manager.promote_to_with_metadata.assert_called_once_with(1, enrichment_result)
+    mock_db_manager.promote_to_with_metadata.assert_called_once()
+    args, kwargs = mock_db_manager.promote_to_with_metadata.call_args
+    assert args == (1, enrichment_result)
+    assert kwargs.get("expand_related") is True
+    assert kwargs.get("max_related_per_source") == 40
 
 def test_enrich_partial_failure(mock_db_manager, mock_searcher, mock_process_single_reference, tmp_path):
     """Test workflow where some entries fail to enrich."""
@@ -88,7 +92,11 @@ def test_enrich_partial_failure(mock_db_manager, mock_searcher, mock_process_sin
     assert "Enrichment finished: 1 promoted, 1 failed." in result.output
 
     # Assertions
-    mock_db_manager.promote_to_with_metadata.assert_called_once_with(1, enrichment_result)
+    mock_db_manager.promote_to_with_metadata.assert_called_once()
+    args, kwargs = mock_db_manager.promote_to_with_metadata.call_args
+    assert args == (1, enrichment_result)
+    assert kwargs.get("expand_related") is True
+    assert kwargs.get("max_related_per_source") == 40
     mock_db_manager.move_no_meta_entry_to_failed.assert_called_once_with(
         2, 'Metadata fetch failed (no match found in OpenAlex/Crossref)'
     )
