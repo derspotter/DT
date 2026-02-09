@@ -523,7 +523,7 @@ select {
   border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: linear-gradient(135deg, #ffffff 0%, #f8f4ef 100%);
-  box-shadow: 0 12px 28px rgba(31, 41, 51, 0.08);
+  box-shadow: 0 6px 16px rgba(31, 41, 51, 0.07);
   padding: 14px 16px;
   display: grid;
   gap: 10px;
@@ -710,6 +710,44 @@ button.danger:disabled {
 .tag.failed {
   background: #fee2e2;
   color: #991b1b;
+}
+
+.downloads-toolbar .toolbar-input,
+.downloads-toolbar .toolbar-select {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  background: #fff;
+  color: var(--ink);
+}
+
+.downloads-toolbar .toolbar-input {
+  width: min(420px, 56vw);
+}
+
+@keyframes heartbeat {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.4);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+.downloads-table .tag.in_progress::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #92400e;
+  animation: heartbeat 1.8s infinite ease-in-out;
 }
 
 .empty-state {

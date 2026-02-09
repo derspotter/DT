@@ -76,6 +76,15 @@
   let corpusSource = ''
   let downloads = []
   let downloadsSource = ''
+  let downloadsQuery = ''
+  let downloadsStatusFilter = 'all'
+  $: filteredDownloads = downloads.filter((item) => {
+    const statusOk = downloadsStatusFilter === 'all' || item.status === downloadsStatusFilter
+    if (!statusOk) return false
+    const q = downloadsQuery.trim().toLowerCase()
+    if (!q) return true
+    return String(item.title || '').toLowerCase().includes(q)
+  })
   let downloadWorker = {
     running: false,
     in_flight: false,
@@ -1659,13 +1668,35 @@
             </div>
           </div>
 
-          <div class="table table-scroll">
+          <div class="table-toolbar downloads-toolbar">
+            <div class="table-toolbar-left">
+              <input
+                class="toolbar-input"
+                type="text"
+                placeholder="Filter titles..."
+                bind:value={downloadsQuery}
+              />
+              <select class="toolbar-select" bind:value={downloadsStatusFilter}>
+                <option value="all">All statuses</option>
+                <option value="in_progress">In progress</option>
+                <option value="queued">Queued</option>
+                <option value="failed">Failed</option>
+              </select>
+            </div>
+            <div class="table-toolbar-right">
+              <span class="muted">
+                Showing {filteredDownloads.length} of {downloads.length}
+              </span>
+            </div>
+          </div>
+
+          <div class="table table-scroll downloads-table">
             <div class="table-row header cols-3">
               <span>Work</span>
               <span>Status</span>
               <span>Attempts</span>
             </div>
-            {#each downloads as item (item.id)}
+            {#each filteredDownloads as item (item.id)}
               <div class="table-row cols-3">
                 <span class="work-title" title={item.title}>{item.title}</span>
                 <span class={`tag ${item.status}`}>{item.status}</span>
@@ -1679,7 +1710,11 @@
             {:else}
               <div class="empty-state">
                 <strong>Queue is empty.</strong>
-                <span class="muted">Add works to the download queue via ingest or keyword search.</span>
+                <span class="muted">
+                  {downloadsQuery.trim() || downloadsStatusFilter !== 'all'
+                    ? 'No items match the current filters.'
+                    : 'Add works to the download queue via ingest or keyword search.'}
+                </span>
               </div>
             {/each}
           </div>
