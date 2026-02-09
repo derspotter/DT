@@ -1369,7 +1369,7 @@
       {#if activeTab === 'ingest'}
         <div class="card" data-testid="ingest-panel">
           <h2>Seed ingestion</h2>
-          <p>Upload PDFs, extract bibliographies, and consolidate reference files.</p>
+          <p>Upload PDFs, extract bibliographies, and select entries for further processing.</p>
           <div class="uploader">
             <label class="upload-drop">
               <input type="file" multiple accept=".pdf" on:change={handleFiles} />
@@ -1616,7 +1616,19 @@
       {#if activeTab === 'downloads'}
         <div class="card" data-testid="downloads-panel">
           <h2>Download queue</h2>
-          <p class="muted">{downloadsSource === 'api' ? 'Live queue from API.' : 'Sample queue data.'}</p>
+          <p class="muted">
+            {#if !downloadsSource}
+              Loading queue...
+            {:else if downloadsSource === 'api'}
+              Live queue from API.
+            {:else if downloadsSource === 'stub'}
+              Stub queue from API.
+            {:else if downloadsSource === 'sample'}
+              Sample queue data.
+            {:else}
+              Queue loaded ({downloadsSource}).
+            {/if}
+          </p>
 
           <div class="worker-card">
             <div class="worker-card__header">

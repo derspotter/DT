@@ -58,6 +58,7 @@ kanzlei.py
 /playwright-*.png
 dl_lit_project/extracted_refs_tmp/
 artifacts/
+dl_lit_project/artifacts/
 
 # OCR output directories
 ocr/ocr_results/

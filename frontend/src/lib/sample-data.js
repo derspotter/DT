@@ -1,9 +1,3 @@
-export const sampleBibliographies = [
-  'HAndbook of New Institutional Economics 2025_refs_physical_p6-6_bibliography.json',
-  '2007_The concept of power_refs_physical_p14_bibliography.json',
-  '2007_The concept of power_refs_physical_p15_bibliography.json',
-]
-
 export const sampleSearchResults = [
   {
     id: 'W2175056322',

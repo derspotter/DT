@@ -80,7 +80,7 @@ class TestGetBibPages(unittest.TestCase):
         mock_api_client.models.generate_content.assert_called_once()
 
         # Verify output pages were created (10-15 inclusive => 6 pages)
-        out_calls = [c for c in mock_pdf_doc_new.save.call_args_list if c.args[0].startswith('out/')]
+        out_calls = [c for c in mock_pdf_doc_new.save.call_args_list if c.args[0].startswith('out/dummy/')]
         self.assertEqual(len(out_calls), 6)
 
     @patch('dl_lit.get_bib_pages.api_client')
@@ -115,16 +115,13 @@ class TestGetBibPages(unittest.TestCase):
         self.assertEqual(mock_api_client.models.generate_content.call_count, 2)
 
         # Check that the final PDFs were saved for each page in each section.
-        final_save_calls = [
-            c for c in mock_pdf_doc_new.save.call_args_list
-            if c.args[0].startswith('out/')
-        ]
+        final_save_calls = [c for c in mock_pdf_doc_new.save.call_args_list if c.args[0].startswith('out/large_dummy/')]
         self.assertEqual(len(final_save_calls), 12)
 
         # Also check that the correct filenames were used
         saved_files = {c.args[0] for c in final_save_calls}
-        expected_files = {f'out/large_dummy_refs_physical_p{n}.pdf' for n in range(5, 11)}
-        expected_files |= {f'out/large_dummy_refs_physical_p{n}.pdf' for n in range(55, 61)}
+        expected_files = {f'out/large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(5, 11)}
+        expected_files |= {f'out/large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(55, 61)}
         self.assertEqual(saved_files, expected_files)
 
 if __name__ == '__main__':

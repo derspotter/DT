@@ -1,5 +1,4 @@
 import {
-  sampleBibliographies,
   sampleSearchResults,
   sampleCorpus,
   sampleDownloads,
@@ -123,20 +122,6 @@ export async function shareCorpus(corpusId, { username, role }) {
   return response.json()
 }
 
-export async function fetchBibliographyList() {
-  try {
-    const response = await fetchWithTimeout(`${API_BASE}/api/bibliographies/all-current`)
-    await throwIfUnauthorized(response)
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-    const data = await response.json()
-    return { data, source: 'api' }
-  } catch (error) {
-    return { data: sampleBibliographies, source: 'sample', error }
-  }
-}
-
 export async function uploadPdf(file) {
   const formData = new FormData()
   formData.append('file', file)
@@ -168,18 +153,6 @@ export async function extractBibliography(filename) {
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Extraction failed')
-  }
-  return response.json()
-}
-
-export async function consolidateBibliographies() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/bibliographies/consolidate`, {
-    method: 'POST',
-  })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Consolidation failed')
   }
   return response.json()
 }

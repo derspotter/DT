@@ -32,14 +32,14 @@ function findUpwards(startDir, childName) {
 }
 
 // --- Define Container Paths ---
-const UPLOADS_DIR = '/usr/src/app/uploads'; // Reverted path
-const DL_LIT_DIR = '/usr/src/app/dl_lit'; // Mounted from ../dl_lit
-const TEMP_PAGES_BASE_DIR = path.join(DL_LIT_DIR, 'temp_pages');
-const BIB_OUTPUT_DIR = path.join(DL_LIT_DIR, 'bibliographies');
-const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_DIR, 'get_bib_pages.py');
+const UPLOADS_DIR = '/usr/src/app/uploads';
 const DL_LIT_PROJECT_DIR =
   findUpwards(__dirname, 'dl_lit_project') || path.join(__dirname, '..', '..', 'dl_lit_project');
-const API_SCRAPER_SCRIPT = path.join(DL_LIT_PROJECT_DIR, 'dl_lit', 'APIscraper_v2.py');
+const DL_LIT_CODE_DIR = path.join(DL_LIT_PROJECT_DIR, 'dl_lit');
+const ARTIFACTS_DIR = process.env.RAG_FEEDER_ARTIFACTS_DIR || path.join(DL_LIT_PROJECT_DIR, 'artifacts');
+const BIB_OUTPUT_DIR = path.join(ARTIFACTS_DIR, 'bibliographies');
+const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
+const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
 const REPO_ROOT = path.dirname(DL_LIT_PROJECT_DIR);
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
@@ -349,7 +349,7 @@ export function createApp({ broadcast } = {}) {
   const downloadWorkers = new Map(); // corpusId -> state
 
   // Ensure temporary and output directories exist
-  fs.mkdirSync(TEMP_PAGES_BASE_DIR, { recursive: true });
+  fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
   fs.mkdirSync(BIB_OUTPUT_DIR, { recursive: true });
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -633,90 +633,8 @@ export function createApp({ broadcast } = {}) {
     return res.json({ shared: true });
   });
 
-  // Dynamic route to fetch bibliography JSON by basename
-  app.get('/api/bibliographies/:baseName/data', requireAuthMiddleware, (req, res) => {
-    const base = req.params.baseName;
-    function findFile(dir) {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const ent of entries) {
-        if (ent.isFile() && ent.name === `${base}_bibliography.json`) {
-          return path.join(dir, ent.name);
-        }
-        if (ent.isDirectory()) {
-          const f = findFile(path.join(dir, ent.name));
-          if (f) return f;
-        }
-      }
-      return null;
-    }
-    const filePath = findFile(BIB_OUTPUT_DIR);
-    if (!filePath) {
-      return res.status(404).json({ error: 'Bibliography not found yet' });
-    }
-    res.sendFile(filePath);
-  });
-
-  app.use('/api/bibliographies', requireAuthMiddleware, express.static(BIB_OUTPUT_DIR));
-
-  // GET combined bibliography entries for a given baseName
-  app.get('/api/bibliographies/:baseName/all', requireAuthMiddleware, (req, res) => {
-    const base = req.params.baseName;
-    const combined = [];
-    function walk(dir) {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const ent of entries) {
-        const abs = path.join(dir, ent.name);
-        if (ent.isDirectory()) {
-          walk(abs);
-        } else if (ent.isFile() && ent.name.startsWith(base) && ent.name.endsWith('_bibliography.json')) {
-          try {
-            const json = JSON.parse(fs.readFileSync(abs, 'utf8'));
-            if (Array.isArray(json)) combined.push(...json);
-          } catch (e) {
-            console.error(`Error reading/parsing ${abs}:`, e);
-          }
-        }
-      }
-    }
-    walk(BIB_OUTPUT_DIR);
-    res.json(combined);
-  });
-
-  // --- NEW: GET ALL current bibliography entries ---
-  app.get('/api/bibliographies/all-current', requireAuthMiddleware, (req, res) => {
-    console.log('[/api/bibliographies/all-current] Received request for file list.');
-    const fileList = [];
-    function walk(dir, relativePath = '') {
-      try {
-        // Check if directory exists before reading
-        if (!fs.existsSync(dir)) {
-          console.warn(`[/api/bibliographies/all-current] Directory not found, skipping: ${dir}`);
-          return;
-        }
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const ent of entries) {
-          const abs = path.join(dir, ent.name);
-          const rel = path.join(relativePath, ent.name);
-          if (ent.isDirectory()) {
-            walk(abs, rel);
-          } else if (ent.isFile() && ent.name.endsWith('_bibliography.json')) {
-            console.log(`[/api/bibliographies/all-current] Found file: ${rel}`);
-            fileList.push(rel); // Add relative path to the list
-          }
-        }
-      } catch (readDirErr) {
-        console.error(`[/api/bibliographies/all-current] Error reading directory ${dir}:`, readDirErr);
-      }
-    }
-
-    // Start walking from the base bibliography output directory
-    walk(BIB_OUTPUT_DIR);
-
-    console.log(`[/api/bibliographies/all-current] Returning ${fileList.length} bibliography filenames.`);
-    // Set content type and send JSON response
-    res.setHeader('Content-Type', 'application/json');
-    res.status(200).json(fileList); // Return the list of filenames
-  });
+  // Legacy `/api/bibliographies/*` endpoints were removed.
+  // The app is DB-first; ingestion results are accessed via `/api/ingest/*`.
 
   // Configure multer for file upload
   const storage = multer.diskStorage({
@@ -782,12 +700,9 @@ export function createApp({ broadcast } = {}) {
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
     const baseName = path.basename(filename, path.extname(filename)); // stable ingest_source
     const existingPagesDir = path.join(BIB_OUTPUT_DIR, baseName);
-    const uniqueSuffix = crypto.randomBytes(8).toString('hex');
-    const tempPagesDir = path.join(TEMP_PAGES_BASE_DIR, `${Date.now()}-${uniqueSuffix}`);
 
     console.log(`[/api/extract-bibliography] Received request for: ${filename}`);
     console.log(`[/api/extract-bibliography] Input PDF path: ${inputPdfPath}`);
-    console.log(`[/api/extract-bibliography] Temp pages dir: ${tempPagesDir}`);
     console.log(`[/api/extract-bibliography] Final bib output dir: ${BIB_OUTPUT_DIR}`);
 
     const inputExists = fs.existsSync(inputPdfPath);
@@ -848,10 +763,6 @@ export function createApp({ broadcast } = {}) {
         return;
       }
 
-      // 2. Create unique temporary directory for pages
-      fs.mkdirSync(tempPagesDir, { recursive: true });
-      console.log(`[/api/extract-bibliography] Created temp directory: ${tempPagesDir}`);
-
       // 3. Run get_bib_pages.py in background
       const getPagesArgs = [
         '--input-pdf', inputPdfPath,
@@ -879,10 +790,6 @@ export function createApp({ broadcast } = {}) {
           const errorMessage = `[/api/extract-bibliography] Error during bibliography page extraction (get_bib_pages.py exited with code ${code}).`;
           send(errorMessage);
           console.error(errorMessage);
-          // Clean up temporary directory on error
-          fs.rm(tempPagesDir, { recursive: true, force: true }, (rmErr) => {
-            if (rmErr) console.error(`[/api/extract-bibliography] Error cleaning up temp dir ${tempPagesDir}:`, rmErr);
-          });
           // Send error response only if headers not already sent
           if (!res.headersSent) {
             return res.status(500).json({ error: 'Error during bibliography page extraction.', scriptCode: code });
@@ -901,9 +808,6 @@ export function createApp({ broadcast } = {}) {
           const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}`;
           console.error(errorMessage);
           send(errorMessage);
-          fs.rm(tempPagesDir, { recursive: true, force: true }, (rmErr) => {
-            if (rmErr) console.error(`[/api/extract-bibliography] Error cleaning up temp dir ${tempPagesDir}:`, rmErr);
-          });
           if (!res.headersSent) {
             return res.status(500).json({ error: 'No extracted page PDFs found after page extraction.' });
           }
@@ -944,17 +848,6 @@ export function createApp({ broadcast } = {}) {
           }
           console.log(`[/api/extract-bibliography] Finished ${API_SCRAPER_SCRIPT}.`);
           console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
-
-          // Consider cleanup here *after* everything is done
-          if (fs.existsSync(tempPagesDir)) {
-            fs.rm(tempPagesDir, { recursive: true, force: true }, (err) => {
-              if (err) {
-                console.error(`[/api/extract-bibliography] Error deleting temp directory ${tempPagesDir} after completion:`, err);
-              } else {
-                console.log(`[/api/extract-bibliography] Deleted temp directory ${tempPagesDir} after completion.`);
-              }
-            });
-          }
         }); // End APIscraper callback
       }); // End get_bib_pages callback
 
@@ -970,55 +863,7 @@ export function createApp({ broadcast } = {}) {
   });
   // --- END NEW ENDPOINT ---
 
-  // --- NEW: POST endpoint to trigger consolidation ---
-  app.post('/api/bibliographies/consolidate', requireAuthMiddleware, (req, res) => {
-    console.log('[/api/bibliographies/consolidate] Received request.');
-
-    const pythonScriptPath = path.join(__dirname, '..', 'dl_lit', 'consolidate_bibs.py');
-    const inputDir = BIB_OUTPUT_DIR;
-    const outputFile = path.join(inputDir, 'master_bibliography.json');
-
-    console.log(`[/api/bibliographies/consolidate] Attempting to execute ${PYTHON_EXEC} with script: ${pythonScriptPath}`);
-
-    const pythonProcess = spawn(PYTHON_EXEC, [
-      pythonScriptPath,
-      inputDir,
-      outputFile
-    ], { stdio: 'pipe' });
-
-    let stdoutData = '';
-    let stderrData = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      stdoutData += data.toString();
-      console.log(`[/api/bibliographies/consolidate] Script stdout: ${data}`);
-      send(`[/api/bibliographies/consolidate] ${data}`); // Broadcast stdout
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      stderrData += data.toString();
-      console.error(`[/api/bibliographies/consolidate] Script stderr: ${data}`);
-      send(`[/api/bibliographies/consolidate ERROR] ${data}`); // Broadcast stderr
-    });
-
-    pythonProcess.on('close', (code) => {
-      console.log(`[/api/bibliographies/consolidate] Script exited with code ${code}`);
-      if (code === 0) {
-        res.status(200).json({ message: 'Consolidation successful.', output: stdoutData });
-      } else {
-        res.status(500).json({
-          message: 'Consolidation failed.',
-          error: stderrData || 'Unknown error from script.',
-          stdout: stdoutData
-        });
-      }
-    });
-
-    pythonProcess.on('error', (err) => {
-      console.error('[/api/bibliographies/consolidate] Failed to start subprocess.', err);
-      res.status(500).json({ message: 'Failed to start consolidation process.', error: err.message });
-    });
-  });
+  // Legacy `/api/bibliographies/consolidate` endpoint removed (DB-first pipeline).
 
   app.post('/api/keyword-search', requireAuthMiddleware, async (req, res) => {
     const query = req.body?.query?.trim();
