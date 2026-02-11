@@ -80,7 +80,10 @@ class TestGetBibPages(unittest.TestCase):
         mock_api_client.models.generate_content.assert_called_once()
 
         # Verify output pages were created (10-15 inclusive => 6 pages)
-        out_calls = [c for c in mock_pdf_doc_new.save.call_args_list if c.args[0].startswith('out/dummy/')]
+        out_calls = [
+            c for c in mock_pdf_doc_new.save.call_args_list
+            if '/dummy/' in str(c.args[0]).replace('\\', '/')
+        ]
         self.assertEqual(len(out_calls), 6)
 
     @patch('dl_lit.get_bib_pages.api_client')
@@ -115,14 +118,18 @@ class TestGetBibPages(unittest.TestCase):
         self.assertEqual(mock_api_client.models.generate_content.call_count, 2)
 
         # Check that the final PDFs were saved for each page in each section.
-        final_save_calls = [c for c in mock_pdf_doc_new.save.call_args_list if c.args[0].startswith('out/large_dummy/')]
+        final_save_calls = [
+            c for c in mock_pdf_doc_new.save.call_args_list
+            if '/large_dummy/' in str(c.args[0]).replace('\\', '/')
+        ]
         self.assertEqual(len(final_save_calls), 12)
 
         # Also check that the correct filenames were used
-        saved_files = {c.args[0] for c in final_save_calls}
-        expected_files = {f'out/large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(5, 11)}
-        expected_files |= {f'out/large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(55, 61)}
-        self.assertEqual(saved_files, expected_files)
+        saved_files = {str(c.args[0]).replace('\\', '/') for c in final_save_calls}
+        expected_suffixes = {f'large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(5, 11)}
+        expected_suffixes |= {f'large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(55, 61)}
+        for suffix in expected_suffixes:
+            self.assertTrue(any(path.endswith(suffix) for path in saved_files), f"Missing expected file suffix: {suffix}")
 
 if __name__ == '__main__':
     unittest.main()

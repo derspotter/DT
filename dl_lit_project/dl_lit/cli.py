@@ -770,7 +770,6 @@ def retry_failed_enrichments_command(db_path):
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, writable=True, resolve_path=True), help='Path to SQLite database file.')
 @click.option('--batch-size', default=50, show_default=True, help='Max number of with_metadata rows to enqueue.')
 def process_downloads_command(db_path, batch_size):
-    click.echo("!!!!!!!!!! DEBUG: ATTEMPTING TO RUN PROCESS-DOWNLOADS !!!!!!!!!!")
     """Move enriched references into the download queue (`to_download_references`)."""
     click.echo(f"Queueing up to {batch_size} items from with_metadata…")
 
@@ -839,11 +838,6 @@ def download_pdfs_command(db_path, limit, download_dir):
     ok = 0
     failed = 0
     for row in queue:
-        # --- DEBUG: Print the raw row from the database ---
-        click.echo("\n--- DEBUG: Raw row from DB ---")
-        click.echo(dict(row))
-        click.echo("--- END DEBUG ---\n")
-
         # Correctly parse author data from the database row, prioritizing rich JSON
         author_structs = []
         author_names_for_display = []

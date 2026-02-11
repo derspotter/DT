@@ -1,35 +1,31 @@
-import os
-import json
-import concurrent.futures
-import time
-import glob
+"""Gemini-based bibliography extraction from page-level PDFs into database staging.
+
+Accepted inputs:
+- a directory of PDFs via `--input-dir`
+- a single PDF via `--input-pdf`
+- a positional path (file or directory) for backward compatibility.
+"""
+
 import argparse
-from typing import Optional, List
-from pathlib import Path
-
+import concurrent.futures
+import glob
+import json
+import os
 import sys
-# Add project root to path to allow absolute imports from `dl_lit`
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import time
+from pathlib import Path
+from threading import Lock
+from typing import List, Optional
 
-# Import DatabaseManager for staged DB insertion
-from dl_lit.db_manager import DatabaseManager
-from dl_lit.utils import get_global_rate_limiter
-from pdfminer.high_level import extract_text
-try:
-    import fitz  # PyMuPDF
-    PYMUPDF_AVAILABLE = True
-except ImportError:
-    PYMUPDF_AVAILABLE = False
-try:
-    from PyPDF2 import PdfReader
-    PYPDF2_AVAILABLE = True
-except ImportError:
-    PYPDF2_AVAILABLE = False
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-import concurrent.futures
-from threading import Lock
+
+# Make local package imports work when this module is executed directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from dl_lit.db_manager import DatabaseManager
+from dl_lit.utils import get_global_rate_limiter
 try:
     from pydantic import BaseModel, ValidationError
     try:
@@ -42,8 +38,8 @@ except ImportError:
     ConfigDict = None
 
 # --- Configuration ---
-# Use Gemini 2.5 Flash model (fast + reliable)
-DEFAULT_MODEL_NAME = 'gemini-2.5-flash'
+# Keep default model stable, but allow override in runtime environments.
+DEFAULT_MODEL_NAME = os.getenv("RAG_FEEDER_GEMINI_MODEL", "gemini-2.5-flash")
 
 # Global client
 api_client = None
@@ -148,6 +144,14 @@ def configure_api_client():
         api_client = None
         return False
 
+def _wait_rate_limit(service_name: str) -> None:
+    """Best-effort rate limiting without turning throttling issues into hard failures."""
+    try:
+        if rate_limiter:
+            rate_limiter.wait_if_needed(service_name)
+    except Exception:
+        return
+
 def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
     """Uploads a PDF file directly to the API and attempts to extract bibliography entries."""
     print(f"[INFO] Uploading PDF directly for bibliography extraction: {pdf_path}", flush=True)
@@ -161,21 +165,20 @@ def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
             return []
     
     try:
-        # Upload the PDF file
-        with open(pdf_path, "rb") as file_handle:
-            uploaded_file = api_client.files.upload(
-                file=file_handle,
-                config={
-                    "mime_type": "application/pdf",
-                    "display_name": Path(pdf_path).name,
-                },
-            )
+        # Upload the PDF file via Files API.
+        uploaded_file = api_client.files.upload(
+            file=str(pdf_path),
+            config={
+                "mime_type": "application/pdf",
+                "display_name": Path(pdf_path).name,
+            },
+        )
         print(f"[DEBUG] Uploaded PDF as name: {uploaded_file.name}", flush=True)
         
         # Prepare the prompt for bibliography extraction
         prompt = BIBLIOGRAPHY_PROMPT
-        rate_limiter.wait_if_needed('gemini')
-        rate_limiter.wait_if_needed('gemini_daily')
+        _wait_rate_limit("gemini")
+        _wait_rate_limit("gemini_daily")
         
         def _call_model():
             config = types.GenerateContentConfig(
@@ -468,51 +471,62 @@ def process_directory_v2(
             print(f"  - {failure['file']}: {failure['reason']}")
     print("-------------------------")
 
-# --- Entry Point ---
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="V2: Extract bibliographies from PDFs using Gemini.")
+    parser.add_argument("input", nargs="?", help="Path to a PDF file or a directory containing PDFs.")
+    parser.add_argument("--input-pdf", dest="input_pdf", help="Path to a single input PDF file.")
+    parser.add_argument("--input-dir", dest="input_dir", help="Path to a directory containing input PDF files.")
+    parser.add_argument("--workers", type=int, default=5, help="Maximum number of concurrent worker threads.")
+    parser.add_argument("--db-path", required=True, help="Path to the SQLite database file.")
+    parser.add_argument("--ingest-source", default=None, help="Identifier for this ingest run (e.g., base filename).")
+    parser.add_argument("--corpus-id", type=int, default=None, help="Corpus ID to associate with inserted entries.")
+    return parser
 
-if __name__ == "__main__":
+
+def _resolve_input_path(args: argparse.Namespace) -> str | None:
+    return args.input_pdf or args.input_dir or args.input
+
+
+def main(argv: list[str] | None = None) -> int:
+    start_total_time = time.time()
     print("--- APIscraper_v2.py MAIN START ---", flush=True)
 
-    # Configure API client at the start
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
     if not configure_api_client():
         print("[FATAL] Exiting due to API configuration failure.", flush=True)
-        exit(1) # Or handle more gracefully depending on needs
+        return 1
 
-    parser = argparse.ArgumentParser(description='V2: Extract bibliographies from PDFs using an API.')
-    parser.add_argument('--input-dir', required=True, help='Directory containing input PDF files.')
-    parser.add_argument('--workers', type=int, default=5, help='Maximum number of concurrent worker threads.')
-    parser.add_argument('--db-path', required=True, help='Path to the SQLite database file to insert extracted references into.')
-    parser.add_argument('--ingest-source', default=None, help='Identifier for this ingest run (e.g., base filename).')
-    parser.add_argument('--corpus-id', type=int, default=None, help='Corpus ID to associate with inserted entries.')
-    args = parser.parse_args()
+    input_path = _resolve_input_path(args)
+    if not input_path:
+        print("[FATAL] No input provided. Use --input-dir, --input-pdf, or positional input.", flush=True)
+        return 2
 
-    input_path = args.input_dir
-    max_workers = args.workers
-    db_path_arg = args.db_path
-    ingest_source = args.ingest_source
-    corpus_id = args.corpus_id
+    db_path_resolved = Path(args.db_path).expanduser().resolve()
+    print(f"[INFO] Using database at: {db_path_resolved}", flush=True)
 
     db_manager = None
-    if not db_path_arg:
-        print("[FATAL] --db-path is a required argument. Exiting.", flush=True)
-        exit(1)
-    else:
-        db_path_resolved = Path(db_path_arg).expanduser().resolve()
-        print(f"[INFO] Using database at: {db_path_resolved}", flush=True)
+    try:
         db_manager = DatabaseManager(db_path=db_path_resolved)
+        if os.path.isdir(input_path):
+            print(f"[INFO] Processing directory: {input_path}", flush=True)
+            process_directory_v2(input_path, db_manager, args.workers, args.ingest_source, args.corpus_id)
+        elif os.path.isfile(input_path) and str(input_path).lower().endswith(".pdf"):
+            print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
+            summary = {"processed_files": 0, "successful_files": 0, "failed_files": 0, "failures": []}
+            process_single_pdf(input_path, db_manager, summary, Lock(), args.ingest_source, args.corpus_id)
+            print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
+        else:
+            print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)
+            return 2
+    finally:
+        if db_manager:
+            db_manager.close_connection()
 
-
-    # Check if input is a directory or single file
-    if os.path.isdir(input_path):
-        print(f"[INFO] Processing directory: {input_path}", flush=True)
-        process_directory_v2(input_path, db_manager, max_workers, ingest_source, corpus_id)
-    elif os.path.isfile(input_path) and input_path.lower().endswith('.pdf'):
-        print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
-        summary = {'processed_files': 0, 'successful_files': 0, 'failed_files': 0, 'failures': []}
-        process_single_pdf(input_path, db_manager, summary, Lock(), ingest_source, corpus_id)
-        print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
-    else:
-        print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)
-
-    start_total_time = time.time()
     print(f"\n[INFO] Total processing time: {time.time() - start_total_time:.2f} seconds.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
