@@ -31,16 +31,57 @@ function findUpwards(startDir, childName) {
   }
 }
 
+function isValidDlLitProjectDir(candidate) {
+  if (!candidate) return false;
+  const dlLitDir = path.join(candidate, 'dl_lit');
+  const dbManagerFile = path.join(dlLitDir, 'db_manager.py');
+  return fs.existsSync(dlLitDir) && fs.existsSync(dbManagerFile);
+}
+
+function findDlLitProjectDir(startDir) {
+  let current = startDir;
+  while (true) {
+    const direct = path.basename(current) === 'dl_lit_project' ? current : null;
+    if (isValidDlLitProjectDir(direct)) {
+      return direct;
+    }
+    const nested = path.join(current, 'dl_lit_project');
+    if (isValidDlLitProjectDir(nested)) {
+      return nested;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function resolveUploadsDir(repoRoot) {
+  const fromEnv = process.env.RAG_FEEDER_UPLOADS_DIR;
+  if (fromEnv) {
+    return fromEnv;
+  }
+  const containerRoot = '/usr/src/app';
+  if (fs.existsSync(containerRoot)) {
+    return path.join(containerRoot, 'uploads');
+  }
+  return path.join(repoRoot, 'uploads');
+}
+
 // --- Define Container Paths ---
-const UPLOADS_DIR = '/usr/src/app/uploads';
+const envProjectDir = process.env.RAG_FEEDER_DL_LIT_PROJECT_DIR;
+const fallbackProjectDir = path.join(__dirname, '..', '..', 'dl_lit_project');
 const DL_LIT_PROJECT_DIR =
-  findUpwards(__dirname, 'dl_lit_project') || path.join(__dirname, '..', '..', 'dl_lit_project');
+  [envProjectDir, findDlLitProjectDir(__dirname), findUpwards(__dirname, 'dl_lit_project'), fallbackProjectDir]
+    .find((dir) => isValidDlLitProjectDir(dir)) || fallbackProjectDir;
 const DL_LIT_CODE_DIR = path.join(DL_LIT_PROJECT_DIR, 'dl_lit');
+const REPO_ROOT = path.dirname(DL_LIT_PROJECT_DIR);
+const UPLOADS_DIR = resolveUploadsDir(REPO_ROOT);
 const ARTIFACTS_DIR = process.env.RAG_FEEDER_ARTIFACTS_DIR || path.join(DL_LIT_PROJECT_DIR, 'artifacts');
 const BIB_OUTPUT_DIR = path.join(ARTIFACTS_DIR, 'bibliographies');
 const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
-const REPO_ROOT = path.dirname(DL_LIT_PROJECT_DIR);
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
 const JWT_SECRET = process.env.RAG_FEEDER_JWT_SECRET || crypto.randomUUID();
@@ -302,6 +343,7 @@ function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
     const env = {
       ...process.env,
       PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+      RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
       RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
     };
 
@@ -401,6 +443,7 @@ export function createApp({ broadcast } = {}) {
     const env = {
       ...process.env,
       PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+      RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
       RAG_FEEDER_DB_PATH: dbPath,
     };
     if (corpusId !== undefined && corpusId !== null) {
@@ -739,7 +782,14 @@ export function createApp({ broadcast } = {}) {
         if (corpusId) {
           scrapeApiArgs.push('--corpus-id', String(corpusId));
         }
-        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
+        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
+          env: {
+            ...process.env,
+            PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+            RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
+            RAG_FEEDER_DB_PATH: DB_PATH,
+          },
+        });
 
         apiScraperProcess.stdout.on('data', (data) => {
           const message = data.toString();
@@ -770,7 +820,14 @@ export function createApp({ broadcast } = {}) {
       ];
 
       console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
-      const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs]);
+      const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], {
+        env: {
+          ...process.env,
+          PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+          RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
+          RAG_FEEDER_DB_PATH: DB_PATH,
+        },
+      });
 
       getPagesProcess.stdout.on('data', (data) => {
         const message = data.toString();
@@ -825,7 +882,14 @@ export function createApp({ broadcast } = {}) {
         if (corpusId) {
           scrapeApiArgs.push('--corpus-id', String(corpusId));
         }
-        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs]);
+        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
+          env: {
+            ...process.env,
+            PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+            RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
+            RAG_FEEDER_DB_PATH: DB_PATH,
+          },
+        });
 
         // Stream output via WebSocket (Already correctly implemented in previous step)
         apiScraperProcess.stdout.on('data', (data) => {

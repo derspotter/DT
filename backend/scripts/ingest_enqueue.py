@@ -1,25 +1,8 @@
 import argparse
 import json
-import sys
-from pathlib import Path
+from _bootstrap import ensure_import_paths
 
-
-def _ensure_import_paths() -> None:
-    # Prefer PYTHONPATH, but defensively add repo roots for docker/local runs.
-    here = Path(__file__).resolve()
-    cursor = here.parent
-    while True:
-        candidate = cursor / "dl_lit_project"
-        if candidate.exists():
-            sys.path.insert(0, str(candidate))
-            sys.path.insert(0, str(candidate.parent))
-            return
-        if cursor.parent == cursor:
-            return
-        cursor = cursor.parent
-
-
-_ensure_import_paths()
+ensure_import_paths(__file__)
 
 from dl_lit.db_manager import DatabaseManager  # noqa: E402
 

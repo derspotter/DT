@@ -7,11 +7,13 @@ import re
 import sys
 from collections import deque
 from pathlib import Path
+from _bootstrap import ensure_import_paths
 
 import requests
 
 ROOT = Path(__file__).resolve().parents[2]
 DL_LIT_PROJECT = ROOT / 'dl_lit_project'
+ensure_import_paths(__file__)
 if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 

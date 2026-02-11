@@ -3,28 +3,12 @@ import copy
 import hashlib
 import json
 import os
-import sys
 import socket
 import time
 from pathlib import Path
+from _bootstrap import ensure_import_paths
 
-
-def _ensure_import_paths() -> None:
-    # Prefer PYTHONPATH (set by backend), but defensively add repo roots for docker/local runs.
-    here = Path(__file__).resolve()
-    cursor = here.parent
-    while True:
-        candidate = cursor / "dl_lit_project"
-        if candidate.exists():
-            sys.path.insert(0, str(candidate))
-            sys.path.insert(0, str(candidate.parent))
-            return
-        if cursor.parent == cursor:
-            return
-        cursor = cursor.parent
-
-
-_ensure_import_paths()
+PROJECT_DIR = ensure_import_paths(__file__)
 
 from dl_lit.db_manager import DatabaseManager  # noqa: E402
 from dl_lit.new_dl import BibliographyEnhancer  # noqa: E402
@@ -81,19 +65,8 @@ def main() -> None:
     # Single shared storage across corpora unless overridden.
     download_dir = args.download_dir.strip()
     if not download_dir:
-        # Find repo root from this script and use dl_lit_project/data/pdf_library.
-        here = Path(__file__).resolve()
-        cursor = here.parent
-        repo_root = None
-        while True:
-            if (cursor / "dl_lit_project").exists():
-                repo_root = cursor
-                break
-            if cursor.parent == cursor:
-                break
-            cursor = cursor.parent
-        repo_root = repo_root or Path.cwd()
-        download_dir = str(repo_root / "dl_lit_project" / "data" / "pdf_library")
+        project_dir = PROJECT_DIR or (Path.cwd() / "dl_lit_project")
+        download_dir = str(project_dir / "data" / "pdf_library")
 
     download_dir_path = Path(download_dir)
     download_dir_path.mkdir(parents=True, exist_ok=True)
