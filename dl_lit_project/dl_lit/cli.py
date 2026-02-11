@@ -11,12 +11,18 @@ import copy
 from tqdm import tqdm
 from threading import Lock
 import hashlib
+import bibtexparser
 
 # Local application imports
 from .db_manager import DatabaseManager
 # For tests: patched in test_get_bib_pages. Lazy import in handler for runtime.
 extract_reference_sections = None
-from .OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
+from .OpenAlexScraper import (
+    OpenAlexCrossrefSearcher,
+    process_bibliography_files,
+    process_single_file,
+    process_single_reference,
+)
 from .new_dl import BibliographyEnhancer
 from .utils import get_global_rate_limiter
 from .pdf_downloader import PDFDownloader

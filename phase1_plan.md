@@ -86,6 +86,11 @@
 - Tests pass for existing CLI workflows plus new keyword-search coverage.
 
 ## Status / Validation
+- Phase 1 closure update (Feb 11, 2026):
+  - Canonical DB-first runtime path resolution is enforced in backend and worker scripts.
+  - Backend and Python test suites pass after bootstrap/runtime hardening.
+  - Phase 1 documentation baseline added in `dl_lit_project/README.md` and expanded `dl_lit_project/DEVELOPMENT.md`.
+  - Python lint baseline configured via `dl_lit_project/pyproject.toml` (`ruff`) and `requirements-dev.txt`.
 - Partial pipeline smoke test run on `dl_lit_project/completed/2004_kapitel-02.pdf` (Jan 26, 2026): extraction succeeded (5 ref pages, 93 entries inserted); enrichment began, then run was stopped early to avoid a long OpenAlex batch.
 - Enrichment smoke test (Jan 26, 2026): `enrich-openalex-db --batch-size 10 --no-fetch-references` → 9 promoted, 1 failed.
 - Failed enrichment retry (Jan 26, 2026): `retry-failed-enrichments` then `enrich-openalex-db --batch-size 5 --no-fetch-references` → 5 promoted, 0 failed.

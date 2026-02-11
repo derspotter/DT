@@ -5,7 +5,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - Seed‑document ingestion (references + citations) with automated retrieval
 - Keyword search with result persistence and download queueing
 - Visualization of citation networks (D3.js)
-- React/Vite frontend
+- Svelte/Vite frontend
 - Docker deployment with persistence and resumable workflows
 - Code audit/refactor + documentation
 
@@ -23,7 +23,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - Data pipeline to compute graph nodes/edges
 - Export graph JSON for frontend use
 
-**MS3 — React/Vite Frontend (May 2026)**
+**MS3 — Frontend (May 2026)**
 - Upload flows (PDF/BibTeX/JSON)
 - Keyword search UI
 - Progress + run history
@@ -44,11 +44,13 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - Full regression test sweep
 - End‑to‑end validation + handover
 
-## 3) Current Status (Jan 2026)
-- Phase 1 (Refactor + Keyword Search) completed and tested.
+## 3) Current Status (Feb 2026)
+- Phase 1 (Refactor + Keyword Search) is completed and tested.
 - Pipeline helper supports `--max-ref-pages`, `--max-entries`, and `--no-enrich` for smoke tests.
 - Dedupe hardening, merge logging, and alias handling implemented.
-- Full test suite passes (`pytest dl_lit_project/tests`).
+- Backend Python bootstrap/runtime pathing is consolidated to avoid invalid local path resolution.
+- Full Python and backend test suites pass (`pytest dl_lit_project/tests`, `cd backend && npm test -- --runInBand`).
+- Visualization is currently treated as optional/nice-to-have and can be revisited after ingestion/search/download hardening.
 
 ## 3.1) Milestone 2 Plan — Visualization (Apr 2026)
 **Goal:** deliver a D3‑based citation/cluster visualization wired to real corpus data.

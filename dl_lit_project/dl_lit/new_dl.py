@@ -91,9 +91,38 @@ class BibliographyEnhancer:
         self.proxies = proxies
         self.output_folder = Path(output_folder) if output_folder else None
         self._pdf_downloader = None
+        # Legacy helper methods in this module still expect both names.
+        self.conn = getattr(self.db_manager, "conn", None)
+        self.db_conn = self.conn
         
         # Initialize Sci-Hub mirror rotation
         self.current_mirror_index = 0
+
+    def _setup_database(self) -> None:
+        """Ensure schema exists before legacy table operations."""
+        try:
+            self.db_manager._create_schema()
+        except Exception:
+            # Some callers only need the current connection and can proceed.
+            return
+
+    def _norm_doi(self, doi):
+        try:
+            return self.db_manager._normalize_doi(doi)
+        except Exception:
+            return None
+
+    def _norm_title(self, title):
+        try:
+            return self.db_manager._normalize_text(title)
+        except Exception:
+            return None
+
+    def _norm_authors(self, authors):
+        try:
+            return self.db_manager._normalize_authors_value(authors)
+        except Exception:
+            return None
 
     def _get_pdf_downloader(self, downloads_dir: Path) -> PDFDownloader:
         """Lazily create a PDFDownloader for the current download directory."""
@@ -1259,8 +1288,8 @@ class BibliographyEnhancer:
 
                     # prepare normalized keys
                     doi = (entry.get('doi','') or '').strip().lower()
-                    norm_title = ReferenceDB._norm_title(entry.get('title',''))
-                    norm_auth = ReferenceDB._norm_authors(entry.get('authors',[]))
+                    norm_title = self._norm_title(entry.get('title', ''))
+                    norm_auth = self._norm_authors(entry.get('authors', []))
                     meta = json.dumps(entry, ensure_ascii=False)
 
                     # Get the database path for the dedicated connection
@@ -1440,10 +1469,7 @@ class BibliographyEnhancer:
             print(f"[DB ERROR] Invalid table name: {table}")
             return False
 
-        # Normalize essential fields
-        norm_doi = self._norm_doi(ref.get('doi'))
-        norm_title = self._norm_title(ref.get('title'))
-          # Handle both original and enriched data structures
+        # Handle both original and enriched data structures
         if 'enriched_data' in ref and ref['enriched_data']:
             # Enriched structure from OpenAlex/Crossref
             enriched = ref['enriched_data']
@@ -1462,15 +1488,18 @@ class BibliographyEnhancer:
             doi = original_ref.get('doi', None)
         else:
             # Fallback for entries that were not enriched (e.g. from bibtex import)
-            title = bib_entry.get('title', '')
-            authors = bib_entry.get('authors', [])
-            year = bib_entry.get('year', None)
-            doi = bib_entry.get('doi', None)
+            title = ref.get('title', '')
+            authors = ref.get('authors', [])
+            year = ref.get('year', None)
+            doi = ref.get('doi', None)
 
         # Ensure title and authors are not None
         title = title or ''
         authors = authors or []
         meta = json.dumps(ref) # Store original metadata
+        norm_doi = self._norm_doi(doi)
+        norm_title = self._norm_title(title)
+        norm_authors = self._norm_authors(authors)
         # Get filename/position if available in ref (e.g., from primary JSON ingestion)
         filename = ref.get('filename') 
         position = ref.get('position') 
@@ -1499,9 +1528,9 @@ class BibliographyEnhancer:
             cursor.execute(f"""INSERT OR IGNORE INTO {table}
                            (doi, title, year, authors, abstract, publication_year, type, container_title, metadata, filename, position, normalized_doi, normalized_title, normalized_authors)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) """,
-                           (ref.get('doi'), ref.get('title'), year, json.dumps(ref.get('authors')), 
+                           (doi, title, year, json.dumps(authors), 
                             abstract, pub_year, ref_type, container, # New values
-                            metadata, filename, position, norm_doi, norm_title, norm_authors))
+                            meta, filename, position, norm_doi, norm_title, norm_authors))
             
             # Check if a row was actually inserted
             if self.conn.total_changes > initial_changes:
@@ -1520,9 +1549,12 @@ class BibliographyEnhancer:
 
     def close(self):
         """Closes the database connection."""
-        if self.conn:
-            self.conn.close()
-            print("[DB] Connection closed.")
+        try:
+            if self.db_manager:
+                self.db_manager.close_connection()
+                print("[DB] Connection closed.")
+        except Exception:
+            return
 
     # ------------------------------------------------------------------
     # DB schema adjustments – add normalised columns if missing (DEPRECATED) 
@@ -1856,6 +1888,12 @@ if __name__ == "__main__":
     import argparse
     from pathlib import Path
 
+    print(
+        "[WARN] Running new_dl.py directly is legacy. Prefer 'python -m dl_lit.cli download-pdfs' for DB-first flows.",
+        flush=True,
+    )
+    default_db_path = str((Path(__file__).resolve().parent.parent / "data" / "literature.db").resolve())
+
     parser = argparse.ArgumentParser(
         description="Ingest JSON references, fetch OpenAlex data, optionally download PDFs."
     )
@@ -1872,7 +1910,7 @@ if __name__ == "__main__":
         help="Directory to save downloaded PDFs and other outputs."
     )
     parser.add_argument(
-        "--db-path", default="processed_references.db",
+        "--db-path", default=default_db_path,
         help="Path to the SQLite database file to use/create."
     )
     parser.add_argument(
@@ -1985,7 +2023,7 @@ if __name__ == "__main__":
         if reference_db:
             try:
                 print("[INFO] Closing database connection.")
-                reference_db.close() # Assumes a close() method exists in ReferenceDB
+                reference_db.close_connection()
             except Exception as e:
                 print(f"[ERROR] Failed to close database connection: {e}")
 

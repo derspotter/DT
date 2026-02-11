@@ -970,7 +970,7 @@ def process_bibliography_files(bib_dir, output_dir, searcher, fetch_citations=Tr
             except Exception as e:
                 print(f"Error processing a file: {e}")
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='Scrape OpenAlex for references and citations.')
     parser.add_argument('--bib-dir', type=str, help='Directory containing bibliography JSON files')
     parser.add_argument('--input-file', type=str, help='Single bibliography JSON file to process')
@@ -979,7 +979,7 @@ def main():
     parser.add_argument('--fetch-citations', action='store_true', default=True, help='Fetch citing work IDs (default: True)')
     parser.add_argument('--no-fetch-citations', action='store_false', dest='fetch_citations', help='Do not fetch citing work IDs')
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.bib_dir and not args.input_file:
         parser.error('Either --bib-dir or --input-file must be specified.')
@@ -992,6 +992,7 @@ def main():
         process_single_file(args.input_file, args.output_dir, searcher, args.fetch_citations)
     elif args.bib_dir:
         process_bibliography_files(args.bib_dir, args.output_dir, searcher, args.fetch_citations)
+    return 0
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
