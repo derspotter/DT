@@ -3,6 +3,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    command: npm run dev -- --legacy-watch
     container_name: rag_feeder_backend
     ports:
       - "4000:4000"
@@ -12,7 +13,10 @@ services:
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - RAG_FEEDER_JWT_SECRET=${RAG_FEEDER_JWT_SECRET}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - CHOKIDAR_USEPOLLING=1
     volumes:
+      - ./backend/src:/usr/src/app/src
+      - ./backend/scripts:/usr/src/app/scripts
       - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_uploads:/usr/src/app/uploads
@@ -24,11 +28,18 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      args:
-        VITE_API_BASE: http://localhost:4000
+      target: build
+    command: npm run dev -- --host 0.0.0.0 --port 5175 --strictPort
     container_name: rag_feeder_frontend
     ports:
       - "5175:5175"
+    environment:
+      - VITE_API_BASE=http://localhost:4000
+      - CHOKIDAR_USEPOLLING=1
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.js:/app/vite.config.js
     restart: unless-stopped
     networks:
       - rag-network

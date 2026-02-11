@@ -1538,7 +1538,7 @@
           <h2>Keyword search</h2>
           <p>Compose boolean OpenAlex queries (AND/OR/NOT) or start from a JSON seed list.</p>
           <form class="search-form" on:submit|preventDefault={runSearch}>
-            <select bind:value={searchMode}>
+            <select bind:value={searchMode} data-testid="search-mode">
               <option value="query">Text query</option>
               <option value="seed">JSON seed</option>
             </select>
@@ -1554,6 +1554,7 @@
                 rows="3"
                 placeholder={"JSON array, e.g. [\"W2741809807\", {\"doi\":\"10.1111/j.1468-0335.1937.tb00002.x\"}]"}
                 bind:value={searchSeedJson}
+                data-testid="search-seed-json"
               ></textarea>
             {/if}
             <select bind:value={searchField}>
@@ -1567,7 +1568,7 @@
             <input type="number" placeholder="To" bind:value={yearTo} />
             <input type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepth} />
             <input type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
-            <button class="primary" type="submit">Search</button>
+            <button class="primary" type="submit" data-testid="search-submit">Search</button>
           </form>
           <p class="muted">{searchStatus} ({searchSource})</p>
           <div class="table">
