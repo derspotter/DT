@@ -489,7 +489,6 @@ def _resolve_input_path(args: argparse.Namespace) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     start_total_time = time.time()
-    print("--- APIscraper_v2.py MAIN START ---", flush=True)
 
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
