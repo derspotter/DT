@@ -65,9 +65,13 @@
   let ingestRunsStatus = ''
 
   let searchQuery = ''
+  let searchMode = 'query'
+  let searchSeedJson = ''
   let searchField = 'default'
   let yearFrom = ''
   let yearTo = ''
+  let relatedDepth = 1
+  let maxRelated = 30
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
@@ -513,21 +517,29 @@
   async function runSearch() {
     searchStatus = 'Searching...'
     try {
-      const { data, source } = await runKeywordSearch({
-        query: searchQuery,
+      const query = searchMode === 'query' ? searchQuery : ''
+      const seedJson = searchMode === 'seed' ? searchSeedJson : ''
+      const { data, source, expansion } = await runKeywordSearch({
+        query,
+        seedJson,
         field: searchField,
         yearFrom,
         yearTo,
+        relatedDepth,
+        maxRelated,
       })
       searchResults = data
       searchSource = source
-      searchStatus = source === 'api' ? 'Results loaded from API.' : 'Sample results loaded.'
+      const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
+      searchStatus = source === 'api'
+        ? `Results loaded from API.${suffix}`
+        : 'Sample results loaded.'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
-      searchStatus = 'Search failed.'
+      searchStatus = error?.message || 'Search failed.'
     }
   }
 
@@ -1524,14 +1536,26 @@
       {#if activeTab === 'search'}
         <div class="card" data-testid="search-panel">
           <h2>Keyword search</h2>
-          <p>Compose OpenAlex queries and queue results for downloads.</p>
+          <p>Compose boolean OpenAlex queries (AND/OR/NOT) or start from a JSON seed list.</p>
           <form class="search-form" on:submit|preventDefault={runSearch}>
-            <input
-              type="text"
-              placeholder="e.g., institutional economics AND governance"
-              bind:value={searchQuery}
-              data-testid="search-query"
-            />
+            <select bind:value={searchMode}>
+              <option value="query">Text query</option>
+              <option value="seed">JSON seed</option>
+            </select>
+            {#if searchMode === 'query'}
+              <input
+                type="text"
+                placeholder="e.g., institutional economics AND governance"
+                bind:value={searchQuery}
+                data-testid="search-query"
+              />
+            {:else}
+              <textarea
+                rows="3"
+                placeholder={"JSON array, e.g. [\"W2741809807\", {\"doi\":\"10.1111/j.1468-0335.1937.tb00002.x\"}]"}
+                bind:value={searchSeedJson}
+              ></textarea>
+            {/if}
             <select bind:value={searchField}>
               <option value="default">All fields</option>
               <option value="title">Title</option>
@@ -1541,6 +1565,8 @@
             </select>
             <input type="number" placeholder="From" bind:value={yearFrom} />
             <input type="number" placeholder="To" bind:value={yearTo} />
+            <input type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepth} />
+            <input type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
             <button class="primary" type="submit">Search</button>
           </form>
           <p class="muted">{searchStatus} ({searchSource})</p>

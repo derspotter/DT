@@ -225,12 +225,28 @@ export async function processMarkedIngestEntries({ limit = 10 } = {}) {
   return response.json()
 }
 
-export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
+export async function runKeywordSearch({
+  query,
+  seedJson,
+  field,
+  yearFrom,
+  yearTo,
+  relatedDepth = 1,
+  maxRelated = 30,
+}) {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, field, yearFrom, yearTo }),
+      body: JSON.stringify({
+        query,
+        seedJson,
+        field,
+        yearFrom,
+        yearTo,
+        relatedDepth,
+        maxRelated,
+      }),
     })
     await throwIfUnauthorized(response)
     if (!response.ok) {
@@ -238,7 +254,13 @@ export async function runKeywordSearch({ query, field, yearFrom, yearTo }) {
     }
     const payload = await response.json()
     const data = Array.isArray(payload) ? payload : payload.results || []
-    return { data, source: payload.source || 'api', runId: payload.runId }
+    return {
+      data,
+      source: payload.source || 'api',
+      runId: payload.runId,
+      mode: payload.mode,
+      expansion: payload.expansion,
+    }
   } catch (error) {
     if (error?.status === 401) {
       throw error

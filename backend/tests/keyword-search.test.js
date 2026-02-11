@@ -12,7 +12,7 @@ describe('POST /api/keyword-search', () => {
     delete process.env.RAG_FEEDER_STUB
   })
 
-  test('requires query', async () => {
+  test('requires query or seedJson', async () => {
     const res = await request(app).post('/api/keyword-search').send({})
     expect(res.status).toBe(400)
   })
@@ -25,5 +25,14 @@ describe('POST /api/keyword-search', () => {
     expect(res.body).toHaveProperty('results')
     expect(Array.isArray(res.body.results)).toBe(true)
     expect(res.body.results[0]).toHaveProperty('title')
+  })
+
+  test('accepts seedJson mode in stub', async () => {
+    const res = await request(app)
+      .post('/api/keyword-search')
+      .send({ seedJson: ['W2015930340'] })
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.results)).toBe(true)
+    expect(res.body.source).toBe('stub')
   })
 })

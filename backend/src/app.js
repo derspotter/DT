@@ -867,8 +867,9 @@ export function createApp({ broadcast } = {}) {
 
   app.post('/api/keyword-search', requireAuthMiddleware, async (req, res) => {
     const query = req.body?.query?.trim();
-    if (!query) {
-      return res.status(400).json({ error: 'query is required' });
+    const seedJson = req.body?.seedJson;
+    if (!query && !seedJson) {
+      return res.status(400).json({ error: 'query or seedJson is required' });
     }
 
     if (process.env.RAG_FEEDER_STUB === '1') {
@@ -881,13 +882,22 @@ export function createApp({ broadcast } = {}) {
     const yearTo = coerceInt(req.body?.yearTo, null);
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
+    const relatedDepth = coerceInt(req.body?.relatedDepth, 1);
+    const maxRelated = coerceInt(req.body?.maxRelated, 30);
     const dbPath = DB_PATH;
 
-    const args = ['--query', query, '--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
-    if (yearFrom) args.push('--year-from', String(yearFrom));
-    if (yearTo) args.push('--year-to', String(yearTo));
+    const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
+    if (query) args.push('--query', query);
+    if (!query && seedJson) {
+      const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
+      args.push('--seed-json', seedPayload);
+    }
+    if (query && yearFrom) args.push('--year-from', String(yearFrom));
+    if (query && yearTo) args.push('--year-to', String(yearTo));
     if (mailto) args.push('--mailto', String(mailto));
     if (enqueue) args.push('--enqueue');
+    if (relatedDepth) args.push('--related-depth', String(relatedDepth));
+    if (maxRelated) args.push('--max-related', String(maxRelated));
 
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });

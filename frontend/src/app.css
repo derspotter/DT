@@ -444,17 +444,24 @@ select {
 
 .search-form {
   display: grid;
-  grid-template-columns: 2fr 1fr 0.7fr 0.7fr auto;
+  grid-template-columns: minmax(140px, 0.9fr) minmax(260px, 2fr) repeat(4, minmax(110px, 0.8fr)) auto;
   gap: 10px;
   margin-bottom: 10px;
+  align-items: start;
 }
 
 .search-form input,
-.search-form select {
+.search-form select,
+.search-form textarea {
   padding: 10px 12px;
   border-radius: 10px;
   border: 1px solid var(--stroke);
   background: #fff;
+}
+
+.search-form textarea {
+  resize: vertical;
+  min-height: 84px;
 }
 
 .table {
