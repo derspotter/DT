@@ -951,8 +951,6 @@ export function createApp({ broadcast } = {}) {
     const relatedDepthDownstream = coerceInt(req.body?.relatedDepthDownstream, relatedDepth);
     const relatedDepthUpstream = coerceInt(req.body?.relatedDepthUpstream, relatedDepth);
     const maxRelated = coerceInt(req.body?.maxRelated, 30);
-    const includeDownstream = Boolean(req.body?.includeDownstream ?? true);
-    const includeUpstream = Boolean(req.body?.includeUpstream ?? false);
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
@@ -968,16 +966,17 @@ export function createApp({ broadcast } = {}) {
     if (relatedDepthDownstream !== null || relatedDepthUpstream !== null) {
       if (relatedDepthDownstream !== null && relatedDepthDownstream > 0) {
         args.push('--related-depth-downstream', String(Math.max(1, relatedDepthDownstream)));
+      } else {
+        args.push('--no-include-downstream');
       }
       if (relatedDepthUpstream !== null && relatedDepthUpstream > 0) {
+        args.push('--include-upstream');
         args.push('--related-depth-upstream', String(Math.max(1, relatedDepthUpstream)));
       }
     } else if (relatedDepth !== null) {
       args.push('--related-depth', String(Math.max(1, relatedDepth)));
     }
     if (maxRelated) args.push('--max-related', String(maxRelated));
-    if (!includeDownstream) args.push('--no-include-downstream');
-    if (includeUpstream) args.push('--include-upstream');
 
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });

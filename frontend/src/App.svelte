@@ -82,8 +82,6 @@
   let relatedDepthDownstream = 1
   let relatedDepthUpstream = 1
   let maxRelated = 30
-  let includeDownstream = true
-  let includeUpstream = false
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
@@ -564,8 +562,6 @@
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
-        includeDownstream,
-        includeUpstream,
       })
       searchResults = data
       searchSource = source
@@ -592,8 +588,6 @@
     relatedDepthDownstream = 1
     relatedDepthUpstream = 1
     maxRelated = 30
-    includeDownstream = true
-    includeUpstream = false
     searchStatus = ''
     searchSource = ''
   }
@@ -1721,30 +1715,34 @@
             </div>
             <div class="search-field">
               <label for="search-depth-down">Downstream depth</label>
-              <input id="search-depth-down" type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepthDownstream} />
-              <p class="field-hint">1 = direct references only. Used when expanding works cited by a seed.</p>
+              <input
+                id="search-depth-down"
+                type="number"
+                min="0"
+                max="4"
+                step="1"
+                placeholder="Depth"
+                bind:value={relatedDepthDownstream}
+              />
+              <p class="field-hint">0 = skip, 1 = direct references only, 2 = one hop further, etc.</p>
             </div>
             <div class="search-field">
               <label for="search-depth-up">Upstream depth</label>
-              <input id="search-depth-up" type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepthUpstream} />
-              <p class="field-hint">1 = direct citing works only. Used when expanding works that cite the seed.</p>
+              <input
+                id="search-depth-up"
+                type="number"
+                min="0"
+                max="4"
+                step="1"
+                placeholder="Depth"
+                bind:value={relatedDepthUpstream}
+              />
+              <p class="field-hint">0 = skip, 1 = direct citing works only, 2 = one hop further, etc.</p>
             </div>
             <div class="search-field">
               <label for="search-max-related">Max related per work</label>
               <input id="search-max-related" type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
               <p class="field-hint">Controls expansion size when references are fetched.</p>
-            </div>
-            <div class="search-field search-checkbox-group">
-              <p class="search-field-title">Expansion direction</p>
-              <label class="inline-check">
-                <input type="checkbox" bind:checked={includeDownstream} />
-                <span>Include references (downstream)</span>
-              </label>
-              <label class="inline-check">
-                <input type="checkbox" bind:checked={includeUpstream} />
-                <span>Include cited-by (upstream)</span>
-              </label>
-              <p class="field-hint">Downstream = works cited by a seed item. Upstream = works that cite the seed item.</p>
             </div>
             <div class="search-field search-actions">
               <button

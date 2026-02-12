@@ -234,8 +234,6 @@ export async function runKeywordSearch({
   relatedDepthDownstream = 1,
   relatedDepthUpstream = 1,
   maxRelated = 30,
-  includeDownstream = true,
-  includeUpstream = false,
 }) {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search`, {
@@ -250,8 +248,6 @@ export async function runKeywordSearch({
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
-        includeDownstream,
-        includeUpstream,
       }),
     })
     await throwIfUnauthorized(response)
