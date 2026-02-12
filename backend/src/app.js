@@ -947,8 +947,12 @@ export function createApp({ broadcast } = {}) {
     const yearTo = coerceInt(req.body?.yearTo, null);
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
-    const relatedDepth = coerceInt(req.body?.relatedDepth, 1);
+    const relatedDepth = coerceInt(req.body?.relatedDepth, null);
+    const relatedDepthDownstream = coerceInt(req.body?.relatedDepthDownstream, relatedDepth);
+    const relatedDepthUpstream = coerceInt(req.body?.relatedDepthUpstream, relatedDepth);
     const maxRelated = coerceInt(req.body?.maxRelated, 30);
+    const includeDownstream = Boolean(req.body?.includeDownstream ?? true);
+    const includeUpstream = Boolean(req.body?.includeUpstream ?? false);
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
@@ -961,8 +965,19 @@ export function createApp({ broadcast } = {}) {
     if (query && yearTo) args.push('--year-to', String(yearTo));
     if (mailto) args.push('--mailto', String(mailto));
     if (enqueue) args.push('--enqueue');
-    if (relatedDepth) args.push('--related-depth', String(relatedDepth));
+    if (relatedDepthDownstream !== null || relatedDepthUpstream !== null) {
+      if (relatedDepthDownstream !== null && relatedDepthDownstream > 0) {
+        args.push('--related-depth-downstream', String(Math.max(1, relatedDepthDownstream)));
+      }
+      if (relatedDepthUpstream !== null && relatedDepthUpstream > 0) {
+        args.push('--related-depth-upstream', String(Math.max(1, relatedDepthUpstream)));
+      }
+    } else if (relatedDepth !== null) {
+      args.push('--related-depth', String(Math.max(1, relatedDepth)));
+    }
     if (maxRelated) args.push('--max-related', String(maxRelated));
+    if (!includeDownstream) args.push('--no-include-downstream');
+    if (includeUpstream) args.push('--include-upstream');
 
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });

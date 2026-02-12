@@ -79,8 +79,11 @@
   let searchField = 'default'
   let yearFrom = ''
   let yearTo = ''
-  let relatedDepth = 1
+  let relatedDepthDownstream = 1
+  let relatedDepthUpstream = 1
   let maxRelated = 30
+  let includeDownstream = true
+  let includeUpstream = false
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
@@ -558,8 +561,11 @@
         field: searchField,
         yearFrom,
         yearTo,
-        relatedDepth,
+        relatedDepthDownstream,
+        relatedDepthUpstream,
         maxRelated,
+        includeDownstream,
+        includeUpstream,
       })
       searchResults = data
       searchSource = source
@@ -574,6 +580,22 @@
       }
       searchStatus = error?.message || 'Search failed.'
     }
+  }
+
+  function resetSearchForm() {
+    searchMode = 'query'
+    searchQuery = ''
+    searchSeedJson = ''
+    searchField = 'default'
+    yearFrom = ''
+    yearTo = ''
+    relatedDepthDownstream = 1
+    relatedDepthUpstream = 1
+    maxRelated = 30
+    includeDownstream = true
+    includeUpstream = false
+    searchStatus = ''
+    searchSource = ''
   }
 
   async function loadCorpus() {
@@ -1608,39 +1630,140 @@
       {#if activeTab === 'search'}
         <div class="card" data-testid="search-panel">
           <h2>Keyword search</h2>
-          <p>Compose boolean OpenAlex queries (AND/OR/NOT) or start from a JSON seed list.</p>
+          <p>Search OpenAlex for works and optionally expand related references.</p>
+          <div class="search-explanation">
+            <details>
+              <summary>How to use this search (quick guide)</summary>
+              <p>
+                Search runs in two modes:
+                <strong>Text query</strong> (boolean) or <strong>JSON seed</strong> mode.
+                The backend sends the request to the OpenAlex script, normalizes input,
+                then deduplicates results before returning.
+              </p>
+              <ul>
+                <li>Text mode is for normal boolean searches like <code>institutional AND economics</code>.</li>
+                <li>Seed mode is for exact starting points like OpenAlex IDs/DOI/title.</li>
+                <li>Field selector controls which metadata is searched.</li>
+                <li>Depth/Max Related controls how far citation graph expansion should go.</li>
+              </ul>
+            </details>
+          </div>
           <form class="search-form" on:submit|preventDefault={runSearch}>
-            <select bind:value={searchMode} data-testid="search-mode">
-              <option value="query">Text query</option>
-              <option value="seed">JSON seed</option>
-            </select>
+            <div class="search-field">
+              <label for="search-mode">Mode</label>
+              <select
+                id="search-mode"
+                bind:value={searchMode}
+                data-testid="search-mode"
+                title="Text mode runs a boolean OpenAlex query; Seed mode starts from a JSON list."
+              >
+                <option value="query">Text query</option>
+                <option value="seed">JSON seed</option>
+              </select>
+              <p class="field-hint">Need an exact list? Use Seed mode with IDs, DOIs, or title objects.</p>
+            </div>
             {#if searchMode === 'query'}
-              <input
-                type="text"
-                placeholder="e.g., institutional economics AND governance"
-                bind:value={searchQuery}
-                data-testid="search-query"
-              />
+              <div class="search-field">
+                <label for="search-query">Text query</label>
+                <input
+                  id="search-query"
+                  type="text"
+                  placeholder="Example: institutional economics AND governance"
+                  bind:value={searchQuery}
+                  data-testid="search-query"
+                  title='Use AND/OR/NOT. Missing operators are treated as implicit AND.'
+                  aria-describedby="search-query-hint"
+                />
+                <p id="search-query-hint" class="field-hint">
+                  Operators supported: <code>AND</code>, <code>OR</code>, <code>NOT</code>.<br />
+                  Example: <code>tax AND welfare NOT Keynes</code>.
+                </p>
+              </div>
             {:else}
-              <textarea
-                rows="3"
-                placeholder={"JSON array, e.g. [\"W2741809807\", {\"doi\":\"10.1111/j.1468-0335.1937.tb00002.x\"}]"}
-                bind:value={searchSeedJson}
-                data-testid="search-seed-json"
-              ></textarea>
+              <div class="search-field">
+                <label for="search-seed-json">Seed list (JSON)</label>
+                <textarea
+                  id="search-seed-json"
+                  rows="3"
+                  placeholder={JSON.stringify(["W2741809807", { doi: "10.1111/j.1468-0335.1937.tb00002.x" }])}
+                  bind:value={searchSeedJson}
+                  data-testid="search-seed-json"
+                  title="JSON array of OpenAlex IDs, DOIs, or objects."
+                  aria-describedby="search-seed-hint"
+                ></textarea>
+                <p id="search-seed-hint" class="field-hint">
+                  Supported seed formats: <code>\"W123456789\"</code>, <code>&#123;&quot;doi&quot;: &quot;...&quot;&#125;</code>, or <code>&#123;&quot;title&quot;: &quot;...&quot;&#125;</code>.
+                </p>
+              </div>
             {/if}
-            <select bind:value={searchField}>
-              <option value="default">All fields</option>
-              <option value="title">Title</option>
-              <option value="abstract">Abstract</option>
-              <option value="title_and_abstract">Title + abstract</option>
-              <option value="fulltext">Full text</option>
-            </select>
-            <input type="number" placeholder="From" bind:value={yearFrom} />
-            <input type="number" placeholder="To" bind:value={yearTo} />
-            <input type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepth} />
-            <input type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
-            <button class="primary" type="submit" data-testid="search-submit">Search</button>
+            <div class="search-field">
+              <label for="search-field">Search field</label>
+              <select id="search-field" bind:value={searchField} title="Limit the OpenAlex query to title/abstract/fulltext scope.">
+                <option value="default">All fields</option>
+                <option value="title">Title</option>
+                <option value="abstract">Abstract</option>
+                <option value="title_and_abstract">Title + abstract</option>
+                <option value="fulltext">Full text</option>
+              </select>
+              <p class="field-hint">
+                Default searches across OpenAlex metadata and abstract/title-like fields.
+              </p>
+            </div>
+            <div class="search-field">
+              <label for="search-year-from">Publication year from</label>
+              <input id="search-year-from" type="number" placeholder="From (e.g. 2000)" bind:value={yearFrom} />
+              <p class="field-hint">Leave empty for no lower bound.</p>
+            </div>
+            <div class="search-field">
+              <label for="search-year-to">Publication year to</label>
+              <input id="search-year-to" type="number" placeholder="To (e.g. 2026)" bind:value={yearTo} />
+              <p class="field-hint">Leave empty for no upper bound.</p>
+            </div>
+            <div class="search-field">
+              <label for="search-depth-down">Downstream depth</label>
+              <input id="search-depth-down" type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepthDownstream} />
+              <p class="field-hint">1 = direct references only. Used when expanding works cited by a seed.</p>
+            </div>
+            <div class="search-field">
+              <label for="search-depth-up">Upstream depth</label>
+              <input id="search-depth-up" type="number" min="1" max="4" step="1" placeholder="Depth" bind:value={relatedDepthUpstream} />
+              <p class="field-hint">1 = direct citing works only. Used when expanding works that cite the seed.</p>
+            </div>
+            <div class="search-field">
+              <label for="search-max-related">Max related per work</label>
+              <input id="search-max-related" type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
+              <p class="field-hint">Controls expansion size when references are fetched.</p>
+            </div>
+            <div class="search-field search-checkbox-group">
+              <p class="search-field-title">Expansion direction</p>
+              <label class="inline-check">
+                <input type="checkbox" bind:checked={includeDownstream} />
+                <span>Include references (downstream)</span>
+              </label>
+              <label class="inline-check">
+                <input type="checkbox" bind:checked={includeUpstream} />
+                <span>Include cited-by (upstream)</span>
+              </label>
+              <p class="field-hint">Downstream = works cited by a seed item. Upstream = works that cite the seed item.</p>
+            </div>
+            <div class="search-field search-actions">
+              <button
+                class="secondary"
+                type="button"
+                title="Reset all search fields to defaults."
+                on:click={resetSearchForm}
+              >
+                Reset
+              </button>
+              <button
+                class="primary"
+                type="submit"
+                data-testid="search-submit"
+                title="Run OpenAlex keyword search with selected mode and filters."
+              >
+                Search OpenAlex
+              </button>
+            </div>
           </form>
           <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
           <div class="table">

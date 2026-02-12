@@ -17,7 +17,10 @@ ensure_import_paths(__file__)
 if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 
-from dl_lit.OpenAlexScraper import fetch_referenced_work_details
+from dl_lit.OpenAlexScraper import (
+    fetch_citing_work_ids,
+    fetch_referenced_work_details,
+)
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.keyword_search import dedupe_results, search_openalex
 from dl_lit.utils import get_global_rate_limiter
@@ -72,6 +75,11 @@ def normalize_doi(value):
     raw = raw.replace('doi:', '')
     match = DOI_RE.search(raw)
     return match.group(0) if match else None
+
+
+def _normalize_candidate_id(value):
+    norm = normalize_openalex_id(value)
+    return norm
 
 
 def _openalex_get(params, mailto=None, retries=3):
@@ -198,70 +206,227 @@ def _dedupe_openalex_items(items):
     return deduped
 
 
-def _extract_ref_ids(work):
-    refs = work.get('referenced_works') or []
+def _extract_openalex_ids(items):
     out = []
-    for ref in refs:
+    for ref in items:
         if isinstance(ref, str):
-            out.append(ref)
+            norm = _normalize_candidate_id(ref)
+            if norm:
+                out.append(norm)
         elif isinstance(ref, dict):
-            out.append(ref.get('id') or ref.get('openalex_id'))
+            norm = _normalize_candidate_id(ref.get('id') or ref.get('openalex_id'))
+            if norm:
+                out.append(norm)
     return [rid for rid in out if rid]
 
 
-def expand_references_recursive(base_items, related_depth, max_related, mailto):
-    if related_depth <= 1 or not base_items:
-        return base_items, {'added': 0, 'processed': 0}
+def _extract_referenced_work_ids(work):
+    refs = work.get('referenced_works') or []
+    return _extract_openalex_ids(refs)
 
-    queue = deque()
-    all_items = _dedupe_openalex_items(base_items)
-    seen = {item.get('id') for item in all_items if item.get('id')}
+
+def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related):
+    cited_by_url = work.get('cited_by_api_url')
+    if not cited_by_url and work.get('id'):
+        refreshed = fetch_work_by_openalex_id(work.get('id'), mailto=mailto)
+        if refreshed:
+            refreshed_work = _to_openalex_like(refreshed) or work
+            cited_by_url = refreshed_work.get('cited_by_api_url')
+
+    if not cited_by_url:
+        return []
+
+    citing_items = fetch_citing_work_ids(
+        cited_by_url,
+        rate_limiter,
+        mailto=mailto or 'spott@wzb.eu',
+        max_citations=max_related if max_related and max_related > 0 else 100,
+    )
+    return _extract_openalex_ids(citing_items)
+
+
+def _collect_candidate_ids(
+    work,
+    max_related,
+    rate_limiter,
+    mailto,
+    direction='downstream',
+):
+    downstream_ids = []
+    upstream_ids = []
+
+    if direction == 'downstream':
+        downstream_ids = _extract_referenced_work_ids(work)
+        if not downstream_ids and work.get('id'):
+            refreshed = fetch_work_by_openalex_id(work.get('id'), mailto=mailto)
+            if refreshed:
+                refreshed_work = _to_openalex_like(refreshed) or work
+                downstream_ids = _extract_referenced_work_ids(refreshed_work)
+        if max_related and max_related > 0:
+            downstream_ids = downstream_ids[:max_related]
+        return list(dict.fromkeys(downstream_ids)), []
+
+    if direction == 'upstream':
+        upstream_ids = _fetch_upstream_candidates(
+            work,
+            rate_limiter=rate_limiter,
+            mailto=mailto,
+            max_related=max_related,
+        )
+        return [], list(dict.fromkeys(upstream_ids))
+
+    return [], []
+
+
+def _crawl_direction(
+    base_items,
+    max_depth,
+    max_related,
+    mailto,
+    direction,
+    all_items,
+    global_ids,
+    rate_limiter,
+):
+    if max_depth <= 1 or not base_items:
+        return {'added': 0, 'processed': 0, 'matched': 0}
+
+    queue = deque((item, 1) for item in base_items)
+    local_seen = {_normalize_candidate_id(item.get('id')) for item in base_items if _normalize_candidate_id(item.get('id'))}
     processed = 0
     added = 0
-
-    for item in all_items:
-        queue.append((item, 1))
-
-    rate_limiter = get_global_rate_limiter()
+    matched = 0
 
     while queue:
         current, level = queue.popleft()
         processed += 1
-        if level >= related_depth:
+        if level >= max_depth:
+            continue
+        downstream_ids, upstream_ids = _collect_candidate_ids(
+            current,
+            max_related=max_related,
+            rate_limiter=rate_limiter,
+            mailto=mailto,
+            direction=direction,
+        )
+        candidate_ids = downstream_ids + upstream_ids
+        if not candidate_ids:
             continue
 
-        ref_ids = _extract_ref_ids(current)
-        if not ref_ids and current.get('id'):
-            refreshed = fetch_work_by_openalex_id(current.get('id'), mailto=mailto)
-            if refreshed:
-                current = _to_openalex_like(refreshed) or current
-                ref_ids = _extract_ref_ids(current)
-
-        if max_related and max_related > 0:
-            ref_ids = ref_ids[:max_related]
-        if not ref_ids:
-            continue
+        candidate_norms = {_normalize_candidate_id(item_id) for item_id in candidate_ids if _normalize_candidate_id(item_id)}
 
         ref_details = fetch_referenced_work_details(
-            ref_ids,
+            candidate_ids,
             rate_limiter,
             mailto=mailto or 'spott@wzb.eu',
-            include_links=(level + 1 < related_depth),
+            include_links=(level + 1 < max_depth),
         )
 
+        resolved = set()
+        resolved_items = []
         for ref in ref_details:
             item = _to_openalex_like(ref)
             if not item:
                 continue
-            key = item.get('id')
-            if key in seen:
+            resolved_items.append(item)
+            item_id = item.get('id')
+            norm = _normalize_candidate_id(item_id)
+            if norm:
+                resolved.add(norm)
+
+        matched += len(candidate_norms & resolved)
+
+        for item in resolved_items:
+            if not item:
                 continue
-            seen.add(key)
-            all_items.append(item)
+            key = item.get('id')
+            norm = _normalize_candidate_id(key)
+            if not norm or norm in local_seen:
+                continue
+            local_seen.add(norm)
+            if norm not in global_ids:
+                global_ids.add(norm)
+                all_items.append(item)
             queue.append((item, level + 1))
             added += 1
 
-    return all_items, {'added': added, 'processed': processed}
+    return {
+        'added': added,
+        'processed': processed,
+        'matched': matched,
+    }
+
+
+def expand_references_recursive(
+    base_items,
+    related_depth_downstream,
+    related_depth_upstream,
+    max_related,
+    mailto,
+    include_downstream=True,
+    include_upstream=False,
+):
+    if not base_items:
+        return base_items, {
+            'added': 0,
+            'processed': 0,
+            'downstream_added': 0,
+            'upstream_added': 0,
+        }
+
+    if related_depth_downstream <= 1 and related_depth_upstream <= 1:
+        return base_items, {
+            'added': 0,
+            'processed': 0,
+            'downstream_added': 0,
+            'upstream_added': 0,
+        }
+
+    all_items = _dedupe_openalex_items(base_items)
+    global_ids = {_normalize_candidate_id(item.get('id')) for item in all_items if _normalize_candidate_id(item.get('id'))}
+
+    rate_limiter = get_global_rate_limiter()
+    downstream_added = 0
+    upstream_added = 0
+    processed = 0
+    added = 0
+
+    if include_downstream:
+        downstream_stats = _crawl_direction(
+            base_items=all_items,
+            max_depth=related_depth_downstream,
+            max_related=max_related,
+            mailto=mailto,
+            direction='downstream',
+            all_items=all_items,
+            global_ids=global_ids,
+            rate_limiter=rate_limiter,
+        )
+        downstream_added += downstream_stats.get('matched', 0)
+        added += downstream_stats.get('added', 0)
+        processed += downstream_stats.get('processed', 0)
+
+    if include_upstream:
+        upstream_stats = _crawl_direction(
+            base_items=all_items,
+            max_depth=related_depth_upstream,
+            max_related=max_related,
+            mailto=mailto,
+            direction='upstream',
+            all_items=all_items,
+            global_ids=global_ids,
+            rate_limiter=rate_limiter,
+        )
+        upstream_added += upstream_stats.get('matched', 0)
+        added += upstream_stats.get('added', 0)
+        processed += upstream_stats.get('processed', 0)
+
+    return all_items, {
+        'added': added,
+        'processed': processed,
+        'downstream_added': downstream_added,
+        'upstream_added': upstream_added,
+    }
 
 
 def _parse_seed_json(seed_json):
@@ -340,7 +505,28 @@ def main():
     parser.add_argument('--enqueue', action='store_true')
     parser.add_argument('--corpus-id', type=int, default=None)
     parser.add_argument('--related-depth', type=int, default=1)
+    parser.add_argument('--related-depth-downstream', type=int, default=None)
+    parser.add_argument('--related-depth-upstream', type=int, default=None)
     parser.add_argument('--max-related', type=int, default=30)
+    parser.add_argument(
+        '--include-downstream',
+        dest='include_downstream',
+        action='store_true',
+        default=True,
+        help='Include downstream references (works cited by each work).',
+    )
+    parser.add_argument(
+        '--no-include-downstream',
+        dest='include_downstream',
+        action='store_false',
+        help='Disable downstream expansion.',
+    )
+    parser.add_argument(
+        '--include-upstream',
+        action='store_true',
+        default=False,
+        help='Include upstream works that cite each work.',
+    )
     args = parser.parse_args()
 
     if os.environ.get('RAG_FEEDER_STUB') == '1':
@@ -349,6 +535,22 @@ def main():
 
     db_path = Path(args.db_path)
     related_depth = max(1, int(args.related_depth or 1))
+    related_depth_downstream = max(
+        1,
+        int(
+            args.related_depth_downstream
+            if args.related_depth_downstream is not None
+            else args.related_depth or related_depth
+        ),
+    )
+    related_depth_upstream = max(
+        1,
+        int(
+            args.related_depth_upstream
+            if args.related_depth_upstream is not None
+            else args.related_depth or related_depth
+        ),
+    )
     max_related = max(1, int(args.max_related or 1))
 
     with contextlib.redirect_stdout(io.StringIO()):
@@ -362,7 +564,11 @@ def main():
             'field': args.field,
             'mailto': args.mailto,
             'related_depth': related_depth,
+            'related_depth_downstream': related_depth_downstream,
+            'related_depth_upstream': related_depth_upstream,
             'max_related': max_related,
+            'include_downstream': args.include_downstream,
+            'include_upstream': args.include_upstream,
         }
         run_query_label = args.query if args.query else '[seed-json]'
         run_id = db.create_search_run(query=run_query_label, filters=filters)
@@ -386,9 +592,12 @@ def main():
 
         all_items, expansion_stats = expand_references_recursive(
             base_items,
-            related_depth=related_depth,
+            related_depth_downstream=related_depth_downstream,
+            related_depth_upstream=related_depth_upstream,
             max_related=max_related,
             mailto=args.mailto,
+            include_downstream=args.include_downstream,
+            include_upstream=args.include_upstream,
         )
 
         records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]

@@ -27,6 +27,32 @@ describe('POST /api/keyword-search', () => {
     expect(res.body.results[0]).toHaveProperty('title')
   })
 
+  test('accepts includeDownstream and includeUpstream flags in payload', async () => {
+    const res = await request(app)
+      .post('/api/keyword-search')
+      .send({
+        query: 'institutional economics',
+        includeDownstream: false,
+        includeUpstream: true,
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('stub')
+  })
+
+  test('accepts separate downstream/upstream depth settings', async () => {
+    const res = await request(app)
+      .post('/api/keyword-search')
+      .send({
+        query: 'institutional economics',
+        relatedDepthDownstream: 3,
+        relatedDepthUpstream: 2,
+        includeDownstream: true,
+        includeUpstream: true,
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('stub')
+  })
+
   test('accepts seedJson mode in stub', async () => {
     const res = await request(app)
       .post('/api/keyword-search')
