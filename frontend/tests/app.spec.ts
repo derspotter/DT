@@ -27,6 +27,58 @@ test.describe('Korpus Builder UI', () => {
     await expect(page.getByRole('heading', { name: 'Extracted entries' })).toBeVisible()
   })
 
+  test('ingest select-all checks all extracted entry rows', async ({ page }) => {
+    await page.route('**/api/ingest/runs*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          runs: [
+            {
+              ingest_source: 'demo-ingest-source',
+              entry_count: 2,
+              last_created_at: '2026-02-12 10:00:00',
+              source_pdf: '/tmp/demo.pdf',
+            },
+          ],
+        }),
+      })
+    })
+    await page.route('**/api/ingest/latest*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ingest_source: 'demo-ingest-source',
+          items: [
+            { id: 101, title: 'First Entry', authors: 'A. Author', year: 2024, source: 'Demo', doi: '' },
+            { id: '102', title: 'Second Entry', authors: 'B. Author', year: 2025, source: 'Demo', doi: '' },
+          ],
+        }),
+      })
+    })
+
+    await page.goto('/')
+    await ensureSignedIn(page)
+    await page.getByTestId('tab-ingest').click()
+    await page.getByRole('button', { name: 'demo-ingest-source' }).click()
+    await expect(page.getByText('Loaded 2 entries.')).toBeVisible()
+
+    await page.getByRole('button', { name: 'Select all' }).click()
+
+    const selectionState = await page.evaluate(() => {
+      const boxes = Array.from(document.querySelectorAll('input[type="checkbox"][aria-label^="Select"]'))
+      const rowBoxes = boxes.filter((el) => el.getAttribute('aria-label') !== 'Select all')
+      return {
+        rows: rowBoxes.length,
+        checkedRows: rowBoxes.filter((el) => el.checked).length,
+      }
+    })
+
+    expect(selectionState.rows).toBe(2)
+    expect(selectionState.checkedRows).toBe(2)
+    await expect(page.getByText('Selected: 2')).toBeVisible()
+  })
   test('keyword search renders mocked results', async ({ page }) => {
     await page.route('**/api/keyword-search', async (route) => {
       await route.fulfill({

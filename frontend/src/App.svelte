@@ -57,7 +57,12 @@
   let latestEntries = []
   let latestEntriesStatus = ''
   let latestEntriesBase = ''
-  let latestSelection = new Set()
+  let latestSelection = []
+  let allLatestSelected = false
+  $: allLatestSelected = latestEntries.length > 0 && latestEntries.every((entry, index) => {
+    const key = latestSelectionKey(entry, index)
+    return key && latestSelection.includes(key)
+  })
   let enqueueStatus = ''
   let processMarkedLimit = 10
   let processMarkedStatus = ''
@@ -314,7 +319,7 @@
     latestEntriesBase = baseName
     latestEntriesStatus = 'Waiting for extracted entries...'
     latestEntries = []
-    latestSelection = new Set()
+    latestSelection = []
     // Extraction + parsing can easily take a couple of minutes for multi-page reference sections.
     const attempts = 36
     for (let i = 0; i < attempts; i += 1) {
@@ -339,32 +344,50 @@
     }
     latestEntriesStatus = 'No entries found yet.'
   }
+  function latestSelectionKey(entry, index = -1) {
+    const primaryId = entry?.id ?? entry?.entry_id
+    if (primaryId !== null && primaryId !== undefined && String(primaryId).trim() !== '') {
+      return `id:${String(primaryId)}`
+    }
 
-  function isLatestSelected(id) {
-    return latestSelection.has(id)
+    const doi = String(entry?.doi || '').trim().toLowerCase()
+    if (doi) {
+      return `doi:${doi}`
+    }
+
+    const title = String(formatTitle(entry) || '').trim().toLowerCase()
+    const authors = String(formatAuthors(entry) || '').trim().toLowerCase()
+    const year = entry?.year ?? ''
+    if (title || authors || year) {
+      return `tay:${title}|${authors}|${year}|${index}`
+    }
+
+    if (index >= 0) {
+      return `idx:${index}`
+    }
+    return ''
   }
 
-  function toggleLatestSelection(id) {
-    const next = new Set(latestSelection)
-    if (next.has(id)) {
-      next.delete(id)
-    } else {
-      next.add(id)
-    }
-    latestSelection = next
+  function isLatestSelected(entry, index = -1) {
+    const key = latestSelectionKey(entry, index)
+    if (!key) return false
+    return latestSelection.includes(key)
   }
 
   function clearLatestSelection() {
-    latestSelection = new Set()
+    latestSelection = []
   }
 
   function selectAllLatest() {
-    latestSelection = new Set((latestEntries || []).map((e) => e.id))
+    latestSelection = (latestEntries || []).map((entry, index) => latestSelectionKey(entry, index)).filter(Boolean)
   }
 
   async function enqueueSelectedLatest() {
     enqueueStatus = ''
-    const ids = [...latestSelection]
+    const ids = (latestEntries || [])
+      .filter((entry, index) => isLatestSelected(entry, index))
+      .map((entry) => entry.id ?? entry.entry_id)
+      .filter((id) => id !== null && id !== undefined && String(id).trim() !== '')
     if (ids.length === 0) {
       enqueueStatus = 'Select at least one entry.'
       return
@@ -1505,7 +1528,7 @@
           {:else}
             <div class="table-toolbar">
               <div class="table-toolbar-left">
-                <span class="muted">Selected: {latestSelection.size}</span>
+                <span class="muted">Selected: {latestSelection.length}</span>
                 <button class="secondary" type="button" on:click={selectAllLatest}>Select all</button>
                 <button class="secondary" type="button" on:click={clearLatestSelection}>Clear</button>
               </div>
@@ -1522,7 +1545,7 @@
                     class="primary"
                     type="button"
                     on:click={enqueueSelectedLatest}
-                    disabled={latestSelection.size === 0}
+                    disabled={latestSelection.length === 0}
                   >
                     Mark selected
                   </button>
@@ -1541,7 +1564,7 @@
                   <input
                     type="checkbox"
                     aria-label="Select all"
-                    checked={latestSelection.size > 0 && latestSelection.size === latestEntries.length}
+                    bind:checked={allLatestSelected}
                     on:change={(e) => (e.target.checked ? selectAllLatest() : clearLatestSelection())}
                   />
                 </span>
@@ -1551,14 +1574,14 @@
                 <span>Source</span>
                 <span>DOI</span>
               </div>
-              {#each latestEntries as entry}
-                <div class={`table-row cols-6 ${isLatestSelected(entry.id) ? 'selected' : ''}`}>
+              {#each latestEntries as entry, index}
+                <div class={`table-row cols-6 ${isLatestSelected(entry, index) ? 'selected' : ''}`}>
                   <span>
                     <input
                       type="checkbox"
-                      checked={isLatestSelected(entry.id)}
                       aria-label={`Select ${formatTitle(entry)}`}
-                      on:change={() => toggleLatestSelection(entry.id)}
+                      bind:group={latestSelection}
+                      value={latestSelectionKey(entry, index)}
                     />
                   </span>
                   <span>{formatTitle(entry)}</span>
