@@ -14,6 +14,21 @@ def fetch_count(cur, table, corpus_id=None):
     return cur.fetchone()[0]
 
 
+def fetch_queue_count(cur, corpus_id=None):
+    if corpus_id is None:
+        cur.execute("SELECT COUNT(*) FROM with_metadata WHERE download_state IN ('queued', 'in_progress')")
+        return cur.fetchone()[0]
+    cur.execute(
+        """SELECT COUNT(*)
+           FROM with_metadata wm
+           JOIN corpus_items ci ON ci.table_name = 'with_metadata' AND ci.row_id = wm.id
+          WHERE ci.corpus_id = ?
+            AND wm.download_state IN ('queued', 'in_progress')""",
+        (corpus_id,),
+    )
+    return cur.fetchone()[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch ingest stats from the database.")
     parser.add_argument("--db-path", required=True, help="Path to SQLite DB.")
@@ -26,7 +41,7 @@ def main():
     stats = {
         "no_metadata": fetch_count(cur, "no_metadata", args.corpus_id),
         "with_metadata": fetch_count(cur, "with_metadata", args.corpus_id),
-        "to_download_references": fetch_count(cur, "to_download_references", args.corpus_id),
+        "to_download_references": fetch_queue_count(cur, args.corpus_id),
         "downloaded_references": fetch_count(cur, "downloaded_references", args.corpus_id),
     }
     conn.close()

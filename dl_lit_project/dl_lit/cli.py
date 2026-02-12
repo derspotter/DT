@@ -892,7 +892,7 @@ def download_pdfs_command(db_path, limit, download_dir):
             authors=author_structs or row.get('authors'),
             year=row.get('year'),
             exclude_id=row['id'],
-            exclude_table='to_download_references'
+            exclude_table='with_metadata'
         )
         if dup_table == 'downloaded_references' and dup_id is not None:
             ok, msg = db.drop_queue_entry_as_duplicate(row['id'], dup_table, dup_id, dup_field)
@@ -1004,7 +1004,7 @@ def inspect_tables_command(db_path, table, limit):
         workflow_tables = [
             ("no_metadata", "Raw extracted references (before enrichment)"),
             ("with_metadata", "Enriched references (after OpenAlex/Crossref lookup)"),
-            ("to_download_references", "Queue for PDF downloads"),
+            ("to_download_references", "Queue state on with_metadata (download_state=queued/in_progress)"),
             ("downloaded_references", "Successfully downloaded papers"),
             ("failed_enrichments", "References that failed metadata enrichment"),
             ("failed_downloads", "References that failed PDF download"),
@@ -1083,7 +1083,7 @@ def inspect_tables_command(db_path, table, limit):
             no_meta_count = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM with_metadata")
             with_meta_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM to_download_references")
+            cursor.execute("SELECT COUNT(*) FROM with_metadata WHERE download_state IN ('queued', 'in_progress')")
             queue_count = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM downloaded_references")
             downloaded_count = cursor.fetchone()[0]

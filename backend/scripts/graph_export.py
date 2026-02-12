@@ -62,12 +62,11 @@ def main():
             allowed_rows = None
 
     tables = []
-    if args.status in ('all', 'with_metadata'):
+    if args.status in ('all', 'with_metadata', 'queued'):
         tables.append(('with_metadata', 'with_metadata'))
     if args.status in ('all', 'downloaded'):
         tables.append(('downloaded_references', 'downloaded'))
-    if args.status in ('all', 'queued'):
-        tables.append(('to_download_references', 'queued'))
+    # queued rows now live in with_metadata (download_state in queued/in_progress)
 
     node_map = {}
     node_by_id = {}
@@ -253,13 +252,22 @@ def main():
                     allowed_ids = allowed_rows.get(table, set())
                     if data.get("id") not in allowed_ids:
                         continue
+                if table == 'with_metadata':
+                    state = (data.get('download_state') or '').strip().lower()
+                    if args.status == 'queued' and state not in ('queued', 'in_progress'):
+                        continue
+                    if args.status == 'with_metadata' and state in ('queued', 'in_progress'):
+                        continue
                 if not include_row(data):
                     continue
                 raw_id = normalize_openalex_id(data.get("openalex_id")) or normalize_doi(data.get("doi")) or f"{table}:{data.get('id')}"
                 if wanted_ids is not None and raw_id not in wanted_ids:
                     continue
-                all_rows.append((table, status, data))
-                add_node(table, data, status)
+                node_status = status
+                if table == 'with_metadata' and (data.get('download_state') or '').strip().lower() in ('queued', 'in_progress'):
+                    node_status = 'queued'
+                all_rows.append((table, node_status, data))
+                add_node(table, data, node_status)
             if len(nodes) >= args.max_nodes:
                 break
 

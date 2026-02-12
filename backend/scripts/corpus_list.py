@@ -42,13 +42,13 @@ def main():
 
     tables = [
         ('downloaded_references', 'downloaded_references'),
-        ('to_download_references', 'to_download_references'),
         ('with_metadata', 'with_metadata'),
         ('no_metadata', 'no_metadata'),
+        ('to_download_references', 'to_download_references'),  # legacy fallback
     ]
 
     items = []
-    for table, status in tables:
+    for table, fallback_status in tables:
         try:
             if args.corpus_id is not None:
                 rows = conn.execute(
@@ -62,18 +62,36 @@ def main():
                 rows = conn.execute(f"SELECT * FROM {table}").fetchall()
         except sqlite3.Error:
             continue
+
         for row in rows:
             data = dict(row)
-            source = data.get('ingest_source') or data.get('source_pdf') or data.get('metadata_source_type') or data.get('journal_conference')
-            items.append({
-                'id': data.get('id'),
-                'title': data.get('title'),
-                'year': data.get('year'),
-                'source': source,
-                'status': status,
-                'doi': data.get('doi'),
-                'openalex_id': data.get('openalex_id'),
-            })
+            status = fallback_status
+            if table == 'with_metadata':
+                state = (data.get('download_state') or '').strip().lower()
+                if state in ('queued', 'in_progress'):
+                    status = 'to_download_references'
+                elif state == 'failed':
+                    status = 'failed_downloads'
+                else:
+                    status = 'with_metadata'
+            source = (
+                data.get('ingest_source')
+                or data.get('source_pdf')
+                or data.get('metadata_source_type')
+                or data.get('journal_conference')
+                or data.get('source')
+            )
+            items.append(
+                {
+                    'id': data.get('id'),
+                    'title': data.get('title'),
+                    'year': data.get('year'),
+                    'source': source,
+                    'status': status,
+                    'doi': data.get('doi'),
+                    'openalex_id': data.get('openalex_id'),
+                }
+            )
 
     conn.close()
 

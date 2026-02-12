@@ -53,6 +53,9 @@
     to_download_references: 0,
     downloaded_references: 0,
   }
+  $: pipelineRawCount = Number(ingestStats.no_metadata || 0)
+  $: pipelineMetadataCount = Number(ingestStats.with_metadata || 0)
+  $: pipelineDownloadedCount = Number(ingestStats.downloaded_references || 0)
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
@@ -179,8 +182,8 @@
     const status = String(statusRaw || '').trim()
     const map = {
       no_metadata: { label: 'Raw', tone: 'queued' },
-      with_metadata: { label: 'Enriched', tone: 'completed' },
-      to_download_references: { label: 'Queued', tone: 'queued' },
+      with_metadata: { label: 'With metadata', tone: 'completed' },
+      to_download_references: { label: 'With metadata', tone: 'in_progress' },
       downloaded_references: { label: 'Downloaded', tone: 'completed' },
       failed_enrichments: { label: 'Enrich failed', tone: 'in_progress' },
       failed_downloads: { label: 'Download failed', tone: 'in_progress' },
@@ -420,10 +423,10 @@
       return
     }
     processingMarked = true
-    processMarkedStatus = `Processing up to ${limit} marked entries (enrich -> queue)...`
+    processMarkedStatus = `Processing up to ${limit} marked entries (enrich -> with metadata)...`
     try {
       const payload = await processMarkedIngestEntries({ limit })
-      processMarkedStatus = `Processed ${payload.processed} (promoted: ${payload.promoted}, queued: ${payload.queued}, failed: ${payload.failed}).`
+      processMarkedStatus = `Processed ${payload.processed} (promoted: ${payload.promoted}, ready for download: ${payload.queued}, failed: ${payload.failed}).`
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -1400,18 +1403,20 @@
           <div class="card highlight" data-testid="dashboard-overview">
             <h2>At a glance</h2>
             <p>Seed ingestion, keyword search, and corpus health in one view.</p>
-            <div class="stat-row">
-              <div>
-                <span class="stat-label">Bibliographies</span>
-                <strong>{ingestStats.no_metadata}</strong>
+            <div class="pipeline-strip" data-testid="pipeline-strip">
+              <div class="pipeline-stage">
+                <span class="stat-label" title="Raw references">Raw</span>
+                <strong>{pipelineRawCount}</strong>
               </div>
-              <div>
-                <span class="stat-label">Corpus works</span>
-                <strong>{corpusItems.length}</strong>
+              <span class="pipeline-arrow" aria-hidden="true">→</span>
+              <div class="pipeline-stage">
+                <span class="stat-label" title="With metadata">Meta</span>
+                <strong>{pipelineMetadataCount}</strong>
               </div>
-              <div>
-                <span class="stat-label">Queue items</span>
-                <strong>{downloads.length}</strong>
+              <span class="pipeline-arrow" aria-hidden="true">→</span>
+              <div class="pipeline-stage">
+                <span class="stat-label" title="Downloaded">Done</span>
+                <strong>{pipelineDownloadedCount}</strong>
               </div>
             </div>
           </div>
@@ -1434,7 +1439,7 @@
             <p>Extraction, enrichment, and downloads are staged and recoverable.</p>
             <div class="pill-row">
               <span class="pill">Extraction ready</span>
-              <span class="pill">Enrichment queued</span>
+              <span class="pill">Metadata ready</span>
               <span class="pill">Downloads active</span>
             </div>
           </div>
@@ -1493,32 +1498,36 @@
             <span class="muted">{ingestStatsStatus}</span>
           </div>
           <div class="pill-row">
-            <span class="pill">Raw: {ingestStats.no_metadata}</span>
-            <span class="pill">Enriched: {ingestStats.with_metadata}</span>
-            <span class="pill">Queued: {ingestStats.to_download_references}</span>
-            <span class="pill">Downloaded: {ingestStats.downloaded_references}</span>
+            <span class="pill">Raw: {pipelineRawCount}</span>
+            <span class="pill">With metadata: {pipelineMetadataCount}</span>
+            <span class="pill">Downloaded: {pipelineDownloadedCount}</span>
           </div>
           <div class="split">
             <span class="muted">{ingestRunsStatus}</span>
           </div>
           {#if ingestRuns.length > 0}
             <div class="table">
-              <div class="table-row header cols-4">
+              <div class="table-row header cols-runs">
                 <span>Run</span>
                 <span>Entries</span>
                 <span>Last seen</span>
                 <span>Source PDF</span>
               </div>
               {#each ingestRuns as run}
-                <div class="table-row cols-4">
+                <div class="table-row cols-runs">
                   <span>
-                    <button class="link" type="button" on:click={() => loadLatestEntries(run.ingest_source)}>
+                    <button
+                      class="link truncate-line"
+                      type="button"
+                      title={run.ingest_source}
+                      on:click={() => loadLatestEntries(run.ingest_source)}
+                    >
                       {run.ingest_source}
                     </button>
                   </span>
                   <span>{run.entry_count}</span>
-                  <span>{run.last_created_at || ''}</span>
-                  <span>{run.source_pdf || ''}</span>
+                  <span class="nowrap">{run.last_created_at || ''}</span>
+                  <span class="truncate-line" title={run.source_pdf || ''}>{run.source_pdf || ''}</span>
                 </div>
               {/each}
             </div>
@@ -1539,7 +1548,7 @@
                     <input type="number" min="1" max="200" step="1" bind:value={processMarkedLimit} />
                   </label>
                   <button class="secondary" type="button" on:click={processMarkedBatch} disabled={processingMarked}>
-                    Enrich + queue
+                    Enrich + prepare download
                   </button>
                   <button
                     class="primary"
@@ -1633,7 +1642,7 @@
             <input type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
             <button class="primary" type="submit" data-testid="search-submit">Search</button>
           </form>
-          <p class="muted">{searchStatus} ({searchSource})</p>
+          <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
           <div class="table">
             <div class="table-row header cols-4">
               <span>Title</span>
@@ -1688,9 +1697,9 @@
             </div>
             {#each corpusItems as item}
               <div class="table-row cols-corpus">
-                <span>{item.title}</span>
-                <span>{item.year}</span>
-                <span class="muted">{item.source || '—'}</span>
+                <span class="line-clamp-2" title={item.title}>{item.title}</span>
+                <span class="nowrap">{item.year}</span>
+                <span class="muted truncate-line" title={item.source || '—'}>{item.source || '—'}</span>
                 <span
                   class={`tag pipeline ${pipelineStatusTone(item.status)}`}
                   title={pipelineStatusTitle(item.status)}
@@ -1782,8 +1791,7 @@
                 <select bind:value={exportFilterStatus} data-testid="export-filter-status">
                   <option value="all">All</option>
                   <option value="downloaded_references">Downloaded</option>
-                  <option value="to_download_references">Queued</option>
-                  <option value="with_metadata">Enriched</option>
+                  <option value="with_metadata">With metadata</option>
                   <option value="no_metadata">Raw</option>
                 </select>
               </label>

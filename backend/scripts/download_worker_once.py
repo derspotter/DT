@@ -109,7 +109,7 @@ def main() -> None:
                 authors=authors,
                 year=row.get("year"),
                 exclude_id=qid,
-                exclude_table="to_download_references",
+                exclude_table="with_metadata",
             )
             if dup_table == "downloaded_references" and dup_id is not None:
                 ok, msg = db.drop_queue_entry_as_duplicate(qid, dup_table, dup_id, dup_field)

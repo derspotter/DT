@@ -10,9 +10,9 @@ from pathlib import Path
 
 TABLES = [
     ("downloaded_references", "downloaded_references"),
-    ("to_download_references", "to_download_references"),
     ("with_metadata", "with_metadata"),
     ("no_metadata", "no_metadata"),
+    ("to_download_references", "to_download_references"),  # legacy fallback
 ]
 
 TABLE_PRIORITY = {
@@ -122,9 +122,18 @@ def load_items(conn: sqlite3.Connection, corpus_id: int | None):
                 ).fetchall()
         for row in rows:
             data = dict(row)
+            item_status = status
+            if table_name == 'with_metadata':
+                state = (data.get('download_state') or '').strip().lower()
+                if state in ('queued', 'in_progress'):
+                    item_status = 'to_download_references'
+                elif state == 'failed':
+                    item_status = 'failed_downloads'
+                else:
+                    item_status = 'with_metadata'
             item = {
                 "id": data.get("id"),
-                "status": status,
+                "status": item_status,
                 "title": data.get("title") or "",
                 "authors": parse_authors(data.get("authors")),
                 "year": data.get("year"),

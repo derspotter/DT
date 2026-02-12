@@ -50,37 +50,33 @@ def main():
     try:
         if args.corpus_id is not None:
             rows = conn.execute(
-                """SELECT t.* FROM to_download_references t
+                """SELECT t.* FROM with_metadata t
                    JOIN corpus_items ci
-                     ON ci.table_name = 'to_download_references' AND ci.row_id = t.id
-                  WHERE ci.corpus_id = ?""",
+                     ON ci.table_name = 'with_metadata' AND ci.row_id = t.id
+                  WHERE ci.corpus_id = ?
+                    AND t.download_state IN ('queued', 'in_progress')""",
                 (args.corpus_id,),
             ).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM to_download_references").fetchall()
+            rows = conn.execute(
+                "SELECT * FROM with_metadata WHERE download_state IN ('queued', 'in_progress')"
+            ).fetchall()
+
         for row in rows:
             data = dict(row)
             status_notes = data.get('status_notes')
-            status = (data.get('download_state') or '').strip() or None
-            # Back-compat for older DBs that don't have download_state yet.
-            if not status:
-                status = 'queued'
-                if status_notes:
-                    lowered = status_notes.lower()
-                    if 'failed' in lowered or 'error' in lowered:
-                        status = 'failed'
-                    elif 'processing' in lowered or 'downloading' in lowered:
-                        status = 'in_progress'
-
+            status = (data.get('download_state') or '').strip() or 'queued'
             attempts = data.get('download_attempt_count')
             if attempts is None:
                 attempts = parse_attempts(status_notes)
-            items.append({
-                'id': data.get('id'),
-                'title': data.get('title'),
-                'status': status,
-                'attempts': int(attempts or 0),
-            })
+            items.append(
+                {
+                    'id': data.get('id'),
+                    'title': data.get('title'),
+                    'status': status,
+                    'attempts': int(attempts or 0),
+                }
+            )
     except sqlite3.Error:
         items = []
     finally:
