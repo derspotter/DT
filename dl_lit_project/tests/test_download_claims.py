@@ -8,13 +8,14 @@ def _seed_queue(db: DatabaseManager, *, corpus_id: int, n: int) -> list[int]:
     ids: list[int] = []
     for i in range(n):
         cur.execute(
-            "INSERT INTO to_download_references (title, authors, year, doi, entry_type) VALUES (?, ?, ?, ?, ?)",
-            (f"Paper {i}", '["A. Author"]', 2000 + i, f"10.0000/test{i}", "article"),
+            "INSERT INTO with_metadata (title, authors, year, doi, normalized_doi, entry_type, download_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (f"Paper {i}", '["A. Author"]', 2000 + i, f"10.0000/test{i}", f"10.0000/test{i}".upper(), "article", "queued"),
         )
         qid = int(cur.lastrowid)
         ids.append(qid)
         cur.execute(
-            "INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id) VALUES (?, 'to_download_references', ?)",
+            "INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id) VALUES (?, 'with_metadata', ?)",
             (int(corpus_id), qid),
         )
     db.conn.commit()
@@ -39,7 +40,7 @@ def test_claim_batch_scoped_to_corpus(tmp_path):
         # Rows should be marked in_progress for claimed items.
         cur = db.conn.cursor()
         cur.execute(
-            "SELECT id, download_state, download_claimed_by, download_lease_expires_at FROM to_download_references ORDER BY id"
+            "SELECT id, download_state, download_claimed_by, download_lease_expires_at FROM with_metadata ORDER BY id"
         )
         rows = cur.fetchall()
         assert len(rows) == 3
@@ -78,7 +79,7 @@ def test_claim_reclaims_after_lease_expires(tmp_path):
         # Force the lease into the past to simulate an interrupted worker.
         cur = db.conn.cursor()
         cur.execute(
-            "UPDATE to_download_references SET download_lease_expires_at = ? WHERE id = ?",
+            "UPDATE with_metadata SET download_lease_expires_at = ? WHERE id = ?",
             (int(time.time()) - 10, int(ids[0])),
         )
         db.conn.commit()
@@ -87,4 +88,3 @@ def test_claim_reclaims_after_lease_expires(tmp_path):
         assert [b["id"] for b in batch2] == ids
     finally:
         db.close_connection()
-

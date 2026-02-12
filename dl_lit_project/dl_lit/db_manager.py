@@ -49,7 +49,18 @@ class DatabaseManager:
             print(f"{GREEN}[DB Manager] In-memory database connected.{RESET}")
         else:
             print(f"{GREEN}[DB Manager] Connected to database: {self.db_path.resolve()}{RESET}")
+        self._legacy_queue_migrated = False
         self._create_schema()
+
+    def _ensure_legacy_queue_migrated(self) -> None:
+        """Migrate legacy queue rows lazily so both old and new queue layouts work."""
+        if self._legacy_queue_migrated:
+            return
+        try:
+            self._migrate_legacy_queue_into_with_metadata()
+        finally:
+            # Never repeatedly migrate in hot paths; failures stay visible but do not block runtime.
+            self._legacy_queue_migrated = True
 
     def retry_failed_downloads(self):
         """Moves all entries from the failed_downloads table back to no_metadata for reprocessing."""
@@ -2289,6 +2300,7 @@ class DatabaseManager:
 
     def get_entries_to_download(self, limit: int = None) -> list[dict]:
         """Fetch queued rows from with_metadata for legacy callers."""
+        self._ensure_legacy_queue_migrated()
         cursor = self.conn.cursor()
         cursor.row_factory = sqlite3.Row
         query = """
@@ -2919,6 +2931,7 @@ class DatabaseManager:
 
     def get_all_from_queue(self) -> list[dict]:
         """Fetch all currently queued or in-progress rows from with_metadata."""
+        self._ensure_legacy_queue_migrated()
         self.conn.row_factory = sqlite3.Row
         cursor = self.conn.cursor()
         try:
@@ -2941,6 +2954,7 @@ class DatabaseManager:
         max_attempts: int | None = None,
     ) -> list[dict]:
         """Atomically claim queued with_metadata rows for download processing."""
+        self._ensure_legacy_queue_migrated()
         if limit <= 0:
             return []
 
