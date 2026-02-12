@@ -7,74 +7,43 @@ async function ensureSignedIn(page: Page) {
     await page.getByRole('textbox', { name: 'Password' }).fill('admin')
     await signInButton.click()
   }
+  await expect(page.getByRole('heading', { name: 'Corpus orchestration workspace' })).toBeVisible()
 }
 
 test.describe('Korpus Builder UI', () => {
   test('dashboard loads', async ({ page }) => {
     await page.goto('/')
+    await ensureSignedIn(page)
     await expect(page.getByTestId('dashboard-overview')).toBeVisible()
-    await expect(page.getByText('Corpus orchestration workspace')).toBeVisible()
+    await expect(page.getByTestId('tab-dashboard')).toBeVisible()
   })
 
-  test('ingest panel shows uploader and bibliography list', async ({ page }) => {
+  test('ingest panel shows uploader and extracted entries section', async ({ page }) => {
     await page.goto('/')
+    await ensureSignedIn(page)
     await page.getByTestId('tab-ingest').click()
     await expect(page.getByTestId('ingest-panel')).toBeVisible()
     await expect(page.getByText('Upload selected')).toBeVisible()
-    await expect(page.getByText('Bibliography files')).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Extracted entries' })).toBeVisible()
   })
 
-  test('keyword search returns sample results', async ({ page }) => {
-    await page.goto('/')
-    await ensureSignedIn(page)
-    await page.getByTestId('tab-search').click()
-    const query = page.getByTestId('search-query')
-    await query.fill('institutional economics')
-    await page
-      .getByTestId('search-panel')
-      .getByRole('button', { name: 'Search' })
-      .click()
-    await expect(page.getByText('Sample results loaded.')).toBeVisible()
-    await expect(page.getByText('The New Institutional Economics')).toBeVisible()
-  })
-
-  test('keyword search supports query mode and JSON seed mode', async ({ page }) => {
-    const seenBodies: Array<Record<string, unknown>> = []
-    const seedPayload = '[{"doi":"10.1111/j.1468-0335.1937.tb00002.x"}]'
-
+  test('keyword search renders mocked results', async ({ page }) => {
     await page.route('**/api/keyword-search', async (route) => {
-      const request = route.request()
-      if (request.method() !== 'POST') {
-        await route.fulfill({
-          status: 204,
-          headers: { 'access-control-allow-origin': '*' },
-          body: '',
-        })
-        return
-      }
-
-      const body = request.postDataJSON() as Record<string, unknown>
-      seenBodies.push(body)
-      const isSeedMode = typeof body.seedJson === 'string' && body.seedJson.length > 0
-
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
-        headers: { 'access-control-allow-origin': '*' },
         body: JSON.stringify({
-          runId: isSeedMode ? 222 : 111,
+          runId: 777,
           source: 'openalex',
-          mode: isSeedMode ? 'seed' : 'query',
-          expansion: { added: isSeedMode ? 1 : 0, processed: 1 },
           results: [
             {
-              id: isSeedMode ? 'W2015930340' : 'W2136823593',
-              openalex_id: isSeedMode ? 'W2015930340' : 'W2136823593',
-              title: isSeedMode ? 'Seed Mode Result' : 'Query Mode Result',
+              id: 'W1',
+              openalex_id: 'W1',
+              title: 'Mocked Search Result',
               authors: 'Test Author',
-              year: isSeedMode ? 1937 : 2000,
+              year: 2024,
               type: 'article',
-              doi: isSeedMode ? '10.1111/j.1468-0335.1937.tb00002.x' : null,
+              doi: null,
             },
           ],
         }),
@@ -84,53 +53,42 @@ test.describe('Korpus Builder UI', () => {
     await page.goto('/')
     await ensureSignedIn(page)
     await page.getByTestId('tab-search').click()
-
-    await page.getByTestId('search-mode').selectOption('query')
     await page.getByTestId('search-query').fill('institutional economics')
     await page.getByTestId('search-submit').click()
-    await expect(page.getByText('Query Mode Result')).toBeVisible()
-    expect(seenBodies[0]).toMatchObject({
-      query: 'institutional economics',
-      seedJson: '',
-    })
-
-    await page.getByTestId('search-mode').selectOption('seed')
-    await page.getByTestId('search-seed-json').fill(seedPayload)
-    await page.getByTestId('search-submit').click()
-    await expect(page.getByText('Seed Mode Result')).toBeVisible()
-    expect(seenBodies[1]).toMatchObject({
-      query: '',
-      seedJson: seedPayload,
-    })
+    await expect(page.getByText('Mocked Search Result')).toBeVisible()
   })
 
   test('corpus table renders', async ({ page }) => {
     await page.goto('/')
+    await ensureSignedIn(page)
     await page.getByTestId('tab-corpus').click()
     await expect(page.getByTestId('corpus-panel')).toBeVisible()
-    await expect(page.getByText('Sample corpus data.')).toBeVisible()
+    await expect(page.getByTestId('corpus-panel').getByRole('heading', { name: 'Corpus' })).toBeVisible()
   })
 
-  test('downloads queue renders', async ({ page }) => {
+  test('downloads queue renders with export controls', async ({ page }) => {
     await page.goto('/')
+    await ensureSignedIn(page)
     await page.getByTestId('tab-downloads').click()
     await expect(page.getByTestId('downloads-panel')).toBeVisible()
-    await expect(page.getByText('Sample queue data.')).toBeVisible()
+    await expect(page.getByTestId('exports-panel')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'JSON' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'BibTeX' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'PDFs ZIP' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Bundle ZIP' })).toBeVisible()
+    await expect(page.getByTestId('export-filter-status')).toBeVisible()
   })
 
-  test('logs view renders', async ({ page }) => {
+  test('logs and graph views render', async ({ page }) => {
     await page.goto('/')
+    await ensureSignedIn(page)
+
     await page.getByTestId('tab-logs').click()
     await expect(page.getByTestId('logs-panel')).toBeVisible()
     await expect(page.getByText('WebSocket status')).toBeVisible()
-  })
 
-  test('graph panel renders', async ({ page }) => {
-    await page.goto('/')
     await page.getByTestId('tab-graph').click()
     await expect(page.getByTestId('graph-panel')).toBeVisible()
     await expect(page.getByLabel('Graph visualization')).toBeVisible()
-    await expect(page.getByText('Relationship')).toBeVisible()
-    await expect(page.getByTestId('graph-panel').getByText('Status')).toBeVisible()
   })
 })

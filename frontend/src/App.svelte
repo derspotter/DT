@@ -22,6 +22,7 @@
     stopDownloadWorker,
     runDownloadWorkerOnce,
     fetchGraph,
+    downloadCorpusExport,
   } from './lib/api'
   import { sampleActivity } from './lib/sample-data'
 
@@ -102,6 +103,12 @@
   let downloadWorkerIntervalSeconds = 60
   let downloadWorkerBatchSize = 3
   let downloadWorkerBusy = false
+  let exportBusy = false
+  let exportStatus = ''
+  let exportFilterStatus = 'all'
+  let exportFilterYearFrom = ''
+  let exportFilterYearTo = ''
+  let exportFilterSource = ''
 
   let logs = []
   let logsStatus = 'connecting'
@@ -651,6 +658,39 @@
     }
   }
 
+  async function handleExportDownload(format, label) {
+    if (exportBusy) return
+    exportBusy = true
+    exportStatus = `${label} export is being generated...`
+    const exportFilters = {
+      status: exportFilterStatus === 'all' ? '' : exportFilterStatus,
+      yearFrom: exportFilterYearFrom ? Number(exportFilterYearFrom) : '',
+      yearTo: exportFilterYearTo ? Number(exportFilterYearTo) : '',
+      source: exportFilterSource.trim(),
+    }
+    try {
+      const { blob, filename } = await downloadCorpusExport(format, exportFilters)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      exportStatus = `${label} export downloaded.`
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        exportStatus = 'Session expired. Please sign in again.'
+        return
+      }
+      exportStatus = error?.message || 'Failed to export corpus data.'
+    } finally {
+      exportBusy = false
+    }
+  }
   async function loadGraph() {
     graphStatus = 'Loading graph...'
     try {
@@ -1706,6 +1746,55 @@
               {/if}
             </div>
           </div>
+
+          <div class="export-card" data-testid="exports-panel">
+            <div class="export-card__meta">
+              <span class="eyebrow">Corpus exports</span>
+              <strong>Final reference data</strong>
+              <p class="muted">Download current corpus as JSON, BibTeX, PDFs only, or a full bundle ZIP.</p>
+            </div>
+            <div class="export-card__filters">
+              <label>
+                Status
+                <select bind:value={exportFilterStatus} data-testid="export-filter-status">
+                  <option value="all">All</option>
+                  <option value="downloaded_references">Downloaded</option>
+                  <option value="to_download_references">Queued</option>
+                  <option value="with_metadata">Enriched</option>
+                  <option value="no_metadata">Raw</option>
+                </select>
+              </label>
+              <label>
+                Year from
+                <input type="number" min="0" step="1" placeholder="1900" bind:value={exportFilterYearFrom} data-testid="export-filter-year-from" />
+              </label>
+              <label>
+                Year to
+                <input type="number" min="0" step="1" placeholder="2026" bind:value={exportFilterYearTo} data-testid="export-filter-year-to" />
+              </label>
+              <label class="source-filter">
+                Source contains
+                <input type="text" placeholder="journal or source" bind:value={exportFilterSource} data-testid="export-filter-source" />
+              </label>
+            </div>
+            <div class="export-card__actions">
+              <button class="secondary" type="button" on:click={() => handleExportDownload('json', 'JSON')} disabled={exportBusy}>
+                JSON
+              </button>
+              <button class="secondary" type="button" on:click={() => handleExportDownload('bibtex', 'BibTeX')} disabled={exportBusy}>
+                BibTeX
+              </button>
+              <button class="secondary" type="button" on:click={() => handleExportDownload('pdfs', 'PDF ZIP')} disabled={exportBusy}>
+                PDFs ZIP
+              </button>
+              <button class="primary" type="button" on:click={() => handleExportDownload('bundle', 'Bundle ZIP')} disabled={exportBusy} data-testid="export-bundle-button">
+                Bundle ZIP
+              </button>
+            </div>
+          </div>
+          {#if exportStatus}
+            <p class="muted">{exportStatus}</p>
+          {/if}
 
           <div class="table-toolbar downloads-toolbar">
             <div class="table-toolbar-left">

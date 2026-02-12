@@ -525,6 +525,62 @@ select {
   background: #fff;
 }
 
+.export-card {
+  margin: 10px 0 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--stroke);
+  background: #fbfaf8;
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.export-card strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.export-card__meta {
+  display: grid;
+  gap: 4px;
+}
+
+.export-card__filters {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(4, minmax(130px, 1fr));
+}
+
+.export-card__filters label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.export-card__filters input,
+.export-card__filters select {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  background: #fff;
+  color: var(--ink);
+  font-size: 0.95rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.export-card__filters .source-filter {
+  grid-column: span 1;
+}
+
+.export-card__actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
 .worker-card {
   margin: 14px 0 18px;
   border-radius: var(--radius-md);
@@ -1033,7 +1089,17 @@ button.danger:disabled {
     grid-template-columns: 1fr;
   }
 
+  .export-card__filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .table-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .export-card__filters {
     grid-template-columns: 1fr;
   }
 }

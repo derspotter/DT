@@ -29,11 +29,12 @@ Status: `deferred (nice-to-have for now)`.
 
 ## M-04 Frontend
 
-Status: `in progress`.
+Status: `completed` for current scope.
 
 - Svelte/Vite frontend in production use for ingest/search/corpus/download/logs/graph.
 - DB-backed ingest selection/queueing and download controls implemented.
-- Remaining polish is mostly UX and incremental workflow refinement.
+- Final export interface implemented: JSON, BibTeX, PDFs ZIP, and Bundle ZIP downloads from current corpus, with status/year/source filters.
+- URL-based tab routing + auth/corpus selection are integrated.
 
 ## M-05 Dockerisierung
 

@@ -98,6 +98,7 @@ const INGEST_PROCESS_MARKED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_proce
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const DOWNLOAD_WORKER_ONCE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'download_worker_once.py');
+const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
 
 const STUB_RESULTS = {
@@ -1008,6 +1009,62 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
+  app.get('/api/exports/:format', requireAuthMiddleware, async (req, res) => {
+    const rawFormat = String(req.params?.format || '').toLowerCase();
+    const formatMap = { json: 'json', bibtex: 'bibtex', pdfs: 'pdfs_zip', bundle: 'bundle_zip' };
+    const selectedFormat = formatMap[rawFormat];
+    if (!selectedFormat) {
+      return res.status(400).json({ error: 'format must be one of: json, bibtex, pdfs, bundle' });
+    }
+
+    const statusFilter = String(req.query?.status || '').trim().toLowerCase();
+    const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
+    const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
+    const sourceFilter = String(req.query?.source || '').trim();
+
+    if (yearFrom !== null && yearTo !== null && yearFrom > yearTo) {
+      return res.status(400).json({ error: 'year_from must be <= year_to' });
+    }
+
+    const dbPath = DB_PATH;
+    let exportDir = path.join(ARTIFACTS_DIR, 'exports');
+    try {
+      fs.mkdirSync(exportDir, { recursive: true });
+      fs.accessSync(exportDir, fs.constants.W_OK);
+    } catch (error) {
+      exportDir = path.join('/tmp', 'rag-feeder-exports');
+      fs.mkdirSync(exportDir, { recursive: true });
+    }
+
+    const args = ['--db-path', dbPath, '--output-dir', exportDir, '--format', selectedFormat];
+    if (statusFilter) {
+      args.push('--status', statusFilter);
+    }
+    if (yearFrom !== null) {
+      args.push('--year-from', String(yearFrom));
+    }
+    if (yearTo !== null) {
+      args.push('--year-to', String(yearTo));
+    }
+    if (sourceFilter) {
+      args.push('--source', sourceFilter);
+    }
+
+    try {
+      const payload = await runPythonJson(EXPORT_BUNDLE_SCRIPT, args, { dbPath, corpusId: req.corpusId });
+      const outputPath = payload?.output_path ? path.resolve(String(payload.output_path)) : '';
+      const safeRoot = path.resolve(exportDir) + path.sep;
+      if (!outputPath || !outputPath.startsWith(safeRoot) || !fs.existsSync(outputPath)) {
+        return res.status(500).json({ error: 'Export failed: output file missing' });
+      }
+
+      const downloadName = payload?.filename || path.basename(outputPath);
+      return res.download(outputPath, downloadName);
+    } catch (error) {
+      console.error('[/api/exports] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to export corpus data' });
+    }
+  });
   app.get('/api/graph', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });

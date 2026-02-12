@@ -369,6 +369,51 @@ export async function runDownloadWorkerOnce({ batchSize = 3 } = {}) {
   return response.json()
 }
 
+export async function downloadCorpusExport(format, { status = '', yearFrom = '', yearTo = '', source = '' } = {}) {
+  const params = new URLSearchParams()
+  if (status) params.set('status', String(status))
+  if (yearFrom !== '' && yearFrom !== null && yearFrom !== undefined) params.set('year_from', String(yearFrom))
+  if (yearTo !== '' && yearTo !== null && yearTo !== undefined) params.set('year_to', String(yearTo))
+  if (source) params.set('source', String(source))
+  const query = params.toString()
+  const endpoint = `${API_BASE}/api/exports/${encodeURIComponent(String(format || ''))}${query ? `?${query}` : ''}`
+
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: 'GET',
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to export corpus data')
+  }
+
+  const blob = await response.blob()
+  const disposition = response.headers.get('content-disposition') || ''
+  let filename = ''
+  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
+  if (star && star[1]) {
+    filename = decodeURIComponent(star[1])
+  } else if (plain && plain[1]) {
+    filename = plain[1]
+  }
+
+  if (!filename) {
+    const fallback = {
+      json: 'references.json',
+      bibtex: 'references.bib',
+      pdfs: 'references.zip',
+      bundle: 'references-bundle.zip',
+    }
+    filename = fallback[String(format)] || 'references-export.bin'
+  }
+
+  return { blob, filename }
+}
 export async function fetchGraph({
   maxNodes = 200,
   relationship = 'both',
