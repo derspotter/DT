@@ -194,8 +194,12 @@ select {
 
 .layout {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
   gap: 24px;
+  min-width: 0;
+  align-items: start;
+  width: 100%;
+  max-width: 100%;
 }
 
 .side-nav {
@@ -239,7 +243,16 @@ select {
   display: flex;
   flex-direction: column;
   gap: 24px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   animation: fade-in 0.4s ease;
+}
+
+.content > * {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 @keyframes fade-in {
@@ -265,6 +278,9 @@ select {
   padding: 22px 24px;
   box-shadow: var(--shadow);
   border: 1px solid var(--stroke);
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .card.highlight {
@@ -477,10 +493,25 @@ select {
 
 .search-form {
   display: grid;
-  grid-template-columns: minmax(140px, 0.9fr) minmax(260px, 2fr) repeat(4, minmax(110px, 0.8fr)) auto;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
   margin-bottom: 10px;
   align-items: start;
+  width: 100%;
+  max-width: 100%;
+}
+
+.search-form > * {
+  min-width: 0;
+}
+
+.search-form > :nth-child(2) {
+  grid-column: span 2;
+}
+
+.search-form .primary {
+  justify-self: start;
+  min-width: 116px;
 }
 
 .search-form input,
@@ -501,6 +532,7 @@ select {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
 }
 
 .table.table-scroll {
@@ -678,6 +710,7 @@ button.danger:disabled {
 
 .table-row > span {
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .table-row:not(.header):nth-child(even) {
@@ -964,6 +997,8 @@ button.danger:disabled {
   grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
+  width: 100%;
+  max-width: 100%;
 }
 
 .graph-canvas {
@@ -1156,6 +1191,10 @@ button.danger:disabled {
 
   .search-form {
     grid-template-columns: 1fr;
+  }
+
+  .search-form > :nth-child(2) {
+    grid-column: auto;
   }
 
   .export-card__filters {
