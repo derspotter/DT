@@ -159,6 +159,8 @@
   let graphViewBox = { x: 0, y: 0, size: 440 }
   let isGraphPanning = false
   let graphPanStart = { x: 0, y: 0, viewX: 0, viewY: 0 }
+  let pipelineRefreshTimer = null
+  let pipelineRefreshInFlight = false
   let creatingCorpus = false
   let shareUsername = ''
   let shareRole = 'viewer'
@@ -276,6 +278,31 @@
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  function shouldTriggerPipelineRefresh(logLine) {
+    const text = String(logLine || '')
+    if (!text) return false
+    return (
+      text.includes('[SUCCESS] Inserted') ||
+      text.includes('Bibliography extraction complete') ||
+      text.includes('Finished APIscraper') ||
+      text.includes('Processing Summary')
+    )
+  }
+
+  function schedulePipelineRefresh(delayMs = 1500) {
+    if (pipelineRefreshTimer || pipelineRefreshInFlight) return
+    pipelineRefreshTimer = setTimeout(async () => {
+      pipelineRefreshTimer = null
+      if (pipelineRefreshInFlight || authStatus !== 'authenticated') return
+      pipelineRefreshInFlight = true
+      try {
+        await Promise.all([loadIngestStats(), loadIngestRuns(), loadCorpus()])
+      } finally {
+        pipelineRefreshInFlight = false
+      }
+    }, delayMs)
   }
 
   async function bootstrapAuth() {
@@ -876,7 +903,11 @@
         logsStatus = 'connected'
       }
       ws.onmessage = (event) => {
-        logs = [...logs, event.data].slice(-maxLogs)
+        const line = event.data
+        logs = [...logs, line].slice(-maxLogs)
+        if (shouldTriggerPipelineRefresh(line)) {
+          schedulePipelineRefresh()
+        }
       }
       ws.onclose = () => {
         logsStatus = 'disconnected'
@@ -1430,7 +1461,13 @@
     }
     boot()
 
-    return () => window.removeEventListener('hashchange', onHashChange)
+    return () => {
+      window.removeEventListener('hashchange', onHashChange)
+      if (pipelineRefreshTimer) {
+        clearTimeout(pipelineRefreshTimer)
+        pipelineRefreshTimer = null
+      }
+    }
   })
 </script>
 
@@ -1459,7 +1496,7 @@
 {:else}
   <div class="app-shell">
     <header class="app-header">
-      <div>
+      <div class="header-main">
         <p class="eyebrow">Korpus Builder</p>
         <h1>Corpus orchestration workspace</h1>
         <p class="subtitle">
@@ -1489,6 +1526,21 @@
               New corpus
             </button>
           </div>
+        </div>
+      </div>
+      <div class="header-log-stream" data-testid="header-log-stream">
+        <div class="header-log-stream__title">
+          <span>Pipeline logs</span>
+          <span class="muted">WebSocket: {logsStatus}</span>
+        </div>
+        <div class="header-log-stream__body">
+          {#if logs.length === 0}
+            <p class="muted">Waiting for pipeline output...</p>
+          {:else}
+            {#each logs.slice(-4).reverse() as entry}
+              <div class="header-log-line">{entry}</div>
+            {/each}
+          {/if}
         </div>
       </div>
     </header>

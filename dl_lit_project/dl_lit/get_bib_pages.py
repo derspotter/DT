@@ -175,6 +175,12 @@ def _upload_pdf(path: str):
     return api_client.files.upload(file=path)
 
 
+def _get_uploaded(name: str):
+    if api_client is None:
+        raise RuntimeError("Gemini client not configured (set GEMINI_API_KEY or GOOGLE_API_KEY).")
+    return api_client.files.get(name=name)
+
+
 def _delete_uploaded(uploaded) -> None:
     if api_client is None or not uploaded:
         return
@@ -184,7 +190,7 @@ def _delete_uploaded(uploaded) -> None:
         return
 
 
-def extract_reference_sections(pdf_path: str, output_dir: str) -> list[str]:
+def extract_reference_sections(pdf_path: str, output_dir: str, uploaded_file_name: str | None = None) -> list[str]:
     """Extract bibliography/reference pages from a PDF into per-page PDF files.
 
     Returns a list of generated file paths (best-effort; may be empty).
@@ -243,8 +249,14 @@ def extract_reference_sections(pdf_path: str, output_dir: str) -> list[str]:
                         }
                     )
         else:
-            uploaded = _upload_pdf(pdf_path)
-            files_to_clean_up.append(uploaded)
+            if uploaded_file_name:
+                uploaded = _get_uploaded(uploaded_file_name)
+                print(f"[INFO] Reusing uploaded Gemini file: {uploaded_file_name}", flush=True)
+            else:
+                uploaded = _upload_pdf(pdf_path)
+                files_to_clean_up.append(uploaded)
+            # Only auto-clean uploads we created in this process.
+            # Reused uploads are cleaned up by the caller/orchestrator.
             all_sections = _find_reference_section_pages(uploaded, total_physical_pages=total_physical_pages)
 
         normalized_sections = _normalize_sections(all_sections, total_physical_pages)
@@ -281,8 +293,13 @@ def extract_reference_sections(pdf_path: str, output_dir: str) -> list[str]:
             shutil.rmtree(temp_chunk_dir, ignore_errors=True)
 
 
-def _process_pdf(pdf_path: str, output_dir: str, move_to_done: bool = False) -> list[str]:
-    files = extract_reference_sections(pdf_path, output_dir)
+def _process_pdf(
+    pdf_path: str,
+    output_dir: str,
+    move_to_done: bool = False,
+    uploaded_file_name: str | None = None,
+) -> list[str]:
+    files = extract_reference_sections(pdf_path, output_dir, uploaded_file_name=uploaded_file_name)
     if move_to_done and files:
         done_bibs_dir = os.path.join(os.path.abspath(os.path.expanduser(output_dir)), "done_bibs")
         os.makedirs(done_bibs_dir, exist_ok=True)
@@ -298,6 +315,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("input", nargs="?", help="Path to a PDF file or a directory containing PDFs")
     p.add_argument("--input-pdf", dest="input_pdf", help="Path to a single PDF file")
     p.add_argument("--input-dir", dest="input_dir", help="Path to a directory containing PDFs")
+    p.add_argument(
+        "--uploaded-file-name",
+        dest="uploaded_file_name",
+        help="Reuse an already uploaded Gemini file (files/<id>) for single-PDF extraction.",
+    )
     p.add_argument("--output-dir", default="bib_output", help="Base output directory for extracted pages")
     p.add_argument(
         "--move-to-done",
@@ -339,7 +361,12 @@ def main(argv: list[str] | None = None) -> int:
 
     for idx, pdf in enumerate(pdf_files, 1):
         try:
-            files = _process_pdf(pdf, output_dir, move_to_done=bool(args.move_to_done))
+            files = _process_pdf(
+                pdf,
+                output_dir,
+                move_to_done=bool(args.move_to_done),
+                uploaded_file_name=args.uploaded_file_name if len(pdf_files) == 1 else None,
+            )
             total_pages += len(files)
             print(
                 f"Completed {idx}/{len(pdf_files)}: {os.path.basename(pdf)} - {len(files)} page(s) extracted.",
@@ -355,4 +382,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-

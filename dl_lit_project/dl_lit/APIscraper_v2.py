@@ -11,7 +11,9 @@ import concurrent.futures
 import glob
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from threading import Lock
@@ -20,6 +22,11 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+try:
+    import pikepdf
+except Exception:
+    pikepdf = None
 
 # Make local package imports work when this module is executed directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,6 +59,12 @@ BIBLIOGRAPHY_PROMPT = (
     "Extract bibliography entries from the attached PDF page. "
     "Return JSON that matches the provided schema. "
     "If no entries are found, return an empty list."
+)
+
+INLINE_CITATION_PROMPT = (
+    "Extract all cited works from this PDF chunk, including inline citations, footnotes, endnotes, "
+    "and per-page references. Return JSON that matches the provided schema. "
+    "Include each cited work once if identifiable. If no citations are found, return an empty list."
 )
 
 if BaseModel:
@@ -152,7 +165,44 @@ def _wait_rate_limit(service_name: str) -> None:
     except Exception:
         return
 
-def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
+def _resolve_prompt(extract_mode: str) -> str:
+    return INLINE_CITATION_PROMPT if extract_mode == "inline" else BIBLIOGRAPHY_PROMPT
+
+
+def _split_pdf_into_chunks(pdf_path: str, chunk_pages: int) -> tuple[str | None, list[str]]:
+    """Create temporary chunk PDFs and return (temp_dir, chunk_paths)."""
+    if chunk_pages <= 0:
+        return None, [pdf_path]
+    if pikepdf is None:
+        raise RuntimeError("pikepdf is required for chunked extraction fallback")
+
+    with pikepdf.Pdf.open(pdf_path) as src_pdf:
+        total_pages = len(src_pdf.pages)
+        if total_pages <= chunk_pages:
+            return None, [pdf_path]
+
+    temp_dir = tempfile.mkdtemp(prefix="apiscraper_chunks_")
+    chunk_paths: list[str] = []
+
+    with pikepdf.Pdf.open(pdf_path) as src_pdf:
+        for start in range(0, len(src_pdf.pages), chunk_pages):
+            end = min(start + chunk_pages, len(src_pdf.pages))
+            chunk_pdf = pikepdf.Pdf.new()
+            for idx in range(start, end):
+                chunk_pdf.pages.append(src_pdf.pages[idx])
+            chunk_path = os.path.join(temp_dir, f"{Path(pdf_path).stem}_chunk_{start+1:05d}_{end:05d}.pdf")
+            chunk_pdf.save(chunk_path)
+            chunk_paths.append(chunk_path)
+
+    return temp_dir, chunk_paths
+
+
+def upload_pdf_and_extract_bibliography(
+    pdf_path,
+    timeout_seconds: int = 120,
+    extract_mode: str = "page",
+    uploaded_file_name: str | None = None,
+):
     """Uploads a PDF file directly to the API and attempts to extract bibliography entries."""
     print(f"[INFO] Uploading PDF directly for bibliography extraction: {pdf_path}", flush=True)
     start_time = time.time()
@@ -165,18 +215,22 @@ def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
             return []
     
     try:
-        # Upload the PDF file via Files API.
-        uploaded_file = api_client.files.upload(
-            file=str(pdf_path),
-            config={
-                "mime_type": "application/pdf",
-                "display_name": Path(pdf_path).name,
-            },
-        )
-        print(f"[DEBUG] Uploaded PDF as name: {uploaded_file.name}", flush=True)
+        if uploaded_file_name:
+            uploaded_file = api_client.files.get(name=uploaded_file_name)
+            print(f"[DEBUG] Reusing uploaded PDF as name: {uploaded_file.name}", flush=True)
+        else:
+            # Upload the PDF file via Files API.
+            uploaded_file = api_client.files.upload(
+                file=str(pdf_path),
+                config={
+                    "mime_type": "application/pdf",
+                    "display_name": Path(pdf_path).name,
+                },
+            )
+            print(f"[DEBUG] Uploaded PDF as name: {uploaded_file.name}", flush=True)
         
         # Prepare the prompt for bibliography extraction
-        prompt = BIBLIOGRAPHY_PROMPT
+        prompt = _resolve_prompt(extract_mode)
         _wait_rate_limit("gemini")
         _wait_rate_limit("gemini_daily")
         
@@ -238,7 +292,7 @@ def upload_pdf_and_extract_bibliography(pdf_path, timeout_seconds: int = 120):
         bibliography_data = []
     finally:
         # Attempt to delete the uploaded file
-        if uploaded_file:
+        if uploaded_file and not uploaded_file_name:
             try:
                 api_client.files.delete(name=uploaded_file.name)
                 print(f"[DEBUG] Deleted uploaded file: {uploaded_file.name}", flush=True)
@@ -308,6 +362,9 @@ def process_single_pdf(
     summary_lock,
     ingest_source: str | None = None,
     corpus_id: int | None = None,
+    extract_mode: str = "page",
+    source_pdf_override: str | None = None,
+    uploaded_file_name: str | None = None,
 ):
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
@@ -319,7 +376,11 @@ def process_single_pdf(
     try:
         # Get Bibliography via API by uploading PDF directly
         stage_start_time = time.time()
-        bibliography_data = upload_pdf_and_extract_bibliography(pdf_path)
+        bibliography_data = upload_pdf_and_extract_bibliography(
+            pdf_path,
+            extract_mode=extract_mode,
+            uploaded_file_name=uploaded_file_name,
+        )
         api_duration = time.time() - stage_start_time
         print(f"[TIMER] Bibliography extraction for {filename} took {api_duration:.2f} seconds.", flush=True)
 
@@ -354,7 +415,7 @@ def process_single_pdf(
                     "issn": entry.get("issn"),
                     "abstract": entry.get("abstract"),
                     "keywords": entry.get("keywords"),
-                    "source_pdf": str(pdf_path),
+                    "source_pdf": str(source_pdf_override or pdf_path),
                     "translated_title": entry.get("translated_title"),
                     "translated_year": entry.get("translated_year"),
                     "translated_language": entry.get("translated_language"),
@@ -390,12 +451,59 @@ def process_single_pdf(
             summary_dict["failed_files"] += 1
             summary_dict["failures"].append({"file": filename, "reason": failure_reason})
 
+
+def process_single_pdf_chunked(
+    pdf_path,
+    db_manager: DatabaseManager,
+    summary_dict,
+    summary_lock,
+    ingest_source: str | None = None,
+    corpus_id: int | None = None,
+    extract_mode: str = "inline",
+    chunk_pages: int = 50,
+    uploaded_file_name: str | None = None,
+):
+    """Fallback extraction for inline/per-page citations by chunking larger PDFs."""
+    temp_chunk_dir = None
+    try:
+        temp_chunk_dir, chunk_paths = _split_pdf_into_chunks(str(pdf_path), int(chunk_pages))
+    except Exception as exc:
+        print(f"[ERROR] Failed to create PDF chunks for {pdf_path}: {exc}", flush=True)
+        with summary_lock:
+            summary_dict["processed_files"] += 1
+            summary_dict["failed_files"] += 1
+            summary_dict["failures"].append({"file": os.path.basename(str(pdf_path)), "reason": str(exc)})
+        return
+
+    try:
+        print(
+            f"[INFO] Chunked fallback extraction for {pdf_path}: {len(chunk_paths)} chunk(s), mode={extract_mode}, chunk_pages={chunk_pages}",
+            flush=True,
+        )
+        for chunk_path in chunk_paths:
+            process_single_pdf(
+                chunk_path,
+                db_manager,
+                summary_dict,
+                summary_lock,
+                ingest_source=ingest_source,
+                corpus_id=corpus_id,
+                extract_mode=extract_mode,
+                source_pdf_override=str(pdf_path),
+                uploaded_file_name=None if chunk_path != str(pdf_path) else uploaded_file_name,
+            )
+    finally:
+        if temp_chunk_dir and os.path.exists(temp_chunk_dir):
+            shutil.rmtree(temp_chunk_dir, ignore_errors=True)
+
 def process_directory_v2(
     input_dir,
     db_manager: DatabaseManager,
     max_workers=5,
     ingest_source: str | None = None,
     corpus_id: int | None = None,
+    extract_mode: str = "page",
+    chunk_pages: int = 0,
 ):
     """Processes all PDFs in the input directory concurrently, saving to the specified output dir."""
     print(f"[INFO] Processing directory: {input_dir}", flush=True)
@@ -419,6 +527,31 @@ def process_directory_v2(
     }
     summary_lock = Lock()
 
+    if chunk_pages and chunk_pages > 0:
+        print(f"[INFO] Chunked mode enabled for directory processing (chunk_pages={chunk_pages}).", flush=True)
+        for pdf_path in pdf_files:
+            process_single_pdf_chunked(
+                pdf_path,
+                db_manager,
+                results_summary,
+                summary_lock,
+                ingest_source=ingest_source,
+                corpus_id=corpus_id,
+                extract_mode=extract_mode,
+                chunk_pages=chunk_pages,
+            )
+        print("\n--- Processing Summary ---")
+        print(f"Total files found: {len(pdf_files)}")
+        print(f"Files processed: {results_summary['processed_files']}")
+        print(f"Successful extractions: {results_summary['successful_files']}")
+        print(f"Failed extractions: {results_summary['failed_files']}")
+        if results_summary['failures']:
+            print("Failures:")
+            for failure in results_summary['failures']:
+                print(f"  - {failure['file']}: {failure['reason']}")
+        print("-------------------------")
+        return
+
     try:
         # Use ThreadPoolExecutor for I/O-bound tasks
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -432,6 +565,7 @@ def process_directory_v2(
                     summary_lock,
                     ingest_source,
                     corpus_id,
+                    extract_mode,
                 )
                 for pdf_path in pdf_files]
 
@@ -480,6 +614,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", required=True, help="Path to the SQLite database file.")
     parser.add_argument("--ingest-source", default=None, help="Identifier for this ingest run (e.g., base filename).")
     parser.add_argument("--corpus-id", type=int, default=None, help="Corpus ID to associate with inserted entries.")
+    parser.add_argument(
+        "--extract-mode",
+        choices=("page", "inline"),
+        default="page",
+        help="Extraction strategy: page=reference page PDFs, inline=all citations in full/chunked PDF.",
+    )
+    parser.add_argument(
+        "--chunk-pages",
+        type=int,
+        default=0,
+        help="If > 0, split each PDF into chunks with this many pages before extraction.",
+    )
+    parser.add_argument(
+        "--uploaded-file-name",
+        default=None,
+        help="Reuse an already uploaded Gemini file (files/<id>) for single-PDF extraction.",
+    )
     return parser
 
 
@@ -510,11 +661,42 @@ def main(argv: list[str] | None = None) -> int:
         db_manager = DatabaseManager(db_path=db_path_resolved)
         if os.path.isdir(input_path):
             print(f"[INFO] Processing directory: {input_path}", flush=True)
-            process_directory_v2(input_path, db_manager, args.workers, args.ingest_source, args.corpus_id)
+            process_directory_v2(
+                input_path,
+                db_manager,
+                args.workers,
+                args.ingest_source,
+                args.corpus_id,
+                args.extract_mode,
+                args.chunk_pages,
+            )
         elif os.path.isfile(input_path) and str(input_path).lower().endswith(".pdf"):
             print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
             summary = {"processed_files": 0, "successful_files": 0, "failed_files": 0, "failures": []}
-            process_single_pdf(input_path, db_manager, summary, Lock(), args.ingest_source, args.corpus_id)
+            if args.chunk_pages and args.chunk_pages > 0:
+                process_single_pdf_chunked(
+                    input_path,
+                    db_manager,
+                    summary,
+                    Lock(),
+                    args.ingest_source,
+                    args.corpus_id,
+                    args.extract_mode,
+                    args.chunk_pages,
+                    args.uploaded_file_name,
+                )
+            else:
+                process_single_pdf(
+                    input_path,
+                    db_manager,
+                    summary,
+                    Lock(),
+                    args.ingest_source,
+                    args.corpus_id,
+                    args.extract_mode,
+                    None,
+                    args.uploaded_file_name,
+                )
             print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
         else:
             print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)

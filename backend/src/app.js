@@ -6,7 +6,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -384,6 +384,87 @@ function coerceInt(value, fallback = null) {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getPdfPageCountSync(pdfPath) {
+  if (!pdfPath || !fs.existsSync(pdfPath)) return null;
+  const probeCode = [
+    'import sys',
+    'import pikepdf',
+    'pdf = pikepdf.Pdf.open(sys.argv[1])',
+    'print(len(pdf.pages))',
+    'pdf.close()',
+  ].join('; ');
+  try {
+    const result = spawnSync(PYTHON_EXEC, ['-c', probeCode, pdfPath], {
+      env: {
+        ...process.env,
+        PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+      },
+      encoding: 'utf8',
+    });
+    if (result.status !== 0) {
+      console.warn(`[/api/extract-bibliography] Could not read page count for ${pdfPath}: ${result.stderr || result.stdout}`);
+      return null;
+    }
+    const parsed = Number.parseInt(String(result.stdout || '').trim(), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  } catch (error) {
+    console.warn(`[/api/extract-bibliography] Page count probe failed for ${pdfPath}: ${error?.message || error}`);
+    return null;
+  }
+}
+
+function geminiUploadPdfSync(pdfPath) {
+  const code = [
+    'import json, os, sys',
+    'from google import genai',
+    'key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")',
+    'assert key, "Missing GEMINI_API_KEY/GOOGLE_API_KEY"',
+    'client = genai.Client(api_key=key)',
+    'f = client.files.upload(file=sys.argv[1], config={"mime_type":"application/pdf","display_name":os.path.basename(sys.argv[1])})',
+    'print(json.dumps({"name": f.name}))',
+  ].join('; ');
+  const result = spawnSync(PYTHON_EXEC, ['-c', code, pdfPath], {
+    env: {
+      ...process.env,
+      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    },
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    throw new Error((result.stderr || result.stdout || 'Gemini upload failed').trim());
+  }
+  const parsed = parseJsonFromOutput(result.stdout || '');
+  if (!parsed?.name) {
+    throw new Error(`Gemini upload returned invalid payload: ${result.stdout}`);
+  }
+  return parsed.name;
+}
+
+function geminiDeleteUploadedSync(uploadedFileName) {
+  if (!uploadedFileName) return;
+  const code = [
+    'import os, sys',
+    'from google import genai',
+    'key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")',
+    'assert key, "Missing GEMINI_API_KEY/GOOGLE_API_KEY"',
+    'client = genai.Client(api_key=key)',
+    'client.files.delete(name=sys.argv[1])',
+    'print("ok")',
+  ].join('; ');
+  const result = spawnSync(PYTHON_EXEC, ['-c', code, uploadedFileName], {
+    env: {
+      ...process.env,
+      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    },
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    console.warn(
+      `[/api/extract-bibliography] Failed to delete uploaded Gemini file ${uploadedFileName}: ${result.stderr || result.stdout}`
+    );
+  }
 }
 
 export function createApp({ broadcast } = {}) {
@@ -772,45 +853,120 @@ export function createApp({ broadcast } = {}) {
     // Status 202 Accepted indicates the request is accepted for processing, but is not complete.
     // --- End Immediate Response ---
 
+    let sharedUploadedFileName = null;
+    const cleanupSharedUpload = () => {
+      if (!sharedUploadedFileName) return;
+      const toDelete = sharedUploadedFileName;
+      sharedUploadedFileName = null;
+      geminiDeleteUploadedSync(toDelete);
+    };
+
     // --- Run Scripts in Background ---
     try {
+      const inputPageCount = inputExists ? getPdfPageCountSync(inputPdfPath) : null;
+      if (inputPageCount) {
+        console.log(`[/api/extract-bibliography] PDF page count: ${inputPageCount}`);
+      }
+
+      // For small PDFs, pre-upload once and reuse the same Gemini file in
+      // get_bib_pages and inline fallback to avoid a second upload.
+      if (inputExists && inputPageCount && inputPageCount <= 50) {
+        try {
+          sharedUploadedFileName = geminiUploadPdfSync(inputPdfPath);
+          console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
+          send(`[/api/extract-bibliography] Uploaded once for reuse: ${sharedUploadedFileName}`);
+        } catch (uploadErr) {
+          console.warn(`[/api/extract-bibliography] Shared upload failed, continuing without reuse: ${uploadErr?.message || uploadErr}`);
+          send(`[/api/extract-bibliography] Shared upload unavailable; continuing with regular flow.`);
+          sharedUploadedFileName = null;
+        }
+      }
+      const runApiScraper = ({
+        inputDir = null,
+        inputPdf = null,
+        extractMode = 'page',
+        chunkPages = 0,
+        uploadedFileName = null,
+        modelOverride = null,
+        label = 'APIscraper',
+      }) => {
+        return new Promise((resolve) => {
+          const dbPath = DB_PATH;
+          const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
+          if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
+          if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
+          if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
+          if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
+          if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
+
+          console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
+          send(`[/api/extract-bibliography] Starting ${label}...`);
+          const child = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
+            env: {
+              ...process.env,
+              ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
+              PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+              RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
+              RAG_FEEDER_DB_PATH: DB_PATH,
+            },
+          });
+
+          child.stdout.on('data', (data) => {
+            const message = data.toString();
+            console.log(`[${label} stdout]: ${message}`);
+            send(`[${label}] ${message}`);
+          });
+
+          child.stderr.on('data', (data) => {
+            const message = data.toString();
+            console.error(`[${label} stderr]: ${message}`);
+            send(`[${label} ERROR] ${message}`);
+          });
+
+          child.on('close', (code) => {
+            if (code !== 0) {
+              console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
+              send(`[/api/extract-bibliography] ${label} failed with code ${code}`);
+              resolve(false);
+              return;
+            }
+            console.log(`[/api/extract-bibliography] Finished ${label}.`);
+            resolve(true);
+          });
+        });
+      };
+
+      const runInlineFallback = async (reason) => {
+        if (!inputExists) {
+          console.error(`[/api/extract-bibliography] Cannot run inline fallback: input PDF missing (${inputPdfPath}).`);
+          send(`[/api/extract-bibliography] Inline fallback skipped (input PDF missing).`);
+          return false;
+        }
+        const useSharedUpload = Boolean(sharedUploadedFileName);
+        const chunkPages = useSharedUpload ? 0 : 50;
+        const why = reason || 'reference page extraction returned no usable pages';
+        console.warn(`[/api/extract-bibliography] Triggering inline citation fallback: ${why}`);
+        send(`[/api/extract-bibliography] Triggering inline citation fallback (${why}, chunk_pages=${chunkPages || 0}).`);
+        const ok = await runApiScraper({
+          inputPdf: inputPdfPath,
+          extractMode: 'inline',
+          chunkPages,
+          uploadedFileName: sharedUploadedFileName,
+          modelOverride: 'gemini-3-flash-preview',
+          label: 'APIscraper inline fallback',
+        });
+        return ok;
+      };
+
       // Fast-path: if the upload is missing but we already have extracted page PDFs, run the scraper only.
       if (!inputExists && pagesExist) {
         console.log(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
         send(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
-        const dbPath = DB_PATH;
-        const scrapeApiArgs = ['--input-dir', existingPagesDir, '--db-path', dbPath, '--ingest-source', baseName];
-        if (corpusId) {
-          scrapeApiArgs.push('--corpus-id', String(corpusId));
-        }
-        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
-          env: {
-            ...process.env,
-            PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-            RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-            RAG_FEEDER_DB_PATH: DB_PATH,
-          },
-        });
-
-        apiScraperProcess.stdout.on('data', (data) => {
-          const message = data.toString();
-          console.log(`[APIscraper stdout]: ${message}`);
-          send(`[APIscraper] ${message}`);
-        });
-
-        apiScraperProcess.stderr.on('data', (data) => {
-          const message = data.toString();
-          console.error(`[APIscraper stderr]: ${message}`);
-          send(`[APIscraper ERROR] ${message}`);
-        });
-
-        apiScraperProcess.on('close', (code) => {
-          if (code !== 0) {
-            console.error(`[/api/extract-bibliography] ${API_SCRAPER_SCRIPT} exited with code ${code}`);
-            return;
-          }
-          console.log(`[/api/extract-bibliography] Finished ${API_SCRAPER_SCRIPT} (reused pages).`);
-        });
+        runApiScraper({
+          inputDir: existingPagesDir,
+          extractMode: 'page',
+          label: 'APIscraper (reused pages)',
+        }).finally(() => cleanupSharedUpload());
         return;
       }
 
@@ -819,6 +975,9 @@ export function createApp({ broadcast } = {}) {
         '--input-pdf', inputPdfPath,
         '--output-dir', BIB_OUTPUT_DIR // Keep this, it seems to place output in BIB_OUTPUT_DIR/baseName/
       ];
+      if (sharedUploadedFileName) {
+        getPagesArgs.push('--uploaded-file-name', sharedUploadedFileName);
+      }
 
       console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
       const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], {
@@ -842,83 +1001,48 @@ export function createApp({ broadcast } = {}) {
         send(`[get_bib_pages ERROR] ${message}`);
       });
 
-      getPagesProcess.on('close', (code) => {
-        console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
-        if (code !== 0) {
-          const errorMessage = `[/api/extract-bibliography] Error during bibliography page extraction (get_bib_pages.py exited with code ${code}).`;
-          send(errorMessage);
-          console.error(errorMessage);
-          // Send error response only if headers not already sent
-          if (!res.headersSent) {
-            return res.status(500).json({ error: 'Error during bibliography page extraction.', scriptCode: code });
-          }
-          return; // Stop further processing
-        }
-
-        // **Proceed to Step 2: Call API Scraper only if Step 1 succeeded**
-        // Construct the expected output dir based on the *output* structure of get_bib_pages
-        const jsonSubDir = existingPagesDir; // Subdirectory named after the base PDF name
-        const pageFiles = fs.existsSync(jsonSubDir)
-          ? fs.readdirSync(jsonSubDir).filter((file) => file.endsWith('.pdf'))
-          : [];
-
-        if (pageFiles.length === 0) {
-          const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}`;
-          console.error(errorMessage);
-          send(errorMessage);
-          if (!res.headersSent) {
-            return res.status(500).json({ error: 'No extracted page PDFs found after page extraction.' });
-          }
-          return;
-        }
-
-        console.log(`[/api/extract-bibliography] Spawning: python ${API_SCRAPER_SCRIPT} ...`);
-        // Correct arguments based on APIscraper_v2.py's argparse
-        const dbPath = DB_PATH;
-        const scrapeApiArgs = [
-          '--input-dir', jsonSubDir,
-          '--db-path', dbPath,
-          '--ingest-source', baseName
-        ];
-        if (corpusId) {
-          scrapeApiArgs.push('--corpus-id', String(corpusId));
-        }
-        const apiScraperProcess = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
-          env: {
-            ...process.env,
-            PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-            RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-            RAG_FEEDER_DB_PATH: DB_PATH,
-          },
-        });
-
-        // Stream output via WebSocket (Already correctly implemented in previous step)
-        apiScraperProcess.stdout.on('data', (data) => {
-          const message = data.toString();
-          console.log(`[APIscraper stdout]: ${message}`);
-          send(`[APIscraper] ${message}`); // Broadcast stdout
-        });
-
-        apiScraperProcess.stderr.on('data', (data) => {
-          const message = data.toString();
-          console.error(`[APIscraper stderr]: ${message}`);
-          send(`[APIscraper ERROR] ${message}`); // Broadcast stderr
-        });
-
-        apiScraperProcess.on('close', (code) => {
+      getPagesProcess.on('close', async (code) => {
+        try {
+          console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
           if (code !== 0) {
-            console.error(`[/api/extract-bibliography] ${API_SCRAPER_SCRIPT} exited with code ${code}`);
-            // Stop processing
+            const errorMessage = `[/api/extract-bibliography] get_bib_pages.py exited with code ${code}.`;
+            send(errorMessage);
+            console.error(errorMessage);
+            await runInlineFallback(`get_bib_pages failed with code ${code}`);
             return;
           }
-          console.log(`[/api/extract-bibliography] Finished ${API_SCRAPER_SCRIPT}.`);
-          console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
-        }); // End APIscraper callback
+
+          // Proceed to page-level parsing when extracted pages exist; otherwise fallback to inline citation extraction.
+          const jsonSubDir = existingPagesDir; // Subdirectory named after the base PDF name
+          const pageFiles = fs.existsSync(jsonSubDir)
+            ? fs.readdirSync(jsonSubDir).filter((file) => file.endsWith('.pdf'))
+            : [];
+
+          if (pageFiles.length === 0) {
+            const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}.`;
+            console.error(errorMessage);
+            send(errorMessage);
+            await runInlineFallback('no extracted bibliography pages found');
+            return;
+          }
+
+          const ok = await runApiScraper({
+            inputDir: jsonSubDir,
+            extractMode: 'page',
+            label: 'APIscraper (page mode)',
+          });
+          if (ok) {
+            console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
+          }
+        } finally {
+          cleanupSharedUpload();
+        }
       }); // End get_bib_pages callback
 
     } catch (error) {
       // This catch block likely only catches synchronous errors like fs.mkdirSync failure
       console.error(`[/api/extract-bibliography] Synchronous error setting up processing for ${filename}:`, error);
+      cleanupSharedUpload();
       // Cannot send response here as it might have already been sent.
     }
     // Removed Finally block as cleanup is handled in callbacks now.
