@@ -86,8 +86,13 @@
   let searchStatus = ''
   let searchSource = ''
 
+  const RAW_STATUSES = new Set(['no_metadata', 'extract_references_from_pdf', 'pending'])
   let corpusItems = []
   let corpusSource = ''
+  $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
+  $: metaItems = corpusItems.filter(i => i.status === 'with_metadata' || i.status === 'to_download_references')
+  $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded_references')
+
   let downloads = []
   let downloadsSource = ''
   let downloadsQuery = ''
@@ -1643,125 +1648,124 @@
             </details>
           </div>
           <form class="search-form" on:submit|preventDefault={runSearch}>
-            <div class="search-field">
-              <label for="search-mode">Mode</label>
-              <select
-                id="search-mode"
-                bind:value={searchMode}
-                data-testid="search-mode"
-                title="Text mode runs a boolean OpenAlex query; Seed mode starts from a JSON list."
-              >
-                <option value="query">Text query</option>
-                <option value="seed">JSON seed</option>
-              </select>
-              <p class="field-hint">Need an exact list? Use Seed mode with IDs, DOIs, or title objects.</p>
-            </div>
-            {#if searchMode === 'query'}
-              <div class="search-field">
-                <label for="search-query">Text query</label>
-                <input
-                  id="search-query"
-                  type="text"
-                  placeholder="Example: institutional economics AND governance"
-                  bind:value={searchQuery}
-                  data-testid="search-query"
-                  title='Use AND/OR/NOT. Missing operators are treated as implicit AND.'
-                  aria-describedby="search-query-hint"
-                />
-                <p id="search-query-hint" class="field-hint">
-                  Operators supported: <code>AND</code>, <code>OR</code>, <code>NOT</code>.<br />
-                  Example: <code>tax AND welfare NOT Keynes</code>.
-                </p>
+            <div class="search-primary-row">
+              <div class="search-field search-mode">
+                <label for="search-mode">Mode</label>
+                <select
+                  id="search-mode"
+                  bind:value={searchMode}
+                  data-testid="search-mode"
+                  title="Text mode runs a boolean OpenAlex query; Seed mode starts from a JSON list."
+                >
+                  <option value="query">Query</option>
+                  <option value="seed">Seed</option>
+                </select>
               </div>
-            {:else}
-              <div class="search-field">
-                <label for="search-seed-json">Seed list (JSON)</label>
-                <textarea
-                  id="search-seed-json"
-                  rows="3"
-                  placeholder={JSON.stringify(["W2741809807", { doi: "10.1111/j.1468-0335.1937.tb00002.x" }])}
-                  bind:value={searchSeedJson}
-                  data-testid="search-seed-json"
-                  title="JSON array of OpenAlex IDs, DOIs, or objects."
-                  aria-describedby="search-seed-hint"
-                ></textarea>
-                <p id="search-seed-hint" class="field-hint">
-                  Supported seed formats: <code>\"W123456789\"</code>, <code>&#123;&quot;doi&quot;: &quot;...&quot;&#125;</code>, or <code>&#123;&quot;title&quot;: &quot;...&quot;&#125;</code>.
-                </p>
+              <div class="search-field search-main-input">
+                {#if searchMode === 'query'}
+                  <div class="label-row">
+                    <label for="search-query">Text query</label>
+                    <span class="field-hint label-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</span>
+                  </div>
+                  <input
+                    id="search-query"
+                    type="text"
+                    placeholder="institutional economics AND governance"
+                    bind:value={searchQuery}
+                    data-testid="search-query"
+                    title='Use AND/OR/NOT. Missing operators are treated as implicit AND.'
+                  />
+                {:else}
+                  <div class="label-row">
+                    <label for="search-seed-json">Seed list (JSON)</label>
+                    <span class="field-hint label-hint">Supported: <code>\"W123...\"</code>, <code>&#123;&quot;doi&quot;:&quot;...&quot;&#125;</code></span>
+                  </div>
+                  <input
+                    id="search-seed-json"
+                    type="text"
+                    placeholder={JSON.stringify(["W2741809807"])}
+                    bind:value={searchSeedJson}
+                    data-testid="search-seed-json"
+                    title="JSON array of OpenAlex IDs, DOIs, or objects."
+                  />
+                {/if}
               </div>
-            {/if}
-            <div class="search-field">
-              <label for="search-field">Search field</label>
-              <select id="search-field" bind:value={searchField} title="Limit the OpenAlex query to title/abstract/fulltext scope.">
-                <option value="default">All fields</option>
-                <option value="title">Title</option>
-                <option value="abstract">Abstract</option>
-                <option value="title_and_abstract">Title + abstract</option>
-                <option value="fulltext">Full text</option>
-              </select>
-              <p class="field-hint">
-                Default searches across OpenAlex metadata and abstract/title-like fields.
-              </p>
-            </div>
-            <div class="search-field">
-              <label for="search-year-from">Publication year from</label>
-              <input id="search-year-from" type="number" placeholder="From (e.g. 2000)" bind:value={yearFrom} />
-              <p class="field-hint">Leave empty for no lower bound.</p>
-            </div>
-            <div class="search-field">
-              <label for="search-year-to">Publication year to</label>
-              <input id="search-year-to" type="number" placeholder="To (e.g. 2026)" bind:value={yearTo} />
-              <p class="field-hint">Leave empty for no upper bound.</p>
-            </div>
-            <div class="search-field">
-              <label for="search-depth-down">Downstream depth</label>
-              <input
-                id="search-depth-down"
-                type="number"
-                min="0"
-                max="4"
-                step="1"
-                placeholder="Depth"
-                bind:value={relatedDepthDownstream}
-              />
-              <p class="field-hint">0 = skip, 1 = direct references only, 2 = one hop further, etc.</p>
-            </div>
-            <div class="search-field">
-              <label for="search-depth-up">Upstream depth</label>
-              <input
-                id="search-depth-up"
-                type="number"
-                min="0"
-                max="4"
-                step="1"
-                placeholder="Depth"
-                bind:value={relatedDepthUpstream}
-              />
-              <p class="field-hint">0 = skip, 1 = direct citing works only, 2 = one hop further, etc.</p>
-            </div>
-            <div class="search-field">
-              <label for="search-max-related">Max related per work</label>
-              <input id="search-max-related" type="number" min="1" max="100" step="1" placeholder="Max related/work" bind:value={maxRelated} />
-              <p class="field-hint">Controls expansion size when references are fetched.</p>
-            </div>
-            <div class="search-field search-actions">
+              <div class="search-field search-scope">
+                <label for="search-field">Search field</label>
+                <select id="search-field" bind:value={searchField} title="Limit the OpenAlex query to title/abstract/fulltext scope.">
+                  <option value="default">All fields</option>
+                  <option value="title">Title</option>
+                  <option value="abstract">Abstract</option>
+                  <option value="title_and_abstract">Title + abstract</option>
+                  <option value="fulltext">Full text</option>
+                </select>
+              </div>
               <button
-                class="secondary"
-                type="button"
-                title="Reset all search fields to defaults."
-                on:click={resetSearchForm}
-              >
-                Reset
-              </button>
-              <button
-                class="primary"
+                class="primary search-submit-btn"
                 type="submit"
                 data-testid="search-submit"
-                title="Run OpenAlex keyword search with selected mode and filters."
+                title="Run Search"
               >
-                Search OpenAlex
+                Search
               </button>
             </div>
+
+            <div class="search-secondary-row">
+              <div class="filter-group">
+                <div class="filter-label">Published between</div>
+                <div class="filter-inputs">
+                  <input id="search-year-from" type="number" placeholder="Year" bind:value={yearFrom} class="year-input" />
+                  <span class="range-sep">–</span>
+                  <input id="search-year-to" type="number" placeholder="Year" bind:value={yearTo} class="year-input" />
+                </div>
+              </div>
+
+              <div class="filter-group">
+                <div class="filter-label">Cit. Depth (Down/Up)</div>
+                <div class="filter-inputs">
+                   <input
+                    id="search-depth-down"
+                    type="number"
+                    min="0"
+                    max="4"
+                    bind:value={relatedDepthDownstream}
+                    title="Downstream extraction depth"
+                    class="depth-input"
+                  />
+                  <span class="range-sep">/</span>
+                  <input
+                    id="search-depth-up"
+                    type="number"
+                    min="0"
+                    max="4"
+                    bind:value={relatedDepthUpstream}
+                    title="Upstream extraction depth"
+                    class="depth-input"
+                  />
+                </div>
+              </div>
+
+              <div class="filter-group">
+                 <div class="filter-label">Max related</div>
+                 <input id="search-max-related" type="number" min="1" max="100" bind:value={maxRelated} class="short-input" />
+              </div>
+
+              <div class="spacer"></div>
+
+              <button
+                class="text-btn reset-btn"
+                type="button"
+                on:click={resetSearchForm}
+              >
+                Reset filters
+              </button>
+            </div>
+            
+            {#if searchMode === 'query'}
+                 <p class="field-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</p>
+            {:else}
+                 <p class="field-hint">Supported: <code>\"W123...\"</code>, <code>&#123;&quot;doi&quot;:&quot;...&quot;&#125;</code></p>
+            {/if}
           </form>
           <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
           <div class="table">
@@ -1809,26 +1813,54 @@
               <span class="muted">{shareStatus}</span>
             {/if}
           </form>
-          <div class="table">
-            <div class="table-row header cols-corpus">
-              <span>Title</span>
-              <span>Year</span>
-              <span>Source</span>
-              <span>Status</span>
-            </div>
-            {#each corpusItems as item}
-              <div class="table-row cols-corpus">
-                <span class="line-clamp-2" title={item.title}>{item.title}</span>
-                <span class="nowrap">{item.year}</span>
-                <span class="muted truncate-line" title={item.source || '—'}>{item.source || '—'}</span>
-                <span
-                  class={`tag pipeline ${pipelineStatusTone(item.status)}`}
-                  title={pipelineStatusTitle(item.status)}
-                >
-                  {pipelineStatusLabel(item.status)}
-                </span>
+          <div class="corpus-columns">
+            <div class="corpus-column">
+              <h3>Raw / Seeds <span class="count">({rawItems.length})</span></h3>
+              <div class="table">
+                 <div class="table-row header cols-corpus-mini">
+                  <span>Title</span>
+                  <span>Year</span>
+                </div>
+                {#each rawItems as item}
+                  <div class="table-row cols-corpus-mini">
+                    <span class="line-clamp-2" title={item.title}>{item.title}</span>
+                    <span class="nowrap">{item.year}</span>
+                  </div>
+                {/each}
               </div>
-            {/each}
+            </div>
+
+            <div class="corpus-column">
+               <h3>With Metadata <span class="count">({metaItems.length})</span></h3>
+               <div class="table">
+                 <div class="table-row header cols-corpus-mini">
+                  <span>Title</span>
+                  <span>Year</span>
+                </div>
+                {#each metaItems as item}
+                  <div class="table-row cols-corpus-mini">
+                    <span class="line-clamp-2" title={item.title}>{item.title}</span>
+                    <span class="nowrap">{item.year}</span>
+                  </div>
+                {/each}
+              </div>
+            </div>
+
+            <div class="corpus-column">
+               <h3>Downloaded <span class="count">({downloadedItems.length})</span></h3>
+               <div class="table">
+                 <div class="table-row header cols-corpus-mini">
+                  <span>Title</span>
+                  <span>Year</span>
+                </div>
+                {#each downloadedItems as item}
+                  <div class="table-row cols-corpus-mini">
+                    <span class="line-clamp-2" title={item.title}>{item.title}</span>
+                    <span class="nowrap">{item.year}</span>
+                  </div>
+                {/each}
+              </div>
+            </div>
           </div>
         </div>
       {/if}
