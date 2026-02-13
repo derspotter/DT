@@ -86,12 +86,25 @@
   let searchStatus = ''
   let searchSource = ''
 
+  const CORPUS_PAGE_SIZE = 120
   const RAW_STATUSES = new Set(['no_metadata', 'extract_references_from_pdf', 'pending'])
   let corpusItems = []
+  let corpusTotal = 0
+  let corpusHasMore = false
+  let corpusLoading = false
+  let corpusLoadingMore = false
+  let corpusLoadStatus = ''
   let corpusSource = ''
   $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
   $: metaItems = corpusItems.filter(i => i.status === 'with_metadata' || i.status === 'to_download_references')
   $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded_references')
+  let selectedCorpusItemKey = ''
+  $: corpusSelectionRows = [
+    ...rawItems.map((item) => ({ bucket: 'raw', item })),
+    ...metaItems.map((item) => ({ bucket: 'metadata', item })),
+    ...downloadedItems.map((item) => ({ bucket: 'downloaded', item })),
+  ]
+  $: selectedCorpusRow = corpusSelectionRows.find((row) => corpusItemKey(row.item, row.bucket) === selectedCorpusItemKey) || null
 
   let downloads = []
   let downloadsSource = ''
@@ -211,6 +224,54 @@
   function pipelineStatusTitle(statusRaw) {
     const st = formatPipelineStatus(statusRaw)
     return st.raw || st.label
+  }
+
+  function corpusItemKey(item, bucket) {
+    if (!item) return ''
+    const id = String(item.id ?? '')
+    const status = String(item.status || '')
+    const title = String(item.title || '').trim().toLowerCase()
+    return `${bucket || 'unknown'}|${status}|${id}|${title}`
+  }
+
+  function isCorpusItemSelected(item, bucket) {
+    const key = corpusItemKey(item, bucket)
+    return key !== '' && key === selectedCorpusItemKey
+  }
+
+  function toggleCorpusItemSelection(item, bucket) {
+    const key = corpusItemKey(item, bucket)
+    if (!key) return
+    selectedCorpusItemKey = selectedCorpusItemKey === key ? '' : key
+  }
+
+  function bucketLabel(bucket) {
+    if (bucket === 'raw') return 'Raw'
+    if (bucket === 'metadata') return 'With metadata'
+    if (bucket === 'downloaded') return 'Downloaded'
+    return 'Unknown'
+  }
+
+  function doiHref(doi) {
+    const value = String(doi || '').trim()
+    if (!value) return ''
+    return value.match(/^https?:\/\//i) ? value : `https://doi.org/${value}`
+  }
+
+  function openAlexHref(openalexId) {
+    const value = String(openalexId || '').trim()
+    if (!value) return ''
+    return value.match(/^https?:\/\//i) ? value : `https://openalex.org/${value}`
+  }
+
+  function handleCorpusColumnScroll(event) {
+    if (!corpusHasMore || corpusLoadingMore || corpusLoading) return
+    const target = event?.currentTarget
+    if (!target) return
+    const remaining = target.scrollHeight - target.scrollTop - target.clientHeight
+    if (remaining <= 120) {
+      loadCorpus({ append: true })
+    }
   }
 
   function sleep(ms) {
@@ -597,16 +658,44 @@
     searchSource = ''
   }
 
-  async function loadCorpus() {
+  async function loadCorpus({ append = false } = {}) {
+    if (append) {
+      if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
+      corpusLoadingMore = true
+      corpusLoadStatus = 'Loading more corpus entries...'
+    } else {
+      corpusLoading = true
+      corpusLoadStatus = 'Loading corpus entries...'
+      corpusItems = []
+      corpusTotal = 0
+      corpusHasMore = false
+      selectedCorpusItemKey = ''
+    }
     try {
-      const { data, source } = await fetchCorpus()
-      corpusItems = data
+      const offset = append ? corpusItems.length : 0
+      const { data, total, source } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset })
+      const incoming = Array.isArray(data) ? data : []
+      corpusItems = append ? [...corpusItems, ...incoming] : incoming
+      corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
+      corpusHasMore = corpusItems.length < corpusTotal
       corpusSource = source
+      if (corpusSource === 'sample') {
+        corpusLoadStatus = 'Showing sample corpus data.'
+      } else {
+        corpusLoadStatus = corpusHasMore
+          ? `Loaded ${corpusItems.length} of ${corpusTotal} entries. Scroll to load more.`
+          : `Loaded ${corpusItems.length} entries.`
+      }
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
+        return
       }
+      corpusLoadStatus = error?.message || 'Failed to load corpus.'
+    } finally {
+      corpusLoading = false
+      corpusLoadingMore = false
     }
   }
 
@@ -1789,79 +1878,153 @@
 
       {#if activeTab === 'corpus'}
         <div class="card" data-testid="corpus-panel">
-          <h2>Corpus</h2>
-          <p class="muted">{corpusSource === 'api' ? 'Live corpus from API.' : 'Sample corpus data.'}</p>
-          <form class="corpus-share" on:submit|preventDefault={handleShareCorpus}>
+          <div class="corpus-header-row">
             <div>
-              <label>
-                Share with
-                <input type="text" placeholder="username" bind:value={shareUsername} />
-              </label>
+              <h2>Corpus</h2>
+              <p class="muted">
+                {corpusSource === 'api' ? 'Live corpus from API.' : 'Sample corpus data.'}
+                {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusTotal}.{/if}
+              </p>
             </div>
-            <div>
-              <label>
-                Role
-                <select bind:value={shareRole}>
-                  <option value="viewer">Viewer</option>
-                  <option value="editor">Editor</option>
-                  <option value="owner">Owner</option>
-                </select>
-              </label>
+            <form class="corpus-share" on:submit|preventDefault={handleShareCorpus}>
+              <div>
+                <label>
+                  Share with
+                  <input type="text" placeholder="username" bind:value={shareUsername} />
+                </label>
+              </div>
+              <div>
+                <label>
+                  Role
+                  <select bind:value={shareRole}>
+                    <option value="viewer">Viewer</option>
+                    <option value="editor">Editor</option>
+                    <option value="owner">Owner</option>
+                  </select>
+                </label>
+              </div>
+              <button class="secondary" type="submit">Share</button>
+              {#if shareStatus}
+                <span class="muted">{shareStatus}</span>
+              {/if}
+            </form>
+          </div>
+
+          <div class="corpus-details">
+            <h3>Selected entry details</h3>
+            <div class="corpus-details-grid" class:muted={!selectedCorpusRow}>
+              <div>
+                <span>Stage</span>
+                <strong>{selectedCorpusRow ? bucketLabel(selectedCorpusRow.bucket) : '-'}</strong>
+              </div>
+              <div>
+                <span>Status</span>
+                <strong>{selectedCorpusRow ? pipelineStatusLabel(selectedCorpusRow.item.status) : '-'}</strong>
+              </div>
+              <div>
+                <span>ID</span>
+                <strong>{selectedCorpusRow?.item.id ?? '-'}</strong>
+              </div>
+              <div>
+                <span>Year</span>
+                <strong>{selectedCorpusRow?.item.year || '-'}</strong>
+              </div>
+              <div class="span-2">
+                <span>Title</span>
+                <strong>{selectedCorpusRow?.item.title || (selectedCorpusRow ? 'Untitled' : '-')}</strong>
+              </div>
+              <div class="span-2">
+                <span>Source</span>
+                <strong>{selectedCorpusRow?.item.source || '-'}</strong>
+              </div>
+              <div class="span-2">
+                <span>DOI</span>
+                {#if selectedCorpusRow?.item.doi}
+                  <a href={doiHref(selectedCorpusRow.item.doi)} target="_blank" rel="noreferrer">{selectedCorpusRow.item.doi}</a>
+                {:else}
+                  <strong>-</strong>
+                {/if}
+              </div>
+              <div class="span-2">
+                <span>OpenAlex</span>
+                {#if selectedCorpusRow?.item.openalex_id}
+                  <a href={openAlexHref(selectedCorpusRow.item.openalex_id)} target="_blank" rel="noreferrer">{selectedCorpusRow.item.openalex_id}</a>
+                {:else}
+                  <strong>-</strong>
+                {/if}
+              </div>
             </div>
-            <button class="secondary" type="submit">Share corpus</button>
-            {#if shareStatus}
-              <span class="muted">{shareStatus}</span>
-            {/if}
-          </form>
+          </div>
           <div class="corpus-columns">
             <div class="corpus-column">
               <h3>Raw / Seeds <span class="count">({rawItems.length})</span></h3>
-              <div class="table">
+              <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
                   <span>Year</span>
                 </div>
                 {#each rawItems as item}
-                  <div class="table-row cols-corpus-mini">
+                  <button
+                    class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'raw') ? 'selected' : ''}`}
+                    type="button"
+                    on:click={() => toggleCorpusItemSelection(item, 'raw')}
+                  >
                     <span class="line-clamp-2" title={item.title}>{item.title}</span>
                     <span class="nowrap">{item.year}</span>
-                  </div>
+                  </button>
                 {/each}
               </div>
             </div>
 
             <div class="corpus-column">
                <h3>With Metadata <span class="count">({metaItems.length})</span></h3>
-               <div class="table">
+               <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
                   <span>Year</span>
                 </div>
                 {#each metaItems as item}
-                  <div class="table-row cols-corpus-mini">
+                  <button
+                    class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'metadata') ? 'selected' : ''}`}
+                    type="button"
+                    on:click={() => toggleCorpusItemSelection(item, 'metadata')}
+                  >
                     <span class="line-clamp-2" title={item.title}>{item.title}</span>
                     <span class="nowrap">{item.year}</span>
-                  </div>
+                  </button>
                 {/each}
               </div>
             </div>
 
             <div class="corpus-column">
                <h3>Downloaded <span class="count">({downloadedItems.length})</span></h3>
-               <div class="table">
+               <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
                   <span>Year</span>
                 </div>
                 {#each downloadedItems as item}
-                  <div class="table-row cols-corpus-mini">
+                  <button
+                    class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'downloaded') ? 'selected' : ''}`}
+                    type="button"
+                    on:click={() => toggleCorpusItemSelection(item, 'downloaded')}
+                  >
                     <span class="line-clamp-2" title={item.title}>{item.title}</span>
                     <span class="nowrap">{item.year}</span>
-                  </div>
+                  </button>
                 {/each}
               </div>
             </div>
           </div>
+          <div class="corpus-lazy-status">
+            <span class="muted">{corpusLoadStatus}</span>
+            {#if corpusHasMore}
+              <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore || corpusLoading}>
+                {corpusLoadingMore ? 'Loading…' : 'Load more'}
+              </button>
+            {/if}
+          </div>
+
         </div>
       {/if}
 

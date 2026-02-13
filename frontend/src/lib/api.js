@@ -271,21 +271,25 @@ export async function runKeywordSearch({
   }
 }
 
-export async function fetchCorpus() {
+export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/api/corpus`)
+    const params = new URLSearchParams()
+    params.set('limit', String(limit))
+    params.set('offset', String(offset))
+    const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
     await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
     }
     const payload = await response.json()
     const data = Array.isArray(payload) ? payload : payload.items || []
-    return { data, source: payload.source || 'api' }
+    const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
+    return { data, total, source: payload.source || 'api' }
   } catch (error) {
     if (error?.status === 401) {
       throw error
     }
-    return { data: sampleCorpus, source: 'sample', error }
+    return { data: sampleCorpus, total: sampleCorpus.length, source: 'sample', error }
   }
 }
 
