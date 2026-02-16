@@ -873,35 +873,56 @@
       exportBusy = false
     }
   }
+  function applyGraphData(data, source, statusText = '') {
+    graphNodes = data.nodes || []
+    graphEdges = data.edges || []
+    graphStats = data.stats || null
+    graphSource = source
+    graphStatus = statusText || (source === 'api' ? 'Loaded from API.' : 'Sample graph loaded.')
+    const degreeMap = buildDegreeMap(graphNodes, graphEdges)
+    graphDegreeMap = degreeMap
+    const { layoutEdges } = buildLayoutEdges(graphNodes, graphEdges, degreeMap)
+    graphLayout = buildGraphLayout(graphNodes, graphEdges, layoutEdges, degreeMap, {
+      focusConnected: graphFocusConnected,
+    })
+    graphNodeMap = new Map(graphLayout.map((node) => [node.id, node]))
+    graphVisibleEdges = graphEdges.filter(
+      (edge) => graphNodeMap.has(edge.source) && graphNodeMap.has(edge.target)
+    )
+    hoveredNodeId = null
+    graphCanvasSize = graphLayout[0]?.canvasSize || 440
+    graphViewBox = { x: 0, y: 0, size: graphCanvasSize }
+  }
+
   async function loadGraph() {
     graphStatus = 'Loading graph...'
     try {
-      const { data, source } = await fetchGraph({
+      const baseParams = {
         maxNodes: graphMaxNodes,
         relationship: graphRelationship,
         status: graphStatusFilter,
         yearFrom: graphYearFrom ? Number(graphYearFrom) : null,
         yearTo: graphYearTo ? Number(graphYearTo) : null,
+      }
+      const primary = await fetchGraph({
+        ...baseParams,
         hideIsolates: graphHideIsolates,
       })
-      graphNodes = data.nodes || []
-      graphEdges = data.edges || []
-      graphStats = data.stats || null
-      graphSource = source
-      graphStatus = source === 'api' ? 'Loaded from API.' : 'Sample graph loaded.'
-      const degreeMap = buildDegreeMap(graphNodes, graphEdges)
-      graphDegreeMap = degreeMap
-      const { layoutEdges } = buildLayoutEdges(graphNodes, graphEdges, degreeMap)
-      graphLayout = buildGraphLayout(graphNodes, graphEdges, layoutEdges, degreeMap, {
-        focusConnected: graphFocusConnected,
-      })
-      graphNodeMap = new Map(graphLayout.map((node) => [node.id, node]))
-      graphVisibleEdges = graphEdges.filter(
-        (edge) => graphNodeMap.has(edge.source) && graphNodeMap.has(edge.target)
-      )
-      hoveredNodeId = null
-      graphCanvasSize = graphLayout[0]?.canvasSize || 440
-      graphViewBox = { x: 0, y: 0, size: graphCanvasSize }
+      const primaryData = primary.data || {}
+      if (graphHideIsolates && (primaryData.nodes || []).length === 0) {
+        const retry = await fetchGraph({ ...baseParams, hideIsolates: false })
+        const retryData = retry.data || {}
+        if ((retryData.nodes || []).length > 0) {
+          graphHideIsolates = false
+          applyGraphData(
+            retryData,
+            retry.source,
+            'No connected citation edges for this corpus; showing isolated works.'
+          )
+          return
+        }
+      }
+      applyGraphData(primaryData, primary.source)
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
