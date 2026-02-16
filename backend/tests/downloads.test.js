@@ -35,4 +35,21 @@ describe('GET /api/downloads', () => {
     expect(stop.status).toBe(200)
     expect(stop.body).toHaveProperty('running')
   })
+
+  test('exposes global pipeline worker controls (stub)', async () => {
+    const status = await request(app).get('/api/pipeline/worker/status')
+    expect(status.status).toBe(200)
+    expect(status.body).toHaveProperty('running')
+    expect(status.body).toHaveProperty('config')
+
+    const start = await request(app)
+      .post('/api/pipeline/worker/start')
+      .send({ intervalSeconds: 30, promoteBatchSize: 10, downloadBatchSize: 3, downloadWorkers: 0 })
+    expect(start.status).toBe(200)
+    expect(start.body).toHaveProperty('running')
+
+    const pause = await request(app).post('/api/pipeline/worker/pause').send({ force: false })
+    expect(pause.status).toBe(200)
+    expect(pause.body).toHaveProperty('running')
+  })
 })

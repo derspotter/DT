@@ -377,6 +377,58 @@ export async function runDownloadWorkerOnce({ batchSize = 3 } = {}) {
   return response.json()
 }
 
+export async function fetchPipelineWorkerStatus() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/worker/status`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load pipeline worker status')
+  }
+  return response.json()
+}
+
+export async function startPipelineWorker({
+  intervalSeconds = 15,
+  promoteBatchSize = 25,
+  promoteWorkers = 6,
+  downloadBatchSize = 5,
+  downloadWorkers = 0,
+} = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/pipeline/worker/start`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ intervalSeconds, promoteBatchSize, promoteWorkers, downloadBatchSize, downloadWorkers }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to start pipeline worker')
+  }
+  return response.json()
+}
+
+export async function pausePipelineWorker({ force = false } = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/pipeline/worker/pause`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to pause pipeline worker')
+  }
+  return response.json()
+}
+
 export async function downloadCorpusExport(format, { status = '', yearFrom = '', yearTo = '', source = '' } = {}) {
   const params = new URLSearchParams()
   if (status) params.set('status', String(status))

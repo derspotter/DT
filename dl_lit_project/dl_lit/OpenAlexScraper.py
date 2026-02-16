@@ -2,15 +2,46 @@ import json
 import re
 from urllib.parse import quote_plus
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from pathlib import Path
 import argparse
 import concurrent.futures
+import os
 from .utils import get_global_rate_limiter
 
 try:
     from rapidfuzz import fuzz
 except ImportError:
     raise ImportError("Module 'rapidfuzz' not found. Install with 'pip install rapidfuzz'")
+
+
+def _build_retry_session(
+    *,
+    total_retries: int = 5,
+    backoff_factor: float = 0.5,
+    pool_connections: int = 64,
+    pool_maxsize: int = 64,
+):
+    """Create a requests session with retry/backoff tuned for OpenAlex/Crossref."""
+    retry = Retry(
+        total=total_retries,
+        read=total_retries,
+        connect=total_retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=pool_connections, pool_maxsize=pool_maxsize)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+_missing_api_key_warned = False
 
 
 def clean_search_term(term):
@@ -38,7 +69,15 @@ def convert_inverted_index_to_text(inverted_index):
     text = " ".join(word for word, _ in word_positions)
     return text
 
-def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max_citations=100):
+def fetch_citing_work_ids(
+    cited_by_url,
+    rate_limiter,
+    mailto="spott@wzb.eu",
+    max_citations=100,
+    session=None,
+    timeout=20,
+    api_key=None,
+):
     """
     Fetches the OpenAlex IDs of works that cite the work at the given URL.
     Handles pagination to get all citing work IDs.
@@ -48,6 +87,8 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max
 
     citing_work_ids = []
     url = f"{cited_by_url}&select=id,title,display_name,authorships,publication_year,doi,type&per-page=100&mailto={mailto}"
+    if api_key:
+        url = f"{url}&api_key={quote_plus(api_key)}"
     page = 1
 
     print(f"Fetching citing works from: {cited_by_url} (max: {max_citations})")
@@ -56,8 +97,8 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max
         try:
             # Apply rate limiting
             rate_limiter.wait_if_needed('openalex')
-
-            response = requests.get(url, headers={"Accept": "application/json"})
+            http = session or requests
+            response = http.get(url, headers={"Accept": "application/json"}, timeout=timeout)
             response.raise_for_status()
             data = response.json()
 
@@ -97,7 +138,15 @@ def fetch_citing_work_ids(cited_by_url, rate_limiter, mailto="spott@wzb.eu", max
     print(f"Finished fetching citing works. Found {len(citing_work_ids)}")
     return citing_work_ids
 
-def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spott@wzb.eu", include_links: bool = False):
+def fetch_referenced_work_details(
+    referenced_work_ids,
+    rate_limiter,
+    mailto="spott@wzb.eu",
+    include_links: bool = False,
+    session=None,
+    timeout=20,
+    api_key=None,
+):
     """
     Fetches detailed metadata for a list of referenced work OpenAlex IDs.
     Uses batch requests to efficiently get details for multiple works.
@@ -129,10 +178,13 @@ def fetch_referenced_work_details(referenced_work_ids, rate_limiter, mailto="spo
         if include_links:
             select_fields += ",referenced_works,cited_by_api_url"
         url = f"https://api.openalex.org/works?filter=openalex_id:{ids_query}&select={select_fields}&per-page=50&mailto={mailto}"
+        if api_key:
+            url = f"{url}&api_key={quote_plus(api_key)}"
         
         try:
             rate_limiter.wait_if_needed('openalex')
-            response = requests.get(url, headers={"Accept": "application/json"})
+            http = session or requests
+            response = http.get(url, headers={"Accept": "application/json"}, timeout=timeout)
             response.raise_for_status()
             data = response.json()
             
@@ -316,20 +368,63 @@ def find_best_author_match(ref_authors, result, ref_editors=None):
 
 def get_authors_and_editors(ref):
     """Get separate lists of authors and editors from reference, expanding multi-author strings."""
-    
+
+    def _normalize_people_field(raw_value):
+        """Normalize person fields that may arrive as list, JSON text, or plain string."""
+        if not raw_value:
+            return []
+
+        if isinstance(raw_value, str):
+            candidate = raw_value.strip()
+            if not candidate:
+                return []
+            if candidate.startswith("[") and candidate.endswith("]"):
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    parsed = [raw_value]
+                else:
+                    if isinstance(parsed, list):
+                        raw_value = parsed
+                    elif isinstance(parsed, str):
+                        raw_value = [parsed]
+                    else:
+                        raw_value = [raw_value]
+            else:
+                raw_value = [raw_value]
+        elif not isinstance(raw_value, list):
+            raw_value = [raw_value]
+
+        normalized = []
+        for item in raw_value:
+            if isinstance(item, str):
+                item = item.strip()
+                if item:
+                    normalized.append(item)
+                continue
+
+            if isinstance(item, dict):
+                display = item.get("display_name") or item.get("name") or item.get("full_name")
+                if isinstance(display, str) and display.strip():
+                    normalized.append(display.strip())
+                    continue
+
+                first = item.get("given") or item.get("first_name") or item.get("first")
+                last = item.get("family") or item.get("last_name") or item.get("last")
+                first = first.strip() if isinstance(first, str) else ""
+                last = last.strip() if isinstance(last, str) else ""
+                if first or last:
+                    normalized.append(f"{last}, {first}".strip(", "))
+
+        return normalized
+
     def expand_author_list(author_list_in):
+        author_list_in = _normalize_people_field(author_list_in)
         if not author_list_in:
             return []
-        
-        # Ensure it's a list to start with
-        if isinstance(author_list_in, str):
-            author_list_in = [author_list_in]
 
         expanded_list = []
         for item in author_list_in:
-            if not isinstance(item, str):
-                continue
-
             # Heuristic: if a string contains multiple commas, it might be a list of authors
             # in the format "Last1, F1., Last2, F2."
             if item.count(',') > 1:
@@ -371,6 +466,22 @@ class OpenAlexCrossrefSearcher:
         self.rate_limiter = rate_limiter or get_global_rate_limiter()
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
+        self.api_key = os.getenv('OPENALEX_API_KEY') or os.getenv('RAG_FEEDER_OPENALEX_API_KEY')
+        global _missing_api_key_warned
+        if not self.api_key and not _missing_api_key_warned:
+            print(
+                "[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key."
+            )
+            _missing_api_key_warned = True
+        self.openalex_timeout = float(os.getenv('RAG_FEEDER_OPENALEX_TIMEOUT', '20'))
+        self.crossref_timeout = float(os.getenv('RAG_FEEDER_CROSSREF_TIMEOUT', '20'))
+        self.openalex_session = _build_retry_session()
+        self.crossref_session = _build_retry_session()
+
+    def _with_openalex_auth(self, params):
+        if self.api_key:
+            params['api_key'] = self.api_key
+        return params
 
     def search_crossref(self, title, authors, year):
         """Search Crossref for matching works."""
@@ -390,7 +501,7 @@ class OpenAlexCrossrefSearcher:
         
         try:
             self.rate_limiter.wait_if_needed('crossref')
-            response = requests.get(url, headers=self.crossref_headers)
+            response = self.crossref_session.get(url, headers=self.crossref_headers, timeout=self.crossref_timeout)
             response.raise_for_status()
             data = response.json()
             
@@ -442,12 +553,18 @@ class OpenAlexCrossrefSearcher:
                 'select': self.fields,
                 'per-page': 1
             }
+            params = self._with_openalex_auth(params)
             
             try:
                 print(f"\nStep {step}: DOI Direct Search")
                 print(f"DOI: {doi}")
                 rate_limiter.wait_if_needed('openalex')
-                response = requests.get(self.base_url, headers=self.headers, params=params)
+                response = self.openalex_session.get(
+                    self.base_url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.openalex_timeout,
+                )
                 response.raise_for_status()
                 data = response.json()
                 
@@ -494,6 +611,7 @@ class OpenAlexCrossrefSearcher:
                 'select': self.fields,
                 'per-page': 10
             }
+            params = self._with_openalex_auth(params)
         
         # Step 8: Crossref search
         elif step == 8:
@@ -516,7 +634,7 @@ class OpenAlexCrossrefSearcher:
                 print(f"Crossref Query: {url}")
                 
                 rate_limiter.wait_if_needed('crossref')
-                response = requests.get(url, headers=self.crossref_headers)
+                response = self.crossref_session.get(url, headers=self.crossref_headers, timeout=self.crossref_timeout)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -570,6 +688,7 @@ class OpenAlexCrossrefSearcher:
                 'select': self.fields,
                 'per-page': 10
             }
+            params = self._with_openalex_auth(params)
         else:
             return {"step": step, "results": [], "success": False, "error": "Invalid step"}
 
@@ -581,12 +700,18 @@ class OpenAlexCrossrefSearcher:
                     'select': self.fields,
                     'per-page': 10
                 }
+                 params = self._with_openalex_auth(params)
 
             try:
                 print(f"\nStep {step}: OpenAlex Query")
                 print(f"Params: {params}")
                 rate_limiter.wait_if_needed('openalex')
-                response = requests.get(self.base_url, headers=self.headers, params=params)
+                response = self.openalex_session.get(
+                    self.base_url,
+                    headers=self.headers,
+                    params=params,
+                    timeout=self.openalex_timeout,
+                )
                 response.raise_for_status()
                 data = response.json()
                 return {"step": step, "results": data.get('results', []), "success": True, "meta": data.get('meta')}
@@ -634,7 +759,10 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
             enriched_ref['citing_works_ids'] = fetch_citing_work_ids(
                 enriched_ref['best_match_result']['cited_by_api_url'], 
                 searcher.rate_limiter, 
-                searcher.headers['User-Agent'].split('/')[-1] # Extract mailto from User-Agent
+                searcher.headers['User-Agent'].split('/')[-1], # Extract mailto from User-Agent
+                session=searcher.openalex_session,
+                timeout=searcher.openalex_timeout,
+                api_key=searcher.api_key,
             )
         enriched_references.append(enriched_ref if enriched_ref else ref)
 
@@ -703,8 +831,30 @@ def process_single_reference(
     max_citations=100,
     related_depth: int = 1,
     max_related_per_reference: int = 40,
+    return_diagnostics: bool = False,
 ):
     """Process a single reference to find its OpenAlex entry and potentially citing works."""
+    diagnostics = {
+        "had_api_error": False,
+        "api_errors": [],
+        "attempted_steps": [],
+        "status": "unknown",
+    }
+    non_api_errors = {
+        "DOI required for step 0",
+        "Container title needed for step 9",
+        "Invalid step",
+    }
+
+    def _record_api_error(step_name, result_payload):
+        diagnostics["had_api_error"] = True
+        diagnostics["api_errors"].append(
+            {
+                "step": step_name,
+                "error": (result_payload or {}).get("error"),
+            }
+        )
+
     title = ref.get('title')
     year = ref.get('year')
     container_title = ref.get('container-title') # Journal or book title
@@ -715,6 +865,9 @@ def process_single_reference(
     if not title and not doi:
         # This print is useful, so we keep it.
         print(f"Skipping reference due to missing title and DOI: {ref.get('id', 'Unknown ID')}")
+        diagnostics["status"] = "invalid_input"
+        if return_diagnostics:
+            return None, diagnostics
         return None # Return None on failure
 
     all_results = {} # Store unique results by ID
@@ -724,7 +877,10 @@ def process_single_reference(
     normalized_doi = normalize_doi(doi)
     if normalized_doi:
         print(f"\nProcessing reference with DOI: {normalized_doi}")
+        diagnostics["attempted_steps"].append(0)
         results = searcher.search(title, year, container_title, abstract, keywords, 0, rate_limiter=rate_limiter, doi=normalized_doi)
+        if not results.get("success") and str(results.get("error") or "") not in non_api_errors:
+            _record_api_error(0, results)
         
         if results['success'] and results['results']:
             # DOI match found - accept immediately without author matching
@@ -745,6 +901,9 @@ def process_single_reference(
                 related_depth=related_depth,
                 max_related_per_reference=max_related_per_reference,
             )
+            diagnostics["status"] = "matched"
+            if return_diagnostics:
+                return final_enrichment, diagnostics
             return final_enrichment
         else:
             print(f"DOI search failed or no results, proceeding with regular search")
@@ -752,11 +911,17 @@ def process_single_reference(
     # If no DOI or DOI search failed, proceed with regular steps 1-9
     if not title:
         print(f"Skipping reference due to missing title: {ref.get('id', 'Unknown ID')}")
+        diagnostics["status"] = "invalid_input"
+        if return_diagnostics:
+            return None, diagnostics
         return None
     
     # Try all steps 1-9 in order, collecting all possible results
     for step in range(1, 10):
+        diagnostics["attempted_steps"].append(step)
         results = searcher.search(title, year, container_title, abstract, keywords, step, rate_limiter=rate_limiter)
+        if not results.get("success") and str(results.get("error") or "") not in non_api_errors:
+            _record_api_error(step, results)
         
         if results['success']:
             if first_success_step is None and len(results['results']) > 0:
@@ -777,7 +942,10 @@ def process_single_reference(
         if result.get('id', '').startswith('crossref:') and result.get('doi')
     }
     for crossref_doi in sorted({d for d in crossref_dois if d}):
+        diagnostics["attempted_steps"].append("crossref_doi_resolve")
         doi_lookup = searcher.search(None, None, None, None, None, 0, rate_limiter=rate_limiter, doi=crossref_doi)
+        if not doi_lookup.get("success") and str(doi_lookup.get("error") or "") not in non_api_errors:
+            _record_api_error("crossref_doi_resolve", doi_lookup)
         if doi_lookup.get('success') and doi_lookup.get('results'):
             for result in doi_lookup['results']:
                 result_id = result.get('id')
@@ -848,9 +1016,15 @@ def process_single_reference(
                 related_depth=related_depth,
                 max_related_per_reference=max_related_per_reference,
             )
+            diagnostics["status"] = "matched"
+            if return_diagnostics:
+                return final_enrichment, diagnostics
             return final_enrichment
 
     # If no high-confidence match is found or no results at all, return None.
+    diagnostics["status"] = "api_error" if diagnostics["had_api_error"] else "no_match"
+    if return_diagnostics:
+        return None, diagnostics
     return None
 
 def _normalize_openalex_id(value: str | None) -> str | None:
@@ -886,6 +1060,9 @@ def _fetch_related_works(
             rate_limiter,
             searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
             include_links=related_depth > 1,
+            session=searcher.openalex_session,
+            timeout=searcher.openalex_timeout,
+            api_key=searcher.api_key,
         )
 
         if related_depth > 1 and enrichment_data['referenced_works']:
@@ -916,6 +1093,9 @@ def _fetch_related_works(
                     rate_limiter,
                     searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
                     include_links=False,
+                    session=searcher.openalex_session,
+                    timeout=searcher.openalex_timeout,
+                    api_key=searcher.api_key,
                 )
                 detail_map = {
                     _normalize_openalex_id(item.get('openalex_id')): item for item in secondary_details
@@ -937,7 +1117,10 @@ def _fetch_related_works(
             openalex_result['cited_by_api_url'],
             rate_limiter,
             searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
-            max_citations
+            max_citations,
+            session=searcher.openalex_session,
+            timeout=searcher.openalex_timeout,
+            api_key=searcher.api_key,
         )
     
     return enrichment_data

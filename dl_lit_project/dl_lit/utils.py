@@ -4,6 +4,7 @@ import time
 import threading
 from collections import deque
 from datetime import datetime, timedelta
+import os
 
 
 class ServiceRateLimiter:
@@ -65,17 +66,38 @@ class ServiceRateLimiter:
 # Global shared rate limiter instance for the entire application
 _global_rate_limiter = None
 
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return max(minimum, int(default))
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return max(minimum, int(default))
+
+
 def get_global_rate_limiter():
     """Get the shared rate limiter instance for the entire application."""
     global _global_rate_limiter
     if _global_rate_limiter is None:
+        default_rps = _env_int('RAG_FEEDER_API_DEFAULT_RPS', 10)
+        openalex_rps = _env_int('RAG_FEEDER_OPENALEX_RPS', 30)
+        crossref_rps = _env_int('RAG_FEEDER_CROSSREF_RPS', 20)
+        unpaywall_rps = _env_int('RAG_FEEDER_UNPAYWALL_RPS', 3)
+        scihub_rps = _env_int('RAG_FEEDER_SCIHUB_RPS', 1)
+        libgen_rps = _env_int('RAG_FEEDER_LIBGEN_RPS', 1)
+        gemini_per_minute = _env_int('RAG_FEEDER_GEMINI_PER_MIN', 10)
+        gemini_daily = _env_int('RAG_FEEDER_GEMINI_DAILY', 250)
         _global_rate_limiter = ServiceRateLimiter({
-            'default': {'limit': 2, 'window': 1},           # 2 requests per second
-            'unpaywall': {'limit': 3, 'window': 1},         # 3 requests per second  
-            'scihub': {'limit': 1, 'window': 2},            # 1 request per 2 seconds
-            'libgen': {'limit': 1, 'window': 2},            # 1 request per 2 seconds
-            'gemini': {'limit': 10, 'window': 60},          # 10 requests per minute
-            'gemini_daily': {'limit': 250, 'window': 86400} # 250 requests per day
+            'default': {'limit': default_rps, 'window': 1},
+            'openalex': {'limit': openalex_rps, 'window': 1},
+            'crossref': {'limit': crossref_rps, 'window': 1},
+            'unpaywall': {'limit': unpaywall_rps, 'window': 1},
+            'scihub': {'limit': scihub_rps, 'window': 1},
+            'libgen': {'limit': libgen_rps, 'window': 1},
+            'gemini': {'limit': gemini_per_minute, 'window': 60},
+            'gemini_daily': {'limit': gemini_daily, 'window': 86400}
         })
     return _global_rate_limiter
 

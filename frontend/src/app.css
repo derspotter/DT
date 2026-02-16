@@ -143,6 +143,28 @@ select {
   min-width: 150px;
 }
 
+.header-pipeline {
+  border-top: 1px solid var(--stroke);
+  padding-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.header-pipeline__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-pipeline__meta {
+  line-height: 1.35;
+}
+
+.header-pipeline__actions {
+  display: flex;
+  gap: 8px;
+}
+
 .header-log-stream {
   grid-column: 1 / -1;
   border: 1px solid var(--stroke);
@@ -166,10 +188,12 @@ select {
 }
 
 .header-log-stream__body {
+  min-height: 110px;
   max-height: 110px;
   overflow-y: auto;
   display: grid;
   gap: 6px;
+  align-content: start;
 }
 
 .header-log-line {
@@ -181,7 +205,9 @@ select {
   border: 1px solid rgba(196, 188, 176, 0.7);
   border-radius: 8px;
   padding: 6px 8px;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .login-shell {
@@ -1457,6 +1483,10 @@ button.danger:disabled {
     flex-direction: column;
     align-items: flex-start;
     width: 100%;
+  }
+
+  .header-pipeline__actions {
+    flex-wrap: wrap;
   }
 
   .layout {

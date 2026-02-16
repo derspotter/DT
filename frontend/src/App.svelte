@@ -1,5 +1,5 @@
 <script>
-  import { onMount } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import {
     login,
     fetchMe,
@@ -21,6 +21,9 @@
     startDownloadWorker,
     stopDownloadWorker,
     runDownloadWorkerOnce,
+    fetchPipelineWorkerStatus,
+    startPipelineWorker,
+    pausePipelineWorker,
     fetchGraph,
     downloadCorpusExport,
   } from './lib/api'
@@ -134,6 +137,18 @@
   let downloadWorkerIntervalSeconds = 60
   let downloadWorkerBatchSize = 3
   let downloadWorkerBusy = false
+  let pipelineWorker = {
+    running: false,
+    in_flight: false,
+    started_at: null,
+    last_tick_at: null,
+    last_result: null,
+    last_error: null,
+    resolved_download_workers: 1,
+    config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
+  }
+  let pipelineWorkerStatus = ''
+  let pipelineWorkerBusy = false
   let exportBusy = false
   let exportStatus = ''
   let exportFilterStatus = 'all'
@@ -172,6 +187,10 @@
   let graphPanStart = { x: 0, y: 0, viewX: 0, viewY: 0 }
   let pipelineRefreshTimer = null
   let pipelineRefreshInFlight = false
+  let liveRefreshIntervalId = null
+  let rawCorpusTableEl = null
+  let metaCorpusTableEl = null
+  let downloadedCorpusTableEl = null
   let creatingCorpus = false
   let shareUsername = ''
   let shareRole = 'viewer'
@@ -295,6 +314,10 @@
     const text = String(logLine || '')
     if (!text) return false
     return (
+      text.includes('[pipeline-worker]') ||
+      text.includes('[pipeline-worker mark]') ||
+      text.includes('[pipeline-worker enrich]') ||
+      text.includes('[download-worker] done') ||
       text.includes('[SUCCESS] Inserted') ||
       text.includes('Bibliography extraction complete') ||
       text.includes('Finished APIscraper') ||
@@ -309,11 +332,57 @@
       if (pipelineRefreshInFlight || authStatus !== 'authenticated') return
       pipelineRefreshInFlight = true
       try {
-        await Promise.all([loadIngestStats(), loadIngestRuns(), loadCorpus()])
+        await Promise.all([
+          loadIngestStats({ quiet: true }),
+          loadIngestRuns(),
+          loadCorpus({ preserveSelection: true, quiet: true }),
+          loadPipelineWorkerStatus({ quiet: true }),
+          loadDownloadWorkerStatus({ quiet: true }),
+          loadDownloads(),
+        ])
       } finally {
         pipelineRefreshInFlight = false
       }
     }, delayMs)
+  }
+
+  function snapshotCorpusScroll() {
+    return {
+      raw: rawCorpusTableEl?.scrollTop ?? 0,
+      meta: metaCorpusTableEl?.scrollTop ?? 0,
+      downloaded: downloadedCorpusTableEl?.scrollTop ?? 0,
+    }
+  }
+
+  function restoreCorpusScroll(snapshot) {
+    if (!snapshot) return
+    if (rawCorpusTableEl) rawCorpusTableEl.scrollTop = snapshot.raw
+    if (metaCorpusTableEl) metaCorpusTableEl.scrollTop = snapshot.meta
+    if (downloadedCorpusTableEl) downloadedCorpusTableEl.scrollTop = snapshot.downloaded
+  }
+
+  function shouldRunLiveRefresh() {
+    if (authStatus !== 'authenticated') return false
+    if (pipelineWorker.running || pipelineWorker.in_flight) return true
+    if (downloadWorker.running || downloadWorker.in_flight) return true
+    return activeTab === 'corpus' || activeTab === 'dashboard' || activeTab === 'downloads'
+  }
+
+  async function runLiveRefreshCycle() {
+    if (!shouldRunLiveRefresh()) return
+    if (pipelineRefreshInFlight) return
+    pipelineRefreshInFlight = true
+    try {
+      await Promise.all([
+        loadIngestStats({ quiet: true }),
+        loadCorpus({ preserveSelection: true, quiet: true }),
+        loadDownloads(),
+        loadDownloadWorkerStatus({ quiet: true }),
+        loadPipelineWorkerStatus({ quiet: true }),
+      ])
+    } finally {
+      pipelineRefreshInFlight = false
+    }
   }
 
   async function bootstrapAuth() {
@@ -366,6 +435,7 @@
     await loadCorpus()
     await loadDownloads()
     await loadDownloadWorkerStatus()
+    await loadPipelineWorkerStatus()
     await loadGraph()
   }
 
@@ -635,19 +705,19 @@
     }
   }
 
-  async function loadIngestStats() {
-    ingestStatsStatus = 'Loading ingest stats...'
+  async function loadIngestStats({ quiet = false } = {}) {
+    if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
     try {
       const payload = await fetchIngestStats()
       ingestStats = payload.stats || ingestStats
-      ingestStatsStatus = 'Loaded ingest stats.'
+      if (!quiet) ingestStatsStatus = 'Loaded ingest stats.'
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
-      ingestStatsStatus = 'Failed to load ingest stats.'
+      if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
       apiStatus = 'offline'
     }
   }
@@ -696,19 +766,24 @@
     searchSource = ''
   }
 
-  async function loadCorpus({ append = false } = {}) {
+  async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
+    const scrollSnapshot = !append && preserveSelection ? snapshotCorpusScroll() : null
     if (append) {
       if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
       corpusLoadingMore = true
-      corpusLoadStatus = 'Loading more corpus entries...'
+      if (!quiet) corpusLoadStatus = 'Loading more corpus entries...'
     } else {
       corpusLoading = true
-      corpusLoadStatus = 'Loading corpus entries...'
-      corpusItems = []
-      corpusTotal = 0
-      corpusHasMore = false
-      corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
-      selectedCorpusItemKey = ''
+      if (!quiet) {
+        corpusLoadStatus = 'Loading corpus entries...'
+        corpusItems = []
+        corpusTotal = 0
+        corpusHasMore = false
+        corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
+      }
+      if (!preserveSelection) {
+        selectedCorpusItemKey = ''
+      }
     }
     try {
       const offset = append ? corpusItems.length : 0
@@ -726,11 +801,17 @@
         }
       }
       if (corpusSource === 'sample') {
-        corpusLoadStatus = 'Showing sample corpus data.'
+        if (!quiet) corpusLoadStatus = 'Showing sample corpus data.'
       } else {
-        corpusLoadStatus = corpusHasMore
-          ? `Loaded ${corpusItems.length} of ${corpusTotal} entries. Scroll to load more.`
-          : `Loaded ${corpusItems.length} entries.`
+        if (!quiet) {
+          corpusLoadStatus = corpusHasMore
+            ? `Loaded ${corpusItems.length} of ${corpusTotal} entries. Scroll to load more.`
+            : `Loaded ${corpusItems.length} entries.`
+        }
+      }
+      if (scrollSnapshot) {
+        await tick()
+        restoreCorpusScroll(scrollSnapshot)
       }
     } catch (error) {
       if (error?.status === 401) {
@@ -738,7 +819,9 @@
         setAuthToken('')
         return
       }
-      corpusLoadStatus = error?.message || 'Failed to load corpus.'
+      if (!quiet) {
+        corpusLoadStatus = error?.message || 'Failed to load corpus.'
+      }
     } finally {
       corpusLoading = false
       corpusLoadingMore = false
@@ -758,21 +841,89 @@
     }
   }
 
-  async function loadDownloadWorkerStatus() {
-    downloadWorkerStatus = 'Loading worker status...'
+  async function loadDownloadWorkerStatus({ quiet = false } = {}) {
+    if (!quiet) downloadWorkerStatus = 'Loading worker status...'
     try {
       const payload = await fetchDownloadWorkerStatus()
       downloadWorker = payload
       downloadWorkerIntervalSeconds = payload?.config?.intervalSeconds ?? downloadWorkerIntervalSeconds
       downloadWorkerBatchSize = payload?.config?.batchSize ?? downloadWorkerBatchSize
-      downloadWorkerStatus = ''
+      if (!quiet) downloadWorkerStatus = ''
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
         return
       }
-      downloadWorkerStatus = error?.message || 'Failed to load worker status.'
+      if (!quiet) downloadWorkerStatus = error?.message || 'Failed to load worker status.'
+    }
+  }
+
+  async function loadPipelineWorkerStatus({ quiet = false } = {}) {
+    if (!quiet) pipelineWorkerStatus = 'Loading global pipeline status...'
+    try {
+      const payload = await fetchPipelineWorkerStatus()
+      pipelineWorker = payload || pipelineWorker
+      if (!quiet) pipelineWorkerStatus = ''
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load global pipeline status.'
+    }
+  }
+
+  async function handleStartPipelineWorker() {
+    if (pipelineWorkerBusy) return
+    pipelineWorkerBusy = true
+    pipelineWorkerStatus = 'Starting global pipeline...'
+    try {
+      await startPipelineWorker({
+        intervalSeconds: Number(pipelineWorker?.config?.intervalSeconds) || 15,
+        promoteBatchSize: Number(pipelineWorker?.config?.promoteBatchSize) || 25,
+        promoteWorkers: Number(pipelineWorker?.config?.promoteWorkers) || 6,
+        downloadBatchSize: Number(pipelineWorker?.config?.downloadBatchSize) || 5,
+        downloadWorkers: Number(pipelineWorker?.config?.downloadWorkers) || 0,
+      })
+      await Promise.all([
+        loadPipelineWorkerStatus(),
+        loadIngestStats(),
+        loadCorpus(),
+        loadDownloads(),
+        loadDownloadWorkerStatus(),
+      ])
+      pipelineWorkerStatus = 'Global pipeline running.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      pipelineWorkerStatus = error?.message || 'Failed to start global pipeline.'
+    } finally {
+      pipelineWorkerBusy = false
+    }
+  }
+
+  async function handlePausePipelineWorker() {
+    if (pipelineWorkerBusy) return
+    pipelineWorkerBusy = true
+    pipelineWorkerStatus = 'Pausing global pipeline...'
+    try {
+      await pausePipelineWorker({ force: false })
+      await loadPipelineWorkerStatus()
+      pipelineWorkerStatus = 'Global pipeline paused.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      pipelineWorkerStatus = error?.message || 'Failed to pause global pipeline.'
+    } finally {
+      pipelineWorkerBusy = false
     }
   }
 
@@ -950,7 +1101,9 @@
         const line = event.data
         logs = [...logs, line].slice(-maxLogs)
         if (shouldTriggerPipelineRefresh(line)) {
-          schedulePipelineRefresh()
+          const isWorkerTick =
+            String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
+          schedulePipelineRefresh(isWorkerTick ? 300 : 1500)
         }
       }
       ws.onclose = () => {
@@ -1617,11 +1770,19 @@
     }
     boot()
 
+    liveRefreshIntervalId = setInterval(() => {
+      runLiveRefreshCycle()
+    }, 5000)
+
     return () => {
       window.removeEventListener('hashchange', onHashChange)
       if (pipelineRefreshTimer) {
         clearTimeout(pipelineRefreshTimer)
         pipelineRefreshTimer = null
+      }
+      if (liveRefreshIntervalId) {
+        clearInterval(liveRefreshIntervalId)
+        liveRefreshIntervalId = null
       }
     }
   })
@@ -1681,6 +1842,47 @@
             <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus}>
               New corpus
             </button>
+          </div>
+          <div class="header-pipeline">
+            <div class="header-pipeline__title">
+              <span class="eyebrow">Global pipeline</span>
+              <strong>{pipelineWorker.running ? 'Running' : 'Paused'}</strong>
+              {#if pipelineWorker.in_flight}
+                <span class="tag queued">in progress</span>
+              {/if}
+            </div>
+            <div class="header-pipeline__meta">
+              <span class="muted small">
+                Raw → Metadata batch {pipelineWorker?.config?.promoteBatchSize ?? 25} ·
+                Enrich workers {pipelineWorker?.config?.promoteWorkers ?? 6} ·
+                Download batch {pipelineWorker?.config?.downloadBatchSize ?? 5} ·
+                Workers {pipelineWorker?.resolved_download_workers ?? 1}
+              </span>
+            </div>
+            <div class="header-pipeline__actions">
+              <button
+                class="primary"
+                type="button"
+                on:click={handleStartPipelineWorker}
+                disabled={pipelineWorkerBusy}
+              >
+                Start / Continue
+              </button>
+              <button
+                class="secondary"
+                type="button"
+                on:click={handlePausePipelineWorker}
+                disabled={pipelineWorkerBusy || !pipelineWorker.running}
+              >
+                Pause
+              </button>
+            </div>
+            {#if pipelineWorkerStatus}
+              <span class="muted small">{pipelineWorkerStatus}</span>
+            {/if}
+            {#if pipelineWorker.last_error}
+              <span class="error small">{pipelineWorker.last_error}</span>
+            {/if}
           </div>
         </div>
       </div>
@@ -2166,7 +2368,7 @@
           <div class="corpus-columns">
             <div class="corpus-column">
               <h3>Raw / Seeds <span class="count">({rawTotal || rawItems.length})</span></h3>
-              <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
+              <div class="table table-scroll corpus-table" bind:this={rawCorpusTableEl} on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
                   <span>Year</span>
@@ -2186,7 +2388,7 @@
 
             <div class="corpus-column">
                <h3>With Metadata <span class="count">({metadataTotal || metaItems.length})</span></h3>
-               <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
+               <div class="table table-scroll corpus-table" bind:this={metaCorpusTableEl} on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
                   <span>Year</span>
@@ -2206,7 +2408,7 @@
 
             <div class="corpus-column">
                <h3>Downloaded <span class="count">({downloadedTotal || downloadedItems.length})</span></h3>
-               <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
+               <div class="table table-scroll corpus-table" bind:this={downloadedCorpusTableEl} on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
                   <span>Year</span>
@@ -2283,7 +2485,12 @@
                     Force stop
                   </button>
                 {:else}
-                  <button class="primary" type="button" on:click={handleStartDownloadWorker} disabled={downloadWorkerBusy}>
+                  <button
+                    class="primary"
+                    type="button"
+                    on:click={handleStartDownloadWorker}
+                    disabled={downloadWorkerBusy || pipelineWorker.running}
+                  >
                     Start
                   </button>
                 {/if}
@@ -2291,6 +2498,9 @@
             </div>
             <div class="worker-card__meta">
               <span class="muted">{downloadWorkerStatus}</span>
+              {#if pipelineWorker.running}
+                <span class="muted small">Download-only worker is disabled while global pipeline is running.</span>
+              {/if}
               {#if downloadWorker.last_error}
                 <span class="error">{downloadWorker.last_error}</span>
               {/if}

@@ -3,6 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
@@ -94,6 +95,7 @@ const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py')
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
+const INGEST_MARK_NEXT_RAW_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_mark_next_raw.py');
 const INGEST_PROCESS_MARKED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_process_marked.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
@@ -340,31 +342,64 @@ function parseJsonFromOutput(output) {
 }
 
 function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
-  return new Promise((resolve, reject) => {
-    const env = {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-      RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-      RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
-    };
+  const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId });
+  return done;
+}
 
-    const finalArgs = [...args];
-    if (corpusId !== undefined && corpusId !== null) {
-      finalArgs.push('--corpus-id', String(corpusId));
+function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine } = {}) {
+  const env = {
+    ...process.env,
+    PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+    RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
+    RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
+  };
+
+  const finalArgs = [...args];
+  if (corpusId !== undefined && corpusId !== null) {
+    finalArgs.push('--corpus-id', String(corpusId));
+  }
+
+  const child = spawn(PYTHON_EXEC, [scriptPath, ...finalArgs], { env });
+  let stdout = '';
+  let stderr = '';
+  let stdoutBuf = '';
+  let stderrBuf = '';
+
+  const flushLines = (buffer, handler, flushPartial = false) => {
+    if (typeof handler !== 'function') {
+      return buffer;
     }
-    const child = spawn(PYTHON_EXEC, [scriptPath, ...finalArgs], { env });
-    let stdout = '';
-    let stderr = '';
+    const parts = String(buffer).split(/\r?\n/);
+    const pending = parts.pop() ?? '';
+    parts
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .forEach((line) => handler(line));
+    if (flushPartial && pending.trim()) {
+      handler(pending.trim());
+      return '';
+    }
+    return pending;
+  };
 
-    child.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
+  child.stdout.on('data', (data) => {
+    const text = data.toString();
+    stdout += text;
+    stdoutBuf += text;
+    stdoutBuf = flushLines(stdoutBuf, onStdoutLine);
+  });
 
-    child.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
+  child.stderr.on('data', (data) => {
+    const text = data.toString();
+    stderr += text;
+    stderrBuf += text;
+    stderrBuf = flushLines(stderrBuf, onStderrLine);
+  });
 
+  const done = new Promise((resolve, reject) => {
     child.on('close', (code) => {
+      stdoutBuf = flushLines(stdoutBuf, onStdoutLine, true);
+      stderrBuf = flushLines(stderrBuf, onStderrLine, true);
       if (code !== 0) {
         return reject(new Error(`Python script failed (${code}): ${stderr || stdout}`));
       }
@@ -376,6 +411,8 @@ function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
       }
     });
   });
+
+  return { child, done };
 }
 
 function coerceInt(value, fallback = null) {
@@ -471,6 +508,7 @@ export function createApp({ broadcast } = {}) {
   const app = express();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
+  const pipelineWorkers = new Map(); // corpusId -> state
 
   // Ensure temporary and output directories exist
   fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
@@ -513,6 +551,31 @@ export function createApp({ broadcast } = {}) {
       });
     }
     return downloadWorkers.get(key);
+  }
+
+  function getOrInitPipelineWorkerState(corpusId) {
+    const key = corpusId || 0;
+    if (!pipelineWorkers.has(key)) {
+      pipelineWorkers.set(key, {
+        running: false,
+        intervalId: null,
+        inFlight: false,
+        children: [],
+        startedAt: null,
+        lastTickAt: null,
+        lastResult: null,
+        lastError: null,
+        resolvedDownloadWorkers: 0,
+        config: {
+          intervalSeconds: 15,
+          promoteBatchSize: 25,
+          promoteWorkers: 6,
+          downloadBatchSize: 5,
+          downloadWorkers: 0, // 0 = auto
+        },
+      });
+    }
+    return pipelineWorkers.get(key);
   }
 
   function spawnDownloadOnce({ corpusId, batchSize, downloadDir }) {
@@ -624,6 +687,242 @@ export function createApp({ broadcast } = {}) {
       } catch (error) {
         // ignore
       }
+    }
+    return state;
+  }
+
+  function countQueuedDownloads(corpusId) {
+    try {
+      if (corpusId !== undefined && corpusId !== null) {
+        const row = authDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM with_metadata wm
+             JOIN corpus_items ci ON ci.table_name = 'with_metadata' AND ci.row_id = wm.id
+             WHERE ci.corpus_id = ?
+               AND wm.download_state IN ('queued', 'in_progress')`
+          )
+          .get(corpusId);
+        return Number(row?.count || 0);
+      }
+      const row = authDb
+        .prepare("SELECT COUNT(*) AS count FROM with_metadata WHERE download_state IN ('queued', 'in_progress')")
+        .get();
+      return Number(row?.count || 0);
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  function resolveDownloadWorkerCount({ corpusId, requestedWorkers = 0, batchSize = 3 }) {
+    const cpuCount = Math.max(1, Number(os.cpus()?.length || 1));
+    const maxRecommended = Math.max(1, Math.min(6, cpuCount));
+    const minBatch = Math.max(1, Number(batchSize || 1));
+    if (Number(requestedWorkers) > 0) {
+      return Math.max(1, Math.min(12, Number(requestedWorkers)));
+    }
+    const queued = countQueuedDownloads(corpusId);
+    if (queued <= 0) {
+      return 1;
+    }
+    const estimated = Math.ceil(queued / (minBatch * 2));
+    return Math.max(1, Math.min(maxRecommended, estimated));
+  }
+
+  function aggregateDownloadPayloads(payloads) {
+    const summary = {
+      processed: 0,
+      downloaded: 0,
+      failed: 0,
+      skipped: 0,
+      errors: [],
+      runs: payloads.length,
+    };
+    payloads.forEach((payload) => {
+      summary.processed += Number(payload?.processed || 0);
+      summary.downloaded += Number(payload?.downloaded || 0);
+      summary.failed += Number(payload?.failed || 0);
+      summary.skipped += Number(payload?.skipped || 0);
+      if (Array.isArray(payload?.errors) && payload.errors.length) {
+        summary.errors.push(...payload.errors);
+      }
+    });
+    return summary;
+  }
+
+  async function tickPipelineWorker(corpusId) {
+    const state = getOrInitPipelineWorkerState(corpusId);
+    if (!state.running || state.inFlight) return;
+    state.inFlight = true;
+    state.lastTickAt = new Date().toISOString();
+    state.lastError = null;
+    state.children = [];
+
+    const promoteBatchSize = Math.max(1, Number(state.config.promoteBatchSize || 10));
+    const promoteWorkers = Math.max(1, Number(state.config.promoteWorkers || 1));
+    const downloadBatchSize = Math.max(1, Number(state.config.downloadBatchSize || 3));
+    const workerCount = resolveDownloadWorkerCount({
+      corpusId,
+      requestedWorkers: Number(state.config.downloadWorkers || 0),
+      batchSize: downloadBatchSize,
+    });
+    state.resolvedDownloadWorkers = workerCount;
+
+    send(
+      `[pipeline-worker] tick corpus=${corpusId || 'none'} promote_batch=${promoteBatchSize} ` +
+        `promote_workers=${promoteWorkers} download_batch=${downloadBatchSize} workers=${workerCount}`
+    );
+
+    let hadActivity = false;
+    try {
+      const markRun = spawnPythonJson(
+        INGEST_MARK_NEXT_RAW_SCRIPT,
+        ['--db-path', DB_PATH, '--limit', String(promoteBatchSize)],
+        {
+          dbPath: DB_PATH,
+          corpusId,
+          onStdoutLine: (line) => send(`[pipeline-worker mark] ${line}`),
+          onStderrLine: (line) => send(`[pipeline-worker mark ERROR] ${line}`),
+        }
+      );
+      state.children.push(markRun.child);
+      const marked = await markRun.done;
+      state.children = state.children.filter((child) => child !== markRun.child);
+      send(
+        `[pipeline-worker] marked raw=${Number(marked?.marked || 0)} candidates=${Number(marked?.available || 0)}`
+      );
+      hadActivity = hadActivity || Number(marked?.marked || 0) > 0;
+
+      const promoteRun = spawnPythonJson(
+        INGEST_PROCESS_MARKED_SCRIPT,
+        [
+          '--db-path',
+          DB_PATH,
+          '--limit',
+          String(promoteBatchSize),
+          '--workers',
+          String(promoteWorkers),
+          '--no-fetch-references',
+        ],
+        {
+          dbPath: DB_PATH,
+          corpusId,
+          onStdoutLine: (line) => send(`[pipeline-worker enrich] ${line}`),
+          onStderrLine: (line) => send(`[pipeline-worker enrich ERROR] ${line}`),
+        }
+      );
+      state.children.push(promoteRun.child);
+      const promoted = await promoteRun.done;
+      state.children = state.children.filter((child) => child !== promoteRun.child);
+      send(
+        `[pipeline-worker] enrich processed=${Number(promoted?.processed || 0)} promoted=${Number(
+          promoted?.promoted || 0
+        )} queued=${Number(promoted?.queued || 0)} failed=${Number(promoted?.failed || 0)}`
+      );
+      hadActivity =
+        hadActivity ||
+        Number(promoted?.processed || 0) > 0 ||
+        Number(promoted?.promoted || 0) > 0 ||
+        Number(promoted?.queued || 0) > 0;
+
+      const runs = [];
+      for (let i = 0; i < workerCount; i += 1) {
+        const { child, done } = spawnDownloadOnce({ corpusId, batchSize: downloadBatchSize });
+        state.children.push(child);
+        runs.push(done);
+      }
+      const settled = await Promise.allSettled(runs);
+      const payloads = settled
+        .filter((result) => result.status === 'fulfilled')
+        .map((result) => result.value);
+      const rejected = settled
+        .filter((result) => result.status === 'rejected')
+        .map((result) => result.reason?.message || String(result.reason || 'unknown error'));
+      const downloads = aggregateDownloadPayloads(payloads);
+      downloads.errors.push(...rejected);
+
+      send(
+        `[pipeline-worker] download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
+          `failed=${downloads.failed} skipped=${downloads.skipped}`
+      );
+      hadActivity =
+        hadActivity || downloads.processed > 0 || downloads.downloaded > 0 || downloads.failed > 0 || downloads.skipped > 0;
+
+      state.lastResult = {
+        marked: {
+          requested: Number(marked?.requested || promoteBatchSize),
+          marked: Number(marked?.marked || 0),
+          available: Number(marked?.available || 0),
+        },
+        promoted: {
+          processed: Number(promoted?.processed || 0),
+          promoted: Number(promoted?.promoted || 0),
+          queued: Number(promoted?.queued || 0),
+          failed: Number(promoted?.failed || 0),
+        },
+        downloads,
+        workers: workerCount,
+      };
+      state.lastError = downloads.errors.length ? downloads.errors[0] : null;
+    } catch (error) {
+      state.lastError = error?.message || String(error);
+      send(`[pipeline-worker ERROR] ${state.lastError}`);
+    } finally {
+      state.children = [];
+      state.inFlight = false;
+      if (state.running && hadActivity) {
+        setTimeout(() => tickPipelineWorker(corpusId), 0);
+      }
+    }
+  }
+
+  function startPipelineWorker(corpusId, config = {}) {
+    const state = getOrInitPipelineWorkerState(corpusId);
+    const intervalSeconds = coerceInt(config.intervalSeconds, state.config.intervalSeconds) || state.config.intervalSeconds;
+    const promoteBatchSize = coerceInt(config.promoteBatchSize, state.config.promoteBatchSize) || state.config.promoteBatchSize;
+    const promoteWorkers =
+      coerceInt(config.promoteWorkers, state.config.promoteWorkers ?? 6) || state.config.promoteWorkers || 6;
+    const downloadBatchSize = coerceInt(config.downloadBatchSize, state.config.downloadBatchSize) || state.config.downloadBatchSize;
+    const downloadWorkersRequested = Math.max(0, coerceInt(config.downloadWorkers, state.config.downloadWorkers) || 0);
+
+    state.config = {
+      intervalSeconds: Math.max(10, intervalSeconds),
+      promoteBatchSize: Math.max(1, promoteBatchSize),
+      promoteWorkers: Math.max(1, Math.min(32, promoteWorkers)),
+      downloadBatchSize: Math.max(1, downloadBatchSize),
+      downloadWorkers: downloadWorkersRequested,
+    };
+
+    // Avoid running legacy download-only worker alongside the orchestration worker.
+    const legacy = getOrInitWorkerState(corpusId);
+    if (legacy.running || legacy.inFlight) {
+      stopDownloadWorker(corpusId, { force: false });
+      send('[pipeline-worker] paused legacy download-only worker for this corpus');
+    }
+
+    if (state.running) return state;
+    state.running = true;
+    state.startedAt = new Date().toISOString();
+    tickPipelineWorker(corpusId);
+    state.intervalId = setInterval(() => tickPipelineWorker(corpusId), state.config.intervalSeconds * 1000);
+    return state;
+  }
+
+  function pausePipelineWorker(corpusId, { force = false } = {}) {
+    const state = getOrInitPipelineWorkerState(corpusId);
+    state.running = false;
+    if (state.intervalId) {
+      clearInterval(state.intervalId);
+      state.intervalId = null;
+    }
+    if (force && Array.isArray(state.children)) {
+      state.children.forEach((child) => {
+        try {
+          child.kill('SIGTERM');
+        } catch (error) {
+          // ignore
+        }
+      });
     }
     return state;
   }
@@ -1283,12 +1582,18 @@ export function createApp({ broadcast } = {}) {
 
   app.post('/api/ingest/process-marked', requireAuthMiddleware, async (req, res) => {
     const limit = coerceInt(req.body?.limit, 10);
+    const workers = coerceInt(req.body?.workers, 6);
+    const fetchReferences = Boolean(req.body?.fetchReferences);
     if (limit === null || limit === undefined || !Number.isFinite(limit) || limit <= 0) {
       return res.status(400).json({ error: 'limit must be a positive number' });
     }
+    if (workers === null || workers === undefined || !Number.isFinite(workers) || workers <= 0) {
+      return res.status(400).json({ error: 'workers must be a positive number' });
+    }
 
     const dbPath = DB_PATH;
-    const args = ['--db-path', dbPath, '--limit', String(limit)];
+    const args = ['--db-path', dbPath, '--limit', String(limit), '--workers', String(workers)];
+    args.push(fetchReferences ? '--fetch-references' : '--no-fetch-references');
     try {
       const payload = await runPythonJson(INGEST_PROCESS_MARKED_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
@@ -1323,6 +1628,79 @@ export function createApp({ broadcast } = {}) {
     }
   });
 
+  app.get('/api/pipeline/worker/status', requireAuthMiddleware, (req, res) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({
+        running: false,
+        in_flight: false,
+        started_at: null,
+        last_tick_at: null,
+        last_result: null,
+        last_error: null,
+        resolved_download_workers: 1,
+        config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
+      });
+    }
+    if (!hasWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    }
+    const state = getOrInitPipelineWorkerState(req.corpusId);
+    return res.json({
+      running: state.running,
+      in_flight: state.inFlight,
+      started_at: state.startedAt,
+      last_tick_at: state.lastTickAt,
+      last_result: state.lastResult,
+      last_error: state.lastError,
+      resolved_download_workers: state.resolvedDownloadWorkers,
+      config: state.config,
+    });
+  });
+
+  app.post('/api/pipeline/worker/start', requireAuthMiddleware, (req, res) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({ running: true, stub: true });
+    }
+    if (!hasWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    }
+    const intervalSeconds = coerceInt(req.body?.intervalSeconds, 15);
+    const promoteBatchSize = coerceInt(req.body?.promoteBatchSize, 25);
+    const promoteWorkers = coerceInt(req.body?.promoteWorkers, 6);
+    const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 5);
+    const downloadWorkersRequested = coerceInt(req.body?.downloadWorkers, 0);
+    const state = startPipelineWorker(req.corpusId, {
+      intervalSeconds,
+      promoteBatchSize,
+      promoteWorkers,
+      downloadBatchSize,
+      downloadWorkers: downloadWorkersRequested,
+    });
+    return res.json({
+      running: state.running,
+      in_flight: state.inFlight,
+      config: state.config,
+      resolved_download_workers: state.resolvedDownloadWorkers,
+    });
+  });
+
+  app.post('/api/pipeline/worker/pause', requireAuthMiddleware, (req, res) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({ running: false, stub: true });
+    }
+    if (!hasWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    }
+    const force = Boolean(req.body?.force);
+    const state = pausePipelineWorker(req.corpusId, { force });
+    return res.json({
+      running: state.running,
+      in_flight: state.inFlight,
+      config: state.config,
+      resolved_download_workers: state.resolvedDownloadWorkers,
+    });
+  });
+
   app.get('/api/downloads/worker/status', requireAuthMiddleware, (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } });
@@ -1349,6 +1727,10 @@ export function createApp({ broadcast } = {}) {
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
+    const pipelineState = getOrInitPipelineWorkerState(req.corpusId);
+    if (pipelineState.running || pipelineState.inFlight) {
+      return res.status(409).json({ error: 'Global pipeline worker is active; pause it first.' });
+    }
     const intervalSeconds = coerceInt(req.body?.intervalSeconds, 60);
     const batchSize = coerceInt(req.body?.batchSize, 3);
     const state = startDownloadWorker(req.corpusId, { intervalSeconds, batchSize });
@@ -1373,6 +1755,10 @@ export function createApp({ broadcast } = {}) {
     }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    }
+    const pipelineState = getOrInitPipelineWorkerState(req.corpusId);
+    if (pipelineState.running || pipelineState.inFlight) {
+      return res.status(409).json({ error: 'Global pipeline worker is active; pause it first.' });
     }
     const batchSize = coerceInt(req.body?.batchSize, 3);
     const state = getOrInitWorkerState(req.corpusId);
