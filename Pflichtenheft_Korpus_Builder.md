@@ -23,7 +23,7 @@ Erweiterung und Produktionsreife des bestehenden Repositories `dl_lit_project` z
 - Knoten = Referenzen, Kanten = Zitierbeziehungen
 - Farbliche Clustering-Optionen (Themen / Suchpfade)
 
-### M-04: Frontend (React + Vite)
+### M-04: Frontend (Vite)
 - Upload-Funktion für Seed-Dokumente (PDF, BibTeX, JSON)
 - Keyword-Suchmaske mit Optionen (Tiefe, Filter etc.)
 - Anzeige des Korpusgraphen und Fortschrittsbalken
@@ -45,7 +45,7 @@ Erweiterung und Produktionsreife des bestehenden Repositories `dl_lit_project` z
 
 - Python-Quellcode entspricht gängigen Konventionen (z. B. PEP8)
 - Einsatz automatischer Linter (z. B. `ruff`) zur Grobprüfung
-- React-Frontend nutzt komponentenbasierte Struktur, Tailwind für Styles
+- Frontend nutzt komponentenbasierte Struktur
 - Keine Performance- oder Usability-Vorgaben
 
 ---
@@ -63,5 +63,5 @@ Nicht Bestandteil des Projekts:
 
 - OpenAlex API, Crossref API
 - Google Gemini API (OCR & Parsing)
-- React, Vite, TailwindCSS
+- Vite
 - D3.js, Docker, SQLite3

@@ -125,7 +125,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - API endpoint to feed graph JSON
 
 ### E) Web Frontend (MS3)
-- React/Vite UI
+- Vite-based UI
 - Upload + search + progress views
 - Visualization page
 - Export/download workflows
@@ -154,6 +154,6 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 ## 7) Acceptance Criteria (per contract)
 - Seed‑document and keyword search workflows operational end‑to‑end
 - Visualization available in UI
-- React/Vite frontend supports upload/search/download
+- Frontend supports upload/search/download
 - Docker deployment with persistent state
 - Documentation complete, tests pass, final acceptance by AG
