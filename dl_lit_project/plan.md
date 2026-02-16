@@ -46,11 +46,13 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 
 ## 3) Current Status (Feb 2026)
 - Phase 1 (Refactor + Keyword Search) is completed and tested.
+- M-01 (Code-Audit & Refactoring) is closed for the audited module set; see `dl_lit_project/M01_code_audit.md`.
+- M-02 (Keyword-Suche) acceptance criteria are met (boolean query, seed JSON mode, recursive expansion, DB persistence).
 - Pipeline helper supports `--max-ref-pages`, `--max-entries`, and `--no-enrich` for smoke tests.
 - Dedupe hardening, merge logging, and alias handling implemented.
 - Backend Python bootstrap/runtime pathing is consolidated to avoid invalid local path resolution.
 - Full Python and backend test suites pass (`pytest dl_lit_project/tests`, `cd backend && npm test -- --runInBand`).
-- Visualization is currently treated as optional/nice-to-have and can be revisited after ingestion/search/download hardening.
+- Visualization now supports interactive zoom/pan plus color clustering modes (search path, component, status, year decade, type) with legend in the frontend graph view.
 
 ## 3.1) Milestone 2 Plan — Visualization (Apr 2026)
 **Goal:** deliver a D3‑based citation/cluster visualization wired to real corpus data.

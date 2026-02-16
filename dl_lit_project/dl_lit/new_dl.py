@@ -1,21 +1,25 @@
-import json
-import time
-import requests
-import os
-import threading
-import re
-from .db_manager import DatabaseManager
-import sqlite3  
+import argparse
 import copy
-import datetime
-from urllib.parse import urljoin, urlparse, urlencode
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import time
+import traceback
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from collections import deque
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from queue import Queue
-import colorama
+from urllib.parse import urljoin, urlparse
+
 import bibtexparser
+import colorama
+import requests
+from bs4 import BeautifulSoup
+
+from .db_manager import DatabaseManager
+from .pdf_downloader import PDFDownloader
+from .utils import ServiceRateLimiter, get_global_rate_limiter
 try:
     # bibtexparser 1.x does not ship middlewares; keep optional so downloads can run without it.
     from bibtexparser.middlewares import SeparateCoAuthors, LatexEncodingMiddleware  # type: ignore
@@ -38,19 +42,6 @@ except Exception:  # pragma: no cover
 
 from google import genai
 # Removed incompatible google.genai.types imports
-
-import json
-import traceback
-import argparse
-import re
-import hashlib
-
-
-
-
-from .db_manager import DatabaseManager
-from .utils import ServiceRateLimiter, get_global_rate_limiter
-from .pdf_downloader import PDFDownloader
 
 
 class BibliographyEnhancer:
@@ -676,7 +667,6 @@ class BibliographyEnhancer:
             enriched = bib_entry['enriched_data']
             title = enriched.get('title') or enriched.get('display_name', '')
             doi = enriched.get('doi')
-            year = enriched.get('publication_year')
             authorships = enriched.get('authorships', [])
             authors = [item.get('author', {}).get('display_name') for item in authorships if item.get('author', {}).get('display_name')] if authorships else []
             # Get open access URL from enriched data
@@ -687,14 +677,12 @@ class BibliographyEnhancer:
             original_ref = bib_entry['original_reference']
             title = original_ref.get('title', '')
             authors = original_ref.get('authors', [])
-            year = original_ref.get('year', None)
             doi = original_ref.get('doi', None)
             open_access_url = original_ref.get('open_access_url')
         else:
             # Extract directly from ref structure (this is the case we're in)
             title = bib_entry.get('title', '')
             authors = bib_entry.get('authors', [])
-            year = bib_entry.get('year', None)
             doi = bib_entry.get('doi', None)
             open_access_url = bib_entry.get('open_access_url')
 

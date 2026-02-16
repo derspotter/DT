@@ -2,6 +2,7 @@ import argparse
 import json
 import sqlite3
 from pathlib import Path
+from collections import Counter
 
 STUB_ITEMS = [
     {
@@ -34,7 +35,21 @@ def main():
     args = parser.parse_args()
 
     if 'RAG_FEEDER_STUB' in __import__('os').environ:
-        print(json.dumps({'items': STUB_ITEMS, 'total': len(STUB_ITEMS), 'source': 'stub'}))
+        print(
+            json.dumps(
+                {
+                    'items': STUB_ITEMS,
+                    'total': len(STUB_ITEMS),
+                    'source': 'stub',
+                    'stage_totals': {
+                        'raw': sum(1 for item in STUB_ITEMS if item.get('status') in ('no_metadata', 'extract_references_from_pdf', 'pending')),
+                        'metadata': sum(1 for item in STUB_ITEMS if item.get('status') in ('with_metadata', 'to_download_references')),
+                        'downloaded': sum(1 for item in STUB_ITEMS if item.get('status') == 'downloaded_references'),
+                    },
+                    'status_counts': dict(Counter(item.get('status') for item in STUB_ITEMS)),
+                }
+            )
+        )
         return
 
     conn = sqlite3.connect(args.db_path)
@@ -109,13 +124,29 @@ def main():
         except (TypeError, ValueError):
             return 0
 
+    status_counts = Counter(item.get('status') for item in items)
+    stage_totals = {
+        'raw': sum(status_counts.get(status, 0) for status in ('no_metadata', 'extract_references_from_pdf', 'pending')),
+        'metadata': sum(status_counts.get(status, 0) for status in ('with_metadata', 'to_download_references')),
+        'downloaded': status_counts.get('downloaded_references', 0),
+    }
+
     items.sort(key=lambda x: (normalize_year(x.get('year')), normalize_id(x.get('id'))), reverse=True)
     total = len(items)
     start = max(args.offset, 0)
     end = start + max(args.limit, 0)
     items = items[start:end]
 
-    print(json.dumps({'items': items, 'total': total}))
+    print(
+        json.dumps(
+            {
+                'items': items,
+                'total': total,
+                'stage_totals': stage_totals,
+                'status_counts': dict(status_counts),
+            }
+        )
+    )
 
 
 if __name__ == '__main__':

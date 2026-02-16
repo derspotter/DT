@@ -6,8 +6,24 @@ import re
 
 STUB_GRAPH = {
     'nodes': [
-        { 'id': 'W2175056322', 'title': 'The New Institutional Economics', 'year': 2002, 'type': 'book-chapter' },
-        { 'id': 'W2015930340', 'title': 'The Nature of the Firm', 'year': 1937, 'type': 'journal-article' },
+        {
+            'id': 'W2175056322',
+            'title': 'The New Institutional Economics',
+            'year': 2002,
+            'type': 'book-chapter',
+            'status': 'with_metadata',
+            'source_path': 'seed_pdf',
+            'ingest_source': 'seed_pdf',
+        },
+        {
+            'id': 'W2015930340',
+            'title': 'The Nature of the Firm',
+            'year': 1937,
+            'type': 'journal-article',
+            'status': 'with_metadata',
+            'source_path': 'keyword_search',
+            'ingest_source': 'keyword_search',
+        },
     ],
     'edges': [
         { 'source': 'W2175056322', 'target': 'W2015930340', 'relationship_type': 'references' },
@@ -27,6 +43,47 @@ def normalize_doi(value):
     if match:
         return match.group(1).upper()
     return str(value).upper()
+
+
+def derive_source_path_label(ingest_source, source_pdf, run_id):
+    ingest = str(ingest_source or "").strip()
+    if ingest:
+        return ingest
+    source_pdf_value = str(source_pdf or "").strip()
+    if source_pdf_value:
+        return os.path.basename(source_pdf_value)
+    if run_id is not None:
+        return f"run:{run_id}"
+    return "unknown"
+
+
+def propagate_source_paths(nodes, edges):
+    node_map = {node.get("id"): node for node in nodes if node.get("id")}
+    adjacency = {}
+    for edge in edges:
+        source_id = edge.get("source")
+        target_id = edge.get("target")
+        if not source_id or not target_id:
+            continue
+        adjacency.setdefault(source_id, set()).add(target_id)
+        adjacency.setdefault(target_id, set()).add(source_id)
+
+    for node in nodes:
+        if node.get("source_path") and node.get("source_path") != "unknown":
+            continue
+        node_id = node.get("id")
+        if not node_id:
+            continue
+        candidates = set()
+        for neighbor_id in adjacency.get(node_id, set()):
+            neighbor = node_map.get(neighbor_id)
+            if not neighbor:
+                continue
+            label = neighbor.get("source_path")
+            if label and label != "unknown":
+                candidates.add(label)
+        if len(candidates) == 1:
+            node["source_path"] = next(iter(candidates))
 
 
 def main():
@@ -104,6 +161,11 @@ def main():
             'year': row.get('year'),
             'type': row.get('entry_type') or row.get('type'),
             'status': status,
+            'doi': row.get('doi'),
+            'openalex_id': normalize_openalex_id(row.get('openalex_id')) or row.get('openalex_id'),
+            'ingest_source': row.get('ingest_source'),
+            'source_pdf': row.get('source_pdf'),
+            'source_path': derive_source_path_label(row.get('ingest_source'), row.get('source_pdf'), row.get('run_id')),
         }
         node_by_id[raw_id] = node
         node_map[node_key] = raw_id
@@ -208,21 +270,46 @@ def main():
                     use_edge_table = True
 
     if use_edge_table:
-        meta_rows = conn.execute(
-            "SELECT id, title, year, type, openalex_id, doi FROM with_metadata"
-        ).fetchall()
         meta_by_id = {}
-        for row in meta_rows:
+        meta_sources = []
+        if has_table("with_metadata"):
+            meta_sources.append(
+                (
+                    "with_metadata",
+                    "with_metadata",
+                    "SELECT id, title, year, type, openalex_id, doi, ingest_source, source_pdf, run_id FROM with_metadata",
+                )
+            )
+        if has_table("downloaded_references"):
+            meta_sources.append(
+                (
+                    "downloaded_references",
+                    "downloaded",
+                    "SELECT id, title, year, entry_type AS type, openalex_id, doi, ingest_source, NULL AS source_pdf, run_id FROM downloaded_references",
+                )
+            )
+
+        for table_name, status_label, query in meta_sources:
+            try:
+                rows = conn.execute(query).fetchall()
+            except sqlite3.Error:
+                continue
+            allowed_ids = None
             if allowed_rows is not None:
-                allowed_meta_ids = allowed_rows.get("with_metadata", set())
-                if row["id"] not in allowed_meta_ids:
+                allowed_ids = allowed_rows.get(table_name, set())
+                if not allowed_ids:
                     continue
-            norm_openalex = normalize_openalex_id(row["openalex_id"])
-            norm_doi = normalize_doi(row["doi"])
-            if norm_openalex:
-                meta_by_id[norm_openalex] = row
-            if norm_doi:
-                meta_by_id[norm_doi] = row
+            for row in rows:
+                if allowed_ids is not None and row["id"] not in allowed_ids:
+                    continue
+                data = dict(row)
+                data["_status"] = status_label
+                norm_openalex = normalize_openalex_id(data.get("openalex_id"))
+                norm_doi = normalize_doi(data.get("doi"))
+                if norm_openalex:
+                    meta_by_id[norm_openalex] = data
+                if norm_doi:
+                    meta_by_id[norm_doi] = data
 
         for node_id in sorted(wanted_ids):
             meta = meta_by_id.get(node_id)
@@ -231,7 +318,16 @@ def main():
                 "title": meta["title"] if meta else node_id,
                 "year": meta["year"] if meta else None,
                 "type": meta["type"] if meta else None,
-                "status": "with_metadata" if meta else "unknown",
+                "status": meta.get("_status") if meta else "unknown",
+                "doi": meta["doi"] if meta else None,
+                "openalex_id": meta["openalex_id"] if meta else None,
+                "ingest_source": meta["ingest_source"] if meta else None,
+                "source_pdf": meta["source_pdf"] if meta else None,
+                "source_path": derive_source_path_label(
+                    meta["ingest_source"] if meta else None,
+                    meta["source_pdf"] if meta else None,
+                    meta["run_id"] if meta else None,
+                ),
             }
             nodes.append(node)
             node_by_id[node_id] = node
@@ -297,6 +393,8 @@ def main():
                 })
 
     conn.close()
+
+    propagate_source_paths(nodes, edges)
 
     degree = {}
     for edge in edges:

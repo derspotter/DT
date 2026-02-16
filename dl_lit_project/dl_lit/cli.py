@@ -1,14 +1,10 @@
 import click
 import json
-import os
-import logging
 import traceback
 import sqlite3
 from pathlib import Path
-from datetime import datetime
 import pprint
 import copy
-from tqdm import tqdm
 from threading import Lock
 import hashlib
 import bibtexparser
@@ -25,7 +21,6 @@ from .OpenAlexScraper import (
 )
 from .new_dl import BibliographyEnhancer
 from .utils import get_global_rate_limiter
-from .pdf_downloader import PDFDownloader
 from .bibtex_formatter import BibTeXFormatter
 from .APIscraper_v2 import process_directory_v2, process_single_pdf
 

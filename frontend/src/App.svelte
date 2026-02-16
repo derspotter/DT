@@ -95,9 +95,13 @@
   let corpusLoadingMore = false
   let corpusLoadStatus = ''
   let corpusSource = ''
+  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
   $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
   $: metaItems = corpusItems.filter(i => i.status === 'with_metadata' || i.status === 'to_download_references')
   $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded_references')
+  $: rawTotal = Number(corpusStageTotals?.raw || 0)
+  $: metadataTotal = Number(corpusStageTotals?.metadata || 0)
+  $: downloadedTotal = Number(corpusStageTotals?.downloaded || 0)
   let selectedCorpusItemKey = ''
   $: corpusSelectionRows = [
     ...rawItems.map((item) => ({ bucket: 'raw', item })),
@@ -149,12 +153,19 @@
   let graphYearFrom = ''
   let graphYearTo = ''
   let graphMaxNodes = 200
+  let graphColorMode = 'source_path'
   let graphHideIsolates = true
   let graphFocusConnected = true
   let hoveredNodeId = null
   let graphLayout = []
+  let graphVisibleEdges = []
   let graphNodeMap = new Map()
   let graphDegreeMap = new Map()
+  let graphComponentMap = new Map()
+  let graphNodeColorMap = new Map()
+  let graphColorLegend = []
+  let graphTotalNodeCount = 0
+  let graphTotalEdgeCount = 0
   let graphCanvasSize = 440
   let graphViewBox = { x: 0, y: 0, size: 440 }
   let isGraphPanning = false
@@ -696,16 +707,24 @@
       corpusItems = []
       corpusTotal = 0
       corpusHasMore = false
+      corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
       selectedCorpusItemKey = ''
     }
     try {
       const offset = append ? corpusItems.length : 0
-      const { data, total, source } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset })
+      const { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset })
       const incoming = Array.isArray(data) ? data : []
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
       corpusHasMore = corpusItems.length < corpusTotal
       corpusSource = source
+      if (stageTotals && typeof stageTotals === 'object') {
+        corpusStageTotals = {
+          raw: Number(stageTotals.raw || 0),
+          metadata: Number(stageTotals.metadata || 0),
+          downloaded: Number(stageTotals.downloaded || 0),
+        }
+      }
       if (corpusSource === 'sample') {
         corpusLoadStatus = 'Showing sample corpus data.'
       } else {
@@ -877,6 +896,10 @@
         focusConnected: graphFocusConnected,
       })
       graphNodeMap = new Map(graphLayout.map((node) => [node.id, node]))
+      graphVisibleEdges = graphEdges.filter(
+        (edge) => graphNodeMap.has(edge.source) && graphNodeMap.has(edge.target)
+      )
+      hoveredNodeId = null
       graphCanvasSize = graphLayout[0]?.canvasSize || 440
       graphViewBox = { x: 0, y: 0, size: graphCanvasSize }
     } catch (error) {
@@ -1328,6 +1351,107 @@
     }))
   }
 
+  const graphColorPalette = [
+    '#0f8b8d',
+    '#bc6c25',
+    '#5c7cfa',
+    '#7f5539',
+    '#3a86ff',
+    '#2a9d8f',
+    '#8f2d56',
+    '#5465ff',
+    '#607744',
+    '#b56576',
+    '#1d3557',
+    '#ca6702',
+  ]
+
+  function labelFromStatus(status) {
+    if (Array.isArray(status)) {
+      if (status.length === 0) return 'Unknown'
+      return status.map((part) => pipelineStatusLabel(part)).join(' + ')
+    }
+    return pipelineStatusLabel(status)
+  }
+
+  function yearBucket(year) {
+    const numeric = Number(year)
+    if (!Number.isFinite(numeric)) return 'Unknown year'
+    const bucket = Math.floor(numeric / 10) * 10
+    return `${bucket}s`
+  }
+
+  function buildComponentMap(nodes, edges) {
+    const nodeIds = new Set(nodes.map((node) => node.id))
+    const adjacency = new Map()
+    for (const node of nodes) adjacency.set(node.id, [])
+    for (const edge of edges) {
+      if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue
+      adjacency.get(edge.source).push(edge.target)
+      adjacency.get(edge.target).push(edge.source)
+    }
+
+    const componentByNode = new Map()
+    const visited = new Set()
+    let componentIndex = 0
+    for (const node of nodes) {
+      if (visited.has(node.id)) continue
+      componentIndex += 1
+      const stack = [node.id]
+      visited.add(node.id)
+      while (stack.length) {
+        const current = stack.pop()
+        componentByNode.set(current, `Cluster ${componentIndex}`)
+        for (const next of adjacency.get(current) || []) {
+          if (visited.has(next)) continue
+          visited.add(next)
+          stack.push(next)
+        }
+      }
+    }
+    return componentByNode
+  }
+
+  function graphClusterLabel(node, mode, componentMap) {
+    if (mode === 'component') return componentMap.get(node.id) || 'Cluster ?'
+    if (mode === 'status') return labelFromStatus(node.status)
+    if (mode === 'year') return yearBucket(node.year)
+    if (mode === 'type') return node.type || 'Unknown type'
+    if (mode === 'source_path') return node.source_path || node.ingest_source || 'Unknown path'
+    return 'Default'
+  }
+
+  function buildNodeColorState(nodes, mode, componentMap) {
+    const counts = new Map()
+    for (const node of nodes) {
+      const key = graphClusterLabel(node, mode, componentMap)
+      counts.set(key, (counts.get(key) || 0) + 1)
+    }
+    const keys = [...counts.keys()].sort((a, b) => {
+      const aUnknown = String(a).toLowerCase() === 'unknown'
+      const bUnknown = String(b).toLowerCase() === 'unknown'
+      if (aUnknown !== bUnknown) return aUnknown ? 1 : -1
+      const byCount = (counts.get(b) || 0) - (counts.get(a) || 0)
+      if (byCount !== 0) return byCount
+      return String(a).localeCompare(String(b))
+    })
+    const colorByKey = new Map()
+    keys.forEach((key, index) => {
+      colorByKey.set(key, graphColorPalette[index % graphColorPalette.length])
+    })
+    const colorByNode = new Map()
+    for (const node of nodes) {
+      const key = graphClusterLabel(node, mode, componentMap)
+      colorByNode.set(node.id, colorByKey.get(key) || '#0f8b8d')
+    }
+    const legend = keys.map((key) => ({
+      key,
+      color: colorByKey.get(key),
+      count: counts.get(key) || 0,
+    }))
+    return { colorByNode, legend }
+  }
+
   function clamp(value, min, max) {
     return Math.min(Math.max(value, min), max)
   }
@@ -1392,15 +1516,26 @@
   }
 
   $: hoveredNode = graphLayout.find((node) => node.id === hoveredNodeId)
-  $: graphNodeCount = graphStats?.node_count ?? graphNodes.length
-  $: graphEdgeCount = graphStats?.edge_count ?? graphEdges.length
-  $: graphRelationshipCounts = graphStats?.relationship_counts || {
-    references: graphEdges.filter((edge) => edge.relationship_type === 'references').length,
-    cited_by: graphEdges.filter((edge) => edge.relationship_type === 'cited_by').length,
+  $: graphVisibleEdges = graphEdges.filter(
+    (edge) => graphNodeMap.has(edge.source) && graphNodeMap.has(edge.target)
+  )
+  $: graphTotalNodeCount = graphStats?.node_count ?? graphNodes.length
+  $: graphTotalEdgeCount = graphStats?.edge_count ?? graphEdges.length
+  $: graphNodeCount = graphLayout.length
+  $: graphEdgeCount = graphVisibleEdges.length
+  $: graphRelationshipCounts = {
+    references: graphVisibleEdges.filter((edge) => edge.relationship_type === 'references').length,
+    cited_by: graphVisibleEdges.filter((edge) => edge.relationship_type === 'cited_by').length,
   }
   $: graphList = [...graphLayout].sort(
     (a, b) => (graphDegreeMap.get(b.id) || 0) - (graphDegreeMap.get(a.id) || 0)
   )
+  $: graphComponentMap = buildComponentMap(graphLayout, graphVisibleEdges)
+  $: {
+    const { colorByNode, legend } = buildNodeColorState(graphLayout, graphColorMode, graphComponentMap)
+    graphNodeColorMap = colorByNode
+    graphColorLegend = legend.slice(0, 8)
+  }
   $: graphDegreeMap = (() => {
     const map = new Map()
     for (const node of graphNodes) {
@@ -2009,7 +2144,7 @@
           </div>
           <div class="corpus-columns">
             <div class="corpus-column">
-              <h3>Raw / Seeds <span class="count">({rawItems.length})</span></h3>
+              <h3>Raw / Seeds <span class="count">({rawTotal || rawItems.length})</span></h3>
               <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
@@ -2029,7 +2164,7 @@
             </div>
 
             <div class="corpus-column">
-               <h3>With Metadata <span class="count">({metaItems.length})</span></h3>
+               <h3>With Metadata <span class="count">({metadataTotal || metaItems.length})</span></h3>
                <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
@@ -2049,7 +2184,7 @@
             </div>
 
             <div class="corpus-column">
-               <h3>Downloaded <span class="count">({downloadedItems.length})</span></h3>
+               <h3>Downloaded <span class="count">({downloadedTotal || downloadedItems.length})</span></h3>
                <div class="table table-scroll corpus-table" on:scroll={handleCorpusColumnScroll}>
                  <div class="table-row header cols-corpus-mini">
                   <span>Title</span>
@@ -2298,6 +2433,16 @@
               <span>Max nodes</span>
               <input type="number" min="20" max="2000" step="20" bind:value={graphMaxNodes} />
             </label>
+            <label>
+              <span>Color by</span>
+              <select bind:value={graphColorMode}>
+                <option value="source_path">Search path</option>
+                <option value="component">Cluster</option>
+                <option value="status">Pipeline status</option>
+                <option value="year">Year decade</option>
+                <option value="type">Work type</option>
+              </select>
+            </label>
             <label class="graph-toggle">
               <span>Hide isolates</span>
               <input type="checkbox" bind:checked={graphHideIsolates} />
@@ -2323,16 +2468,14 @@
                 on:pointerleave={handleGraphPointerUp}
                 style="touch-action: none;"
               >
-                {#each graphEdges as edge}
-                  {#if graphNodeMap.has(edge.source) && graphNodeMap.has(edge.target)}
-                    <line
-                      x1={graphNodeMap.get(edge.source).x}
-                      y1={graphNodeMap.get(edge.source).y}
-                      x2={graphNodeMap.get(edge.target).x}
-                      y2={graphNodeMap.get(edge.target).y}
-                      class={`edge ${edge.relationship_type === 'cited_by' ? 'edge--cited' : 'edge--ref'}`}
-                    />
-                  {/if}
+                {#each graphVisibleEdges as edge}
+                  <line
+                    x1={graphNodeMap.get(edge.source).x}
+                    y1={graphNodeMap.get(edge.source).y}
+                    x2={graphNodeMap.get(edge.target).x}
+                    y2={graphNodeMap.get(edge.target).y}
+                    class={`edge ${edge.relationship_type === 'cited_by' ? 'edge--cited' : 'edge--ref'}`}
+                  />
                 {/each}
                 {#each graphLayout as node}
                   <g
@@ -2350,6 +2493,7 @@
                       cy={node.y}
                       r={hoveredNodeId === node.id ? node.size + 4 : node.size}
                       class="node"
+                      style={`fill: ${graphNodeColorMap.get(node.id) || '#0f8b8d'};`}
                     />
                     <title>{node.title}</title>
                   </g>
@@ -2375,12 +2519,35 @@
                   <strong>{graphRelationshipCounts.cited_by}</strong>
                 </div>
               </div>
+              <p class="muted small">
+                Showing {graphNodeCount}/{graphTotalNodeCount} nodes and {graphEdgeCount}/{graphTotalEdgeCount} edges.
+              </p>
               {#if hoveredNode}
                 <div class="graph-hover">
                   <span class="eyebrow">Selected node</span>
                   <strong>{hoveredNode.title}</strong>
+                  <span class="muted small">
+                    {hoveredNode.year || 'Year ?'} · {hoveredNode.type || 'Type ?'} · {labelFromStatus(hoveredNode.status)}
+                  </span>
+                  <span class="muted small">Path: {hoveredNode.source_path || hoveredNode.ingest_source || 'unknown'}</span>
                 </div>
               {/if}
+              <div class="graph-legend">
+                <span class="eyebrow">Color legend</span>
+                {#if graphColorLegend.length === 0}
+                  <p class="muted">No cluster groups available.</p>
+                {:else}
+                  <div class="graph-legend-list">
+                    {#each graphColorLegend as item}
+                      <div class="graph-legend-item">
+                        <span class="graph-legend-swatch" style={`background:${item.color};`}></span>
+                        <span>{item.key}</span>
+                        <strong>{item.count}</strong>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
               <div class="graph-actions">
                 <button class="secondary" type="button" on:click={resetGraphView}>Reset view</button>
               </div>
@@ -2392,7 +2559,13 @@
                     on:mouseleave={() => (hoveredNodeId = null)}
                     type="button"
                   >
-                    <span>{truncateLabel(node.title)}</span>
+                    <span class="graph-list-label">
+                      <span
+                        class="graph-legend-swatch"
+                        style={`background:${graphNodeColorMap.get(node.id) || '#0f8b8d'};`}
+                      ></span>
+                      <span>{truncateLabel(node.title)}</span>
+                    </span>
                     <strong>{graphDegreeMap.get(node.id) ?? 0}</strong>
                   </button>
                 {/each}

@@ -369,7 +369,6 @@ def process_single_pdf(
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
     print(f"\n[INFO] Processing {filename}...", flush=True)
-    start_process_time = time.time()
     file_success = False
     failure_reason = "Unknown"
 

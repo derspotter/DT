@@ -72,11 +72,18 @@ export const sampleDownloads = [
 
 export const sampleGraph = {
   nodes: [
-    { id: 'W1', title: 'The New Institutional Economics', year: 2002, type: 'book-chapter' },
-    { id: 'W2', title: 'The Nature of the Firm', year: 1937, type: 'journal-article' },
-    { id: 'W3', title: 'The Problem of Social Cost', year: 1960, type: 'journal-article' },
-    { id: 'W4', title: 'Markets and Hierarchies', year: 1975, type: 'book' },
-    { id: 'W5', title: 'Transaction Cost Economics', year: 1985, type: 'journal-article' },
+    {
+      id: 'W1',
+      title: 'The New Institutional Economics',
+      year: 2002,
+      type: 'book-chapter',
+      status: 'with_metadata',
+      source_path: 'seed_pdf',
+    },
+    { id: 'W2', title: 'The Nature of the Firm', year: 1937, type: 'journal-article', status: 'downloaded', source_path: 'seed_pdf' },
+    { id: 'W3', title: 'The Problem of Social Cost', year: 1960, type: 'journal-article', status: 'with_metadata', source_path: 'keyword_search' },
+    { id: 'W4', title: 'Markets and Hierarchies', year: 1975, type: 'book', status: 'queued', source_path: 'keyword_search' },
+    { id: 'W5', title: 'Transaction Cost Economics', year: 1985, type: 'journal-article', status: 'queued', source_path: 'seed_pdf' },
   ],
   edges: [
     { source: 'W1', target: 'W2', relationship_type: 'references' },

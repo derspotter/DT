@@ -284,12 +284,14 @@ export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
     const payload = await response.json()
     const data = Array.isArray(payload) ? payload : payload.items || []
     const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
-    return { data, total, source: payload.source || 'api' }
+    const stageTotals = payload?.stage_totals || null
+    const statusCounts = payload?.status_counts || null
+    return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
   } catch (error) {
     if (error?.status === 401) {
       throw error
     }
-    return { data: sampleCorpus, total: sampleCorpus.length, source: 'sample', error }
+    return { data: sampleCorpus, total: sampleCorpus.length, source: 'sample', stageTotals: null, statusCounts: null, error }
   }
 }
 

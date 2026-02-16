@@ -426,6 +426,10 @@ select {
   color: var(--muted);
 }
 
+.small {
+  font-size: 0.8rem;
+}
+
 .uploader {
   display: flex;
   gap: 16px;
@@ -1192,7 +1196,7 @@ button.danger:disabled {
 
 .graph-controls {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -1212,6 +1216,7 @@ button.danger:disabled {
 .graph-toggle input[type="checkbox"] {
   width: 16px;
   height: 16px;
+  accent-color: #0f8b8d;
 }
 
 .graph-controls select,
@@ -1269,6 +1274,41 @@ button.danger:disabled {
   font-size: 0.95rem;
 }
 
+.graph-legend {
+  background: white;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 18px 40px rgba(29, 53, 64, 0.08);
+}
+
+.graph-legend-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.graph-legend-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.graph-legend-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
 .graph-list {
   display: grid;
   gap: 8px;
@@ -1290,9 +1330,16 @@ button.danger:disabled {
   text-align: left;
 }
 
-.graph-list button span {
+.graph-list button > span {
   flex: 1;
   color: #23313b;
+}
+
+.graph-list-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .graph-list button strong {
@@ -1321,10 +1368,9 @@ button.danger:disabled {
 }
 
 .node {
-  fill: #0f8b8d;
   stroke: white;
   stroke-width: 2;
-  transition: r 0.2s ease, fill 0.2s ease;
+  transition: r 0.2s ease, filter 0.2s ease;
 }
 
 .node-label {
@@ -1333,7 +1379,8 @@ button.danger:disabled {
 }
 
 .graph-wrap g.active .node {
-  fill: #117477;
+  filter: brightness(0.82);
+  stroke-width: 3;
 }
 
 .graph-actions button {

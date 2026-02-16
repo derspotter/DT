@@ -2,14 +2,9 @@ import json
 import re
 from urllib.parse import quote_plus
 import requests
-import time
 from pathlib import Path
-from collections import deque
-from datetime import datetime, timedelta
 import argparse
 import concurrent.futures
-import threading
-import os
 from .utils import get_global_rate_limiter
 
 try:
