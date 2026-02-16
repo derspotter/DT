@@ -8,27 +8,43 @@ def _has_column(cursor, table, column):
     return any(row[1] == column for row in rows)
 
 
+def _table_exists(cursor, table):
+    row = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return bool(row)
+
+
 def fetch_count(cur, table, corpus_id=None):
+    if not _table_exists(cur, table):
+        return 0
     if corpus_id is None:
         cur.execute(f"SELECT COUNT(*) FROM {table}")
         return cur.fetchone()[0]
     cur.execute(
-        "SELECT COUNT(*) FROM corpus_items WHERE corpus_id = ? AND table_name = ?",
-        (corpus_id, table),
+        f"""
+        SELECT COUNT(*)
+          FROM {table} t
+          JOIN corpus_items ci
+            ON ci.table_name = ? AND ci.row_id = t.id
+         WHERE ci.corpus_id = ?
+        """,
+        (table, corpus_id),
     )
     return cur.fetchone()[0]
 
 
 def fetch_queue_count(cur, corpus_id=None):
-    queue_table = "to_download_references"
+    # Canonical queue now lives in with_metadata.download_state.
+    queue_table = "with_metadata"
+    if not _table_exists(cur, queue_table):
+        return 0
     has_state = _has_column(cur, queue_table, "download_state")
-    state_filter = " wm.download_state IN ('queued', 'in_progress')" if has_state else " 1 = 1"
+    state_filter = "wm.download_state IN ('queued', 'in_progress')" if has_state else "1 = 0"
 
     if corpus_id is None:
-        query = f"SELECT COUNT(*) FROM {queue_table}"
-        if has_state:
-            query += " WHERE download_state IN ('queued', 'in_progress')"
-        cur.execute(query)
+        cur.execute(f"SELECT COUNT(*) FROM {queue_table} wm WHERE {state_filter}")
         return cur.fetchone()[0]
     cur.execute(
         f"""

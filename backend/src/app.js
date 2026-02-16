@@ -330,15 +330,45 @@ function requireAuth(db) {
 }
 
 function parseJsonFromOutput(output) {
-  const lines = output.trim().split(/\r?\n/).filter(Boolean);
+  const lines = String(output || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const tryParse = (text) => {
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+
+  // Fast path: find a valid JSON line near the bottom while skipping log lines
+  // such as "[DB Manager] ...", which are not JSON arrays.
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    if (line.startsWith('{') || line.startsWith('[')) {
-      return JSON.parse(line);
+    const line = lines[i];
+    const bracketIndex = line.search(/[\[{]/);
+    if (bracketIndex < 0) continue;
+    const inlineCandidate = line.slice(bracketIndex).trim();
+    const parsedInline = tryParse(inlineCandidate);
+    if (parsedInline !== null) return parsedInline;
+  }
+
+  // Fallback: recover pretty-printed/multiline JSON blocks from stdout.
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    const bracketIndex = line.search(/[\[{]/);
+    if (bracketIndex < 0) continue;
+    for (let j = lines.length; j > i; j -= 1) {
+      const segment = lines.slice(i, j);
+      segment[0] = segment[0].slice(bracketIndex);
+      const parsedSegment = tryParse(segment.join('\n'));
+      if (parsedSegment !== null) return parsedSegment;
     }
   }
-  throw new Error(`No JSON output from python. Output was: ${output}`);
+
+  throw new Error(`No valid JSON output from python. Output was: ${output}`);
 }
 
 function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
