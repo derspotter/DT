@@ -188,7 +188,7 @@ select {
 }
 
 .header-log-stream__body {
-  min-height: 110px;
+  min-height: 44px;
   max-height: 110px;
   overflow-y: auto;
   display: grid;

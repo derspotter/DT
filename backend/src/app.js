@@ -277,6 +277,21 @@ function migrateExistingToCorpus(db, corpusId) {
   }
 }
 
+function pruneStaleCorpusItems(db) {
+  const managedTables = ['no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references'];
+  managedTables.forEach((tableName) => {
+    if (!tableExists(db, tableName)) return;
+    db.exec(
+      `DELETE FROM corpus_items
+        WHERE table_name = '${tableName}'
+          AND NOT EXISTS (
+            SELECT 1 FROM ${tableName} t
+             WHERE t.id = corpus_items.row_id
+          )`
+    );
+  });
+}
+
 function listCorporaForUser(db, userId) {
   return db
     .prepare(
@@ -549,6 +564,7 @@ export function createApp({ broadcast } = {}) {
   ensureAuthSchema(authDb);
   const defaultCorpusId = bootstrapDefaultCorpus(authDb);
   migrateExistingToCorpus(authDb, defaultCorpusId);
+  pruneStaleCorpusItems(authDb);
   if (!process.env.RAG_FEEDER_JWT_SECRET) {
     console.warn('[auth] RAG_FEEDER_JWT_SECRET not set; tokens will reset on restart.');
   }

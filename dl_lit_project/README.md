@@ -50,6 +50,12 @@ Frontend talks to backend via Vite API base during development.
 - Backend tests: `cd backend && npm test -- --runInBand`
 - Lint (Python): `venv/bin/ruff check --config dl_lit_project/pyproject.toml dl_lit_project/dl_lit backend/scripts`
 
+## Documentation
+
+- User guide: `dl_lit_project/docs/USER_GUIDE.md`
+- Ops runbook: `dl_lit_project/docs/OPS_RUNBOOK.md`
+- Developer notes: `dl_lit_project/DEVELOPMENT.md`
+
 ## Environment
 
 Required for extraction/enrichment:
