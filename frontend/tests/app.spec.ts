@@ -143,4 +143,76 @@ test.describe('Korpus Builder UI', () => {
     await expect(page.getByTestId('graph-panel')).toBeVisible()
     await expect(page.getByLabel('Graph visualization')).toBeVisible()
   })
+
+  test('logs tab supports type switch and older paging controls', async ({ page }) => {
+    await page.route('**/api/logs/tail*', async (route) => {
+      const url = new URL(route.request().url())
+      const type = url.searchParams.get('type') || 'pipeline'
+      const cursor = Number(url.searchParams.get('cursor') || '0')
+      if (type === 'app') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            type: 'app',
+            entries: ['[app] recent line'],
+            count: 1,
+            lines: 200,
+            cursor,
+            next_cursor: cursor + 1,
+            has_more: false,
+            total_lines: 1,
+            include_rotated: true,
+            source_file: '/tmp/backend-app.log',
+            source_exists: true,
+          }),
+        })
+        return
+      }
+      const payload = cursor === 0
+        ? {
+          type: 'pipeline',
+          entries: ['[pipeline] latest line'],
+          count: 1,
+          lines: 200,
+          cursor: 0,
+          next_cursor: 1,
+          has_more: true,
+          total_lines: 2,
+          include_rotated: true,
+          source_file: '/tmp/backend-pipeline.log',
+          source_exists: true,
+        }
+        : {
+          type: 'pipeline',
+          entries: ['[pipeline] older line'],
+          count: 1,
+          lines: 200,
+          cursor,
+          next_cursor: cursor + 1,
+          has_more: false,
+          total_lines: 2,
+          include_rotated: true,
+          source_file: '/tmp/backend-pipeline.log',
+          source_exists: true,
+        }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(payload),
+      })
+    })
+
+    await page.goto('/')
+    await ensureSignedIn(page)
+    await page.getByTestId('tab-logs').click()
+    await expect(page.getByTestId('logs-panel')).toBeVisible()
+    await expect(page.getByTestId('logs-type-select')).toBeVisible()
+
+    await page.getByRole('button', { name: 'Load older' }).click()
+    await expect(page.getByTestId('logs-panel').getByText('[pipeline] older line')).toBeVisible()
+
+    await page.getByTestId('logs-type-select').selectOption('app')
+    await expect(page.getByTestId('logs-panel').getByText('[app] recent line')).toBeVisible()
+  })
 })

@@ -158,6 +158,7 @@
   let exportFilterSource = ''
 
   let logs = []
+  let logsType = 'pipeline'
   let logsStatus = 'connecting'
   let logsSocket = null
   let logsReconnectTimer = null
@@ -206,6 +207,13 @@
 
   const maxLogs = 200
   const maxLogHistory = 5000
+
+  function resetLogState() {
+    logs = []
+    logsCursor = 0
+    logsHasMore = false
+    logsTailStatus = ''
+  }
 
   function formatBytes(bytes) {
     if (bytes === 0) return '0 B'
@@ -1130,7 +1138,7 @@
     if (!force && logs.length > 0) return
     logsTailStatus = 'Loading recent logs...'
     try {
-      const payload = await fetchLogsTail({ type: 'pipeline', lines: maxLogs, includeRotated: true, cursor: 0 })
+      const payload = await fetchLogsTail({ type: logsType, lines: maxLogs, includeRotated: true, cursor: 0 })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       logs = entries.slice(-maxLogHistory)
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
@@ -1154,7 +1162,7 @@
     logsTailStatus = 'Loading older logs...'
     try {
       const payload = await fetchLogsTail({
-        type: 'pipeline',
+        type: logsType,
         lines: maxLogs,
         includeRotated: true,
         cursor: logsCursor,
@@ -1215,6 +1223,7 @@
       }
       ws.onmessage = (event) => {
         if (logsSocket !== ws) return
+        if (logsType !== 'pipeline') return
         const line = event.data
         const hadLines = logs.length > 0
         logs = [...logs, line].slice(-maxLogHistory)
@@ -1259,6 +1268,13 @@
       logsSocket = null
     }
     logsStatus = 'disconnected'
+  }
+
+  async function handleLogTypeChange(event) {
+    const next = String(event?.target?.value || 'pipeline').toLowerCase()
+    logsType = next === 'app' ? 'app' : 'pipeline'
+    resetLogState()
+    await hydrateLogsFromTail({ force: true })
   }
 
   function buildDegreeMap(nodes, edges) {
@@ -2784,10 +2800,17 @@
 
       {#if activeTab === 'logs'}
         <div class="card" data-testid="logs-panel">
-          <h2>Pipeline logs</h2>
+          <h2>Logs</h2>
           <p class="muted">WebSocket status: {logsStatus}</p>
           <div class="log-toolbar">
             <div class="log-toolbar__actions">
+              <label class="log-type-select">
+                <span class="muted small">Type</span>
+                <select bind:value={logsType} on:change={handleLogTypeChange} data-testid="logs-type-select">
+                  <option value="pipeline">Pipeline</option>
+                  <option value="app">App</option>
+                </select>
+              </label>
               <button
                 class="secondary"
                 type="button"

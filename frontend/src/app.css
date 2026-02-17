@@ -1269,6 +1269,20 @@ button.danger:disabled {
   display: inline-flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: flex-end;
+}
+
+.log-type-select {
+  display: inline-grid;
+  gap: 4px;
+}
+
+.log-type-select select {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--stroke);
+  background: #fff;
+  color: var(--ink);
 }
 
 .log-line {
