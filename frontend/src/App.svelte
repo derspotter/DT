@@ -22,6 +22,7 @@
     stopDownloadWorker,
     runDownloadWorkerOnce,
     fetchPipelineWorkerStatus,
+    fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
     fetchGraph,
@@ -158,6 +159,12 @@
 
   let logs = []
   let logsStatus = 'connecting'
+  let logsSocket = null
+  let logsReconnectTimer = null
+  let logsCursor = 0
+  let logsHasMore = false
+  let logsLoadingOlder = false
+  let logsTailStatus = ''
   let graphStatus = ''
   let graphSource = ''
   let graphNodes = []
@@ -188,6 +195,7 @@
   let pipelineRefreshTimer = null
   let pipelineRefreshInFlight = false
   let liveRefreshIntervalId = null
+  let lastTabRefreshAt = 0
   let rawCorpusTableEl = null
   let metaCorpusTableEl = null
   let downloadedCorpusTableEl = null
@@ -197,6 +205,7 @@
   let shareStatus = ''
 
   const maxLogs = 200
+  const maxLogHistory = 5000
 
   function formatBytes(bytes) {
     if (bytes === 0) return '0 B'
@@ -385,6 +394,38 @@
     }
   }
 
+  async function refreshForActiveTab(tabId) {
+    if (authStatus !== 'authenticated') return
+    const now = Date.now()
+    // Avoid duplicate refreshes from rapid tab/hash updates.
+    if (now - lastTabRefreshAt < 800) return
+    if (pipelineRefreshInFlight) return
+    lastTabRefreshAt = now
+    pipelineRefreshInFlight = true
+    try {
+      const tasks = [
+        loadIngestStats({ quiet: true }),
+        loadPipelineWorkerStatus({ quiet: true }),
+        loadDownloadWorkerStatus({ quiet: true }),
+      ]
+      if (tabId === 'dashboard' || tabId === 'corpus') {
+        tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
+      }
+      if (tabId === 'dashboard' || tabId === 'downloads') {
+        tasks.push(loadDownloads())
+      }
+      if (tabId === 'ingest') {
+        tasks.push(loadIngestRuns())
+      }
+      if (tabId === 'graph') {
+        tasks.push(loadGraph())
+      }
+      await Promise.all(tasks)
+    } finally {
+      pipelineRefreshInFlight = false
+    }
+  }
+
   async function bootstrapAuth() {
     authStatus = 'loading'
     authError = ''
@@ -402,6 +443,7 @@
       authUser = null
       corpora = []
       currentCorpusId = null
+      disconnectLogs()
       setAuthToken('')
     }
   }
@@ -425,6 +467,7 @@
     } catch (error) {
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
+      disconnectLogs()
       setAuthToken('')
     }
   }
@@ -1083,9 +1126,71 @@
     }
   }
 
-  function connectLogs() {
+  async function hydrateLogsFromTail({ force = false } = {}) {
+    if (!force && logs.length > 0) return
+    logsTailStatus = 'Loading recent logs...'
     try {
-      const rawBase = import.meta.env.VITE_API_BASE || window.location.origin
+      const payload = await fetchLogsTail({ type: 'pipeline', lines: maxLogs, includeRotated: true, cursor: 0 })
+      const entries = Array.isArray(payload?.entries) ? payload.entries : []
+      logs = entries.slice(-maxLogHistory)
+      logsCursor = Number.isFinite(Number(payload?.next_cursor))
+        ? Number(payload.next_cursor)
+        : logs.length
+      logsHasMore = Boolean(payload?.has_more)
+      logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      logsTailStatus = error?.message || 'Failed to load persisted logs.'
+    }
+  }
+
+  async function loadOlderLogs() {
+    if (logsLoadingOlder || !logsHasMore) return
+    logsLoadingOlder = true
+    logsTailStatus = 'Loading older logs...'
+    try {
+      const payload = await fetchLogsTail({
+        type: 'pipeline',
+        lines: maxLogs,
+        includeRotated: true,
+        cursor: logsCursor,
+      })
+      const entries = Array.isArray(payload?.entries) ? payload.entries : []
+      if (entries.length > 0) {
+        logs = [...entries, ...logs].slice(-maxLogHistory)
+      }
+      logsCursor = Number.isFinite(Number(payload?.next_cursor))
+        ? Number(payload.next_cursor)
+        : logsCursor + entries.length
+      logsHasMore = Boolean(payload?.has_more)
+      logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} older log lines.` : 'No older logs found.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      logsTailStatus = error?.message || 'Failed to load older logs.'
+    } finally {
+      logsLoadingOlder = false
+    }
+  }
+
+  function connectLogs() {
+    disconnectLogs()
+    logsStatus = 'connecting'
+    hydrateLogsFromTail()
+    try {
+      const envBase = String(import.meta.env.VITE_API_BASE || '').trim()
+      const devBackendBase =
+        window.location.port === '5175'
+          ? `${window.location.protocol}//${window.location.hostname}:4000`
+          : window.location.origin
+      const rawBase = envBase || devBackendBase
       let wsUrl = 'ws://localhost:4000'
       try {
         const u = new URL(rawBase, window.location.origin)
@@ -1094,12 +1199,30 @@
         // fall back to localhost default
       }
       const ws = new WebSocket(wsUrl)
+      logsSocket = ws
+      const scheduleReconnect = () => {
+        if (authStatus !== 'authenticated') return
+        if (logsReconnectTimer) return
+        logsStatus = 'reconnecting'
+        logsReconnectTimer = setTimeout(() => {
+          logsReconnectTimer = null
+          connectLogs()
+        }, 3000)
+      }
       ws.onopen = () => {
+        if (logsSocket !== ws) return
         logsStatus = 'connected'
       }
       ws.onmessage = (event) => {
+        if (logsSocket !== ws) return
         const line = event.data
-        logs = [...logs, line].slice(-maxLogs)
+        const hadLines = logs.length > 0
+        logs = [...logs, line].slice(-maxLogHistory)
+        if (logsCursor > 0) {
+          logsCursor = Math.min(maxLogHistory, logsCursor + 1)
+        } else if (!hadLines) {
+          logsCursor = logs.length
+        }
         if (shouldTriggerPipelineRefresh(line)) {
           const isWorkerTick =
             String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
@@ -1107,14 +1230,35 @@
         }
       }
       ws.onclose = () => {
-        logsStatus = 'disconnected'
+        if (logsSocket === ws) {
+          logsSocket = null
+          scheduleReconnect()
+        }
       }
       ws.onerror = () => {
-        logsStatus = 'error'
+        if (logsSocket === ws) {
+          scheduleReconnect()
+        }
       }
     } catch (error) {
       logsStatus = 'unavailable'
     }
+  }
+
+  function disconnectLogs() {
+    if (logsReconnectTimer) {
+      clearTimeout(logsReconnectTimer)
+      logsReconnectTimer = null
+    }
+    if (logsSocket) {
+      try {
+        logsSocket.close()
+      } catch (error) {
+        // ignore close errors
+      }
+      logsSocket = null
+    }
+    logsStatus = 'disconnected'
   }
 
   function buildDegreeMap(nodes, edges) {
@@ -1751,6 +1895,7 @@
     const safeTab = tabIds.has(tabId) ? tabId : 'dashboard'
     activeTab = safeTab
     updateHash(safeTab, replace)
+    refreshForActiveTab(safeTab)
   }
 
   onMount(() => {
@@ -1761,9 +1906,17 @@
       const tab = readTabFromHash()
       if (tab && tab !== activeTab) {
         activeTab = tab
+        refreshForActiveTab(tab)
       }
     }
     window.addEventListener('hashchange', onHashChange)
+
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === 'hidden') return
+      refreshForActiveTab(activeTab)
+    }
+    window.addEventListener('focus', onFocusOrVisible)
+    document.addEventListener('visibilitychange', onFocusOrVisible)
 
     const boot = async () => {
       await bootstrapAuth()
@@ -1772,10 +1925,13 @@
 
     liveRefreshIntervalId = setInterval(() => {
       runLiveRefreshCycle()
-    }, 5000)
+    }, 3000)
 
     return () => {
       window.removeEventListener('hashchange', onHashChange)
+      window.removeEventListener('focus', onFocusOrVisible)
+      document.removeEventListener('visibilitychange', onFocusOrVisible)
+      disconnectLogs()
       if (pipelineRefreshTimer) {
         clearTimeout(pipelineRefreshTimer)
         pipelineRefreshTimer = null
@@ -1846,25 +2002,37 @@
           <div class="header-pipeline">
             <div class="header-pipeline__title">
               <span class="eyebrow">Global pipeline</span>
-              <strong>{pipelineWorker.running ? 'Running' : 'Paused'}</strong>
-              {#if pipelineWorker.in_flight}
-                <span class="tag queued">in progress</span>
-              {/if}
+              <div class="header-pipeline__state">
+                <strong class:running={pipelineWorker.running}>{pipelineWorker.running ? 'Running' : 'Paused'}</strong>
+                {#if pipelineWorker.in_flight}
+                  <span class="tag queued">in progress</span>
+                {/if}
+              </div>
             </div>
-            <div class="header-pipeline__meta">
-              <span class="muted small">
-                Raw → Metadata batch {pipelineWorker?.config?.promoteBatchSize ?? 25} ·
-                Enrich workers {pipelineWorker?.config?.promoteWorkers ?? 6} ·
-                Download batch {pipelineWorker?.config?.downloadBatchSize ?? 5} ·
-                Workers {pipelineWorker?.resolved_download_workers ?? 1}
-              </span>
+            <div class="header-pipeline__stats">
+              <div class="pipeline-kpi">
+                <span class="muted small">Raw → Meta batch</span>
+                <strong>{pipelineWorker?.config?.promoteBatchSize ?? 25}</strong>
+              </div>
+              <div class="pipeline-kpi">
+                <span class="muted small">Enrich workers</span>
+                <strong>{pipelineWorker?.config?.promoteWorkers ?? 6}</strong>
+              </div>
+              <div class="pipeline-kpi">
+                <span class="muted small">Download batch</span>
+                <strong>{pipelineWorker?.config?.downloadBatchSize ?? 5}</strong>
+              </div>
+              <div class="pipeline-kpi">
+                <span class="muted small">Download workers</span>
+                <strong>{Math.max(1, Number(pipelineWorker?.resolved_download_workers || 0))}</strong>
+              </div>
             </div>
             <div class="header-pipeline__actions">
               <button
                 class="primary"
                 type="button"
                 on:click={handleStartPipelineWorker}
-                disabled={pipelineWorkerBusy}
+                disabled={pipelineWorkerBusy || pipelineWorker.running}
               >
                 Start / Continue
               </button>
@@ -1872,7 +2040,7 @@
                 class="secondary"
                 type="button"
                 on:click={handlePausePipelineWorker}
-                disabled={pipelineWorkerBusy || !pipelineWorker.running}
+                disabled={!pipelineWorker.running && !pipelineWorker.in_flight}
               >
                 Pause
               </button>
@@ -2618,6 +2786,32 @@
         <div class="card" data-testid="logs-panel">
           <h2>Pipeline logs</h2>
           <p class="muted">WebSocket status: {logsStatus}</p>
+          <div class="log-toolbar">
+            <div class="log-toolbar__actions">
+              <button
+                class="secondary"
+                type="button"
+                on:click={loadOlderLogs}
+                disabled={logsLoadingOlder || !logsHasMore}
+              >
+                {logsLoadingOlder ? 'Loading…' : 'Load older'}
+              </button>
+              <button
+                class="secondary"
+                type="button"
+                on:click={() => hydrateLogsFromTail({ force: true })}
+                disabled={logsLoadingOlder}
+              >
+                Refresh from file
+              </button>
+            </div>
+            <span class="muted small">
+              {logsTailStatus}
+              {#if logs.length > 0}
+                {' '}Showing {logs.length} lines.
+              {/if}
+            </span>
+          </div>
           <div class="log-box">
             {#if logs.length === 0}
               <p class="muted">Waiting for pipeline output...</p>

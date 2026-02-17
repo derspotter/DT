@@ -19,7 +19,7 @@ Erweiterung und Produktionsreife des bestehenden Repositories `dl_lit_project` z
 - Input: freie Textsuche oder JSON-Seed
 
 ### M-03: Visualisierung
-- D3.js-Komponente zur Darstellung von Korpusstruktur und Zitationsnetzwerken
+- Visualisierungskomponente zur Darstellung von Korpusstruktur und Zitationsnetzwerken
 - Knoten = Referenzen, Kanten = Zitierbeziehungen
 - Farbliche Clustering-Optionen (Themen / Suchpfade)
 
@@ -64,4 +64,4 @@ Nicht Bestandteil des Projekts:
 - OpenAlex API, Crossref API
 - Google Gemini API (OCR & Parsing)
 - Vite
-- D3.js, Docker, SQLite3
+- Docker, SQLite3

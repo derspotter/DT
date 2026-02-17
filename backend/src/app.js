@@ -468,6 +468,63 @@ function coerceInt(value, fallback = null) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function getLogSettings() {
+  const logDir = process.env.RAG_FEEDER_LOG_DIR || path.join(REPO_ROOT, 'logs');
+  const maxFiles = Math.max(0, coerceInt(process.env.RAG_FEEDER_LOG_MAX_FILES, 5) || 5);
+  return {
+    logDir,
+    maxFiles,
+    appLogFile: path.join(logDir, 'backend-app.log'),
+    pipelineLogFile: path.join(logDir, 'backend-pipeline.log'),
+  };
+}
+
+function readTailLinesFromFile(filePath, maxLines) {
+  try {
+    if (!filePath || !fs.existsSync(filePath) || maxLines <= 0) return [];
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw) return [];
+    const lines = raw
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean);
+    return lines.slice(-maxLines);
+  } catch (error) {
+    console.warn(`[logs/tail] Failed reading ${filePath}: ${error?.message || error}`);
+    return [];
+  }
+}
+
+function readAllLogLines(baseFilePath, { includeRotated = true, maxFiles = 5 } = {}) {
+  const lines = [];
+  if (includeRotated) {
+    // Load oldest rotated files first for chronological order.
+    for (let i = maxFiles; i >= 1; i -= 1) {
+      const backupFile = `${baseFilePath}.${i}`;
+      lines.push(...readTailLinesFromFile(backupFile, Number.MAX_SAFE_INTEGER));
+    }
+  }
+  lines.push(...readTailLinesFromFile(baseFilePath, Number.MAX_SAFE_INTEGER));
+  return lines;
+}
+
+function readLogWindow(baseFilePath, { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5 } = {}) {
+  const allLines = readAllLogLines(baseFilePath, { includeRotated, maxFiles });
+  const totalLines = allLines.length;
+  const safeLimit = Math.max(1, Number(limit) || 200);
+  const safeCursor = Math.max(0, Math.min(Number(cursor) || 0, totalLines));
+  const end = Math.max(0, totalLines - safeCursor);
+  const start = Math.max(0, end - safeLimit);
+  const entries = allLines.slice(start, end);
+  return {
+    entries,
+    totalLines,
+    hasMore: start > 0,
+    nextCursor: safeCursor + entries.length,
+    cursor: safeCursor,
+  };
+}
+
 function getPdfPageCountSync(pdfPath) {
   if (!pdfPath || !fs.existsSync(pdfPath)) return null;
   const probeCode = [
@@ -1671,6 +1728,65 @@ export function createApp({ broadcast } = {}) {
     } catch (error) {
       console.error('[/api/ingest/stats] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest stats' });
+    }
+  });
+
+  app.get('/api/logs/tail', requireAuthMiddleware, (req, res) => {
+    try {
+      const type = String(req.query?.type || 'pipeline').trim().toLowerCase();
+      const lines = Math.min(2000, Math.max(1, coerceInt(req.query?.lines, 200) || 200));
+      const cursor = Math.max(0, coerceInt(req.query?.cursor, 0) || 0);
+      const includeRotatedRaw = String(req.query?.include_rotated ?? req.query?.includeRotated ?? '1').trim().toLowerCase();
+      const includeRotated = !['0', 'false', 'no'].includes(includeRotatedRaw);
+      const { logDir, maxFiles, appLogFile, pipelineLogFile } = getLogSettings();
+
+      let sourceFile = null;
+      if (type === 'pipeline') {
+        sourceFile = pipelineLogFile;
+      } else if (type === 'app') {
+        sourceFile = appLogFile;
+      } else {
+        return res.status(400).json({ error: "Invalid log type. Use 'pipeline' or 'app'." });
+      }
+
+      if (!fs.existsSync(logDir)) {
+        return res.json({
+          type,
+          entries: [],
+          count: 0,
+          lines,
+          cursor,
+          next_cursor: cursor,
+          has_more: false,
+          total_lines: 0,
+          include_rotated: includeRotated,
+          source_file: sourceFile,
+          source_exists: false,
+        });
+      }
+
+      const window = readLogWindow(sourceFile, {
+        limit: lines,
+        cursor,
+        includeRotated,
+        maxFiles,
+      });
+      return res.json({
+        type,
+        entries: window.entries,
+        count: window.entries.length,
+        lines,
+        cursor: window.cursor,
+        next_cursor: window.nextCursor,
+        has_more: window.hasMore,
+        total_lines: window.totalLines,
+        include_rotated: includeRotated,
+        source_file: sourceFile,
+        source_exists: fs.existsSync(sourceFile),
+      });
+    } catch (error) {
+      console.error('[/api/logs/tail] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to tail logs' });
     }
   });
 

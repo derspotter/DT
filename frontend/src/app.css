@@ -109,10 +109,10 @@ select {
   background: #fbfaf8;
   border: 1px solid var(--stroke);
   border-radius: 14px;
-  padding: 12px 14px;
+  padding: 14px 14px;
   display: grid;
-  gap: 10px;
-  min-width: 280px;
+  gap: 12px;
+  min-width: 320px;
   box-shadow: 0 10px 24px rgba(31, 41, 51, 0.06);
 }
 
@@ -145,24 +145,70 @@ select {
 
 .header-pipeline {
   border-top: 1px solid var(--stroke);
-  padding-top: 10px;
+  padding-top: 12px;
   display: grid;
-  gap: 6px;
+  gap: 10px;
+}
+
+.header-pipeline .eyebrow {
+  margin: 0;
 }
 
 .header-pipeline__title {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
 }
 
-.header-pipeline__meta {
-  line-height: 1.35;
+.header-pipeline__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.header-pipeline__title strong {
+  font-size: 0.92rem;
+  color: #5a3a22;
+  background: rgba(244, 184, 96, 0.22);
+  border: 1px solid rgba(244, 184, 96, 0.45);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.header-pipeline__title strong.running {
+  color: #0a5557;
+  background: rgba(15, 139, 141, 0.18);
+  border-color: rgba(15, 139, 141, 0.35);
+}
+
+.header-pipeline__stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.pipeline-kpi {
+  background: #ffffff;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 7px 9px;
+  display: grid;
+  gap: 2px;
+}
+
+.pipeline-kpi strong {
+  font-size: 0.92rem;
+  line-height: 1.1;
 }
 
 .header-pipeline__actions {
   display: flex;
   gap: 8px;
+}
+
+.header-pipeline__actions button {
+  flex: 1;
 }
 
 .header-log-stream {
@@ -883,6 +929,7 @@ select {
 .export-card__filters label {
   display: grid;
   gap: 6px;
+  min-width: 0;
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -897,6 +944,9 @@ select {
   background: #fff;
   color: var(--ink);
   font-size: 0.95rem;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   text-transform: none;
   letter-spacing: 0;
 }
@@ -1206,6 +1256,21 @@ button.danger:disabled {
   font-size: 0.85rem;
 }
 
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.log-toolbar__actions {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .log-line {
   padding-bottom: 6px;
   border-bottom: 1px solid rgba(214, 245, 243, 0.1);
@@ -1487,6 +1552,10 @@ button.danger:disabled {
 
   .header-pipeline__actions {
     flex-wrap: wrap;
+  }
+
+  .header-pipeline__stats {
+    grid-template-columns: 1fr;
   }
 
   .layout {

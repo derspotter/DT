@@ -34,7 +34,7 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) 
     if (authToken) {
       headers.Authorization = `Bearer ${authToken}`
     }
-    const response = await fetch(url, { ...options, headers, signal: controller.signal })
+    const response = await fetch(url, { cache: 'no-store', ...options, headers, signal: controller.signal })
     return response
   } finally {
     clearTimeout(timeout)
@@ -383,6 +383,21 @@ export async function fetchPipelineWorkerStatus() {
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Failed to load pipeline worker status')
+  }
+  return response.json()
+}
+
+export async function fetchLogsTail({ type = 'pipeline', lines = 200, includeRotated = true, cursor = 0 } = {}) {
+  const params = new URLSearchParams()
+  params.set('type', String(type || 'pipeline'))
+  params.set('lines', String(lines || 200))
+  params.set('cursor', String(cursor || 0))
+  params.set('include_rotated', includeRotated ? '1' : '0')
+  const response = await fetchWithTimeout(`${API_BASE}/api/logs/tail?${params.toString()}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to fetch log tail')
   }
   return response.json()
 }
