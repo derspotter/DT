@@ -4,6 +4,7 @@ services:
     environment:
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
       - CHOKIDAR_USEPOLLING=1
     volumes:
       - ./backend:/usr/src/app
@@ -11,6 +12,7 @@ services:
       - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_uploads:/usr/src/app/uploads
+      - rag_feeder_logs:/usr/src/app/logs
 
   rag_feeder:
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5175"
@@ -26,3 +28,4 @@ services:
 volumes:
   rag_backend_node_modules:
   rag_feeder_node_modules:
+  rag_feeder_logs:

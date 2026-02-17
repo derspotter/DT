@@ -17,6 +17,7 @@ services:
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
       - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
       - RAG_FEEDER_ENRICH_WORKERS=${RAG_FEEDER_ENRICH_WORKERS:-6}
+      - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
       - CHOKIDAR_USEPOLLING=1
     volumes:
       - ./backend/src:/usr/src/app/src
@@ -24,6 +25,7 @@ services:
       - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_uploads:/usr/src/app/uploads
+      - rag_feeder_logs:/usr/src/app/logs
     restart: unless-stopped
     networks:
       - rag-network
@@ -54,3 +56,4 @@ networks:
 
 volumes:
   rag_feeder_uploads:
+  rag_feeder_logs:

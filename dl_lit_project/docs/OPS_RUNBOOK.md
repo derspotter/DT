@@ -24,6 +24,9 @@
 - Logs:
   - `docker logs -f rag_feeder_backend`
   - `docker logs -f rag_feeder_frontend`
+  - persistent files:
+    - `tail -f logs/backend-app.log`
+    - `tail -f logs/backend-pipeline.log`
 
 ## Required environment
 
@@ -38,6 +41,27 @@ Optional throughput controls:
 - `RAG_FEEDER_OPENALEX_RPS`
 - `RAG_FEEDER_CROSSREF_RPS`
 - `RAG_FEEDER_ENRICH_WORKERS`
+
+Optional logging controls:
+
+- `RAG_FEEDER_LOG_DIR` (default: `<repo>/logs`)
+- `RAG_FEEDER_LOG_MAX_BYTES` (default: `10485760`)
+- `RAG_FEEDER_LOG_MAX_FILES` (default: `5`)
+
+## Log API
+
+- Tail latest lines:
+  - `curl -H "Authorization: Bearer <token>" "http://localhost:4000/api/logs/tail?type=pipeline&lines=200"`
+- Fetch older page using cursor:
+  - `curl -H "Authorization: Bearer <token>" "http://localhost:4000/api/logs/tail?type=pipeline&lines=200&cursor=200"`
+- App logs instead of pipeline logs:
+  - `curl -H "Authorization: Bearer <token>" "http://localhost:4000/api/logs/tail?type=app&lines=100"`
+
+Response fields:
+- `entries`: log lines in chronological order
+- `has_more`: whether older lines are available
+- `next_cursor`: cursor for the next "older" page
+- `total_lines`: total merged lines (including rotated files if enabled)
 
 ## Data safety
 

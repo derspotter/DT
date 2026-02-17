@@ -64,3 +64,5 @@ Required for extraction/enrichment:
 Optional but recommended:
 - `RAG_FEEDER_JWT_SECRET`
 - `RAG_FEEDER_GEMINI_MODEL` (default: `gemini-3-flash-preview`)
+- `RAG_FEEDER_LOG_DIR` (default: `logs/`)
+- `RAG_FEEDER_LOG_MAX_BYTES` and `RAG_FEEDER_LOG_MAX_FILES` for rotation

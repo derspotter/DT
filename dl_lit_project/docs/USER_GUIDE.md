@@ -47,6 +47,10 @@
 - **Corpus**: browse stage tables and entry details.
 - **Downloads**: view queue and downloaded outputs.
 - **Graph**: inspect citation network and filters.
+- **Logs**:
+  - switch between **Pipeline** and **App** logs
+  - click **Load older** to page back through persisted logs
+  - click **Refresh from file** to reload the latest persisted lines
 
 ## 7. Export data
 
