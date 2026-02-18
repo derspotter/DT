@@ -540,6 +540,7 @@ class DatabaseManager:
         self._add_missing_columns_to_downloaded_references()
         self._add_missing_columns_to_ingest_entries()
         self._migrate_legacy_queue_into_with_metadata()
+        self._backfill_normalized_contributors()
 
         # Helpful indices for quick look-ups (after ensuring columns exist)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
@@ -806,7 +807,10 @@ class DatabaseManager:
                 doi = self._normalize_doi(row.get('doi'))
                 openalex_id = self._normalize_openalex_id(row.get('openalex_id'))
                 normalized_title = row.get('normalized_title') or self._normalize_text(row.get('title'))
-                normalized_authors = row.get('normalized_authors') or self._normalize_authors_value(row.get('authors'))
+                normalized_authors = row.get('normalized_authors') or self._normalize_contributor_fields(
+                    row.get('authors'),
+                    row.get('editors'),
+                )
                 year = row.get('year')
 
                 existing_id = None
@@ -1098,6 +1102,90 @@ class DatabaseManager:
             joined = str(authors)
         return self._normalize_text(joined)
 
+    def _parse_name_list(self, value: list | str | None) -> list[str]:
+        """Parse a list-like field (authors/editors) into a clean list of names."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("[") and raw.endswith("]"):
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, list):
+                        return [str(item).strip() for item in parsed if str(item).strip()]
+                except json.JSONDecodeError:
+                    pass
+            return [raw]
+        return [str(value).strip()] if str(value).strip() else []
+
+    def _normalize_contributor_fields(
+        self,
+        authors: list | str | None = None,
+        editors: list | str | None = None,
+    ) -> str | None:
+        """Normalize contributors for duplicate matching; fall back to editors when authors are empty."""
+        author_list = self._parse_name_list(authors)
+        if author_list:
+            return self._normalize_authors_value(author_list)
+        editor_list = self._parse_name_list(editors)
+        if editor_list:
+            return self._normalize_authors_value(editor_list)
+        return None
+
+    def _backfill_normalized_contributors(self) -> None:
+        """Fill missing normalized_authors from authors/editor fields for legacy rows."""
+        cursor = self.conn.cursor()
+        table_specs = [
+            ("no_metadata", "id"),
+            ("with_metadata", "id"),
+            ("to_download_references", "id"),
+            ("downloaded_references", "id"),
+        ]
+        total_updated = 0
+
+        for table_name, pk_col in table_specs:
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = {row[1] for row in cursor.fetchall()}
+            required = {pk_col, "authors", "editors", "normalized_authors"}
+            if not required.issubset(columns):
+                continue
+
+            cursor.execute(
+                f"""
+                SELECT {pk_col}, authors, editors, normalized_authors
+                FROM {table_name}
+                WHERE (normalized_authors IS NULL OR TRIM(normalized_authors) = '')
+                  AND (
+                    (authors IS NOT NULL AND TRIM(authors) NOT IN ('', '[]'))
+                    OR
+                    (editors IS NOT NULL AND TRIM(editors) NOT IN ('', '[]'))
+                  )
+                """
+            )
+            rows = cursor.fetchall()
+            updates: list[tuple[str, int]] = []
+            for row_id, authors_raw, editors_raw, _ in rows:
+                normalized = self._normalize_contributor_fields(authors_raw, editors_raw)
+                if normalized:
+                    updates.append((normalized, row_id))
+
+            if updates:
+                cursor.executemany(
+                    f"UPDATE {table_name} SET normalized_authors = ? WHERE {pk_col} = ?",
+                    updates,
+                )
+                total_updated += len(updates)
+
+        if total_updated:
+            self.conn.commit()
+            print(
+                f"{GREEN}[DB Manager] Backfilled normalized contributors for {total_updated} row(s).{RESET}"
+            )
+
     def add_entries_to_no_metadata_from_json(
         self,
         json_file_path: str | Path,
@@ -1202,6 +1290,7 @@ class DatabaseManager:
         openalex_id: str | None,
         title: str | None = None,
         authors: list | str | None = None,
+        editors: list | str | None = None,
         year: int | str | None = None,
         exclude_id: int | None = None,
         exclude_table: str | None = None
@@ -1216,6 +1305,7 @@ class DatabaseManager:
             openalex_id: The OpenAlex ID to check (e.g., 'W12345').
             title: The title to check (will be normalized).
             authors: The authors to check (list or JSON string, will be normalized).
+            editors: The editors to check (used as contributor fallback when authors are missing).
             year: The year to check.
             exclude_id: An entry ID to exclude from the search.
             exclude_table: The table name associated with exclude_id.
@@ -1225,22 +1315,7 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
 
-        def _normalize_authors_input(authors_value: list | str | None) -> str | None:
-            if not authors_value:
-                return None
-            if isinstance(authors_value, list):
-                return self._normalize_authors_value(authors_value)
-            if isinstance(authors_value, str):
-                authors_str = authors_value.strip()
-                if authors_str.startswith("[") and authors_str.endswith("]"):
-                    try:
-                        parsed = json.loads(authors_str)
-                        if isinstance(parsed, list):
-                            return self._normalize_authors_value(parsed)
-                    except json.JSONDecodeError:
-                        pass
-                return self._normalize_authors_value(authors_str)
-            return self._normalize_authors_value(authors_value)
+        normalized_contributors = self._normalize_contributor_fields(authors, editors)
 
         def _execute_check(table, field, value):
             query = f"SELECT id FROM {table} WHERE {field} = ?"
@@ -1318,15 +1393,16 @@ class DatabaseManager:
                         return alias_table, alias_id, "alias_title"
 
         # Fallbacks using normalized title/authors/year when identifiers are missing
-        if title and authors and year:
-            # Normalize inputs
+        year_str = None
+        year_present = False
+        if year is not None:
+            year_value = str(year).strip()
+            if year_value:
+                year_str = year_value
+                year_present = True
+
+        if title and normalized_contributors and year_present and year_str is not None:
             normalized_title = self._normalize_text(title)
-            normalized_authors = _normalize_authors_input(authors)
-            
-            # Convert year to string for consistent comparison
-            year_str = str(year)
-            
-            # Check each table for title/authors/year match
             for table in ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]:
                 query = f"""
                     SELECT id FROM {table} 
@@ -1334,7 +1410,7 @@ class DatabaseManager:
                     AND normalized_authors = ? 
                     AND CAST(year AS TEXT) = ?
                 """
-                params = [normalized_title, normalized_authors, year_str]
+                params = [normalized_title, normalized_contributors, year_str]
                 
                 if table == exclude_table and exclude_id is not None:
                     query += " AND id != ?"
@@ -1345,18 +1421,17 @@ class DatabaseManager:
                 if row:
                     return table, row[0], "title_authors_year"
 
-        # If year is missing but we have authors, use title+authors to avoid punctuation-only duplicates.
-        if title and authors and not year:
+        # If year is missing but we have contributors, use title+contributors to avoid punctuation-only duplicates.
+        if title and normalized_contributors and not year_present:
             normalized_title = self._normalize_text(title)
-            normalized_authors = _normalize_authors_input(authors)
-            if normalized_title and normalized_authors:
+            if normalized_title:
                 for table in ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]:
                     query = f"""
                         SELECT id FROM {table}
                         WHERE normalized_title = ?
                         AND normalized_authors = ?
                     """
-                    params = [normalized_title, normalized_authors]
+                    params = [normalized_title, normalized_contributors]
                     if table == exclude_table and exclude_id is not None:
                         query += " AND id != ?"
                         params.append(exclude_id)
@@ -1365,10 +1440,9 @@ class DatabaseManager:
                     if row:
                         return table, row[0], "title_authors"
 
-        # If authors are missing but we have a year, use title+year.
-        if title and year and not authors:
+        # If contributors are missing but we have a year, use title+year.
+        if title and year_present and not normalized_contributors and year_str is not None:
             normalized_title = self._normalize_text(title)
-            year_str = str(year)
             if normalized_title:
                 for table in ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]:
                     query = f"""
@@ -1664,8 +1738,11 @@ class DatabaseManager:
                 updates["normalized_doi"] = self._normalize_doi(updates.get("doi"))
             if "title" in updates and "normalized_title" in canonical_cols:
                 updates["normalized_title"] = self._normalize_text(updates.get("title"))
-            if "authors" in updates and "normalized_authors" in canonical_cols:
-                updates["normalized_authors"] = self._normalize_authors_value(updates.get("authors"))
+            if "normalized_authors" in canonical_cols and ("authors" in updates or "editors" in updates):
+                updates["normalized_authors"] = self._normalize_contributor_fields(
+                    updates.get("authors", canonical.get("authors")),
+                    updates.get("editors", canonical.get("editors")),
+                )
 
             if updates:
                 set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -1790,8 +1867,11 @@ class DatabaseManager:
                 updates["normalized_doi"] = self._normalize_doi(updates.get("doi"))
             if "title" in updates and "normalized_title" in existing_cols:
                 updates["normalized_title"] = self._normalize_text(updates.get("title"))
-            if "authors" in updates and "normalized_authors" in existing_cols:
-                updates["normalized_authors"] = self._normalize_authors_value(updates.get("authors"))
+            if "normalized_authors" in existing_cols and ("authors" in updates or "editors" in updates):
+                updates["normalized_authors"] = self._normalize_contributor_fields(
+                    updates.get("authors", existing.get("authors")),
+                    updates.get("editors", existing.get("editors")),
+                )
 
             if updates:
                 set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
@@ -1876,10 +1956,9 @@ class DatabaseManager:
         doi_raw = ref.get("doi")
         norm_doi = self._normalize_doi(doi_raw)
         norm_title = self._normalize_text(title)
-        authors_raw = ref.get("authors") or []
-        if isinstance(authors_raw, str):
-            authors_raw = [authors_raw]
-        norm_authors = self._normalize_authors_value(authors_raw)
+        authors_raw = self._parse_name_list(ref.get("authors"))
+        editors_raw = self._parse_name_list(ref.get("editors"))
+        norm_authors = self._normalize_contributor_fields(authors_raw, editors_raw)
 
         # Duplicate search using existing helper (will search downloaded & queue)
         # Pass title, authors, and year for comprehensive duplicate detection
@@ -1888,6 +1967,7 @@ class DatabaseManager:
             openalex_id=None,
             title=title,
             authors=authors_raw,
+            editors=editors_raw,
             year=ref.get("year")
         )
         if tbl:
@@ -1895,7 +1975,7 @@ class DatabaseManager:
             incoming_ref_for_merge = {
                 **ref,
                 "authors": json.dumps(authors_raw) if authors_raw else None,
-                "editors": json.dumps(ref.get("editors")) if ref.get("editors") else None,
+                "editors": json.dumps(editors_raw) if editors_raw else None,
                 "keywords": json.dumps(ref.get("keywords")) if ref.get("keywords") else None,
                 "normalized_doi": norm_doi,
                 "normalized_title": norm_title,
@@ -1991,7 +2071,7 @@ class DatabaseManager:
                     ref.get("source_pdf"),
                     title,
                     json.dumps(authors_raw),
-                    json.dumps(ref.get("editors")) if ref.get("editors") else None,
+                    json.dumps(editors_raw) if editors_raw else None,
                     ref.get("year"),
                     doi_raw,
                     ref.get("source"),
@@ -2187,7 +2267,10 @@ class DatabaseManager:
                 "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id")),
             }
             merged["normalized_title"] = self._normalize_text(merged.get("title"))
-            merged["normalized_authors"] = self._normalize_authors_value(merged.get("authors"))
+            merged["normalized_authors"] = self._normalize_contributor_fields(
+                merged.get("authors"),
+                merged.get("editors"),
+            )
 
             # Check for duplicates before promotion
             tbl, eid, field = self.check_if_exists(
@@ -2195,6 +2278,7 @@ class DatabaseManager:
                 openalex_id=merged.get("openalex_id"),
                 title=merged.get("title"),
                 authors=merged.get("authors"),
+                editors=merged.get("editors"),
                 year=merged.get("year"),
                 exclude_id=no_meta_id,
                 exclude_table="no_metadata"
@@ -2631,6 +2715,7 @@ class DatabaseManager:
             openalex_id=input_openalex_id,
             title=title,
             authors=parsed_data.get('authors'),
+            editors=parsed_data.get('editors'),
             year=parsed_data.get('year'),
             exclude_id=exclude_id,
             exclude_table=exclude_table,
@@ -2678,7 +2763,10 @@ class DatabaseManager:
             authors_value = parsed_data.get('authors')
             authors_json = json.dumps(authors_value) if isinstance(authors_value, list) else authors_value
             normalized_title = self._normalize_text(parsed_data.get('title'))
-            normalized_authors = self._normalize_authors_value(authors_value)
+            normalized_authors = self._normalize_contributor_fields(
+                authors_value,
+                parsed_data.get('editors'),
+            )
             normalized_doi = self._normalize_doi(parsed_data.get('doi'))
 
             insert_data = {

@@ -148,3 +148,61 @@ def test_merge_log_records_high_confidence_duplicate(tmp_path):
     assert cur.fetchone()[0] >= 1
 
     db.close_connection()
+
+
+def test_check_if_exists_uses_editors_when_authors_missing(tmp_path):
+    db_path = tmp_path / "test.db"
+    db = DatabaseManager(db_path)
+
+    ref = {
+        "title": "Vom Klassenkampf Zum Co-Management?",
+        "authors": [],
+        "editors": ["Klitzke, U.", "Betz, H.", "Moreke, M."],
+        "year": 2000,
+    }
+    row_id, err = db.insert_no_metadata(ref)
+    assert row_id is not None and err is None
+
+    table, eid, field = db.check_if_exists(
+        doi=None,
+        openalex_id=None,
+        title=ref["title"],
+        authors=[],
+        editors=["Klitzke, U.", "Betz, H.", "Moreke, M."],
+        year=2000,
+    )
+    assert table == "no_metadata"
+    assert eid == row_id
+    assert field == "title_authors_year"
+    db.close_connection()
+
+
+def test_backfills_normalized_authors_from_editors(tmp_path):
+    db_path = tmp_path / "test.db"
+    db = DatabaseManager(db_path)
+
+    cur = db.conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO no_metadata (title, authors, editors, year, normalized_title, normalized_authors)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "Editors Only Work",
+            "[]",
+            json.dumps(["Yamamura, K.", "Streeck, W."]),
+            2003,
+            db._normalize_text("Editors Only Work"),
+            None,
+        ),
+    )
+    row_id = cur.lastrowid
+    db.conn.commit()
+    db.close_connection()
+
+    reopened = DatabaseManager(db_path)
+    cur2 = reopened.conn.cursor()
+    cur2.execute("SELECT normalized_authors FROM no_metadata WHERE id = ?", (row_id,))
+    normalized = cur2.fetchone()[0]
+    assert normalized == reopened._normalize_authors_value(["Yamamura, K.", "Streeck, W."])
+    reopened.close_connection()

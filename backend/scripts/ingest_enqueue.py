@@ -119,6 +119,7 @@ def main():
             openalex_id=entry.get("openalex_id"),
             title=entry.get("title"),
             authors=entry.get("authors"),
+            editors=entry.get("editors"),
             year=entry.get("year"),
         )
 

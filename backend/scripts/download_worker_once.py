@@ -107,6 +107,7 @@ def main() -> None:
                 openalex_id=row.get("openalex_id"),
                 title=row.get("title"),
                 authors=authors,
+                editors=row.get("editors"),
                 year=row.get("year"),
                 exclude_id=qid,
                 exclude_table="with_metadata",
