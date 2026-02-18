@@ -508,8 +508,32 @@ function readAllLogLines(baseFilePath, { includeRotated = true, maxFiles = 5 } =
   return lines;
 }
 
-function readLogWindow(baseFilePath, { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5 } = {}) {
-  const allLines = readAllLogLines(baseFilePath, { includeRotated, maxFiles });
+function extractLogCorpusTag(line) {
+  const match = String(line || '').match(/\bcorpus=([a-zA-Z0-9_-]+)/);
+  return match ? match[1] : '';
+}
+
+function readLogWindow(
+  baseFilePath,
+  {
+    limit = 200,
+    cursor = 0,
+    includeRotated = true,
+    maxFiles = 5,
+    corpusId = null,
+  } = {}
+) {
+  let allLines = readAllLogLines(baseFilePath, { includeRotated, maxFiles });
+  const requestedCorpusTag = String(corpusId ?? '').trim();
+  if (requestedCorpusTag) {
+    allLines = allLines.filter((line) => {
+      const tag = extractLogCorpusTag(line);
+      if (!tag) {
+        return false;
+      }
+      return tag === requestedCorpusTag;
+    });
+  }
   const totalLines = allLines.length;
   const safeLimit = Math.max(1, Number(limit) || 200);
   const safeCursor = Math.max(0, Math.min(Number(cursor) || 0, totalLines));
@@ -687,6 +711,7 @@ export function createApp({ broadcast } = {}) {
     if (downloadDir) {
       args.push('--download-dir', String(downloadDir));
     }
+    const corpusTag = corpusId || 'none';
 
     const env = {
       ...process.env,
@@ -708,7 +733,7 @@ export function createApp({ broadcast } = {}) {
       message
         .split(/\r?\n/)
         .filter(Boolean)
-        .forEach((line) => send(`[download-worker] ${line}`));
+        .forEach((line) => send(`[download-worker] corpus=${corpusTag} ${line}`));
     });
 
     child.stderr.on('data', (data) => {
@@ -717,10 +742,10 @@ export function createApp({ broadcast } = {}) {
       message
         .split(/\r?\n/)
         .filter(Boolean)
-        .forEach((line) => send(`[download-worker ERROR] ${line}`));
+        .forEach((line) => send(`[download-worker ERROR] corpus=${corpusTag} ${line}`));
     });
 
-    const done = new Promise((resolve, reject) => {
+  const done = new Promise((resolve, reject) => {
       child.on('close', (code) => {
         if (code !== 0) {
           return reject(new Error(`Python script failed (${code}): ${stderr || stdout}`));
@@ -744,17 +769,18 @@ export function createApp({ broadcast } = {}) {
     state.lastTickAt = new Date().toISOString();
     state.lastError = null;
     const { batchSize } = state.config;
-    send(`[download-worker] tick corpus=${corpusId || 'none'} batch=${batchSize}`);
+    const corpusTag = corpusId || 'none';
+    send(`[download-worker] corpus=${corpusTag} tick batch=${batchSize}`);
     try {
       const { child, done } = spawnDownloadOnce({ corpusId, batchSize });
       state.child = child;
       state.lastResult = await done;
       send(
-        `[download-worker] done processed=${state.lastResult.processed} downloaded=${state.lastResult.downloaded} failed=${state.lastResult.failed} skipped=${state.lastResult.skipped}`
+        `[download-worker] corpus=${corpusTag} done processed=${state.lastResult.processed} downloaded=${state.lastResult.downloaded} failed=${state.lastResult.failed} skipped=${state.lastResult.skipped}`
       );
     } catch (error) {
       state.lastError = error?.message || String(error);
-      send(`[download-worker ERROR] ${state.lastError}`);
+      send(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
     } finally {
       state.child = null;
       state.inFlight = false;
@@ -857,6 +883,7 @@ export function createApp({ broadcast } = {}) {
     const state = getOrInitPipelineWorkerState(corpusId);
     if (!state.running || state.inFlight) return;
     state.inFlight = true;
+    const corpusTag = corpusId || 'none';
     state.lastTickAt = new Date().toISOString();
     state.lastError = null;
     state.children = [];
@@ -872,7 +899,7 @@ export function createApp({ broadcast } = {}) {
     state.resolvedDownloadWorkers = workerCount;
 
     send(
-      `[pipeline-worker] tick corpus=${corpusId || 'none'} promote_batch=${promoteBatchSize} ` +
+      `[pipeline-worker] tick corpus=${corpusTag} promote_batch=${promoteBatchSize} ` +
         `promote_workers=${promoteWorkers} download_batch=${downloadBatchSize} workers=${workerCount}`
     );
 
@@ -884,15 +911,15 @@ export function createApp({ broadcast } = {}) {
         {
           dbPath: DB_PATH,
           corpusId,
-          onStdoutLine: (line) => send(`[pipeline-worker mark] ${line}`),
-          onStderrLine: (line) => send(`[pipeline-worker mark ERROR] ${line}`),
+          onStdoutLine: (line) => send(`[pipeline-worker mark] corpus=${corpusTag} ${line}`),
+          onStderrLine: (line) => send(`[pipeline-worker mark ERROR] corpus=${corpusTag} ${line}`),
         }
       );
       state.children.push(markRun.child);
       const marked = await markRun.done;
       state.children = state.children.filter((child) => child !== markRun.child);
       send(
-        `[pipeline-worker] marked raw=${Number(marked?.marked || 0)} candidates=${Number(marked?.available || 0)}`
+        `[pipeline-worker] corpus=${corpusTag} marked raw=${Number(marked?.marked || 0)} candidates=${Number(marked?.available || 0)}`
       );
       hadActivity = hadActivity || Number(marked?.marked || 0) > 0;
 
@@ -910,15 +937,15 @@ export function createApp({ broadcast } = {}) {
         {
           dbPath: DB_PATH,
           corpusId,
-          onStdoutLine: (line) => send(`[pipeline-worker enrich] ${line}`),
-          onStderrLine: (line) => send(`[pipeline-worker enrich ERROR] ${line}`),
+          onStdoutLine: (line) => send(`[pipeline-worker enrich] corpus=${corpusTag} ${line}`),
+          onStderrLine: (line) => send(`[pipeline-worker enrich ERROR] corpus=${corpusTag} ${line}`),
         }
       );
       state.children.push(promoteRun.child);
       const promoted = await promoteRun.done;
       state.children = state.children.filter((child) => child !== promoteRun.child);
       send(
-        `[pipeline-worker] enrich processed=${Number(promoted?.processed || 0)} promoted=${Number(
+        `[pipeline-worker] corpus=${corpusTag} enrich processed=${Number(promoted?.processed || 0)} promoted=${Number(
           promoted?.promoted || 0
         )} queued=${Number(promoted?.queued || 0)} failed=${Number(promoted?.failed || 0)}`
       );
@@ -945,7 +972,7 @@ export function createApp({ broadcast } = {}) {
       downloads.errors.push(...rejected);
 
       send(
-        `[pipeline-worker] download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
+        `[pipeline-worker] corpus=${corpusTag} download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
           `failed=${downloads.failed} skipped=${downloads.skipped}`
       );
       hadActivity =
@@ -969,7 +996,7 @@ export function createApp({ broadcast } = {}) {
       state.lastError = downloads.errors.length ? downloads.errors[0] : null;
     } catch (error) {
       state.lastError = error?.message || String(error);
-      send(`[pipeline-worker ERROR] ${state.lastError}`);
+      send(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
     } finally {
       state.children = [];
       state.inFlight = false;
@@ -1028,6 +1055,98 @@ export function createApp({ broadcast } = {}) {
       });
     }
     return state;
+  }
+
+  function pauseAllPipelineWorkers({ force = false } = {}) {
+    const result = {
+      requestedForce: Boolean(force),
+      stopped: 0,
+      inFlight: 0,
+      wasRunning: 0,
+      states: {},
+    };
+    for (const [key, state] of pipelineWorkers.entries()) {
+      const hadInFlight = Boolean(state.inFlight);
+      const hadRunning = Boolean(state.running);
+      state.running = false;
+      if (state.intervalId) {
+        clearInterval(state.intervalId);
+        state.intervalId = null;
+      }
+      if (force && Array.isArray(state.children)) {
+        state.children.forEach((child) => {
+          try {
+            child.kill('SIGTERM');
+          } catch (error) {
+            // ignore
+          }
+        });
+      }
+      if (force) {
+        state.inFlight = false;
+        state.children = [];
+      }
+      const keyLabel = key === 0 ? 'none' : String(key);
+      result.states[keyLabel] = {
+        running: state.running,
+        inFlight: state.inFlight,
+      };
+      if (hadRunning) {
+        result.wasRunning += 1;
+      }
+      if (hadInFlight) {
+        result.inFlight += 1;
+      }
+      if (hadRunning || hadInFlight) {
+        result.stopped += 1;
+      }
+    }
+    return result;
+  }
+
+  function stopAllDownloadWorkers({ force = false } = {}) {
+    const result = {
+      requestedForce: Boolean(force),
+      stopped: 0,
+      inFlight: 0,
+      wasRunning: 0,
+      states: {},
+    };
+    for (const [key, state] of downloadWorkers.entries()) {
+      const hadInFlight = Boolean(state.inFlight);
+      const hadRunning = Boolean(state.running);
+      state.running = false;
+      if (state.intervalId) {
+        clearInterval(state.intervalId);
+        state.intervalId = null;
+      }
+      if (force && state.child) {
+        try {
+          state.child.kill('SIGTERM');
+        } catch (error) {
+          // ignore
+        }
+      }
+      if (force) {
+        state.inFlight = false;
+        state.child = null;
+      }
+      const keyLabel = key === 0 ? 'none' : String(key);
+      result.states[keyLabel] = {
+        running: state.running,
+        inFlight: state.inFlight,
+      };
+      if (hadRunning) {
+        result.wasRunning += 1;
+      }
+      if (hadInFlight) {
+        result.inFlight += 1;
+      }
+      if (hadRunning || hadInFlight) {
+        result.stopped += 1;
+      }
+    }
+    return result;
   }
 
   // Middleware
@@ -1224,6 +1343,7 @@ export function createApp({ broadcast } = {}) {
   app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, (req, res) => {
     const { filename } = req.params;
     const corpusId = req.corpusId;
+    const corpusTag = String(corpusId || 'none');
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
     const baseName = path.basename(filename, path.extname(filename)); // stable ingest_source
     const existingPagesDir = path.join(BIB_OUTPUT_DIR, baseName);
@@ -1276,10 +1396,10 @@ export function createApp({ broadcast } = {}) {
         try {
           sharedUploadedFileName = geminiUploadPdfSync(inputPdfPath);
           console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
-          send(`[/api/extract-bibliography] Uploaded once for reuse: ${sharedUploadedFileName}`);
+          send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
         } catch (uploadErr) {
           console.warn(`[/api/extract-bibliography] Shared upload failed, continuing without reuse: ${uploadErr?.message || uploadErr}`);
-          send(`[/api/extract-bibliography] Shared upload unavailable; continuing with regular flow.`);
+          send(`[/api/extract-bibliography][corpus=${corpusTag}] Shared upload unavailable; continuing with regular flow.`);
           sharedUploadedFileName = null;
         }
       }
@@ -1302,7 +1422,7 @@ export function createApp({ broadcast } = {}) {
           if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
 
           console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
-          send(`[/api/extract-bibliography] Starting ${label}...`);
+          send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
           const child = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
             env: {
               ...process.env,
@@ -1316,19 +1436,19 @@ export function createApp({ broadcast } = {}) {
           child.stdout.on('data', (data) => {
             const message = data.toString();
             console.log(`[${label} stdout]: ${message}`);
-            send(`[${label}] ${message}`);
+            send(`[${label}] [corpus=${corpusTag}] ${message}`);
           });
 
           child.stderr.on('data', (data) => {
             const message = data.toString();
             console.error(`[${label} stderr]: ${message}`);
-            send(`[${label} ERROR] ${message}`);
+            send(`[${label} ERROR] [corpus=${corpusTag}] ${message}`);
           });
 
           child.on('close', (code) => {
             if (code !== 0) {
               console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
-              send(`[/api/extract-bibliography] ${label} failed with code ${code}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
               resolve(false);
               return;
             }
@@ -1341,14 +1461,16 @@ export function createApp({ broadcast } = {}) {
       const runInlineFallback = async (reason) => {
         if (!inputExists) {
           console.error(`[/api/extract-bibliography] Cannot run inline fallback: input PDF missing (${inputPdfPath}).`);
-          send(`[/api/extract-bibliography] Inline fallback skipped (input PDF missing).`);
+          send(`[/api/extract-bibliography][corpus=${corpusTag}] Inline fallback skipped (input PDF missing).`);
           return false;
         }
         const useSharedUpload = Boolean(sharedUploadedFileName);
         const chunkPages = useSharedUpload ? 0 : 50;
         const why = reason || 'reference page extraction returned no usable pages';
         console.warn(`[/api/extract-bibliography] Triggering inline citation fallback: ${why}`);
-        send(`[/api/extract-bibliography] Triggering inline citation fallback (${why}, chunk_pages=${chunkPages || 0}).`);
+        send(
+          `[/api/extract-bibliography][corpus=${corpusTag}] Triggering inline citation fallback (${why}, chunk_pages=${chunkPages || 0}).`
+        );
         const ok = await runApiScraper({
           inputPdf: inputPdfPath,
           extractMode: 'inline',
@@ -1363,7 +1485,7 @@ export function createApp({ broadcast } = {}) {
       // Fast-path: if the upload is missing but we already have extracted page PDFs, run the scraper only.
       if (!inputExists && pagesExist) {
         console.log(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
-        send(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
+        send(`[/api/extract-bibliography][corpus=${corpusTag}] Upload missing; reusing extracted pages in ${existingPagesDir}`);
         runApiScraper({
           inputDir: existingPagesDir,
           extractMode: 'page',
@@ -1394,13 +1516,13 @@ export function createApp({ broadcast } = {}) {
       getPagesProcess.stdout.on('data', (data) => {
         const message = data.toString();
         console.log(`[get_bib_pages stdout]: ${message}`);
-        send(`[get_bib_pages] ${message}`);
+        send(`[get_bib_pages][corpus=${corpusTag}] ${message}`);
       });
 
       getPagesProcess.stderr.on('data', (data) => {
         const message = data.toString();
         console.error(`[get_bib_pages stderr]: ${message}`);
-        send(`[get_bib_pages ERROR] ${message}`);
+        send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${message}`);
       });
 
       getPagesProcess.on('close', async (code) => {
@@ -1408,7 +1530,7 @@ export function createApp({ broadcast } = {}) {
           console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
           if (code !== 0) {
             const errorMessage = `[/api/extract-bibliography] get_bib_pages.py exited with code ${code}.`;
-            send(errorMessage);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] get_bib_pages.py exited with code ${code}.`);
             console.error(errorMessage);
             await runInlineFallback(`get_bib_pages failed with code ${code}`);
             return;
@@ -1423,7 +1545,7 @@ export function createApp({ broadcast } = {}) {
           if (pageFiles.length === 0) {
             const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}.`;
             console.error(errorMessage);
-            send(errorMessage);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] No extracted page PDFs found in: ${jsonSubDir}.`);
             await runInlineFallback('no extracted bibliography pages found');
             return;
           }
@@ -1435,6 +1557,7 @@ export function createApp({ broadcast } = {}) {
           });
           if (ok) {
             console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename}.`);
           }
         } finally {
           cleanupSharedUpload();
@@ -1734,6 +1857,11 @@ export function createApp({ broadcast } = {}) {
   app.get('/api/logs/tail', requireAuthMiddleware, (req, res) => {
     try {
       const type = String(req.query?.type || 'pipeline').trim().toLowerCase();
+      const corpusIdRaw = req.query?.corpus_id ?? req.query?.corpusId;
+      const parsedCorpusId =
+        corpusIdRaw === undefined || corpusIdRaw === null || String(corpusIdRaw).trim() === ''
+          ? null
+          : coerceInt(corpusIdRaw, null);
       const lines = Math.min(2000, Math.max(1, coerceInt(req.query?.lines, 200) || 200));
       const cursor = Math.max(0, coerceInt(req.query?.cursor, 0) || 0);
       const includeRotatedRaw = String(req.query?.include_rotated ?? req.query?.includeRotated ?? '1').trim().toLowerCase();
@@ -1770,6 +1898,7 @@ export function createApp({ broadcast } = {}) {
         cursor,
         includeRotated,
         maxFiles,
+        corpusId: type === 'pipeline' && Number.isFinite(parsedCorpusId) ? parsedCorpusId : null,
       });
       return res.json({
         type,
@@ -1860,6 +1989,28 @@ export function createApp({ broadcast } = {}) {
       in_flight: state.inFlight,
       config: state.config,
       resolved_download_workers: state.resolvedDownloadWorkers,
+    });
+  });
+
+  app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({
+        pipeline: { stopped: 0, in_flight: 0, wasRunning: 0, states: {} },
+        downloads: { stopped: 0, in_flight: 0, wasRunning: 0, states: {} },
+        force: Boolean(req.body?.force),
+      });
+    }
+    if (!hasWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    }
+    const force = Boolean(req.body?.force);
+    const pipelineResult = pauseAllPipelineWorkers({ force });
+    const downloadResult = stopAllDownloadWorkers({ force });
+    send(`[pipeline-worker] corpus=all stopped all workers force=${force}`);
+    return res.json({
+      pipeline: pipelineResult,
+      downloads: downloadResult,
+      force,
     });
   });
 

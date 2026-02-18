@@ -1285,6 +1285,17 @@ button.danger:disabled {
   color: var(--ink);
 }
 
+.log-filter-current {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.log-filter-current input[type="checkbox"] {
+  margin: 0;
+  accent-color: #0f8b8d;
+}
+
 .log-line {
   padding-bottom: 6px;
   border-bottom: 1px solid rgba(214, 245, 243, 0.1);

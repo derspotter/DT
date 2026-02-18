@@ -15,12 +15,20 @@ describe('GET /api/logs/tail', () => {
 
     fs.writeFileSync(
       path.join(tmpDir, 'backend-pipeline.log.1'),
-      ['[older] line-a', '[older] line-b', '[older] line-c'].join('\n') + '\n',
+      [
+        '[older] corpus=123 line-a',
+        '[older] corpus=123 line-b',
+        '[older] corpus=456 line-c',
+      ].join('\n') + '\n',
       'utf8'
     )
     fs.writeFileSync(
       path.join(tmpDir, 'backend-pipeline.log'),
-      ['[new] line-d', '[new] line-e', '[new] line-f'].join('\n') + '\n',
+      [
+        '[new] corpus=999 line-d',
+        '[new] corpus=123 line-e',
+        '[new] corpus=123 line-f',
+      ].join('\n') + '\n',
       'utf8'
     )
     fs.writeFileSync(path.join(tmpDir, 'backend-app.log'), ['[app] one', '[app] two'].join('\n') + '\n', 'utf8')
@@ -40,7 +48,12 @@ describe('GET /api/logs/tail', () => {
     const res = await request(app).get('/api/logs/tail?type=pipeline&lines=4')
     expect(res.status).toBe(200)
     expect(res.body.type).toBe('pipeline')
-    expect(res.body.entries).toEqual(['[older] line-c', '[new] line-d', '[new] line-e', '[new] line-f'])
+    expect(res.body.entries).toEqual([
+      '[older] corpus=456 line-c',
+      '[new] corpus=999 line-d',
+      '[new] corpus=123 line-e',
+      '[new] corpus=123 line-f',
+    ])
     expect(res.body.count).toBe(4)
     expect(res.body.has_more).toBe(true)
     expect(res.body.next_cursor).toBe(4)
@@ -52,7 +65,7 @@ describe('GET /api/logs/tail', () => {
     expect(newer.status).toBe(200)
     const older = await request(app).get(`/api/logs/tail?type=pipeline&lines=4&cursor=${newer.body.next_cursor}`)
     expect(older.status).toBe(200)
-    expect(older.body.entries).toEqual(['[older] line-a', '[older] line-b'])
+    expect(older.body.entries).toEqual(['[older] corpus=123 line-a', '[older] corpus=123 line-b'])
     expect(older.body.has_more).toBe(false)
     expect(older.body.next_cursor).toBe(6)
   })
@@ -63,6 +76,22 @@ describe('GET /api/logs/tail', () => {
     expect(res.body.type).toBe('app')
     expect(res.body.entries).toEqual(['[app] one', '[app] two'])
     expect(res.body.count).toBe(2)
+  })
+
+  test('supports filtering by corpus tag', async () => {
+    const resWithTag = await request(app).get('/api/logs/tail?type=pipeline&lines=5&corpus_id=123')
+    expect(resWithTag.status).toBe(200)
+    expect(resWithTag.body.entries).toEqual([
+      '[older] corpus=123 line-a',
+      '[older] corpus=123 line-b',
+      '[new] corpus=123 line-e',
+      '[new] corpus=123 line-f',
+    ])
+    expect(resWithTag.body.has_more).toBe(false)
+
+    const resAll = await request(app).get('/api/logs/tail?type=pipeline&lines=5&corpus_id=999')
+    expect(resAll.status).toBe(200)
+    expect(resAll.body.entries).toEqual(['[new] corpus=999 line-d'])
   })
 
   test('rejects invalid log type', async () => {

@@ -52,4 +52,21 @@ describe('GET /api/downloads', () => {
     expect(pause.status).toBe(200)
     expect(pause.body).toHaveProperty('running')
   })
+
+  test('supports global pause-all worker controls (stub)', async () => {
+    const startPipeline = await request(app)
+      .post('/api/pipeline/worker/start')
+      .send({ intervalSeconds: 30, promoteBatchSize: 10, downloadBatchSize: 3, downloadWorkers: 0 })
+    expect(startPipeline.status).toBe(200)
+
+    const pauseAll = await request(app).post('/api/pipeline/worker/pause-all').send({ force: true })
+    expect(pauseAll.status).toBe(200)
+    expect(pauseAll.body).toHaveProperty('pipeline')
+    expect(pauseAll.body).toHaveProperty('downloads')
+    expect(typeof pauseAll.body.pipeline.stopped).toBe('number')
+    expect(typeof pauseAll.body.downloads.stopped).toBe('number')
+
+    const stopDownload = await request(app).post('/api/downloads/worker/stop').send({ force: true })
+    expect(stopDownload.status).toBe(200)
+  })
 })

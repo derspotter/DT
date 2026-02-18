@@ -387,12 +387,21 @@ export async function fetchPipelineWorkerStatus() {
   return response.json()
 }
 
-export async function fetchLogsTail({ type = 'pipeline', lines = 200, includeRotated = true, cursor = 0 } = {}) {
+export async function fetchLogsTail({
+  type = 'pipeline',
+  lines = 200,
+  includeRotated = true,
+  cursor = 0,
+  corpusId = null,
+} = {}) {
   const params = new URLSearchParams()
   params.set('type', String(type || 'pipeline'))
   params.set('lines', String(lines || 200))
   params.set('cursor', String(cursor || 0))
   params.set('include_rotated', includeRotated ? '1' : '0')
+  if (type === 'pipeline' && corpusId !== undefined && corpusId !== null) {
+    params.set('corpus_id', String(corpusId))
+  }
   const response = await fetchWithTimeout(`${API_BASE}/api/logs/tail?${params.toString()}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
@@ -440,6 +449,24 @@ export async function pausePipelineWorker({ force = false } = {}) {
   if (!response.ok) {
     const payload = await response.text()
     throw new Error(payload || 'Failed to pause pipeline worker')
+  }
+  return response.json()
+}
+
+export async function pauseAllPipelineWorkers({ force = true } = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/pipeline/worker/pause-all`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to pause all workers')
   }
   return response.json()
 }

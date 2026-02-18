@@ -102,8 +102,8 @@ test.describe('Korpus Builder live integration', () => {
     if (stateText.toLowerCase() === 'paused') {
       await page.getByRole('button', { name: 'Start / Continue' }).click()
       await expect(globalPipeline.locator('.header-pipeline__state strong')).toHaveText(/Running/i, { timeout: 20_000 })
-      await page.getByRole('button', { name: 'Pause' }).click()
-      await expect(globalPipeline.locator('.header-pipeline__actions button', { hasText: 'Pause' })).toBeVisible()
+      await page.getByRole('button', { name: 'Pause', exact: true }).click()
+      await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeVisible()
     }
 
     await page.getByTestId('tab-ingest').click()

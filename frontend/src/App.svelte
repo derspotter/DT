@@ -25,6 +25,7 @@
     fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
+    pauseAllPipelineWorkers,
     fetchGraph,
     downloadCorpusExport,
   } from './lib/api'
@@ -159,6 +160,7 @@
 
   let logs = []
   let logsType = 'pipeline'
+  let logsFilterCurrentCorpus = true
   let logsStatus = 'connecting'
   let logsSocket = null
   let logsReconnectTimer = null
@@ -327,6 +329,11 @@
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  function getLogsCorpusId() {
+    if (!logsFilterCurrentCorpus) return null
+    return Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+  }
+
   function shouldTriggerPipelineRefresh(logLine) {
     const text = String(logLine || '')
     if (!text) return false
@@ -340,6 +347,16 @@
       text.includes('Finished APIscraper') ||
       text.includes('Processing Summary')
     )
+  }
+
+  function isLogLineForCurrentCorpus(logLine) {
+    if (!logsFilterCurrentCorpus) return true
+    const corpusFilter = getLogsCorpusId()
+    if (!corpusFilter) return true
+    const text = String(logLine || '')
+    const match = text.match(/corpus=([a-zA-Z0-9_-]+)/)
+    if (!match) return true
+    return match[1] === String(corpusFilter)
   }
 
   function schedulePipelineRefresh(delayMs = 1500) {
@@ -500,6 +517,9 @@
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || nextId
       await refreshAll()
+      if (logsType === 'pipeline') {
+        handleLogsCorpusFilterChange()
+      }
     } catch (error) {
       authError = error.message || 'Failed to select corpus'
     }
@@ -517,6 +537,9 @@
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId
       await refreshAll()
+      if (logsType === 'pipeline') {
+        handleLogsCorpusFilterChange()
+      }
     } catch (error) {
       authError = error.message || 'Failed to create corpus'
     } finally {
@@ -978,6 +1001,26 @@
     }
   }
 
+  async function handlePauseAllPipelineWorkers() {
+    if (pipelineWorkerBusy) return
+    pipelineWorkerBusy = true
+    pipelineWorkerStatus = 'Pausing all pipeline workers...'
+    try {
+      await pauseAllPipelineWorkers({ force: true })
+      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads()])
+      pipelineWorkerStatus = 'Global pause complete.'
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      pipelineWorkerStatus = error?.message || 'Failed to pause all workers.'
+    } finally {
+      pipelineWorkerBusy = false
+    }
+  }
+
   async function handleStartDownloadWorker() {
     if (downloadWorkerBusy) return
     downloadWorkerBusy = true
@@ -1138,7 +1181,13 @@
     if (!force && logs.length > 0) return
     logsTailStatus = 'Loading recent logs...'
     try {
-      const payload = await fetchLogsTail({ type: logsType, lines: maxLogs, includeRotated: true, cursor: 0 })
+      const payload = await fetchLogsTail({
+        type: logsType,
+        lines: maxLogs,
+        includeRotated: true,
+        cursor: 0,
+        corpusId: getLogsCorpusId(),
+      })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       logs = entries.slice(-maxLogHistory)
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
@@ -1166,6 +1215,7 @@
         lines: maxLogs,
         includeRotated: true,
         cursor: logsCursor,
+        corpusId: getLogsCorpusId(),
       })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       if (entries.length > 0) {
@@ -1225,6 +1275,7 @@
         if (logsSocket !== ws) return
         if (logsType !== 'pipeline') return
         const line = event.data
+        if (!isLogLineForCurrentCorpus(line)) return
         const hadLines = logs.length > 0
         logs = [...logs, line].slice(-maxLogHistory)
         if (logsCursor > 0) {
@@ -1252,6 +1303,11 @@
     } catch (error) {
       logsStatus = 'unavailable'
     }
+  }
+
+  function handleLogsCorpusFilterChange() {
+    resetLogState()
+    hydrateLogsFromTail({ force: true })
   }
 
   function disconnectLogs() {
@@ -2060,6 +2116,15 @@
               >
                 Pause
               </button>
+              <button
+                class="secondary danger"
+                type="button"
+                on:click={handlePauseAllPipelineWorkers}
+                disabled={pipelineWorkerBusy || (!pipelineWorker.running && !pipelineWorker.in_flight && !downloadWorker.running && !downloadWorker.in_flight)}
+                title="Stop all pipeline and download workers across all corpora (force)."
+              >
+                Pause all
+              </button>
             </div>
             {#if pipelineWorkerStatus}
               <span class="muted small">{pipelineWorkerStatus}</span>
@@ -2810,6 +2875,10 @@
                   <option value="pipeline">Pipeline</option>
                   <option value="app">App</option>
                 </select>
+              </label>
+              <label class="log-filter-current">
+                <input type="checkbox" bind:checked={logsFilterCurrentCorpus} on:change={handleLogsCorpusFilterChange} />
+                <span class="muted small">Current corpus only</span>
               </label>
               <button
                 class="secondary"
