@@ -61,4 +61,13 @@ describe('POST /api/keyword-search', () => {
     expect(res.status).toBe(200)
     expect(res.body.source).toBe('stub')
   })
+
+  test('returns centralized recursion config', async () => {
+    const res = await request(app).get('/api/recursion-config')
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveProperty('keyword')
+    expect(res.body).toHaveProperty('uploadedDocs')
+    expect(res.body.keyword).toHaveProperty('relatedDepthDownstream')
+    expect(res.body.uploadedDocs).toHaveProperty('relatedDepth')
+  })
 })

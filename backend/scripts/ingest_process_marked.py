@@ -16,6 +16,10 @@ from dl_lit.OpenAlexScraper import (  # noqa: E402
     process_single_reference,
 )
 from dl_lit.utils import get_global_rate_limiter  # noqa: E402
+from reference_expansion import (
+    DEFAULT_MAX_RELATED,
+    DEFAULT_RELATED_DEPTH,
+)
 
 
 _thread_local = threading.local()
@@ -152,8 +156,8 @@ def main() -> None:
         help="Fetch citing works from OpenAlex (API intensive).",
     )
     parser.add_argument("--max-citations", type=int, default=100, help="Max citing works per paper.")
-    parser.add_argument("--related-depth", type=int, default=1, help="Reference expansion depth.")
-    parser.add_argument("--max-related", type=int, default=40, help="Max nested references per work.")
+    parser.add_argument("--related-depth", type=int, default=DEFAULT_RELATED_DEPTH, help="Reference expansion depth.")
+    parser.add_argument("--max-related", type=int, default=DEFAULT_MAX_RELATED, help="Max nested references per work.")
     parser.add_argument(
         "--api-retries",
         type=int,

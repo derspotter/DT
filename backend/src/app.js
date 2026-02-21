@@ -386,6 +386,82 @@ function parseJsonFromOutput(output) {
   throw new Error(`No valid JSON output from python. Output was: ${output}`);
 }
 
+function coercePositiveInt(value, fallback, minValue = 1) {
+  const normalized = coerceInt(value, fallback);
+  if (!Number.isFinite(normalized)) {
+    return fallback;
+  }
+  return normalized >= minValue ? normalized : minValue;
+}
+
+function buildKeywordSearchExpansion(body = {}) {
+  const explicitDepth = coerceInt(body?.relatedDepth, null);
+  const parsed = {
+    relatedDepthDownstream: coercePositiveInt(
+      coerceInt(body?.relatedDepthDownstream, explicitDepth ?? null),
+      RECURSION_DEFAULTS.keyword.relatedDepthDownstream,
+      1
+    ),
+    relatedDepthUpstream: coercePositiveInt(
+      coerceInt(body?.relatedDepthUpstream, explicitDepth ?? null),
+      RECURSION_DEFAULTS.keyword.relatedDepthUpstream,
+      1
+    ),
+    maxRelated: coercePositiveInt(body?.maxRelated, RECURSION_DEFAULTS.keyword.maxRelated, 1),
+    includeDownstream: body?.includeDownstream === undefined
+      ? RECURSION_DEFAULTS.keyword.includeDownstream
+      : Boolean(body.includeDownstream),
+    includeUpstream: body?.includeUpstream === undefined
+      ? RECURSION_DEFAULTS.keyword.includeUpstream
+      : Boolean(body.includeUpstream),
+  };
+  return parsed;
+}
+
+function applyKeywordSearchExpansionArgs(args, expansion) {
+  if (expansion.includeDownstream || expansion.includeUpstream) {
+    args.push('--related-depth-downstream', String(expansion.relatedDepthDownstream));
+    if (!expansion.includeDownstream) {
+      args.push('--no-include-downstream');
+    }
+    if (expansion.includeUpstream) {
+      args.push('--include-upstream');
+      args.push('--related-depth-upstream', String(expansion.relatedDepthUpstream));
+    }
+  } else {
+    args.push('--related-depth', String(1));
+    args.push('--no-include-downstream');
+  }
+  args.push('--max-related', String(expansion.maxRelated));
+}
+
+function buildUploadedDocsExpansion(body = {}) {
+  return {
+    relatedDepth: coercePositiveInt(
+      coerceInt(body?.relatedDepth, null),
+      RECURSION_DEFAULTS.uploadedDocs.relatedDepth,
+      1
+    ),
+    maxRelated: coercePositiveInt(
+      body?.maxRelated,
+      RECURSION_DEFAULTS.uploadedDocs.maxRelated,
+      1
+    ),
+    includeDownstream: body?.includeDownstream === undefined
+      ? RECURSION_DEFAULTS.uploadedDocs.includeDownstream
+      : Boolean(body.includeDownstream),
+  };
+}
+
+function applyUploadedDocsExpansionArgs(args, expansion) {
+  if (expansion.includeDownstream) {
+    args.push('--related-depth', String(expansion.relatedDepth));
+  } else {
+    args.push('--related-depth', String(1));
+  }
+  args.push('--max-related', String(expansion.maxRelated));
+}
+
 function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
   const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId });
   return done;
@@ -467,6 +543,35 @@ function coerceInt(value, fallback = null) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
+
+function coerceBoolEnv(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+  return fallback;
+}
+
+const RECURSION_DEFAULTS = {
+  keyword: {
+    relatedDepthDownstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
+    relatedDepthUpstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 1) || 1),
+    maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
+    includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, true),
+    includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
+  },
+  uploadedDocs: {
+    relatedDepth: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
+    maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
+    includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, true),
+  },
+};
 
 function getLogSettings() {
   const logDir = process.env.RAG_FEEDER_LOG_DIR || path.join(REPO_ROOT, 'logs');
@@ -1596,17 +1701,18 @@ export function createApp({ broadcast } = {}) {
     const yearTo = coerceInt(req.body?.yearTo, null);
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
-    const relatedDepth = coerceInt(req.body?.relatedDepth, null);
-    const relatedDepthDownstream = coerceInt(req.body?.relatedDepthDownstream, relatedDepth);
-    const relatedDepthUpstream = coerceInt(req.body?.relatedDepthUpstream, relatedDepth);
-    const maxRelated = coerceInt(req.body?.maxRelated, 30);
-    const includeDownstream =
-      req.body?.includeDownstream === undefined ? true : Boolean(req.body.includeDownstream);
-    const includeUpstream =
-      req.body?.includeUpstream === undefined ? false : Boolean(req.body.includeUpstream);
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
+    const expansion = buildKeywordSearchExpansion({
+      relatedDepth: coerceInt(req.body?.relatedDepth, null),
+      relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
+      relatedDepthUpstream: coerceInt(req.body?.relatedDepthUpstream, null),
+      maxRelated: coerceInt(req.body?.maxRelated, null),
+      includeDownstream: req.body?.includeDownstream,
+      includeUpstream: req.body?.includeUpstream,
+    });
+
     if (query) args.push('--query', query);
     if (!query && seedJson) {
       const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
@@ -1616,30 +1722,7 @@ export function createApp({ broadcast } = {}) {
     if (query && yearTo) args.push('--year-to', String(yearTo));
     if (mailto) args.push('--mailto', String(mailto));
     if (enqueue) args.push('--enqueue');
-    if (relatedDepthDownstream !== null || relatedDepthUpstream !== null) {
-      if (relatedDepthDownstream !== null && relatedDepthDownstream > 0) {
-        if (includeDownstream) {
-          args.push('--related-depth-downstream', String(Math.max(1, relatedDepthDownstream)));
-        } else {
-          args.push('--no-include-downstream');
-        }
-      } else {
-        args.push('--no-include-downstream');
-      }
-      if (relatedDepthUpstream !== null && relatedDepthUpstream > 0 && includeUpstream) {
-        args.push('--include-upstream');
-        args.push('--related-depth-upstream', String(Math.max(1, relatedDepthUpstream)));
-      }
-    } else if (relatedDepth !== null) {
-      args.push('--related-depth', String(Math.max(1, relatedDepth)));
-      if (!includeDownstream) {
-        args.push('--no-include-downstream');
-      }
-      if (includeUpstream && relatedDepth > 0) {
-        args.push('--include-upstream');
-      }
-    }
-    if (maxRelated) args.push('--max-related', String(maxRelated));
+    applyKeywordSearchExpansionArgs(args, expansion);
 
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });
@@ -1666,6 +1749,13 @@ export function createApp({ broadcast } = {}) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
     }
+  });
+
+  app.get('/api/recursion-config', requireAuthMiddleware, (req, res) => {
+    res.json({
+      keyword: RECURSION_DEFAULTS.keyword,
+      uploadedDocs: RECURSION_DEFAULTS.uploadedDocs,
+    });
   });
 
   app.get('/api/downloads', requireAuthMiddleware, async (req, res) => {
@@ -1824,6 +1914,11 @@ export function createApp({ broadcast } = {}) {
     const limit = coerceInt(req.body?.limit, 10);
     const workers = coerceInt(req.body?.workers, 6);
     const fetchReferences = Boolean(req.body?.fetchReferences);
+    const expansion = buildUploadedDocsExpansion({
+      relatedDepth: req.body?.relatedDepth,
+      maxRelated: req.body?.maxRelated,
+      includeDownstream: req.body?.includeDownstream,
+    });
     if (limit === null || limit === undefined || !Number.isFinite(limit) || limit <= 0) {
       return res.status(400).json({ error: 'limit must be a positive number' });
     }
@@ -1834,6 +1929,7 @@ export function createApp({ broadcast } = {}) {
     const dbPath = DB_PATH;
     const args = ['--db-path', dbPath, '--limit', String(limit), '--workers', String(workers)];
     args.push(fetchReferences ? '--fetch-references' : '--no-fetch-references');
+    applyUploadedDocsExpansionArgs(args, expansion);
     try {
       const payload = await runPythonJson(INGEST_PROCESS_MARKED_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);

@@ -15,6 +15,7 @@
     enqueueIngestEntries,
     processMarkedIngestEntries,
     runKeywordSearch,
+    fetchRecursionConfig,
     fetchCorpus,
     fetchDownloadQueue,
     fetchDownloadWorkerStatus,
@@ -89,6 +90,13 @@
   let relatedDepthDownstream = 1
   let relatedDepthUpstream = 1
   let maxRelated = 30
+  let keywordRecursionConfig = {
+    includeDownstream: true,
+    includeUpstream: false,
+    relatedDepthDownstream: 1,
+    relatedDepthUpstream: 1,
+    maxRelated: 30,
+  }
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
@@ -317,6 +325,47 @@
     return value.match(/^https?:\/\//i) ? value : `https://openalex.org/${value}`
   }
 
+  function coerceRecursionInt(value, fallback) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : fallback
+  }
+
+  function applyKeywordRecursionDefaults(config = {}) {
+    const next = {
+      includeDownstream: config?.includeDownstream ?? keywordRecursionConfig.includeDownstream,
+      includeUpstream: config?.includeUpstream ?? keywordRecursionConfig.includeUpstream,
+      relatedDepthDownstream: coerceRecursionInt(config?.relatedDepthDownstream, keywordRecursionConfig.relatedDepthDownstream),
+      relatedDepthUpstream: coerceRecursionInt(config?.relatedDepthUpstream, keywordRecursionConfig.relatedDepthUpstream),
+      maxRelated: coerceRecursionInt(config?.maxRelated, keywordRecursionConfig.maxRelated),
+    }
+
+    includeDownstream = Boolean(next.includeDownstream)
+    includeUpstream = Boolean(next.includeUpstream)
+    relatedDepthDownstream = Math.max(1, Number(next.relatedDepthDownstream))
+    relatedDepthUpstream = Math.max(1, Number(next.relatedDepthUpstream))
+    maxRelated = Math.max(1, Number(next.maxRelated))
+
+    keywordRecursionConfig = {
+      ...keywordRecursionConfig,
+      ...next,
+    }
+  }
+
+  async function loadRecursionConfig() {
+    try {
+      const payload = await fetchRecursionConfig()
+      if (payload?.keyword && typeof payload.keyword === 'object') {
+        applyKeywordRecursionDefaults(payload.keyword)
+      }
+      apiStatus = 'online'
+    } catch (error) {
+      if (error?.status === 401) {
+        throw error
+      }
+      // keep defaults if fetch fails
+    }
+  }
+
   function handleCorpusColumnScroll(event) {
     if (!corpusHasMore || corpusLoadingMore || corpusLoading) return
     const target = event?.currentTarget
@@ -462,6 +511,7 @@
       corpora = payload.corpora || []
       currentCorpusId = authUser?.last_corpus_id || (corpora[0]?.id ?? null)
       authStatus = 'authenticated'
+      await loadRecursionConfig()
       await refreshAll()
       connectLogs()
     } catch (error) {
@@ -489,6 +539,7 @@
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
       authStatus = 'authenticated'
+      await loadRecursionConfig()
       await refreshAll()
       connectLogs()
     } catch (error) {
@@ -837,11 +888,7 @@
     searchField = 'default'
     yearFrom = ''
     yearTo = ''
-    includeDownstream = true
-    includeUpstream = false
-    relatedDepthDownstream = 1
-    relatedDepthUpstream = 1
-    maxRelated = 30
+    applyKeywordRecursionDefaults(keywordRecursionConfig)
     searchStatus = ''
     searchSource = ''
   }

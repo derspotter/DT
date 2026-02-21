@@ -275,6 +275,16 @@ export async function runKeywordSearch({
   }
 }
 
+export async function fetchRecursionConfig() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/recursion-config`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load recursion config')
+  }
+  return response.json()
+}
+
 export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
   try {
     const params = new URLSearchParams()

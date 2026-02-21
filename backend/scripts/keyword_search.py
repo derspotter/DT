@@ -24,6 +24,13 @@ from dl_lit.OpenAlexScraper import (
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.keyword_search import dedupe_results, search_openalex
 from dl_lit.utils import get_global_rate_limiter
+from reference_expansion import (
+    DEFAULT_INCLUDE_DOWNSTREAM,
+    DEFAULT_INCLUDE_UPSTREAM,
+    DEFAULT_MAX_RELATED,
+    DEFAULT_RELATED_DEPTH,
+    DEFAULT_RELATED_DEPTH_UPSTREAM,
+)
 
 STUB_RESULTS = [
     {
@@ -504,15 +511,15 @@ def main():
     parser.add_argument('--mailto', default=None)
     parser.add_argument('--enqueue', action='store_true')
     parser.add_argument('--corpus-id', type=int, default=None)
-    parser.add_argument('--related-depth', type=int, default=1)
+    parser.add_argument('--related-depth', type=int, default=DEFAULT_RELATED_DEPTH)
     parser.add_argument('--related-depth-downstream', type=int, default=None)
     parser.add_argument('--related-depth-upstream', type=int, default=None)
-    parser.add_argument('--max-related', type=int, default=30)
+    parser.add_argument('--max-related', type=int, default=DEFAULT_MAX_RELATED)
     parser.add_argument(
         '--include-downstream',
         dest='include_downstream',
         action='store_true',
-        default=True,
+        default=DEFAULT_INCLUDE_DOWNSTREAM,
         help='Include downstream references (works cited by each work).',
     )
     parser.add_argument(
@@ -524,7 +531,7 @@ def main():
     parser.add_argument(
         '--include-upstream',
         action='store_true',
-        default=False,
+        default=DEFAULT_INCLUDE_UPSTREAM,
         help='Include upstream works that cite each work.',
     )
     args = parser.parse_args()
