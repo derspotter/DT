@@ -47,4 +47,18 @@ describe('POST /api/keyword-search', () => {
     expect(Array.isArray(res.body.results)).toBe(true)
     expect(res.body.source).toBe('stub')
   })
+
+  test('supports seed mode expansion controls in stub', async () => {
+    const res = await request(app)
+      .post('/api/keyword-search')
+      .send({
+        seedJson: ['10.1234/example'],
+        relatedDepthDownstream: 2,
+        relatedDepthUpstream: 2,
+        includeDownstream: false,
+        includeUpstream: true,
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('stub')
+  })
 })

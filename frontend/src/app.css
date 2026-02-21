@@ -697,6 +697,22 @@ select {
   /* Tighter label gap */
 }
 
+.expansion-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.84rem;
+  color: var(--ink);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.expansion-toggle input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
 .filter-label {
   font-size: 0.7rem;
   color: var(--muted);

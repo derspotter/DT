@@ -84,6 +84,8 @@
   let searchField = 'default'
   let yearFrom = ''
   let yearTo = ''
+  let includeDownstream = true
+  let includeUpstream = false
   let relatedDepthDownstream = 1
   let relatedDepthUpstream = 1
   let maxRelated = 30
@@ -807,6 +809,8 @@
         field: searchField,
         yearFrom,
         yearTo,
+        includeDownstream,
+        includeUpstream,
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
@@ -833,6 +837,8 @@
     searchField = 'default'
     yearFrom = ''
     yearTo = ''
+    includeDownstream = true
+    includeUpstream = false
     relatedDepthDownstream = 1
     relatedDepthUpstream = 1
     maxRelated = 30
@@ -2491,6 +2497,26 @@
                     class="depth-input"
                   />
                 </div>
+              </div>
+
+              <div class="filter-group">
+                <div class="filter-label">Expansion</div>
+                <label class="expansion-toggle">
+                  <input
+                    id="search-include-downstream"
+                    type="checkbox"
+                    bind:checked={includeDownstream}
+                  />
+                  <span>Downstream</span>
+                </label>
+                <label class="expansion-toggle">
+                  <input
+                    id="search-include-upstream"
+                    type="checkbox"
+                    bind:checked={includeUpstream}
+                  />
+                  <span>Upstream</span>
+                </label>
               </div>
 
               <div class="filter-group">

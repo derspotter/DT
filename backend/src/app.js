@@ -1600,6 +1600,10 @@ export function createApp({ broadcast } = {}) {
     const relatedDepthDownstream = coerceInt(req.body?.relatedDepthDownstream, relatedDepth);
     const relatedDepthUpstream = coerceInt(req.body?.relatedDepthUpstream, relatedDepth);
     const maxRelated = coerceInt(req.body?.maxRelated, 30);
+    const includeDownstream =
+      req.body?.includeDownstream === undefined ? true : Boolean(req.body.includeDownstream);
+    const includeUpstream =
+      req.body?.includeUpstream === undefined ? false : Boolean(req.body.includeUpstream);
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
@@ -1614,16 +1618,26 @@ export function createApp({ broadcast } = {}) {
     if (enqueue) args.push('--enqueue');
     if (relatedDepthDownstream !== null || relatedDepthUpstream !== null) {
       if (relatedDepthDownstream !== null && relatedDepthDownstream > 0) {
-        args.push('--related-depth-downstream', String(Math.max(1, relatedDepthDownstream)));
+        if (includeDownstream) {
+          args.push('--related-depth-downstream', String(Math.max(1, relatedDepthDownstream)));
+        } else {
+          args.push('--no-include-downstream');
+        }
       } else {
         args.push('--no-include-downstream');
       }
-      if (relatedDepthUpstream !== null && relatedDepthUpstream > 0) {
+      if (relatedDepthUpstream !== null && relatedDepthUpstream > 0 && includeUpstream) {
         args.push('--include-upstream');
         args.push('--related-depth-upstream', String(Math.max(1, relatedDepthUpstream)));
       }
     } else if (relatedDepth !== null) {
       args.push('--related-depth', String(Math.max(1, relatedDepth)));
+      if (!includeDownstream) {
+        args.push('--no-include-downstream');
+      }
+      if (includeUpstream && relatedDepth > 0) {
+        args.push('--include-upstream');
+      }
     }
     if (maxRelated) args.push('--max-related', String(maxRelated));
 
