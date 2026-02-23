@@ -74,6 +74,7 @@ def fetch_citing_work_ids(
     rate_limiter,
     mailto="spott@wzb.eu",
     max_citations=100,
+    include_links=False,
     session=None,
     timeout=20,
     api_key=None,
@@ -86,7 +87,10 @@ def fetch_citing_work_ids(
         return []
 
     citing_work_ids = []
-    url = f"{cited_by_url}&select=id,title,display_name,authorships,publication_year,doi,type&per-page=100&mailto={mailto}"
+    select_fields = "id,title,display_name,authorships,publication_year,doi,type"
+    if include_links:
+        select_fields += ",referenced_works,cited_by_api_url"
+    url = f"{cited_by_url}&select={select_fields}&per-page=100&mailto={mailto}"
     if api_key:
         url = f"{url}&api_key={quote_plus(api_key)}"
     page = 1
@@ -116,6 +120,9 @@ def fetch_citing_work_ids(
                     'doi': work.get("doi"),
                     'type': work.get("type")
                 }
+                if include_links:
+                    work_details['referenced_works'] = work.get("referenced_works") or []
+                    work_details['cited_by_api_url'] = work.get("cited_by_api_url")
                 citing_work_ids.append(work_details)
 
             # Check for next page
@@ -830,6 +837,7 @@ def process_single_reference(
     fetch_citations=False,
     max_citations=100,
     related_depth: int = 1,
+    related_depth_upstream: int = 1,
     max_related_per_reference: int = 40,
     return_diagnostics: bool = False,
 ):
@@ -898,6 +906,7 @@ def process_single_reference(
                 fetch_references,
                 fetch_citations,
                 max_citations,
+                related_depth_upstream=related_depth_upstream,
                 related_depth=related_depth,
                 max_related_per_reference=max_related_per_reference,
             )
@@ -1013,6 +1022,7 @@ def process_single_reference(
                 fetch_references,
                 fetch_citations,
                 max_citations,
+                related_depth_upstream=related_depth_upstream,
                 related_depth=related_depth,
                 max_related_per_reference=max_related_per_reference,
             )
@@ -1043,6 +1053,7 @@ def _fetch_related_works(
     fetch_references=True,
     fetch_citations=False,
     max_citations=100,
+    related_depth_upstream: int = 1,
     related_depth: int = 1,
     max_related_per_reference: int = 40,
 ):
@@ -1118,10 +1129,27 @@ def _fetch_related_works(
             rate_limiter,
             searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
             max_citations,
+            include_links=related_depth_upstream > 1,
             session=searcher.openalex_session,
             timeout=searcher.openalex_timeout,
             api_key=searcher.api_key,
         )
+        if related_depth_upstream > 1 and enrichment_data['citing_works']:
+            print(f"Fetching second-level citing works (depth: {related_depth_upstream})...")
+            for citing_work in enrichment_data['citing_works']:
+                cited_by_url = citing_work.get('cited_by_api_url')
+                if not cited_by_url:
+                    continue
+                citing_work['citing_works_expanded'] = fetch_citing_work_ids(
+                    cited_by_url,
+                    rate_limiter,
+                    searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
+                    min(max_related_per_reference, max_citations),
+                    include_links=False,
+                    session=searcher.openalex_session,
+                    timeout=searcher.openalex_timeout,
+                    api_key=searcher.api_key,
+                )
     
     return enrichment_data
 

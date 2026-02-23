@@ -2346,7 +2346,12 @@ class DatabaseManager:
                 )
             
             if enrichment.get('citing_works'):
-                self.add_citing_works_to_with_metadata(new_id, enrichment['citing_works'])
+                self.add_citing_works_to_with_metadata(
+                    new_id,
+                    enrichment['citing_works'],
+                    expand_related=expand_related,
+                    max_related_per_source=max_related_per_source,
+                )
 
             self.update_work_alias_owner("no_metadata", no_meta_id, "with_metadata", new_id)
             cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
@@ -3414,7 +3419,13 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error adding referenced works to with_metadata: {e}{RESET}")
             return 0
 
-    def add_citing_works_to_with_metadata(self, source_work_id: int, citing_works: list) -> int:
+    def add_citing_works_to_with_metadata(
+        self,
+        source_work_id: int,
+        citing_works: list,
+        expand_related: bool = False,
+        max_related_per_source: int = 40,
+    ) -> int:
         """Add citing works as separate entries in the with_metadata table."""
         if not citing_works:
             return 0
@@ -3493,6 +3504,41 @@ class DatabaseManager:
                     run_id=source_run_id,
                 ):
                     edge_count += 1
+
+                if (
+                    expand_related
+                    and target_row_id
+                    and citing_work.get("citing_works_expanded")
+                ):
+                    child_source_node_id = self._make_node_id(
+                        normalized_openalex_id,
+                        doi,
+                        "with_metadata",
+                        target_row_id,
+                    )
+                    for child in citing_work.get("citing_works_expanded", [])[:max_related_per_source]:
+                        child_row_id, child_openalex_id, child_doi = _insert_related_work(
+                            child,
+                            target_row_id,
+                            "cited_by",
+                        )
+                        child_node_id = self._make_node_id(
+                            child_openalex_id,
+                            child_doi,
+                            "with_metadata",
+                            child_row_id,
+                        )
+                        if self._insert_citation_edge(
+                            child_source_node_id,
+                            child_node_id,
+                            "cited_by",
+                            source_table="with_metadata",
+                            target_table="with_metadata",
+                            source_row_id=target_row_id,
+                            target_row_id=child_row_id,
+                            run_id=source_run_id,
+                        ):
+                            edge_count += 1
             
             print(f"{GREEN}[DB Manager] Added {stored_count} citing works and {edge_count} edges for work ID {source_work_id}{RESET}")
             return stored_count

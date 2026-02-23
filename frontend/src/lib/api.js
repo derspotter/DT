@@ -207,13 +207,27 @@ export async function enqueueIngestEntries(entryIds) {
   return response.json()
 }
 
-export async function processMarkedIngestEntries({ limit = 10 } = {}) {
+export async function processMarkedIngestEntries({
+  limit = 10,
+  includeDownstream = true,
+  includeUpstream = false,
+  relatedDepthDownstream = 1,
+  relatedDepthUpstream = 1,
+  maxRelated = 30,
+} = {}) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/ingest/process-marked`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ limit }),
+      body: JSON.stringify({
+        limit,
+        includeDownstream,
+        includeUpstream,
+        relatedDepthDownstream,
+        relatedDepthUpstream,
+        maxRelated,
+      }),
     },
     PIPELINE_TIMEOUT
   )

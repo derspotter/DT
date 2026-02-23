@@ -436,10 +436,21 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
 }
 
 function buildUploadedDocsExpansion(body = {}) {
+  const explicitDepth = coerceInt(body?.relatedDepth, null)
   return {
     relatedDepth: coercePositiveInt(
-      coerceInt(body?.relatedDepth, null),
+      explicitDepth,
       RECURSION_DEFAULTS.uploadedDocs.relatedDepth,
+      1
+    ),
+    relatedDepthDownstream: coercePositiveInt(
+      coerceInt(body?.relatedDepthDownstream, explicitDepth ?? null),
+      RECURSION_DEFAULTS.uploadedDocs.relatedDepthDownstream,
+      1
+    ),
+    relatedDepthUpstream: coercePositiveInt(
+      coerceInt(body?.relatedDepthUpstream, explicitDepth ?? null),
+      RECURSION_DEFAULTS.uploadedDocs.relatedDepthUpstream,
       1
     ),
     maxRelated: coercePositiveInt(
@@ -450,14 +461,28 @@ function buildUploadedDocsExpansion(body = {}) {
     includeDownstream: body?.includeDownstream === undefined
       ? RECURSION_DEFAULTS.uploadedDocs.includeDownstream
       : Boolean(body.includeDownstream),
+    includeUpstream: body?.includeUpstream === undefined
+      ? RECURSION_DEFAULTS.uploadedDocs.includeUpstream
+      : Boolean(body.includeUpstream),
   };
 }
 
 function applyUploadedDocsExpansionArgs(args, expansion) {
-  if (expansion.includeDownstream) {
-    args.push('--related-depth', String(expansion.relatedDepth));
+  if (expansion.includeDownstream || expansion.includeUpstream) {
+    args.push('--related-depth-downstream', String(expansion.relatedDepthDownstream));
+    if (!expansion.includeDownstream) {
+      args.push('--no-include-downstream');
+    }
+    if (expansion.includeUpstream) {
+      args.push('--include-upstream');
+      args.push('--related-depth-upstream', String(expansion.relatedDepthUpstream));
+    } else {
+      args.push('--no-include-upstream');
+    }
   } else {
-    args.push('--related-depth', String(1));
+    args.push('--related-depth-downstream', String(1));
+    args.push('--no-include-downstream');
+    args.push('--no-include-upstream');
   }
   args.push('--max-related', String(expansion.maxRelated));
 }
@@ -568,8 +593,11 @@ const RECURSION_DEFAULTS = {
   },
   uploadedDocs: {
     relatedDepth: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
+    relatedDepthDownstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
+    relatedDepthUpstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 1) || 1),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
     includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, true),
+    includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
 };
 
@@ -1913,11 +1941,13 @@ export function createApp({ broadcast } = {}) {
   app.post('/api/ingest/process-marked', requireAuthMiddleware, async (req, res) => {
     const limit = coerceInt(req.body?.limit, 10);
     const workers = coerceInt(req.body?.workers, 6);
-    const fetchReferences = Boolean(req.body?.fetchReferences);
     const expansion = buildUploadedDocsExpansion({
       relatedDepth: req.body?.relatedDepth,
       maxRelated: req.body?.maxRelated,
       includeDownstream: req.body?.includeDownstream,
+      includeUpstream: req.body?.includeUpstream,
+      relatedDepthDownstream: req.body?.relatedDepthDownstream,
+      relatedDepthUpstream: req.body?.relatedDepthUpstream,
     });
     if (limit === null || limit === undefined || !Number.isFinite(limit) || limit <= 0) {
       return res.status(400).json({ error: 'limit must be a positive number' });
@@ -1928,7 +1958,8 @@ export function createApp({ broadcast } = {}) {
 
     const dbPath = DB_PATH;
     const args = ['--db-path', dbPath, '--limit', String(limit), '--workers', String(workers)];
-    args.push(fetchReferences ? '--fetch-references' : '--no-fetch-references');
+    const shouldFetchReferences = expansion.includeDownstream;
+    args.push(shouldFetchReferences ? '--fetch-references' : '--no-fetch-references');
     applyUploadedDocsExpansionArgs(args, expansion);
     try {
       const payload = await runPythonJson(INGEST_PROCESS_MARKED_SCRIPT, args, { dbPath, corpusId: req.corpusId });

@@ -19,6 +19,8 @@ from dl_lit.utils import get_global_rate_limiter  # noqa: E402
 from reference_expansion import (
     DEFAULT_MAX_RELATED,
     DEFAULT_RELATED_DEPTH,
+    DEFAULT_RELATED_DEPTH_UPSTREAM,
+    DEFAULT_INCLUDE_UPSTREAM,
 )
 
 
@@ -113,7 +115,8 @@ def _enrich_entry(entry: dict, args, rate_limiter):
             fetch_references=args.fetch_references,
             fetch_citations=args.fetch_citations,
             max_citations=args.max_citations,
-            related_depth=args.related_depth,
+            related_depth=args.related_depth_downstream,
+            related_depth_upstream=args.related_depth_upstream,
             max_related_per_reference=args.max_related,
             return_diagnostics=True,
         )
@@ -156,7 +159,45 @@ def main() -> None:
         help="Fetch citing works from OpenAlex (API intensive).",
     )
     parser.add_argument("--max-citations", type=int, default=100, help="Max citing works per paper.")
-    parser.add_argument("--related-depth", type=int, default=DEFAULT_RELATED_DEPTH, help="Reference expansion depth.")
+    parser.add_argument("--related-depth", type=int, default=None, help="Compatibility alias for downstream depth.")
+    parser.add_argument(
+        "--related-depth-downstream",
+        type=int,
+        default=DEFAULT_RELATED_DEPTH,
+        help="Reference expansion depth for downstream.",
+    )
+    parser.add_argument(
+        "--related-depth-upstream",
+        type=int,
+        default=DEFAULT_RELATED_DEPTH_UPSTREAM,
+        help="Citation expansion depth for upstream.",
+    )
+    parser.add_argument(
+        "--include-downstream",
+        dest="include_downstream",
+        action="store_true",
+        default=None,
+        help="Fetch referenced works when enriching entries.",
+    )
+    parser.add_argument(
+        "--no-include-downstream",
+        dest="include_downstream",
+        action="store_false",
+        help="Skip downstream references.",
+    )
+    parser.add_argument(
+        "--include-upstream",
+        dest="include_upstream",
+        action="store_true",
+        default=None,
+        help="Fetch citing works when enriching entries.",
+    )
+    parser.add_argument(
+        "--no-include-upstream",
+        dest="include_upstream",
+        action="store_false",
+        help="Skip upstream citations.",
+    )
     parser.add_argument("--max-related", type=int, default=DEFAULT_MAX_RELATED, help="Max nested references per work.")
     parser.add_argument(
         "--api-retries",
@@ -181,6 +222,18 @@ def main() -> None:
     if args.limit <= 0:
         print(json.dumps({"processed": 0, "promoted": 0, "queued": 0, "failed": 0, "errors": ["limit must be > 0"]}))
         return
+
+    downstream_depth = args.related_depth_downstream
+    if args.related_depth is not None:
+        downstream_depth = args.related_depth
+    downstream_depth = max(1, int(downstream_depth or 1))
+    upstream_depth = max(1, int(args.related_depth_upstream or 1))
+    args.include_downstream = bool(args.include_downstream) if args.include_downstream is not None else True
+    if args.include_upstream is None:
+        args.include_upstream = bool(DEFAULT_INCLUDE_UPSTREAM)
+    args.fetch_citations = bool(args.include_upstream)
+    args.related_depth_downstream = downstream_depth
+    args.related_depth_upstream = upstream_depth
 
     db = DatabaseManager(args.db_path)
     rate_limiter = get_global_rate_limiter()
@@ -247,7 +300,7 @@ def main() -> None:
                 wid, err = db.promote_to_with_metadata(
                     no_meta_id,
                     enriched,
-                    expand_related=args.related_depth > 1 and args.fetch_references,
+                    expand_related=args.related_depth_downstream > 1 and args.fetch_references,
                     max_related_per_source=args.max_related,
                 )
                 if not wid:

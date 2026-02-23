@@ -354,8 +354,9 @@
   async function loadRecursionConfig() {
     try {
       const payload = await fetchRecursionConfig()
-      if (payload?.keyword && typeof payload.keyword === 'object') {
-        applyKeywordRecursionDefaults(payload.keyword)
+      const cfg = payload?.keyword || payload?.uploadedDocs || null
+      if (cfg && typeof cfg === 'object') {
+        applyKeywordRecursionDefaults(cfg)
       }
       apiStatus = 'online'
     } catch (error) {
@@ -727,7 +728,14 @@
     processingMarked = true
     processMarkedStatus = `Processing up to ${limit} marked entries (enrich -> with metadata)...`
     try {
-      const payload = await processMarkedIngestEntries({ limit })
+      const payload = await processMarkedIngestEntries({
+        limit,
+        includeDownstream,
+        includeUpstream,
+        relatedDepthDownstream,
+        relatedDepthUpstream,
+        maxRelated,
+      })
       processMarkedStatus = `Processed ${payload.processed} (promoted: ${payload.promoted}, ready for download: ${payload.queued}, failed: ${payload.failed}).`
       await loadDownloads()
       await loadIngestStats()
