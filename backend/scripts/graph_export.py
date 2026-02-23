@@ -508,6 +508,28 @@ def main():
                 used_edge_table = True
 
     if not used_edge_table:
+        source_lookup = {}
+        openalex_lookup = {}
+        doi_lookup = {}
+
+        for row_tbl, row in row_candidates:
+            row_node_id = row.get('_node_id')
+            if not row_node_id:
+                continue
+            row_id = row.get('id')
+            if row_id is not None:
+                source_lookup[(row_tbl, str(row_id))] = row_node_id
+
+            openalex_id = normalize_openalex_id(row.get('openalex_id'))
+            if openalex_id:
+                source_lookup[(row_tbl, openalex_id)] = row_node_id
+                openalex_lookup[openalex_id] = row_node_id
+
+            doi = normalize_doi(row.get('doi'))
+            if doi:
+                source_lookup[(row_tbl, doi)] = row_node_id
+                doi_lookup[doi] = row_node_id
+
         edge_set = set()
         for table_name, data in row_candidates:
             source_work_id = data.get('source_work_id')
@@ -518,21 +540,38 @@ def main():
             if source_node is None:
                 continue
 
-            source_row_key = f"{table_name}:{source_work_id}"
             target_node_id = data['_node_id']
             source_candidate = None
 
-            if f"{table_name}:{source_work_id}" == source_row_key:
-                source_candidate = node_by_id.get(source_row_key)
-            else:
-                source_candidate = None
+            candidates = [
+                str(source_work_id).strip(),
+            ]
+            source_work_id_openalex = normalize_openalex_id(source_work_id)
+            if source_work_id_openalex:
+                candidates.append(source_work_id_openalex)
+            source_work_id_doi = normalize_doi(source_work_id)
+            if source_work_id_doi:
+                candidates.append(source_work_id_doi)
+
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                source_candidate = source_lookup.get((table_name, candidate))
+                if source_candidate:
+                    break
+                source_candidate = openalex_lookup.get(candidate)
+                if source_candidate:
+                    break
+                source_candidate = doi_lookup.get(candidate)
+                if source_candidate:
+                    break
 
             if source_candidate is None:
                 source_candidate = next(
                     (
                         row.get('_node_id')
                         for row_tbl, row in row_candidates
-                        if row_tbl == table_name and row.get('id') == source_work_id
+                        if row.get('id') == source_work_id
                     ),
                     None,
                 )
