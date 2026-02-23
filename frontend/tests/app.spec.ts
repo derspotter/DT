@@ -90,6 +90,16 @@ function writePdfFixture(pathname: string, text: string): string {
 test.describe('Korpus Builder live integration', () => {
   test.setTimeout(180_000)
 
+  async function readGraphSummary(page: Page) {
+    const values = await page.getByTestId('graph-panel').locator('.graph-summary strong').allTextContents()
+    return {
+      nodes: Number(values[0] || 0),
+      edges: Number(values[1] || 0),
+      references: Number(values[2] || 0),
+      citedBy: Number(values[3] || 0),
+    }
+  }
+
   test('end-to-end flow uses real backend APIs', async ({ page, request }) => {
     await ensureSignedIn(page, request)
 
@@ -200,5 +210,70 @@ test.describe('Korpus Builder live integration', () => {
 
     await uploadRow.getByRole('button', { name: 'Extract' }).click()
     await expect(uploadRow.locator('.status')).toHaveText('extracted', { timeout: 30_000 })
+  })
+
+  test('graph controls update data and re-query on every change', async ({ page }) => {
+    await ensureSignedIn(page, page.request)
+
+    await page.getByTestId('tab-graph').click()
+    const graphPanel = page.getByTestId('graph-panel')
+    await expect(graphPanel).toBeVisible()
+
+    const status = await waitUntilGraphSettled(page)
+    expect(status).not.toContain('Loading graph...')
+
+    const initialSummary = await readGraphSummary(page)
+    for (const count of Object.values(initialSummary)) {
+      expect(count).toBeGreaterThanOrEqual(0)
+    }
+
+    const graphControls = graphPanel.locator('.graph-controls')
+    const graphSelects = graphControls.locator('select')
+    const graphInputs = graphControls.locator('input[type="number"]')
+    const relationshipSelect = graphSelects.nth(0)
+    const statusSelect = graphSelects.nth(1)
+    const colorModeSelect = graphSelects.nth(2)
+    const maxNodesInput = graphInputs.nth(1)
+    const yearFromInput = graphInputs.nth(0)
+
+    await relationshipSelect.selectOption('references')
+    const referencesResponse = page.waitForResponse(
+      (res) => res.url().includes('/api/graph') && res.request().method() === 'GET' && new URL(res.url()).searchParams.get('relationship') === 'references'
+    )
+    await page.getByRole('button', { name: 'Apply filters' }).click()
+    await referencesResponse
+    const referencesSummary = await waitUntilGraphSettled(page).then(() => readGraphSummary(page))
+    expect(referencesSummary.nodes).toBeGreaterThanOrEqual(0)
+
+    await relationshipSelect.selectOption('cited_by')
+    const citedByResponse = page.waitForResponse(
+      (res) => res.url().includes('/api/graph') && res.request().method() === 'GET' && new URL(res.url()).searchParams.get('relationship') === 'cited_by'
+    )
+    await page.getByRole('button', { name: 'Apply filters' }).click()
+    await citedByResponse
+    await waitUntilGraphSettled(page)
+    const citedBySummary = await readGraphSummary(page)
+    expect(citedBySummary.edges).toBeGreaterThanOrEqual(0)
+    expect(citedBySummary).toBeDefined()
+
+    await statusSelect.selectOption('with_metadata')
+    await maxNodesInput.fill('120')
+    await yearFromInput.fill('2000')
+    await colorModeSelect.selectOption('status')
+    await statusSelect.waitFor()
+    await page.getByRole('button', { name: 'Apply filters' }).click()
+    await waitUntilGraphSettled(page)
+
+    const currentSummary = await readGraphSummary(page)
+    expect(currentSummary.nodes).toBeGreaterThanOrEqual(0)
+
+    await page.getByRole('button', { name: 'Reset view' }).click()
+    expect(await page.getByLabel('Graph visualization').getAttribute('aria-label')).toBe('Graph visualization')
+
+    if (currentSummary.nodes > 0) {
+      const listItem = page.locator('.graph-list button', { hasText: /./ }).first()
+      await listItem.hover()
+      await expect(page.locator('.graph-hover')).toBeVisible()
+    }
   })
 })
