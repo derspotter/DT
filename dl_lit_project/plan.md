@@ -4,7 +4,7 @@
 This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflichtenheft. The product modernizes and extends `dl_lit_project` into a web‑based Korpus‑Builder that supports:
 - Seed‑document ingestion (references + citations) with automated retrieval
 - Keyword search with result persistence and download queueing
-- Visualization of citation networks (D3.js)
+- Visualization of citation networks
 - Svelte/Vite frontend
 - Docker deployment with persistence and resumable workflows
 - Code audit/refactor + documentation
@@ -19,7 +19,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - Tests for CLI + keyword search + pipeline
 
 **MS2 — Visualization (Apr 2026)**
-- D3‑based citation/cluster visualization
+- Interactive citation/cluster visualization
 - Data pipeline to compute graph nodes/edges
 - Export graph JSON for frontend use
 
@@ -55,7 +55,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 - Visualization now supports interactive zoom/pan plus color clustering modes (search path, component, status, year decade, type) with legend in the frontend graph view.
 
 ## 3.1) Milestone 2 Plan — Visualization (Apr 2026)
-**Goal:** deliver a D3‑based citation/cluster visualization wired to real corpus data.
+**Goal:** deliver an interactive citation/cluster visualization wired to real corpus data.
 
 ### Scope
 - Graph dataset generation (nodes + edges) from the DB
@@ -78,8 +78,8 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
    - Support JSON response with `{ nodes, edges, stats }`
    - Implement caching for large runs (store JSON blobs in DB or disk)
 
-4) **Frontend (D3)**
-   - D3 force‑layout graph with zoom/pan
+4) **Frontend**
+   - Force-layout graph with zoom/pan
    - Toggle: citations only / seed‑centric view
    - Cluster coloring (by year, source, or keyword)
    - Node tooltip with metadata + download status
@@ -92,7 +92,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 ### Deliverables
 - `graph_builder.py` (or integrated into backend service)
 - `GET /api/graph` endpoint
-- D3 visualization page wired to API
+- Frontend visualization page wired to API
 - Documentation for graph generation + filters
 
 ### Acceptance (MS2)
@@ -123,7 +123,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
 
 ### D) Visualization (MS2)
 - Build graph datasets from DB
-- D3 citation graph + clustering
+- Graph visualization + clustering
 - API endpoint to feed graph JSON
 
 ### E) Web Frontend (MS3)
