@@ -117,5 +117,4 @@ wss.on('connection', (ws) => {
     clients.delete(ws);
   });
 
-  ws.send('WebSocket connection established. Waiting for script output...');
 });

@@ -1336,6 +1336,7 @@
         if (logsSocket !== ws) return
         if (logsType !== 'pipeline') return
         const line = event.data
+        if (typeof line === 'string' && line.startsWith('WebSocket connection established')) return
         if (!isLogLineForCurrentCorpus(line)) return
         const hadLines = logs.length > 0
         logs = [...logs, line].slice(-maxLogHistory)

@@ -1031,11 +1031,6 @@ export function createApp({ broadcast } = {}) {
     });
     state.resolvedDownloadWorkers = workerCount;
 
-    send(
-      `[pipeline-worker] tick corpus=${corpusTag} promote_batch=${promoteBatchSize} ` +
-        `promote_workers=${promoteWorkers} download_batch=${downloadBatchSize} workers=${workerCount}`
-    );
-
     let hadActivity = false;
     try {
       const markRun = spawnPythonJson(
@@ -1051,10 +1046,12 @@ export function createApp({ broadcast } = {}) {
       state.children.push(markRun.child);
       const marked = await markRun.done;
       state.children = state.children.filter((child) => child !== markRun.child);
-      send(
-        `[pipeline-worker] corpus=${corpusTag} marked raw=${Number(marked?.marked || 0)} candidates=${Number(marked?.available || 0)}`
-      );
-      hadActivity = hadActivity || Number(marked?.marked || 0) > 0;
+      const markedRaw = Number(marked?.marked || 0);
+      const markedCandidates = Number(marked?.available || 0);
+      if (markedRaw > 0 || markedCandidates > 0) {
+        send(`[pipeline-worker] corpus=${corpusTag} marked raw=${markedRaw} candidates=${markedCandidates}`);
+      }
+      hadActivity = hadActivity || markedRaw > 0;
 
       const promoteRun = spawnPythonJson(
         INGEST_PROCESS_MARKED_SCRIPT,
@@ -1077,16 +1074,22 @@ export function createApp({ broadcast } = {}) {
       state.children.push(promoteRun.child);
       const promoted = await promoteRun.done;
       state.children = state.children.filter((child) => child !== promoteRun.child);
-      send(
-        `[pipeline-worker] corpus=${corpusTag} enrich processed=${Number(promoted?.processed || 0)} promoted=${Number(
-          promoted?.promoted || 0
-        )} queued=${Number(promoted?.queued || 0)} failed=${Number(promoted?.failed || 0)}`
-      );
+      const promotedProcessed = Number(promoted?.processed || 0);
+      const promotedPromoted = Number(promoted?.promoted || 0);
+      const promotedQueued = Number(promoted?.queued || 0);
+      const promotedFailed = Number(promoted?.failed || 0);
+      if (promotedProcessed > 0 || promotedPromoted > 0 || promotedQueued > 0 || promotedFailed > 0) {
+        send(
+          `[pipeline-worker] corpus=${corpusTag} enrich processed=${promotedProcessed} ` +
+            `promoted=${promotedPromoted} queued=${promotedQueued} failed=${promotedFailed}`
+        );
+      }
       hadActivity =
         hadActivity ||
-        Number(promoted?.processed || 0) > 0 ||
-        Number(promoted?.promoted || 0) > 0 ||
-        Number(promoted?.queued || 0) > 0;
+        promotedProcessed > 0 ||
+        promotedPromoted > 0 ||
+        promotedQueued > 0 ||
+        promotedFailed > 0;
 
       const runs = [];
       for (let i = 0; i < workerCount; i += 1) {
@@ -1104,10 +1107,18 @@ export function createApp({ broadcast } = {}) {
       const downloads = aggregateDownloadPayloads(payloads);
       downloads.errors.push(...rejected);
 
-      send(
-        `[pipeline-worker] corpus=${corpusTag} download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
-          `failed=${downloads.failed} skipped=${downloads.skipped}`
-      );
+      if (
+        downloads.processed > 0 ||
+        downloads.downloaded > 0 ||
+        downloads.failed > 0 ||
+        downloads.skipped > 0 ||
+        downloads.errors.length > 0
+      ) {
+        send(
+          `[pipeline-worker] corpus=${corpusTag} download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
+            `failed=${downloads.failed} skipped=${downloads.skipped}`
+        );
+      }
       hadActivity =
         hadActivity || downloads.processed > 0 || downloads.downloaded > 0 || downloads.failed > 0 || downloads.skipped > 0;
 
