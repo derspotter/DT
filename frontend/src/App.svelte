@@ -178,8 +178,6 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
-  let headerLogStreamBodyEl
-  let keepHeaderLogAtNewest = true
   let graphStatus = ''
   let graphSource = ''
   let graphNodes = []
@@ -221,16 +219,6 @@
 
   const maxLogs = 200
   const maxLogHistory = 5000
-  const topPipelineLogWindow = 30
-
-  $: {
-    if (headerLogStreamBodyEl && logs.length > 0 && keepHeaderLogAtNewest && logsType === 'pipeline') {
-      tick().then(() => {
-        if (!headerLogStreamBodyEl || !keepHeaderLogAtNewest || logsType !== 'pipeline') return
-        headerLogStreamBodyEl.scrollTop = 0
-      })
-    }
-  }
 
   function resetLogState() {
     logs = []
@@ -1379,7 +1367,6 @@
   }
 
   function handleLogsCorpusFilterChange() {
-    keepHeaderLogAtNewest = true
     resetLogState()
     hydrateLogsFromTail({ force: true })
   }
@@ -1403,16 +1390,8 @@
   async function handleLogTypeChange(event) {
     const next = String(event?.target?.value || 'pipeline').toLowerCase()
     logsType = next === 'app' ? 'app' : 'pipeline'
-    keepHeaderLogAtNewest = true
     resetLogState()
     await hydrateLogsFromTail({ force: true })
-  }
-
-  function handleHeaderLogStreamScroll(event) {
-    const el = event?.currentTarget
-    if (!el) return
-    const threshold = 24
-    keepHeaderLogAtNewest = el.scrollTop <= threshold
   }
 
   function buildDegreeMap(nodes, edges) {
@@ -2222,15 +2201,11 @@
           <span>Pipeline logs</span>
           <span class="muted">WebSocket: {logsStatus}</span>
         </div>
-        <div
-          class="header-log-stream__body"
-          bind:this={headerLogStreamBodyEl}
-          on:scroll={handleHeaderLogStreamScroll}
-        >
+        <div class="header-log-stream__body">
           {#if logs.length === 0}
             <p class="muted">Waiting for pipeline output...</p>
           {:else}
-            {#each logs.slice(-topPipelineLogWindow).reverse() as entry}
+            {#each logs.slice(-4).reverse() as entry}
               <div class="header-log-line">{entry}</div>
             {/each}
           {/if}
@@ -3156,8 +3131,8 @@
                 {:else}
                   <span class="eyebrow">Selected node</span>
                   <strong>Hover a node to preview</strong>
-                  <span class="muted small">Connected node details and source path will appear here.</span>
-                  <span class="muted small">&nbsp;</span>
+                  <span class="muted small">Connected node details will appear here.</span>
+                  <span class="muted small">Path: -</span>
                 {/if}
               </div>
               <div class="graph-legend">

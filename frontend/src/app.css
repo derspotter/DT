@@ -235,10 +235,8 @@ select {
 
 .header-log-stream__body {
   min-height: 44px;
-  height: 136px;
-  max-height: 190px;
+  max-height: 110px;
   overflow-y: auto;
-  overflow-x: hidden;
   display: grid;
   gap: 6px;
   align-content: start;
@@ -1400,25 +1398,29 @@ button.danger:disabled {
   border-radius: 12px;
   padding: 12px;
   box-shadow: 0 18px 40px rgba(29, 53, 64, 0.08);
-  min-height: 86px;
 }
 
 .graph-hover strong {
   display: block;
   margin-top: 6px;
   font-size: 0.95rem;
-  min-height: 1.4em;
-  line-height: 1.4em;
+  line-height: 1.35;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+}
+
+.graph-hover {
+  height: 110px;
+  min-height: 110px;
+  overflow: hidden;
 }
 
 .graph-hover .muted.small {
   display: block;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .graph-legend {
@@ -1427,12 +1429,18 @@ button.danger:disabled {
   border-radius: 12px;
   padding: 12px;
   box-shadow: 0 18px 40px rgba(29, 53, 64, 0.08);
+  height: 188px;
+  min-height: 188px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .graph-legend-list {
   display: grid;
   gap: 6px;
   margin-top: 8px;
+  overflow-y: auto;
 }
 
 .graph-legend-item {
@@ -1441,9 +1449,6 @@ button.danger:disabled {
   align-items: center;
   gap: 8px;
   font-size: 0.8rem;
-  min-height: 28px;
-  height: 28px;
-  line-height: 1.2;
 }
 
 .graph-legend-item span {
@@ -1472,23 +1477,17 @@ button.danger:disabled {
   background: #fff;
   border-radius: 10px;
   padding: 8px 10px;
-  display: grid;
-  grid-template-columns: 1fr auto;
+  display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
   font-size: 0.85rem;
   text-align: left;
-  min-height: 38px;
-  height: 38px;
-  overflow: hidden;
 }
 
 .graph-list button > span {
   flex: 1;
   color: #23313b;
-  min-width: 0;
-  overflow: hidden;
 }
 
 .graph-list-label {
@@ -1496,42 +1495,16 @@ button.danger:disabled {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  min-height: 22px;
-  overflow: hidden;
-}
-
-.graph-list-label > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .graph-list button strong {
   color: #0f8b8d;
   font-size: 0.8rem;
-  min-width: 30px;
-  text-align: right;
-  white-space: nowrap;
 }
 
 .graph-list button.active {
   border-color: #0f8b8d;
   box-shadow: 0 12px 24px rgba(15, 139, 141, 0.16);
-}
-
-@media (max-width: 980px) {
-  .graph-summary div,
-  .graph-hover {
-    height: 90px;
-  }
-
-  .graph-list button {
-    height: 40px;
-  }
-
-  .graph-legend-item {
-    height: 30px;
-  }
 }
 
 .edge {
