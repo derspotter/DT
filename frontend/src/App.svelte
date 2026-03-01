@@ -31,15 +31,39 @@
     downloadCorpusExport,
   } from './lib/api'
   import { sampleActivity } from './lib/sample-data'
+  import Dashboard from './components/Dashboard.svelte'
+  import Logs from './components/Logs.svelte'
+  import Graph from './components/Graph.svelte'
+  import Corpus from './components/Corpus.svelte'
 
-  const tabs = [
-    { id: 'dashboard', label: 'Dashboard' },
-    { id: 'ingest', label: 'Ingest' },
-    { id: 'search', label: 'Keyword Search' },
-    { id: 'corpus', label: 'Corpus' },
-    { id: 'downloads', label: 'Downloads' },
-    { id: 'logs', label: 'Logs' },
-    { id: 'graph', label: 'Graph' },
+  const tabGroups = [
+    {
+      title: 'Ingest',
+      tabs: [
+        { id: 'ingest', label: 'Seed Document' },
+        { id: 'search', label: 'Keyword Search' },
+      ]
+    },
+    {
+      title: 'Manage',
+      tabs: [
+        { id: 'corpus', label: 'Corpus' },
+        { id: 'downloads', label: 'Downloads' },
+      ]
+    },
+    {
+      title: 'Analyze',
+      tabs: [
+        { id: 'graph', label: 'Graph' },
+      ]
+    },
+    {
+      title: 'System',
+      tabs: [
+        { id: 'dashboard', label: 'Pipeline Status' },
+        { id: 'logs', label: 'Logs' },
+      ]
+    }
   ]
 
   let activeTab = 'dashboard'
@@ -739,6 +763,51 @@
     await loadGraph()
   }
 
+  function resetFrontendState() {
+    ingestStats = { no_metadata: 0, with_metadata: 0, to_download_references: 0, downloaded_references: 0 }
+    ingestStatsStatus = ''
+    latestEntries = []
+    latestEntriesStatus = ''
+    latestEntriesBase = ''
+    latestSelection = []
+    enqueueStatus = ''
+    processMarkedStatus = ''
+    ingestRuns = []
+    ingestRunsStatus = ''
+    searchQuery = ''
+    searchSeedJson = ''
+    searchResults = []
+    searchStatus = ''
+    searchSource = ''
+    corpusItems = []
+    corpusTotal = 0
+    corpusLoadStatus = ''
+    corpusSource = ''
+    corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
+    selectedCorpusItemKey = ''
+    downloads = []
+    downloadsSource = ''
+    downloadsQuery = ''
+    graphStatus = ''
+    graphSource = ''
+    graphNodes = []
+    graphEdges = []
+    graphStats = null
+    graphLayout = []
+    graphVisibleEdges = []
+    graphNodeMap = new Map()
+    graphDegreeMap = new Map()
+    graphComponentMap = new Map()
+    graphNodeColorMap = new Map()
+    graphColorLegend = []
+    logs = []
+    logsCursor = 0
+    logsHasMore = false
+    logsTailStatus = ''
+    pendingPromotionEvents = []
+    promotionHighlights = new Set()
+  }
+
   async function handleSelectCorpus(event) {
     const nextId = Number(event.target.value)
     if (!nextId) return
@@ -748,8 +817,7 @@
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || nextId
-      pendingPromotionEvents = []
-      promotionHighlights = new Set()
+      resetFrontendState()
       await refreshAll()
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
@@ -770,8 +838,7 @@
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId
-      pendingPromotionEvents = []
-      promotionHighlights = new Set()
+      resetFrontendState()
       await refreshAll()
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
@@ -2189,7 +2256,7 @@
     return label.length > max ? `${label.slice(0, max - 1)}…` : label
   }
 
-  const tabIds = new Set(tabs.map((tab) => tab.id))
+  const tabIds = new Set(tabGroups.flatMap(group => group.tabs).map(tab => tab.id))
 
   function readTabFromHash() {
     if (typeof window === 'undefined') return null
@@ -2312,10 +2379,6 @@
         </p>
       </div>
       <div class="header-meta">
-        <div class="header-badge">
-          <span>Milestone 2 prep</span>
-          <strong>Frontend · Svelte</strong>
-        </div>
         <div class="header-panel">
           <div class="header-user">
             <span class="eyebrow">Signed in</span>
@@ -2334,148 +2397,44 @@
               New corpus
             </button>
           </div>
-          <div class="header-pipeline">
-            <div class="header-pipeline__title">
-              <span class="eyebrow">Global pipeline</span>
-              <div class="header-pipeline__state">
-                <strong class:running={pipelineWorker.running}>{pipelineWorker.running ? 'Running' : 'Paused'}</strong>
-                {#if pipelineWorker.in_flight}
-                  <span class="tag queued">in progress</span>
-                {/if}
-              </div>
-            </div>
-            <div class="header-pipeline__stats">
-              <div class="pipeline-kpi">
-                <span class="muted small">Raw → Meta batch</span>
-                <strong>{pipelineWorker?.config?.promoteBatchSize ?? 25}</strong>
-              </div>
-              <div class="pipeline-kpi">
-                <span class="muted small">Enrich workers</span>
-                <strong>{pipelineWorker?.config?.promoteWorkers ?? 6}</strong>
-              </div>
-              <div class="pipeline-kpi">
-                <span class="muted small">Download batch</span>
-                <strong>{pipelineWorker?.config?.downloadBatchSize ?? 5}</strong>
-              </div>
-              <div class="pipeline-kpi">
-                <span class="muted small">Download workers</span>
-                <strong>{Math.max(1, Number(pipelineWorker?.resolved_download_workers || 0))}</strong>
-              </div>
-            </div>
-            <div class="header-pipeline__actions">
-              <button
-                class="primary"
-                type="button"
-                on:click={handleStartPipelineWorker}
-                disabled={pipelineWorkerBusy || pipelineWorker.running}
-              >
-                Start / Continue
-              </button>
-              <button
-                class="secondary"
-                type="button"
-                on:click={handlePausePipelineWorker}
-                disabled={!pipelineWorker.running && !pipelineWorker.in_flight}
-              >
-                Pause
-              </button>
-              <button
-                class="secondary danger"
-                type="button"
-                on:click={handlePauseAllPipelineWorkers}
-                disabled={pipelineWorkerBusy || (!pipelineWorker.running && !pipelineWorker.in_flight && !downloadWorker.running && !downloadWorker.in_flight)}
-                title="Stop all pipeline and download workers across all corpora (force)."
-              >
-                Pause all
-              </button>
-            </div>
-            {#if pipelineWorkerStatus}
-              <span class="muted small">{pipelineWorkerStatus}</span>
-            {/if}
-            {#if pipelineWorker.last_error}
-              <span class="error small">{pipelineWorker.last_error}</span>
-            {/if}
-          </div>
-        </div>
-      </div>
-      <div class="header-log-stream" data-testid="header-log-stream">
-        <div class="header-log-stream__title">
-          <span>Pipeline logs</span>
-          <span class="muted">WebSocket: {logsStatus}</span>
-        </div>
-        <div class="header-log-stream__body">
-          {#if logs.length === 0}
-            <p class="muted">Waiting for pipeline output...</p>
-          {:else}
-            {#each logs.slice(-4).reverse() as entry}
-              <div class="header-log-line">{entry}</div>
-            {/each}
-          {/if}
         </div>
       </div>
     </header>
 
   <div class="layout">
     <aside class="side-nav" data-testid="side-nav">
-      {#each tabs as tab}
-        <button
-          class:active={activeTab === tab.id}
-          on:click={() => setActiveTab(tab.id)}
-          type="button"
-          data-testid={`tab-${tab.id}`}
-        >
-          {tab.label}
-        </button>
+      {#each tabGroups as group}
+        <div class="nav-group">
+          <span class="nav-group-title">{group.title}</span>
+          {#each group.tabs as tab}
+            <button
+              class:active={activeTab === tab.id}
+              on:click={() => setActiveTab(tab.id)}
+              type="button"
+              data-testid={`tab-${tab.id}`}
+            >
+              {tab.label}
+            </button>
+          {/each}
+        </div>
       {/each}
     </aside>
 
     <section class="content">
       {#if activeTab === 'dashboard'}
-        <div class="grid">
-          <div class="card highlight" data-testid="dashboard-overview">
-            <h2>At a glance</h2>
-            <p>Seed ingestion, keyword search, and corpus health in one view.</p>
-            <div class="pipeline-strip" data-testid="pipeline-strip">
-              <div class="pipeline-stage">
-                <span class="stat-label" title="Raw references">Raw</span>
-                <strong>{pipelineRawCount}</strong>
-              </div>
-              <span class="pipeline-arrow" aria-hidden="true">→</span>
-              <div class="pipeline-stage">
-                <span class="stat-label" title="With metadata">Meta</span>
-                <strong>{pipelineMetadataCount}</strong>
-              </div>
-              <span class="pipeline-arrow" aria-hidden="true">→</span>
-              <div class="pipeline-stage">
-                <span class="stat-label" title="Downloaded">Done</span>
-                <strong>{pipelineDownloadedCount}</strong>
-              </div>
-            </div>
-          </div>
-          <div class="card">
-            <h2>Recent activity</h2>
-            <ul class="activity">
-              {#each sampleActivity as item}
-                <li>
-                  <div>
-                    <strong>{item.label}</strong>
-                    <span>{item.detail}</span>
-                  </div>
-                  <time>{item.timestamp}</time>
-                </li>
-              {/each}
-            </ul>
-          </div>
-          <div class="card">
-            <h2>Pipeline health</h2>
-            <p>Extraction, enrichment, and downloads are staged and recoverable.</p>
-            <div class="pill-row">
-              <span class="pill">Extraction ready</span>
-              <span class="pill">Metadata ready</span>
-              <span class="pill">Downloads active</span>
-            </div>
-          </div>
-        </div>
+        <Dashboard
+          {pipelineRawCount}
+          {pipelineMetadataCount}
+          {pipelineDownloadedCount}
+          {pipelineWorker}
+          {downloadWorker}
+          {pipelineWorkerBusy}
+          {pipelineWorkerStatus}
+          {sampleActivity}
+          {handleStartPipelineWorker}
+          {handlePausePipelineWorker}
+          {handlePauseAllPipelineWorkers}
+        />
       {/if}
 
       {#if activeTab === 'ingest'}
@@ -2815,161 +2774,33 @@
       {/if}
 
       {#if activeTab === 'corpus'}
-        <div class="card" data-testid="corpus-panel">
-          <div class="corpus-header-row">
-            <div>
-              <h2>Corpus</h2>
-              <p class="muted">
-                {corpusSource === 'api' ? 'Live corpus from API.' : 'Sample corpus data.'}
-                {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusTotal}.{/if}
-              </p>
-            </div>
-            <form class="corpus-share" on:submit|preventDefault={handleShareCorpus}>
-              <div>
-                <label>
-                  Share with
-                  <input type="text" placeholder="username" bind:value={shareUsername} />
-                </label>
-              </div>
-              <div>
-                <label>
-                  Role
-                  <select bind:value={shareRole}>
-                    <option value="viewer">Viewer</option>
-                    <option value="editor">Editor</option>
-                    <option value="owner">Owner</option>
-                  </select>
-                </label>
-              </div>
-              <button class="secondary" type="submit">Share</button>
-              {#if shareStatus}
-                <span class="muted">{shareStatus}</span>
-              {/if}
-            </form>
-          </div>
-
-          <div class="corpus-details">
-            <h3>Selected entry details</h3>
-            <div class="corpus-details-grid" class:muted={!selectedCorpusRow}>
-              <div>
-                <span>Stage</span>
-                <strong>{selectedCorpusRow ? bucketLabel(selectedCorpusRow.bucket) : '-'}</strong>
-              </div>
-              <div>
-                <span>Status</span>
-                <strong>{selectedCorpusRow ? pipelineStatusLabel(selectedCorpusRow.item.status) : '-'}</strong>
-              </div>
-              <div>
-                <span>ID</span>
-                <strong>{selectedCorpusRow?.item.id ?? '-'}</strong>
-              </div>
-              <div>
-                <span>Year</span>
-                <strong>{selectedCorpusRow?.item.year || '-'}</strong>
-              </div>
-              <div class="span-2">
-                <span>Title</span>
-                <strong>{selectedCorpusRow?.item.title || (selectedCorpusRow ? 'Untitled' : '-')}</strong>
-              </div>
-              <div class="span-2">
-                <span>Source</span>
-                <strong>{selectedCorpusRow?.item.source || '-'}</strong>
-              </div>
-              <div class="span-2">
-                <span>DOI</span>
-                {#if selectedCorpusRow?.item.doi}
-                  <a href={doiHref(selectedCorpusRow.item.doi)} target="_blank" rel="noreferrer">{selectedCorpusRow.item.doi}</a>
-                {:else}
-                  <strong>-</strong>
-                {/if}
-              </div>
-              <div class="span-2">
-                <span>OpenAlex</span>
-                {#if selectedCorpusRow?.item.openalex_id}
-                  <a href={openAlexHref(selectedCorpusRow.item.openalex_id)} target="_blank" rel="noreferrer">{selectedCorpusRow.item.openalex_id}</a>
-                {:else}
-                  <strong>-</strong>
-                {/if}
-              </div>
-            </div>
-          </div>
-          <div class="corpus-columns">
-            <div class="corpus-column">
-              <h3>Raw / Seeds <span class="count">({rawTotal || rawItems.length})</span></h3>
-              <div class="table table-scroll corpus-table" bind:this={rawCorpusTableEl} on:scroll={handleCorpusColumnScroll}>
-                 <div class="table-row header cols-corpus-mini">
-                  <span>Title</span>
-                  <span>Year</span>
-                </div>
-                {#each rawItems as item}
-                  <button
-                    class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'raw') ? 'selected' : ''}`}
-                    class:promotion-target-flash={isPromotionHighlighted('raw', item.id)}
-                    type="button"
-                    use:bindCorpusRow={{ stage: 'raw', key: corpusMotionKey('raw', item.id) }}
-                    on:click={() => toggleCorpusItemSelection(item, 'raw')}
-                  >
-                    <span class="line-clamp-2" title={item.title}>{item.title}</span>
-                    <span class="nowrap">{item.year}</span>
-                  </button>
-                {/each}
-              </div>
-            </div>
-
-            <div class="corpus-column">
-               <h3>With Metadata <span class="count">({metadataTotal || metaItems.length})</span></h3>
-               <div class="table table-scroll corpus-table" bind:this={metaCorpusTableEl} on:scroll={handleCorpusColumnScroll}>
-                 <div class="table-row header cols-corpus-mini">
-                  <span>Title</span>
-                  <span>Year</span>
-                </div>
-                {#each metaItems as item}
-                  <button
-                    class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'metadata') ? 'selected' : ''}`}
-                    class:promotion-target-flash={isPromotionHighlighted('metadata', item.id)}
-                    type="button"
-                    use:bindCorpusRow={{ stage: 'metadata', key: corpusMotionKey('metadata', item.id) }}
-                    on:click={() => toggleCorpusItemSelection(item, 'metadata')}
-                  >
-                    <span class="line-clamp-2" title={item.title}>{item.title}</span>
-                    <span class="nowrap">{item.year}</span>
-                  </button>
-                {/each}
-              </div>
-            </div>
-
-            <div class="corpus-column">
-               <h3>Downloaded <span class="count">({downloadedTotal || downloadedItems.length})</span></h3>
-               <div class="table table-scroll corpus-table" bind:this={downloadedCorpusTableEl} on:scroll={handleCorpusColumnScroll}>
-                 <div class="table-row header cols-corpus-mini">
-                  <span>Title</span>
-                  <span>Year</span>
-                </div>
-                {#each downloadedItems as item}
-                  <button
-                    class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'downloaded') ? 'selected' : ''}`}
-                    class:promotion-target-flash={isPromotionHighlighted('downloaded', item.id)}
-                    type="button"
-                    use:bindCorpusRow={{ stage: 'downloaded', key: corpusMotionKey('downloaded', item.id) }}
-                    on:click={() => toggleCorpusItemSelection(item, 'downloaded')}
-                  >
-                    <span class="line-clamp-2" title={item.title}>{item.title}</span>
-                    <span class="nowrap">{item.year}</span>
-                  </button>
-                {/each}
-              </div>
-            </div>
-          </div>
-          <div class="corpus-lazy-status">
-            <span class="muted">{corpusLoadStatus}</span>
-            {#if corpusHasMore}
-              <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore || corpusLoading}>
-                {corpusLoadingMore ? 'Loading…' : 'Load more'}
-              </button>
-            {/if}
-          </div>
-
-        </div>
+        <Corpus
+          {corpusSource}
+          {corpusTotal}
+          {corpusItems}
+          {rawTotal}
+          {metadataTotal}
+          {downloadedTotal}
+          bind:shareUsername={shareUsername}
+          bind:shareRole={shareRole}
+          {shareStatus}
+          {handleShareCorpus}
+          {selectedCorpusRow}
+          {bucketLabel}
+          {pipelineStatusLabel}
+          {doiHref}
+          {openAlexHref}
+          {isCorpusItemSelected}
+          {toggleCorpusItemSelection}
+          {isPromotionHighlighted}
+          {bindCorpusRow}
+          {corpusMotionKey}
+          {corpusLoadStatus}
+          {corpusHasMore}
+          {corpusLoadingMore}
+          {corpusLoading}
+          {loadCorpus}
+        />
       {/if}
 
       {#if activeTab === 'downloads'}
@@ -3149,237 +2980,57 @@
       {/if}
 
       {#if activeTab === 'logs'}
-        <div class="card" data-testid="logs-panel">
-          <h2>Logs</h2>
-          <p class="muted">WebSocket status: {logsStatus}</p>
-          <div class="log-toolbar">
-            <div class="log-toolbar__actions">
-              <label class="log-type-select">
-                <span class="muted small">Type</span>
-                <select bind:value={logsType} on:change={handleLogTypeChange} data-testid="logs-type-select">
-                  <option value="pipeline">Pipeline</option>
-                  <option value="app">App</option>
-                </select>
-              </label>
-              <label class="log-filter-current">
-                <input type="checkbox" bind:checked={logsFilterCurrentCorpus} on:change={handleLogsCorpusFilterChange} />
-                <span class="muted small">Current corpus only</span>
-              </label>
-              <button
-                class="secondary"
-                type="button"
-                on:click={loadOlderLogs}
-                disabled={logsLoadingOlder || !logsHasMore}
-              >
-                {logsLoadingOlder ? 'Loading…' : 'Load older'}
-              </button>
-              <button
-                class="secondary"
-                type="button"
-                on:click={() => hydrateLogsFromTail({ force: true })}
-                disabled={logsLoadingOlder}
-              >
-                Refresh from file
-              </button>
-            </div>
-            <span class="muted small">
-              {logsTailStatus}
-              {#if logs.length > 0}
-                {' '}Showing {logs.length} lines.
-              {/if}
-            </span>
-          </div>
-          <div class="log-box">
-            {#if logs.length === 0}
-              <p class="muted">Waiting for pipeline output...</p>
-            {:else}
-              {#each logs as entry}
-                <div class="log-line">{entry}</div>
-              {/each}
-            {/if}
-          </div>
-        </div>
+        <Logs
+          bind:logsType={logsType}
+          bind:logsFilterCurrentCorpus={logsFilterCurrentCorpus}
+          {logsStatus}
+          {logsLoadingOlder}
+          {logsHasMore}
+          {logsTailStatus}
+          {logs}
+          {handleLogTypeChange}
+          {handleLogsCorpusFilterChange}
+          {loadOlderLogs}
+          {hydrateLogsFromTail}
+        />
       {/if}
 
       {#if activeTab === 'graph'}
-        <div class="card" data-testid="graph-panel">
-          <h2>Graph overview</h2>
-          <p class="muted">{graphStatus} ({graphSource})</p>
-          <div class="graph-controls">
-            <label>
-              <span>Relationship</span>
-              <select bind:value={graphRelationship}>
-                <option value="both">References + Cited by</option>
-                <option value="references">References only</option>
-                <option value="cited_by">Cited by only</option>
-              </select>
-            </label>
-            <label>
-              <span>Status</span>
-              <select bind:value={graphStatusFilter}>
-                <option value="all">All</option>
-                <option value="with_metadata">With metadata</option>
-                <option value="downloaded">Downloaded</option>
-                <option value="queued">Queued</option>
-              </select>
-            </label>
-            <label>
-              <span>Year from</span>
-              <input type="number" min="1600" max="2100" bind:value={graphYearFrom} placeholder="1900" />
-            </label>
-            <label>
-              <span>Year to</span>
-              <input type="number" min="1600" max="2100" bind:value={graphYearTo} placeholder="2026" />
-            </label>
-            <label>
-              <span>Max nodes</span>
-              <input type="number" min="20" max="2000" step="20" bind:value={graphMaxNodes} />
-            </label>
-            <label>
-              <span>Color by</span>
-              <select bind:value={graphColorMode}>
-                <option value="source_path">Search path</option>
-                <option value="component">Cluster</option>
-                <option value="status">Pipeline status</option>
-                <option value="year">Year decade</option>
-                <option value="type">Work type</option>
-              </select>
-            </label>
-            <label class="graph-toggle">
-              <span>Hide isolates</span>
-              <input type="checkbox" bind:checked={graphHideIsolates} />
-            </label>
-            <label class="graph-toggle">
-              <span>Largest cluster only</span>
-              <input type="checkbox" bind:checked={graphFocusConnected} />
-            </label>
-            <div class="graph-controls-actions">
-              <button class="secondary" type="button" on:click={loadGraph}>Apply filters</button>
-            </div>
-          </div>
-          <div class="graph-layout">
-            <div class="graph-wrap graph-canvas">
-              <svg
-                viewBox={`${graphViewBox.x} ${graphViewBox.y} ${graphViewBox.size} ${graphViewBox.size}`}
-                aria-label="Graph visualization"
-                role="application"
-                on:wheel={handleGraphWheel}
-                on:pointerdown={handleGraphPointerDown}
-                on:pointermove={handleGraphPointerMove}
-                on:pointerup={handleGraphPointerUp}
-                on:pointerleave={handleGraphPointerUp}
-                style="touch-action: none;"
-              >
-                {#each graphVisibleEdges as edge}
-                  <line
-                    x1={graphNodeMap.get(edge.source).x}
-                    y1={graphNodeMap.get(edge.source).y}
-                    x2={graphNodeMap.get(edge.target).x}
-                    y2={graphNodeMap.get(edge.target).y}
-                    class={`edge ${edge.relationship_type === 'cited_by' ? 'edge--cited' : 'edge--ref'}`}
-                  />
-                {/each}
-                {#each graphLayout as node}
-                  <g
-                    class:active={hoveredNodeId === node.id}
-                    on:mouseenter={() => (hoveredNodeId = node.id)}
-                    on:mouseleave={() => (hoveredNodeId = null)}
-                    on:focus={() => (hoveredNodeId = node.id)}
-                    on:blur={() => (hoveredNodeId = null)}
-                    role="button"
-                    tabindex="0"
-                    aria-label={node.title}
-                  >
-                    <circle
-                      cx={node.x}
-                      cy={node.y}
-                      r={hoveredNodeId === node.id ? node.size + 4 : node.size}
-                      class="node"
-                      style={`fill: ${graphNodeColorMap.get(node.id) || '#0f8b8d'};`}
-                    />
-                    <title>{node.title}</title>
-                  </g>
-                {/each}
-              </svg>
-            </div>
-            <div class="graph-details">
-              <div class="graph-summary">
-                <div>
-                  <span class="eyebrow">Nodes</span>
-                  <strong>{graphNodeCount}</strong>
-                </div>
-                <div>
-                  <span class="eyebrow">Edges</span>
-                  <strong>{graphEdgeCount}</strong>
-                </div>
-                <div>
-                  <span class="eyebrow">References</span>
-                  <strong>{graphRelationshipCounts.references}</strong>
-                </div>
-                <div>
-                  <span class="eyebrow">Cited by</span>
-                  <strong>{graphRelationshipCounts.cited_by}</strong>
-                </div>
-              </div>
-              <p class="muted small">
-                Showing {graphNodeCount}/{graphTotalNodeCount} nodes and {graphEdgeCount}/{graphTotalEdgeCount} edges.
-              </p>
-              <div class="graph-hover">
-                {#if hoveredNode}
-                  <span class="eyebrow">Selected node</span>
-                  <strong>{hoveredNode.title}</strong>
-                  <span class="muted small">
-                    {hoveredNode.year || 'Year ?'} · {hoveredNode.type || 'Type ?'} · {labelFromStatus(hoveredNode.status)}
-                  </span>
-                  <span class="muted small">Path: {hoveredNode.source_path || hoveredNode.ingest_source || 'unknown'}</span>
-                {:else}
-                  <span class="eyebrow">Selected node</span>
-                  <strong>Hover a node to preview</strong>
-                  <span class="muted small">Connected node details will appear here.</span>
-                  <span class="muted small">Path: -</span>
-                {/if}
-              </div>
-              <div class="graph-legend">
-                <span class="eyebrow">Color legend</span>
-                {#if graphColorLegend.length === 0}
-                  <p class="muted">No cluster groups available.</p>
-                {:else}
-                  <div class="graph-legend-list">
-                    {#each graphColorLegend as item}
-                      <div class="graph-legend-item">
-                        <span class="graph-legend-swatch" style={`background:${item.color};`}></span>
-                        <span>{item.key}</span>
-                        <strong>{item.count}</strong>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
-              </div>
-              <div class="graph-actions">
-                <button class="secondary" type="button" on:click={resetGraphView}>Reset view</button>
-              </div>
-              <div class="graph-list">
-                {#each graphList as node}
-                  <button
-                    class:active={hoveredNodeId === node.id}
-                    on:mouseenter={() => (hoveredNodeId = node.id)}
-                    on:mouseleave={() => (hoveredNodeId = null)}
-                    type="button"
-                  >
-                    <span class="graph-list-label">
-                      <span
-                        class="graph-legend-swatch"
-                        style={`background:${graphNodeColorMap.get(node.id) || '#0f8b8d'};`}
-                      ></span>
-                      <span>{truncateLabel(node.title)}</span>
-                    </span>
-                    <strong>{graphDegreeMap.get(node.id) ?? 0}</strong>
-                  </button>
-                {/each}
-              </div>
-            </div>
-          </div>
-        </div>
+        <Graph
+          bind:graphRelationship={graphRelationship}
+          bind:graphStatusFilter={graphStatusFilter}
+          bind:graphYearFrom={graphYearFrom}
+          bind:graphYearTo={graphYearTo}
+          bind:graphMaxNodes={graphMaxNodes}
+          bind:graphColorMode={graphColorMode}
+          bind:graphHideIsolates={graphHideIsolates}
+          bind:graphFocusConnected={graphFocusConnected}
+          {graphStatus}
+          {graphSource}
+          {loadGraph}
+          {graphViewBox}
+          {handleGraphWheel}
+          {handleGraphPointerDown}
+          {handleGraphPointerMove}
+          {handleGraphPointerUp}
+          {graphVisibleEdges}
+          {graphNodeMap}
+          {graphLayout}
+          bind:hoveredNodeId={hoveredNodeId}
+          {graphNodeColorMap}
+          {graphNodeCount}
+          {graphEdgeCount}
+          {graphRelationshipCounts}
+          {graphTotalNodeCount}
+          {graphTotalEdgeCount}
+          {hoveredNode}
+          {labelFromStatus}
+          {graphColorLegend}
+          {resetGraphView}
+          {graphList}
+          {truncateLabel}
+          {graphDegreeMap}
+        />
       {/if}
     </section>
   </div>
