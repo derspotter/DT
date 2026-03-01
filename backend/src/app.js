@@ -851,64 +851,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return pipelineWorkers.get(key);
   }
 
-  function spawnDownloadOnce({ corpusId, batchSize, downloadDir }) {
-    const dbPath = DB_PATH;
-    const args = ['--db-path', dbPath, '--limit', String(batchSize)];
-    if (downloadDir) {
-      args.push('--download-dir', String(downloadDir));
-    }
-    const corpusTag = corpusId || 'none';
-
-    const env = {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-      RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-      RAG_FEEDER_DB_PATH: dbPath,
-    };
-    if (corpusId !== undefined && corpusId !== null) {
-      args.push('--corpus-id', String(corpusId));
-    }
-
-    const child = spawn(PYTHON_EXEC, [DOWNLOAD_WORKER_ONCE_SCRIPT, ...args], { env });
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (data) => {
-      const message = data.toString();
-      stdout += message;
-      message
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .forEach((line) => send(`[download-worker] corpus=${corpusTag} ${line}`));
-    });
-
-    child.stderr.on('data', (data) => {
-      const message = data.toString();
-      stderr += message;
-      message
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .forEach((line) => send(`[download-worker ERROR] corpus=${corpusTag} ${line}`));
-    });
-
-  const done = new Promise((resolve, reject) => {
-      child.on('close', (code) => {
-        if (code !== 0) {
-          return reject(new Error(`Python script failed (${code}): ${stderr || stdout}`));
-        }
-        try {
-          const payload = parseJsonFromOutput(stdout);
-          return resolve(payload);
-        } catch (error) {
-          return reject(error);
-        }
-      });
-    });
-
-    return { child, done };
-  }
-
-  async function tickDownloadWorker(corpusId) {
+  function tickDownloadWorker(corpusId) {
     const state = getOrInitWorkerState(corpusId);
     if (!state.running || state.inFlight) return;
     state.inFlight = true;
@@ -916,19 +859,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     state.lastError = null;
     const { batchSize } = state.config;
     const corpusTag = corpusId || 'none';
-    send(`[download-worker] corpus=${corpusTag} tick batch=${batchSize}`);
+    
     try {
-      const { child, done } = spawnDownloadOnce({ corpusId, batchSize });
-      state.child = child;
-      state.lastResult = await done;
-      send(
-        `[download-worker] corpus=${corpusTag} done processed=${state.lastResult.processed} downloaded=${state.lastResult.downloaded} failed=${state.lastResult.failed} skipped=${state.lastResult.skipped}`
-      );
+      mainDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(corpusId, 'download', JSON.stringify({ batchSize }));
     } catch (error) {
       state.lastError = error?.message || String(error);
-      send(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
+      console.error(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
     } finally {
-      state.child = null;
       state.inFlight = false;
     }
   }
@@ -955,13 +894,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
       state.intervalId = null;
-    }
-    if (force && state.child) {
-      try {
-        state.child.kill('SIGTERM');
-      } catch (error) {
-        // ignore
-      }
     }
     return state;
   }
@@ -1057,163 +989,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const corpusTag = corpusId || 'none';
     state.lastTickAt = new Date().toISOString();
     state.lastError = null;
-    state.children = [];
-
-    const promoteBatchSize = Math.max(1, Number(state.config.promoteBatchSize || 10));
-    const promoteWorkers = Math.max(1, Number(state.config.promoteWorkers || 1));
-    const downloadBatchSize = Math.max(1, Number(state.config.downloadBatchSize || 3));
-    const workerCount = resolveDownloadWorkerCount({
-      corpusId,
-      requestedWorkers: Number(state.config.downloadWorkers || 0),
-      batchSize: downloadBatchSize,
-    });
-    state.resolvedDownloadWorkers = workerCount;
-
-    let hadActivity = false;
+    
     try {
-      const markRun = spawnPythonJson(
-        INGEST_MARK_NEXT_RAW_SCRIPT,
-        ['--db-path', DB_PATH, '--limit', String(promoteBatchSize)],
-        {
-          dbPath: DB_PATH,
-          corpusId,
-          onStdoutLine: (line) => send(`[pipeline-worker mark] corpus=${corpusTag} ${line}`),
-          onStderrLine: (line) => send(`[pipeline-worker mark ERROR] corpus=${corpusTag} ${line}`),
-        }
-      );
-      state.children.push(markRun.child);
-      const marked = await markRun.done;
-      state.children = state.children.filter((child) => child !== markRun.child);
-      const markedRaw = Number(marked?.marked || 0);
-      const markedCandidates = Number(marked?.available || 0);
-      if (markedRaw > 0 || markedCandidates > 0) {
-        send(`[pipeline-worker] corpus=${corpusTag} marked raw=${markedRaw} candidates=${markedCandidates}`);
-      }
-      hadActivity = hadActivity || markedRaw > 0;
-
-      const promoteRun = spawnPythonJson(
-        INGEST_PROCESS_MARKED_SCRIPT,
-        [
-          '--db-path',
-          DB_PATH,
-          '--limit',
-          String(promoteBatchSize),
-          '--workers',
-          String(promoteWorkers),
-          '--no-fetch-references',
-        ],
-        {
-          dbPath: DB_PATH,
-          corpusId,
-          onStdoutLine: (line) => send(`[pipeline-worker enrich] corpus=${corpusTag} ${line}`),
-          onStderrLine: (line) => send(`[pipeline-worker enrich ERROR] corpus=${corpusTag} ${line}`),
-        }
-      );
-      state.children.push(promoteRun.child);
-      const promoted = await promoteRun.done;
-      state.children = state.children.filter((child) => child !== promoteRun.child);
-      const promotionResults = Array.isArray(promoted?.results) ? promoted.results : [];
-      promotionResults.forEach((row) => {
-        const action = String(row?.action || '');
-        if (action !== 'queued' && action !== 'enqueue_skipped') return;
-        emitPromotionEvent({
-          corpusId,
-          transition: 'raw_to_metadata',
-          fromStage: 'raw',
-          toStage: 'metadata',
-          itemId: row?.no_metadata_id,
-          destItemId: row?.with_metadata_id,
-          title: row?.title || null,
-        });
-      });
-      const promotedProcessed = Number(promoted?.processed || 0);
-      const promotedPromoted = Number(promoted?.promoted || 0);
-      const promotedQueued = Number(promoted?.queued || 0);
-      const promotedFailed = Number(promoted?.failed || 0);
-      if (promotedProcessed > 0 || promotedPromoted > 0 || promotedQueued > 0 || promotedFailed > 0) {
-        send(
-          `[pipeline-worker] corpus=${corpusTag} enrich processed=${promotedProcessed} ` +
-            `promoted=${promotedPromoted} queued=${promotedQueued} failed=${promotedFailed}`
-        );
-      }
-      hadActivity =
-        hadActivity ||
-        promotedProcessed > 0 ||
-        promotedPromoted > 0 ||
-        promotedQueued > 0 ||
-        promotedFailed > 0;
-
-      const runs = [];
-      for (let i = 0; i < workerCount; i += 1) {
-        const { child, done } = spawnDownloadOnce({ corpusId, batchSize: downloadBatchSize });
-        state.children.push(child);
-        runs.push(done);
-      }
-      const settled = await Promise.allSettled(runs);
-      const payloads = settled
-        .filter((result) => result.status === 'fulfilled')
-        .map((result) => result.value);
-      const rejected = settled
-        .filter((result) => result.status === 'rejected')
-        .map((result) => result.reason?.message || String(result.reason || 'unknown error'));
-      const downloads = aggregateDownloadPayloads(payloads);
-      downloads.errors.push(...rejected);
-      payloads.forEach((payload) => {
-        const rows = Array.isArray(payload?.results) ? payload.results : [];
-        rows.forEach((row) => {
-          if (String(row?.action || '') !== 'downloaded') return;
-          emitPromotionEvent({
-            corpusId,
-            transition: 'metadata_to_downloaded',
-            fromStage: 'metadata',
-            toStage: 'downloaded',
-            itemId: row?.with_metadata_id ?? row?.queue_id,
-            destItemId: row?.downloaded_id,
-            title: row?.title || null,
-          });
-        });
-      });
-
-      if (
-        downloads.processed > 0 ||
-        downloads.downloaded > 0 ||
-        downloads.failed > 0 ||
-        downloads.skipped > 0 ||
-        downloads.errors.length > 0
-      ) {
-        send(
-          `[pipeline-worker] corpus=${corpusTag} download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
-            `failed=${downloads.failed} skipped=${downloads.skipped}`
-        );
-      }
-      hadActivity =
-        hadActivity || downloads.processed > 0 || downloads.downloaded > 0 || downloads.failed > 0 || downloads.skipped > 0;
-
-      state.lastResult = {
-        marked: {
-          requested: Number(marked?.requested || promoteBatchSize),
-          marked: Number(marked?.marked || 0),
-          available: Number(marked?.available || 0),
-        },
-        promoted: {
-          processed: Number(promoted?.processed || 0),
-          promoted: Number(promoted?.promoted || 0),
-          queued: Number(promoted?.queued || 0),
-          failed: Number(promoted?.failed || 0),
-        },
-        downloads,
-        workers: workerCount,
-      };
-      state.lastError = downloads.errors.length ? downloads.errors[0] : null;
+      mainDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(corpusId, 'pipeline_tick', JSON.stringify({ config: state.config }));
     } catch (error) {
       state.lastError = error?.message || String(error);
-      send(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
+      console.error(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
     } finally {
-      state.children = [];
       state.inFlight = false;
-      if (state.running && hadActivity) {
-        setTimeout(() => tickPipelineWorker(corpusId), 0);
-      }
     }
   }
 
@@ -1238,7 +1023,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const legacy = getOrInitWorkerState(corpusId);
     if (legacy.running || legacy.inFlight) {
       stopDownloadWorker(corpusId, { force: false });
-      send('[pipeline-worker] paused legacy download-only worker for this corpus');
     }
 
     if (state.running) return state;
@@ -1255,15 +1039,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
       state.intervalId = null;
-    }
-    if (force && Array.isArray(state.children)) {
-      state.children.forEach((child) => {
-        try {
-          child.kill('SIGTERM');
-        } catch (error) {
-          // ignore
-        }
-      });
     }
     return state;
   }
