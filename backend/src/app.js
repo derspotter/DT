@@ -2034,31 +2034,26 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.status(400).json({ error: 'workers must be a positive number' });
     }
 
-    const dbPath = DB_PATH;
-    const args = ['--db-path', dbPath, '--limit', String(limit), '--workers', String(workers)];
-    const shouldFetchReferences = expansion.includeDownstream;
-    args.push(shouldFetchReferences ? '--fetch-references' : '--no-fetch-references');
-    applyUploadedDocsExpansionArgs(args, expansion);
     try {
-      const payload = await runPythonJson(INGEST_PROCESS_MARKED_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      const rows = Array.isArray(payload?.results) ? payload.results : [];
-      rows.forEach((row) => {
-        const action = String(row?.action || '');
-        if (action !== 'queued' && action !== 'enqueue_skipped') return;
-        emitPromotionEvent({
-          corpusId: req.corpusId,
-          transition: 'raw_to_metadata',
-          fromStage: 'raw',
-          toStage: 'metadata',
-          itemId: row?.no_metadata_id,
-          destItemId: row?.with_metadata_id,
-          title: row?.title || null,
-        });
+      const jobParams = {
+        limit,
+        workers,
+        expansion,
+        shouldFetchReferences: expansion.includeDownstream
+      };
+
+      const result = mainDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(req.corpusId, 'enrich', JSON.stringify(jobParams));
+
+      return res.json({ 
+        success: true, 
+        job_id: result.lastInsertRowid,
+        message: 'Enrichment job queued successfully.'
       });
-      return res.json(payload);
     } catch (error) {
       console.error('[/api/ingest/process-marked] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to process marked ingest entries' });
+      return res.status(500).json({ error: error.message || 'Failed to queue marked ingest entries for processing' });
     }
   });
 
@@ -2182,68 +2177,43 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.post('/api/pipeline/worker/start', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: true, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const intervalSeconds = coerceInt(req.body?.intervalSeconds, 15);
-    const promoteBatchSize = coerceInt(req.body?.promoteBatchSize, 25);
-    const promoteWorkers = coerceInt(req.body?.promoteWorkers, 6);
-    const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 5);
-    const downloadWorkersRequested = coerceInt(req.body?.downloadWorkers, 0);
-    const state = startPipelineWorker(req.corpusId, {
-      intervalSeconds,
-      promoteBatchSize,
-      promoteWorkers,
-      downloadBatchSize,
-      downloadWorkers: downloadWorkersRequested,
-    });
+    
+    const state = getOrInitPipelineWorkerState(req.corpusId);
+    state.running = true;
+    
     return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
+      running: true,
+      in_flight: false,
       config: state.config,
-      resolved_download_workers: state.resolvedDownloadWorkers,
+      resolved_download_workers: state.config.downloadWorkers || 0,
     });
   });
 
   app.post('/api/pipeline/worker/pause', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: false, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const force = Boolean(req.body?.force);
-    const state = pausePipelineWorker(req.corpusId, { force });
-    return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
-      config: state.config,
-      resolved_download_workers: state.resolvedDownloadWorkers,
-    });
+    
+    const state = getOrInitPipelineWorkerState(req.corpusId);
+    state.running = false;
+    return res.json({ running: false });
   });
 
   app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({
-        pipeline: { stopped: 0, in_flight: 0, wasRunning: 0, states: {} },
-        downloads: { stopped: 0, in_flight: 0, wasRunning: 0, states: {} },
-        force: Boolean(req.body?.force),
-      });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const force = Boolean(req.body?.force);
-    const pipelineResult = pauseAllPipelineWorkers({ force });
-    const downloadResult = stopAllDownloadWorkers({ force });
-    send(`[pipeline-worker] corpus=all stopped all workers force=${force}`);
+    
+    for (const state of pipelineWorkers.values()) {
+      state.running = false;
+    }
     return res.json({
-      pipeline: pipelineResult,
-      downloads: downloadResult,
-      force,
+      pipeline: { stopped: pipelineWorkers.size },
+      downloads: { stopped: downloadWorkers.size },
+      force: true
     });
   });
 
@@ -2267,83 +2237,55 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.post('/api/downloads/worker/start', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: true, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const pipelineState = getOrInitPipelineWorkerState(req.corpusId);
-    if (pipelineState.running || pipelineState.inFlight) {
-      return res.status(409).json({ error: 'Global pipeline worker is active; pause it first.' });
-    }
-    const intervalSeconds = coerceInt(req.body?.intervalSeconds, 60);
     const batchSize = coerceInt(req.body?.batchSize, 3);
-    const state = startDownloadWorker(req.corpusId, { intervalSeconds, batchSize });
-    return res.json({ running: state.running, config: state.config });
+    
+    try {
+      const result = mainDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
+
+      return res.json({ 
+        running: true, 
+        job_id: result.lastInsertRowid,
+        message: 'Download job queued successfully.'
+      });
+    } catch (error) {
+      console.error('[/api/downloads/worker/start] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to queue download job' });
+    }
   });
 
   app.post('/api/downloads/worker/stop', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: false, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const force = Boolean(req.body?.force);
-    const state = stopDownloadWorker(req.corpusId, { force });
-    return res.json({ running: state.running });
+    const state = getOrInitWorkerState(req.corpusId);
+    state.running = false;
+    return res.json({ running: false });
   });
 
   app.post('/api/downloads/worker/run-once', requireAuthMiddleware, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ processed: 0, downloaded: 0, failed: 0, skipped: 0, source: 'stub' });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const pipelineState = getOrInitPipelineWorkerState(req.corpusId);
-    if (pipelineState.running || pipelineState.inFlight) {
-      return res.status(409).json({ error: 'Global pipeline worker is active; pause it first.' });
-    }
     const batchSize = coerceInt(req.body?.batchSize, 3);
-    const state = getOrInitWorkerState(req.corpusId);
-    if (state.inFlight) {
-      return res.status(409).json({ error: 'Worker is already processing a batch' });
-    }
-    state.inFlight = true;
-    state.lastTickAt = new Date().toISOString();
-    state.lastError = null;
-    send(`[download-worker] run-once corpus=${req.corpusId || 'none'} batch=${batchSize}`);
+    
     try {
-      const { child, done } = spawnDownloadOnce({ corpusId: req.corpusId, batchSize });
-      state.child = child;
-      const payload = await done;
-      const resultRows = Array.isArray(payload?.results) ? payload.results : [];
-      resultRows.forEach((row) => {
-        if (String(row?.action || '') !== 'downloaded') return;
-        emitPromotionEvent({
-          corpusId: req.corpusId,
-          transition: 'metadata_to_downloaded',
-          fromStage: 'metadata',
-          toStage: 'downloaded',
-          itemId: row?.with_metadata_id ?? row?.queue_id,
-          destItemId: row?.downloaded_id,
-          title: row?.title || null,
-        });
+      const result = mainDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
+
+      return res.json({ 
+        success: true, 
+        job_id: result.lastInsertRowid,
+        message: 'Download job queued successfully.'
       });
-      state.lastResult = payload;
-      send(
-        `[download-worker] done processed=${payload.processed} downloaded=${payload.downloaded} failed=${payload.failed} skipped=${payload.skipped}`
-      );
-      return res.json(payload);
     } catch (error) {
-      state.lastError = error?.message || String(error);
-      send(`[download-worker ERROR] ${state.lastError}`);
-      return res.status(500).json({ error: state.lastError });
-    } finally {
-      state.child = null;
-      state.inFlight = false;
+      console.error('[/api/downloads/worker/run-once] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to queue download job' });
     }
   });
 

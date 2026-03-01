@@ -411,6 +411,21 @@ class DatabaseManager:
             )
         """)
 
+        # 10. Pipeline Jobs (for background daemon)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pipeline_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                corpus_id INTEGER,
+                job_type TEXT NOT NULL, -- e.g., 'enrich', 'download', 'keyword_search'
+                status TEXT DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed'
+                parameters_json TEXT, -- any parameters needed for the job
+                result_json TEXT, -- output results or error messages
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+        """)
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS citation_edges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
