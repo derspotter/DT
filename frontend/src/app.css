@@ -1845,3 +1845,8 @@ button.danger:disabled {
 .corpus-details-grid .span-2 {
   grid-column: span 2;
 }
+
+.opacity-50 {
+  opacity: 0.5;
+}
+

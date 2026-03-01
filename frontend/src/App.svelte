@@ -937,7 +937,7 @@
     latestSelection = (latestEntries || []).map((entry, index) => latestSelectionKey(entry, index)).filter(Boolean)
   }
 
-  async function enqueueSelectedLatest() {
+  async function enqueueSelectedLatest(withDownload = false) {
     enqueueStatus = ''
     const ids = (latestEntries || [])
       .filter((entry, index) => isLatestSelected(entry, index))
@@ -961,7 +961,7 @@
         await processMarkedBatch()
         
         // Also ensure the global pipeline worker is running so downloads actually happen
-        if (!pipelineWorker.running) {
+        if (withDownload && !pipelineWorker.running) {
           enqueueStatus += ' Starting background downloader...'
           await handleStartPipelineWorker()
         }
@@ -2546,14 +2546,51 @@
               <div class="table-toolbar-right">
                 <div class="toolbar-actions">
                   <button
-                    class="primary"
+                    class="secondary"
                     type="button"
-                    on:click={enqueueSelectedLatest}
+                    on:click={() => enqueueSelectedLatest(false)}
                     disabled={latestSelection.length === 0 || processingMarked}
                   >
-                    {processingMarked ? 'Processing...' : 'Enrich Selected'}
+                    {processingMarked ? 'Processing...' : 'Enrich'}
+                  </button>
+                  <button
+                    class="primary"
+                    type="button"
+                    on:click={() => enqueueSelectedLatest(true)}
+                    disabled={latestSelection.length === 0 || processingMarked}
+                  >
+                    {processingMarked ? 'Processing...' : 'Enrich + Download'}
                   </button>
                 </div>
+              </div>
+            </div>
+
+            <div class="expansion-settings-row" style="display: flex; align-items: center; gap: 20px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--stroke); border-radius: 8px; margin-bottom: 16px; flex-wrap: nowrap; overflow-x: auto;">
+              <span class="muted small" style="text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; white-space: nowrap;">Enrichment Expansion</span>
+              
+              <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px; white-space: nowrap;" class:opacity-50={!includeDownstream}>
+                <label class="expansion-toggle">
+                  <input type="checkbox" bind:checked={includeDownstream} />
+                  <span>Downstream</span>
+                </label>
+                <span class="muted small" style="margin-left: 4px;">Depth</span>
+                <input type="number" min="1" max="4" bind:value={relatedDepthDownstream} disabled={!includeDownstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
+              </div>
+
+              <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px;" class:opacity-50={!includeUpstream}>
+                <label class="expansion-toggle">
+                  <input type="checkbox" bind:checked={includeUpstream} />
+                  <span>Upstream</span>
+                </label>
+                <span class="muted small" style="margin-left: 4px;">Depth</span>
+                <input type="number" min="1" max="4" bind:value={relatedDepthUpstream} disabled={!includeUpstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
+              </div>
+
+              <div style="width: 1px; height: 20px; background: var(--stroke);"></div>
+              
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <span class="muted small">Max Related / Paper</span>
+                <input type="number" min="1" max="100" bind:value={maxRelated} class="short-input" style="padding: 4px; width: 60px; border-radius: 4px; border: 1px solid var(--stroke);" />
               </div>
             </div>
             {#if enqueueStatus}
