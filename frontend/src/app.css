@@ -1735,11 +1735,57 @@ button.danger:disabled {
   font: inherit;
   color: inherit;
   cursor: pointer;
+  position: relative;
+  transform: translate3d(0, 0, 0);
 }
 
 .corpus-select-row:focus-visible {
   outline: 2px solid rgba(15, 139, 141, 0.45);
   outline-offset: 1px;
+}
+
+.corpus-select-row.promotion-slide {
+  animation: corpusPromotionSlide 420ms cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  will-change: transform, opacity;
+  z-index: 2;
+}
+
+.corpus-select-row.promotion-target-flash {
+  animation: corpusPromotionFlash 640ms ease-out;
+}
+
+@keyframes corpusPromotionSlide {
+  from {
+    transform: translate(var(--promotion-dx, 0), var(--promotion-dy, 0));
+    opacity: 0.72;
+  }
+
+  to {
+    transform: translate(0, 0);
+    opacity: 1;
+  }
+}
+
+@keyframes corpusPromotionFlash {
+  0% {
+    background: rgba(15, 139, 141, 0.26);
+    border-color: rgba(15, 139, 141, 0.42);
+  }
+
+  100% {
+    background: rgba(15, 139, 141, 0.08);
+    border-color: rgba(15, 139, 141, 0.16);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .corpus-select-row.promotion-slide {
+    animation: none;
+  }
+
+  .corpus-select-row.promotion-target-flash {
+    animation-duration: 220ms;
+  }
 }
 
 .corpus-details {

@@ -92,7 +92,17 @@ function broadcast(message) {
   });
 }
 
-const app = createApp({ broadcast });
+function broadcastEvent(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const serialized = JSON.stringify(payload);
+  clients.forEach((client) => {
+    if (client.readyState === client.OPEN) {
+      client.send(serialized);
+    }
+  });
+}
+
+const app = createApp({ broadcast, broadcastEvent });
 const server = app.listen(port, () => {
   console.log(`HTTP server listening on port ${port}`);
 });

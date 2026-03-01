@@ -763,9 +763,10 @@ function geminiDeleteUploadedSync(uploadedFileName) {
   }
 }
 
-export function createApp({ broadcast } = {}) {
+export function createApp({ broadcast, broadcastEvent } = {}) {
   const app = express();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
+  const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
   const pipelineWorkers = new Map(); // corpusId -> state
 
@@ -774,7 +775,19 @@ export function createApp({ broadcast } = {}) {
   fs.mkdirSync(BIB_OUTPUT_DIR, { recursive: true });
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const authDb = new Database(DB_PATH);
+  const authDb = new Database(DB_PATH, { timeout: 3_000 });
+  // Test suites spin up multiple app instances in parallel; these settings
+  // reduce transient SQLITE_BUSY / "database is locked" bootstrapping failures.
+  try {
+    authDb.pragma('journal_mode = WAL');
+  } catch (error) {
+    // keep default journal mode if WAL is unavailable
+  }
+  try {
+    authDb.pragma('busy_timeout = 3000');
+  } catch (error) {
+    // timeout option already helps; pragma is best-effort
+  }
   ensureAuthSchema(authDb);
   const defaultCorpusId = bootstrapDefaultCorpus(authDb);
   migrateExistingToCorpus(authDb, defaultCorpusId);
@@ -1012,6 +1025,31 @@ export function createApp({ broadcast } = {}) {
     return summary;
   }
 
+  function emitPromotionEvent({
+    corpusId,
+    transition,
+    fromStage,
+    toStage,
+    itemId,
+    destItemId = null,
+    title = null,
+  }) {
+    const sourceId = Number(itemId);
+    if (!Number.isFinite(sourceId)) return;
+    const targetId = Number(destItemId);
+    sendEvent({
+      kind: 'promotion',
+      corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
+      transition,
+      from_stage: fromStage,
+      to_stage: toStage,
+      item_id: sourceId,
+      dest_item_id: Number.isFinite(targetId) ? targetId : null,
+      title: title ? String(title) : null,
+      ts: new Date().toISOString(),
+    });
+  }
+
   async function tickPipelineWorker(corpusId) {
     const state = getOrInitPipelineWorkerState(corpusId);
     if (!state.running || state.inFlight) return;
@@ -1074,6 +1112,20 @@ export function createApp({ broadcast } = {}) {
       state.children.push(promoteRun.child);
       const promoted = await promoteRun.done;
       state.children = state.children.filter((child) => child !== promoteRun.child);
+      const promotionResults = Array.isArray(promoted?.results) ? promoted.results : [];
+      promotionResults.forEach((row) => {
+        const action = String(row?.action || '');
+        if (action !== 'queued' && action !== 'enqueue_skipped') return;
+        emitPromotionEvent({
+          corpusId,
+          transition: 'raw_to_metadata',
+          fromStage: 'raw',
+          toStage: 'metadata',
+          itemId: row?.no_metadata_id,
+          destItemId: row?.with_metadata_id,
+          title: row?.title || null,
+        });
+      });
       const promotedProcessed = Number(promoted?.processed || 0);
       const promotedPromoted = Number(promoted?.promoted || 0);
       const promotedQueued = Number(promoted?.queued || 0);
@@ -1106,6 +1158,21 @@ export function createApp({ broadcast } = {}) {
         .map((result) => result.reason?.message || String(result.reason || 'unknown error'));
       const downloads = aggregateDownloadPayloads(payloads);
       downloads.errors.push(...rejected);
+      payloads.forEach((payload) => {
+        const rows = Array.isArray(payload?.results) ? payload.results : [];
+        rows.forEach((row) => {
+          if (String(row?.action || '') !== 'downloaded') return;
+          emitPromotionEvent({
+            corpusId,
+            transition: 'metadata_to_downloaded',
+            fromStage: 'metadata',
+            toStage: 'downloaded',
+            itemId: row?.with_metadata_id ?? row?.queue_id,
+            destItemId: row?.downloaded_id,
+            title: row?.title || null,
+          });
+        });
+      });
 
       if (
         downloads.processed > 0 ||
@@ -1974,6 +2041,20 @@ export function createApp({ broadcast } = {}) {
     applyUploadedDocsExpansionArgs(args, expansion);
     try {
       const payload = await runPythonJson(INGEST_PROCESS_MARKED_SCRIPT, args, { dbPath, corpusId: req.corpusId });
+      const rows = Array.isArray(payload?.results) ? payload.results : [];
+      rows.forEach((row) => {
+        const action = String(row?.action || '');
+        if (action !== 'queued' && action !== 'enqueue_skipped') return;
+        emitPromotionEvent({
+          corpusId: req.corpusId,
+          transition: 'raw_to_metadata',
+          fromStage: 'raw',
+          toStage: 'metadata',
+          itemId: row?.no_metadata_id,
+          destItemId: row?.with_metadata_id,
+          title: row?.title || null,
+        });
+      });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/ingest/process-marked] Error:', error);
@@ -2238,6 +2319,19 @@ export function createApp({ broadcast } = {}) {
       const { child, done } = spawnDownloadOnce({ corpusId: req.corpusId, batchSize });
       state.child = child;
       const payload = await done;
+      const resultRows = Array.isArray(payload?.results) ? payload.results : [];
+      resultRows.forEach((row) => {
+        if (String(row?.action || '') !== 'downloaded') return;
+        emitPromotionEvent({
+          corpusId: req.corpusId,
+          transition: 'metadata_to_downloaded',
+          fromStage: 'metadata',
+          toStage: 'downloaded',
+          itemId: row?.with_metadata_id ?? row?.queue_id,
+          destItemId: row?.downloaded_id,
+          title: row?.title || null,
+        });
+      });
       state.lastResult = payload;
       send(
         `[download-worker] done processed=${payload.processed} downloaded=${payload.downloaded} failed=${payload.failed} skipped=${payload.skipped}`

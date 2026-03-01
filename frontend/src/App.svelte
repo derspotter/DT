@@ -124,6 +124,18 @@
     ...downloadedItems.map((item) => ({ bucket: 'downloaded', item })),
   ]
   $: selectedCorpusRow = corpusSelectionRows.find((row) => corpusItemKey(row.item, row.bucket) === selectedCorpusItemKey) || null
+  let corpusRowElements = {
+    raw: new Map(),
+    metadata: new Map(),
+    downloaded: new Map(),
+  }
+  let pendingPromotionEvents = []
+  let promotionAnimationInFlight = false
+  let promotionFlushTimer = null
+  let promotionHighlights = new Set()
+  let promotionHighlightVersion = 0
+  let prefersReducedMotion = false
+  let reducedMotionMediaQuery = null
 
   let downloads = []
   let downloadsSource = ''
@@ -293,6 +305,172 @@
     const status = String(item.status || '')
     const title = String(item.title || '').trim().toLowerCase()
     return `${bucket || 'unknown'}|${status}|${id}|${title}`
+  }
+
+  function corpusMotionKey(stage, id) {
+    if (!stage) return ''
+    const numericId = Number(id)
+    if (!Number.isFinite(numericId)) return ''
+    return `${stage}:${numericId}`
+  }
+
+  function isPromotionHighlighted(stage, id) {
+    promotionHighlightVersion
+    const key = corpusMotionKey(stage, id)
+    return key ? promotionHighlights.has(key) : false
+  }
+
+  function addPromotionHighlight(stage, id, ttlMs = 700) {
+    const key = corpusMotionKey(stage, id)
+    if (!key) return
+    promotionHighlights.add(key)
+    promotionHighlights = new Set(promotionHighlights)
+    promotionHighlightVersion += 1
+    window.setTimeout(() => {
+      if (!promotionHighlights.has(key)) return
+      promotionHighlights.delete(key)
+      promotionHighlights = new Set(promotionHighlights)
+      promotionHighlightVersion += 1
+    }, ttlMs)
+  }
+
+  function stageFromTransitionSide(value) {
+    const v = String(value || '').trim().toLowerCase()
+    if (v === 'raw' || v === 'metadata' || v === 'downloaded') return v
+    return ''
+  }
+
+  function parsePromotionEventMessage(raw) {
+    if (typeof raw !== 'string' || !raw.startsWith('{')) return null
+    try {
+      const parsed = JSON.parse(raw)
+      if (!parsed || parsed.kind !== 'promotion') return null
+      const fromStage = stageFromTransitionSide(parsed.from_stage)
+      const toStage = stageFromTransitionSide(parsed.to_stage)
+      const itemId = Number(parsed.item_id)
+      const destItemId = Number(parsed.dest_item_id)
+      if (!fromStage || !toStage || !Number.isFinite(itemId)) return null
+      return {
+        corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
+        transition: String(parsed.transition || ''),
+        fromStage,
+        toStage,
+        itemId,
+        destItemId: Number.isFinite(destItemId) ? destItemId : null,
+      }
+    } catch (error) {
+      return null
+    }
+  }
+
+  function bindCorpusRow(node, params) {
+    let currentStage = ''
+    let currentKey = ''
+    const apply = (next) => {
+      const stage = stageFromTransitionSide(next?.stage)
+      const key = String(next?.key || '')
+      if (currentStage && currentKey && corpusRowElements[currentStage]) {
+        corpusRowElements[currentStage].delete(currentKey)
+      }
+      currentStage = stage
+      currentKey = key
+      if (currentStage && currentKey && corpusRowElements[currentStage]) {
+        corpusRowElements[currentStage].set(currentKey, node)
+      }
+    }
+    apply(params)
+    return {
+      update(next) {
+        apply(next)
+      },
+      destroy() {
+        if (currentStage && currentKey && corpusRowElements[currentStage]) {
+          corpusRowElements[currentStage].delete(currentKey)
+        }
+      },
+    }
+  }
+
+  function queuePromotionAnimation(eventPayload) {
+    if (activeTab !== 'corpus') return
+    if (eventPayload?.corpusId !== null && Number(currentCorpusId) !== Number(eventPayload.corpusId)) return
+    const sourceKey = corpusMotionKey(eventPayload.fromStage, eventPayload.itemId)
+    const sourceEl = sourceKey ? corpusRowElements[eventPayload.fromStage]?.get(sourceKey) : null
+    const sourceRect = sourceEl ? sourceEl.getBoundingClientRect() : null
+    pendingPromotionEvents = [...pendingPromotionEvents, { ...eventPayload, sourceRect }]
+    if (pendingPromotionEvents.length > 200) {
+      pendingPromotionEvents = pendingPromotionEvents.slice(-200)
+    }
+    if (promotionFlushTimer || promotionAnimationInFlight) return
+    promotionFlushTimer = window.setTimeout(() => {
+      promotionFlushTimer = null
+      flushPromotionAnimations()
+    }, 110)
+  }
+
+  function waitForNextFrame() {
+    return new Promise((resolve) => {
+      requestAnimationFrame(() => resolve())
+    })
+  }
+
+  async function playPromotionAnimation(eventPayload) {
+    const destinationId = eventPayload.destItemId
+    if (!Number.isFinite(destinationId)) return
+    const destinationKey = corpusMotionKey(eventPayload.toStage, destinationId)
+    const destinationEl = destinationKey ? corpusRowElements[eventPayload.toStage]?.get(destinationKey) : null
+    if (!destinationEl) {
+      addPromotionHighlight(eventPayload.toStage, destinationId)
+      return
+    }
+
+    if (prefersReducedMotion || !eventPayload.sourceRect) {
+      addPromotionHighlight(eventPayload.toStage, destinationId)
+      return
+    }
+
+    const destinationRect = destinationEl.getBoundingClientRect()
+    const dx = eventPayload.sourceRect.left - destinationRect.left
+    const dy = eventPayload.sourceRect.top - destinationRect.top
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+      addPromotionHighlight(eventPayload.toStage, destinationId)
+      return
+    }
+
+    destinationEl.style.setProperty('--promotion-dx', `${dx}px`)
+    destinationEl.style.setProperty('--promotion-dy', `${dy}px`)
+    destinationEl.classList.add('promotion-slide')
+    await waitForNextFrame()
+    await new Promise((resolve) => setTimeout(resolve, 440))
+    destinationEl.classList.remove('promotion-slide')
+    destinationEl.style.removeProperty('--promotion-dx')
+    destinationEl.style.removeProperty('--promotion-dy')
+    addPromotionHighlight(eventPayload.toStage, destinationId)
+  }
+
+  async function flushPromotionAnimations() {
+    if (promotionAnimationInFlight) return
+    if (activeTab !== 'corpus') return
+    if (pendingPromotionEvents.length === 0) return
+    promotionAnimationInFlight = true
+    try {
+      const batch = pendingPromotionEvents
+      pendingPromotionEvents = []
+      await loadCorpus({ preserveSelection: true, quiet: true })
+      await tick()
+      await waitForNextFrame()
+      for (const eventPayload of batch) {
+        await playPromotionAnimation(eventPayload)
+      }
+    } finally {
+      promotionAnimationInFlight = false
+      if (pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
+        promotionFlushTimer = window.setTimeout(() => {
+          promotionFlushTimer = null
+          flushPromotionAnimations()
+        }, 110)
+      }
+    }
   }
 
   function isCorpusItemSelected(item, bucket) {
@@ -570,6 +748,8 @@
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || nextId
+      pendingPromotionEvents = []
+      promotionHighlights = new Set()
       await refreshAll()
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
@@ -590,6 +770,8 @@
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId
+      pendingPromotionEvents = []
+      promotionHighlights = new Set()
       await refreshAll()
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
@@ -759,8 +941,9 @@
     }
   }
 
-  function handleFiles(event) {
+  async function handleFiles(event) {
     const files = Array.from(event.target.files || [])
+    if (files.length === 0) return
     const newItems = files.map((file) => ({
       id: `${file.name}-${file.size}-${Date.now()}`,
       file,
@@ -772,6 +955,9 @@
     }))
     uploads = [...uploads, ...newItems]
     event.target.value = ''
+    for (const item of newItems) {
+      await uploadItem(item)
+    }
   }
 
   async function uploadItem(item) {
@@ -793,14 +979,6 @@
       }
       updateUpload(item.id, { status: 'failed', message: error.message || 'Upload failed' })
       apiStatus = 'offline'
-    }
-  }
-
-  async function uploadAll() {
-    for (const item of uploads) {
-      if (item.status === 'ready') {
-        await uploadItem(item)
-      }
     }
   }
 
@@ -1334,8 +1512,14 @@
       }
       ws.onmessage = (event) => {
         if (logsSocket !== ws) return
+        const promotionEvent = parsePromotionEventMessage(event.data)
+        if (promotionEvent) {
+          queuePromotionAnimation(promotionEvent)
+          return
+        }
         if (logsType !== 'pipeline') return
         const line = event.data
+        if (typeof line === 'string' && line.startsWith('{')) return
         if (typeof line === 'string' && line.startsWith('WebSocket connection established')) return
         if (!isLogLineForCurrentCorpus(line)) return
         const hadLines = logs.length > 0
@@ -2029,18 +2213,29 @@
     const safeTab = tabIds.has(tabId) ? tabId : 'dashboard'
     activeTab = safeTab
     updateHash(safeTab, replace)
+    if (safeTab === 'corpus' && pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
+      promotionFlushTimer = window.setTimeout(() => {
+        promotionFlushTimer = null
+        flushPromotionAnimations()
+      }, 80)
+    }
     refreshForActiveTab(safeTab)
   }
 
   onMount(() => {
     const initialTab = readTabFromHash() || activeTab
     setActiveTab(initialTab, { replace: true })
+    reducedMotionMediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
+    prefersReducedMotion = Boolean(reducedMotionMediaQuery?.matches)
+    const onReducedMotionChange = (event) => {
+      prefersReducedMotion = Boolean(event?.matches)
+    }
+    reducedMotionMediaQuery?.addEventListener?.('change', onReducedMotionChange)
 
     const onHashChange = () => {
       const tab = readTabFromHash()
       if (tab && tab !== activeTab) {
-        activeTab = tab
-        refreshForActiveTab(tab)
+        setActiveTab(tab, { replace: true })
       }
     }
     window.addEventListener('hashchange', onHashChange)
@@ -2065,6 +2260,8 @@
       window.removeEventListener('hashchange', onHashChange)
       window.removeEventListener('focus', onFocusOrVisible)
       document.removeEventListener('visibilitychange', onFocusOrVisible)
+      reducedMotionMediaQuery?.removeEventListener?.('change', onReducedMotionChange)
+      reducedMotionMediaQuery = null
       disconnectLogs()
       if (pipelineRefreshTimer) {
         clearTimeout(pipelineRefreshTimer)
@@ -2073,6 +2270,10 @@
       if (liveRefreshIntervalId) {
         clearInterval(liveRefreshIntervalId)
         liveRefreshIntervalId = null
+      }
+      if (promotionFlushTimer) {
+        clearTimeout(promotionFlushTimer)
+        promotionFlushTimer = null
       }
     }
   })
@@ -2284,9 +2485,8 @@
           <div class="uploader">
             <label class="upload-drop">
               <input type="file" multiple accept=".pdf" on:change={handleFiles} />
-              <span>Drop PDFs or click to add files</span>
+              <span>Drop PDFs or click to add files (uploads start automatically)</span>
             </label>
-            <button class="primary" type="button" on:click={uploadAll}>Upload selected</button>
           </div>
           <div class="upload-list">
             {#if uploads.length === 0}
@@ -2300,9 +2500,6 @@
                   </div>
                   <div class="upload-actions">
                     <span class={`status ${item.status}`}>{item.status}</span>
-                    <button type="button" on:click={() => uploadItem(item)} disabled={item.status !== 'ready'}>
-                      Upload
-                    </button>
                     <button
                       type="button"
                       on:click={() => extractForItem(item)}
@@ -2707,7 +2904,9 @@
                 {#each rawItems as item}
                   <button
                     class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'raw') ? 'selected' : ''}`}
+                    class:promotion-target-flash={isPromotionHighlighted('raw', item.id)}
                     type="button"
+                    use:bindCorpusRow={{ stage: 'raw', key: corpusMotionKey('raw', item.id) }}
                     on:click={() => toggleCorpusItemSelection(item, 'raw')}
                   >
                     <span class="line-clamp-2" title={item.title}>{item.title}</span>
@@ -2727,7 +2926,9 @@
                 {#each metaItems as item}
                   <button
                     class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'metadata') ? 'selected' : ''}`}
+                    class:promotion-target-flash={isPromotionHighlighted('metadata', item.id)}
                     type="button"
+                    use:bindCorpusRow={{ stage: 'metadata', key: corpusMotionKey('metadata', item.id) }}
                     on:click={() => toggleCorpusItemSelection(item, 'metadata')}
                   >
                     <span class="line-clamp-2" title={item.title}>{item.title}</span>
@@ -2747,7 +2948,9 @@
                 {#each downloadedItems as item}
                   <button
                     class={`table-row cols-corpus-mini corpus-select-row ${isCorpusItemSelected(item, 'downloaded') ? 'selected' : ''}`}
+                    class:promotion-target-flash={isPromotionHighlighted('downloaded', item.id)}
                     type="button"
+                    use:bindCorpusRow={{ stage: 'downloaded', key: corpusMotionKey('downloaded', item.id) }}
                     on:click={() => toggleCorpusItemSelection(item, 'downloaded')}
                   >
                     <span class="line-clamp-2" title={item.title}>{item.title}</span>

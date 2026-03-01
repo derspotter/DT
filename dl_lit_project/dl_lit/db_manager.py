@@ -1776,6 +1776,23 @@ class DatabaseManager:
                         ),
                     )
 
+            # Preserve corpus membership when collapsing duplicates across stages.
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'corpus_items' LIMIT 1"
+            )
+            if cur.fetchone():
+                cur.execute(
+                    """INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
+                       SELECT corpus_id, ?, ?
+                         FROM corpus_items
+                        WHERE table_name = ? AND row_id = ?""",
+                    (canonical_table, canonical_id, duplicate_table, duplicate_id),
+                )
+                cur.execute(
+                    "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
+                    (duplicate_table, duplicate_id),
+                )
+
             # Delete duplicate row
             cur.execute(f"DELETE FROM {duplicate_table} WHERE id = ?", (duplicate_id,))
 

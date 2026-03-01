@@ -141,9 +141,31 @@ def main() -> None:
                         checksum = hashlib.sha256(fh.read()).hexdigest()
                 except Exception:
                     pass
-                db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
+                downloaded_id, move_error = db.move_entry_to_downloaded(
+                    qid,
+                    result,
+                    fp,
+                    checksum,
+                    result.get("download_source", "unknown"),
+                )
+                if move_error or not downloaded_id:
+                    db.move_queue_entry_to_failed(qid, f"move_to_downloaded_failed: {move_error or 'unknown'}")
+                    failed += 1
+                    results.append({"queue_id": qid, "action": "failed", "error": move_error or "move_to_downloaded_failed"})
+                    print(f"[DOWNLOAD] failed move_to_downloaded: {move_error or 'unknown'}", flush=True)
+                    continue
                 downloaded += 1
-                results.append({"queue_id": qid, "action": "downloaded", "file_path": fp, "source": result.get("download_source")})
+                results.append(
+                    {
+                        "queue_id": qid,
+                        "with_metadata_id": qid,
+                        "downloaded_id": int(downloaded_id),
+                        "title": row.get("title"),
+                        "action": "downloaded",
+                        "file_path": fp,
+                        "source": result.get("download_source"),
+                    }
+                )
                 print(f"[DOWNLOAD] ok source={result.get('download_source', '?')}", flush=True)
             else:
                 db.move_queue_entry_to_failed(qid, "download_failed")
