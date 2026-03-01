@@ -950,9 +950,24 @@
     enqueueStatus = `Marking ${ids.length} entries for enrichment...`
     try {
       const payload = await enqueueIngestEntries(ids)
-      enqueueStatus = `Marked ${payload.marked} (staged: ${payload.staged}, already processed: ${payload.already_processed}, duplicates: ${payload.duplicates}).`
+      enqueueStatus = `Marked ${payload.marked} (staged: ${payload.staged}, already processed: ${payload.already_processed}, duplicates: ${payload.duplicates}). Starting enrichment...`
       await loadDownloads()
       await loadIngestStats()
+      
+      // Automatically trigger enrichment after marking
+      if (payload.marked > 0 || payload.staged > 0) {
+        // Set limit to match what was just marked, or default to a reasonable batch size
+        processMarkedLimit = Math.max(10, payload.marked + payload.staged)
+        await processMarkedBatch()
+        
+        // Also ensure the global pipeline worker is running so downloads actually happen
+        if (!pipelineWorker.running) {
+          enqueueStatus += ' Starting background downloader...'
+          await handleStartPipelineWorker()
+        }
+      } else {
+        enqueueStatus += ' No new entries to enrich.'
+      }
     } catch (error) {
       let message = error?.message || 'Failed to enqueue entries.'
       try {
@@ -1555,10 +1570,10 @@
           ? `${window.location.protocol}//${window.location.hostname}:4000`
           : window.location.origin
       const rawBase = envBase || devBackendBase
-      let wsUrl = 'ws://localhost:4000'
+      let wsUrl = 'ws://localhost:4000/api/ws'
       try {
         const u = new URL(rawBase, window.location.origin)
-        wsUrl = `${u.protocol === 'https:' ? 'wss' : 'ws'}://${u.host}`
+        wsUrl = `${u.protocol === 'https:' ? 'wss' : 'ws'}://${u.host}/api/ws`
       } catch (error) {
         // fall back to localhost default
       }
@@ -2439,7 +2454,7 @@
 
       {#if activeTab === 'ingest'}
         <div class="card" data-testid="ingest-panel">
-          <h2>Seed ingestion</h2>
+          <h2>Seed document</h2>
           <p>Upload PDFs, extract bibliographies, and select entries for further processing.</p>
           <div class="uploader">
             <label class="upload-drop">
@@ -2530,20 +2545,13 @@
               </div>
               <div class="table-toolbar-right">
                 <div class="toolbar-actions">
-                  <label class="inline-field">
-                    <span class="muted">Batch</span>
-                    <input type="number" min="1" max="200" step="1" bind:value={processMarkedLimit} />
-                  </label>
-                  <button class="secondary" type="button" on:click={processMarkedBatch} disabled={processingMarked}>
-                    Enrich + prepare download
-                  </button>
                   <button
                     class="primary"
                     type="button"
                     on:click={enqueueSelectedLatest}
-                    disabled={latestSelection.length === 0}
+                    disabled={latestSelection.length === 0 || processingMarked}
                   >
-                    Mark selected
+                    {processingMarked ? 'Processing...' : 'Enrich Selected'}
                   </button>
                 </div>
               </div>

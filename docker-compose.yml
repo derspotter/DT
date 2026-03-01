@@ -9,7 +9,7 @@ services:
       - "4000:4000"
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
-      - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175
+      - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175,https://genkia.de
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - RAG_FEEDER_JWT_SECRET=${RAG_FEEDER_JWT_SECRET}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}

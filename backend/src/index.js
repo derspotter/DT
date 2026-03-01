@@ -107,7 +107,7 @@ const server = app.listen(port, () => {
   console.log(`HTTP server listening on port ${port}`);
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, path: '/api/ws' });
 
 wss.on('connection', (ws) => {
   console.log('Client connected via WebSocket');
