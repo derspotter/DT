@@ -14,7 +14,7 @@ Replace the Node.js `setInterval` orchestration with a single, persistent Python
 
 ---
 
-## Phase 1: Database Job Queue Integration
+## Phase 1: Database Job Queue Integration (COMPLETED)
 Communicate between Node.js and the Python Daemon using a "Jobs" table in SQLite.
 1. **Schema Update:** Create a `pipeline_jobs` table to track job types (`enrich`, `download`, `keyword_search`), statuses (`pending`, `running`, `completed`, `failed`), progress, and `corpus_id`.
 2. **Node.js Update:** Refactor API endpoints (`/api/ingest/process-marked`, `/api/downloads/worker/start`, etc.) to insert rows into `pipeline_jobs` instead of spawning Python scripts.
