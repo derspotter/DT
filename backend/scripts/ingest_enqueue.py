@@ -125,12 +125,18 @@ def main():
 
         if tbl == "no_metadata" and eid is not None:
             _mark_selected(db, int(eid), selected=1)
+            # Mark the ingest_entry as processed so it hides from the UI
+            cur.execute("UPDATE ingest_entries SET processed = 1 WHERE id = ?", (ingest_id,))
+            db.conn.commit()
             marked += 1
             results.append({"ingest_entry_id": ingest_id, "action": "marked", "no_metadata_id": int(eid)})
             continue
 
         if tbl in ("with_metadata", "to_download_references", "downloaded_references") and eid is not None:
             # Do not skip stages: these are already past raw. We just report.
+            # However, mark it as processed so it hides from the UI as well.
+            cur.execute("UPDATE ingest_entries SET processed = 1 WHERE id = ?", (ingest_id,))
+            db.conn.commit()
             already_processed += 1
             results.append(
                 {
@@ -148,6 +154,9 @@ def main():
         if no_meta_id:
             staged += 1
             _mark_selected(db, int(no_meta_id), selected=1)
+            # Mark as processed
+            cur.execute("UPDATE ingest_entries SET processed = 1 WHERE id = ?", (ingest_id,))
+            db.conn.commit()
             marked += 1
             results.append({"ingest_entry_id": ingest_id, "action": "staged_and_marked", "no_metadata_id": int(no_meta_id)})
         else:

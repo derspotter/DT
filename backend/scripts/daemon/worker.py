@@ -33,7 +33,19 @@ from reference_expansion import (
 )
 
 def log(msg: str):
-    print(f"[{datetime.now().isoformat()}] [DAEMON] {msg}", flush=True)
+    timestamp = datetime.now().isoformat()
+    formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
+    print(formatted_msg, flush=True)
+    
+    # Also append to the same pipeline log file that Node.js uses, so the UI can read it
+    log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
+    log_file = os.path.join(log_dir, "backend-pipeline.log")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(formatted_msg + "\n")
+    except Exception as e:
+        print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 
 class PipelineDaemon:
     def __init__(self, db_path: str):
@@ -245,6 +257,48 @@ class PipelineDaemon:
 
         return {"processed": processed, "promoted": promoted, "queued": queued, "failed": failed, "errors": errors, "results": results}
 
+    def _download_single(self, row):
+        qid = int(row["id"])
+        authors_raw = row.get("authors")
+        authors = []
+        if isinstance(authors_raw, str):
+            try: authors = json.loads(authors_raw)
+            except: authors = [authors_raw]
+        elif isinstance(authors_raw, list):
+            authors = authors_raw
+
+        dup_table, dup_id, dup_field = self.db.check_if_exists(
+            doi=row.get("doi"), openalex_id=row.get("openalex_id"), title=row.get("title"),
+            authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="with_metadata"
+        )
+        if dup_table == "downloaded_references" and dup_id is not None:
+            ok, msg = self.db.drop_queue_entry_as_duplicate(qid, dup_table, dup_id, dup_field)
+            return "skipped", {"queue_id": qid, "action": "dropped_duplicate"}
+
+        ref = {"title": row.get("title"), "authors": authors, "doi": row.get("doi"), "type": row.get("entry_type"), "year": row.get("year")}
+        
+        try:
+            result = self.enhancer.enhance_bibliography(ref, self.download_dir)
+        except Exception as exc:
+            return "error", str(exc)
+
+        if result and result.get("downloaded_file"):
+            fp = str(result["downloaded_file"])
+            checksum = ""
+            try:
+                with open(fp, "rb") as fh: checksum = hashlib.sha256(fh.read()).hexdigest()
+            except: pass
+            
+            downloaded_id, move_error = self.db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
+            if move_error or not downloaded_id:
+                self.db.move_queue_entry_to_failed(qid, "move_to_downloaded_failed")
+                return "failed", {"queue_id": qid, "action": "failed"}
+                
+            return "downloaded", {"queue_id": qid, "action": "downloaded", "downloaded_id": int(downloaded_id)}
+        else:
+            self.db.move_queue_entry_to_failed(qid, "download_failed")
+            return "failed", {"queue_id": qid, "action": "failed"}
+
     # --- DOWNLOAD LOGIC ---
     def do_download(self, corpus_id: int, limit: int):
         rows = self.db.claim_download_batch(limit=limit, corpus_id=corpus_id, claimed_by=self.worker_id, lease_seconds=900)
@@ -254,55 +308,31 @@ class PipelineDaemon:
         processed, downloaded, failed, skipped = 0, 0, 0, 0
         results, errors = [], []
 
-        for row in rows:
-            processed += 1
-            qid = int(row["id"])
-            authors_raw = row.get("authors")
-            authors = []
-            if isinstance(authors_raw, str):
-                try: authors = json.loads(authors_raw)
-                except: authors = [authors_raw]
-            elif isinstance(authors_raw, list):
-                authors = authors_raw
-
-            dup_table, dup_id, dup_field = self.db.check_if_exists(
-                doi=row.get("doi"), openalex_id=row.get("openalex_id"), title=row.get("title"),
-                authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="with_metadata"
-            )
-            if dup_table == "downloaded_references" and dup_id is not None:
-                ok, msg = self.db.drop_queue_entry_as_duplicate(qid, dup_table, dup_id, dup_field)
-                skipped += 1
-                results.append({"queue_id": qid, "action": "dropped_duplicate"})
-                continue
-
-            ref = {"title": row.get("title"), "authors": authors, "doi": row.get("doi"), "type": row.get("entry_type"), "year": row.get("year")}
-            
-            try:
-                result = self.enhancer.enhance_bibliography(ref, self.download_dir)
-            except Exception as exc:
-                result = None
-                errors.append(str(exc))
-
-            if result and result.get("downloaded_file"):
-                fp = str(result["downloaded_file"])
-                checksum = ""
+        # Download multiple files concurrently. Be careful not to overwhelm the disk or rate limiters.
+        # Max out at min(limit, 16) parallel downloads
+        max_download_workers = min(len(rows), 16)
+        
+        with ThreadPoolExecutor(max_workers=max_download_workers) as executor:
+            futures = {executor.submit(self._download_single, row): row for row in rows}
+            for future in as_completed(futures):
+                processed += 1
                 try:
-                    with open(fp, "rb") as fh: checksum = hashlib.sha256(fh.read()).hexdigest()
-                except: pass
-                
-                downloaded_id, move_error = self.db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
-                if move_error or not downloaded_id:
-                    self.db.move_queue_entry_to_failed(qid, "move_to_downloaded_failed")
+                    status, data = future.result()
+                    if status == "skipped":
+                        skipped += 1
+                        results.append(data)
+                    elif status == "downloaded":
+                        downloaded += 1
+                        results.append(data)
+                    elif status == "failed":
+                        failed += 1
+                        results.append(data)
+                    elif status == "error":
+                        failed += 1
+                        errors.append(data)
+                except Exception as exc:
                     failed += 1
-                    results.append({"queue_id": qid, "action": "failed"})
-                    continue
-                    
-                downloaded += 1
-                results.append({"queue_id": qid, "action": "downloaded", "downloaded_id": int(downloaded_id)})
-            else:
-                self.db.move_queue_entry_to_failed(qid, "download_failed")
-                failed += 1
-                results.append({"queue_id": qid, "action": "failed"})
+                    errors.append(str(exc))
 
         return {"processed": processed, "downloaded": downloaded, "failed": failed, "skipped": skipped, "errors": errors, "results": results}
 

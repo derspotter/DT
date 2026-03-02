@@ -861,7 +861,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const corpusTag = corpusId || 'none';
     
     try {
-      mainDb.prepare(
+      authDb.prepare(
         "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
       ).run(corpusId, 'download', JSON.stringify({ batchSize }));
     } catch (error) {
@@ -919,6 +919,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       return 0;
     }
+  }
+
+  function resolveAutoDownloadBatchSize(corpusId) {
+    const queued = countQueuedDownloads(corpusId);
+    const minBatch = 25;
+    const maxBatch = Math.max(minBatch, coerceInt(process.env.RAG_FEEDER_DOWNLOAD_BATCH_MAX, 200) || 200);
+    if (queued <= 0) return minBatch;
+    return Math.max(minBatch, Math.min(maxBatch, queued));
   }
 
   function resolveDownloadWorkerCount({ corpusId, requestedWorkers = 0, batchSize = 3 }) {
@@ -991,7 +999,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     state.lastError = null;
     
     try {
-      mainDb.prepare(
+      authDb.prepare(
         "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
       ).run(corpusId, 'pipeline_tick', JSON.stringify({ config: state.config }));
     } catch (error) {
@@ -1817,7 +1825,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         shouldFetchReferences: expansion.includeDownstream
       };
 
-      const result = mainDb.prepare(
+      const result = authDb.prepare(
         "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
       ).run(req.corpusId, 'enrich', JSON.stringify(jobParams));
 
@@ -2015,17 +2023,19 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const batchSize = coerceInt(req.body?.batchSize, 3);
+    const batchSize = resolveAutoDownloadBatchSize(req.corpusId);
     
     try {
-      const result = mainDb.prepare(
+      const result = authDb.prepare(
         "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
       ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
 
       return res.json({ 
         running: true, 
         job_id: result.lastInsertRowid,
-        message: 'Download job queued successfully.'
+        batch_size: batchSize,
+        mode: 'auto',
+        message: 'Download job queued successfully (auto throughput mode).'
       });
     } catch (error) {
       console.error('[/api/downloads/worker/start] Error:', error);
@@ -2046,17 +2056,19 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const batchSize = coerceInt(req.body?.batchSize, 3);
+    const batchSize = resolveAutoDownloadBatchSize(req.corpusId);
     
     try {
-      const result = mainDb.prepare(
+      const result = authDb.prepare(
         "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
       ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
 
       return res.json({ 
         success: true, 
         job_id: result.lastInsertRowid,
-        message: 'Download job queued successfully.'
+        batch_size: batchSize,
+        mode: 'auto',
+        message: 'Download job queued successfully (auto throughput mode).'
       });
     } catch (error) {
       console.error('[/api/downloads/worker/run-once] Error:', error);

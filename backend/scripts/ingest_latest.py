@@ -34,7 +34,7 @@ def main():
     has_ingest_entries = cur.fetchone() is not None
 
     if has_ingest_entries:
-        conditions = []
+        conditions = ["processed = 0"]
         params = []
         if args.base_name:
             conditions.append("ingest_source = ?")

@@ -351,13 +351,13 @@ export async function fetchDownloadWorkerStatus() {
   return response.json()
 }
 
-export async function startDownloadWorker({ intervalSeconds = 60, batchSize = 3 } = {}) {
+export async function startDownloadWorker() {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/downloads/worker/start`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ intervalSeconds, batchSize }),
+      body: JSON.stringify({}),
     },
     PIPELINE_TIMEOUT
   )
@@ -387,13 +387,13 @@ export async function stopDownloadWorker({ force = false } = {}) {
   return response.json()
 }
 
-export async function runDownloadWorkerOnce({ batchSize = 3 } = {}) {
+export async function runDownloadWorkerOnce() {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/downloads/worker/run-once`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batchSize }),
+      body: JSON.stringify({}),
     },
     PIPELINE_TIMEOUT
   )

@@ -89,6 +89,7 @@
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
+  $: isWaitingLatestEntries = latestEntriesStatus.startsWith('Checking for extracted entries')
   let latestEntriesBase = ''
   let latestSelection = []
   let allLatestSelected = false
@@ -182,8 +183,6 @@
     config: { intervalSeconds: 60, batchSize: 3 },
   }
   let downloadWorkerStatus = ''
-  let downloadWorkerIntervalSeconds = 60
-  let downloadWorkerBatchSize = 3
   let downloadWorkerBusy = false
   let pipelineWorker = {
     running: false,
@@ -872,7 +871,7 @@
 
   async function loadLatestEntries(baseName) {
     latestEntriesBase = baseName
-    latestEntriesStatus = 'Waiting for extracted entries...'
+    latestEntriesStatus = 'Checking for extracted entries...'
     latestEntries = []
     latestSelection = []
     // Extraction + parsing can easily take a couple of minutes for multi-page reference sections.
@@ -894,10 +893,10 @@
         }
         // Keep waiting; extraction can take time.
       }
-      latestEntriesStatus = `Waiting for extracted entries... (${i + 1}/${attempts})`
+      latestEntriesStatus = `Checking for extracted entries... (${i + 1}/${attempts})`
       await sleep(5000)
     }
-    latestEntriesStatus = 'No entries found yet.'
+    latestEntriesStatus = ''
   }
   function latestSelectionKey(entry, index = -1) {
     const primaryId = entry?.id ?? entry?.entry_id
@@ -1000,7 +999,7 @@
         relatedDepthUpstream,
         maxRelated,
       })
-      processMarkedStatus = `Processed ${payload.processed} (promoted: ${payload.promoted}, ready for download: ${payload.queued}, failed: ${payload.failed}).`
+      processMarkedStatus = payload.message || 'Enrichment job queued. Check Pipeline Status for progress.'
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -1090,7 +1089,7 @@
     try {
       const payload = await fetchIngestRuns(20)
       ingestRuns = payload.runs || []
-      ingestRunsStatus = ingestRuns.length ? `Loaded ${ingestRuns.length} runs.` : 'No ingest runs found.'
+      ingestRunsStatus = ''
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1105,7 +1104,7 @@
     try {
       const payload = await fetchIngestStats()
       ingestStats = payload.stats || ingestStats
-      if (!quiet) ingestStatsStatus = 'Loaded ingest stats.'
+      if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) {
@@ -1241,8 +1240,6 @@
     try {
       const payload = await fetchDownloadWorkerStatus()
       downloadWorker = payload
-      downloadWorkerIntervalSeconds = payload?.config?.intervalSeconds ?? downloadWorkerIntervalSeconds
-      downloadWorkerBatchSize = payload?.config?.batchSize ?? downloadWorkerBatchSize
       if (!quiet) downloadWorkerStatus = ''
     } catch (error) {
       if (error?.status === 401) {
@@ -1347,12 +1344,9 @@
     downloadWorkerBusy = true
     downloadWorkerStatus = 'Starting worker...'
     try {
-      await startDownloadWorker({
-        intervalSeconds: Number(downloadWorkerIntervalSeconds) || 60,
-        batchSize: Number(downloadWorkerBatchSize) || 3,
-      })
+      await startDownloadWorker()
       await loadDownloadWorkerStatus()
-      downloadWorkerStatus = 'Worker started.'
+      downloadWorkerStatus = 'Worker started (auto throughput mode).'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1390,10 +1384,10 @@
     downloadWorkerBusy = true
     downloadWorkerStatus = 'Running one batch...'
     try {
-      await runDownloadWorkerOnce({ batchSize: Number(downloadWorkerBatchSize) || 3 })
+      await runDownloadWorkerOnce()
       await loadDownloadWorkerStatus()
       await loadDownloads()
-      downloadWorkerStatus = 'Batch completed.'
+      downloadWorkerStatus = 'Batch completed (auto throughput mode).'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -2490,14 +2484,18 @@
 
         <div class="card">
           <h3>Extracted entries</h3>
-          <p class="muted">{latestEntriesStatus}</p>
+          {#if latestEntriesStatus}
+            <p class="muted">{latestEntriesStatus}</p>
+          {/if}
           {#if latestEntriesBase}
             <p class="muted">Source: {latestEntriesBase}</p>
           {/if}
           <div class="split">
             <button class="secondary" type="button" on:click={loadIngestStats}>Refresh stats</button>
             <button class="secondary" type="button" on:click={loadIngestRuns}>Refresh runs</button>
-            <span class="muted">{ingestStatsStatus}</span>
+            {#if ingestStatsStatus}
+              <span class="muted">{ingestStatsStatus}</span>
+            {/if}
           </div>
           <div class="pill-row">
             <span class="pill">Raw: {pipelineRawCount}</span>
@@ -2505,7 +2503,9 @@
             <span class="pill">Downloaded: {pipelineDownloadedCount}</span>
           </div>
           <div class="split">
-            <span class="muted">{ingestRunsStatus}</span>
+            {#if ingestRunsStatus}
+              <span class="muted">{ingestRunsStatus}</span>
+            {/if}
           </div>
           {#if ingestRuns.length > 0}
             <div class="table">
@@ -2534,8 +2534,8 @@
               {/each}
             </div>
           {/if}
-          {#if latestEntries.length === 0}
-            <p class="muted">No extracted entries yet.</p>
+          {#if latestEntries.length === 0 && !isWaitingLatestEntries}
+            <p class="muted">{latestEntriesBase ? 'No extracted entries found for this source yet.' : 'Upload a PDF and run Extract to view entries.'}</p>
           {:else}
             <div class="table-toolbar">
               <div class="table-toolbar-left">
@@ -2875,15 +2875,6 @@
                 {/if}
               </div>
               <div class="worker-card__actions">
-                <label class="inline-field">
-                  <span class="muted">Every</span>
-                  <input type="number" min="10" step="10" bind:value={downloadWorkerIntervalSeconds} />
-                  <span class="muted">s</span>
-                </label>
-                <label class="inline-field">
-                  <span class="muted">Batch</span>
-                  <input type="number" min="1" max="25" step="1" bind:value={downloadWorkerBatchSize} />
-                </label>
                 <button class="secondary" type="button" on:click={handleRunDownloadOnce} disabled={downloadWorkerBusy}>
                   Run once
                 </button>
@@ -2908,6 +2899,7 @@
             </div>
             <div class="worker-card__meta">
               <span class="muted">{downloadWorkerStatus}</span>
+              <span class="muted small">Throughput is auto-managed by the backend for maximum speed.</span>
               {#if pipelineWorker.running}
                 <span class="muted small">Download-only worker is disabled while global pipeline is running.</span>
               {/if}
