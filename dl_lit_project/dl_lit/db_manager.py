@@ -139,6 +139,7 @@ class DatabaseManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bibtex_key TEXT,
                 entry_type TEXT,
+                source_pdf TEXT,
                 title TEXT NOT NULL,
                 authors TEXT, -- JSON list of strings
                 editors TEXT, -- JSON list of strings for book/volume editors
@@ -570,6 +571,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_openalex ON search_results(openalex_id)")
         
         # Add indexes for title/author/year duplicate detection
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_source_pdf ON downloaded_references(source_pdf)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_title_year ON downloaded_references(normalized_title, year)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_authors ON downloaded_references(normalized_authors)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_title_year ON with_metadata(normalized_title, year)")
@@ -961,6 +963,7 @@ class DatabaseManager:
         columns = [col[1] for col in cursor.fetchall()]
 
         for col_name, col_type in [
+            ('source_pdf', 'TEXT'),
             ('ingest_source', 'TEXT'),
             ('run_id', 'INTEGER'),
             ('normalized_title', 'TEXT'),
@@ -2488,6 +2491,7 @@ class DatabaseManager:
             data_to_insert = {
                 'bibtex_key': enriched_metadata.get('bibtex_key', original_entry.get('bibtex_key')),
                 'entry_type': enriched_metadata.get('type', original_entry.get('entry_type')),
+                'source_pdf': original_entry.get('source_pdf'),
                 'title': enriched_metadata.get('title', original_entry.get('title')),
                 'authors': authors,
                 'year': enriched_metadata.get('publication_year', original_entry.get('year')),
