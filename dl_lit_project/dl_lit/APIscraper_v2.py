@@ -58,13 +58,17 @@ rate_limiter = get_global_rate_limiter()
 BIBLIOGRAPHY_PROMPT = (
     "Extract bibliography entries from the attached PDF page. "
     "Return JSON that matches the provided schema. "
+    "CRITICAL: You MUST extract the 'authors' for every entry if they exist in the text. "
+    "Look closely for names at the beginning of each citation. Never leave the 'authors' list empty if names are visible. "
     "If no entries are found, return an empty list."
 )
 
 INLINE_CITATION_PROMPT = (
     "Extract all cited works from this PDF chunk, including inline citations, footnotes, endnotes, "
     "and per-page references. Return JSON that matches the provided schema. "
-    "Include each cited work once if identifiable. If no citations are found, return an empty list."
+    "Include each cited work once if identifiable. "
+    "CRITICAL: You MUST extract the 'authors' for every cited work. Look closely for names before the year or title. "
+    "If no citations are found, return an empty list."
 )
 
 if BaseModel:

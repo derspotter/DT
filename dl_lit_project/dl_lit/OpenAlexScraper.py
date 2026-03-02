@@ -156,30 +156,30 @@ def fetch_referenced_work_details(
 ):
     """
     Fetches detailed metadata for a list of referenced work OpenAlex IDs.
-    Uses batch requests to efficiently get details for multiple works.
+    Uses concurrent batch requests to efficiently get details for multiple works.
     """
     if not referenced_work_ids:
         return []
 
-    referenced_works = []
-    
     # Process in batches of 50 (OpenAlex limit for pipe queries)
     batch_size = 50
+    batches = []
+    
     for i in range(0, len(referenced_work_ids), batch_size):
         batch = referenced_work_ids[i:i+batch_size]
-        
-        # Extract just the work IDs for the batch query
         work_ids = []
         for work_id in batch:
             if isinstance(work_id, str):
                 work_ids.append(work_id)
             elif isinstance(work_id, dict) and work_id.get('id'):
                 work_ids.append(work_id['id'])
-        
-        if not work_ids:
-            continue
-            
-        # Create pipe-separated query for batch request
+        if work_ids:
+            batches.append(work_ids)
+
+    if not batches:
+        return []
+
+    def _fetch_batch(work_ids):
         ids_query = "|".join(work_ids)
         select_fields = "id,title,display_name,authorships,publication_year,doi,type"
         if include_links:
@@ -195,8 +195,8 @@ def fetch_referenced_work_details(
             response.raise_for_status()
             data = response.json()
             
-            results = data.get("results", [])
-            for work in results:
+            batch_results = []
+            for work in data.get("results", []):
                 work_details = {
                     'openalex_id': work.get("id"),
                     'title': work.get("display_name"),
@@ -208,13 +208,25 @@ def fetch_referenced_work_details(
                 if include_links:
                     work_details['referenced_works'] = work.get("referenced_works") or []
                     work_details['cited_by_api_url'] = work.get("cited_by_api_url")
-                referenced_works.append(work_details)
-                
+                batch_results.append(work_details)
+            return batch_results
+            
         except requests.exceptions.RequestException as e:
             print(f"Error fetching referenced work details: {str(e)}")
+            return []
         except Exception as e:
             print(f"Unexpected error fetching referenced work details: {str(e)}")
+            return []
+
+    referenced_works = []
     
+    # We use ThreadPoolExecutor to run batches concurrently.
+    # Max workers clamped to 8 to avoid overwhelming the single rate limiter suddenly.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(batches), 8)) as executor:
+        futures = [executor.submit(_fetch_batch, batch) for batch in batches]
+        for future in concurrent.futures.as_completed(futures):
+            referenced_works.extend(future.result())
+            
     print(f"Fetched details for {len(referenced_works)} referenced works")
     return referenced_works
 
