@@ -125,7 +125,7 @@ def main():
 
         if tbl == "no_metadata" and eid is not None:
             _mark_selected(db, int(eid), selected=1)
-            # Mark the ingest_entry as processed so it hides from the UI
+            # Mark as processed so UI can show it as enriched/queued.
             cur.execute("UPDATE ingest_entries SET processed = 1 WHERE id = ?", (ingest_id,))
             db.conn.commit()
             marked += 1
@@ -134,7 +134,7 @@ def main():
 
         if tbl in ("with_metadata", "to_download_references", "downloaded_references") and eid is not None:
             # Do not skip stages: these are already past raw. We just report.
-            # However, mark it as processed so it hides from the UI as well.
+            # Also mark as processed so UI can show it as enriched.
             cur.execute("UPDATE ingest_entries SET processed = 1 WHERE id = ?", (ingest_id,))
             db.conn.commit()
             already_processed += 1

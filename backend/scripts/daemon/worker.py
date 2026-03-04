@@ -47,6 +47,21 @@ def log(msg: str):
     except Exception as e:
         print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 
+
+def parse_duplicate_merge_marker(message: str | None) -> dict | None:
+    """Parse DUPLICATE_MERGED marker emitted by db_manager promotion path."""
+    if not message or "DUPLICATE_MERGED|" not in message:
+        return None
+    marker_text = message.split("DUPLICATE_MERGED|", 1)[1]
+    marker_text = marker_text.rstrip("]").strip()
+    data: dict[str, str] = {}
+    for part in marker_text.split("|"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        data[key.strip()] = value.strip()
+    return data or None
+
 class PipelineDaemon:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -67,17 +82,46 @@ class PipelineDaemon:
         )
         self.running = True
         self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}"
+        self._requeue_running_jobs_on_startup()
         log(f"Initialized daemon worker {self.worker_id} at {db_path}")
 
+    def _requeue_running_jobs_on_startup(self):
+        """Requeue previously running jobs after daemon restarts."""
+        cur = self.db.conn.cursor()
+        cur.execute(
+            """
+            UPDATE pipeline_jobs
+            SET status = 'pending', started_at = NULL
+            WHERE status = 'running'
+            """
+        )
+        requeued = int(cur.rowcount or 0)
+        self.db.conn.commit()
+        if requeued:
+            log(f"Requeued {requeued} previously running pipeline job(s) on startup.")
+
     def fetch_next_job(self):
-        """Fetch the oldest pending job from the queue."""
+        """Fetch the next pending job from the queue with interactive-priority ordering."""
         cur = self.db.conn.cursor()
         cur.execute(
             """
             SELECT id, corpus_id, job_type, parameters_json
             FROM pipeline_jobs
             WHERE status = 'pending'
-            ORDER BY created_at ASC
+            ORDER BY
+                CASE
+                    WHEN job_type = 'enrich' AND corpus_id IS NOT NULL THEN 0
+                    WHEN job_type = 'enrich' THEN 1
+                    WHEN job_type = 'pipeline_tick' THEN 2
+                    WHEN job_type = 'download' AND corpus_id IS NOT NULL THEN 3
+                    WHEN job_type = 'download' THEN 4
+                    ELSE 5
+                END ASC,
+                CASE
+                    WHEN job_type = 'enrich' THEN created_at
+                    ELSE NULL
+                END DESC,
+                created_at ASC
             LIMIT 1
             """
         )
@@ -103,18 +147,20 @@ class PipelineDaemon:
     def mark_job_completed(self, job_id: int, result: dict):
         cur = self.db.conn.cursor()
         cur.execute(
-            "UPDATE pipeline_jobs SET status = 'completed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ?",
+            "UPDATE pipeline_jobs SET status = 'completed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ? AND status = 'running'",
             (json.dumps(result), job_id)
         )
         self.db.conn.commit()
+        return int(cur.rowcount or 0) > 0
 
     def mark_job_failed(self, job_id: int, error_msg: str):
         cur = self.db.conn.cursor()
         cur.execute(
-            "UPDATE pipeline_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ?",
+            "UPDATE pipeline_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ? AND status = 'running'",
             (json.dumps({"error": error_msg}), job_id)
         )
         self.db.conn.commit()
+        return int(cur.rowcount or 0) > 0
 
     # --- MARKING LOGIC ---
     def do_mark(self, corpus_id: int, limit: int):
@@ -207,9 +253,16 @@ class PipelineDaemon:
             to_process.append(row)
 
         if not to_process:
-            return {"processed": 0, "promoted": 0, "queued": 0, "failed": 0, "results": []}
+            return {
+                "processed": 0,
+                "promoted": 0,
+                "queued": 0,
+                "failed": 0,
+                "duplicates_merged": 0,
+                "results": [],
+            }
 
-        processed, promoted, queued, failed = 0, 0, 0, 0
+        processed, promoted, queued, failed, duplicates_merged = 0, 0, 0, 0, 0
         results, errors = [], []
         
         fetch_refs = expansion.get("includeDownstream", True)
@@ -242,7 +295,30 @@ class PipelineDaemon:
                     no_meta_id, enriched, expand_related=(rel_down > 1 and fetch_refs), max_related_per_source=max_rel
                 )
                 if not wid:
-                    failed += 1
+                    dup = parse_duplicate_merge_marker(err)
+                    if dup:
+                        duplicates_merged += 1
+                        canonical_table = dup.get("table") or ""
+                        canonical_id_raw = dup.get("id") or ""
+                        queue_id_raw = dup.get("queue_id") or ""
+                        queued_flag = (dup.get("queued") or "") == "1"
+                        if canonical_table == "with_metadata" and queued_flag:
+                            queued += 1
+                        results.append(
+                            {
+                                "no_metadata_id": no_meta_id,
+                                "action": "duplicate_merged",
+                                "canonical_table": canonical_table,
+                                "canonical_id": int(canonical_id_raw) if canonical_id_raw.isdigit() else None,
+                                "queue_id": int(queue_id_raw) if queue_id_raw.isdigit() else None,
+                                "queued": queued_flag,
+                            }
+                        )
+                    else:
+                        failed += 1
+                        errors.append(err or f"Promotion failed for no_metadata:{no_meta_id}")
+                        results.append({"no_metadata_id": no_meta_id, "action": "promotion_failed", "error": err})
+                    # no_metadata row may already be merged away; this is a no-op in that case.
                     cur.execute("UPDATE no_metadata SET selected_for_enrichment = 0 WHERE id = ?", (no_meta_id,))
                     self.db.conn.commit()
                     continue
@@ -255,7 +331,15 @@ class PipelineDaemon:
                 else:
                     results.append({"no_metadata_id": no_meta_id, "with_metadata_id": int(wid), "action": "enqueue_skipped"})
 
-        return {"processed": processed, "promoted": promoted, "queued": queued, "failed": failed, "errors": errors, "results": results}
+        return {
+            "processed": processed,
+            "promoted": promoted,
+            "queued": queued,
+            "failed": failed,
+            "duplicates_merged": duplicates_merged,
+            "errors": errors,
+            "results": results,
+        }
 
     def _download_single(self, row):
         qid = int(row["id"])
@@ -275,7 +359,15 @@ class PipelineDaemon:
             ok, msg = self.db.drop_queue_entry_as_duplicate(qid, dup_table, dup_id, dup_field)
             return "skipped", {"queue_id": qid, "action": "dropped_duplicate"}
 
-        ref = {"title": row.get("title"), "authors": authors, "doi": row.get("doi"), "type": row.get("entry_type"), "year": row.get("year")}
+        ref = {
+            "title": row.get("title"),
+            "authors": authors,
+            "doi": row.get("doi"),
+            "type": row.get("type") or row.get("entry_type") or "",
+            "year": row.get("year"),
+            "open_access_url": row.get("url_source") or row.get("url"),
+            "openalex_json": row.get("openalex_json"),
+        }
         
         try:
             result = self.enhancer.enhance_bibliography(ref, self.download_dir)
@@ -301,7 +393,15 @@ class PipelineDaemon:
 
     # --- DOWNLOAD LOGIC ---
     def do_download(self, corpus_id: int, limit: int):
-        rows = self.db.claim_download_batch(limit=limit, corpus_id=corpus_id, claimed_by=self.worker_id, lease_seconds=900)
+        # Prevent one very large queued job (e.g. batchSize=3000) from monopolizing
+        # the single daemon loop for a long period.
+        per_job_max = int(os.getenv("RAG_FEEDER_DOWNLOAD_JOB_MAX", "150") or "150")
+        per_job_max = max(1, min(per_job_max, 5000))
+        effective_limit = min(max(1, int(limit or 1)), per_job_max)
+        if effective_limit != limit:
+            log(f"Clamped download job batch from {limit} to {effective_limit} (RAG_FEEDER_DOWNLOAD_JOB_MAX={per_job_max})")
+
+        rows = self.db.claim_download_batch(limit=effective_limit, corpus_id=corpus_id, claimed_by=self.worker_id, lease_seconds=900)
         if not rows:
             return {"processed": 0, "downloaded": 0, "failed": 0, "skipped": 0, "results": []}
 
@@ -309,8 +409,11 @@ class PipelineDaemon:
         results, errors = [], []
 
         # Download multiple files concurrently. Be careful not to overwhelm the disk or rate limiters.
-        # Max out at min(limit, 16) parallel downloads
-        max_download_workers = min(len(rows), 16)
+        # Max out at min(limit, configured cap) parallel downloads.
+        # Keep env configurable so operators can tune throughput without code changes.
+        max_workers_cfg = int(os.getenv("RAG_FEEDER_DOWNLOAD_WORKERS", "16") or "16")
+        max_workers_cfg = max(1, min(max_workers_cfg, 128))
+        max_download_workers = min(len(rows), max_workers_cfg)
         
         with ThreadPoolExecutor(max_workers=max_download_workers) as executor:
             futures = {executor.submit(self._download_single, row): row for row in rows}
@@ -376,14 +479,19 @@ class PipelineDaemon:
                     else:
                         raise ValueError(f"Unknown job type: {job['job_type']}")
                         
-                    self.mark_job_completed(job["id"], result or {})
-                    log(f"Successfully completed job {job['id']}")
+                    updated = self.mark_job_completed(job["id"], result or {})
+                    if updated:
+                        log(f"Successfully completed job {job['id']}")
+                    else:
+                        log(f"Job {job['id']} finished execution but was already cancelled; completion not recorded.")
                     
                 except Exception as e:
                     import traceback
                     err_msg = traceback.format_exc()
                     log(f"Job {job['id']} failed: {e}")
-                    self.mark_job_failed(job["id"], err_msg)
+                    updated = self.mark_job_failed(job["id"], err_msg)
+                    if not updated:
+                        log(f"Job {job['id']} failure not recorded because it was already cancelled.")
                     
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")

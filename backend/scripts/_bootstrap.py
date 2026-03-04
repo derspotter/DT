@@ -2,6 +2,11 @@ import os
 import sys
 from pathlib import Path
 
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
 
 def _is_valid_project_dir(candidate: Path | None) -> bool:
     if not candidate:
@@ -40,4 +45,9 @@ def ensure_import_paths(anchor_file: str) -> Path | None:
         as_str = str(p)
         if as_str not in sys.path:
             sys.path.insert(0, as_str)
+    if load_dotenv is not None:
+        repo_root = project_dir.parent
+        # Load both root and backend env files when present; do not override explicit env.
+        load_dotenv(repo_root / ".env", override=False)
+        load_dotenv(repo_root / "backend" / ".env", override=False)
     return project_dir

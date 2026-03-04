@@ -123,8 +123,10 @@ def main() -> None:
                 "title": row.get("title"),
                 "authors": authors,
                 "doi": row.get("doi"),
-                "type": row.get("entry_type") or "",
+                "type": row.get("type") or row.get("entry_type") or "",
                 "year": row.get("year"),
+                "open_access_url": row.get("url_source") or row.get("url"),
+                "openalex_json": row.get("openalex_json"),
             }
 
             try:
