@@ -1,4 +1,5 @@
 requests
+PySocks
 PyMuPDF
 beautifulsoup4
 google-cloud-aiplatform
