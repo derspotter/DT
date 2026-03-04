@@ -109,6 +109,18 @@ export async function createCorpus(name) {
   return response.json()
 }
 
+export async function deleteCorpus(corpusId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}`, {
+    method: 'DELETE',
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to delete corpus')
+  }
+  return response.json()
+}
+
 export async function shareCorpus(corpusId, { username, role }) {
   const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/share`, {
     method: 'POST',
@@ -214,6 +226,8 @@ export async function processMarkedIngestEntries({
   relatedDepthDownstream = 1,
   relatedDepthUpstream = 1,
   maxRelated = 30,
+  enqueueDownload = false,
+  downloadBatchSize = 25,
 } = {}) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/ingest/process-marked`,
@@ -227,6 +241,8 @@ export async function processMarkedIngestEntries({
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        enqueueDownload,
+        downloadBatchSize,
       }),
     },
     PIPELINE_TIMEOUT
@@ -250,6 +266,8 @@ export async function runKeywordSearch({
   relatedDepthDownstream = 1,
   relatedDepthUpstream = 1,
   maxRelated = 30,
+  enqueue = false,
+  fallbackToSample = true,
 }) {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search`, {
@@ -266,6 +284,7 @@ export async function runKeywordSearch({
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        enqueue,
       }),
     })
     await throwIfUnauthorized(response)
@@ -283,6 +302,9 @@ export async function runKeywordSearch({
     }
   } catch (error) {
     if (error?.status === 401) {
+      throw error
+    }
+    if (!fallbackToSample) {
       throw error
     }
     return { data: sampleSearchResults, source: 'sample', error }
