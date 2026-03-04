@@ -26,8 +26,8 @@ from threading import Lock
 from datetime import datetime, timedelta
 
 # --- Configuration ---
-# Use Gemini standard Flash model for speed
-DEFAULT_MODEL_NAME = 'gemini-3-flash-preview'
+# Use Gemini 3.1 Flash Lite preview for all extraction steps in this script.
+DEFAULT_MODEL_NAME = 'gemini-3.1-flash-lite-preview'
 
 # Global client/model variable
 api_client = None

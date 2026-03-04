@@ -43,8 +43,20 @@ class DatabaseManager:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             print(f"{GREEN}[DB Manager] Connecting to database file: {self.db_path.resolve()}{RESET}")
         
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False) # check_same_thread=False for broader usability if needed
+        self.conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,  # Shared by design in some threaded call paths.
+            timeout=30.0,
+        )
         self.conn.execute("PRAGMA foreign_keys = ON")
+        # Improve concurrent-read/write behavior and reduce transient lock failures.
+        try:
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+            self.conn.execute("PRAGMA busy_timeout = 5000")
+        except sqlite3.Error:
+            # Best effort only (e.g., in-memory DB can reject WAL mode).
+            pass
         if self.is_in_memory:
             print(f"{GREEN}[DB Manager] In-memory database connected.{RESET}")
         else:
@@ -613,7 +625,7 @@ class DatabaseManager:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add relationship_type column: {e}{RESET}")
 
     def _add_missing_columns_to_ingest_entries(self):
-        """Add missing corpus_id column to ingest_entries table if it doesn't exist."""
+        """Add missing compatibility columns to ingest_entries table if they don't exist."""
         cursor = self.conn.cursor()
         cursor.execute("PRAGMA table_info(ingest_entries)")
         columns = [col[1] for col in cursor.fetchall()]
@@ -623,6 +635,12 @@ class DatabaseManager:
                 print(f"{GREEN}[DB Manager] Added corpus_id column to ingest_entries table.{RESET}")
             except sqlite3.Error as e:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add corpus_id column: {e}{RESET}")
+        if 'processed' not in columns:
+            try:
+                cursor.execute("ALTER TABLE ingest_entries ADD COLUMN processed INTEGER DEFAULT 0")
+                print(f"{GREEN}[DB Manager] Added processed column to ingest_entries table.{RESET}")
+            except sqlite3.Error as e:
+                print(f"{YELLOW}[DB Manager] Warning: Could not add processed column: {e}{RESET}")
 
     def _add_normalized_columns_to_download_queue(self):
         """Add missing normalized columns to to_download_references table if they don't exist."""
@@ -2329,7 +2347,16 @@ class DatabaseManager:
                     match_field=field,
                     notes="promote_duplicate",
                 )
-                return None, f"Entry already exists in {tbl} (ID {eid}) on {field}"
+                queue_id: int | None = None
+                queue_err: str | None = None
+                # If duplicate merged into canonical with_metadata row, ensure it enters download queue.
+                if tbl == "with_metadata":
+                    queue_id, queue_err = self.enqueue_for_download(int(eid))
+                marker = (
+                    f"DUPLICATE_MERGED|table={tbl}|id={eid}|field={field}|"
+                    f"queued={1 if queue_id else 0}|queue_id={queue_id or ''}|queue_error={queue_err or ''}"
+                )
+                return None, f"Entry already exists in {tbl} (ID {eid}) on {field} [{marker}]"
 
             cur.execute(
                 """INSERT INTO with_metadata (source_pdf,title,authors,editors,year,doi,normalized_doi,openalex_id,
@@ -3164,7 +3191,7 @@ class DatabaseManager:
             )
 
             fetch_sql = f"""
-                SELECT id, title, authors, year, doi, openalex_id, entry_type
+                SELECT id, title, authors, year, doi, openalex_id, entry_type, type, url, url_source, openalex_json
                   FROM with_metadata
                  WHERE id IN ({placeholders})
                    AND download_claimed_by = ?
@@ -3186,6 +3213,10 @@ class DatabaseManager:
                         "doi": r[4],
                         "openalex_id": r[5],
                         "entry_type": r[6],
+                        "type": r[7],
+                        "url": r[8],
+                        "url_source": r[9],
+                        "openalex_json": r[10],
                     }
                 )
             return out

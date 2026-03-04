@@ -1,6 +1,7 @@
 click
 google-genai
 requests
+PySocks
 beautifulsoup4
 pikepdf
 PyMuPDF

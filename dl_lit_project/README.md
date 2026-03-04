@@ -81,6 +81,11 @@ Recommended:
 - `RAG_FEEDER_OPENALEX_RPS` (default `30`)
 - `RAG_FEEDER_CROSSREF_RPS` (default `20`)
 - `RAG_FEEDER_ENRICH_WORKERS` (default `6`)
+- `RAG_FEEDER_VPN_PROXY_URL` (optional SOCKS/HTTP proxy for download fallback)
+- `RAG_FEEDER_VPN_MODE` (`fallback` | `prefer` | `force`, default `fallback`)
+- `RAG_FEEDER_VPN_ENFORCE_EDUVPN` (default `1`; blocks proxy route unless eduVPN is connected)
+- `RAG_FEEDER_VPN_STATUS_CMD` (required when enforcement is on; e.g. `ssh jayjag@desktop 'eduvpn-cli status'`)
+- `RAG_FEEDER_VPN_CONNECT_CMD` (optional auto-connect command, run when status is disconnected)
 
 ## Docs
 
