@@ -171,7 +171,7 @@ export async function extractBibliography(filename) {
 
 export async function fetchBibliographyEntries(baseName) {
   const response = await fetchWithTimeout(
-    `${API_BASE}/api/ingest/latest?baseName=${encodeURIComponent(baseName)}`
+    `${API_BASE}/api/ingest/latest?baseName=${encodeURIComponent(baseName)}&limit=5000`
   )
   await throwIfUnauthorized(response)
   if (!response.ok) {
