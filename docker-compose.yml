@@ -17,6 +17,12 @@ services:
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
       - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
       - RAG_FEEDER_ENRICH_WORKERS=${RAG_FEEDER_ENRICH_WORKERS:-6}
+      - RAG_FEEDER_DOWNLOAD_BATCH_MAX=${RAG_FEEDER_DOWNLOAD_BATCH_MAX:-2000}
+      - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
+      - RAG_FEEDER_LIBGEN_RPS=${RAG_FEEDER_LIBGEN_RPS:-2}
+      - RAG_FEEDER_GEMINI_PER_MIN=${RAG_FEEDER_GEMINI_PER_MIN:-2000}
+      - RAG_FEEDER_GEMINI_TOKENS_PER_MIN=${RAG_FEEDER_GEMINI_TOKENS_PER_MIN:-3000000}
+      - RAG_FEEDER_GEMINI_DAILY=${RAG_FEEDER_GEMINI_DAILY:-100000}
       - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
       - CHOKIDAR_USEPOLLING=1
     volumes:
@@ -25,6 +31,36 @@ services:
       - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_uploads:/usr/src/app/uploads
+      - rag_feeder_logs:/usr/src/app/logs
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  rag_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --db-path /usr/src/app/dl_lit_project/data/literature.db
+    container_name: rag_feeder_worker
+    environment:
+      - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
+      - RAG_FEEDER_PYTHON=/opt/venv/bin/python
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
+      - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
+      - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
+      - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
+      - RAG_FEEDER_LIBGEN_RPS=${RAG_FEEDER_LIBGEN_RPS:-2}
+      - RAG_FEEDER_GEMINI_PER_MIN=${RAG_FEEDER_GEMINI_PER_MIN:-2000}
+      - RAG_FEEDER_GEMINI_TOKENS_PER_MIN=${RAG_FEEDER_GEMINI_TOKENS_PER_MIN:-3000000}
+      - RAG_FEEDER_GEMINI_DAILY=${RAG_FEEDER_GEMINI_DAILY:-100000}
+      - RAG_FEEDER_DOWNLOAD_WORKERS=${RAG_FEEDER_DOWNLOAD_WORKERS:-32}
+    volumes:
+      - ./backend/src:/usr/src/app/src
+      - ./backend/scripts:/usr/src/app/scripts
+      - ./dl_lit:/usr/src/app/dl_lit
+      - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_logs:/usr/src/app/logs
     restart: unless-stopped
     networks:

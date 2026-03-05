@@ -1,68 +1,94 @@
 # dl_lit_project
 
-Database-first literature corpus builder for seed-document ingestion, keyword search, enrichment, and resilient PDF download queuing.
+Canonical Python pipeline package used by the app (`dl_lit`).
 
-## What this project is now
+## Canonical Paths
 
-Canonical Python package: `dl_lit_project/dl_lit`  
-Canonical CLI: `python -m dl_lit.cli`  
-Canonical database: `dl_lit_project/data/literature.db`
+- Package: `dl_lit_project/dl_lit`
+- DB: `dl_lit_project/data/literature.db`
+- CLI module: `python -m dl_lit.cli`
 
-The root-level `dl_lit/` folder is legacy and not used by the backend runtime.
+Root-level `dl_lit/` is legacy.
 
-## Core workflow (DB-first)
+## DB-First Model
 
-1. Extract bibliography pages from a seed PDF:
-   - `python -m dl_lit.cli extract-bib-pages <pdf-or-dir> --output-dir artifacts/bibliographies`
-2. Parse extracted bibliography pages into DB (`no_metadata`):
-   - `python -m dl_lit.cli extract-bib-api artifacts/bibliographies/<run_dir> --db-path data/literature.db`
-3. Enrich selected rows via OpenAlex/Crossref:
-   - `python -m dl_lit.cli enrich-openalex-db --db-path data/literature.db --batch-size 50`
-4. Queue and process downloads:
-   - `python -m dl_lit.cli process-downloads --db-path data/literature.db --batch-size 20`
-   - `python -m dl_lit.cli download-pdfs --db-path data/literature.db --limit 20`
+Core staged tables:
 
-Single-command orchestration:
+- `no_metadata`
+- `with_metadata`
+- `downloaded_references`
+
+Queueing for downloads is currently state-based in `with_metadata.download_state`.
+
+Related tables still in use:
+
+- `failed_enrichments`
+- `failed_downloads`
+- `ingest_entries`
+- `corpus_items`
+- `pipeline_jobs`
+- `pipeline_runs`
+
+## Worker Architecture (Current)
+
+Backend inserts rows into `pipeline_jobs`.
+Python daemon (`backend/scripts/daemon/worker.py`) polls pending jobs and executes:
+
+- `enrich`
+- `download`
+- `pipeline_tick` (mark -> enrich -> download)
+
+Results are written to `pipeline_jobs.result_json`.
+
+## CLI: Direct Operations
+
+Run from `dl_lit_project/`.
+
+Extraction:
+
+- `python -m dl_lit.cli extract-bib-pages <pdf-or-dir> --output-dir artifacts/bibliographies`
+- `python -m dl_lit.cli extract-bib-api artifacts/bibliographies/<run_dir> --db-path data/literature.db`
+
+Enrichment:
+
+- `python -m dl_lit.cli enrich-openalex-db --db-path data/literature.db --batch-size 50`
+- `python -m dl_lit.cli retry-failed-enrichments --db-path data/literature.db`
+
+Downloads:
+
+- `python -m dl_lit.cli process-downloads --db-path data/literature.db --batch-size 20`
+- `python -m dl_lit.cli download-pdfs --db-path data/literature.db --limit 20`
+
+End-to-end helper:
+
 - `python -m dl_lit.cli run-pipeline <pdf-or-dir> --db-path data/literature.db`
 
-## Keyword search (Milestone 1 scope)
+Keyword search:
 
-Query mode:
-- `python -m dl_lit.cli keyword-search --query "institution AND governance" --max-results 200 --db-path data/literature.db`
-
-Seed-JSON mode (web backend uses the same script path):
-- `backend/scripts/keyword_search.py --seed-json '[{"openalex_id":"W2015930340"}]' --db-path dl_lit_project/data/literature.db`
-
-Supports recursive expansion:
-- `--related-depth <n>` and `--max-related <n>`
-
-## Web app
-
-Use root `docker-compose.yml` services:
-- backend: `rag_backend` on `:4000`
-- frontend: `rag_feeder` on `:5175`
-
-Frontend talks to backend via Vite API base during development.
-
-## Development and quality checks
-
-- Python tests: `venv/bin/pytest -q dl_lit_project/tests`
-- Backend tests: `cd backend && npm test -- --runInBand`
-- Lint (Python): `venv/bin/ruff check --config dl_lit_project/pyproject.toml dl_lit_project/dl_lit backend/scripts`
-
-## Documentation
-
-- User guide: `dl_lit_project/docs/USER_GUIDE.md`
-- Ops runbook: `dl_lit_project/docs/OPS_RUNBOOK.md`
-- Developer notes: `dl_lit_project/DEVELOPMENT.md`
+- `python -m dl_lit.cli keyword-search --query "institution AND governance" --db-path data/literature.db`
+- `python -m dl_lit.cli keyword-search --seed-json '[{\"openalex_id\":\"W2015930340\"}]' --db-path data/literature.db`
 
 ## Environment
 
-Required for extraction/enrichment:
+Required:
+
 - `GOOGLE_API_KEY` (or `GEMINI_API_KEY`)
 
-Optional but recommended:
-- `RAG_FEEDER_JWT_SECRET`
-- `RAG_FEEDER_GEMINI_MODEL` (default: `gemini-3-flash-preview`)
-- `RAG_FEEDER_LOG_DIR` (default: `logs/`)
-- `RAG_FEEDER_LOG_MAX_BYTES` and `RAG_FEEDER_LOG_MAX_FILES` for rotation
+Recommended:
+
+- `OPENALEX_API_KEY`
+- `RAG_FEEDER_MAILTO`
+- `RAG_FEEDER_OPENALEX_RPS` (default `30`)
+- `RAG_FEEDER_CROSSREF_RPS` (default `20`)
+- `RAG_FEEDER_ENRICH_WORKERS` (default `6`)
+- `RAG_FEEDER_VPN_PROXY_URL` (optional SOCKS/HTTP proxy for download fallback)
+- `RAG_FEEDER_VPN_MODE` (`fallback` | `prefer` | `force`, default `fallback`)
+- `RAG_FEEDER_VPN_ENFORCE_EDUVPN` (default `1`; blocks proxy route unless eduVPN is connected)
+- `RAG_FEEDER_VPN_STATUS_CMD` (required when enforcement is on; e.g. `ssh jayjag@desktop 'eduvpn-cli status'`)
+- `RAG_FEEDER_VPN_CONNECT_CMD` (optional auto-connect command, run when status is disconnected)
+
+## Docs
+
+- `docs/USER_GUIDE.md`
+- `docs/OPS_RUNBOOK.md`
+- `DEVELOPMENT.md`

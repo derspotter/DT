@@ -1,11 +1,11 @@
 # Legacy Scripts And Artifacts
 
-This directory exists for historical reasons. It contains legacy standalone scripts and runtime artifacts from earlier iterations of the project.
+This directory is legacy and kept for historical compatibility.
 
-Canonical, maintained code lives in `dl_lit_project/dl_lit/` and should be used via:
+Current implementation lives in:
 
-- CLI: `python -m dl_lit.cli ...`
-- Web backend: runs scripts from `dl_lit_project/dl_lit/` and stores outputs under `dl_lit_project/artifacts/`.
+- `dl_lit_project/dl_lit` (canonical Python package)
+- `backend/scripts/daemon/worker.py` (queue consumer)
+- `backend/src/app.js` (API + queue producer)
 
-If you are adding features or fixing bugs, prefer changing code in `dl_lit_project/dl_lit/`.
-
+If you are implementing or fixing current behavior, edit `dl_lit_project/` and `backend/` instead.

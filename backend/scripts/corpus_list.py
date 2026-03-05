@@ -45,6 +45,8 @@ def main():
                         'raw': sum(1 for item in STUB_ITEMS if item.get('status') in ('no_metadata', 'extract_references_from_pdf', 'pending')),
                         'metadata': sum(1 for item in STUB_ITEMS if item.get('status') in ('with_metadata', 'to_download_references')),
                         'downloaded': sum(1 for item in STUB_ITEMS if item.get('status') == 'downloaded_references'),
+                        'failed_enrichments': sum(1 for item in STUB_ITEMS if item.get('status') == 'failed_enrichments'),
+                        'failed_downloads': sum(1 for item in STUB_ITEMS if item.get('status') == 'failed_downloads'),
                     },
                     'status_counts': dict(Counter(item.get('status') for item in STUB_ITEMS)),
                 }
@@ -59,6 +61,8 @@ def main():
         ('downloaded_references', 'downloaded_references'),
         ('with_metadata', 'with_metadata'),
         ('no_metadata', 'no_metadata'),
+        ('failed_enrichments', 'failed_enrichments'),
+        ('failed_downloads', 'failed_downloads'),
         ('to_download_references', 'to_download_references'),  # legacy fallback
     ]
 
@@ -129,6 +133,8 @@ def main():
         'raw': sum(status_counts.get(status, 0) for status in ('no_metadata', 'extract_references_from_pdf', 'pending')),
         'metadata': sum(status_counts.get(status, 0) for status in ('with_metadata', 'to_download_references')),
         'downloaded': status_counts.get('downloaded_references', 0),
+        'failed_enrichments': status_counts.get('failed_enrichments', 0),
+        'failed_downloads': status_counts.get('failed_downloads', 0),
     }
 
     items.sort(key=lambda x: (normalize_year(x.get('year')), normalize_id(x.get('id'))), reverse=True)

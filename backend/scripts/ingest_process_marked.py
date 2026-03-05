@@ -27,6 +27,21 @@ from reference_expansion import (
 _thread_local = threading.local()
 
 
+def parse_duplicate_merge_marker(message: str | None) -> dict | None:
+    """Parse DUPLICATE_MERGED marker emitted by db_manager promotion path."""
+    if not message or "DUPLICATE_MERGED|" not in message:
+        return None
+    marker_text = message.split("DUPLICATE_MERGED|", 1)[1]
+    marker_text = marker_text.rstrip("]").strip()
+    data: dict[str, str] = {}
+    for part in marker_text.split("|"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        data[key.strip()] = value.strip()
+    return data or None
+
+
 def _get_thread_searcher(mailto: str, rate_limiter):
     searcher = getattr(_thread_local, "searcher", None)
     if searcher is None:
@@ -220,7 +235,18 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.limit <= 0:
-        print(json.dumps({"processed": 0, "promoted": 0, "queued": 0, "failed": 0, "errors": ["limit must be > 0"]}))
+        print(
+            json.dumps(
+                {
+                    "processed": 0,
+                    "promoted": 0,
+                    "queued": 0,
+                    "failed": 0,
+                    "duplicates_merged": 0,
+                    "errors": ["limit must be > 0"],
+                }
+            )
+        )
         return
 
     downstream_depth = args.related_depth_downstream
@@ -240,7 +266,18 @@ def main() -> None:
 
     to_process = _rows_to_process(db, corpus_id=args.corpus_id, limit=args.limit)
     if not to_process:
-        print(json.dumps({"processed": 0, "promoted": 0, "queued": 0, "failed": 0, "source": "db"}))
+        print(
+            json.dumps(
+                {
+                    "processed": 0,
+                    "promoted": 0,
+                    "queued": 0,
+                    "failed": 0,
+                    "duplicates_merged": 0,
+                    "source": "db",
+                }
+            )
+        )
         db.close_connection()
         return
 
@@ -248,6 +285,7 @@ def main() -> None:
     promoted = 0
     queued = 0
     failed = 0
+    duplicates_merged = 0
     errors: list[str] = []
     results: list[dict] = []
 
@@ -304,9 +342,29 @@ def main() -> None:
                     max_related_per_source=args.max_related,
                 )
                 if not wid:
-                    failed += 1
-                    errors.append(err or f"Promotion failed for no_metadata:{no_meta_id}")
-                    results.append({"no_metadata_id": no_meta_id, "action": "promotion_failed", "error": err})
+                    dup = parse_duplicate_merge_marker(err)
+                    if dup:
+                        duplicates_merged += 1
+                        canonical_table = dup.get("table") or ""
+                        canonical_id_raw = dup.get("id") or ""
+                        queue_id_raw = dup.get("queue_id") or ""
+                        queued_flag = (dup.get("queued") or "") == "1"
+                        if canonical_table == "with_metadata" and queued_flag:
+                            queued += 1
+                        results.append(
+                            {
+                                "no_metadata_id": no_meta_id,
+                                "action": "duplicate_merged",
+                                "canonical_table": canonical_table,
+                                "canonical_id": int(canonical_id_raw) if canonical_id_raw.isdigit() else None,
+                                "queue_id": int(queue_id_raw) if queue_id_raw.isdigit() else None,
+                                "queued": queued_flag,
+                            }
+                        )
+                    else:
+                        failed += 1
+                        errors.append(err or f"Promotion failed for no_metadata:{no_meta_id}")
+                        results.append({"no_metadata_id": no_meta_id, "action": "promotion_failed", "error": err})
                     # Ensure we don't keep re-processing a stuck "marked" item forever.
                     _unmark(db, no_meta_id)
                     continue
@@ -337,6 +395,7 @@ def main() -> None:
                 "promoted": promoted,
                 "queued": queued,
                 "failed": failed,
+                "duplicates_merged": duplicates_merged,
                 "errors": errors,
                 "results": results,
                 "workers": workers,

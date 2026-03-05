@@ -16,23 +16,34 @@ def main():
 
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingest_entries'")
     has_ingest_entries = cur.fetchone() is not None
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingest_source_metadata'")
+    has_source_metadata = cur.fetchone() is not None
 
     runs = []
     if has_ingest_entries:
         conditions = []
         params = []
         if args.corpus_id is not None:
-            conditions.append("corpus_id = ?")
+            conditions.append("ie.corpus_id = ?")
             params.append(args.corpus_id)
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        metadata_join = ""
+        if has_source_metadata:
+            metadata_join = """
+            LEFT JOIN ingest_source_metadata ism
+              ON ism.ingest_source = ie.ingest_source
+             AND ism.corpus_id = COALESCE(ie.corpus_id, 0)
+            """
         query = f"""
-            SELECT ingest_source,
+            SELECT ie.ingest_source,
                    COUNT(*) AS entry_count,
-                   MAX(created_at) AS last_created_at,
-                   MAX(source_pdf) AS source_pdf
-            FROM ingest_entries
+                   MAX(ie.created_at) AS last_created_at,
+                   MAX(ie.source_pdf) AS source_pdf
+                   {', MAX(ism.title) AS seed_title, MAX(ism.authors) AS seed_authors, MAX(ism.year) AS seed_year, MAX(ism.doi) AS seed_doi, MAX(ism.source) AS seed_source, MAX(ism.publisher) AS seed_publisher' if has_source_metadata else ''}
+            FROM ingest_entries ie
+            {metadata_join}
             {where_clause}
-            GROUP BY ingest_source
+            GROUP BY ie.ingest_source
             ORDER BY last_created_at DESC
             LIMIT ?
         """
@@ -65,10 +76,19 @@ def main():
         cur.execute(query, params)
         runs = [dict(row) for row in cur.fetchall()]
 
+    for run in runs:
+        seed_authors = run.get("seed_authors")
+        if isinstance(seed_authors, str):
+            try:
+                parsed = json.loads(seed_authors)
+                if isinstance(parsed, list):
+                    run["seed_authors"] = parsed
+            except Exception:
+                pass
+
     conn.close()
     print(json.dumps({"runs": runs, "total": len(runs), "source": "db"}))
 
 
 if __name__ == "__main__":
     main()
-

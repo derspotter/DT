@@ -5,6 +5,7 @@
   export let rawTotal;
   export let metadataTotal;
   export let downloadedTotal;
+  export let failedEnrichmentTotal;
   export let shareUsername;
   export let shareRole;
   export let shareStatus;
@@ -36,6 +37,8 @@
       if (item.status && item.status !== 'no_metadata' && item.status !== 'extract_references_from_pdf' && item.status !== 'pending') return false;
     } else if (stageFilter === 'metadata') {
       if (item.status !== 'with_metadata' && item.status !== 'to_download_references') return false;
+    } else if (stageFilter === 'failed_enrichment') {
+      if (item.status !== 'failed_enrichments') return false;
     } else if (stageFilter === 'downloaded') {
       if (item.status !== 'downloaded_references') return false;
     }
@@ -55,6 +58,7 @@
   function getBucketForItem(item) {
     if (!item.status || item.status === 'no_metadata' || item.status === 'extract_references_from_pdf' || item.status === 'pending') return 'raw';
     if (item.status === 'with_metadata' || item.status === 'to_download_references') return 'metadata';
+    if (item.status === 'failed_enrichments' || item.status === 'failed_downloads') return 'failed';
     if (item.status === 'downloaded_references') return 'downloaded';
     return 'raw';
   }
@@ -150,6 +154,7 @@
         <option value="all">All stages ({corpusTotal || corpusItems.length})</option>
         <option value="raw">Raw / Seeds ({rawTotal || 0})</option>
         <option value="metadata">With Metadata ({metadataTotal || 0})</option>
+        <option value="failed_enrichment">Failed enrichments ({failedEnrichmentTotal || 0})</option>
         <option value="downloaded">Downloaded ({downloadedTotal || 0})</option>
       </select>
     </label>

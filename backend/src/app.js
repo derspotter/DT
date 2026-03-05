@@ -214,6 +214,20 @@ function ensureAuthSchema(db) {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(corpus_id, table_name, row_id)
     );
+    CREATE TABLE IF NOT EXISTS ingest_source_metadata (
+      corpus_id INTEGER NOT NULL DEFAULT 0,
+      ingest_source TEXT NOT NULL,
+      source_pdf TEXT,
+      title TEXT,
+      authors TEXT,
+      year INTEGER,
+      doi TEXT,
+      source TEXT,
+      publisher TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (corpus_id, ingest_source)
+    );
   `);
   if (tableExists(db, 'ingest_entries')) {
     ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
@@ -384,6 +398,68 @@ function parseJsonFromOutput(output) {
   }
 
   throw new Error(`No valid JSON output from python. Output was: ${output}`);
+}
+
+function normalizeIngestSourceMetadata(value) {
+  if (!value || typeof value !== 'object') return null;
+  const out = {};
+  if (typeof value.title === 'string' && value.title.trim()) out.title = value.title.trim();
+  if (Array.isArray(value.authors)) {
+    const authors = value.authors
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+    if (authors.length > 0) out.authors = authors;
+  }
+  if (typeof value.year === 'number' && Number.isFinite(value.year)) {
+    out.year = Math.trunc(value.year);
+  } else if (typeof value.year === 'string' && value.year.trim()) {
+    out.year = value.year.trim();
+  }
+  if (typeof value.doi === 'string' && value.doi.trim()) out.doi = value.doi.trim();
+  if (typeof value.source === 'string' && value.source.trim()) out.source = value.source.trim();
+  if (typeof value.publisher === 'string' && value.publisher.trim()) out.publisher = value.publisher.trim();
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function upsertIngestSourceMetadata(db, { corpusId, ingestSource, sourcePdf, sourceMetadata }) {
+  if (!ingestSource || !sourceMetadata) return false;
+  const corpusKey = Number.isFinite(Number(corpusId)) ? Number(corpusId) : 0;
+  let yearInt = null;
+  if (Number.isInteger(sourceMetadata.year)) {
+    yearInt = sourceMetadata.year;
+  } else if (typeof sourceMetadata.year === 'string' && /^\d+$/.test(sourceMetadata.year.trim())) {
+    yearInt = Number(sourceMetadata.year.trim());
+  }
+  const authorsJson = Array.isArray(sourceMetadata.authors)
+    ? JSON.stringify(sourceMetadata.authors)
+    : null;
+
+  db.prepare(
+    `INSERT INTO ingest_source_metadata
+      (corpus_id, ingest_source, source_pdf, title, authors, year, doi, source, publisher)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(corpus_id, ingest_source)
+     DO UPDATE SET
+       source_pdf = excluded.source_pdf,
+       title = COALESCE(excluded.title, ingest_source_metadata.title),
+       authors = COALESCE(excluded.authors, ingest_source_metadata.authors),
+       year = COALESCE(excluded.year, ingest_source_metadata.year),
+       doi = COALESCE(excluded.doi, ingest_source_metadata.doi),
+       source = COALESCE(excluded.source, ingest_source_metadata.source),
+       publisher = COALESCE(excluded.publisher, ingest_source_metadata.publisher),
+       updated_at = CURRENT_TIMESTAMP`
+  ).run(
+    corpusKey,
+    String(ingestSource),
+    sourcePdf || null,
+    sourceMetadata.title || null,
+    authorsJson,
+    yearInt,
+    sourceMetadata.doi || null,
+    sourceMetadata.source || null,
+    sourceMetadata.publisher || null
+  );
+  return true;
 }
 
 function coercePositiveInt(value, fallback, minValue = 1) {
@@ -713,14 +789,36 @@ function getPdfPageCountSync(pdfPath) {
 
 function geminiUploadPdfSync(pdfPath) {
   const code = [
-    'import json, os, sys',
+    'import json',
+    'import os',
+    'import shutil',
+    'import sys',
+    'import tempfile',
+    'import unicodedata',
     'from google import genai',
     'key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")',
     'assert key, "Missing GEMINI_API_KEY/GOOGLE_API_KEY"',
     'client = genai.Client(api_key=key)',
-    'f = client.files.upload(file=sys.argv[1], config={"mime_type":"application/pdf","display_name":os.path.basename(sys.argv[1])})',
+    'pdf_path = sys.argv[1]',
+    'base = os.path.basename(pdf_path)',
+    'norm = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")',
+    'safe = "".join((c if (c.isalnum() or c in "._-") else "_") for c in norm).strip("._") or "upload"',
+    'if not safe.lower().endswith(".pdf"):',
+    '    safe += ".pdf"',
+    'is_ascii = all(ord(c) < 128 for c in pdf_path) and all(ord(c) < 128 for c in base)',
+    'tmpdir = None',
+    'upload_path = pdf_path',
+    'display_name = base',
+    'if not is_ascii:',
+    '    tmpdir = tempfile.mkdtemp(prefix="gemini_upload_")',
+    '    upload_path = os.path.join(tmpdir, safe)',
+    '    shutil.copy2(pdf_path, upload_path)',
+    '    display_name = safe',
+    'f = client.files.upload(file=upload_path, config={"mime_type":"application/pdf","display_name":display_name})',
     'print(json.dumps({"name": f.name}))',
-  ].join('; ');
+    'if tmpdir:',
+    '    shutil.rmtree(tmpdir, ignore_errors=True)',
+  ].join('\n');
   const result = spawnSync(PYTHON_EXEC, ['-c', code, pdfPath], {
     env: {
       ...process.env,
@@ -851,64 +949,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return pipelineWorkers.get(key);
   }
 
-  function spawnDownloadOnce({ corpusId, batchSize, downloadDir }) {
-    const dbPath = DB_PATH;
-    const args = ['--db-path', dbPath, '--limit', String(batchSize)];
-    if (downloadDir) {
-      args.push('--download-dir', String(downloadDir));
-    }
-    const corpusTag = corpusId || 'none';
-
-    const env = {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-      RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-      RAG_FEEDER_DB_PATH: dbPath,
-    };
-    if (corpusId !== undefined && corpusId !== null) {
-      args.push('--corpus-id', String(corpusId));
-    }
-
-    const child = spawn(PYTHON_EXEC, [DOWNLOAD_WORKER_ONCE_SCRIPT, ...args], { env });
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (data) => {
-      const message = data.toString();
-      stdout += message;
-      message
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .forEach((line) => send(`[download-worker] corpus=${corpusTag} ${line}`));
-    });
-
-    child.stderr.on('data', (data) => {
-      const message = data.toString();
-      stderr += message;
-      message
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .forEach((line) => send(`[download-worker ERROR] corpus=${corpusTag} ${line}`));
-    });
-
-  const done = new Promise((resolve, reject) => {
-      child.on('close', (code) => {
-        if (code !== 0) {
-          return reject(new Error(`Python script failed (${code}): ${stderr || stdout}`));
-        }
-        try {
-          const payload = parseJsonFromOutput(stdout);
-          return resolve(payload);
-        } catch (error) {
-          return reject(error);
-        }
-      });
-    });
-
-    return { child, done };
-  }
-
-  async function tickDownloadWorker(corpusId) {
+  function tickDownloadWorker(corpusId) {
     const state = getOrInitWorkerState(corpusId);
     if (!state.running || state.inFlight) return;
     state.inFlight = true;
@@ -916,19 +957,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     state.lastError = null;
     const { batchSize } = state.config;
     const corpusTag = corpusId || 'none';
-    send(`[download-worker] corpus=${corpusTag} tick batch=${batchSize}`);
+    
     try {
-      const { child, done } = spawnDownloadOnce({ corpusId, batchSize });
-      state.child = child;
-      state.lastResult = await done;
-      send(
-        `[download-worker] corpus=${corpusTag} done processed=${state.lastResult.processed} downloaded=${state.lastResult.downloaded} failed=${state.lastResult.failed} skipped=${state.lastResult.skipped}`
-      );
+      authDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(corpusId, 'download', JSON.stringify({ batchSize }));
     } catch (error) {
       state.lastError = error?.message || String(error);
-      send(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
+      console.error(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
     } finally {
-      state.child = null;
       state.inFlight = false;
     }
   }
@@ -956,14 +993,130 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       clearInterval(state.intervalId);
       state.intervalId = null;
     }
-    if (force && state.child) {
-      try {
-        state.child.kill('SIGTERM');
-      } catch (error) {
-        // ignore
-      }
-    }
     return state;
+  }
+
+  function cancelDownloadJobs(corpusId, { includeRunning = true, reason = 'stopped_by_user' } = {}) {
+    if (!tableExists(authDb, 'pipeline_jobs')) {
+      return { pending: 0, running: 0 };
+    }
+    const resultPayload = JSON.stringify({
+      cancelled: true,
+      reason: String(reason || 'stopped_by_user'),
+      at: new Date().toISOString(),
+    });
+    let pending = 0;
+    let running = 0;
+    try {
+      pending = Number(
+        authDb
+          .prepare(
+            `UPDATE pipeline_jobs
+             SET status = 'cancelled',
+                 finished_at = CURRENT_TIMESTAMP,
+                 result_json = COALESCE(result_json, ?)
+             WHERE job_type = 'download'
+               AND status = 'pending'
+               AND corpus_id IS ?`
+          )
+          .run(resultPayload, corpusId ?? null).changes || 0
+      );
+      if (includeRunning) {
+        running = Number(
+          authDb
+            .prepare(
+              `UPDATE pipeline_jobs
+               SET status = 'cancelled',
+                   finished_at = CURRENT_TIMESTAMP,
+                   result_json = COALESCE(result_json, ?)
+               WHERE job_type = 'download'
+                 AND status = 'running'
+                 AND corpus_id IS ?`
+            )
+            .run(resultPayload, corpusId ?? null).changes || 0
+        );
+      }
+    } catch (error) {
+      console.warn(`[download-worker] Failed to cancel download jobs for corpus=${corpusId ?? 'none'}: ${error?.message || error}`);
+    }
+    return { pending, running };
+  }
+
+  function cancelAllDownloadJobs({ includeRunning = true, reason = 'stopped_by_user' } = {}) {
+    if (!tableExists(authDb, 'pipeline_jobs')) {
+      return { pending: 0, running: 0 };
+    }
+    const resultPayload = JSON.stringify({
+      cancelled: true,
+      reason: String(reason || 'stopped_by_user'),
+      at: new Date().toISOString(),
+    });
+    let pending = 0;
+    let running = 0;
+    try {
+      pending = Number(
+        authDb
+          .prepare(
+            `UPDATE pipeline_jobs
+             SET status = 'cancelled',
+                 finished_at = CURRENT_TIMESTAMP,
+                 result_json = COALESCE(result_json, ?)
+             WHERE job_type = 'download'
+               AND status = 'pending'`
+          )
+          .run(resultPayload).changes || 0
+      );
+      if (includeRunning) {
+        running = Number(
+          authDb
+            .prepare(
+              `UPDATE pipeline_jobs
+               SET status = 'cancelled',
+                   finished_at = CURRENT_TIMESTAMP,
+                   result_json = COALESCE(result_json, ?)
+               WHERE job_type = 'download'
+                 AND status = 'running'`
+            )
+            .run(resultPayload).changes || 0
+        );
+      }
+    } catch (error) {
+      console.warn(`[download-worker] Failed to cancel all download jobs: ${error?.message || error}`);
+    }
+    return { pending, running };
+  }
+
+  function countDownloadPipelineJobs(corpusId) {
+    if (!tableExists(authDb, 'pipeline_jobs')) {
+      return { pending: 0, running: 0 };
+    }
+    try {
+      const pending = Number(
+        authDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM pipeline_jobs
+             WHERE job_type = 'download'
+               AND status = 'pending'
+               AND corpus_id IS ?`
+          )
+          .get(corpusId ?? null)?.count || 0
+      );
+      const running = Number(
+        authDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM pipeline_jobs
+             WHERE job_type = 'download'
+               AND status = 'running'
+               AND corpus_id IS ?`
+          )
+          .get(corpusId ?? null)?.count || 0
+      );
+      return { pending, running };
+    } catch (error) {
+      return { pending: 0, running: 0 };
+    }
   }
 
   function countQueuedDownloads(corpusId) {
@@ -987,6 +1140,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       return 0;
     }
+  }
+
+  function resolveAutoDownloadBatchSize(corpusId) {
+    const queued = countQueuedDownloads(corpusId);
+    const minBatch = 25;
+    const maxBatch = Math.max(minBatch, coerceInt(process.env.RAG_FEEDER_DOWNLOAD_BATCH_MAX, 200) || 200);
+    if (queued <= 0) return minBatch;
+    return Math.max(minBatch, Math.min(maxBatch, queued));
   }
 
   function resolveDownloadWorkerCount({ corpusId, requestedWorkers = 0, batchSize = 3 }) {
@@ -1057,163 +1218,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const corpusTag = corpusId || 'none';
     state.lastTickAt = new Date().toISOString();
     state.lastError = null;
-    state.children = [];
-
-    const promoteBatchSize = Math.max(1, Number(state.config.promoteBatchSize || 10));
-    const promoteWorkers = Math.max(1, Number(state.config.promoteWorkers || 1));
-    const downloadBatchSize = Math.max(1, Number(state.config.downloadBatchSize || 3));
-    const workerCount = resolveDownloadWorkerCount({
-      corpusId,
-      requestedWorkers: Number(state.config.downloadWorkers || 0),
-      batchSize: downloadBatchSize,
-    });
-    state.resolvedDownloadWorkers = workerCount;
-
-    let hadActivity = false;
+    
     try {
-      const markRun = spawnPythonJson(
-        INGEST_MARK_NEXT_RAW_SCRIPT,
-        ['--db-path', DB_PATH, '--limit', String(promoteBatchSize)],
-        {
-          dbPath: DB_PATH,
-          corpusId,
-          onStdoutLine: (line) => send(`[pipeline-worker mark] corpus=${corpusTag} ${line}`),
-          onStderrLine: (line) => send(`[pipeline-worker mark ERROR] corpus=${corpusTag} ${line}`),
-        }
-      );
-      state.children.push(markRun.child);
-      const marked = await markRun.done;
-      state.children = state.children.filter((child) => child !== markRun.child);
-      const markedRaw = Number(marked?.marked || 0);
-      const markedCandidates = Number(marked?.available || 0);
-      if (markedRaw > 0 || markedCandidates > 0) {
-        send(`[pipeline-worker] corpus=${corpusTag} marked raw=${markedRaw} candidates=${markedCandidates}`);
-      }
-      hadActivity = hadActivity || markedRaw > 0;
-
-      const promoteRun = spawnPythonJson(
-        INGEST_PROCESS_MARKED_SCRIPT,
-        [
-          '--db-path',
-          DB_PATH,
-          '--limit',
-          String(promoteBatchSize),
-          '--workers',
-          String(promoteWorkers),
-          '--no-fetch-references',
-        ],
-        {
-          dbPath: DB_PATH,
-          corpusId,
-          onStdoutLine: (line) => send(`[pipeline-worker enrich] corpus=${corpusTag} ${line}`),
-          onStderrLine: (line) => send(`[pipeline-worker enrich ERROR] corpus=${corpusTag} ${line}`),
-        }
-      );
-      state.children.push(promoteRun.child);
-      const promoted = await promoteRun.done;
-      state.children = state.children.filter((child) => child !== promoteRun.child);
-      const promotionResults = Array.isArray(promoted?.results) ? promoted.results : [];
-      promotionResults.forEach((row) => {
-        const action = String(row?.action || '');
-        if (action !== 'queued' && action !== 'enqueue_skipped') return;
-        emitPromotionEvent({
-          corpusId,
-          transition: 'raw_to_metadata',
-          fromStage: 'raw',
-          toStage: 'metadata',
-          itemId: row?.no_metadata_id,
-          destItemId: row?.with_metadata_id,
-          title: row?.title || null,
-        });
-      });
-      const promotedProcessed = Number(promoted?.processed || 0);
-      const promotedPromoted = Number(promoted?.promoted || 0);
-      const promotedQueued = Number(promoted?.queued || 0);
-      const promotedFailed = Number(promoted?.failed || 0);
-      if (promotedProcessed > 0 || promotedPromoted > 0 || promotedQueued > 0 || promotedFailed > 0) {
-        send(
-          `[pipeline-worker] corpus=${corpusTag} enrich processed=${promotedProcessed} ` +
-            `promoted=${promotedPromoted} queued=${promotedQueued} failed=${promotedFailed}`
-        );
-      }
-      hadActivity =
-        hadActivity ||
-        promotedProcessed > 0 ||
-        promotedPromoted > 0 ||
-        promotedQueued > 0 ||
-        promotedFailed > 0;
-
-      const runs = [];
-      for (let i = 0; i < workerCount; i += 1) {
-        const { child, done } = spawnDownloadOnce({ corpusId, batchSize: downloadBatchSize });
-        state.children.push(child);
-        runs.push(done);
-      }
-      const settled = await Promise.allSettled(runs);
-      const payloads = settled
-        .filter((result) => result.status === 'fulfilled')
-        .map((result) => result.value);
-      const rejected = settled
-        .filter((result) => result.status === 'rejected')
-        .map((result) => result.reason?.message || String(result.reason || 'unknown error'));
-      const downloads = aggregateDownloadPayloads(payloads);
-      downloads.errors.push(...rejected);
-      payloads.forEach((payload) => {
-        const rows = Array.isArray(payload?.results) ? payload.results : [];
-        rows.forEach((row) => {
-          if (String(row?.action || '') !== 'downloaded') return;
-          emitPromotionEvent({
-            corpusId,
-            transition: 'metadata_to_downloaded',
-            fromStage: 'metadata',
-            toStage: 'downloaded',
-            itemId: row?.with_metadata_id ?? row?.queue_id,
-            destItemId: row?.downloaded_id,
-            title: row?.title || null,
-          });
-        });
-      });
-
-      if (
-        downloads.processed > 0 ||
-        downloads.downloaded > 0 ||
-        downloads.failed > 0 ||
-        downloads.skipped > 0 ||
-        downloads.errors.length > 0
-      ) {
-        send(
-          `[pipeline-worker] corpus=${corpusTag} download processed=${downloads.processed} downloaded=${downloads.downloaded} ` +
-            `failed=${downloads.failed} skipped=${downloads.skipped}`
-        );
-      }
-      hadActivity =
-        hadActivity || downloads.processed > 0 || downloads.downloaded > 0 || downloads.failed > 0 || downloads.skipped > 0;
-
-      state.lastResult = {
-        marked: {
-          requested: Number(marked?.requested || promoteBatchSize),
-          marked: Number(marked?.marked || 0),
-          available: Number(marked?.available || 0),
-        },
-        promoted: {
-          processed: Number(promoted?.processed || 0),
-          promoted: Number(promoted?.promoted || 0),
-          queued: Number(promoted?.queued || 0),
-          failed: Number(promoted?.failed || 0),
-        },
-        downloads,
-        workers: workerCount,
-      };
-      state.lastError = downloads.errors.length ? downloads.errors[0] : null;
+      authDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(corpusId, 'pipeline_tick', JSON.stringify({ config: state.config }));
     } catch (error) {
       state.lastError = error?.message || String(error);
-      send(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
+      console.error(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
     } finally {
-      state.children = [];
       state.inFlight = false;
-      if (state.running && hadActivity) {
-        setTimeout(() => tickPipelineWorker(corpusId), 0);
-      }
     }
   }
 
@@ -1238,7 +1252,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const legacy = getOrInitWorkerState(corpusId);
     if (legacy.running || legacy.inFlight) {
       stopDownloadWorker(corpusId, { force: false });
-      send('[pipeline-worker] paused legacy download-only worker for this corpus');
     }
 
     if (state.running) return state;
@@ -1255,15 +1268,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (state.intervalId) {
       clearInterval(state.intervalId);
       state.intervalId = null;
-    }
-    if (force && Array.isArray(state.children)) {
-      state.children.forEach((child) => {
-        try {
-          child.kill('SIGTERM');
-        } catch (error) {
-          // ignore
-        }
-      });
     }
     return state;
   }
@@ -1490,6 +1494,102 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.json({ shared: true });
   });
 
+  app.delete('/api/corpora/:id', requireAuthMiddleware, (req, res) => {
+    const corpusId = Number(req.params.id);
+    if (!Number.isFinite(corpusId) || corpusId <= 0) {
+      return res.status(400).json({ error: 'Invalid corpus id' });
+    }
+
+    const access = authDb
+      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
+      .get(req.user.id, corpusId);
+    if (!access || access.role !== 'owner') {
+      return res.status(403).json({ error: 'Only owners can delete corpora' });
+    }
+
+    const corpus = authDb
+      .prepare('SELECT id, name FROM corpora WHERE id = ?')
+      .get(corpusId);
+    if (!corpus) {
+      return res.status(404).json({ error: 'Corpus not found' });
+    }
+
+    // Stop in-memory schedulers first so they do not keep queueing jobs for a deleted corpus.
+    pausePipelineWorker(corpusId, { force: false });
+    stopDownloadWorker(corpusId, { force: false });
+    pipelineWorkers.delete(corpusId);
+    downloadWorkers.delete(corpusId);
+
+    try {
+      const result = authDb.transaction(() => {
+        const affectedUsers = authDb
+          .prepare('SELECT DISTINCT user_id FROM user_corpora WHERE corpus_id = ?')
+          .all(corpusId)
+          .map((row) => Number(row.user_id))
+          .filter((id) => Number.isFinite(id) && id > 0);
+
+        if (tableExists(authDb, 'pipeline_jobs')) {
+          authDb.prepare('DELETE FROM pipeline_jobs WHERE corpus_id = ?').run(corpusId);
+        }
+        if (tableExists(authDb, 'ingest_entries')) {
+          authDb.prepare('DELETE FROM ingest_entries WHERE corpus_id = ?').run(corpusId);
+        }
+        if (tableExists(authDb, 'ingest_source_metadata')) {
+          authDb.prepare('DELETE FROM ingest_source_metadata WHERE corpus_id = ?').run(corpusId);
+        }
+        authDb.prepare('DELETE FROM corpus_items WHERE corpus_id = ?').run(corpusId);
+        authDb.prepare('DELETE FROM user_corpora WHERE corpus_id = ?').run(corpusId);
+        authDb.prepare('DELETE FROM corpora WHERE id = ?').run(corpusId);
+
+        let fallbackCreated = 0;
+        let requesterSelectedCorpusId = null;
+
+        for (const userId of affectedUsers) {
+          let nextCorpusId = authDb
+            .prepare(
+              `SELECT c.id
+               FROM corpora c
+               JOIN user_corpora uc ON uc.corpus_id = c.id
+               WHERE uc.user_id = ?
+               ORDER BY c.created_at DESC, c.id DESC
+               LIMIT 1`
+            )
+            .get(userId)?.id;
+
+          if (!nextCorpusId) {
+            const created = authDb
+              .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+              .run('Default Corpus', userId);
+            nextCorpusId = created.lastInsertRowid;
+            authDb
+              .prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')")
+              .run(userId, nextCorpusId);
+            fallbackCreated += 1;
+          }
+
+          authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(nextCorpusId, userId);
+          if (userId === req.user.id) {
+            requesterSelectedCorpusId = nextCorpusId;
+          }
+        }
+
+        return {
+          deleted: true,
+          deleted_id: corpusId,
+          deleted_name: corpus.name,
+          selected_corpus_id: requesterSelectedCorpusId,
+          affected_users: affectedUsers.length,
+          fallback_corpora_created: fallbackCreated,
+        };
+      })();
+
+      return res.json(result);
+    } catch (error) {
+      console.error('[/api/corpora/:id DELETE] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to delete corpus' });
+    }
+  });
+
   // Legacy `/api/bibliographies/*` endpoints were removed.
   // The app is DB-first; ingestion results are accessed via `/api/ingest/*`.
 
@@ -1551,7 +1651,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   // --- END MODIFIED UPLOAD ENDPOINT ---
 
   // --- NEW ENDPOINT: Extract Bibliography ---
-  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, (req, res) => {
+  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, async (req, res) => {
     const { filename } = req.params;
     const corpusId = req.corpusId;
     const corpusTag = String(corpusId || 'none');
@@ -1687,7 +1787,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           extractMode: 'inline',
           chunkPages,
           uploadedFileName: sharedUploadedFileName,
-          modelOverride: 'gemini-3-flash-preview',
+          modelOverride: 'gemini-3.1-flash-lite-preview',
           label: 'APIscraper inline fallback',
         });
         return ok;
@@ -1697,6 +1797,27 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (!inputExists && pagesExist) {
         console.log(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
         send(`[/api/extract-bibliography][corpus=${corpusTag}] Upload missing; reusing extracted pages in ${existingPagesDir}`);
+        try {
+          const sourceMetadataPath = path.join(existingPagesDir, 'source_metadata.json');
+          if (fs.existsSync(sourceMetadataPath)) {
+            const parsed = JSON.parse(fs.readFileSync(sourceMetadataPath, 'utf8'));
+            const sourceMetadata = normalizeIngestSourceMetadata(parsed?.source_metadata);
+            if (sourceMetadata) {
+              const saved = upsertIngestSourceMetadata(authDb, {
+                corpusId,
+                ingestSource: baseName,
+                sourcePdf: null,
+                sourceMetadata,
+              });
+              if (saved) {
+                send(`[/api/extract-bibliography][corpus=${corpusTag}] Loaded source metadata from existing extraction.`);
+              }
+            }
+          }
+        } catch (sourceMetaErr) {
+          console.warn(`[/api/extract-bibliography] Failed to read source metadata sidecar from reused pages: ${sourceMetaErr?.message || sourceMetaErr}`);
+          send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar could not be loaded from reused pages.`);
+        }
         runApiScraper({
           inputDir: existingPagesDir,
           extractMode: 'page',
@@ -1745,6 +1866,34 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             console.error(errorMessage);
             await runInlineFallback(`get_bib_pages failed with code ${code}`);
             return;
+          }
+
+          // get_bib_pages now writes source_metadata.json from the same Gemini call
+          // that detects reference sections; ingest it before page/inline extraction.
+          try {
+            const sourceMetadataPath = path.join(existingPagesDir, 'source_metadata.json');
+            if (fs.existsSync(sourceMetadataPath)) {
+              const parsed = JSON.parse(fs.readFileSync(sourceMetadataPath, 'utf8'));
+              const sourceMetadata = normalizeIngestSourceMetadata(parsed?.source_metadata);
+              if (sourceMetadata) {
+                const saved = upsertIngestSourceMetadata(authDb, {
+                  corpusId,
+                  ingestSource: baseName,
+                  sourcePdf: inputPdfPath,
+                  sourceMetadata,
+                });
+                if (saved) {
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata extracted and saved.`);
+                }
+              } else {
+                send(`[/api/extract-bibliography][corpus=${corpusTag}] No source metadata inferred from section-detection call.`);
+              }
+            } else {
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar not found after section extraction.`);
+            }
+          } catch (sourceMetaErr) {
+            console.warn(`[/api/extract-bibliography] Failed to read source metadata sidecar: ${sourceMetaErr?.message || sourceMetaErr}`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar could not be parsed.`);
           }
 
           // Proceed to page-level parsing when extracted pages exist; otherwise fallback to inline citation extraction.
@@ -2019,6 +2168,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.post('/api/ingest/process-marked', requireAuthMiddleware, async (req, res) => {
     const limit = coerceInt(req.body?.limit, 10);
     const workers = coerceInt(req.body?.workers, 6);
+    const enqueueDownload = Boolean(req.body?.enqueueDownload);
+    const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 25);
     const expansion = buildUploadedDocsExpansion({
       relatedDepth: req.body?.relatedDepth,
       maxRelated: req.body?.maxRelated,
@@ -2033,32 +2184,48 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (workers === null || workers === undefined || !Number.isFinite(workers) || workers <= 0) {
       return res.status(400).json({ error: 'workers must be a positive number' });
     }
+    if (enqueueDownload && (downloadBatchSize === null || downloadBatchSize === undefined || !Number.isFinite(downloadBatchSize) || downloadBatchSize <= 0)) {
+      return res.status(400).json({ error: 'downloadBatchSize must be a positive number' });
+    }
 
-    const dbPath = DB_PATH;
-    const args = ['--db-path', dbPath, '--limit', String(limit), '--workers', String(workers)];
-    const shouldFetchReferences = expansion.includeDownstream;
-    args.push(shouldFetchReferences ? '--fetch-references' : '--no-fetch-references');
-    applyUploadedDocsExpansionArgs(args, expansion);
     try {
-      const payload = await runPythonJson(INGEST_PROCESS_MARKED_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      const rows = Array.isArray(payload?.results) ? payload.results : [];
-      rows.forEach((row) => {
-        const action = String(row?.action || '');
-        if (action !== 'queued' && action !== 'enqueue_skipped') return;
-        emitPromotionEvent({
-          corpusId: req.corpusId,
-          transition: 'raw_to_metadata',
-          fromStage: 'raw',
-          toStage: 'metadata',
-          itemId: row?.no_metadata_id,
-          destItemId: row?.with_metadata_id,
-          title: row?.title || null,
-        });
+      const jobParams = {
+        limit,
+        workers,
+        expansion,
+        shouldFetchReferences: expansion.includeDownstream
+      };
+
+      const insertJobStmt = authDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      );
+      const insertProcessMarkedJobs = authDb.transaction(() => {
+        const enrichResult = insertJobStmt.run(req.corpusId, 'enrich', JSON.stringify(jobParams));
+        let downloadJobId = null;
+        if (enqueueDownload) {
+          const dlParams = { batchSize: downloadBatchSize };
+          const dlResult = insertJobStmt.run(req.corpusId, 'download', JSON.stringify(dlParams));
+          downloadJobId = dlResult.lastInsertRowid;
+        }
+        return {
+          enrichJobId: enrichResult.lastInsertRowid,
+          downloadJobId,
+        };
       });
-      return res.json(payload);
+      const queued = insertProcessMarkedJobs();
+
+      return res.json({
+        success: true, 
+        job_id: queued.enrichJobId,
+        enrich_job_id: queued.enrichJobId,
+        download_job_id: queued.downloadJobId,
+        message: enqueueDownload
+          ? 'Enrichment and download jobs queued successfully.'
+          : 'Enrichment job queued successfully.'
+      });
     } catch (error) {
       console.error('[/api/ingest/process-marked] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to process marked ingest entries' });
+      return res.status(500).json({ error: error.message || 'Failed to queue marked ingest entries for processing' });
     }
   });
 
@@ -2182,68 +2349,47 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.post('/api/pipeline/worker/start', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: true, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const intervalSeconds = coerceInt(req.body?.intervalSeconds, 15);
-    const promoteBatchSize = coerceInt(req.body?.promoteBatchSize, 25);
-    const promoteWorkers = coerceInt(req.body?.promoteWorkers, 6);
-    const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 5);
-    const downloadWorkersRequested = coerceInt(req.body?.downloadWorkers, 0);
-    const state = startPipelineWorker(req.corpusId, {
-      intervalSeconds,
-      promoteBatchSize,
-      promoteWorkers,
-      downloadBatchSize,
-      downloadWorkers: downloadWorkersRequested,
-    });
+    
+    const state = getOrInitPipelineWorkerState(req.corpusId);
+    state.running = true;
+    
     return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
+      running: true,
+      in_flight: false,
       config: state.config,
-      resolved_download_workers: state.resolvedDownloadWorkers,
+      resolved_download_workers: state.config.downloadWorkers || 0,
     });
   });
 
   app.post('/api/pipeline/worker/pause', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: false, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const force = Boolean(req.body?.force);
-    const state = pausePipelineWorker(req.corpusId, { force });
-    return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
-      config: state.config,
-      resolved_download_workers: state.resolvedDownloadWorkers,
-    });
+    
+    const state = getOrInitPipelineWorkerState(req.corpusId);
+    state.running = false;
+    return res.json({ running: false });
   });
 
   app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({
-        pipeline: { stopped: 0, in_flight: 0, wasRunning: 0, states: {} },
-        downloads: { stopped: 0, in_flight: 0, wasRunning: 0, states: {} },
-        force: Boolean(req.body?.force),
-      });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const force = Boolean(req.body?.force);
-    const pipelineResult = pauseAllPipelineWorkers({ force });
-    const downloadResult = stopAllDownloadWorkers({ force });
-    send(`[pipeline-worker] corpus=all stopped all workers force=${force}`);
+
+    const pipeline = pauseAllPipelineWorkers({ force: true });
+    const downloads = stopAllDownloadWorkers({ force: true });
+    const cancelledJobs = cancelAllDownloadJobs({
+      includeRunning: true,
+      reason: 'pipeline_pause_all',
+    });
     return res.json({
-      pipeline: pipelineResult,
-      downloads: downloadResult,
-      force,
+      pipeline,
+      downloads,
+      cancelled_jobs: cancelledJobs,
+      force: true,
     });
   });
 
@@ -2255,95 +2401,144 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
     const state = getOrInitWorkerState(req.corpusId);
+    let queuedJobs = 0;
+    let runningJobs = 0;
+    try {
+      const pendingRow = authDb
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM pipeline_jobs
+           WHERE job_type = 'download'
+             AND status = 'pending'
+             AND corpus_id IS ?`
+        )
+        .get(req.corpusId ?? null);
+      queuedJobs = Number(pendingRow?.count || 0);
+      const runningRow = authDb
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM pipeline_jobs
+           WHERE job_type = 'download'
+             AND status = 'running'
+             AND corpus_id IS ?`
+        )
+        .get(req.corpusId ?? null);
+      runningJobs = Number(runningRow?.count || 0);
+    } catch (error) {
+      // Best-effort; keep legacy in-memory state if query fails.
+    }
+
+    const queueActive = queuedJobs > 0 || runningJobs > 0;
+    const legacyIntervalActive = Boolean(state.running && state.intervalId);
+    const effectiveRunning = queueActive || legacyIntervalActive;
     return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
+      running: effectiveRunning,
+      in_flight: state.inFlight || runningJobs > 0,
       started_at: state.startedAt,
       last_tick_at: state.lastTickAt,
       last_result: state.lastResult,
       last_error: state.lastError,
       config: state.config,
+      queued_jobs: queuedJobs,
+      running_jobs: runningJobs,
     });
   });
 
   app.post('/api/downloads/worker/start', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: true, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const pipelineState = getOrInitPipelineWorkerState(req.corpusId);
-    if (pipelineState.running || pipelineState.inFlight) {
-      return res.status(409).json({ error: 'Global pipeline worker is active; pause it first.' });
+    const state = getOrInitWorkerState(req.corpusId);
+    const perJobMax = Math.max(1, Math.min(5000, coerceInt(process.env.RAG_FEEDER_DOWNLOAD_JOB_MAX, 150) || 150));
+    const queueDepth = countQueuedDownloads(req.corpusId);
+    const existingJobs = countDownloadPipelineJobs(req.corpusId);
+    const existingOutstanding = Number(existingJobs.pending || 0) + Number(existingJobs.running || 0);
+    const desiredJobs = queueDepth > 0 ? Math.ceil(queueDepth / perJobMax) : 0;
+    const jobsToQueue = Math.max(0, desiredJobs - existingOutstanding);
+    
+    try {
+      let queuedJobs = 0;
+      if (jobsToQueue > 0) {
+        const insert = authDb.prepare(
+          "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+        );
+        const enqueueMany = authDb.transaction(() => {
+          for (let index = 0; index < jobsToQueue; index += 1) {
+            const remaining = Math.max(1, queueDepth - index * perJobMax);
+            const batchSize = Math.max(1, Math.min(perJobMax, remaining));
+            insert.run(req.corpusId, 'download', JSON.stringify({ batchSize }));
+            queuedJobs += 1;
+          }
+        });
+        enqueueMany();
+      }
+
+      // Queue-driven mode still reports a worker state in UI; keep it in sync.
+      state.running = queueDepth > 0 || existingOutstanding > 0 || queuedJobs > 0;
+      if (state.running) {
+        state.startedAt = state.startedAt || new Date().toISOString();
+      }
+      state.lastTickAt = new Date().toISOString();
+      state.lastError = null;
+      state.config = { ...state.config, batchSize: perJobMax };
+
+      return res.json({ 
+        running: state.running,
+        queued_jobs: queuedJobs,
+        queued_download_items: queueDepth,
+        outstanding_jobs_before: existingOutstanding,
+        desired_jobs: desiredJobs,
+        per_job_max: perJobMax,
+        batch_size: perJobMax,
+        mode: 'auto',
+        message: queuedJobs > 0
+          ? `Queued ${queuedJobs} download job(s) to drain ${queueDepth} queued item(s).`
+          : 'Download backlog already covered by existing queued/running jobs.'
+      });
+    } catch (error) {
+      console.error('[/api/downloads/worker/start] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to queue download job' });
     }
-    const intervalSeconds = coerceInt(req.body?.intervalSeconds, 60);
-    const batchSize = coerceInt(req.body?.batchSize, 3);
-    const state = startDownloadWorker(req.corpusId, { intervalSeconds, batchSize });
-    return res.json({ running: state.running, config: state.config });
   });
 
   app.post('/api/downloads/worker/stop', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: false, stub: true });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const force = Boolean(req.body?.force);
-    const state = stopDownloadWorker(req.corpusId, { force });
-    return res.json({ running: state.running });
+    const state = getOrInitWorkerState(req.corpusId);
+    state.running = false;
+    if (state.intervalId) {
+      clearInterval(state.intervalId);
+      state.intervalId = null;
+    }
+    const cancelledJobs = cancelDownloadJobs(req.corpusId, {
+      includeRunning: true,
+      reason: 'download_worker_stop',
+    });
+    return res.json({ running: false, cancelled_jobs: cancelledJobs });
   });
 
   app.post('/api/downloads/worker/run-once', requireAuthMiddleware, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ processed: 0, downloaded: 0, failed: 0, skipped: 0, source: 'stub' });
-    }
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    const pipelineState = getOrInitPipelineWorkerState(req.corpusId);
-    if (pipelineState.running || pipelineState.inFlight) {
-      return res.status(409).json({ error: 'Global pipeline worker is active; pause it first.' });
-    }
-    const batchSize = coerceInt(req.body?.batchSize, 3);
-    const state = getOrInitWorkerState(req.corpusId);
-    if (state.inFlight) {
-      return res.status(409).json({ error: 'Worker is already processing a batch' });
-    }
-    state.inFlight = true;
-    state.lastTickAt = new Date().toISOString();
-    state.lastError = null;
-    send(`[download-worker] run-once corpus=${req.corpusId || 'none'} batch=${batchSize}`);
+    const batchSize = resolveAutoDownloadBatchSize(req.corpusId);
+    
     try {
-      const { child, done } = spawnDownloadOnce({ corpusId: req.corpusId, batchSize });
-      state.child = child;
-      const payload = await done;
-      const resultRows = Array.isArray(payload?.results) ? payload.results : [];
-      resultRows.forEach((row) => {
-        if (String(row?.action || '') !== 'downloaded') return;
-        emitPromotionEvent({
-          corpusId: req.corpusId,
-          transition: 'metadata_to_downloaded',
-          fromStage: 'metadata',
-          toStage: 'downloaded',
-          itemId: row?.with_metadata_id ?? row?.queue_id,
-          destItemId: row?.downloaded_id,
-          title: row?.title || null,
-        });
+      const result = authDb.prepare(
+        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+      ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
+
+      return res.json({ 
+        success: true, 
+        job_id: result.lastInsertRowid,
+        batch_size: batchSize,
+        mode: 'auto',
+        message: 'Download job queued successfully (auto throughput mode).'
       });
-      state.lastResult = payload;
-      send(
-        `[download-worker] done processed=${payload.processed} downloaded=${payload.downloaded} failed=${payload.failed} skipped=${payload.skipped}`
-      );
-      return res.json(payload);
     } catch (error) {
-      state.lastError = error?.message || String(error);
-      send(`[download-worker ERROR] ${state.lastError}`);
-      return res.status(500).json({ error: state.lastError });
-    } finally {
-      state.child = null;
-      state.inFlight = false;
+      console.error('[/api/downloads/worker/run-once] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to queue download job' });
     }
   });
 

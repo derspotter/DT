@@ -23,6 +23,7 @@ import shutil
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,6 +56,19 @@ MAX_PAGES_FOR_API = 50
 CHUNK_SIZE = 50
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return max(minimum, int(default))
+    try:
+        return max(minimum, int(raw))
+    except Exception:
+        return max(minimum, int(default))
+
+
+GET_BIB_CHUNK_WORKERS = _env_int("RAG_FEEDER_GET_BIB_CHUNK_WORKERS", 6)
+
+
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 api_client = None
@@ -66,6 +80,7 @@ if api_key:
 
 
 SECTION_JSON_RE = re.compile(r"```json\s*([\s\S]*?)\s*```", re.IGNORECASE)
+SOURCE_METADATA_FILENAME = "source_metadata.json"
 
 
 def _clean_json_response(text: str) -> str:
@@ -104,26 +119,146 @@ def _normalize_sections(sections: list[dict], total_pages: int) -> list[dict]:
     return normalized
 
 
-def _rate_limiter_wait(kind: str) -> None:
+def _normalize_source_metadata(value: dict | None) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+
+    normalized: dict = {}
+    title = value.get("title")
+    if isinstance(title, str) and title.strip():
+        normalized["title"] = title.strip()
+
+    authors = value.get("authors")
+    if isinstance(authors, list):
+        cleaned = [str(a).strip() for a in authors if str(a).strip()]
+        if cleaned:
+            normalized["authors"] = cleaned
+
+    year = value.get("year")
+    if isinstance(year, (int, float)):
+        normalized["year"] = int(year)
+    elif isinstance(year, str):
+        y = year.strip()
+        if y:
+            normalized["year"] = y
+
+    doi = value.get("doi")
+    if isinstance(doi, str) and doi.strip():
+        normalized["doi"] = doi.strip()
+
+    source = value.get("source")
+    if isinstance(source, str) and source.strip():
+        normalized["source"] = source.strip()
+
+    publisher = value.get("publisher")
+    if isinstance(publisher, str) and publisher.strip():
+        normalized["publisher"] = publisher.strip()
+
+    return normalized or None
+
+
+def _parse_section_and_source_payload(json_text: str) -> tuple[list[dict], dict | None]:
+    if not json_text:
+        return [], None
+    try:
+        parsed = json.loads(json_text)
+    except Exception:
+        return [], None
+
+    # Backward compatibility: plain array response.
+    if isinstance(parsed, list):
+        return parsed, None
+
+    if not isinstance(parsed, dict):
+        return [], None
+
+    sections = parsed.get("reference_sections")
+    if not isinstance(sections, list):
+        sections = parsed.get("sections")
+    if not isinstance(sections, list):
+        sections = []
+
+    source_metadata = _normalize_source_metadata(parsed.get("source_metadata"))
+    return sections, source_metadata
+
+
+def _write_source_metadata_file(output_dir: str, source_metadata: dict | None) -> None:
+    payload = {"source_metadata": source_metadata}
+    out_path = os.path.join(output_dir, SOURCE_METADATA_FILENAME)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+
+def _rate_limiter_wait(kind: str, units: int = 1) -> None:
     if not get_global_rate_limiter:
         return
     rl = get_global_rate_limiter()
     try:
-        rl.wait_if_needed(kind)
+        rl.wait_if_needed(kind, units=units)
     except Exception:
         # Rate limiter is best-effort; do not fail extraction because of it.
         return
 
 
-def _find_reference_section_pages(uploaded_pdf, total_physical_pages: int, timeout_seconds: int = 180) -> list[dict]:
+def _extract_total_tokens(response) -> int | None:
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return None
+        for key in ("total_token_count", "total_tokens"):
+            value = getattr(usage, key, None)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+    except Exception:
+        return None
+    return None
+
+
+def _find_reference_section_pages(
+    uploaded_pdf,
+    total_physical_pages: int,
+    timeout_seconds: int = 180,
+    include_source_metadata: bool = True,
+) -> tuple[list[dict], dict | None]:
     if api_client is None:
         raise RuntimeError("Gemini client not configured (set GEMINI_API_KEY or GOOGLE_API_KEY).")
 
     prompt = f"""
+Identify ALL bibliography/reference sections in this PDF and extract source document metadata.
+
+Use 1-based PHYSICAL page indices (first PDF page = 1) and ignore any printed page numbers.
+Return ONLY valid JSON in this exact shape:
+{{
+  "reference_sections": [{{"start_page": 12, "end_page": 15}}],
+  "source_metadata": {{
+    "title": "...",
+    "authors": ["..."],
+    "year": 2021,
+    "doi": "...",
+    "source": "...",
+    "publisher": "..."
+  }}
+}}
+
+Rules:
+- start_page = page where the references section begins (title or first entry). Be inclusive.
+- end_page = page where the last reference entry ends (do not include unrelated pages after).
+- Include every distinct bibliography/reference section, especially after chapters.
+- For source_metadata, infer from the attached PDF. If unavailable, use null per field.
+
+Document has {total_physical_pages} physical pages.
+""".strip()
+    if not include_source_metadata:
+        prompt = f"""
 Identify ALL bibliography/reference sections in this PDF.
 
 Use 1-based PHYSICAL page indices (first PDF page = 1) and ignore any printed page numbers.
-Return only a JSON array of objects with start_page and end_page.
+Return ONLY valid JSON in this exact shape:
+{{
+  "reference_sections": [{{"start_page": 12, "end_page": 15}}]
+}}
 
 Rules:
 - start_page = page where the references section begins (title or first entry). Be inclusive.
@@ -131,11 +266,6 @@ Rules:
 - Include every distinct bibliography/reference section, especially after chapters.
 
 Document has {total_physical_pages} physical pages.
-
-Format:
-[
-  {{"start_page": 12, "end_page": 15}}
-]
 """.strip()
 
     _rate_limiter_wait("gemini")
@@ -159,20 +289,45 @@ Format:
             future.cancel()
             raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from exc
 
+    token_count = _extract_total_tokens(resp)
+    if token_count:
+        _rate_limiter_wait("gemini_tokens", units=token_count)
+
     json_text = _clean_json_response(getattr(resp, "text", "") or "")
-    if not json_text:
-        return []
-    try:
-        parsed = json.loads(json_text)
-        return parsed if isinstance(parsed, list) else []
-    except Exception:
-        return []
+    return _parse_section_and_source_payload(json_text)
 
 
 def _upload_pdf(path: str):
     if api_client is None:
         raise RuntimeError("Gemini client not configured (set GEMINI_API_KEY or GOOGLE_API_KEY).")
-    return api_client.files.upload(file=path)
+    source_path = str(path)
+    display_name = Path(source_path).name
+    temp_upload_dir = None
+    try:
+        source_path.encode("ascii")
+        display_name.encode("ascii")
+        upload_path = source_path
+    except UnicodeEncodeError:
+        normalized = unicodedata.normalize("NFKD", display_name)
+        ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+        safe_name = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in ascii_only).strip("._")
+        if not safe_name:
+            safe_name = "upload"
+        if not safe_name.lower().endswith(".pdf"):
+            safe_name += ".pdf"
+        temp_upload_dir = tempfile.mkdtemp(prefix="gemini_upload_")
+        upload_path = os.path.join(temp_upload_dir, safe_name)
+        shutil.copy2(source_path, upload_path)
+        display_name = safe_name
+
+    try:
+        return api_client.files.upload(
+            file=upload_path,
+            config={"mime_type": "application/pdf", "display_name": display_name},
+        )
+    finally:
+        if temp_upload_dir and os.path.exists(temp_upload_dir):
+            shutil.rmtree(temp_upload_dir, ignore_errors=True)
 
 
 def _get_uploaded(name: str):
@@ -188,6 +343,37 @@ def _delete_uploaded(uploaded) -> None:
         api_client.files.delete(name=uploaded.name)
     except Exception:
         return
+
+
+def _extract_chunk_sections(
+    chunk_idx: int,
+    total_chunks: int,
+    start: int,
+    end: int,
+    chunk_path: str,
+    include_source_metadata: bool,
+):
+    uploaded = _upload_pdf(chunk_path)
+    try:
+        sections, chunk_source_metadata = _find_reference_section_pages(
+            uploaded,
+            total_physical_pages=end - start,
+            include_source_metadata=include_source_metadata,
+        )
+    finally:
+        _delete_uploaded(uploaded)
+
+    print(
+        f"[INFO] Chunk {chunk_idx}/{total_chunks} returned {len(sections)} section range(s).",
+        flush=True,
+    )
+    return {
+        "chunk_idx": chunk_idx,
+        "start": start,
+        "end": end,
+        "sections": sections,
+        "source_metadata": chunk_source_metadata if include_source_metadata else None,
+    }
 
 
 def extract_reference_sections(pdf_path: str, output_dir: str, uploaded_file_name: str | None = None) -> list[str]:
@@ -218,37 +404,105 @@ def extract_reference_sections(pdf_path: str, output_dir: str, uploaded_file_nam
             total_physical_pages = len(pdf_doc.pages)
 
         all_sections: list[dict] = []
+        source_metadata: dict | None = None
 
         if total_physical_pages > MAX_PAGES_FOR_API:
+            total_chunks = (total_physical_pages + CHUNK_SIZE - 1) // CHUNK_SIZE
+            print(
+                f"[INFO] Large PDF mode: {total_physical_pages} pages split into {total_chunks} chunk(s) of up to {CHUNK_SIZE}.",
+                flush=True,
+            )
             temp_chunk_dir = tempfile.mkdtemp(prefix="bib_chunks_")
-            for start in range(0, total_physical_pages, CHUNK_SIZE):
-                end = min(start + CHUNK_SIZE, total_physical_pages)
-                chunk_path = os.path.join(temp_chunk_dir, f"{base_name}_chunk_{start+1}-{end}.pdf")
-
-                with pikepdf.Pdf.open(pdf_path) as src_pdf:
+            chunk_specs: list[tuple[int, int, int, str]] = []
+            with pikepdf.Pdf.open(pdf_path) as src_pdf:
+                for chunk_idx, start in enumerate(range(0, total_physical_pages, CHUNK_SIZE), start=1):
+                    end = min(start + CHUNK_SIZE, total_physical_pages)
+                    chunk_path = os.path.join(temp_chunk_dir, f"{base_name}_chunk_{start+1}-{end}.pdf")
                     chunk_pdf = pikepdf.Pdf.new()
                     for idx in range(start, end):
                         chunk_pdf.pages.append(src_pdf.pages[idx])
                     chunk_pdf.save(chunk_path)
+                    chunk_specs.append((chunk_idx, start, end, chunk_path))
 
-                uploaded = _upload_pdf(chunk_path)
-                files_to_clean_up.append(uploaded)
+            first_chunk_idx, first_start, first_end, first_chunk_path = chunk_specs[0]
+            print(
+                f"[INFO] Analyzing chunk {first_chunk_idx}/{total_chunks}: pages {first_start + 1}-{first_end} (source metadata enabled).",
+                flush=True,
+            )
+            first_result = _extract_chunk_sections(
+                chunk_idx=first_chunk_idx,
+                total_chunks=total_chunks,
+                start=first_start,
+                end=first_end,
+                chunk_path=first_chunk_path,
+                include_source_metadata=True,
+            )
+            source_metadata = first_result.get("source_metadata")
+            if source_metadata:
+                print("[INFO] Source metadata extracted from first chunk (pages 1-50).", flush=True)
+            else:
+                print("[INFO] No source metadata inferred from first chunk (pages 1-50).", flush=True)
 
-                sections = _find_reference_section_pages(uploaded, total_physical_pages=end - start)
-                for sec in sections:
-                    try:
-                        sec_start = int(sec.get("start_page"))
-                        sec_end = int(sec.get("end_page"))
-                    except Exception:
-                        continue
-                    # Shift chunk-local 1-based indices to doc-global 1-based indices.
-                    all_sections.append(
-                        {
-                            "start_page": sec_start + start,
-                            "end_page": sec_end + start,
-                        }
-                    )
+            for sec in first_result.get("sections") or []:
+                try:
+                    sec_start = int(sec.get("start_page"))
+                    sec_end = int(sec.get("end_page"))
+                except Exception:
+                    continue
+                all_sections.append(
+                    {
+                        "start_page": sec_start + first_start,
+                        "end_page": sec_end + first_start,
+                    }
+                )
+
+            remaining_specs = chunk_specs[1:]
+            if remaining_specs:
+                remaining_workers = min(GET_BIB_CHUNK_WORKERS, len(remaining_specs))
+                print(
+                    f"[INFO] Analyzing remaining {len(remaining_specs)} chunk(s) in parallel (workers={remaining_workers}).",
+                    flush=True,
+                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=remaining_workers) as executor:
+                    future_map = {}
+                    for chunk_idx, start, end, chunk_path in remaining_specs:
+                        print(
+                            f"[INFO] Queued chunk {chunk_idx}/{total_chunks}: pages {start + 1}-{end}.",
+                            flush=True,
+                        )
+                        future = executor.submit(
+                            _extract_chunk_sections,
+                            chunk_idx,
+                            total_chunks,
+                            start,
+                            end,
+                            chunk_path,
+                            False,
+                        )
+                        future_map[future] = (chunk_idx, start, end)
+
+                    for future in concurrent.futures.as_completed(future_map):
+                        chunk_idx, start, _ = future_map[future]
+                        result = future.result()
+                        for sec in result.get("sections") or []:
+                            try:
+                                sec_start = int(sec.get("start_page"))
+                                sec_end = int(sec.get("end_page"))
+                            except Exception:
+                                continue
+                            all_sections.append(
+                                {
+                                    "start_page": sec_start + start,
+                                    "end_page": sec_end + start,
+                                }
+                            )
+            else:
+                print("[INFO] No additional chunks after first chunk.", flush=True)
         else:
+            print(
+                f"[INFO] Single-call mode: analyzing full PDF ({total_physical_pages} pages) for sections + source metadata.",
+                flush=True,
+            )
             if uploaded_file_name:
                 uploaded = _get_uploaded(uploaded_file_name)
                 print(f"[INFO] Reusing uploaded Gemini file: {uploaded_file_name}", flush=True)
@@ -257,10 +511,19 @@ def extract_reference_sections(pdf_path: str, output_dir: str, uploaded_file_nam
                 files_to_clean_up.append(uploaded)
             # Only auto-clean uploads we created in this process.
             # Reused uploads are cleaned up by the caller/orchestrator.
-            all_sections = _find_reference_section_pages(uploaded, total_physical_pages=total_physical_pages)
+            all_sections, source_metadata = _find_reference_section_pages(uploaded, total_physical_pages=total_physical_pages)
+            print(f"[INFO] Section detection returned {len(all_sections)} section range(s).", flush=True)
+            if source_metadata:
+                print("[INFO] Source metadata extracted from section-detection call.", flush=True)
+            else:
+                print("[INFO] No source metadata inferred from section-detection call.", flush=True)
+
+        # Persist seed/source metadata from the same Gemini call as section detection.
+        _write_source_metadata_file(specific_output_dir, source_metadata)
 
         normalized_sections = _normalize_sections(all_sections, total_physical_pages)
         if not normalized_sections:
+            print("[INFO] No valid reference sections after normalization.", flush=True)
             return []
 
         generated_files: list[str] = []

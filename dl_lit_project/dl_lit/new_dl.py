@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -79,7 +80,26 @@ class BibliographyEnhancer:
         self.client = genai.Client(api_key=api_key) if api_key else None
         # Google Search for grounding (disabled for compatibility)
         # self.google_search_tool = Tool(google_search=GoogleSearch())
-        self.proxies = proxies
+        self.proxies = self._resolve_vpn_proxies(proxies)
+        fallback_sources_raw = os.getenv("RAG_FEEDER_VPN_FALLBACK_SOURCES", "doi,publisher")
+        self.vpn_fallback_sources = {
+            token.strip().lower()
+            for token in fallback_sources_raw.split(",")
+            if token.strip()
+        }
+        self.vpn_mode = os.getenv("RAG_FEEDER_VPN_MODE", "fallback").strip().lower()
+        self.vpn_enforce_eduvpn = os.getenv("RAG_FEEDER_VPN_ENFORCE_EDUVPN", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.vpn_status_cmd = (os.getenv("RAG_FEEDER_VPN_STATUS_CMD") or "").strip()
+        self.vpn_connect_cmd = (os.getenv("RAG_FEEDER_VPN_CONNECT_CMD") or "").strip()
+        self.vpn_status_timeout_seconds = max(2, int(os.getenv("RAG_FEEDER_VPN_STATUS_TIMEOUT_SECONDS", "8") or "8"))
+        self.vpn_connect_timeout_seconds = max(5, int(os.getenv("RAG_FEEDER_VPN_CONNECT_TIMEOUT_SECONDS", "45") or "45"))
+        self.vpn_status_cache_ttl_seconds = max(1, int(os.getenv("RAG_FEEDER_VPN_STATUS_CACHE_SECONDS", "20") or "20"))
+        self._vpn_status_cache_until = 0.0
+        self._vpn_status_cache_value = False
+        self._vpn_warned_missing_status_cmd = False
+        self.enable_unpaywall = os.getenv("RAG_FEEDER_USE_UNPAYWALL", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.download_timeout = max(3, int(os.getenv("RAG_FEEDER_DOWNLOAD_TIMEOUT_SECONDS", "12") or "12"))
+        self.max_libgen_candidates = max(1, int(os.getenv("RAG_FEEDER_MAX_LIBGEN_CANDIDATES", "12") or "12"))
         self.output_folder = Path(output_folder) if output_folder else None
         self._pdf_downloader = None
         # Legacy helper methods in this module still expect both names.
@@ -88,6 +108,170 @@ class BibliographyEnhancer:
         
         # Initialize Sci-Hub mirror rotation
         self.current_mirror_index = 0
+        if self.proxies:
+            print(f"[DL] VPN proxy fallback enabled for sources: {sorted(self.vpn_fallback_sources)}")
+            if self.vpn_enforce_eduvpn:
+                if self.vpn_status_cmd:
+                    print("[DL] eduVPN enforcement enabled: proxy use requires a connected status check.")
+                else:
+                    print("[DL] WARNING: RAG_FEEDER_VPN_ENFORCE_EDUVPN=1 but RAG_FEEDER_VPN_STATUS_CMD is not set; proxy route will be refused.")
+
+    def _resolve_vpn_proxies(self, proxies: dict | None) -> dict | None:
+        if proxies:
+            return proxies
+        proxy_url = (os.getenv("RAG_FEEDER_VPN_PROXY_URL") or "").strip()
+        if not proxy_url:
+            return None
+        return {"http": proxy_url, "https": proxy_url}
+
+    @staticmethod
+    def _is_publisher_host(host: str) -> bool:
+        if not host:
+            return False
+        host = host.lower()
+        publisher_markers = (
+            "springer",
+            "sciencedirect.com",
+            "elsevier.com",
+            "wiley.com",
+            "tandfonline.com",
+            "jstor.org",
+            "nature.com",
+            "acm.org",
+            "ieeexplore.ieee.org",
+            "oxfordacademic.com",
+            "cambridge.org",
+            "sagepub.com",
+            "degruyter.com",
+            "proquest.com",
+            "ebscohost.com",
+        )
+        return any(marker in host for marker in publisher_markers)
+
+    def _should_use_vpn_fallback(self, source: str | None, url: str | None) -> bool:
+        if not self.proxies:
+            return False
+        source_l = (source or "").strip().lower()
+        host = urlparse(url).netloc.lower() if url else ""
+
+        if "doi" in self.vpn_fallback_sources and (source_l == "doi" or "doi.org" in host):
+            return True
+        if "publisher" in self.vpn_fallback_sources and self._is_publisher_host(host):
+            return True
+        if "direct" in self.vpn_fallback_sources and source_l == "direct url":
+            return True
+        if "scihub" in self.vpn_fallback_sources and "sci-hub" in source_l:
+            return True
+        if "libgen" in self.vpn_fallback_sources and "libgen" in source_l:
+            return True
+        return False
+
+    @staticmethod
+    def _should_retry_with_vpn_status(status_code: int) -> bool:
+        return status_code in {401, 402, 403, 407, 451, 500, 502, 503, 504}
+
+    def _request_get_direct(self, url: str, **kwargs) -> requests.Response:
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.get(url, **kwargs)
+
+    def _request_get_vpn(self, url: str, **kwargs) -> requests.Response:
+        if not self.proxies:
+            raise requests.exceptions.RequestException("VPN proxy not configured")
+        if not self._is_eduvpn_connected():
+            raise requests.exceptions.RequestException(
+                "eduVPN not connected (or could not be verified); refusing desktop proxy route"
+            )
+        with requests.Session() as session:
+            session.trust_env = False
+            session.proxies.update(self.proxies)
+            return session.get(url, **kwargs)
+
+    @staticmethod
+    def _run_shell_cmd(command: str, timeout_seconds: int) -> tuple[bool, str]:
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            output = "\n".join(part for part in [proc.stdout.strip(), proc.stderr.strip()] if part)
+            return proc.returncode == 0, output
+        except Exception as exc:
+            return False, str(exc)
+
+    @staticmethod
+    def _status_output_indicates_connected(output: str, command_ok: bool) -> bool:
+        text = (output or "").strip().lower()
+        if "not connected" in text or "disconnected" in text:
+            return False
+        if "currently connected" in text or "connected to" in text:
+            return True
+        # Generic status-check commands may intentionally produce no stdout and only signal via exit code.
+        if not text:
+            return bool(command_ok)
+        # Fallback for custom outputs without canonical phrasing.
+        return bool(command_ok and "connected" in text)
+
+    def _is_eduvpn_connected(self, force_refresh: bool = False) -> bool:
+        if not self.proxies:
+            return False
+        if not self.vpn_enforce_eduvpn:
+            return True
+
+        now = time.monotonic()
+        if not force_refresh and now < self._vpn_status_cache_until:
+            return self._vpn_status_cache_value
+
+        if not self.vpn_status_cmd:
+            if not self._vpn_warned_missing_status_cmd:
+                print("[DL] WARNING: Cannot verify eduVPN status because RAG_FEEDER_VPN_STATUS_CMD is not set.")
+                self._vpn_warned_missing_status_cmd = True
+            connected = False
+        else:
+            ok, output = self._run_shell_cmd(self.vpn_status_cmd, self.vpn_status_timeout_seconds)
+            connected = self._status_output_indicates_connected(output, ok)
+
+        if not connected and self.vpn_connect_cmd:
+            print("[DL] eduVPN not connected; running RAG_FEEDER_VPN_CONNECT_CMD before proxy request...")
+            connect_ok, connect_output = self._run_shell_cmd(self.vpn_connect_cmd, self.vpn_connect_timeout_seconds)
+            if not connect_ok:
+                snippet = (connect_output or "").replace("\n", " ")[:220]
+                print(f"[DL] eduVPN connect command failed: {snippet}")
+            if self.vpn_status_cmd:
+                ok, output = self._run_shell_cmd(self.vpn_status_cmd, self.vpn_status_timeout_seconds)
+                connected = self._status_output_indicates_connected(output, ok)
+
+        self._vpn_status_cache_value = connected
+        self._vpn_status_cache_until = now + self.vpn_status_cache_ttl_seconds
+        return connected
+
+    def _request_get(self, url: str, *, source: str | None = None, allow_vpn_fallback: bool = False, **kwargs) -> tuple[requests.Response, str]:
+        fallback_ok = allow_vpn_fallback and self._should_use_vpn_fallback(source, url)
+        if fallback_ok and self.vpn_mode in {"prefer", "force"}:
+            try:
+                response = self._request_get_vpn(url, **kwargs)
+                return response, "vpn"
+            except requests.exceptions.RequestException as vpn_exc:
+                if self.vpn_mode == "force":
+                    raise
+                print(f"  VPN preferred but failed ({vpn_exc}); falling back to direct...")
+        try:
+            response = self._request_get_direct(url, **kwargs)
+            if fallback_ok and self._should_retry_with_vpn_status(response.status_code):
+                print(f"  Direct request returned HTTP {response.status_code}; retrying via VPN proxy...")
+                try:
+                    return self._request_get_vpn(url, **kwargs), "vpn"
+                except requests.exceptions.RequestException as vpn_exc:
+                    print(f"  VPN fallback failed: {vpn_exc}")
+            return response, "direct"
+        except requests.exceptions.RequestException:
+            if fallback_ok:
+                print("  Direct request failed; retrying via VPN proxy...")
+                return self._request_get_vpn(url, **kwargs), "vpn"
+            raise
 
     def _setup_database(self) -> None:
         """Ensure schema exists before legacy table operations."""
@@ -182,7 +366,7 @@ class BibliographyEnhancer:
                 print(f"Unpaywall daily request limit exceeded. Skipping Unpaywall check for DOI {doi}.")
                 return None
                 
-            response = requests.get(url, headers=self.unpaywall_headers, timeout=10)
+            response = self._request_get_direct(url, headers=self.unpaywall_headers, timeout=10)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.HTTPError as e:
@@ -199,7 +383,16 @@ class BibliographyEnhancer:
         url = url_info['url']
         print(f"Trying {url_info['source']}: {url}")
         try:
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=30, allow_redirects=True)
+            response, route_used = self._request_get(
+                url,
+                source=url_info.get('source'),
+                allow_vpn_fallback=True,
+                headers={'User-Agent': 'Mozilla/5.0'},
+                timeout=self.download_timeout,
+                allow_redirects=True,
+            )
+            if route_used == "vpn":
+                print(f"  Using VPN route for {url_info.get('source', 'URL')}")
             if response.status_code == 200:
                 content_type = response.headers.get('content-type', '').lower()
                 if 'application/pdf' in content_type:
@@ -329,7 +522,7 @@ class BibliographyEnhancer:
             
             start_req = time.monotonic()
             try:
-                response = requests.get(scihub_url, headers=headers, timeout=30, proxies=self.proxies)
+                response = self._request_get_direct(scihub_url, headers=headers, timeout=self.download_timeout)
                 req_duration = time.monotonic() - start_req
                 print(f"  DEBUG: Sci-Hub request to {mirror} took {req_duration:.2f}s")
                 response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
@@ -385,119 +578,111 @@ class BibliographyEnhancer:
         return None
 
     def search_libgen(self, title: str, author_surnames: list[str], ref_type: str = ''):
-        """Search for publications on LibGen and extract working download links, prioritizing PDFs."""
+        """Search LibGen mirrors and return likely download links, prioritizing PDFs."""
         search_author = author_surnames[0] if author_surnames else ''
-        is_book = ref_type.lower() in ['book', 'monograph']
+        is_book = (ref_type or '').lower() in ['book', 'monograph']
 
         query = f'{title} {search_author}'.strip()
         query = query.replace(' ', '+')
-        base_url = "https://libgen.li"
-        libgen_url = f"{base_url}/index.php?req={query}&lg_topic=libgen&open=0&view=simple&res=25&phrase=1&column=def"
-        
+        libgen_mirrors = [
+            "https://libgen.li",
+            "https://libgen.vg",
+        ]
+
         print(f"Searching LibGen for: {title}")
         print(f"  Book type detection: is_book={is_book}, ref_type='{ref_type}'")
         print(f"  Using author surname: '{search_author}'")
-        print(f"  LibGen URL: {libgen_url}")
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
+        }
 
-        try:
-            self.rate_limiter.wait_if_needed('libgen')
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
-            }
-            response = requests.get(libgen_url, headers=headers, timeout=30, proxies=self.proxies)
-            response.raise_for_status()
+        pdf_matches = []
+        other_matches = []
+        seen_urls = set()
 
-            soup = BeautifulSoup(response.text, 'html.parser')
-            matches = []
-            pdf_matches = []
-            other_matches = []
+        for base_url in libgen_mirrors:
+            libgen_url = f"{base_url}/index.php?req={query}&lg_topic=libgen&open=0&view=simple&res=25&phrase=1&column=def"
+            print(f"  LibGen URL: {libgen_url}")
+            try:
+                self.rate_limiter.wait_if_needed('libgen')
+                response = self._request_get_direct(libgen_url, headers=headers, timeout=self.download_timeout)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
 
-            # Find the results table
-            table = soup.find('table', {'id': 'tablelibgen'})
-            if not table:
-                print("  No results table found - checking for captcha/bot detection")
-                if soup.find(text=re.compile('captcha|bot|automated|security check', re.IGNORECASE)):
-                    print("  WARNING: Possible captcha/bot detection detected")
-                return []
-
-            # Process rows (skip header)
-            rows = table.find_all('tr')[1:]  
-            print(f"Found {len(rows)} results to process")
-            
-            for idx, row in enumerate(rows, start=1):
-                cells = row.find_all('td')
-                if len(cells) < 9:
-                    print(f"  Row {idx}: Skipped - only {len(cells)} cells (need at least 9)")
+                # Prefer canonical file table, fallback to older variant if present.
+                table = soup.find('table', {'id': 'tablelibgen'}) or soup.find('table', {'id': 'tablelibgen1'})
+                if not table:
+                    print(f"  No LibGen results table found on {base_url}")
+                    if soup.find(string=re.compile('captcha|bot|automated|security check', re.IGNORECASE)):
+                        print(f"  WARNING: Possible captcha/bot detection on {base_url}")
                     continue
-                    
-                result_title = cells[0].get_text(strip=True)
-                result_author = cells[1].get_text(strip=True)
-                file_ext = cells[7].get_text(strip=True).lower()
-                
-                print(f"  Row {idx}: Title='{result_title[:60]}...', Authors='{result_author}', Ext='{file_ext}'")
-                
-                # Skip if it's a review
-                if "Review by:" in result_author:
-                    print("    Skipped - appears to be a review")
-                    continue
-                    
-                # Skip if book title contains review markers
-                if is_book:
-                    review_markers = [
-                        "vol.", "iss.", "pp.", "pages",
-                        "Review of", "Book Review",
-                        ") pp.", ") p.",
-                    ]
-                    if any(marker in result_title for marker in review_markers):
-                        print(f"    Skipped - contains review marker")
+
+                rows = table.find_all('tr')[1:]
+                print(f"  {base_url}: found {len(rows)} candidate rows")
+
+                for idx, row in enumerate(rows, start=1):
+                    cells = row.find_all('td')
+                    if len(cells) < 9:
+                        print(f"  Row {idx}: skipped - only {len(cells)} cells")
                         continue
-                
-                # Get mirror links from the last column
-                mirrors_cell = cells[-1]
-                mirror_links = mirrors_cell.find_all('a')
-                print(f"    Found {len(mirror_links)} mirror links")
-                
-                for link_idx, link in enumerate(mirror_links, start=1):
-                    href = link.get('href', '')
-                    source = link.get('data-original-title', link.get_text(strip=True))
-                    if href:
-                        # Handle relative URLs
-                        if not href.startswith('http'):
-                            href = f"{base_url}{href if href.startswith('/') else '/' + href}"
-                            
+
+                    result_title = cells[0].get_text(strip=True)
+                    result_author = cells[1].get_text(strip=True)
+                    file_ext = cells[7].get_text(strip=True).lower()
+
+                    if "Review by:" in result_author:
+                        continue
+
+                    if is_book:
+                        review_markers = [
+                            "vol.", "iss.", "pp.", "pages",
+                            "Review of", "Book Review",
+                            ") pp.", ") p.",
+                        ]
+                        if any(marker in result_title for marker in review_markers):
+                            continue
+
+                    mirrors_cell = cells[-1]
+                    mirror_links = mirrors_cell.find_all('a')
+                    for link in mirror_links:
+                        href = link.get('href', '')
+                        source = link.get('data-original-title', link.get_text(strip=True))
+                        if not href:
+                            continue
+
+                        resolved_href = urljoin(base_url + '/', href)
+                        if resolved_href in seen_urls:
+                            continue
+                        seen_urls.add(resolved_href)
+
                         match_entry = {
-                            'url': href,
+                            'url': resolved_href,
                             'title': result_title,
                             'authors': result_author,
-                            'source': f'LibGen ({source})',
-                            'reason': f'{file_ext.upper()} download'
+                            'source': f'LibGen ({urlparse(base_url).netloc}: {source})',
+                            'reason': f'{file_ext.upper()} download',
                         }
-                        
-                        # Separate PDF and non-PDF matches
+
                         if file_ext == 'pdf':
                             pdf_matches.append(match_entry)
-                            print(f"    Mirror {link_idx}: PDF link found - {href[:80]}...")
                         else:
                             other_matches.append(match_entry)
-                            print(f"    Mirror {link_idx}: Non-PDF link found - {href[:80]}...")
+            except requests.exceptions.RequestException as e:
+                if hasattr(e, 'response') and e.response and e.response.status_code == 429:
+                    print(f"  LibGen rate limit exceeded on {base_url}, trying next mirror")
+                    continue
+                print(f"  Error searching {base_url}: {str(e)}")
+                continue
 
-            # Combine PDF matches first, then other formats
-            matches = pdf_matches + other_matches
-            print(f"Found {len(matches)} non-review download links ({len(pdf_matches)} PDFs)")
-            return matches
-
-        except requests.exceptions.RequestException as e:
-            if hasattr(e, 'response') and e.response and e.response.status_code == 429:
-                print("LibGen rate limit exceeded. Skipping...")
-                return []
-            print(f"Error searching LibGen: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return []
+        matches = pdf_matches + other_matches
+        print(f"Found {len(matches)} non-review LibGen links ({len(pdf_matches)} PDFs)")
+        return matches
 
 
     def is_likely_pdf_url(self, url):
         """Checks if a URL is likely to point directly to a PDF based on patterns."""
+        if not isinstance(url, str) or not url:
+            return False
         url_lower = url.lower()
         
         # General PDF checks
@@ -512,13 +697,24 @@ class BibliographyEnhancer:
         
         return False
         
-    def try_extract_pdf_link(self, html_url):
+    def try_extract_pdf_link(self, html_url, source: str | None = None, allow_vpn_fallback: bool = False, force_vpn: bool = False):
         try:
             print(f"  Checking HTML page for PDF link: {html_url}")
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15'
             }
-            response = requests.get(html_url, headers=headers, timeout=30)
+            if force_vpn:
+                response = self._request_get_vpn(html_url, headers=headers, timeout=self.download_timeout)
+            else:
+                response, route_used = self._request_get(
+                    html_url,
+                    source=source or "html",
+                    allow_vpn_fallback=allow_vpn_fallback,
+                    headers=headers,
+                    timeout=self.download_timeout,
+                )
+                if route_used == "vpn":
+                    print("  HTML page fetched via VPN route")
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -570,8 +766,17 @@ class BibliographyEnhancer:
                 'Accept': 'text/html,application/pdf,application/x-pdf,*/*'
             }
             
-            # Add timeout to request
-            response = requests.get(url, allow_redirects=True, headers=headers, timeout=30)
+            source_label = "DOI" if "doi.org" in urlparse(url).netloc.lower() else "Direct URL"
+            response, route_used = self._request_get(
+                url,
+                source=source_label,
+                allow_vpn_fallback=True,
+                allow_redirects=True,
+                headers=headers,
+                timeout=self.download_timeout,
+            )
+            if route_used == "vpn":
+                print("  Retried via VPN route")
             
             # Check for specific HTTP error codes
             if response.status_code == 404:
@@ -601,7 +806,12 @@ class BibliographyEnhancer:
                 
                 # If it seems to be HTML, try extracting PDF link
                 if 'text/html' in response.headers.get('Content-Type', '').lower():
-                    pdf_url = self.try_extract_pdf_link(url)
+                    pdf_url = self.try_extract_pdf_link(
+                        url,
+                        source=source_label,
+                        allow_vpn_fallback=(route_used == "direct"),
+                        force_vpn=(route_used == "vpn"),
+                    )
                     if pdf_url and pdf_url != url:
                         return self.download_paper(pdf_url, filename, ref_type)
             
@@ -741,23 +951,26 @@ class BibliographyEnhancer:
                 'reason': 'DOI resolution'
             })
             
-            # 1. Check Unpaywall for open access versions
-            unpaywall_result = self.check_unpaywall(doi)
-            if unpaywall_result and unpaywall_result.get('best_oa_location'):
-                oa_location = unpaywall_result['best_oa_location']
-                if oa_location.get('url_for_pdf'):
-                    print(f"  Unpaywall found OA PDF URL: {oa_location['url_for_pdf']}")
-                    urls_to_try.append({
-                        'url': oa_location['url_for_pdf'],
-                        'title': title,
-                        'snippet': '',
-                        'source': oa_location.get('host_type', 'Unpaywall OA'),
-                        'reason': 'Found via Unpaywall DOI lookup'
-                    })
+            # 1. Check Unpaywall for open access versions (optional; disabled by default for speed)
+            if self.enable_unpaywall:
+                unpaywall_result = self.check_unpaywall(doi)
+                if unpaywall_result and unpaywall_result.get('best_oa_location'):
+                    oa_location = unpaywall_result['best_oa_location']
+                    if oa_location.get('url_for_pdf'):
+                        print(f"  Unpaywall found OA PDF URL: {oa_location['url_for_pdf']}")
+                        urls_to_try.append({
+                            'url': oa_location['url_for_pdf'],
+                            'title': title,
+                            'snippet': '',
+                            'source': oa_location.get('host_type', 'Unpaywall OA'),
+                            'reason': 'Found via Unpaywall DOI lookup'
+                        })
+                    else:
+                        print(f"  Unpaywall found OA location but no direct PDF URL for DOI {doi}.")
                 else:
-                    print(f"  Unpaywall found OA location but no direct PDF URL for DOI {doi}.")
+                     print(f"  Unpaywall found no OA location for DOI {doi}.")
             else:
-                 print(f"  Unpaywall found no OA location for DOI {doi}.")
+                print("  Unpaywall lookup disabled (RAG_FEEDER_USE_UNPAYWALL=0)")
 
         if open_access_url:
             urls_to_try.append({
@@ -816,28 +1029,31 @@ class BibliographyEnhancer:
                     if surname:
                         author_surnames.append(surname)
 
-            # LibGen is currently down - commented out but preserved for future use
-            # print("Sci-Hub failed (or no DOI). Trying LibGen...")
-            # libgen_results = self.search_libgen(title, author_surnames, ref.get('type', ''))
-            # if libgen_results:
-            #     print(f"Found {len(libgen_results)} results on LibGen")
-            #     urls_to_try.extend(libgen_results)
-            #     for url_info in urls_to_try:
-            #         if self.try_download_url(url_info['url'], url_info.get('source', "LibGen"), ref, downloads_dir):
-            #             ref['download_source'] = url_info.get('source', "LibGen")
-            #             ref['download_reason'] = 'Successfully downloaded via LibGen' # More specific reason
-            #             download_success = True
-            #             file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-            #             print(f"{GREEN}✓ Downloaded from: {url_info.get('source', 'LibGen')} as {Path(file_path).name}{RESET}")
-            #             break # Exit LibGen loop on success
-            print("Sci-Hub failed (or no DOI). LibGen is currently unavailable.")
+            print("Sci-Hub failed (or no DOI). Trying LibGen...")
+            libgen_results = self.search_libgen(title, author_surnames, ref.get('type', ''))
+            if libgen_results:
+                print(f"Found {len(libgen_results)} results on LibGen")
+                for idx, url_info in enumerate(libgen_results):
+                    if self.max_libgen_candidates and idx >= self.max_libgen_candidates:
+                        print(f"Reached LibGen candidate limit ({self.max_libgen_candidates}); stopping LibGen attempts for this entry.")
+                        break
+                    libgen_source = url_info.get('source', "LibGen")
+                    if self.try_download_url(url_info['url'], libgen_source, ref, downloads_dir):
+                        ref['download_source'] = libgen_source
+                        ref['download_reason'] = 'Successfully downloaded via LibGen'
+                        download_success = True
+                        file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
+                        print(f"{GREEN}✓ Downloaded from: {libgen_source} as {Path(file_path).name}{RESET}")
+                        break
+            else:
+                print("No LibGen matches found.")
 
 
         # If all methods fail, mark as not found
         if not download_success:
             print(f"  {RED}✗ No valid matches found through any method{RESET}")
             ref['download_status'] = 'not_found'
-            ref['download_reason'] = 'No valid matches found through DOI, Unpaywall, or Sci-Hub'
+            ref['download_reason'] = 'No valid matches found through DOI, Unpaywall, Sci-Hub, or LibGen'
 
         # Return the modified ref dictionary if download was successful, otherwise None
         if 'downloaded_file' in ref and ref['downloaded_file']:
@@ -850,7 +1066,7 @@ class BibliographyEnhancer:
              return None # Return None on failure or skip
 
 
-    def try_download_url(self, url, source, ref, downloads_dir):
+    def try_download_url(self, url, source, ref, downloads_dir, _force_vpn=False, _vpn_retry_used=False):
         """Attempts to download a PDF from a given URL.
         Includes basic validation and HTML page handling.
         Returns True if successful, False otherwise. Sets ref['downloaded_file'] on success.
@@ -877,7 +1093,20 @@ class BibliographyEnhancer:
             }
             
             # Add timeout to request
-            response = requests.get(url, allow_redirects=True, headers=headers, timeout=30)
+            if _force_vpn:
+                response = self._request_get_vpn(url, allow_redirects=True, headers=headers, timeout=self.download_timeout)
+                route_used = "vpn"
+            else:
+                response, route_used = self._request_get(
+                    url,
+                    source=source,
+                    allow_vpn_fallback=True,
+                    allow_redirects=True,
+                    headers=headers,
+                    timeout=self.download_timeout,
+                )
+            if route_used == "vpn":
+                print("  Request route: VPN")
             
             # Check for specific HTTP error codes
             if response.status_code == 404:
@@ -902,18 +1131,47 @@ class BibliographyEnhancer:
                     f.write(content)
                 print("  Direct download successful - Valid complete PDF")
                 ref['downloaded_file'] = str(filename)
-                ref['download_source'] = source
+                effective_source = source if route_used == "direct" else f"{source} (via VPN)"
+                ref['download_source'] = effective_source
+                ref['download_route'] = route_used
                 return True
             else:
                 print(f"  {YELLOW}Downloaded file is not a valid complete PDF{RESET}")
 
+                if (
+                    route_used == "direct"
+                    and not _vpn_retry_used
+                    and self._should_use_vpn_fallback(source, url)
+                ):
+                    print("  Direct route returned non-PDF content; retrying same URL via VPN...")
+                    return self.try_download_url(
+                        url,
+                        source,
+                        ref,
+                        downloads_dir,
+                        _force_vpn=True,
+                        _vpn_retry_used=True,
+                    )
+
                 # If it seems to be HTML, try extracting PDF link
                 # --- MODIFICATION HERE ---
-                pdf_url_from_html = self.try_extract_pdf_link(url) # Pass the original URL
+                pdf_url_from_html = self.try_extract_pdf_link(
+                    url,
+                    source=source,
+                    allow_vpn_fallback=(route_used == "direct"),
+                    force_vpn=(route_used == "vpn"),
+                ) # Pass the original URL
                 if pdf_url_from_html and pdf_url_from_html != url: # Avoid infinite loops
                     print(f"  Found potential PDF link in HTML, retrying download for: {pdf_url_from_html}")
                     # Recursively call try_download_url with the new link, potentially updating source
-                    return self.try_download_url(pdf_url_from_html, source + " (via HTML)", ref, downloads_dir)
+                    return self.try_download_url(
+                        pdf_url_from_html,
+                        source + " (via HTML)",
+                        ref,
+                        downloads_dir,
+                        _force_vpn=(route_used == "vpn"),
+                        _vpn_retry_used=_vpn_retry_used,
+                    )
                 else:
                      print(f"  {YELLOW}Could not extract a PDF link from the HTML page.{RESET}")
                 # --- END MODIFICATION ---

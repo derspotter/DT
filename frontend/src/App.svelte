@@ -5,6 +5,7 @@
     fetchMe,
     selectCorpus,
     createCorpus,
+    deleteCorpus as deleteCorpusApi,
     shareCorpus,
     setAuthToken,
     uploadPdf,
@@ -89,10 +90,38 @@
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
+  $: isWaitingLatestEntries =
+    latestEntriesStatus.startsWith('Waiting for extracted entries') ||
+    latestEntriesStatus.startsWith('Loading extracted entries')
   let latestEntriesBase = ''
+  let latestSeedDocument = null
+  let extractionProgress = {
+    active: false,
+    runId: 0,
+    baseName: '',
+    backendFilename: '',
+    phase: '',
+    detail: '',
+    percent: 0,
+    indeterminate: false,
+    pageFilesTotal: 0,
+    pageFilesProcessed: 0,
+    startedAtMs: 0,
+  }
+  let extractionProgressRunId = 0
   let latestSelection = []
+  let selectableLatestCount = 0
+  let selectedLatestCount = 0
+  $: selectableLatestCount = (latestEntries || []).reduce((count, entry) => {
+    return isLatestSelectable(entry) ? count + 1 : count
+  }, 0)
+  $: selectedLatestCount = (latestEntries || []).reduce((count, entry, index) => {
+    return isLatestSelectable(entry) && isLatestSelected(entry, index) ? count + 1 : count
+  }, 0)
   let allLatestSelected = false
-  $: allLatestSelected = latestEntries.length > 0 && latestEntries.every((entry, index) => {
+  $: allLatestSelected = selectableLatestCount > 0 && latestEntries
+    .filter((entry) => isLatestSelectable(entry))
+    .every((entry, index) => {
     const key = latestSelectionKey(entry, index)
     return key && latestSelection.includes(key)
   })
@@ -124,9 +153,26 @@
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
+  let searchSelection = []
+  let searchQueueConfigs = {}
+  let searchQueueStatus = ''
+  let searchQueueBusy = false
+  let allSearchSelected = false
+  let selectedSearchCount = 0
+  $: allSearchSelected =
+    searchResults.length > 0 &&
+    searchResults.every((result, index) => {
+      const key = searchResultKey(result, index)
+      return key && searchSelection.includes(key)
+    })
+  $: selectedSearchCount = searchResults.reduce((count, result, index) => {
+    const key = searchResultKey(result, index)
+    return key && searchSelection.includes(key) ? count + 1 : count
+  }, 0)
 
   const CORPUS_PAGE_SIZE = 120
   const RAW_STATUSES = new Set(['no_metadata', 'extract_references_from_pdf', 'pending'])
+  const FAILED_STATUSES = new Set(['failed_enrichments', 'failed_downloads'])
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
@@ -134,24 +180,28 @@
   let corpusLoadingMore = false
   let corpusLoadStatus = ''
   let corpusSource = ''
-  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
+  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichments: 0, failed_downloads: 0 }
   $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
   $: metaItems = corpusItems.filter(i => i.status === 'with_metadata' || i.status === 'to_download_references')
   $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded_references')
+  $: failedItems = corpusItems.filter(i => FAILED_STATUSES.has(i.status))
   $: rawTotal = Number(corpusStageTotals?.raw || 0)
   $: metadataTotal = Number(corpusStageTotals?.metadata || 0)
   $: downloadedTotal = Number(corpusStageTotals?.downloaded || 0)
+  $: failedEnrichmentTotal = Number(corpusStageTotals?.failed_enrichments || 0)
   let selectedCorpusItemKey = ''
   $: corpusSelectionRows = [
     ...rawItems.map((item) => ({ bucket: 'raw', item })),
     ...metaItems.map((item) => ({ bucket: 'metadata', item })),
     ...downloadedItems.map((item) => ({ bucket: 'downloaded', item })),
+    ...failedItems.map((item) => ({ bucket: 'failed', item })),
   ]
   $: selectedCorpusRow = corpusSelectionRows.find((row) => corpusItemKey(row.item, row.bucket) === selectedCorpusItemKey) || null
   let corpusRowElements = {
     raw: new Map(),
     metadata: new Map(),
     downloaded: new Map(),
+    failed: new Map(),
   }
   let pendingPromotionEvents = []
   let promotionAnimationInFlight = false
@@ -182,8 +232,6 @@
     config: { intervalSeconds: 60, batchSize: 3 },
   }
   let downloadWorkerStatus = ''
-  let downloadWorkerIntervalSeconds = 60
-  let downloadWorkerBatchSize = 3
   let downloadWorkerBusy = false
   let pipelineWorker = {
     running: false,
@@ -249,6 +297,11 @@
   let metaCorpusTableEl = null
   let downloadedCorpusTableEl = null
   let creatingCorpus = false
+  let deletingCorpus = false
+  let corpusActionStatus = ''
+  let corpusActionError = false
+  $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
+  $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
   let shareUsername = ''
   let shareRole = 'viewer'
   let shareStatus = ''
@@ -292,6 +345,43 @@
 
   function formatTitle(entry) {
     return entry?.title || entry?.source || entry?.url || 'Untitled'
+  }
+
+  function parseAuthorsValue(value) {
+    if (Array.isArray(value)) return value.map((v) => String(v || '').trim()).filter(Boolean)
+    if (typeof value === 'string') {
+      const raw = value.trim()
+      if (!raw) return []
+      try {
+        const parsed = JSON.parse(raw)
+        if (Array.isArray(parsed)) return parsed.map((v) => String(v || '').trim()).filter(Boolean)
+      } catch (error) {
+        // fall through
+      }
+      return raw.split(';').map((v) => v.trim()).filter(Boolean)
+    }
+    return []
+  }
+
+  function formatSeedDocumentLabel(meta, fallback = '') {
+    if (!meta || typeof meta !== 'object') return fallback || 'Unknown source'
+    const title = String(meta.title || '').trim()
+    const year = String(meta.year || '').trim()
+    const doi = String(meta.doi || '').trim()
+    const base = title || fallback || 'Unknown source'
+    const yearPart = year ? ` (${year})` : ''
+    const doiPart = doi ? ` · ${doi}` : ''
+    return `${base}${yearPart}${doiPart}`
+  }
+
+  function formatSeedDocumentDetails(meta) {
+    if (!meta || typeof meta !== 'object') return ''
+    const authors = parseAuthorsValue(meta.authors)
+    if (authors.length > 0) return authors.join(', ')
+    const source = String(meta.source || '').trim()
+    const publisher = String(meta.publisher || '').trim()
+    if (source && publisher) return `${source} · ${publisher}`
+    return source || publisher || ''
   }
 
   function formatPipelineStatus(statusRaw) {
@@ -360,7 +450,7 @@
 
   function stageFromTransitionSide(value) {
     const v = String(value || '').trim().toLowerCase()
-    if (v === 'raw' || v === 'metadata' || v === 'downloaded') return v
+    if (v === 'raw' || v === 'metadata' || v === 'downloaded' || v === 'failed') return v
     return ''
   }
 
@@ -512,6 +602,7 @@
     if (bucket === 'raw') return 'Raw'
     if (bucket === 'metadata') return 'With metadata'
     if (bucket === 'downloaded') return 'Downloaded'
+    if (bucket === 'failed') return 'Failed'
     return 'Unknown'
   }
 
@@ -581,6 +672,175 @@
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  function beginExtractionProgress(baseName, backendFilename = '') {
+    extractionProgressRunId += 1
+    extractionProgress = {
+      active: true,
+      runId: extractionProgressRunId,
+      baseName: String(baseName || '').trim(),
+      backendFilename: String(backendFilename || '').trim(),
+      phase: 'queued',
+      detail: 'Extraction queued...',
+      percent: 2,
+      indeterminate: true,
+      pageFilesTotal: 0,
+      pageFilesProcessed: 0,
+      startedAtMs: Date.now(),
+    }
+  }
+
+  function finishExtractionProgress() {
+    extractionProgress = {
+      active: false,
+      runId: 0,
+      baseName: '',
+      backendFilename: '',
+      phase: '',
+      detail: '',
+      percent: 0,
+      indeterminate: false,
+      pageFilesTotal: 0,
+      pageFilesProcessed: 0,
+      startedAtMs: 0,
+    }
+  }
+
+  function updateExtractionProgress({ phase, detail, percent, indeterminate, pageFilesTotal, pageFilesProcessed } = {}) {
+    if (!extractionProgress.active) return
+    const next = { ...extractionProgress }
+    if (phase) next.phase = phase
+    if (typeof detail === 'string') next.detail = detail
+    if (typeof indeterminate === 'boolean') next.indeterminate = indeterminate
+    if (Number.isFinite(Number(pageFilesTotal)) && Number(pageFilesTotal) >= 0) {
+      next.pageFilesTotal = Number(pageFilesTotal)
+    }
+    if (Number.isFinite(Number(pageFilesProcessed)) && Number(pageFilesProcessed) >= 0) {
+      next.pageFilesProcessed = Number(pageFilesProcessed)
+    }
+    if (Number.isFinite(Number(percent))) {
+      // Keep progress monotonic and bounded.
+      const bounded = Math.max(0, Math.min(100, Number(percent)))
+      next.percent = Math.max(next.percent || 0, bounded)
+    }
+    extractionProgress = next
+  }
+
+  function updateExtractionProgressFromLog(logLine) {
+    if (!extractionProgress.active) return
+    const text = String(logLine || '')
+    if (!text) return
+
+    const base = extractionProgress.baseName
+    const backendName = extractionProgress.backendFilename
+    const likelyExtractionLog =
+      text.includes('extract-bibliography') ||
+      text.includes('[get_bib_pages]') ||
+      text.includes('[APIscraper')
+    const mentionsCurrentRun =
+      (base && text.includes(base)) || (backendName && text.includes(backendName))
+    if (!likelyExtractionLog && !mentionsCurrentRun) return
+
+    if (text.includes('Extracting seed document metadata')) {
+      updateExtractionProgress({
+        phase: 'seed_metadata',
+        detail: 'Extracting seed metadata...',
+        percent: 8,
+        indeterminate: true,
+      })
+      return
+    }
+
+    const findRefsMatch = text.match(/Extracting bibliography pages for\s+(\d+)\s+PDF/i)
+    if (findRefsMatch) {
+      const docs = Number(findRefsMatch[1])
+      updateExtractionProgress({
+        phase: 'find_reference_pages',
+        detail: `Finding reference sections (${docs} PDF${docs === 1 ? '' : 's'})...`,
+        percent: 18,
+        indeterminate: true,
+      })
+      return
+    }
+
+    const pagesExtractedMatch = text.match(/Done\.\s*Extracted\s+(\d+)\s+page\(s\)\s+in/i)
+    if (pagesExtractedMatch) {
+      const pages = Number(pagesExtractedMatch[1])
+      updateExtractionProgress({
+        phase: 'reference_pages_extracted',
+        detail: `Extracted ${pages} reference page${pages === 1 ? '' : 's'}.`,
+        percent: 38,
+        indeterminate: false,
+      })
+      return
+    }
+
+    if (text.includes('Starting APIscraper')) {
+      updateExtractionProgress({
+        phase: 'parsing_pages',
+        detail: 'Parsing extracted references...',
+        percent: 45,
+        indeterminate: true,
+      })
+      return
+    }
+
+    const foundFilesMatch = text.match(/Found\s+(\d+)\s+PDF files/i)
+    if (foundFilesMatch && text.includes('[APIscraper')) {
+      const total = Number(foundFilesMatch[1])
+      updateExtractionProgress({
+        phase: 'parsing_pages',
+        detail: `Parsing ${total} extracted page file${total === 1 ? '' : 's'}...`,
+        percent: 50,
+        indeterminate: false,
+        pageFilesTotal: total,
+        pageFilesProcessed: 0,
+      })
+      return
+    }
+
+    if (text.includes('[APIscraper') && text.includes('[INFO] Processing ')) {
+      const total = Number(extractionProgress.pageFilesTotal || 0)
+      const nextProcessed = Number(extractionProgress.pageFilesProcessed || 0) + 1
+      if (total > 0) {
+        const parsePct = 50 + Math.min(45, (nextProcessed / total) * 45)
+        updateExtractionProgress({
+          phase: 'parsing_pages',
+          detail: `Parsing extracted pages (${Math.min(nextProcessed, total)}/${total})...`,
+          percent: parsePct,
+          indeterminate: false,
+          pageFilesProcessed: Math.min(nextProcessed, total),
+        })
+      } else {
+        updateExtractionProgress({
+          phase: 'parsing_pages',
+          detail: 'Parsing extracted pages...',
+          percent: 55,
+          indeterminate: true,
+        })
+      }
+      return
+    }
+
+    if (text.includes('Processing Summary') && text.includes('[APIscraper')) {
+      updateExtractionProgress({
+        phase: 'finalizing',
+        detail: 'Finalizing extracted entries...',
+        percent: 95,
+        indeterminate: false,
+      })
+      return
+    }
+
+    if (text.includes('Bibliography extraction complete for')) {
+      updateExtractionProgress({
+        phase: 'completed',
+        detail: 'Extraction complete.',
+        percent: 100,
+        indeterminate: false,
+      })
+    }
   }
 
   function getLogsCorpusId() {
@@ -753,6 +1013,18 @@
     }
   }
 
+  function handleLogout() {
+    disconnectLogs()
+    setAuthToken('')
+    authStatus = 'unauthenticated'
+    authError = ''
+    authUser = null
+    corpora = []
+    currentCorpusId = null
+    loginPassword = ''
+    resetFrontendState()
+  }
+
   async function refreshAll() {
     await loadIngestStats()
     await loadIngestRuns()
@@ -769,6 +1041,7 @@
     latestEntries = []
     latestEntriesStatus = ''
     latestEntriesBase = ''
+    latestSeedDocument = null
     latestSelection = []
     enqueueStatus = ''
     processMarkedStatus = ''
@@ -779,6 +1052,10 @@
     searchResults = []
     searchStatus = ''
     searchSource = ''
+    searchSelection = []
+    searchQueueConfigs = {}
+    searchQueueStatus = ''
+    searchQueueBusy = false
     corpusItems = []
     corpusTotal = 0
     corpusLoadStatus = ''
@@ -806,9 +1083,14 @@
     logsTailStatus = ''
     pendingPromotionEvents = []
     promotionHighlights = new Set()
+    corpusActionStatus = ''
+    corpusActionError = false
+    finishExtractionProgress()
   }
 
   async function handleSelectCorpus(event) {
+    corpusActionStatus = ''
+    corpusActionError = false
     const nextId = Number(event.target.value)
     if (!nextId) return
     try {
@@ -829,6 +1111,8 @@
 
   async function handleCreateCorpus() {
     if (creatingCorpus) return
+    corpusActionStatus = ''
+    corpusActionError = false
     const name = window.prompt('New corpus name')
     if (!name) return
     creatingCorpus = true
@@ -843,10 +1127,60 @@
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
+      corpusActionStatus = `Created corpus "${name.trim()}".`
+      corpusActionError = false
     } catch (error) {
+      corpusActionStatus = error.message || 'Failed to create corpus.'
+      corpusActionError = true
       authError = error.message || 'Failed to create corpus'
     } finally {
       creatingCorpus = false
+    }
+  }
+
+  async function handleDeleteCorpus() {
+    if (deletingCorpus) return
+    corpusActionStatus = ''
+    corpusActionError = false
+    if (!currentCorpusId) {
+      corpusActionStatus = 'Select a corpus first.'
+      corpusActionError = true
+      return
+    }
+    if (!canDeleteCurrentCorpus) {
+      corpusActionStatus = 'Only corpus owners can delete corpora.'
+      corpusActionError = true
+      return
+    }
+
+    const corpusName = String(currentCorpus?.name || `Corpus ${currentCorpusId}`).trim()
+    const confirmed = window.confirm(
+      `Delete corpus "${corpusName}"?\n\nThis removes corpus shares, ingest rows, and queued jobs for this corpus.`
+    )
+    if (!confirmed) return
+
+    deletingCorpus = true
+    corpusActionStatus = `Deleting "${corpusName}"...`
+    corpusActionError = false
+    try {
+      const payload = await deleteCorpusApi(currentCorpusId)
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || payload?.selected_corpus_id || corpora[0]?.id || null
+      resetFrontendState()
+      await refreshAll()
+      if (logsType === 'pipeline') {
+        handleLogsCorpusFilterChange()
+      }
+      const deletedName = payload?.deleted_name || corpusName
+      corpusActionStatus = `Deleted corpus "${deletedName}".`
+      corpusActionError = false
+    } catch (error) {
+      corpusActionStatus = error.message || 'Failed to delete corpus.'
+      corpusActionError = true
+    } finally {
+      deletingCorpus = false
     }
   }
 
@@ -870,34 +1204,73 @@
     }
   }
 
-  async function loadLatestEntries(baseName) {
+  async function loadLatestEntries(baseName, { waitForExtraction = false } = {}) {
+    if (!waitForExtraction && extractionProgress.active) {
+      finishExtractionProgress()
+    }
     latestEntriesBase = baseName
-    latestEntriesStatus = 'Waiting for extracted entries...'
+    latestSeedDocument = null
+    latestEntriesStatus = waitForExtraction ? 'Waiting for extracted entries...' : 'Loading extracted entries...'
     latestEntries = []
     latestSelection = []
-    // Extraction + parsing can easily take a couple of minutes for multi-page reference sections.
-    const attempts = 36
-    for (let i = 0; i < attempts; i += 1) {
+    const startedAt = Date.now()
+    const maxWaitMs = waitForExtraction ? 180_000 : 10_000
+    const pollIntervalMs = waitForExtraction ? 2_000 : 1_500
+
+    while (Date.now() - startedAt < maxWaitMs) {
       try {
         const payload = await fetchBibliographyEntries(baseName)
         const items = payload.items || []
+        if (payload.seed_document) {
+          latestSeedDocument = payload.seed_document
+        }
         if (Array.isArray(items) && items.length > 0) {
           latestEntries = items
           latestEntriesStatus = `Loaded ${items.length} entries.`
+          if (waitForExtraction) {
+            updateExtractionProgress({
+              phase: 'completed',
+              detail: 'Extraction complete.',
+              percent: 100,
+              indeterminate: false,
+            })
+            // Briefly keep 100% visible, then clear.
+            const completedRunId = extractionProgress.runId
+            setTimeout(() => {
+              if (extractionProgress.active && extractionProgress.runId === completedRunId) {
+                finishExtractionProgress()
+              }
+            }, 1200)
+          }
           return
         }
       } catch (error) {
         if (error?.status === 401) {
           authStatus = 'unauthenticated'
           setAuthToken('')
+          finishExtractionProgress()
           return
         }
-        // Keep waiting; extraction can take time.
+        if (!waitForExtraction) {
+          latestEntriesStatus = 'Failed to load extracted entries.'
+          return
+        }
+        // Keep waiting while extraction is in progress.
       }
-      latestEntriesStatus = `Waiting for extracted entries... (${i + 1}/${attempts})`
-      await sleep(5000)
+      if (waitForExtraction) {
+        const elapsedSec = Math.floor((Date.now() - startedAt) / 1000)
+        latestEntriesStatus = `Waiting for extracted entries... ${elapsedSec}s`
+      } else {
+        latestEntriesStatus = 'Loading extracted entries...'
+      }
+      await sleep(pollIntervalMs)
     }
-    latestEntriesStatus = 'No entries found yet.'
+
+    if (waitForExtraction) {
+      latestEntriesStatus = 'Extraction still running. Waiting for entries to appear...'
+    } else {
+      latestEntriesStatus = 'No extracted entries found.'
+    }
   }
   function latestSelectionKey(entry, index = -1) {
     const primaryId = entry?.id ?? entry?.entry_id
@@ -923,7 +1296,34 @@
     return ''
   }
 
+  function hasLatestEntryId(entry) {
+    const primaryId = entry?.id ?? entry?.entry_id
+    return primaryId !== null && primaryId !== undefined && String(primaryId).trim() !== ''
+  }
+
+  function latestIngestState(entry) {
+    const state = String(entry?.ingest_state || '').trim().toLowerCase()
+    if (state === 'downloaded' || state === 'enriched' || state === 'pending') {
+      return state
+    }
+    // Backward compatibility for older API payloads.
+    return Number(entry?.processed || 0) > 0 ? 'enriched' : 'pending'
+  }
+
+  function isLatestDownloaded(entry) {
+    return latestIngestState(entry) === 'downloaded'
+  }
+
+  function isLatestProcessed(entry) {
+    return latestIngestState(entry) === 'enriched'
+  }
+
+  function isLatestSelectable(entry) {
+    return hasLatestEntryId(entry) && latestIngestState(entry) === 'pending'
+  }
+
   function isLatestSelected(entry, index = -1) {
+    if (!isLatestSelectable(entry)) return false
     const key = latestSelectionKey(entry, index)
     if (!key) return false
     return latestSelection.includes(key)
@@ -934,13 +1334,16 @@
   }
 
   function selectAllLatest() {
-    latestSelection = (latestEntries || []).map((entry, index) => latestSelectionKey(entry, index)).filter(Boolean)
+    latestSelection = (latestEntries || [])
+      .filter((entry) => isLatestSelectable(entry))
+      .map((entry, index) => latestSelectionKey(entry, index))
+      .filter(Boolean)
   }
 
-  async function enqueueSelectedLatest() {
+  async function enqueueSelectedLatest(withDownload = false) {
     enqueueStatus = ''
     const ids = (latestEntries || [])
-      .filter((entry, index) => isLatestSelected(entry, index))
+      .filter((entry, index) => isLatestSelectable(entry) && isLatestSelected(entry, index))
       .map((entry) => entry.id ?? entry.entry_id)
       .filter((id) => id !== null && id !== undefined && String(id).trim() !== '')
     if (ids.length === 0) {
@@ -958,10 +1361,10 @@
       if (payload.marked > 0 || payload.staged > 0) {
         // Set limit to match what was just marked, or default to a reasonable batch size
         processMarkedLimit = Math.max(10, payload.marked + payload.staged)
-        await processMarkedBatch()
+        await processMarkedBatch({ withDownload })
         
         // Also ensure the global pipeline worker is running so downloads actually happen
-        if (!pipelineWorker.running) {
+        if (withDownload && !pipelineWorker.running) {
           enqueueStatus += ' Starting background downloader...'
           await handleStartPipelineWorker()
         }
@@ -981,7 +1384,7 @@
     }
   }
 
-  async function processMarkedBatch() {
+  async function processMarkedBatch({ withDownload = false } = {}) {
     processMarkedStatus = ''
     if (processingMarked) return
     const limit = Number(processMarkedLimit)
@@ -999,8 +1402,10 @@
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        enqueueDownload: withDownload,
+        downloadBatchSize: Math.max(25, limit),
       })
-      processMarkedStatus = `Processed ${payload.processed} (promoted: ${payload.promoted}, ready for download: ${payload.queued}, failed: ${payload.failed}).`
+      processMarkedStatus = payload.message || 'Enrichment job queued. Check Pipeline Status for progress.'
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -1066,15 +1471,17 @@
 
   async function extractForItem(item) {
     if (!item.backendFilename) return
+    const baseName = item.backendFilename.replace(/\.pdf$/i, '')
+    beginExtractionProgress(baseName, item.backendFilename)
     updateUpload(item.id, { status: 'extracting', message: 'Extracting bibliography' })
     try {
       await extractBibliography(item.backendFilename)
       updateUpload(item.id, { status: 'extracted', message: 'Extraction started' })
-      const baseName = item.backendFilename.replace(/\.pdf$/i, '')
-      await loadLatestEntries(baseName)
+      await loadLatestEntries(baseName, { waitForExtraction: true })
       await loadIngestStats()
       await loadIngestRuns()
     } catch (error) {
+      finishExtractionProgress()
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
@@ -1090,7 +1497,7 @@
     try {
       const payload = await fetchIngestRuns(20)
       ingestRuns = payload.runs || []
-      ingestRunsStatus = ingestRuns.length ? `Loaded ${ingestRuns.length} runs.` : 'No ingest runs found.'
+      ingestRunsStatus = ''
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1105,7 +1512,7 @@
     try {
       const payload = await fetchIngestStats()
       ingestStats = payload.stats || ingestStats
-      if (!quiet) ingestStatsStatus = 'Loaded ingest stats.'
+      if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) {
@@ -1136,6 +1543,8 @@
       })
       searchResults = data
       searchSource = source
+      initializeSearchQueueConfig(data)
+      searchQueueStatus = ''
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
       searchStatus = source === 'api'
         ? `Results loaded from API.${suffix}`
@@ -1149,6 +1558,153 @@
     }
   }
 
+  function searchResultKey(result, index = -1) {
+    const openalexId = String(result?.openalex_id || '').trim().toLowerCase()
+    if (openalexId) return `oa:${openalexId}`
+    const doi = String(result?.doi || '').trim().toLowerCase()
+    if (doi) return `doi:${doi}`
+    const id = String(result?.id || '').trim().toLowerCase()
+    if (id) return `id:${id}`
+    return `idx:${index}:${String(result?.title || '').trim().toLowerCase()}`
+  }
+
+  function defaultSearchQueueConfig() {
+    return {
+      includeDownstream: Boolean(includeDownstream),
+      includeUpstream: Boolean(includeUpstream),
+      relatedDepthDownstream: Math.max(1, Number(relatedDepthDownstream) || 1),
+      relatedDepthUpstream: Math.max(1, Number(relatedDepthUpstream) || 1),
+      maxRelated: Math.max(1, Number(maxRelated) || 1),
+    }
+  }
+
+  function initializeSearchQueueConfig(results = searchResults) {
+    const next = {}
+    for (const [index, result] of (results || []).entries()) {
+      const key = searchResultKey(result, index)
+      if (!key) continue
+      next[key] = {
+        ...defaultSearchQueueConfig(),
+        ...(searchQueueConfigs[key] || {}),
+      }
+    }
+    searchQueueConfigs = next
+    searchSelection = searchSelection.filter((key) => Boolean(next[key]))
+  }
+
+  function getSearchQueueConfig(key) {
+    return searchQueueConfigs[key] || defaultSearchQueueConfig()
+  }
+
+  function updateSearchQueueConfig(key, patch) {
+    const current = getSearchQueueConfig(key)
+    searchQueueConfigs = {
+      ...searchQueueConfigs,
+      [key]: { ...current, ...patch },
+    }
+  }
+
+  function clearSearchSelection() {
+    searchSelection = []
+  }
+
+  function selectAllSearchResults() {
+    searchSelection = (searchResults || []).map((result, index) => searchResultKey(result, index)).filter(Boolean)
+  }
+
+  function buildSeedItemFromSearchResult(result) {
+    const openalexId = String(result?.openalex_id || '').trim()
+    if (openalexId) return { openalex_id: openalexId }
+
+    const id = String(result?.id || '').trim()
+    if (/^https?:\/\/openalex\.org\/w\d+$/i.test(id) || /^w\d+$/i.test(id)) {
+      return { openalex_id: id }
+    }
+
+    const doi = String(result?.doi || '').trim()
+    if (doi) return { doi }
+
+    return { title: String(result?.title || id || '').trim() }
+  }
+
+  async function enqueueSelectedSearchResults(startPipeline = false) {
+    searchQueueStatus = ''
+    if (searchQueueBusy) return
+
+    if (searchSource !== 'api') {
+      searchQueueStatus = 'Only API search results can be enqueued. Run the search against the live API first.'
+      return
+    }
+
+    const selectedRows = (searchResults || [])
+      .map((result, index) => ({ result, index, key: searchResultKey(result, index) }))
+      .filter(({ key }) => key && searchSelection.includes(key))
+
+    if (selectedRows.length === 0) {
+      searchQueueStatus = 'Select at least one search result.'
+      return
+    }
+
+    searchQueueBusy = true
+    let queuedSeeds = 0
+    let queuedWorks = 0
+    const failures = []
+
+    try {
+      for (let i = 0; i < selectedRows.length; i += 1) {
+        const { result, key } = selectedRows[i]
+        const cfg = getSearchQueueConfig(key)
+        const seedPayload = JSON.stringify([buildSeedItemFromSearchResult(result)])
+        const title = String(result?.title || result?.id || key).slice(0, 80)
+        searchQueueStatus = `Queueing ${i + 1}/${selectedRows.length}: ${title}`
+        try {
+          const payload = await runKeywordSearch({
+            query: '',
+            seedJson: seedPayload,
+            field: 'default',
+            includeDownstream: Boolean(cfg.includeDownstream),
+            includeUpstream: Boolean(cfg.includeUpstream),
+            relatedDepthDownstream: Math.max(1, Number(cfg.relatedDepthDownstream) || 1),
+            relatedDepthUpstream: Math.max(1, Number(cfg.relatedDepthUpstream) || 1),
+            maxRelated: Math.max(1, Number(cfg.maxRelated) || 1),
+            enqueue: true,
+            fallbackToSample: false,
+          })
+          if (payload?.source !== 'api') {
+            throw new Error('backend did not return live API results')
+          }
+          queuedSeeds += 1
+          queuedWorks += Array.isArray(payload?.data) ? payload.data.length : 0
+        } catch (error) {
+          failures.push(`${title}: ${error?.message || 'enqueue failed'}`)
+        }
+      }
+
+      await Promise.all([
+        loadDownloads(),
+        loadIngestStats({ quiet: true }),
+        loadCorpus({ preserveSelection: true, quiet: true }),
+      ])
+
+      if (startPipeline && queuedSeeds > 0 && !pipelineWorker.running) {
+        await handleStartPipelineWorker()
+      }
+
+      if (queuedSeeds === 0) {
+        searchQueueStatus = failures.length > 0 ? `No items queued. ${failures[0]}` : 'No items queued.'
+      } else {
+        const failSuffix =
+          failures.length > 0
+            ? ` ${failures.length} item(s) failed${failures[0] ? ` (first: ${failures[0]})` : ''}.`
+            : ''
+        const pipelineSuffix = startPipeline && queuedSeeds > 0 ? ' Downloader started.' : ''
+        searchQueueStatus = `Queued ${queuedSeeds} seed item(s); ${queuedWorks} work(s) sent to with_metadata queue.${failSuffix}${pipelineSuffix}`
+      }
+    } finally {
+      searchQueueBusy = false
+    }
+  }
+
   function resetSearchForm() {
     searchMode = 'query'
     searchQuery = ''
@@ -1159,6 +1715,9 @@
     applyKeywordRecursionDefaults(keywordRecursionConfig)
     searchStatus = ''
     searchSource = ''
+    searchSelection = []
+    searchQueueConfigs = {}
+    searchQueueStatus = ''
   }
 
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
@@ -1174,7 +1733,7 @@
         corpusItems = []
         corpusTotal = 0
         corpusHasMore = false
-        corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
+        corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichments: 0, failed_downloads: 0 }
       }
       if (!preserveSelection) {
         selectedCorpusItemKey = ''
@@ -1193,6 +1752,8 @@
           raw: Number(stageTotals.raw || 0),
           metadata: Number(stageTotals.metadata || 0),
           downloaded: Number(stageTotals.downloaded || 0),
+          failed_enrichments: Number(stageTotals.failed_enrichments || 0),
+          failed_downloads: Number(stageTotals.failed_downloads || 0),
         }
       }
       if (corpusSource === 'sample') {
@@ -1241,8 +1802,6 @@
     try {
       const payload = await fetchDownloadWorkerStatus()
       downloadWorker = payload
-      downloadWorkerIntervalSeconds = payload?.config?.intervalSeconds ?? downloadWorkerIntervalSeconds
-      downloadWorkerBatchSize = payload?.config?.batchSize ?? downloadWorkerBatchSize
       if (!quiet) downloadWorkerStatus = ''
     } catch (error) {
       if (error?.status === 401) {
@@ -1347,12 +1906,9 @@
     downloadWorkerBusy = true
     downloadWorkerStatus = 'Starting worker...'
     try {
-      await startDownloadWorker({
-        intervalSeconds: Number(downloadWorkerIntervalSeconds) || 60,
-        batchSize: Number(downloadWorkerBatchSize) || 3,
-      })
+      await startDownloadWorker()
       await loadDownloadWorkerStatus()
-      downloadWorkerStatus = 'Worker started.'
+      downloadWorkerStatus = 'Worker started (auto throughput mode).'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1390,10 +1946,10 @@
     downloadWorkerBusy = true
     downloadWorkerStatus = 'Running one batch...'
     try {
-      await runDownloadWorkerOnce({ batchSize: Number(downloadWorkerBatchSize) || 3 })
+      await runDownloadWorkerOnce()
       await loadDownloadWorkerStatus()
       await loadDownloads()
-      downloadWorkerStatus = 'Batch completed.'
+      downloadWorkerStatus = 'Batch completed (auto throughput mode).'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1599,11 +2155,12 @@
           queuePromotionAnimation(promotionEvent)
           return
         }
-        if (logsType !== 'pipeline') return
         const line = event.data
         if (typeof line === 'string' && line.startsWith('{')) return
         if (typeof line === 'string' && line.startsWith('WebSocket connection established')) return
         if (!isLogLineForCurrentCorpus(line)) return
+        updateExtractionProgressFromLog(line)
+        if (logsType !== 'pipeline') return
         const hadLines = logs.length > 0
         logs = [...logs, line].slice(-maxLogHistory)
         if (logsCursor > 0) {
@@ -2393,25 +2950,40 @@
           Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
         </p>
       </div>
-      <div class="header-meta">
-        <div class="header-panel">
-          <div class="header-user">
-            <span class="eyebrow">Signed in</span>
-            <strong>{authUser?.username}</strong>
-          </div>
-          <div class="header-corpus">
-            <label>
-              Corpus
-              <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
-                {#each corpora as corpus}
-                  <option value={corpus.id}>{corpus.name}</option>
-                {/each}
-              </select>
-            </label>
-            <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus}>
-              New corpus
+      <div class="header-panel">
+        <div class="header-user">
+          <span class="eyebrow">Signed in</span>
+          <strong>{authUser?.username}</strong>
+          <button class="secondary logout-button" type="button" on:click={handleLogout}>
+            Log out
+          </button>
+        </div>
+        <div class="header-corpus">
+          <label>
+            <span class="header-corpus-label">Corpus</span>
+            <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
+              {#each corpora as corpus}
+                <option value={corpus.id}>{corpus.name}</option>
+              {/each}
+            </select>
+          </label>
+          <div class="header-corpus-actions">
+            <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus || deletingCorpus}>
+              {creatingCorpus ? 'Creating...' : 'New corpus'}
+            </button>
+            <button
+              class="danger"
+              type="button"
+              on:click={handleDeleteCorpus}
+              disabled={deletingCorpus || creatingCorpus || !currentCorpusId || !canDeleteCurrentCorpus}
+              title={canDeleteCurrentCorpus ? 'Delete selected corpus' : 'Only owners can delete corpora'}
+            >
+              {deletingCorpus ? 'Deleting...' : 'Delete corpus'}
             </button>
           </div>
+          {#if corpusActionStatus}
+            <p class={`${corpusActionError ? 'error' : 'muted'} header-corpus-status`}>{corpusActionStatus}</p>
+          {/if}
         </div>
       </div>
     </header>
@@ -2490,14 +3062,41 @@
 
         <div class="card">
           <h3>Extracted entries</h3>
-          <p class="muted">{latestEntriesStatus}</p>
+          {#if latestEntriesStatus}
+            <p class="muted">{latestEntriesStatus}</p>
+          {/if}
+          {#if extractionProgress.active && isWaitingLatestEntries}
+            <div class="extract-progress">
+              <div
+                class={`extract-progress-track ${extractionProgress.indeterminate ? 'indeterminate' : ''}`}
+                role="progressbar"
+                aria-label="Extraction progress"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={Math.round(extractionProgress.percent || 0)}
+              >
+                <div
+                  class="extract-progress-bar"
+                  style={extractionProgress.indeterminate ? '' : `width: ${Math.max(2, Math.min(100, extractionProgress.percent || 0))}%`}
+                ></div>
+              </div>
+              {#if extractionProgress.detail}
+                <p class="muted small">{extractionProgress.detail}</p>
+              {/if}
+            </div>
+          {/if}
           {#if latestEntriesBase}
-            <p class="muted">Source: {latestEntriesBase}</p>
+            <p class="muted">Source: {formatSeedDocumentLabel(latestSeedDocument, latestEntriesBase)}</p>
+            {#if formatSeedDocumentDetails(latestSeedDocument)}
+              <p class="muted">{formatSeedDocumentDetails(latestSeedDocument)}</p>
+            {/if}
           {/if}
           <div class="split">
             <button class="secondary" type="button" on:click={loadIngestStats}>Refresh stats</button>
             <button class="secondary" type="button" on:click={loadIngestRuns}>Refresh runs</button>
-            <span class="muted">{ingestStatsStatus}</span>
+            {#if ingestStatsStatus}
+              <span class="muted">{ingestStatsStatus}</span>
+            {/if}
           </div>
           <div class="pill-row">
             <span class="pill">Raw: {pipelineRawCount}</span>
@@ -2505,7 +3104,9 @@
             <span class="pill">Downloaded: {pipelineDownloadedCount}</span>
           </div>
           <div class="split">
-            <span class="muted">{ingestRunsStatus}</span>
+            {#if ingestRunsStatus}
+              <span class="muted">{ingestRunsStatus}</span>
+            {/if}
           </div>
           {#if ingestRuns.length > 0}
             <div class="table">
@@ -2513,7 +3114,7 @@
                 <span>Run</span>
                 <span>Entries</span>
                 <span>Last seen</span>
-                <span>Source PDF</span>
+                <span>Source details</span>
               </div>
               {#each ingestRuns as run}
                 <div class="table-row cols-runs">
@@ -2521,39 +3122,105 @@
                     <button
                       class="link truncate-line"
                       type="button"
-                      title={run.ingest_source}
+                      title={formatSeedDocumentLabel(
+                        {
+                          title: run.seed_title,
+                          year: run.seed_year,
+                          doi: run.seed_doi,
+                        },
+                        run.ingest_source
+                      )}
                       on:click={() => loadLatestEntries(run.ingest_source)}
                     >
-                      {run.ingest_source}
+                      {formatSeedDocumentLabel(
+                        {
+                          title: run.seed_title,
+                          year: run.seed_year,
+                          doi: run.seed_doi,
+                        },
+                        run.ingest_source
+                      )}
                     </button>
                   </span>
                   <span>{run.entry_count}</span>
                   <span class="nowrap">{run.last_created_at || ''}</span>
-                  <span class="truncate-line" title={run.source_pdf || ''}>{run.source_pdf || ''}</span>
+                  <span
+                    class="truncate-line"
+                    title={
+                      formatSeedDocumentDetails({
+                        authors: run.seed_authors,
+                        source: run.seed_source,
+                        publisher: run.seed_publisher,
+                      }) || (run.source_pdf || '')
+                    }
+                  >
+                    {formatSeedDocumentDetails({
+                      authors: run.seed_authors,
+                      source: run.seed_source,
+                      publisher: run.seed_publisher,
+                    }) || (run.source_pdf || '')}
+                  </span>
                 </div>
               {/each}
             </div>
           {/if}
-          {#if latestEntries.length === 0}
-            <p class="muted">No extracted entries yet.</p>
+          {#if latestEntries.length === 0 && !isWaitingLatestEntries}
+            <p class="muted">{latestEntriesBase ? 'No extracted entries found for this source yet.' : 'Upload a PDF and run Extract to view entries.'}</p>
           {:else}
             <div class="table-toolbar">
               <div class="table-toolbar-left">
-                <span class="muted">Selected: {latestSelection.length}</span>
+                <span class="muted">Selected: {selectedLatestCount} / {selectableLatestCount} pending</span>
                 <button class="secondary" type="button" on:click={selectAllLatest}>Select all</button>
                 <button class="secondary" type="button" on:click={clearLatestSelection}>Clear</button>
               </div>
               <div class="table-toolbar-right">
                 <div class="toolbar-actions">
                   <button
+                    class="secondary"
+                    type="button"
+                    on:click={() => enqueueSelectedLatest(false)}
+                    disabled={selectedLatestCount === 0 || processingMarked}
+                  >
+                    {processingMarked ? 'Processing...' : 'Enrich'}
+                  </button>
+                  <button
                     class="primary"
                     type="button"
-                    on:click={enqueueSelectedLatest}
-                    disabled={latestSelection.length === 0 || processingMarked}
+                    on:click={() => enqueueSelectedLatest(true)}
+                    disabled={selectedLatestCount === 0 || processingMarked}
                   >
-                    {processingMarked ? 'Processing...' : 'Enrich Selected'}
+                    {processingMarked ? 'Processing...' : 'Enrich + Download'}
                   </button>
                 </div>
+              </div>
+            </div>
+
+            <div class="expansion-settings-row" style="display: flex; align-items: center; gap: 20px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--stroke); border-radius: 8px; margin-bottom: 16px; flex-wrap: nowrap; overflow-x: auto;">
+              <span class="muted small" style="text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; white-space: nowrap;">Enrichment Expansion</span>
+              
+              <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px; white-space: nowrap;" class:opacity-50={!includeDownstream}>
+                <label class="expansion-toggle">
+                  <input type="checkbox" bind:checked={includeDownstream} />
+                  <span>Downstream</span>
+                </label>
+                <span class="muted small" style="margin-left: 4px;">Depth</span>
+                <input type="number" min="1" max="4" bind:value={relatedDepthDownstream} disabled={!includeDownstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
+              </div>
+
+              <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px;" class:opacity-50={!includeUpstream}>
+                <label class="expansion-toggle">
+                  <input type="checkbox" bind:checked={includeUpstream} />
+                  <span>Upstream</span>
+                </label>
+                <span class="muted small" style="margin-left: 4px;">Depth</span>
+                <input type="number" min="1" max="4" bind:value={relatedDepthUpstream} disabled={!includeUpstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
+              </div>
+
+              <div style="width: 1px; height: 20px; background: var(--stroke);"></div>
+              
+              <div style="display: flex; gap: 8px; align-items: center;">
+                <span class="muted small">Max Related / Paper</span>
+                <input type="number" min="1" max="100" bind:value={maxRelated} class="short-input" style="padding: 4px; width: 60px; border-radius: 4px; border: 1px solid var(--stroke);" />
               </div>
             </div>
             {#if enqueueStatus}
@@ -2569,6 +3236,7 @@
                     type="checkbox"
                     aria-label="Select all"
                     bind:checked={allLatestSelected}
+                    disabled={selectableLatestCount === 0}
                     on:change={(e) => (e.target.checked ? selectAllLatest() : clearLatestSelection())}
                   />
                 </span>
@@ -2579,14 +3247,27 @@
                 <span>DOI</span>
               </div>
               {#each latestEntries as entry, index}
-                <div class={`table-row cols-6 ${isLatestSelected(entry, index) ? 'selected' : ''}`}>
-                  <span>
-                    <input
-                      type="checkbox"
-                      aria-label={`Select ${formatTitle(entry)}`}
-                      bind:group={latestSelection}
-                      value={latestSelectionKey(entry, index)}
-                    />
+                <div class={`table-row cols-6 ${isLatestSelected(entry, index) ? 'selected' : ''} ${isLatestDownloaded(entry) ? 'downloaded' : isLatestProcessed(entry) ? 'enriched' : ''}`}>
+                  <span class="ingest-select-cell">
+                    {#if isLatestSelectable(entry)}
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${formatTitle(entry)}`}
+                        bind:group={latestSelection}
+                        value={latestSelectionKey(entry, index)}
+                      />
+                    {:else}
+                      <input
+                        type="checkbox"
+                        aria-label={`${formatTitle(entry)} is not selectable`}
+                        disabled
+                      />
+                    {/if}
+                    {#if isLatestDownloaded(entry)}
+                      <span class="tag downloaded ingest-state-tag">Downloaded</span>
+                    {:else if isLatestProcessed(entry)}
+                      <span class="tag completed ingest-state-tag">Enriched</span>
+                    {/if}
                   </span>
                   <span>{formatTitle(entry)}</span>
                   <span>{formatAuthors(entry)}</span>
@@ -2762,19 +3443,122 @@
             {/if}
           </form>
           <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
+          {#if searchResults.length > 0}
+            <div class="search-queue-actions">
+              <div class="search-queue-selection">
+                <button class="secondary" type="button" on:click={selectAllSearchResults} disabled={searchQueueBusy}>
+                  Select all
+                </button>
+                <button class="text-btn" type="button" on:click={clearSearchSelection} disabled={searchQueueBusy}>
+                  Clear
+                </button>
+                <span class="muted small">{selectedSearchCount} selected</span>
+              </div>
+              <div class="search-queue-buttons">
+                <button
+                  class="secondary"
+                  type="button"
+                  on:click={() => enqueueSelectedSearchResults(false)}
+                  disabled={searchQueueBusy || selectedSearchCount === 0}
+                >
+                  {searchQueueBusy ? 'Queueing...' : 'Enqueue Selected'}
+                </button>
+                <button
+                  class="primary"
+                  type="button"
+                  on:click={() => enqueueSelectedSearchResults(true)}
+                  disabled={searchQueueBusy || selectedSearchCount === 0}
+                >
+                  {searchQueueBusy ? 'Queueing...' : 'Enqueue + Download'}
+                </button>
+              </div>
+            </div>
+            {#if searchQueueStatus}
+              <p class="muted">{searchQueueStatus}</p>
+            {/if}
+          {/if}
           <div class="table">
-            <div class="table-row header cols-4">
+            <div class="table-row header cols-search">
+              <span>
+                <input
+                  type="checkbox"
+                  aria-label="Select all search results"
+                  bind:checked={allSearchSelected}
+                  on:change={(e) => (e.target.checked ? selectAllSearchResults() : clearSearchSelection())}
+                />
+              </span>
               <span>Title</span>
               <span>Authors</span>
               <span>Year</span>
               <span>Type</span>
+              <span>Per-Item Expansion</span>
             </div>
-            {#each searchResults as result}
-              <div class="table-row cols-4">
+            {#each searchResults as result, index}
+              {@const rowKey = searchResultKey(result, index)}
+              {@const rowCfg = getSearchQueueConfig(rowKey)}
+              <div class={`table-row cols-search ${searchSelection.includes(rowKey) ? 'selected' : ''}`}>
+                <span>
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${result.title || rowKey}`}
+                    bind:group={searchSelection}
+                    value={rowKey}
+                  />
+                </span>
                 <span>{result.title}</span>
                 <span>{result.authors}</span>
                 <span>{result.year}</span>
                 <span>{result.type}</span>
+                <span>
+                  <div class="search-row-controls">
+                    <label class="search-row-toggle">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(rowCfg.includeDownstream)}
+                        on:change={(e) => updateSearchQueueConfig(rowKey, { includeDownstream: e.target.checked })}
+                      />
+                      <span>Down</span>
+                    </label>
+                    <input
+                      class="search-row-input"
+                      type="number"
+                      min="1"
+                      max="4"
+                      value={rowCfg.relatedDepthDownstream}
+                      disabled={!rowCfg.includeDownstream}
+                      on:change={(e) => updateSearchQueueConfig(rowKey, { relatedDepthDownstream: Math.max(1, Number(e.target.value) || 1) })}
+                      title="Downstream depth"
+                    />
+                    <label class="search-row-toggle">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(rowCfg.includeUpstream)}
+                        on:change={(e) => updateSearchQueueConfig(rowKey, { includeUpstream: e.target.checked })}
+                      />
+                      <span>Up</span>
+                    </label>
+                    <input
+                      class="search-row-input"
+                      type="number"
+                      min="1"
+                      max="4"
+                      value={rowCfg.relatedDepthUpstream}
+                      disabled={!rowCfg.includeUpstream}
+                      on:change={(e) => updateSearchQueueConfig(rowKey, { relatedDepthUpstream: Math.max(1, Number(e.target.value) || 1) })}
+                      title="Upstream depth"
+                    />
+                    <span class="muted small">max</span>
+                    <input
+                      class="search-row-input search-row-max"
+                      type="number"
+                      min="1"
+                      max="100"
+                      value={rowCfg.maxRelated}
+                      on:change={(e) => updateSearchQueueConfig(rowKey, { maxRelated: Math.max(1, Number(e.target.value) || 1) })}
+                      title="Max related works"
+                    />
+                  </div>
+                </span>
               </div>
             {/each}
           </div>
@@ -2789,6 +3573,7 @@
           {rawTotal}
           {metadataTotal}
           {downloadedTotal}
+          {failedEnrichmentTotal}
           bind:shareUsername={shareUsername}
           bind:shareRole={shareRole}
           {shareStatus}
@@ -2838,15 +3623,6 @@
                 {/if}
               </div>
               <div class="worker-card__actions">
-                <label class="inline-field">
-                  <span class="muted">Every</span>
-                  <input type="number" min="10" step="10" bind:value={downloadWorkerIntervalSeconds} />
-                  <span class="muted">s</span>
-                </label>
-                <label class="inline-field">
-                  <span class="muted">Batch</span>
-                  <input type="number" min="1" max="25" step="1" bind:value={downloadWorkerBatchSize} />
-                </label>
                 <button class="secondary" type="button" on:click={handleRunDownloadOnce} disabled={downloadWorkerBusy}>
                   Run once
                 </button>
@@ -2871,6 +3647,7 @@
             </div>
             <div class="worker-card__meta">
               <span class="muted">{downloadWorkerStatus}</span>
+              <span class="muted small">Throughput is auto-managed by the backend for maximum speed.</span>
               {#if pipelineWorker.running}
                 <span class="muted small">Download-only worker is disabled while global pipeline is running.</span>
               {/if}
@@ -2965,7 +3742,7 @@
             {#each filteredDownloads as item (item.id)}
               <div class="table-row cols-3">
                 <span class="work-title" title={item.title}>{item.title}</span>
-                <span class={`tag ${item.status}`}>{item.status}</span>
+                <span class={`tag status-chip ${item.status}`}>{item.status}</span>
                 <span
                   class={`attempts-badge ${item.attempts >= 4 ? 'danger' : item.attempts >= 2 ? 'warn' : ''}`}
                   title={item.attempts > 0 ? `Attempts: ${item.attempts}` : 'No attempts yet'}

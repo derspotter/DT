@@ -14,22 +14,22 @@ Replace the Node.js `setInterval` orchestration with a single, persistent Python
 
 ---
 
-## Phase 1: Database Job Queue Integration
+## Phase 1: Database Job Queue Integration (COMPLETED)
 Communicate between Node.js and the Python Daemon using a "Jobs" table in SQLite.
 1. **Schema Update:** Create a `pipeline_jobs` table to track job types (`enrich`, `download`, `keyword_search`), statuses (`pending`, `running`, `completed`, `failed`), progress, and `corpus_id`.
 2. **Node.js Update:** Refactor API endpoints (`/api/ingest/process-marked`, `/api/downloads/worker/start`, etc.) to insert rows into `pipeline_jobs` instead of spawning Python scripts.
 3. **WebSocket Update:** Node.js reads the `pipeline_jobs` table to push real-time status updates to the frontend via WebSockets.
 
-## Phase 2: Building the Python Daemon
-1. **The Daemon Script:** Create a long-running Python process (`backend/scripts/daemon.py`).
+## Phase 2: Building the Python Daemon (COMPLETED)
+1. **The Daemon Script:** Create a long-running Python process (`backend/scripts/daemon/worker.py`).
 2. **The Loop:** Run a continuous loop polling the `pipeline_jobs` table for `status = 'pending'`.
 3. **Task Routing:** Route fetched jobs to existing core logic (e.g., `DatabaseManager`, `OpenAlexScraper`).
 4. **Persistent Connections:** Maintain a single, open SQLite connection and a persistent HTTP connection pool for APIs to drastically speed up processing.
 5. **Logging:** Log directly to files or a database table, bypassing Node.js entirely.
 
-## Phase 3: Docker Refactoring & Cleanup
-1. **Docker Compose:** Add a new `rag_worker` service in `docker-compose.yml` to run `python backend/scripts/daemon.py`.
-2. **Clean Up:** Remove the `python-shell` dependency from the Node.js `package.json`. Delete the orchestration functions (`startPipelineWorker`, `tickPipelineWorker`, `spawnDownloadOnce`) from `app.js`.
+## Phase 3: Docker Refactoring & Cleanup (COMPLETED)
+1. **Docker Compose:** Add a new `rag_worker` service in `docker-compose.yml` to run `python backend/scripts/daemon/worker.py`.
+2. **Clean Up:** Remove the orchestration functions (`startPipelineWorker`, `tickPipelineWorker`, `spawnDownloadOnce`) from `app.js`.
 
 ---
 

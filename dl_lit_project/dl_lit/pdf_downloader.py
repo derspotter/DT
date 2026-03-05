@@ -74,7 +74,9 @@ class PDFDownloader:
             print(f"[Downloader] Attempting to download from {source}: {pdf_url}")
             # Use a generic rate limit for downloads, as we don't know the host in advance
             self.rate_limiter.wait_if_needed('default') 
-            response = requests.get(pdf_url, headers=self.headers, timeout=60, allow_redirects=True)
+            with requests.Session() as session:
+                session.trust_env = False
+                response = session.get(pdf_url, headers=self.headers, timeout=60, allow_redirects=True)
             response.raise_for_status()
 
             pdf_content = response.content

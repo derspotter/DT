@@ -903,8 +903,10 @@ def download_pdfs_command(db_path, limit, download_dir):
             'title': row.get('title'),
             'authors': author_structs,  # Pass the structured data for searching
             'doi': row.get('doi'),
-            'type': row.get('entry_type') or '',
-            'year': row.get('year')
+            'type': row.get('type') or row.get('entry_type') or '',
+            'year': row.get('year'),
+            'open_access_url': row.get('url_source') or row.get('url'),
+            'openalex_json': row.get('openalex_json'),
         }
 
         result = enhancer.enhance_bibliography(copy.deepcopy(ref), download_dir)
