@@ -1291,24 +1291,24 @@ button.danger:disabled {
 
 .table-row.enriched,
 .table-row:not(.header):nth-child(even).enriched {
-  background: #edf7ef;
-  border-color: rgba(27, 154, 89, 0.25);
+  background: rgba(27, 154, 89, 0.04);
+  border-color: rgba(27, 154, 89, 0.15);
 }
 
 .table-row:not(.header).enriched:hover {
-  background: #e3f3e6;
-  border-color: rgba(27, 154, 89, 0.4);
+  background: rgba(27, 154, 89, 0.08);
+  border-color: rgba(27, 154, 89, 0.25);
 }
 
 .table-row.downloaded,
 .table-row:not(.header):nth-child(even).downloaded {
-  background: #eaf3ff;
-  border-color: rgba(3, 105, 161, 0.28);
+  background: rgba(3, 105, 161, 0.04);
+  border-color: rgba(3, 105, 161, 0.15);
 }
 
 .table-row:not(.header).downloaded:hover {
-  background: #dbeaff;
-  border-color: rgba(3, 105, 161, 0.45);
+  background: rgba(3, 105, 161, 0.08);
+  border-color: rgba(3, 105, 161, 0.25);
 }
 
 .table-row.selected,
