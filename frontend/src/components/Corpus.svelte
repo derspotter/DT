@@ -28,6 +28,7 @@
   export let corpusLoadingMore;
   export let corpusLoading;
   export let loadCorpus;
+  export let handleCorpusColumnScroll;
 
   let textFilter = '';
   let stageFilter = 'all';
@@ -161,7 +162,11 @@
   </div>
 
   <div class="corpus-table-unified">
-    <div class="table table-scroll corpus-table" style="max-height: 500px; overflow-y: auto;">
+    <div
+      class="table table-scroll corpus-table"
+      style="max-height: 500px; overflow-y: auto;"
+      on:scroll={handleCorpusColumnScroll}
+    >
       <div class="table-row header" style="grid-template-columns: 2fr 80px 100px;">
         <span>Title</span>
         <span>Year</span>
