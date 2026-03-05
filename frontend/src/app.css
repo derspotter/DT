@@ -1184,7 +1184,7 @@ button.danger:disabled {
 }
 
 .table-row.cols-runs {
-  grid-template-columns: minmax(0, 1.5fr) 84px 176px minmax(0, 2.5fr);
+  grid-template-columns: minmax(0, 3fr) 84px 176px minmax(0, 1fr);
   align-items: center;
 }
 
