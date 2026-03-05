@@ -1721,6 +1721,9 @@
   }
 
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
+    if (!append && corpusLoading) return
+    if (!append && quiet && corpusLoadingMore) return
+
     const scrollSnapshot = !append && preserveSelection ? snapshotCorpusScroll() : null
     if (append) {
       if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
@@ -1741,7 +1744,13 @@
     }
     try {
       const offset = append ? corpusItems.length : 0
-      const { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset })
+      const requestedLimit =
+        append
+          ? CORPUS_PAGE_SIZE
+          : quiet && preserveSelection
+            ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
+            : CORPUS_PAGE_SIZE
+      const { data, total, source, stageTotals } = await fetchCorpus({ limit: requestedLimit, offset })
       const incoming = Array.isArray(data) ? data : []
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
@@ -3231,7 +3240,7 @@
             {/if}
             <div class="table">
               <div class="table-row header cols-6">
-                <span>
+                <span class="ingest-select-cell">
                   <input
                     type="checkbox"
                     aria-label="Select all"
@@ -3239,6 +3248,7 @@
                     disabled={selectableLatestCount === 0}
                     on:change={(e) => (e.target.checked ? selectAllLatest() : clearLatestSelection())}
                   />
+                  <span>Status</span>
                 </span>
                 <span>Title</span>
                 <span>Authors</span>
@@ -3593,6 +3603,7 @@
           {corpusLoadingMore}
           {corpusLoading}
           {loadCorpus}
+          {handleCorpusColumnScroll}
         />
       {/if}
 
