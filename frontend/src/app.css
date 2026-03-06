@@ -698,6 +698,61 @@ select {
   animation: extract-progress-indeterminate 1.2s ease-in-out infinite;
 }
 
+.ingest-start-prompt {
+  margin: 6px 0 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: #fbfaf8;
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ingest-start-prompt p {
+  margin: 6px 0 0;
+}
+
+.ingest-start-prompt__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ingest-job-progress {
+  margin: 6px 0 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: #fff;
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.ingest-job-progress__top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ingest-job-progress__stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.ingest-job-progress__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
 .file-list {
   list-style: none;
   padding: 0;
@@ -1150,6 +1205,10 @@ button.danger:disabled {
   font-size: 0.95rem;
 }
 
+.table-row.clickable {
+  cursor: pointer;
+}
+
 .table-row>span {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -1397,6 +1456,11 @@ button.danger:disabled {
 .tag.queued {
   background: #e0f2fe;
   color: #0369a1;
+}
+
+.tag.pending {
+  background: #f4f4f5;
+  color: #3f3f46;
 }
 
 .tag.downloaded {

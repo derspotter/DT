@@ -24,6 +24,8 @@
     stopDownloadWorker,
     runDownloadWorkerOnce,
     fetchPipelineWorkerStatus,
+    fetchPipelineDaemonStatus,
+    fetchPipelineJobsSummary,
     fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
@@ -129,6 +131,36 @@
   let processMarkedLimit = 10
   let processMarkedStatus = ''
   let processingMarked = false
+  let ingestTrackedRequest = {
+    active: false,
+    requestId: '',
+    jobIds: [],
+    withDownload: false,
+  }
+  let ingestJobProgress = {
+    pending: 0,
+    running: 0,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    total: 0,
+    updatedAt: '',
+    daemonOnline: null,
+    daemonLastSeenAt: '',
+    error: '',
+  }
+  let ingestShowStartPrompt = false
+  let ingestStartPromptBusy = false
+  let ingestStartPromptError = ''
+  let ingestProgressPollTimer = null
+  let ingestLastProgressSignature = ''
+  const INGEST_PROGRESS_POLL_MS = 2000
+  $: ingestProgressDone = ingestJobProgress.total > 0 &&
+    ingestJobProgress.pending === 0 &&
+    ingestJobProgress.running === 0
+  $: ingestProgressRatio = ingestJobProgress.total > 0
+    ? (ingestJobProgress.completed + ingestJobProgress.failed + ingestJobProgress.cancelled) / ingestJobProgress.total
+    : 0
   let ingestRuns = []
   let ingestRunsStatus = ''
 
@@ -245,6 +277,9 @@
   }
   let pipelineWorkerStatus = ''
   let pipelineWorkerBusy = false
+  $: if (pipelineWorker.running && ingestShowStartPrompt) {
+    ingestShowStartPrompt = false
+  }
   let exportBusy = false
   let exportStatus = ''
   let exportFilterStatus = 'all'
@@ -674,6 +709,183 @@
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  function stopIngestProgressPolling() {
+    if (ingestProgressPollTimer) {
+      clearInterval(ingestProgressPollTimer)
+      ingestProgressPollTimer = null
+    }
+  }
+
+  function resetIngestProgressTracking() {
+    stopIngestProgressPolling()
+    ingestTrackedRequest = {
+      active: false,
+      requestId: '',
+      jobIds: [],
+      withDownload: false,
+    }
+    ingestJobProgress = {
+      pending: 0,
+      running: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      total: 0,
+      updatedAt: '',
+      daemonOnline: null,
+      daemonLastSeenAt: '',
+      error: '',
+    }
+    ingestLastProgressSignature = ''
+    ingestShowStartPrompt = false
+    ingestStartPromptBusy = false
+    ingestStartPromptError = ''
+  }
+
+  function applyIngestJobsSummary(summary) {
+    const counts = summary?.counts || {}
+    const daemon = summary?.daemon || {}
+    const next = {
+      pending: Number(counts.pending || 0),
+      running: Number(counts.running || 0),
+      completed: Number(counts.completed || 0),
+      failed: Number(counts.failed || 0),
+      cancelled: Number(counts.cancelled || 0),
+      total: Number(counts.total || 0),
+      updatedAt: new Date().toISOString(),
+      daemonOnline: daemon?.online === true ? true : daemon?.online === false ? false : null,
+      daemonLastSeenAt: String(daemon?.last_seen_at || '').trim(),
+      error: '',
+    }
+    ingestJobProgress = next
+
+    if (next.running > 0) {
+      processMarkedStatus = `Processing queued jobs... running ${next.running}, pending ${next.pending}.`
+    } else if (next.pending > 0) {
+      processMarkedStatus = `Jobs queued and waiting for worker... pending ${next.pending}.`
+    } else if (next.total > 0) {
+      if (next.failed > 0 || next.cancelled > 0) {
+        processMarkedStatus = `Finished with issues: ${next.completed} completed, ${next.failed} failed, ${next.cancelled} cancelled.`
+      } else {
+        processMarkedStatus = `Finished: ${next.completed} job${next.completed === 1 ? '' : 's'} completed.`
+      }
+    }
+  }
+
+  async function refreshIngestJobProgress() {
+    if (!ingestTrackedRequest.active || !Array.isArray(ingestTrackedRequest.jobIds) || ingestTrackedRequest.jobIds.length === 0) {
+      return
+    }
+    try {
+      const summary = await fetchPipelineJobsSummary({
+        jobIds: ingestTrackedRequest.jobIds,
+        recentLimit: Math.max(50, ingestTrackedRequest.jobIds.length),
+      })
+      applyIngestJobsSummary(summary)
+
+      const signature = [
+        ingestJobProgress.pending,
+        ingestJobProgress.running,
+        ingestJobProgress.completed,
+        ingestJobProgress.failed,
+        ingestJobProgress.cancelled,
+      ].join(':')
+      if (signature !== ingestLastProgressSignature) {
+        ingestLastProgressSignature = signature
+        await Promise.all([
+          loadIngestStats({ quiet: true }),
+          loadCorpus({ preserveSelection: true, quiet: true }),
+          loadDownloads(),
+        ])
+      }
+
+      if (ingestProgressDone) {
+        stopIngestProgressPolling()
+        ingestTrackedRequest = { ...ingestTrackedRequest, active: false }
+        ingestShowStartPrompt = false
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      ingestJobProgress = {
+        ...ingestJobProgress,
+        error: error?.message || 'Failed to load queued job progress.',
+      }
+    }
+  }
+
+  function startIngestProgressPolling() {
+    stopIngestProgressPolling()
+    ingestProgressPollTimer = setInterval(() => {
+      refreshIngestJobProgress()
+    }, INGEST_PROGRESS_POLL_MS)
+  }
+
+  async function trackIngestQueuedJobs(payload, { withDownload = false } = {}) {
+    const jobIdsFromPayload = Array.isArray(payload?.jobs)
+      ? payload.jobs.map((job) => Number(job?.id)).filter((v) => Number.isFinite(v) && v > 0)
+      : []
+    const fallbackJobIds = [payload?.enrich_job_id, payload?.download_job_id]
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v) && v > 0)
+    const jobIds = [...new Set([...jobIdsFromPayload, ...fallbackJobIds])]
+
+    if (jobIds.length === 0) {
+      resetIngestProgressTracking()
+      return
+    }
+
+    ingestTrackedRequest = {
+      active: true,
+      requestId: String(payload?.request_id || ''),
+      jobIds,
+      withDownload: Boolean(withDownload),
+    }
+    ingestShowStartPrompt = Boolean(withDownload && !pipelineWorker.running)
+    ingestStartPromptError = ''
+    ingestJobProgress = {
+      ...ingestJobProgress,
+      pending: jobIds.length,
+      total: jobIds.length,
+      updatedAt: new Date().toISOString(),
+      error: '',
+    }
+    await refreshIngestJobProgress()
+    if (ingestTrackedRequest.active) {
+      startIngestProgressPolling()
+    }
+  }
+
+  async function handleStartQueuedIngestJobs() {
+    if (ingestStartPromptBusy) return
+    ingestStartPromptBusy = true
+    ingestStartPromptError = ''
+    try {
+      const daemonPayload = await fetchPipelineDaemonStatus()
+      const daemon = daemonPayload?.daemon || null
+      if (!daemon?.online) {
+        const lastSeen = daemon?.last_seen_at ? ` Last heartbeat: ${daemon.last_seen_at}.` : ''
+        ingestStartPromptError = `Worker daemon is offline. Start the worker service first.${lastSeen}`
+        return
+      }
+      await handleStartPipelineWorker()
+      ingestShowStartPrompt = false
+      await refreshIngestJobProgress()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      ingestStartPromptError = error?.message || 'Failed to start processing.'
+    } finally {
+      ingestStartPromptBusy = false
+    }
+  }
+
   function beginExtractionProgress(baseName, backendFilename = '') {
     extractionProgressRunId += 1
     extractionProgress = {
@@ -856,6 +1068,9 @@
       text.includes('[pipeline-worker mark]') ||
       text.includes('[pipeline-worker enrich]') ||
       text.includes('[download-worker] done') ||
+      text.includes('[DAEMON] Picked up job') ||
+      text.includes('[DAEMON] Successfully completed job') ||
+      text.includes('[DAEMON] Job ') ||
       text.includes('[SUCCESS] Inserted') ||
       text.includes('Bibliography extraction complete') ||
       text.includes('Finished APIscraper') ||
@@ -911,6 +1126,7 @@
 
   function shouldRunLiveRefresh() {
     if (authStatus !== 'authenticated') return false
+    if (ingestTrackedRequest.active) return true
     if (pipelineWorker.running || pipelineWorker.in_flight) return true
     if (downloadWorker.running || downloadWorker.in_flight) return true
     return activeTab === 'corpus' || activeTab === 'dashboard' || activeTab === 'downloads'
@@ -1036,6 +1252,7 @@
   }
 
   function resetFrontendState() {
+    resetIngestProgressTracking()
     ingestStats = { no_metadata: 0, with_metadata: 0, to_download_references: 0, downloaded_references: 0 }
     ingestStatsStatus = ''
     latestEntries = []
@@ -1340,6 +1557,17 @@
       .filter(Boolean)
   }
 
+  function toggleLatestSelection(entry, index) {
+    if (!isLatestSelectable(entry)) return;
+    const key = latestSelectionKey(entry, index);
+    if (!key) return;
+    if (latestSelection.includes(key)) {
+      latestSelection = latestSelection.filter(k => k !== key);
+    } else {
+      latestSelection = [...latestSelection, key];
+    }
+  }
+
   async function enqueueSelectedLatest(withDownload = false) {
     enqueueStatus = ''
     const ids = (latestEntries || [])
@@ -1362,12 +1590,6 @@
         // Set limit to match what was just marked, or default to a reasonable batch size
         processMarkedLimit = Math.max(10, payload.marked + payload.staged)
         await processMarkedBatch({ withDownload })
-        
-        // Also ensure the global pipeline worker is running so downloads actually happen
-        if (withDownload && !pipelineWorker.running) {
-          enqueueStatus += ' Starting background downloader...'
-          await handleStartPipelineWorker()
-        }
       } else {
         enqueueStatus += ' No new entries to enrich.'
       }
@@ -1405,7 +1627,8 @@
         enqueueDownload: withDownload,
         downloadBatchSize: Math.max(25, limit),
       })
-      processMarkedStatus = payload.message || 'Enrichment job queued. Check Pipeline Status for progress.'
+      processMarkedStatus = payload.message || 'Jobs queued successfully.'
+      await trackIngestQueuedJobs(payload, { withDownload })
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -1610,6 +1833,16 @@
 
   function selectAllSearchResults() {
     searchSelection = (searchResults || []).map((result, index) => searchResultKey(result, index)).filter(Boolean)
+  }
+
+  function toggleSearchSelection(result, index) {
+    const key = searchResultKey(result, index);
+    if (!key) return;
+    if (searchSelection.includes(key)) {
+      searchSelection = searchSelection.filter(k => k !== key);
+    } else {
+      searchSelection = [...searchSelection, key];
+    }
   }
 
   function buildSeedItemFromSearchResult(result) {
@@ -2919,6 +3152,7 @@
         clearInterval(liveRefreshIntervalId)
         liveRefreshIntervalId = null
       }
+      stopIngestProgressPolling()
       if (promotionFlushTimer) {
         clearTimeout(promotionFlushTimer)
         promotionFlushTimer = null
@@ -3126,7 +3360,23 @@
                 <span>Source details</span>
               </div>
               {#each ingestRuns as run}
-                <div class="table-row cols-runs">
+                <div 
+                  class="table-row cols-runs clickable"
+                  on:click={(e) => {
+                    if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                    fetchBibliographyEntries(run.ingest_source);
+                    activeTab = 'ingest';
+                  }}
+                  on:keydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      fetchBibliographyEntries(run.ingest_source);
+                      activeTab = 'ingest';
+                    }
+                  }}
+                  role="button"
+                  tabindex="0"
+                >
                   <span>
                     <button
                       class="link truncate-line"
@@ -3238,6 +3488,98 @@
             {#if processMarkedStatus}
               <p class="muted">{processMarkedStatus}</p>
             {/if}
+            {#if ingestShowStartPrompt}
+              <div class="ingest-start-prompt">
+                <div>
+                  <strong>Jobs queued.</strong>
+                  <p class="muted">Start global processing now to execute enrichment and downloads.</p>
+                  {#if ingestJobProgress.daemonOnline === false}
+                    <p class="error">Worker daemon appears offline. Start the worker service first.</p>
+                  {/if}
+                  {#if ingestStartPromptError}
+                    <p class="error">{ingestStartPromptError}</p>
+                  {/if}
+                </div>
+                <div class="ingest-start-prompt__actions">
+                  <button
+                    class="primary"
+                    type="button"
+                    on:click={handleStartQueuedIngestJobs}
+                    disabled={ingestStartPromptBusy}
+                  >
+                    {ingestStartPromptBusy ? 'Starting...' : 'Start now'}
+                  </button>
+                  <button
+                    class="secondary"
+                    type="button"
+                    on:click={() => { ingestShowStartPrompt = false; ingestStartPromptError = '' }}
+                    disabled={ingestStartPromptBusy}
+                  >
+                    Later
+                  </button>
+                </div>
+              </div>
+            {/if}
+            {#if ingestTrackedRequest.requestId || ingestJobProgress.total > 0 || ingestJobProgress.error}
+              <div class="ingest-job-progress">
+                <div class="ingest-job-progress__top">
+                  <span class="muted small">
+                    {#if ingestTrackedRequest.requestId}
+                      Request: {ingestTrackedRequest.requestId}
+                    {:else}
+                      Latest queued request
+                    {/if}
+                  </span>
+                  <span class={`tag ${ingestProgressDone ? 'completed' : ingestJobProgress.running > 0 ? 'queued' : 'pending'}`}>
+                    {#if ingestProgressDone}
+                      Finished
+                    {:else if ingestJobProgress.running > 0}
+                      Running
+                    {:else}
+                      Queued
+                    {/if}
+                  </span>
+                </div>
+                <div
+                  class="extract-progress-track"
+                  role="progressbar"
+                  aria-label="Ingest queued jobs progress"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={Math.round(ingestProgressRatio * 100)}
+                >
+                  <div
+                    class="extract-progress-bar"
+                    style={`width: ${Math.max(2, Math.min(100, ingestProgressRatio * 100))}%`}
+                  ></div>
+                </div>
+                <div class="ingest-job-progress__stats">
+                  <span>Pending: {ingestJobProgress.pending}</span>
+                  <span>Running: {ingestJobProgress.running}</span>
+                  <span>Completed: {ingestJobProgress.completed}</span>
+                  <span>Failed: {ingestJobProgress.failed}</span>
+                  <span>Cancelled: {ingestJobProgress.cancelled}</span>
+                </div>
+                <div class="ingest-job-progress__meta">
+                  <span class="muted small">
+                    Daemon:
+                    {#if ingestJobProgress.daemonOnline === true}
+                      Online
+                    {:else if ingestJobProgress.daemonOnline === false}
+                      Offline
+                    {:else}
+                      Unknown
+                    {/if}
+                  </span>
+                  {#if ingestJobProgress.updatedAt}
+                    <span class="muted small">Updated: {ingestJobProgress.updatedAt}</span>
+                  {/if}
+                </div>
+                {#if ingestJobProgress.error}
+                  <p class="error small">{ingestJobProgress.error}</p>
+                {/if}
+              </div>
+            {/if}
             <div class="table">
               <div class="table-row header cols-6">
                 <span class="ingest-select-cell">
@@ -3257,7 +3599,23 @@
                 <span>DOI</span>
               </div>
               {#each latestEntries as entry, index}
-                <div class={`table-row cols-6 ${isLatestSelected(entry, index) ? 'selected' : ''} ${isLatestDownloaded(entry) ? 'downloaded' : isLatestProcessed(entry) ? 'enriched' : ''}`}>
+                <div 
+                  class={`table-row cols-6 clickable ${isLatestSelected(entry, index) ? 'selected' : ''} ${isLatestDownloaded(entry) ? 'downloaded' : isLatestProcessed(entry) ? 'enriched' : ''}`}
+                  on:click={(e) => {
+                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                    toggleLatestSelection(entry, index);
+                  }}
+                  on:keydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                      e.preventDefault();
+                      toggleLatestSelection(entry, index);
+                    }
+                  }}
+                  role="checkbox"
+                  aria-checked={isLatestSelected(entry, index)}
+                  tabindex="0"
+                >
                   <span class="ingest-select-cell">
                     {#if isLatestSelectable(entry)}
                       <input
@@ -3506,7 +3864,23 @@
             {#each searchResults as result, index}
               {@const rowKey = searchResultKey(result, index)}
               {@const rowCfg = getSearchQueueConfig(rowKey)}
-              <div class={`table-row cols-search ${searchSelection.includes(rowKey) ? 'selected' : ''}`}>
+              <div 
+                class={`table-row cols-search clickable ${searchSelection.includes(rowKey) ? 'selected' : ''}`}
+                on:click={(e) => {
+                  if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                  toggleSearchSelection(result, index);
+                }}
+                on:keydown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                    e.preventDefault();
+                    toggleSearchSelection(result, index);
+                  }
+                }}
+                role="checkbox"
+                aria-checked={searchSelection.includes(rowKey)}
+                tabindex="0"
+              >
                 <span>
                   <input
                     type="checkbox"

@@ -437,6 +437,45 @@ export async function fetchPipelineWorkerStatus() {
   return response.json()
 }
 
+export async function fetchPipelineDaemonStatus() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/daemon/status`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load daemon status')
+  }
+  return response.json()
+}
+
+export async function fetchPipelineJobsSummary({ jobIds = [], types = [], recentLimit = 50 } = {}) {
+  const params = new URLSearchParams()
+  if (Array.isArray(jobIds) && jobIds.length > 0) {
+    const normalized = [...new Set(jobIds.map((v) => Number(v)).filter((v) => Number.isFinite(v) && v > 0))]
+    if (normalized.length > 0) {
+      params.set('job_ids', normalized.join(','))
+    }
+  }
+  if (Array.isArray(types) && types.length > 0) {
+    const normalizedTypes = [...new Set(types.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))]
+    if (normalizedTypes.length > 0) {
+      params.set('types', normalizedTypes.join(','))
+    }
+  }
+  const parsedLimit = Number(recentLimit)
+  if (Number.isFinite(parsedLimit) && parsedLimit > 0) {
+    params.set('recent_limit', String(parsedLimit))
+  }
+
+  const query = params.toString()
+  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/jobs/summary${query ? `?${query}` : ''}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load pipeline jobs summary')
+  }
+  return response.json()
+}
+
 export async function fetchLogsTail({
   type = 'pipeline',
   lines = 200,

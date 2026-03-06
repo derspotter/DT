@@ -174,7 +174,7 @@
       </div>
       {#each filteredItems as item}
         <button
-          class={`table-row corpus-select-row ${isCorpusItemSelected(item, getBucketForItem(item)) ? 'selected' : ''}`}
+          class={`table-row clickable corpus-select-row ${isCorpusItemSelected(item, getBucketForItem(item)) ? 'selected' : ''}`}
           class:promotion-target-flash={isPromotionHighlighted(getBucketForItem(item), item.id)}
           type="button"
           style="grid-template-columns: 2fr 80px 100px; text-align: left;"
