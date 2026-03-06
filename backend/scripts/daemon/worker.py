@@ -81,9 +81,56 @@ class PipelineDaemon:
             output_folder=self.download_dir
         )
         self.running = True
+        self.daemon_name = "pipeline"
+        self.heartbeat_interval_seconds = max(1, int(os.getenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", "3") or "3"))
+        self._last_heartbeat_at = 0.0
         self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}"
+        self._ensure_heartbeat_table()
         self._requeue_running_jobs_on_startup()
+        self._heartbeat("starting", {"worker_id": self.worker_id}, force=True)
         log(f"Initialized daemon worker {self.worker_id} at {db_path}")
+
+    def _ensure_heartbeat_table(self):
+        cur = self.db.conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+                daemon_name TEXT PRIMARY KEY,
+                worker_id TEXT,
+                status TEXT,
+                details_json TEXT,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.db.conn.commit()
+
+    def _heartbeat(self, status: str, details: dict | None = None, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_heartbeat_at) < self.heartbeat_interval_seconds:
+            return
+        cur = self.db.conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, details_json, last_seen_at, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(daemon_name) DO UPDATE SET
+                worker_id = excluded.worker_id,
+                status = excluded.status,
+                details_json = excluded.details_json,
+                last_seen_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                self.daemon_name,
+                self.worker_id,
+                str(status or "idle"),
+                json.dumps(details or {}),
+            ),
+        )
+        self.db.conn.commit()
+        self._last_heartbeat_at = now
 
     def _requeue_running_jobs_on_startup(self):
         """Requeue previously running jobs after daemon restarts."""
@@ -443,12 +490,23 @@ class PipelineDaemon:
         log("Pipeline Daemon starting. Waiting for jobs...")
         while self.running:
             try:
+                self._heartbeat("idle", {"state": "polling"})
                 job = self.fetch_next_job()
                 if not job:
                     time.sleep(5)
                     continue
                     
                 log(f"Picked up job {job['id']} of type '{job['job_type']}'")
+                self._heartbeat(
+                    "running",
+                    {
+                        "state": "running_job",
+                        "job_id": int(job["id"]),
+                        "job_type": str(job["job_type"]),
+                        "corpus_id": job.get("corpus_id"),
+                    },
+                    force=True,
+                )
                 corpus_id = job.get("corpus_id")
                 params = job.get("params", {})
                 result = None
@@ -484,6 +542,16 @@ class PipelineDaemon:
                         log(f"Successfully completed job {job['id']}")
                     else:
                         log(f"Job {job['id']} finished execution but was already cancelled; completion not recorded.")
+                    self._heartbeat(
+                        "idle",
+                        {
+                            "state": "job_completed",
+                            "job_id": int(job["id"]),
+                            "job_type": str(job["job_type"]),
+                            "corpus_id": corpus_id,
+                        },
+                        force=True,
+                    )
                     
                 except Exception as e:
                     import traceback
@@ -492,12 +560,25 @@ class PipelineDaemon:
                     updated = self.mark_job_failed(job["id"], err_msg)
                     if not updated:
                         log(f"Job {job['id']} failure not recorded because it was already cancelled.")
+                    self._heartbeat(
+                        "error",
+                        {
+                            "state": "job_failed",
+                            "job_id": int(job["id"]),
+                            "job_type": str(job["job_type"]),
+                            "corpus_id": corpus_id,
+                            "error": str(e),
+                        },
+                        force=True,
+                    )
                     
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")
                 self.running = False
+                self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
             except Exception as e:
                 log(f"Critical error in main loop: {e}")
+                self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
                 time.sleep(10)
 
 if __name__ == "__main__":

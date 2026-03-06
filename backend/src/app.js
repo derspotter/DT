@@ -228,6 +228,14 @@ function ensureAuthSchema(db) {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, ingest_source)
     );
+    CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+      daemon_name TEXT PRIMARY KEY,
+      worker_id TEXT,
+      status TEXT,
+      details_json TEXT,
+      last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
   `);
   if (tableExists(db, 'ingest_entries')) {
     ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
@@ -947,6 +955,67 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       });
     }
     return pipelineWorkers.get(key);
+  }
+
+  function parseSqliteTimestampToMs(value) {
+    const text = String(value || '').trim();
+    if (!text) return null;
+    const normalized = text.includes('T') ? text : text.replace(' ', 'T');
+    const withZone = /[zZ]|[+-]\d{2}:\d{2}$/.test(normalized) ? normalized : `${normalized}Z`;
+    const ms = Date.parse(withZone);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  function readPipelineDaemonStatus() {
+    const staleAfterSeconds = Math.max(5, coerceInt(process.env.RAG_FEEDER_DAEMON_STALE_SECONDS, 15) || 15);
+    if (!tableExists(authDb, 'daemon_heartbeat')) {
+      return {
+        online: false,
+        worker_id: null,
+        status: 'unknown',
+        last_seen_at: null,
+        stale_after_seconds: staleAfterSeconds,
+      };
+    }
+
+    const row = authDb
+      .prepare(
+        `SELECT daemon_name, worker_id, status, details_json, last_seen_at
+         FROM daemon_heartbeat
+         WHERE daemon_name = ?
+         LIMIT 1`
+      )
+      .get('pipeline');
+
+    if (!row) {
+      return {
+        online: false,
+        worker_id: null,
+        status: 'offline',
+        details: null,
+        last_seen_at: null,
+        stale_after_seconds: staleAfterSeconds,
+      };
+    }
+
+    const lastSeenMs = parseSqliteTimestampToMs(row.last_seen_at);
+    const nowMs = Date.now();
+    const online = Number.isFinite(lastSeenMs) ? nowMs - lastSeenMs <= staleAfterSeconds * 1000 : false;
+    let details = null;
+    try {
+      details = row.details_json ? JSON.parse(row.details_json) : null;
+    } catch (error) {
+      details = null;
+    }
+
+    return {
+      online,
+      worker_id: row.worker_id || null,
+      status: row.status || (online ? 'online' : 'offline'),
+      details,
+      last_seen_at: row.last_seen_at || null,
+      stale_after_seconds: staleAfterSeconds,
+    };
   }
 
   function tickDownloadWorker(corpusId) {
@@ -2189,7 +2258,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     try {
+      const requestId = crypto.randomUUID();
       const jobParams = {
+        request_id: requestId,
         limit,
         workers,
         expansion,
@@ -2203,7 +2274,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         const enrichResult = insertJobStmt.run(req.corpusId, 'enrich', JSON.stringify(jobParams));
         let downloadJobId = null;
         if (enqueueDownload) {
-          const dlParams = { batchSize: downloadBatchSize };
+          const dlParams = { batchSize: downloadBatchSize, request_id: requestId };
           const dlResult = insertJobStmt.run(req.corpusId, 'download', JSON.stringify(dlParams));
           downloadJobId = dlResult.lastInsertRowid;
         }
@@ -2213,12 +2284,38 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         };
       });
       const queued = insertProcessMarkedJobs();
+      const queuedJobIds = [queued.enrichJobId, queued.downloadJobId]
+        .map((v) => Number(v))
+        .filter((v) => Number.isFinite(v) && v > 0);
+      let jobs = [];
+      if (queuedJobIds.length > 0) {
+        const placeholders = queuedJobIds.map(() => '?').join(', ');
+        jobs = authDb
+          .prepare(
+            `SELECT id, job_type, status, created_at
+             FROM pipeline_jobs
+             WHERE id IN (${placeholders})
+             ORDER BY id ASC`
+          )
+          .all(...queuedJobIds)
+          .map((row) => ({
+            id: Number(row.id),
+            job_type: row.job_type,
+            status: row.status,
+            created_at: row.created_at,
+          }));
+      }
 
       return res.json({
         success: true, 
+        request_id: requestId,
         job_id: queued.enrichJobId,
         enrich_job_id: queued.enrichJobId,
         download_job_id: queued.downloadJobId,
+        jobs,
+        tracking: {
+          recommended_poll_ms: 2000,
+        },
         message: enqueueDownload
           ? 'Enrichment and download jobs queued successfully.'
           : 'Enrichment job queued successfully.'
@@ -2251,6 +2348,139 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       console.error('[/api/ingest/stats] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest stats' });
+    }
+  });
+
+  app.get('/api/pipeline/daemon/status', requireAuthMiddleware, (req, res) => {
+    try {
+      return res.json({
+        source: 'db',
+        daemon: readPipelineDaemonStatus(),
+      });
+    } catch (error) {
+      console.error('[/api/pipeline/daemon/status] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to fetch daemon status' });
+    }
+  });
+
+  app.get('/api/pipeline/jobs/summary', requireAuthMiddleware, (req, res) => {
+    try {
+      if (!tableExists(authDb, 'pipeline_jobs')) {
+        return res.json({
+          source: 'db',
+          counts: {
+            pending: 0,
+            running: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 0,
+            other: 0,
+            total: 0,
+          },
+          jobs: [],
+          daemon: readPipelineDaemonStatus(),
+        });
+      }
+
+      const rawJobIds = String(req.query?.job_ids ?? req.query?.jobIds ?? '').trim();
+      const requestedJobIds = rawJobIds
+        ? [...new Set(rawJobIds.split(',').map((part) => Number(part.trim())).filter((v) => Number.isFinite(v) && v > 0))]
+        : [];
+      const rawTypes = String(req.query?.types || '').trim().toLowerCase();
+      const allowedTypes = new Set(['enrich', 'download', 'pipeline_tick']);
+      const requestedTypes = rawTypes
+        ? [...new Set(rawTypes.split(',').map((part) => part.trim()).filter((value) => allowedTypes.has(value)))]
+        : [];
+      const recentLimit = Math.max(1, Math.min(500, coerceInt(req.query?.recent_limit ?? req.query?.recentLimit, 50) || 50));
+      const limit = Math.max(recentLimit, requestedJobIds.length || 0);
+
+      const whereClauses = ['corpus_id IS ?'];
+      const params = [req.corpusId ?? null];
+      if (requestedJobIds.length > 0) {
+        whereClauses.push(`id IN (${requestedJobIds.map(() => '?').join(', ')})`);
+        params.push(...requestedJobIds);
+      }
+      if (requestedTypes.length > 0) {
+        whereClauses.push(`job_type IN (${requestedTypes.map(() => '?').join(', ')})`);
+        params.push(...requestedTypes);
+      }
+
+      const rows = authDb
+        .prepare(
+          `SELECT id, corpus_id, job_type, status, parameters_json, result_json, created_at, started_at, finished_at
+           FROM pipeline_jobs
+           WHERE ${whereClauses.join(' AND ')}
+           ORDER BY created_at DESC, id DESC
+           LIMIT ?`
+        )
+        .all(...params, limit);
+
+      const counts = {
+        pending: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        other: 0,
+        total: rows.length,
+      };
+
+      const jobs = rows.map((row) => {
+        const status = String(row.status || '').trim().toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(counts, status)) {
+          counts[status] += 1;
+        } else {
+          counts.other += 1;
+        }
+
+        let paramsJson = null;
+        let resultJson = null;
+        try {
+          paramsJson = row.parameters_json ? JSON.parse(row.parameters_json) : null;
+        } catch (error) {
+          paramsJson = null;
+        }
+        try {
+          resultJson = row.result_json ? JSON.parse(row.result_json) : null;
+        } catch (error) {
+          resultJson = row.result_json || null;
+        }
+        const errorMessage =
+          typeof resultJson === 'object' && resultJson !== null
+            ? resultJson.error || null
+            : typeof resultJson === 'string'
+              ? resultJson
+              : null;
+
+        return {
+          id: Number(row.id),
+          corpus_id: row.corpus_id,
+          job_type: row.job_type,
+          status: row.status,
+          request_id: paramsJson?.request_id || null,
+          created_at: row.created_at,
+          started_at: row.started_at,
+          finished_at: row.finished_at,
+          error: errorMessage,
+          result: resultJson,
+        };
+      });
+
+      return res.json({
+        source: 'db',
+        counts,
+        filters: {
+          corpus_id: req.corpusId ?? null,
+          job_ids: requestedJobIds,
+          types: requestedTypes,
+          limit,
+        },
+        jobs,
+        daemon: readPipelineDaemonStatus(),
+      });
+    } catch (error) {
+      console.error('[/api/pipeline/jobs/summary] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to fetch job summary' });
     }
   });
 
@@ -2352,15 +2582,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    
-    const state = getOrInitPipelineWorkerState(req.corpusId);
-    state.running = true;
-    
+
+    const state = startPipelineWorker(req.corpusId, req.body || {});
+
     return res.json({
-      running: true,
-      in_flight: false,
+      running: state.running,
+      in_flight: state.inFlight,
+      started_at: state.startedAt,
+      last_tick_at: state.lastTickAt,
+      last_result: state.lastResult,
+      last_error: state.lastError,
       config: state.config,
-      resolved_download_workers: state.config.downloadWorkers || 0,
+      resolved_download_workers: state.resolvedDownloadWorkers,
     });
   });
 
@@ -2368,10 +2601,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
     }
-    
-    const state = getOrInitPipelineWorkerState(req.corpusId);
-    state.running = false;
-    return res.json({ running: false });
+
+    const force = Boolean(req.body?.force);
+    const state = pausePipelineWorker(req.corpusId, { force });
+    return res.json({
+      running: state.running,
+      in_flight: state.inFlight,
+      force,
+    });
   });
 
   app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {

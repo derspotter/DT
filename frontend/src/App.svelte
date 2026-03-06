@@ -1489,6 +1489,28 @@
       latestEntriesStatus = 'No extracted entries found.'
     }
   }
+
+  function clearLatestEntriesView() {
+    if (extractionProgress.active) {
+      finishExtractionProgress()
+    }
+    latestEntries = []
+    latestEntriesBase = ''
+    latestSeedDocument = null
+    latestEntriesStatus = ''
+    latestSelection = []
+  }
+
+  async function handleToggleLatestRun(baseName) {
+    const normalized = String(baseName || '').trim()
+    if (!normalized) return
+    if (String(latestEntriesBase || '').trim() === normalized) {
+      clearLatestEntriesView()
+      return
+    }
+    await loadLatestEntries(normalized)
+  }
+
   function latestSelectionKey(entry, index = -1) {
     const primaryId = entry?.id ?? entry?.entry_id
     if (primaryId !== null && primaryId !== undefined && String(primaryId).trim() !== '') {
@@ -3364,14 +3386,12 @@
                   class="table-row cols-runs clickable"
                   on:click={(e) => {
                     if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                    fetchBibliographyEntries(run.ingest_source);
-                    activeTab = 'ingest';
+                    handleToggleLatestRun(run.ingest_source);
                   }}
                   on:keydown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       e.preventDefault();
-                      fetchBibliographyEntries(run.ingest_source);
-                      activeTab = 'ingest';
+                      handleToggleLatestRun(run.ingest_source);
                     }
                   }}
                   role="button"
@@ -3389,7 +3409,7 @@
                         },
                         run.ingest_source
                       )}
-                      on:click={() => loadLatestEntries(run.ingest_source)}
+                      on:click={() => handleToggleLatestRun(run.ingest_source)}
                     >
                       {formatSeedDocumentLabel(
                         {
