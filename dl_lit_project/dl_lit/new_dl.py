@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import os
+import pprint
 import re
 import sqlite3
 import subprocess
@@ -11,7 +12,7 @@ import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from queue import Queue
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import bibtexparser
 import colorama
@@ -33,6 +34,22 @@ GREEN = colorama.Fore.GREEN
 RED = colorama.Fore.RED
 YELLOW = colorama.Fore.YELLOW
 RESET = colorama.Style.RESET_ALL # Use colorama's reset
+DOWNLOAD_DEBUG_ENABLED = os.getenv("RAG_FEEDER_DOWNLOAD_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _download_log(message: str) -> None:
+    print(message, flush=True)
+
+
+def _download_debug(message: str) -> None:
+    if DOWNLOAD_DEBUG_ENABLED:
+        _download_log(f"[DL DEBUG] {message}")
+
+
+def _download_debug_payload(label: str, payload) -> None:
+    if DOWNLOAD_DEBUG_ENABLED:
+        formatted = pprint.pformat(payload, compact=True, width=120, sort_dicts=False)
+        _download_log(f"[DL DEBUG] {label}: {formatted}")
 
 # Optional: only needed for Vertex AI flows. Keep import soft so the downloader
 # can run in lightweight environments (like the web backend container).
@@ -115,6 +132,183 @@ class BibliographyEnhancer:
                     print("[DL] eduVPN enforcement enabled: proxy use requires a connected status check.")
                 else:
                     print("[DL] WARNING: RAG_FEEDER_VPN_ENFORCE_EDUVPN=1 but RAG_FEEDER_VPN_STATUS_CMD is not set; proxy route will be refused.")
+
+    @staticmethod
+    def _looks_like_bot_challenge(html: str) -> bool:
+        text = (html or "").lower()
+        markers = (
+            "captcha",
+            "security check",
+            "attention required",
+            "cloudflare",
+            "verify you are human",
+            "cf-challenge",
+            "g-recaptcha",
+            "hcaptcha",
+            "/cdn-cgi/challenge-platform/",
+        )
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _classify_libgen_no_table_page(html: str) -> tuple[str, str]:
+        text = html or ""
+        lower = text.lower()
+        if BibliographyEnhancer._looks_like_bot_challenge(text):
+            return ("bot_detection", "challenge markers present")
+
+        badge_counts = [int(match) for match in re.findall(r'badge\s+badge-primary">\s*(\d+)\s*<', text, re.I)]
+        if badge_counts:
+            if any(count > 0 for count in badge_counts):
+                return ("non_file_results_present", f"no file table; badge counts={badge_counts}")
+            return ("no_search_results", "all visible result badges are zero")
+
+        if "no files found" in lower or "nothing found" in lower or "no results" in lower:
+            return ("no_search_results", "page reports no results")
+
+        return ("no_results_table", "no recognized results table or challenge markers")
+
+    @staticmethod
+    def _is_supported_libgen_result(url: str, source: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        source_l = (source or "").strip().lower()
+        blocked_hosts = (
+            "randombook.org",
+            "libgen.pw",
+            "bookfi.net",
+            "annas-archive",
+        )
+        if any(host_fragment in host for host_fragment in blocked_hosts):
+            return False
+        return True
+
+    def _save_libgen_debug_response(
+        self,
+        *,
+        base_url: str,
+        context: str,
+        query: str,
+        response: requests.Response | None = None,
+        error: str | None = None,
+    ) -> None:
+        debug_dir = Path("/home/jay/DT/logs/libgen_debug")
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        host = urlparse(base_url).netloc.replace(":", "_")
+        digest = hashlib.sha1(f"{host}|{context}|{query}".encode("utf-8", "ignore")).hexdigest()[:10]
+        path = debug_dir / f"{stamp}_{host}_{context}_{digest}.html"
+        payload = []
+        payload.append(f"<!-- base_url: {base_url} -->")
+        payload.append(f"<!-- context: {context} -->")
+        payload.append(f"<!-- query: {query} -->")
+        if error:
+            payload.append(f"<!-- error: {error} -->")
+        if response is not None:
+            payload.append(f"<!-- status: {response.status_code} -->")
+            payload.append(f"<!-- final_url: {response.url} -->")
+            payload.append(f"<!-- content_type: {response.headers.get('Content-Type', '')} -->")
+            body = response.text
+        else:
+            body = ""
+        payload.append(body)
+        try:
+            path.write_text("\n".join(payload), encoding="utf-8", errors="ignore")
+            print(f"  Saved LibGen debug page: {path}")
+        except Exception as exc:
+            print(f"  Failed to save LibGen debug page: {exc}")
+
+    @staticmethod
+    def _response_looks_html(response: requests.Response) -> bool:
+        content_type = (response.headers.get('Content-Type') or "").lower()
+        if 'html' in content_type or content_type.startswith('text/'):
+            return True
+        sample = (response.content or b"")[:512].lstrip().lower()
+        return sample.startswith(b'<!doctype html') or sample.startswith(b'<html') or b'<body' in sample
+
+    def _extract_pdf_link_from_response(self, response: requests.Response):
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if self.is_likely_pdf_url(href):
+                print(f"  Found PDF link: {href}")
+                found_link = href
+                break
+        else:
+            found_link = None
+
+        if not found_link:
+            get_button = soup.find('a', href=True, string='GET')
+            if get_button:
+                found_link = get_button['href']
+                print(f"  Found GET button link: {found_link}")
+
+        if not found_link:
+            embed = soup.find('embed', {'type': 'application/pdf'})
+            if embed and embed.get('src'):
+                found_link = embed['src']
+                print(f"  Found embedded PDF link: {found_link}")
+
+        if not found_link:
+            iframe = soup.find('iframe', {'id': 'pdf'})
+            if iframe and iframe.get('src'):
+                found_link = iframe['src']
+                print(f"  Found iframe PDF link: {found_link}")
+
+        if not found_link:
+            return None
+
+        if not found_link.startswith(('http://', 'https://')):
+            found_link = urljoin(response.url, found_link)
+        return found_link
+
+    @staticmethod
+    def _extract_author_surname(author) -> str:
+        if isinstance(author, dict):
+            family = (author.get('family') or '').strip()
+            if family:
+                return family
+            raw = author.get('raw')
+            if raw is None:
+                return ''
+            author = raw
+
+        text = str(author or '').strip()
+        if not text:
+            return ''
+
+        # Common raw format in no_metadata is "Lastname, A.".
+        if ',' in text:
+            left = text.split(',', 1)[0].strip()
+            if left:
+                return left
+
+        parts = text.split()
+        return parts[-1].strip(',.') if parts else ''
+
+    @staticmethod
+    def _normalize_libgen_query_text(title: str, surname: str = "") -> str:
+        text = (title or "").strip()
+        if ":" in text:
+            text = text.split(":", 1)[0].strip()
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        text = re.sub(r"\s+", " ", text).strip()
+        if surname:
+            text = f"{text} {surname}".strip()
+        return text
+
+    @staticmethod
+    def _normalize_download_source_label(source: str | None, fallback: str = "Direct URL") -> str:
+        text = str(source or "").strip()
+        if not text or text.lower() in {"none", "null", "unknown"}:
+            return fallback
+        return text
+
+    @staticmethod
+    def _is_direct_download_candidate(url: str | None) -> bool:
+        if not url:
+            return False
+        parsed = urlparse(str(url).strip())
+        return parsed.scheme in {"http", "https"}
 
     def _resolve_vpn_proxies(self, proxies: dict | None) -> dict | None:
         if proxies:
@@ -310,6 +504,85 @@ class BibliographyEnhancer:
                 mailto=self.email,
             )
         return self._pdf_downloader
+
+    @staticmethod
+    def _classify_http_status(status_code: int | None) -> str:
+        if status_code == 403:
+            return "forbidden"
+        if status_code == 404:
+            return "not_found"
+        if status_code == 429:
+            return "rate_limited"
+        if status_code and 500 <= int(status_code) <= 599:
+            return "server_error"
+        return "http_error"
+
+    @staticmethod
+    def _classify_exception_message(message: str | None) -> str:
+        text = (message or "").lower()
+        if "timed out" in text or "timeout" in text:
+            return "timeout"
+        if "too many redirects" in text:
+            return "too_many_redirects"
+        if "forbidden" in text or "403" in text:
+            return "forbidden"
+        if "404" in text or "not found" in text:
+            return "not_found"
+        if "429" in text or "rate limit" in text:
+            return "rate_limited"
+        if "connection" in text:
+            return "connection_error"
+        if "invalid complete pdf" in text or "failed pdf validation" in text:
+            return "invalid_pdf"
+        if "no pdf link" in text:
+            return "no_pdf_link"
+        if "no doi" in text:
+            return "no_doi"
+        return "request_error"
+
+    def _ensure_download_trace(self, ref: dict) -> list[dict]:
+        if not isinstance(ref, dict):
+            return []
+        trace = ref.get("download_trace")
+        if not isinstance(trace, list):
+            trace = []
+            ref["download_trace"] = trace
+        return trace
+
+    def _record_download_event(
+        self,
+        ref: dict,
+        *,
+        source: str,
+        outcome: str,
+        category: str | None = None,
+        detail: str | None = None,
+        url: str | None = None,
+        route: str | None = None,
+        duration_ms: int | None = None,
+        phase: str = "download",
+    ) -> None:
+        trace = self._ensure_download_trace(ref)
+        event = {
+            "phase": phase,
+            "source": source,
+            "outcome": outcome,
+        }
+        if category:
+            event["category"] = category
+        if detail:
+            event["detail"] = detail[:400]
+        if url:
+            event["url"] = url[:400]
+        if route:
+            event["route"] = route
+        if duration_ms is not None:
+            event["duration_ms"] = int(duration_ms)
+        trace.append(event)
+        if outcome != "success" and category:
+            ref["download_failure_category"] = category
+            if detail:
+                ref["download_failure_detail"] = detail[:400]
 
     def escape_bibtex(self, text: str | None) -> str:
         """Escapes characters with special meaning in BibTeX/LaTeX."""
@@ -524,7 +797,7 @@ class BibliographyEnhancer:
             try:
                 response = self._request_get_direct(scihub_url, headers=headers, timeout=self.download_timeout)
                 req_duration = time.monotonic() - start_req
-                print(f"  DEBUG: Sci-Hub request to {mirror} took {req_duration:.2f}s")
+                _download_debug(f"Sci-Hub request to {mirror} took {req_duration:.2f}s")
                 response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
                 # Parse the HTML response to find the PDF link
@@ -582,8 +855,8 @@ class BibliographyEnhancer:
         search_author = author_surnames[0] if author_surnames else ''
         is_book = (ref_type or '').lower() in ['book', 'monograph']
 
-        query = f'{title} {search_author}'.strip()
-        query = query.replace(' ', '+')
+        query_text = self._normalize_libgen_query_text(title, search_author)
+        query = quote_plus(query_text)
         libgen_mirrors = [
             "https://libgen.li",
             "https://libgen.vg",
@@ -592,6 +865,7 @@ class BibliographyEnhancer:
         print(f"Searching LibGen for: {title}")
         print(f"  Book type detection: is_book={is_book}, ref_type='{ref_type}'")
         print(f"  Using author surname: '{search_author}'")
+        print(f"  Normalized LibGen query: '{query_text}'")
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.1'
         }
@@ -612,9 +886,16 @@ class BibliographyEnhancer:
                 # Prefer canonical file table, fallback to older variant if present.
                 table = soup.find('table', {'id': 'tablelibgen'}) or soup.find('table', {'id': 'tablelibgen1'})
                 if not table:
-                    print(f"  No LibGen results table found on {base_url}")
-                    if soup.find(string=re.compile('captcha|bot|automated|security check', re.IGNORECASE)):
-                        print(f"  WARNING: Possible captcha/bot detection on {base_url}")
+                    context, detail = self._classify_libgen_no_table_page(response.text)
+                    print(f"  No LibGen results table found on {base_url} ({detail})")
+                    if context == "bot_detection":
+                        print(f"  WARNING: Bot/challenge page detected on {base_url}")
+                    self._save_libgen_debug_response(
+                        base_url=base_url,
+                        context=context,
+                        query=query,
+                        response=response,
+                    )
                     continue
 
                 rows = table.find_all('tr')[1:]
@@ -651,6 +932,8 @@ class BibliographyEnhancer:
                             continue
 
                         resolved_href = urljoin(base_url + '/', href)
+                        if not self._is_supported_libgen_result(resolved_href, source):
+                            continue
                         if resolved_href in seen_urls:
                             continue
                         seen_urls.add(resolved_href)
@@ -670,7 +953,29 @@ class BibliographyEnhancer:
             except requests.exceptions.RequestException as e:
                 if hasattr(e, 'response') and e.response and e.response.status_code == 429:
                     print(f"  LibGen rate limit exceeded on {base_url}, trying next mirror")
+                    self._save_libgen_debug_response(
+                        base_url=base_url,
+                        context="http_429",
+                        query=query,
+                        response=e.response,
+                        error=str(e),
+                    )
                     continue
+                if hasattr(e, 'response') and e.response and e.response.status_code in {500, 502, 503, 504}:
+                    self._save_libgen_debug_response(
+                        base_url=base_url,
+                        context=f"http_{e.response.status_code}",
+                        query=query,
+                        response=e.response,
+                        error=str(e),
+                    )
+                elif isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+                    self._save_libgen_debug_response(
+                        base_url=base_url,
+                        context="request_error",
+                        query=query,
+                        error=str(e),
+                    )
                 print(f"  Error searching {base_url}: {str(e)}")
                 continue
 
@@ -716,35 +1021,7 @@ class BibliographyEnhancer:
                 if route_used == "vpn":
                     print("  HTML page fetched via VPN route")
             response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Look for PDF links first
-            found_link = None # Initialize found_link
-            for a_tag in soup.find_all('a', href=True):
-                href = a_tag['href']
-                if self.is_likely_pdf_url(href):
-                    print(f"  Found PDF link: {href}")
-                    found_link = href
-                    break
-            else:
-                # If no PDF links, try GET button
-                get_button = soup.find('a', href=True, string='GET')
-                if get_button:
-                    found_link = get_button['href']
-                    print(f"  Found GET button link: {found_link}")
-                else:
-                    return None # Return None if no PDF link or GET button found
-
-            # Return None if loop finished without finding a link and GET button wasn't found either
-            if found_link is None:
-                 return None
-                 
-            # Handle relative URLs in one place
-            if not found_link.startswith(('http://', 'https://')):
-                found_link = urljoin(response.url, found_link)
-                
-            return found_link
+            return self._extract_pdf_link_from_response(response)
 
         except requests.exceptions.RequestException as e:
             print(f"  Error checking HTML page: {e}")
@@ -851,16 +1128,14 @@ class BibliographyEnhancer:
 
     def enhance_bibliography(self, ref, downloads_dir, force_download=False):
         """Enhances a single reference dictionary, attempts download, and returns the modified ref or None."""
-        import pprint
-        print("DEBUG: ref received:")
-        pprint.pprint(ref)
+        _download_debug_payload("ref received", ref)
         # Ensure downloads_dir is a Path object (it should be, but double-check)
         if not isinstance(downloads_dir, Path):
-            print(f"ERROR: downloads_dir passed to enhance_bibliography is not a Path object: {type(downloads_dir)}")
+            _download_log(f"[DL ERROR] downloads_dir passed to enhance_bibliography is not a Path object: {type(downloads_dir)}")
             try:
                 downloads_dir = Path(downloads_dir)
             except TypeError:
-                print("ERROR: Cannot convert downloads_dir to Path. Aborting enhance_bibliography for this ref.")
+                _download_log("[DL ERROR] Cannot convert downloads_dir to Path. Aborting enhance_bibliography for this ref.")
                 return None # Indicate failure
 
 
@@ -868,8 +1143,7 @@ class BibliographyEnhancer:
 
         # Use ref directly since it already contains the data we need
         bib_entry = ref
-        print("DEBUG: bib_entry extracted:")
-        pprint.pprint(bib_entry)
+        _download_debug_payload("bib_entry extracted", bib_entry)
 
         # Handle both original and enriched data structures
         if 'enriched_data' in bib_entry and bib_entry['enriched_data']:
@@ -899,7 +1173,7 @@ class BibliographyEnhancer:
         # Ensure title and authors are not None
         title = title or ''
         authors = authors or []
-        print(f"DEBUG: authors extracted: {authors}")
+        _download_debug(f"authors extracted: {authors}")
         
         ref_type = ref.get('type', '')
         urls_to_try = []
@@ -918,10 +1192,20 @@ class BibliographyEnhancer:
 
         if openalex_payload:
             downloader = self._get_pdf_downloader(downloads_dir)
-            path, checksum, source = downloader.attempt_download(openalex_payload, ref_type=ref_type)
+            path, checksum, source, attempts = downloader.attempt_download(openalex_payload, ref_type=ref_type)
+            for attempt in attempts:
+                self._record_download_event(
+                    ref,
+                    source=attempt.get("source") or "PDFDownloader",
+                    outcome="success" if attempt.get("outcome") == "success" else "failure",
+                    category=attempt.get("failure_category"),
+                    detail=attempt.get("detail"),
+                    url=attempt.get("url"),
+                    phase="download",
+                )
             if path:
                 ref['downloaded_file'] = str(path)
-                ref['download_source'] = source
+                ref['download_source'] = self._normalize_download_source_label(source, fallback="OpenAlex OA URL")
                 ref['download_reason'] = 'Downloaded via PDFDownloader'
                 ref['checksum'] = checksum
                 download_success = True
@@ -930,7 +1214,7 @@ class BibliographyEnhancer:
 
         # 1. Try direct URL first if it exists
         direct_url = bib_entry.get('url')
-        if direct_url:
+        if self._is_direct_download_candidate(direct_url):
             print("Found direct URL in reference")
             urls_to_try.append({
                 'url': direct_url,
@@ -939,6 +1223,8 @@ class BibliographyEnhancer:
                 'source': 'Direct URL',
                 'reason': 'Direct URL from reference'
             })
+        elif direct_url:
+            _download_debug(f"Skipping non-HTTP direct URL candidate: {direct_url}")
         
         # 1. Try DOI resolution
         if doi:
@@ -962,13 +1248,15 @@ class BibliographyEnhancer:
                             'url': oa_location['url_for_pdf'],
                             'title': title,
                             'snippet': '',
-                            'source': oa_location.get('host_type', 'Unpaywall OA'),
+                            'source': oa_location.get('host_type') or 'Unpaywall OA',
                             'reason': 'Found via Unpaywall DOI lookup'
                         })
                     else:
                         print(f"  Unpaywall found OA location but no direct PDF URL for DOI {doi}.")
+                        self._record_download_event(ref, source="Unpaywall", outcome="failure", category="no_pdf_url", detail=f"No direct PDF URL for DOI {doi}", phase="lookup")
                 else:
                      print(f"  Unpaywall found no OA location for DOI {doi}.")
+                     self._record_download_event(ref, source="Unpaywall", outcome="failure", category="no_oa_location", detail=f"No OA location for DOI {doi}", phase="lookup")
             else:
                 print("  Unpaywall lookup disabled (RAG_FEEDER_USE_UNPAYWALL=0)")
 
@@ -984,11 +1272,11 @@ class BibliographyEnhancer:
         # Try downloading from direct sources first
         for url_info in urls_to_try:
             if self.try_download_url(url_info['url'], url_info['source'], ref, downloads_dir):
-                ref['download_source'] = url_info['source']
+                ref['download_source'] = self._normalize_download_source_label(url_info['source'], fallback='Direct URL')
                 ref['download_reason'] = url_info['reason']
                 download_success = True
                 file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-                print(f"{GREEN}✓ Downloaded from: {url_info['source']} as {Path(file_path).name}{RESET}")
+                print(f"{GREEN}✓ Downloaded from: {ref['download_source']} as {Path(file_path).name}{RESET}")
 
         # 2. If direct methods fail, try Sci-Hub (using DOI)
         if not download_success and ref.get('doi'):
@@ -998,11 +1286,13 @@ class BibliographyEnhancer:
             if scihub_result:
                 print(f"\nFound PDF link on Sci-Hub: {scihub_result['url']}")
                 if self.try_download_url(scihub_result['url'], scihub_result['source'], ref, downloads_dir):
-                    ref['download_source'] = scihub_result['source']
+                    ref['download_source'] = self._normalize_download_source_label(scihub_result['source'], fallback='Sci-Hub')
                     ref['download_reason'] = scihub_result['reason'] # Keep Sci-Hub reason
                     download_success = True
                     file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-                    print(f"{GREEN}✓ Downloaded from: {scihub_result['source']} as {Path(file_path).name}{RESET}")
+                    print(f"{GREEN}✓ Downloaded from: {ref['download_source']} as {Path(file_path).name}{RESET}")
+            else:
+                self._record_download_event(ref, source="Sci-Hub", outcome="failure", category="no_match", detail=f"No PDF link found for DOI {ref['doi']}", phase="lookup")
 
         # 3. If Sci-Hub fails (or no DOI), try LibGen
         if not download_success:
@@ -1010,22 +1300,7 @@ class BibliographyEnhancer:
             author_surnames = []
             if authors:
                 for author in authors:
-                    # Handle both string and dict formats
-                    if isinstance(author, dict):
-                        # Use the 'family' field if available, otherwise extract from 'raw'
-                        surname = author.get('family')
-                        if not surname and author.get('raw'):
-                            # Fallback: take the last part of the name as the surname
-                            if isinstance(author['raw'], str):
-                                parts = author['raw'].split()
-                                surname = parts[-1] if parts else ''
-                            else:
-                                surname = str(author['raw'])
-                    else:
-                        # Handle string format
-                        parts = str(author).split()
-                        surname = parts[-1] if parts else ''
-                    
+                    surname = self._extract_author_surname(author)
                     if surname:
                         author_surnames.append(surname)
 
@@ -1039,14 +1314,15 @@ class BibliographyEnhancer:
                         break
                     libgen_source = url_info.get('source', "LibGen")
                     if self.try_download_url(url_info['url'], libgen_source, ref, downloads_dir):
-                        ref['download_source'] = libgen_source
+                        ref['download_source'] = self._normalize_download_source_label(libgen_source, fallback='LibGen')
                         ref['download_reason'] = 'Successfully downloaded via LibGen'
                         download_success = True
                         file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
-                        print(f"{GREEN}✓ Downloaded from: {libgen_source} as {Path(file_path).name}{RESET}")
+                        print(f"{GREEN}✓ Downloaded from: {ref['download_source']} as {Path(file_path).name}{RESET}")
                         break
             else:
                 print("No LibGen matches found.")
+                self._record_download_event(ref, source="LibGen", outcome="failure", category="no_match", detail=f"No LibGen matches for {title[:160]}", phase="lookup")
 
 
         # If all methods fail, mark as not found
@@ -1054,6 +1330,8 @@ class BibliographyEnhancer:
             print(f"  {RED}✗ No valid matches found through any method{RESET}")
             ref['download_status'] = 'not_found'
             ref['download_reason'] = 'No valid matches found through DOI, Unpaywall, Sci-Hub, or LibGen'
+            ref.setdefault('download_failure_category', 'source_exhausted')
+            ref.setdefault('download_failure_detail', ref['download_reason'])
 
         # Return the modified ref dictionary if download was successful, otherwise None
         if 'downloaded_file' in ref and ref['downloaded_file']:
@@ -1077,7 +1355,7 @@ class BibliographyEnhancer:
             print(f"{RED}ERROR try_download_url: Title is not a string for ref ID {ref.get('id', 'N/A')}! Using fallback.{RESET}")
             title_val = 'Untitled_check_source_data'
 
-        print(f"DEBUG try_download_url called with source: {source}, url: {url}") # Debug print for source
+        _download_debug(f"try_download_url source={source} url={url}")
 
         # Create safe filename from title
         safe_title = "".join(c for c in (title_val[:50]) if c.isalnum() or c in ' -_').strip()
@@ -1085,6 +1363,7 @@ class BibliographyEnhancer:
         ref_type = ref.get('type', '')
         
         print(f"\nTrying {source}: {url}")
+        started_at = time.monotonic()
         
         try:
             headers = {
@@ -1111,18 +1390,23 @@ class BibliographyEnhancer:
             # Check for specific HTTP error codes
             if response.status_code == 404:
                 print("  PDF not found (404)")
+                self._record_download_event(ref, source=source, outcome="failure", category="not_found", detail="HTTP 404", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                 return False
             elif response.status_code == 403:
                 print("  Access forbidden (403)")
+                self._record_download_event(ref, source=source, outcome="failure", category="forbidden", detail="HTTP 403", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                 return False
             elif response.status_code == 429:
                 print("  Too many requests (429) - Rate limited")
+                self._record_download_event(ref, source=source, outcome="failure", category="rate_limited", detail="HTTP 429", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                 return False
             elif response.status_code != 200:
                 print(f"  HTTP error {response.status_code}")
+                self._record_download_event(ref, source=source, outcome="failure", category=self._classify_http_status(response.status_code), detail=f"HTTP {response.status_code}", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                 return False
                     
             content = response.content
+            content_type = (response.headers.get('Content-Type') or "").lower()
             
             # Enhanced PDF validation (shared)
             downloader = self._get_pdf_downloader(downloads_dir)
@@ -1131,12 +1415,15 @@ class BibliographyEnhancer:
                     f.write(content)
                 print("  Direct download successful - Valid complete PDF")
                 ref['downloaded_file'] = str(filename)
-                effective_source = source if route_used == "direct" else f"{source} (via VPN)"
+                normalized_source = self._normalize_download_source_label(source, fallback="Direct URL")
+                effective_source = normalized_source if route_used == "direct" else f"{normalized_source} (via VPN)"
                 ref['download_source'] = effective_source
                 ref['download_route'] = route_used
+                self._record_download_event(ref, source=effective_source, outcome="success", detail="direct_download", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                 return True
             else:
                 print(f"  {YELLOW}Downloaded file is not a valid complete PDF{RESET}")
+                self._record_download_event(ref, source=source, outcome="failure", category="invalid_pdf", detail="Downloaded file failed PDF validation", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
 
                 if (
                     route_used == "direct"
@@ -1155,12 +1442,16 @@ class BibliographyEnhancer:
 
                 # If it seems to be HTML, try extracting PDF link
                 # --- MODIFICATION HERE ---
-                pdf_url_from_html = self.try_extract_pdf_link(
-                    url,
-                    source=source,
-                    allow_vpn_fallback=(route_used == "direct"),
-                    force_vpn=(route_used == "vpn"),
-                ) # Pass the original URL
+                pdf_url_from_html = None
+                if self._response_looks_html(response):
+                    pdf_url_from_html = self._extract_pdf_link_from_response(response)
+                elif any(token in url.lower() for token in ('ads.php', '/book/', 'sci-hub.', 'doi.org')):
+                    pdf_url_from_html = self.try_extract_pdf_link(
+                        url,
+                        source=source,
+                        allow_vpn_fallback=(route_used == "direct"),
+                        force_vpn=(route_used == "vpn"),
+                    )
                 if pdf_url_from_html and pdf_url_from_html != url: # Avoid infinite loops
                     print(f"  Found potential PDF link in HTML, retrying download for: {pdf_url_from_html}")
                     # Recursively call try_download_url with the new link, potentially updating source
@@ -1174,21 +1465,35 @@ class BibliographyEnhancer:
                     )
                 else:
                      print(f"  {YELLOW}Could not extract a PDF link from the HTML page.{RESET}")
+                     if "libgen" in (source or "").lower():
+                         self._save_libgen_debug_response(
+                             base_url=url,
+                             context="no_pdf_link",
+                             query=title_val[:120],
+                             response=response if self._response_looks_html(response) else None,
+                             error=f"source={source}",
+                         )
+                     detail = f"No PDF link extracted from response (content-type={content_type or 'unknown'})"
+                     self._record_download_event(ref, source=f"{source} HTML", outcome="failure", category="no_pdf_link", detail=detail, url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                 # --- END MODIFICATION ---
 
             return False # Return False if download wasn't valid PDF and no link extracted/retried
 
         except requests.exceptions.ConnectionError:
             print("  Connection error - Could not reach server")
+            self._record_download_event(ref, source=source, outcome="failure", category="connection_error", detail="Connection error", url=url, duration_ms=(time.monotonic() - started_at) * 1000)
             return False
         except requests.exceptions.Timeout:
             print("  Request timed out")
+            self._record_download_event(ref, source=source, outcome="failure", category="timeout", detail="Request timed out", url=url, duration_ms=(time.monotonic() - started_at) * 1000)
             return False
         except requests.exceptions.TooManyRedirects:
             print("  Too many redirects")
+            self._record_download_event(ref, source=source, outcome="failure", category="too_many_redirects", detail="Too many redirects", url=url, duration_ms=(time.monotonic() - started_at) * 1000)
             return False
         except requests.exceptions.RequestException as e:
             print(f"  Request failed: {str(e)}")
+            self._record_download_event(ref, source=source, outcome="failure", category=self._classify_exception_message(str(e)), detail=str(e), url=url, duration_ms=(time.monotonic() - started_at) * 1000)
             return False
         except Exception as e:
             print(f"  Unexpected error: {str(e)}")
@@ -1198,6 +1503,7 @@ class BibliographyEnhancer:
                     print(f"  Removed potentially incomplete file: {filename.name}")
                 except Exception as unlink_e:
                      print(f"  Error removing file during exception handling: {unlink_e}")
+            self._record_download_event(ref, source=source, outcome="failure", category="unexpected_error", detail=str(e), url=url, duration_ms=(time.monotonic() - started_at) * 1000)
             return False
 
     # --- BibTeX Export --- <<< NEW SECTION

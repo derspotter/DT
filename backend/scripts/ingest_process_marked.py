@@ -252,9 +252,9 @@ def main() -> None:
     downstream_depth = args.related_depth_downstream
     if args.related_depth is not None:
         downstream_depth = args.related_depth
-    downstream_depth = max(1, int(downstream_depth or 1))
-    upstream_depth = max(1, int(args.related_depth_upstream or 1))
-    args.include_downstream = bool(args.include_downstream) if args.include_downstream is not None else True
+    downstream_depth = max(0, int(downstream_depth or 0))
+    upstream_depth = max(0, int(args.related_depth_upstream or 0))
+    args.include_downstream = bool(args.include_downstream) if args.include_downstream is not None else False
     if args.include_upstream is None:
         args.include_upstream = bool(DEFAULT_INCLUDE_UPSTREAM)
     args.fetch_citations = bool(args.include_upstream)

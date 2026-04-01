@@ -7,6 +7,7 @@ import requests
 from .utils import get_global_rate_limiter
 
 TOKEN_RE = re.compile(r'"[^"]+"|\(|\)|\bAND\b|\bOR\b|\bNOT\b|[^()\s]+', re.IGNORECASE)
+OPENALEX_TERM_CLEAN_RE = re.compile(r"[^\w\s-]+", re.UNICODE)
 
 PRECEDENCE = {
     'NOT': 3,
@@ -84,11 +85,36 @@ def normalize_query(query: str) -> str:
     return " ".join(tokens)
 
 
-def _openalex_request(params: dict, rate_limiter, retries: int = 3) -> dict:
+def build_openalex_query_text(query: str) -> str:
+    """Validate the query, then downgrade boolean syntax into plain OpenAlex text search.
+
+    OpenAlex `search=` and `*.search` filters do not reliably accept the boolean query syntax
+    we expose in the UI. We still validate parentheses/operators, but strip the boolean
+    operators before sending the request so queries like `baumol's disease` or
+    `(foo OR bar) AND baz` become robust plain-text searches instead of 400s.
+    """
+    normalized_query = normalize_query(query)
+    cleaned_terms: list[str] = []
+    for token in normalized_query.split():
+        if token in PRECEDENCE or token in ("(", ")"):
+            continue
+        term = token.strip().strip('"').strip()
+        if not term:
+            continue
+        term = OPENALEX_TERM_CLEAN_RE.sub(" ", term)
+        term = " ".join(part for part in term.split() if part)
+        if term:
+            cleaned_terms.append(term)
+    if not cleaned_terms:
+        raise QuerySyntaxError("Query does not contain searchable terms")
+    return " ".join(cleaned_terms)
+
+
+def _openalex_request(endpoint: str, params: dict, rate_limiter, retries: int = 3) -> dict:
     for attempt in range(retries):
         try:
             rate_limiter.wait_if_needed('openalex')
-            response = requests.get("https://api.openalex.org/works", params=params, timeout=30)
+            response = requests.get(f"https://api.openalex.org/{endpoint}", params=params, timeout=30)
             if response.status_code in (429, 500, 502, 503, 504):
                 raise requests.RequestException(f"HTTP {response.status_code}")
             response.raise_for_status()
@@ -97,7 +123,30 @@ def _openalex_request(params: dict, rate_limiter, retries: int = 3) -> dict:
             if attempt == retries - 1:
                 raise
             time.sleep(2 ** attempt)
-    raise RuntimeError("OpenAlex request failed after retries")
+    raise RuntimeError(f"OpenAlex request to /{endpoint} failed after retries")
+
+
+def resolve_openalex_author_ids(author: str, mailto: str | None = None, max_results: int = 5) -> list[str]:
+    author = (author or '').strip()
+    if not author:
+        return []
+    rate_limiter = get_global_rate_limiter()
+    params = {
+        'search': author,
+        'per-page': max(1, min(int(max_results), 25)),
+        'select': 'id,display_name',
+    }
+    if mailto:
+        params['mailto'] = mailto
+    data = _openalex_request('authors', params, rate_limiter)
+    ids = []
+    for item in data.get('results', []):
+        author_id = item.get('id')
+        if isinstance(author_id, str):
+            short_id = author_id.rsplit('/', 1)[-1]
+            if short_id:
+                ids.append(short_id)
+    return ids
 
 
 def search_openalex(query: str,
@@ -105,8 +154,9 @@ def search_openalex(query: str,
                     year_from: int | None = None,
                     year_to: int | None = None,
                     mailto: str | None = None,
-                    field: str | None = "default") -> list[dict]:
-    normalized_query = normalize_query(query)
+                    field: str | None = "default",
+                    author: str | None = None) -> list[dict]:
+    openalex_query = build_openalex_query_text(query)
     rate_limiter = get_global_rate_limiter()
 
     params = {
@@ -130,15 +180,29 @@ def search_openalex(query: str,
             raise ValueError(f"Unknown search field: {field}")
 
     if field_key:
-        params["filter"] = f"{field_key}:{normalized_query}"
+        params["filter"] = f"{field_key}:{openalex_query}"
     else:
-        params["search"] = normalized_query
+        params["search"] = openalex_query
 
     filters = []
-    if year_from:
-        filters.append(f"publication_year:>={year_from}")
-    if year_to:
-        filters.append(f"publication_year:<={year_to}")
+    author_ids = resolve_openalex_author_ids(author, mailto=mailto) if author else []
+    if author and not author_ids:
+        return []
+    if author_ids:
+        filters.append(f"authorships.author.id:{'|'.join(author_ids[:100])}")
+    year_from_value = int(year_from) if year_from not in (None, '') else None
+    year_to_value = int(year_to) if year_to not in (None, '') else None
+    if year_from_value is not None and year_to_value is not None:
+        if year_from_value > year_to_value:
+            year_from_value, year_to_value = year_to_value, year_from_value
+        if year_from_value == year_to_value:
+            filters.append(f"publication_year:{year_from_value}")
+        else:
+            filters.append(f"publication_year:{year_from_value}-{year_to_value}")
+    elif year_from_value is not None:
+        filters.append(f"publication_year:>{year_from_value - 1}")
+    elif year_to_value is not None:
+        filters.append(f"publication_year:<{year_to_value + 1}")
     if filters:
         if "filter" in params:
             params["filter"] = ",".join([params["filter"], *filters])
@@ -151,7 +215,7 @@ def search_openalex(query: str,
     seen_ids: set[str] = set()
 
     while True:
-        data = _openalex_request(params, rate_limiter)
+        data = _openalex_request('works', params, rate_limiter)
         for item in data.get("results", []):
             item_id = item.get("id")
             if not item_id or item_id in seen_ids:

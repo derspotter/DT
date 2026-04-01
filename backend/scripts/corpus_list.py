@@ -104,11 +104,13 @@ def main():
                 {
                     'id': data.get('id'),
                     'title': data.get('title'),
+                    'authors': data.get('authors'),
                     'year': data.get('year'),
                     'source': source,
                     'status': status,
                     'doi': data.get('doi'),
                     'openalex_id': data.get('openalex_id'),
+                    'file_path': data.get('file_path'),
                 }
             )
 

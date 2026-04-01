@@ -564,6 +564,7 @@ class DatabaseManager:
         self._add_normalized_columns_to_download_queue()
         self._add_claim_columns_to_download_queue()
         self._add_missing_columns_to_no_metadata()
+        self._add_enrich_columns_to_no_metadata()
         self._add_missing_columns_to_with_metadata()
         self._add_missing_columns_to_downloaded_references()
         self._add_missing_columns_to_ingest_entries()
@@ -572,6 +573,7 @@ class DatabaseManager:
 
         # Helpful indices for quick look-ups (after ensuring columns exist)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_enrich_state_lease ON no_metadata(enrich_state, enrich_lease_expires_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_openalex ON with_metadata(openalex_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_doi ON with_metadata(normalized_doi)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_state_lease ON with_metadata(download_state, download_lease_expires_at)")
@@ -771,6 +773,42 @@ class DatabaseManager:
                 print(f"{GREEN}[DB Manager] Added selected_for_enrichment column to no_metadata table.{RESET}")
             except sqlite3.Error as e:
                 print(f"{YELLOW}[DB Manager] Warning: Could not add selected_for_enrichment column: {e}{RESET}")
+
+    def _add_enrich_columns_to_no_metadata(self):
+        """Add missing enrich worker claim/lease columns to no_metadata."""
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA table_info(no_metadata)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        for col_name, col_type in [
+            ('enrich_state', "TEXT DEFAULT 'pending'"),
+            ('enrich_claimed_by', 'TEXT'),
+            ('enrich_claimed_at', 'INTEGER'),
+            ('enrich_lease_expires_at', 'INTEGER'),
+            ('enrich_attempt_count', 'INTEGER DEFAULT 0'),
+            ('enrich_last_attempt_at', 'INTEGER'),
+            ('enrich_last_error', 'TEXT'),
+        ]:
+            if col_name not in columns:
+                try:
+                    cursor.execute(f"ALTER TABLE no_metadata ADD COLUMN {col_name} {col_type}")
+                    print(f"{GREEN}[DB Manager] Added {col_name} column to no_metadata table.{RESET}")
+                except sqlite3.Error as e:
+                    print(f"{YELLOW}[DB Manager] Warning: Could not add {col_name} column: {e}{RESET}")
+
+        try:
+            cursor.execute(
+                """
+                UPDATE no_metadata
+                   SET enrich_state = CASE
+                       WHEN COALESCE(selected_for_enrichment, 0) = 1 THEN 'pending'
+                       WHEN enrich_state IS NULL OR TRIM(COALESCE(enrich_state, '')) = '' THEN 'pending'
+                       ELSE enrich_state
+                   END
+                """
+            )
+        except sqlite3.Error as e:
+            print(f"{YELLOW}[DB Manager] Warning: Could not backfill enrich_state on no_metadata: {e}{RESET}")
 
     def _add_missing_columns_to_with_metadata(self):
         """Add missing source/provenance columns to with_metadata table if they don't exist."""
@@ -1022,7 +1060,9 @@ class DatabaseManager:
                 INSERT INTO failed_enrichments (id, source_pdf, title, authors, year, doi, raw_text_search, reason)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, insert_data)
-            failed_id = cur.lastrowid
+            failed_id = row_data[0]
+
+            self.reassign_corpus_items("no_metadata", no_meta_id, "failed_enrichments", failed_id)
 
             # 3. Delete from no_metadata
             cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
@@ -2449,6 +2489,194 @@ class DatabaseManager:
             cur.execute("ROLLBACK")
             return None, f"Transaction failed: {e}"
 
+    def queue_for_enrichment(self, no_meta_id: int) -> tuple[int | None, str | None]:
+        """Mark a no_metadata row as pending enrichment and clear any stale claim."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute("BEGIN")
+            cur.execute("SELECT id FROM no_metadata WHERE id = ?", (no_meta_id,))
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                return None, "Row not found in no_metadata"
+
+            cur.execute(
+                """UPDATE no_metadata
+                      SET selected_for_enrichment = 1,
+                          enrich_state = 'pending',
+                          enrich_claimed_by = NULL,
+                          enrich_claimed_at = NULL,
+                          enrich_lease_expires_at = NULL,
+                          enrich_last_error = NULL
+                    WHERE id = ?""",
+                (no_meta_id,),
+            )
+            cur.execute("COMMIT")
+            return int(no_meta_id), None
+        except sqlite3.Error as e:
+            cur.execute("ROLLBACK")
+            return None, f"Transaction failed: {e}"
+
+    def claim_enrich_batch(
+        self,
+        *,
+        limit: int,
+        corpus_id: int | None,
+        claimed_by: str,
+        lease_seconds: int = 15 * 60,
+        max_attempts: int | None = None,
+        target_ids: list[int] | None = None,
+    ) -> list[dict]:
+        """Atomically claim no_metadata rows for enrichment processing."""
+        if limit <= 0:
+            return []
+
+        target_ids = [int(value) for value in (target_ids or []) if int(value) > 0]
+        now = int(time.time())
+        lease_expires_at = now + int(max(1, lease_seconds))
+        eligible_state_sql = """
+            (
+              COALESCE(enrich_state, 'pending') = 'pending'
+              OR (
+                   enrich_state = 'in_progress'
+                   AND enrich_lease_expires_at IS NOT NULL
+                   AND enrich_lease_expires_at <= ?
+                 )
+            )
+        """
+        params: list = [now]
+        attempts_sql = ""
+        if max_attempts is not None:
+            attempts_sql = " AND COALESCE(enrich_attempt_count, 0) < ?"
+            params.append(int(max_attempts))
+
+        cur = self.conn.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            where_clauses = [eligible_state_sql]
+            query_params: list = list(params)
+
+            if corpus_id is not None:
+                where_clauses.append(
+                    "EXISTS (SELECT 1 FROM corpus_items ci WHERE ci.table_name = 'no_metadata' AND ci.row_id = nm.id AND ci.corpus_id = ?)"
+                )
+                query_params.append(int(corpus_id))
+
+            if target_ids:
+                placeholders = ",".join("?" for _ in target_ids)
+                where_clauses.append(f"nm.id IN ({placeholders})")
+                query_params.extend(target_ids)
+
+            where_sql = " AND ".join(where_clauses)
+            cur.execute(
+                f"""
+                SELECT nm.id
+                  FROM no_metadata nm
+                 WHERE {where_sql}
+                   {attempts_sql}
+                 ORDER BY COALESCE(nm.selected_for_enrichment, 0) DESC, nm.id ASC
+                 LIMIT ?
+                """,
+                query_params + [int(limit)],
+            )
+            ids = [int(r[0]) for r in cur.fetchall()]
+            if not ids:
+                self.conn.commit()
+                return []
+
+            placeholders = ",".join(["?"] * len(ids))
+            claim_sql = f"""
+                UPDATE no_metadata
+                   SET enrich_state = 'in_progress',
+                       enrich_claimed_by = ?,
+                       enrich_claimed_at = ?,
+                       enrich_lease_expires_at = ?,
+                       enrich_attempt_count = COALESCE(enrich_attempt_count, 0) + 1,
+                       enrich_last_attempt_at = ?,
+                       enrich_last_error = NULL
+                 WHERE id IN ({placeholders})
+                   AND {eligible_state_sql}
+                   {attempts_sql}
+            """
+            cur.execute(
+                claim_sql,
+                [claimed_by, now, lease_expires_at, now] + ids + params,
+            )
+            cur.execute(
+                f"""
+                SELECT id, title, authors, year, doi, source, volume, issue, pages,
+                       publisher, type, url, isbn, issn, abstract, keywords
+                  FROM no_metadata
+                 WHERE id IN ({placeholders})
+                   AND enrich_claimed_by = ?
+                   AND enrich_claimed_at = ?
+                 ORDER BY id ASC
+                """,
+                ids + [claimed_by, now],
+            )
+            rows = cur.fetchall()
+            self.conn.commit()
+
+            out: list[dict] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r[0],
+                        "title": r[1],
+                        "authors": r[2],
+                        "year": r[3],
+                        "doi": r[4],
+                        "source": r[5],
+                        "volume": r[6],
+                        "issue": r[7],
+                        "pages": r[8],
+                        "publisher": r[9],
+                        "type": r[10],
+                        "url": r[11],
+                        "isbn": r[12],
+                        "issn": r[13],
+                        "abstract": r[14],
+                        "keywords": r[15],
+                    }
+                )
+            return out
+        except sqlite3.Error:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return []
+
+    def reset_enrich_claim(self, no_meta_id: int, *, state: str = "pending", error: str | None = None, selected: int = 0) -> tuple[bool, str | None]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """UPDATE no_metadata
+                      SET selected_for_enrichment = ?,
+                          enrich_state = ?,
+                          enrich_claimed_by = NULL,
+                          enrich_claimed_at = NULL,
+                          enrich_lease_expires_at = NULL,
+                          enrich_last_error = ?
+                    WHERE id = ?""",
+                (1 if selected else 0, state, error, no_meta_id),
+            )
+            self.conn.commit()
+            return True, None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            return False, str(e)
+
+    def delete_no_metadata_entry(self, no_meta_id: int) -> tuple[bool, str | None]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
+            self.delete_work_aliases("no_metadata", no_meta_id)
+            self.conn.commit()
+            return True, None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            return False, str(e)
+
     def get_entries_to_download(self, limit: int = None) -> list[dict]:
         """Fetch queued rows from with_metadata for legacy callers."""
         self._ensure_legacy_queue_migrated()
@@ -2563,6 +2791,105 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error moving entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
 
+    def move_no_metadata_entry_to_downloaded(
+        self,
+        source_id: int,
+        download_result: dict,
+        file_path: str,
+        checksum: str,
+        source_of_download: str,
+    ) -> tuple[int | None, str | None]:
+        """Move a raw no_metadata row directly to downloaded_references after raw-download fallback."""
+        cursor = self.conn.cursor()
+        try:
+            original_entry = self.get_entry_by_id('no_metadata', source_id)
+            if not original_entry:
+                raise sqlite3.Error(f"No entry found in no_metadata with ID {source_id}")
+
+            title = download_result.get('title') or original_entry.get('title')
+            authors = download_result.get('authors')
+            if authors is None:
+                authors = original_entry.get('authors')
+            elif isinstance(authors, list):
+                authors = json.dumps(authors)
+            elif not isinstance(authors, str):
+                authors = json.dumps([str(authors)])
+
+            doi = download_result.get('doi') or original_entry.get('doi')
+            openalex_id = download_result.get('openalex_id') or original_entry.get('openalex_id')
+            url_source = download_result.get('url') or download_result.get('open_access_url') or original_entry.get('url')
+            metadata_blob = json.dumps(download_result)
+            normalized_title = self._normalize_text(title)
+            normalized_authors = self._normalize_contributor_fields(authors, original_entry.get('editors'))
+
+            duplicate_table, duplicate_id, duplicate_field = self.check_if_exists(
+                doi=doi,
+                openalex_id=openalex_id,
+                title=title,
+                authors=authors,
+                editors=original_entry.get('editors'),
+                year=download_result.get('year') or original_entry.get('year'),
+                exclude_id=source_id,
+                exclude_table="no_metadata",
+            )
+            if duplicate_table == "downloaded_references" and duplicate_id is not None:
+                ok, err = self._merge_records(
+                    canonical_table="downloaded_references",
+                    canonical_id=int(duplicate_id),
+                    duplicate_table="no_metadata",
+                    duplicate_id=source_id,
+                    match_field=duplicate_field,
+                    notes="raw_download_duplicate_merge",
+                )
+                return (int(duplicate_id), None) if ok else (None, err or "duplicate_merge_failed")
+
+            data_to_insert = {
+                'entry_type': download_result.get('type') or original_entry.get('type'),
+                'source_pdf': original_entry.get('source_pdf'),
+                'title': title,
+                'authors': authors,
+                'year': download_result.get('year') or original_entry.get('year'),
+                'doi': doi,
+                'openalex_id': openalex_id,
+                'url_source': url_source,
+                'file_path': file_path,
+                'abstract': download_result.get('abstract') or original_entry.get('abstract'),
+                'keywords': json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
+                'journal_conference': download_result.get('source') or original_entry.get('source'),
+                'volume': download_result.get('volume') or original_entry.get('volume'),
+                'issue': download_result.get('issue') or original_entry.get('issue'),
+                'pages': download_result.get('pages') or original_entry.get('pages'),
+                'publisher': download_result.get('publisher') or original_entry.get('publisher'),
+                'metadata_source_type': 'raw_download_fallback',
+                'bibtex_entry_json': metadata_blob,
+                'status_notes': 'Downloaded after metadata enrichment failed',
+                'date_processed': datetime.now().isoformat(),
+                'checksum_pdf': checksum,
+                'source_of_download': source_of_download,
+                'ingest_source': original_entry.get('ingest_source'),
+                'run_id': original_entry.get('run_id'),
+                'normalized_title': normalized_title,
+                'normalized_authors': normalized_authors,
+            }
+
+            final_data = {k: v for k, v in data_to_insert.items() if v is not None}
+            cols = ', '.join(final_data.keys())
+            placeholders = ', '.join(['?'] * len(final_data))
+
+            cursor.execute(f"INSERT INTO downloaded_references ({cols}) VALUES ({placeholders})", list(final_data.values()))
+            new_id = cursor.lastrowid
+
+            self.update_work_alias_owner('no_metadata', source_id, 'downloaded_references', new_id)
+            self.reassign_corpus_items('no_metadata', source_id, 'downloaded_references', new_id)
+            cursor.execute("DELETE FROM no_metadata WHERE id = ?", (source_id,))
+
+            self.conn.commit()
+            return int(new_id), None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            print(f"{RED}[DB Manager] Error moving raw entry {source_id} to downloaded: {e}{RESET}")
+            return None, str(e)
+
     def move_entry_to_failed(self, source_id: int, reason: str) -> tuple[int | None, str | None]:
         """Moves an entry from with_metadata into failed_downloads."""
         cursor = self.conn.cursor()
@@ -2584,11 +2911,8 @@ class DatabaseManager:
 
             cursor.execute(f"INSERT INTO failed_downloads ({cols}) VALUES ({placeholders})", list(filtered.values()))
             inserted_id = cursor.lastrowid
-            self.delete_work_aliases("with_metadata", source_id)
-            cursor.execute(
-                "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
-                ("with_metadata", source_id),
-            )
+            self.update_work_alias_owner("with_metadata", source_id, "failed_downloads", inserted_id)
+            self.reassign_corpus_items("with_metadata", source_id, "failed_downloads", inserted_id)
             cursor.execute("DELETE FROM with_metadata WHERE id = ?", (source_id,))
             self.conn.commit()
             print(f"{GREEN}[DB Manager] Moved entry ID {source_id} to failed_downloads.{RESET}")

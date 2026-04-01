@@ -11,6 +11,14 @@ import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import {
+  ensureSeedSchema,
+  upsertSearchRunCorpus,
+  listSeedSources,
+  listSeedCandidates,
+  hideSeedSource,
+  dismissSeedCandidates,
+} from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -99,6 +107,7 @@ const INGEST_MARK_NEXT_RAW_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_mark_n
 const INGEST_PROCESS_MARKED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_process_marked.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
+const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
 const DOWNLOAD_WORKER_ONCE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'download_worker_once.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
@@ -339,6 +348,10 @@ function getUserById(db, userId) {
     .get(userId);
 }
 
+function isAdminUser(user) {
+  return String(user?.username || '') === ADMIN_USERNAME;
+}
+
 function requireAuth(db) {
   return (req, res, next) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
@@ -484,12 +497,12 @@ function buildKeywordSearchExpansion(body = {}) {
     relatedDepthDownstream: coercePositiveInt(
       coerceInt(body?.relatedDepthDownstream, explicitDepth ?? null),
       RECURSION_DEFAULTS.keyword.relatedDepthDownstream,
-      1
+      0
     ),
     relatedDepthUpstream: coercePositiveInt(
       coerceInt(body?.relatedDepthUpstream, explicitDepth ?? null),
       RECURSION_DEFAULTS.keyword.relatedDepthUpstream,
-      1
+      0
     ),
     maxRelated: coercePositiveInt(body?.maxRelated, RECURSION_DEFAULTS.keyword.maxRelated, 1),
     includeDownstream: body?.includeDownstream === undefined
@@ -513,7 +526,7 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
       args.push('--related-depth-upstream', String(expansion.relatedDepthUpstream));
     }
   } else {
-    args.push('--related-depth', String(1));
+    args.push('--related-depth', String(0));
     args.push('--no-include-downstream');
   }
   args.push('--max-related', String(expansion.maxRelated));
@@ -525,17 +538,17 @@ function buildUploadedDocsExpansion(body = {}) {
     relatedDepth: coercePositiveInt(
       explicitDepth,
       RECURSION_DEFAULTS.uploadedDocs.relatedDepth,
-      1
+      0
     ),
     relatedDepthDownstream: coercePositiveInt(
       coerceInt(body?.relatedDepthDownstream, explicitDepth ?? null),
       RECURSION_DEFAULTS.uploadedDocs.relatedDepthDownstream,
-      1
+      0
     ),
     relatedDepthUpstream: coercePositiveInt(
       coerceInt(body?.relatedDepthUpstream, explicitDepth ?? null),
       RECURSION_DEFAULTS.uploadedDocs.relatedDepthUpstream,
-      1
+      0
     ),
     maxRelated: coercePositiveInt(
       body?.maxRelated,
@@ -564,7 +577,7 @@ function applyUploadedDocsExpansionArgs(args, expansion) {
       args.push('--no-include-upstream');
     }
   } else {
-    args.push('--related-depth-downstream', String(1));
+    args.push('--related-depth-downstream', String(0));
     args.push('--no-include-downstream');
     args.push('--no-include-upstream');
   }
@@ -669,18 +682,18 @@ function coerceBoolEnv(value, fallback) {
 
 const RECURSION_DEFAULTS = {
   keyword: {
-    relatedDepthDownstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
-    relatedDepthUpstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 1) || 1),
+    relatedDepthDownstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
+    relatedDepthUpstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 0) || 0),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
-    includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, true),
+    includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, false),
     includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
   uploadedDocs: {
-    relatedDepth: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
-    relatedDepthDownstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 1) || 1),
-    relatedDepthUpstream: Math.max(1, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 1) || 1),
+    relatedDepth: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
+    relatedDepthDownstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
+    relatedDepthUpstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 0) || 0),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
-    includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, true),
+    includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, false),
     includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
 };
@@ -895,6 +908,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // timeout option already helps; pragma is best-effort
   }
   ensureAuthSchema(authDb);
+  ensureSeedSchema(authDb);
   const defaultCorpusId = bootstrapDefaultCorpus(authDb);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
@@ -906,6 +920,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (process.env.RAG_FEEDER_STUB === '1') return true;
     const role = getCorpusRoleForUser(authDb, req.user?.id, req.corpusId);
     return role === 'owner' || role === 'editor';
+  };
+  const hasAdminWorkerAccess = (req) => {
+    if (process.env.RAG_FEEDER_STUB === '1') return true;
+    return isAdminUser(req.user);
   };
 
   // Ensure uploads directory exists (already present, keeping for clarity)
@@ -978,16 +996,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       };
     }
 
-    const row = authDb
+    const rows = authDb
       .prepare(
         `SELECT daemon_name, worker_id, status, details_json, last_seen_at
          FROM daemon_heartbeat
-         WHERE daemon_name = ?
-         LIMIT 1`
+         WHERE daemon_name IN ('pipeline', 'enrich', 'download')`
       )
-      .get('pipeline');
+      .all();
 
-    if (!row) {
+    if (!rows || rows.length === 0) {
       return {
         online: false,
         worker_id: null,
@@ -997,24 +1014,84 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         stale_after_seconds: staleAfterSeconds,
       };
     }
-
-    const lastSeenMs = parseSqliteTimestampToMs(row.last_seen_at);
     const nowMs = Date.now();
-    const online = Number.isFinite(lastSeenMs) ? nowMs - lastSeenMs <= staleAfterSeconds * 1000 : false;
-    let details = null;
-    try {
-      details = row.details_json ? JSON.parse(row.details_json) : null;
-    } catch (error) {
-      details = null;
+    const workers = {};
+    let anyOnline = false;
+    let latestLastSeen = null;
+    let latestWorker = null;
+    for (const row of rows) {
+      const lastSeenMs = parseSqliteTimestampToMs(row.last_seen_at);
+      const online = Number.isFinite(lastSeenMs) ? nowMs - lastSeenMs <= staleAfterSeconds * 1000 : false;
+      let details = null;
+      try {
+        details = row.details_json ? JSON.parse(row.details_json) : null;
+      } catch (error) {
+        details = null;
+      }
+      workers[row.daemon_name] = {
+        online,
+        worker_id: row.worker_id || null,
+        status: row.status || (online ? 'online' : 'offline'),
+        details,
+        last_seen_at: row.last_seen_at || null,
+      };
+      if (online) anyOnline = true;
+      if (!latestLastSeen || String(row.last_seen_at || '') > String(latestLastSeen)) {
+        latestLastSeen = row.last_seen_at || null;
+        latestWorker = workers[row.daemon_name];
+      }
     }
+    return {
+      online: anyOnline,
+      worker_id: latestWorker?.worker_id || null,
+      status: latestWorker?.status || (anyOnline ? 'online' : 'offline'),
+      details: latestWorker?.details || null,
+      last_seen_at: latestWorker?.last_seen_at || null,
+      workers,
+      stale_after_seconds: staleAfterSeconds,
+    };
+  }
+
+  function readWorkerBacklogSummary(corpusId) {
+    const scopedCorpusId = corpusId ?? null;
+    const countScoped = (tableName, whereSql = '', params = []) => {
+      if (!tableExists(authDb, tableName)) return 0;
+      const normalizedWhere = String(whereSql || '').trim();
+      try {
+        if (scopedCorpusId === null) {
+          const row = authDb
+            .prepare(
+              `SELECT COUNT(*) AS count
+               FROM ${tableName}
+               ${normalizedWhere ? `WHERE ${normalizedWhere}` : ''}`
+            )
+            .get(...params);
+          return Number(row?.count || 0);
+        }
+        const row = authDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM ${tableName} t
+             JOIN corpus_items ci ON ci.table_name = '${tableName}' AND ci.row_id = t.id
+             WHERE ci.corpus_id = ?${normalizedWhere ? ` AND ${normalizedWhere}` : ''}`
+          )
+          .get(scopedCorpusId, ...params);
+        return Number(row?.count || 0);
+      } catch (error) {
+        return 0;
+      }
+    };
 
     return {
-      online,
-      worker_id: row.worker_id || null,
-      status: row.status || (online ? 'online' : 'offline'),
-      details,
-      last_seen_at: row.last_seen_at || null,
-      stale_after_seconds: staleAfterSeconds,
+      corpus_id: scopedCorpusId,
+      raw_pending: countScoped('no_metadata', "COALESCE(enrich_state, 'pending') = 'pending'"),
+      enriching: countScoped('no_metadata', "COALESCE(enrich_state, 'pending') = 'in_progress'"),
+      with_metadata: countScoped('with_metadata'),
+      queued_download: countScoped('with_metadata', "COALESCE(download_state, 'with_metadata') = 'queued'"),
+      downloading: countScoped('with_metadata', "COALESCE(download_state, 'with_metadata') = 'in_progress'"),
+      downloaded: countScoped('downloaded_references'),
+      failed_enrichment: countScoped('failed_enrichments'),
+      failed_download: countScoped('failed_downloads'),
     };
   }
 
@@ -1188,6 +1265,39 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   }
 
+  function countPipelineTickJobs(corpusId) {
+    if (!tableExists(authDb, 'pipeline_jobs')) {
+      return { pending: 0, running: 0 };
+    }
+    try {
+      const pending = Number(
+        authDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM pipeline_jobs
+             WHERE job_type = 'pipeline_tick'
+               AND status = 'pending'
+               AND corpus_id IS ?`
+          )
+          .get(corpusId ?? null)?.count || 0
+      );
+      const running = Number(
+        authDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM pipeline_jobs
+             WHERE job_type = 'pipeline_tick'
+               AND status = 'running'
+               AND corpus_id IS ?`
+          )
+          .get(corpusId ?? null)?.count || 0
+      );
+      return { pending, running };
+    } catch (error) {
+      return { pending: 0, running: 0 };
+    }
+  }
+
   function countQueuedDownloads(corpusId) {
     try {
       if (corpusId !== undefined && corpusId !== null) {
@@ -1289,6 +1399,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     state.lastError = null;
     
     try {
+      const outstanding = countPipelineTickJobs(corpusId);
+      if (Number(outstanding.pending || 0) > 0 || Number(outstanding.running || 0) > 0) {
+        state.inFlight = false;
+        return;
+      }
       authDb.prepare(
         "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
       ).run(corpusId, 'pipeline_tick', JSON.stringify({ config: state.config }));
@@ -1475,7 +1590,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const token = jwt.sign({ sub: user.id, username: user.username }, JWT_SECRET, {
       expiresIn: '7d',
     });
-    return res.json({ token, user: { id: user.id, username: user.username, last_corpus_id: lastCorpusId } });
+    return res.json({
+      token,
+      user: {
+        id: user.id,
+        username: user.username,
+        last_corpus_id: lastCorpusId,
+        is_admin: isAdminUser(user),
+      },
+    });
   });
 
   app.post('/api/auth/register', (req, res) => {
@@ -1504,7 +1627,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   app.get('/api/auth/me', requireAuthMiddleware, (req, res) => {
     const corpora = listCorporaForUser(authDb, req.user.id);
-    return res.json({ user: req.user, corpora });
+    return res.json({
+      user: {
+        ...req.user,
+        is_admin: isAdminUser(req.user),
+      },
+      corpora,
+    });
   });
 
   // --- Corpus management ---
@@ -1756,6 +1885,29 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // --- End Immediate Response ---
 
     let sharedUploadedFileName = null;
+    const sendExtractionSignal = ({ status = 'success', mode = '', reason = '' } = {}) => {
+      const parts = [
+        '[extract-status]',
+        `[corpus=${corpusTag}]`,
+        `[base=${baseName}]`,
+        `[file=${filename}]`,
+        'done',
+        `status=${status}`,
+      ];
+      if (mode) parts.push(`mode=${mode}`);
+      if (reason) parts.push(`reason=${reason}`);
+      send(parts.join(' '));
+      sendEvent({
+        kind: 'extraction',
+        event: 'done',
+        corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
+        base_name: baseName,
+        filename,
+        status,
+        mode: mode || null,
+        reason: reason || null,
+      });
+    };
     const cleanupSharedUpload = () => {
       if (!sharedUploadedFileName) return;
       const toDelete = sharedUploadedFileName;
@@ -1790,6 +1942,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         chunkPages = 0,
         uploadedFileName = null,
         modelOverride = null,
+        inlineModelOverride = null,
         label = 'APIscraper',
       }) => {
         return new Promise((resolve) => {
@@ -1799,6 +1952,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
           if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
           if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
+          scrapeApiArgs.push('--seed-only');
           if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
 
           console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
@@ -1807,6 +1961,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             env: {
               ...process.env,
               ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
+              ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
               PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
               RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
               RAG_FEEDER_DB_PATH: DB_PATH,
@@ -1844,8 +1999,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           send(`[/api/extract-bibliography][corpus=${corpusTag}] Inline fallback skipped (input PDF missing).`);
           return false;
         }
-        const useSharedUpload = Boolean(sharedUploadedFileName);
-        const chunkPages = useSharedUpload ? 0 : 50;
+        const chunkPages = inputPageCount && inputPageCount > 12 ? 10 : 0;
+        const inlineUploadedFileName = chunkPages > 0 ? null : sharedUploadedFileName;
         const why = reason || 'reference page extraction returned no usable pages';
         console.warn(`[/api/extract-bibliography] Triggering inline citation fallback: ${why}`);
         send(
@@ -1855,10 +2010,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           inputPdf: inputPdfPath,
           extractMode: 'inline',
           chunkPages,
-          uploadedFileName: sharedUploadedFileName,
-          modelOverride: 'gemini-3.1-flash-lite-preview',
+          uploadedFileName: inlineUploadedFileName,
+          inlineModelOverride: 'gemini-3.1-pro-preview',
           label: 'APIscraper inline fallback',
         });
+        if (ok) {
+          sendExtractionSignal({ status: 'success', mode: 'inline', reason: why });
+        }
         return ok;
       };
 
@@ -1891,7 +2049,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           inputDir: existingPagesDir,
           extractMode: 'page',
           label: 'APIscraper (reused pages)',
-        }).finally(() => cleanupSharedUpload());
+        })
+          .then((ok) => {
+            sendExtractionSignal({ status: ok ? 'success' : 'failed', mode: 'page_reuse' });
+          })
+          .finally(() => cleanupSharedUpload());
         return;
       }
 
@@ -1933,7 +2095,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             const errorMessage = `[/api/extract-bibliography] get_bib_pages.py exited with code ${code}.`;
             send(`[/api/extract-bibliography][corpus=${corpusTag}] get_bib_pages.py exited with code ${code}.`);
             console.error(errorMessage);
-            await runInlineFallback(`get_bib_pages failed with code ${code}`);
+            const ok = await runInlineFallback(`get_bib_pages failed with code ${code}`);
+            if (!ok) {
+              sendExtractionSignal({ status: 'failed', mode: 'inline', reason: `get_bib_pages_exit_${code}` });
+            }
             return;
           }
 
@@ -1975,7 +2140,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}.`;
             console.error(errorMessage);
             send(`[/api/extract-bibliography][corpus=${corpusTag}] No extracted page PDFs found in: ${jsonSubDir}.`);
-            await runInlineFallback('no extracted bibliography pages found');
+            const ok = await runInlineFallback('no extracted bibliography pages found');
+            if (!ok) {
+              sendExtractionSignal({ status: 'failed', mode: 'inline', reason: 'no_extracted_pages' });
+            }
             return;
           }
 
@@ -1987,6 +2155,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           if (ok) {
             console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
             send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename}.`);
+            sendExtractionSignal({ status: 'success', mode: 'page' });
+          } else {
+            sendExtractionSignal({ status: 'failed', mode: 'page' });
           }
         } finally {
           cleanupSharedUpload();
@@ -2020,6 +2191,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     const field = req.body?.field || 'default';
+    const author = req.body?.author?.trim() || '';
     const maxResults = coerceInt(req.body?.maxResults, 200);
     const yearFrom = coerceInt(req.body?.yearFrom, null);
     const yearTo = coerceInt(req.body?.yearTo, null);
@@ -2042,6 +2214,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
       args.push('--seed-json', seedPayload);
     }
+    if (query && author) args.push('--author', author);
     if (query && yearFrom) args.push('--year-from', String(yearFrom));
     if (query && yearTo) args.push('--year-to', String(yearTo));
     if (mailto) args.push('--mailto', String(mailto));
@@ -2050,10 +2223,185 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });
+      if (Number.isFinite(Number(payload?.runId)) && Number(payload.runId) > 0 && Number.isFinite(Number(req.corpusId))) {
+        upsertSearchRunCorpus(authDb, {
+          searchRunId: Number(payload.runId),
+          corpusId: Number(req.corpusId),
+        });
+      }
       return res.json(payload);
     } catch (error) {
       console.error('[/api/keyword-search] Error:', error);
       return res.status(500).json({ error: error.message || 'Keyword search failed' });
+    }
+  });
+
+  app.get('/api/seed/sources', requireAuthMiddleware, (req, res) => {
+    try {
+      const limit = Math.max(1, Math.min(500, coerceInt(req.query?.limit, 100) || 100));
+      const sources = listSeedSources(authDb, req.corpusId, { limit });
+      return res.json({ source: 'db', sources, total: sources.length });
+    } catch (error) {
+      console.error('[/api/seed/sources] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load seed sources' });
+    }
+  });
+
+  app.get('/api/seed/sources/:sourceType/:sourceKey/candidates', requireAuthMiddleware, (req, res) => {
+    try {
+      const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
+      const sourceKey = String(req.params?.sourceKey || '').trim();
+      if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+        return res.status(400).json({ error: 'Invalid seed source' });
+      }
+      const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey);
+      const sourceSummary = listSeedSources(authDb, req.corpusId, { limit: 500 }).find(
+        (source) => source.source_type === sourceType && String(source.source_key) === sourceKey
+      ) || null;
+      return res.json({
+        source: 'db',
+        source_summary: sourceSummary,
+        candidates,
+        total: candidates.length,
+      });
+    } catch (error) {
+      console.error('[/api/seed/sources/:sourceType/:sourceKey/candidates] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load seed candidates' });
+    }
+  });
+
+  app.post('/api/seed/sources/:sourceType/:sourceKey/promote', requireAuthMiddleware, async (req, res) => {
+    const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
+    const sourceKey = String(req.params?.sourceKey || '').trim();
+    if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+      return res.status(400).json({ error: 'Invalid seed source' });
+    }
+
+    const rawCandidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
+    const requestedCandidateKeys = [...new Set(rawCandidateKeys.map((value) => String(value || '').trim()).filter(Boolean))];
+    const workers = coerceInt(req.body?.workers, 6);
+    const enqueueDownload = req.body?.enqueueDownload === undefined ? true : Boolean(req.body.enqueueDownload);
+    const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 25);
+    const expansion = buildUploadedDocsExpansion({
+      relatedDepth: req.body?.relatedDepth,
+      maxRelated: req.body?.maxRelated,
+      includeDownstream: req.body?.includeDownstream,
+      includeUpstream: req.body?.includeUpstream,
+      relatedDepthDownstream: req.body?.relatedDepthDownstream,
+      relatedDepthUpstream: req.body?.relatedDepthUpstream,
+    });
+    if (workers === null || workers === undefined || !Number.isFinite(workers) || workers <= 0) {
+      return res.status(400).json({ error: 'workers must be a positive number' });
+    }
+    if (enqueueDownload && (downloadBatchSize === null || downloadBatchSize === undefined || !Number.isFinite(downloadBatchSize) || downloadBatchSize <= 0)) {
+      return res.status(400).json({ error: 'downloadBatchSize must be a positive number' });
+    }
+
+    try {
+      const availableCandidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey);
+      const promotableCandidates = availableCandidates.filter((candidate) => {
+        const state = String(candidate?.state || '').trim().toLowerCase();
+        return !Boolean(candidate?.in_corpus) && state !== 'downloaded';
+      });
+      const selectedCandidates = requestedCandidateKeys.length > 0
+        ? promotableCandidates.filter((candidate) => requestedCandidateKeys.includes(String(candidate.candidate_key || '')))
+        : promotableCandidates;
+      const promotionCandidates = selectedCandidates.map((candidate) => ({
+        candidate_key: candidate?.candidate_key || null,
+        source_type: sourceType,
+        source_key: sourceKey,
+        title: candidate?.title || null,
+        authors: candidate?.authors || [],
+        year: candidate?.year || null,
+        doi: candidate?.doi || null,
+        openalex_id: candidate?.openalex_id || null,
+        source: candidate?.source || null,
+        publisher: candidate?.publisher || null,
+        url: candidate?.url || null,
+        type: candidate?.type || null,
+        abstract: candidate?.abstract || null,
+        keywords: candidate?.keywords || null,
+        source_pdf: candidate?.source_pdf || null,
+        ingest_source: candidate?.ingest_source || null,
+        run_id: candidate?.run_id || null,
+      }));
+
+      if (promotionCandidates.length === 0) {
+        return res.status(400).json({ error: 'No selectable seed candidates found for promotion' });
+      }
+
+      const promotion = await runPythonJson(
+        SEED_PROMOTE_SCRIPT,
+        [
+          '--db-path',
+          DB_PATH,
+          '--candidates-json',
+          JSON.stringify(promotionCandidates),
+          ...(enqueueDownload ? ['--enqueue-download'] : []),
+        ],
+        { dbPath: DB_PATH, corpusId: req.corpusId }
+      );
+
+      const noMetadataIds = [...new Set((promotion?.no_metadata_ids || []).map((value) => Number(value)).filter((value) => Number.isFinite(value) && value > 0))];
+      const shouldQueueEnrich = noMetadataIds.length > 0;
+      const shouldQueueDownload = Boolean(
+        enqueueDownload && (
+          shouldQueueEnrich ||
+          Number(promotion?.queued_existing_download || 0) > 0 ||
+          Number(promotion?.already_enriched || 0) > 0 ||
+          Number(promotion?.already_queued_download || 0) > 0 ||
+          Number(promotion?.failed_download_existing || 0) > 0
+        )
+      );
+
+      return res.json({
+        success: true,
+        request_id: '',
+        jobs: [],
+        tracking: null,
+        promotion,
+        backlog: readWorkerBacklogSummary(req.corpusId),
+        message: shouldQueueEnrich || shouldQueueDownload
+          ? 'Selected candidates were added to the corpus pipeline. Background workers will continue from DB state.'
+          : 'Selected candidates were already reflected in the corpus state.',
+      });
+    } catch (error) {
+      console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to promote seed candidates' });
+    }
+  });
+
+  app.post('/api/seed/candidates/dismiss', requireAuthMiddleware, (req, res) => {
+    try {
+      const sourceType = String(req.body?.sourceType || '').trim().toLowerCase();
+      const sourceKey = String(req.body?.sourceKey || '').trim();
+      const candidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
+      if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+        return res.status(400).json({ error: 'Invalid seed source' });
+      }
+      if (candidateKeys.length === 0) {
+        return res.status(400).json({ error: 'candidateKeys must be a non-empty array' });
+      }
+      const dismissed = dismissSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, candidateKeys);
+      return res.json({ success: true, dismissed });
+    } catch (error) {
+      console.error('[/api/seed/candidates/dismiss] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to dismiss seed candidates' });
+    }
+  });
+
+  app.delete('/api/seed/sources/:sourceType/:sourceKey', requireAuthMiddleware, (req, res) => {
+    try {
+      const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
+      const sourceKey = String(req.params?.sourceKey || '').trim();
+      if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+        return res.status(400).json({ error: 'Invalid seed source' });
+      }
+      const removed = hideSeedSource(authDb, req.corpusId, sourceType, sourceKey);
+      return res.json({ success: true, removed });
+    } catch (error) {
+      console.error('[/api/seed/sources/:sourceType/:sourceKey] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to remove seed source' });
     }
   });
 
@@ -2072,6 +2420,43 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
+    }
+  });
+
+  app.get('/api/corpus/downloaded/:id/file', requireAuthMiddleware, async (req, res) => {
+    const itemId = coerceInt(req.params?.id, null);
+    if (!Number.isFinite(itemId) || itemId <= 0) {
+      return res.status(400).json({ error: 'Invalid downloaded item id' });
+    }
+
+    try {
+      const db = new Database(DB_PATH, { readonly: true });
+      const row = db.prepare(
+        `SELECT dr.id, dr.title, dr.file_path
+           FROM downloaded_references dr
+           JOIN corpus_items ci
+             ON ci.table_name = 'downloaded_references'
+            AND ci.row_id = dr.id
+          WHERE ci.corpus_id = ?
+            AND dr.id = ?
+          LIMIT 1`
+      ).get(req.corpusId, itemId);
+      db.close();
+
+      if (!row) {
+        return res.status(404).json({ error: 'Downloaded file not found in this corpus' });
+      }
+
+      const filePath = path.resolve(String(row.file_path || ''));
+      if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Downloaded file is missing on disk' });
+      }
+
+      const downloadName = path.basename(filePath);
+      return res.download(filePath, downloadName);
+    } catch (error) {
+      console.error('[/api/corpus/downloaded/:id/file] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to download corpus file' });
     }
   });
 
@@ -2258,67 +2643,30 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     try {
-      const requestId = crypto.randomUUID();
-      const jobParams = {
-        request_id: requestId,
-        limit,
-        workers,
-        expansion,
-        shouldFetchReferences: expansion.includeDownstream
-      };
-
-      const insertJobStmt = authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      );
-      const insertProcessMarkedJobs = authDb.transaction(() => {
-        const enrichResult = insertJobStmt.run(req.corpusId, 'enrich', JSON.stringify(jobParams));
-        let downloadJobId = null;
-        if (enqueueDownload) {
-          const dlParams = { batchSize: downloadBatchSize, request_id: requestId };
-          const dlResult = insertJobStmt.run(req.corpusId, 'download', JSON.stringify(dlParams));
-          downloadJobId = dlResult.lastInsertRowid;
-        }
-        return {
-          enrichJobId: enrichResult.lastInsertRowid,
-          downloadJobId,
-        };
-      });
-      const queued = insertProcessMarkedJobs();
-      const queuedJobIds = [queued.enrichJobId, queued.downloadJobId]
-        .map((v) => Number(v))
-        .filter((v) => Number.isFinite(v) && v > 0);
-      let jobs = [];
-      if (queuedJobIds.length > 0) {
-        const placeholders = queuedJobIds.map(() => '?').join(', ');
-        jobs = authDb
-          .prepare(
-            `SELECT id, job_type, status, created_at
-             FROM pipeline_jobs
-             WHERE id IN (${placeholders})
-             ORDER BY id ASC`
-          )
-          .all(...queuedJobIds)
-          .map((row) => ({
-            id: Number(row.id),
-            job_type: row.job_type,
-            status: row.status,
-            created_at: row.created_at,
-          }));
-      }
+      const markedRow = authDb
+        .prepare(
+          `SELECT COUNT(*) AS count
+           FROM no_metadata nm
+           JOIN corpus_items ci ON ci.table_name = 'no_metadata' AND ci.row_id = nm.id
+           WHERE ci.corpus_id = ?
+             AND COALESCE(nm.selected_for_enrichment, 0) = 1`
+        )
+        .get(req.corpusId);
+      const marked = Number(markedRow?.count || 0);
 
       return res.json({
-        success: true, 
-        request_id: requestId,
-        job_id: queued.enrichJobId,
-        enrich_job_id: queued.enrichJobId,
-        download_job_id: queued.downloadJobId,
-        jobs,
-        tracking: {
-          recommended_poll_ms: 2000,
-        },
+        success: true,
+        request_id: '',
+        job_id: null,
+        enrich_job_id: null,
+        download_job_id: null,
+        jobs: [],
+        tracking: null,
+        marked,
+        backlog: readWorkerBacklogSummary(req.corpusId),
         message: enqueueDownload
-          ? 'Enrichment and download jobs queued successfully.'
-          : 'Enrichment job queued successfully.'
+          ? 'Marked entries remain queued in the database. Background workers will enrich and download them automatically.'
+          : 'Marked entries remain queued in the database. Background workers will enrich them automatically.'
       });
     } catch (error) {
       console.error('[/api/ingest/process-marked] Error:', error);
@@ -2356,6 +2704,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json({
         source: 'db',
         daemon: readPipelineDaemonStatus(),
+        backlog: readWorkerBacklogSummary(req.corpusId),
       });
     } catch (error) {
       console.error('[/api/pipeline/daemon/status] Error:', error);
@@ -2458,6 +2807,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           job_type: row.job_type,
           status: row.status,
           request_id: paramsJson?.request_id || null,
+          parameters: paramsJson,
           created_at: row.created_at,
           started_at: row.started_at,
           finished_at: row.finished_at,
@@ -2562,71 +2912,62 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
       });
     }
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required for diagnostics worker status' });
     }
-    const state = getOrInitPipelineWorkerState(req.corpusId);
+    const daemon = readPipelineDaemonStatus();
+    const enrich = daemon?.workers?.enrich || {};
+    const backlog = readWorkerBacklogSummary(req.corpusId);
     return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
-      started_at: state.startedAt,
-      last_tick_at: state.lastTickAt,
-      last_result: state.lastResult,
-      last_error: state.lastError,
-      resolved_download_workers: state.resolvedDownloadWorkers,
-      config: state.config,
+      running: Boolean(enrich.online),
+      in_flight: String(enrich.status || '').toLowerCase() === 'running',
+      started_at: enrich.last_seen_at || null,
+      last_tick_at: enrich.last_seen_at || null,
+      last_result: enrich.details || null,
+      last_error: enrich.status === 'error' ? JSON.stringify(enrich.details || {}) : null,
+      resolved_download_workers: Boolean((daemon?.workers?.download || {}).online) ? 1 : 0,
+      config: { mode: 'db-driven' },
+      backlog,
     });
   });
 
   app.post('/api/pipeline/worker/start', requireAuthMiddleware, (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required to manage pipeline workers' });
     }
 
-    const state = startPipelineWorker(req.corpusId, req.body || {});
-
     return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
-      started_at: state.startedAt,
-      last_tick_at: state.lastTickAt,
-      last_result: state.lastResult,
-      last_error: state.lastError,
-      config: state.config,
-      resolved_download_workers: state.resolvedDownloadWorkers,
+      running: true,
+      in_flight: false,
+      config: { mode: 'db-driven' },
+      message: 'DB-driven enrich/download workers run continuously. Manual pipeline start is no longer used.',
     });
   });
 
   app.post('/api/pipeline/worker/pause', requireAuthMiddleware, (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required to manage pipeline workers' });
     }
 
-    const force = Boolean(req.body?.force);
-    const state = pausePipelineWorker(req.corpusId, { force });
     return res.json({
-      running: state.running,
-      in_flight: state.inFlight,
-      force,
+      running: true,
+      in_flight: false,
+      force: Boolean(req.body?.force),
+      message: 'DB-driven workers are managed outside the app. Manual pipeline pause is no longer used.',
     });
   });
 
   app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required to manage pipeline workers' });
     }
 
-    const pipeline = pauseAllPipelineWorkers({ force: true });
-    const downloads = stopAllDownloadWorkers({ force: true });
-    const cancelledJobs = cancelAllDownloadJobs({
-      includeRunning: true,
-      reason: 'pipeline_pause_all',
-    });
     return res.json({
-      pipeline,
-      downloads,
-      cancelled_jobs: cancelledJobs,
+      pipeline: { running: true, in_flight: false },
+      downloads: { running: true, in_flight: false },
+      cancelled_jobs: { pending: 0, running: 0 },
       force: true,
+      message: 'DB-driven workers are managed outside the app. Global pause is not supported from the UI.',
     });
   });
 
@@ -2634,150 +2975,73 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } });
     }
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required for diagnostics worker status' });
     }
-    const state = getOrInitWorkerState(req.corpusId);
-    let queuedJobs = 0;
-    let runningJobs = 0;
-    try {
-      const pendingRow = authDb
-        .prepare(
-          `SELECT COUNT(*) AS count
-           FROM pipeline_jobs
-           WHERE job_type = 'download'
-             AND status = 'pending'
-             AND corpus_id IS ?`
-        )
-        .get(req.corpusId ?? null);
-      queuedJobs = Number(pendingRow?.count || 0);
-      const runningRow = authDb
-        .prepare(
-          `SELECT COUNT(*) AS count
-           FROM pipeline_jobs
-           WHERE job_type = 'download'
-             AND status = 'running'
-             AND corpus_id IS ?`
-        )
-        .get(req.corpusId ?? null);
-      runningJobs = Number(runningRow?.count || 0);
-    } catch (error) {
-      // Best-effort; keep legacy in-memory state if query fails.
-    }
-
-    const queueActive = queuedJobs > 0 || runningJobs > 0;
-    const legacyIntervalActive = Boolean(state.running && state.intervalId);
-    const effectiveRunning = queueActive || legacyIntervalActive;
+    const daemon = readPipelineDaemonStatus();
+    const download = daemon?.workers?.download || {};
+    const backlog = readWorkerBacklogSummary(req.corpusId);
     return res.json({
-      running: effectiveRunning,
-      in_flight: state.inFlight || runningJobs > 0,
-      started_at: state.startedAt,
-      last_tick_at: state.lastTickAt,
-      last_result: state.lastResult,
-      last_error: state.lastError,
-      config: state.config,
-      queued_jobs: queuedJobs,
-      running_jobs: runningJobs,
+      running: Boolean(download.online),
+      in_flight: String(download.status || '').toLowerCase() === 'running',
+      started_at: download.last_seen_at || null,
+      last_tick_at: download.last_seen_at || null,
+      last_result: download.details || null,
+      last_error: download.status === 'error' ? JSON.stringify(download.details || {}) : null,
+      config: { mode: 'db-driven' },
+      queued_jobs: Number(backlog.queued_download || 0),
+      running_jobs: Number(backlog.downloading || 0),
+      queued_download_items: Number(backlog.queued_download || 0),
     });
   });
 
   app.post('/api/downloads/worker/start', requireAuthMiddleware, (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required to manage download workers' });
     }
-    const state = getOrInitWorkerState(req.corpusId);
-    const perJobMax = Math.max(1, Math.min(5000, coerceInt(process.env.RAG_FEEDER_DOWNLOAD_JOB_MAX, 150) || 150));
-    const queueDepth = countQueuedDownloads(req.corpusId);
-    const existingJobs = countDownloadPipelineJobs(req.corpusId);
-    const existingOutstanding = Number(existingJobs.pending || 0) + Number(existingJobs.running || 0);
-    const desiredJobs = queueDepth > 0 ? Math.ceil(queueDepth / perJobMax) : 0;
-    const jobsToQueue = Math.max(0, desiredJobs - existingOutstanding);
-    
-    try {
-      let queuedJobs = 0;
-      if (jobsToQueue > 0) {
-        const insert = authDb.prepare(
-          "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-        );
-        const enqueueMany = authDb.transaction(() => {
-          for (let index = 0; index < jobsToQueue; index += 1) {
-            const remaining = Math.max(1, queueDepth - index * perJobMax);
-            const batchSize = Math.max(1, Math.min(perJobMax, remaining));
-            insert.run(req.corpusId, 'download', JSON.stringify({ batchSize }));
-            queuedJobs += 1;
-          }
-        });
-        enqueueMany();
-      }
-
-      // Queue-driven mode still reports a worker state in UI; keep it in sync.
-      state.running = queueDepth > 0 || existingOutstanding > 0 || queuedJobs > 0;
-      if (state.running) {
-        state.startedAt = state.startedAt || new Date().toISOString();
-      }
-      state.lastTickAt = new Date().toISOString();
-      state.lastError = null;
-      state.config = { ...state.config, batchSize: perJobMax };
-
-      return res.json({ 
-        running: state.running,
-        queued_jobs: queuedJobs,
-        queued_download_items: queueDepth,
-        outstanding_jobs_before: existingOutstanding,
-        desired_jobs: desiredJobs,
-        per_job_max: perJobMax,
-        batch_size: perJobMax,
-        mode: 'auto',
-        message: queuedJobs > 0
-          ? `Queued ${queuedJobs} download job(s) to drain ${queueDepth} queued item(s).`
-          : 'Download backlog already covered by existing queued/running jobs.'
-      });
-    } catch (error) {
-      console.error('[/api/downloads/worker/start] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to queue download job' });
-    }
+    const backlog = readWorkerBacklogSummary(req.corpusId);
+    return res.json({
+      running: true,
+      queued_jobs: 0,
+      queued_download_items: Number(backlog.queued_download || 0),
+      outstanding_jobs_before: 0,
+      desired_jobs: 0,
+      per_job_max: 0,
+      batch_size: 0,
+      mode: 'db-driven',
+      message: 'DB-driven download worker runs continuously. Manual start is no longer used.',
+    });
   });
 
   app.post('/api/downloads/worker/stop', requireAuthMiddleware, (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required to manage download workers' });
     }
-    const state = getOrInitWorkerState(req.corpusId);
-    state.running = false;
-    if (state.intervalId) {
-      clearInterval(state.intervalId);
-      state.intervalId = null;
-    }
-    const cancelledJobs = cancelDownloadJobs(req.corpusId, {
-      includeRunning: true,
-      reason: 'download_worker_stop',
+    return res.json({
+      running: true,
+      cancelled_jobs: { pending: 0, running: 0 },
+      message: 'DB-driven download worker is managed outside the app. Manual stop is no longer used.',
     });
-    return res.json({ running: false, cancelled_jobs: cancelledJobs });
   });
 
   app.post('/api/downloads/worker/run-once', requireAuthMiddleware, async (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
+    if (!hasAdminWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Admin access required to manage download workers' });
     }
-    const batchSize = resolveAutoDownloadBatchSize(req.corpusId);
-    
-    try {
-      const result = authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
-
-      return res.json({ 
-        success: true, 
-        job_id: result.lastInsertRowid,
-        batch_size: batchSize,
-        mode: 'auto',
-        message: 'Download job queued successfully (auto throughput mode).'
-      });
-    } catch (error) {
-      console.error('[/api/downloads/worker/run-once] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to queue download job' });
-    }
+    const backlog = readWorkerBacklogSummary(req.corpusId);
+    return res.json({
+      success: true,
+      job_id: null,
+      batch_size: 0,
+      mode: 'db-driven',
+      queued_download_items: Number(backlog.queued_download || 0),
+      message: 'DB-driven download worker runs continuously. Run once is no longer used.',
+    });
   });
+
+  if (process.env.NODE_ENV !== 'test') {
+    console.log('[pipeline-worker] DB-driven enrich/download workers expected; no pipeline_jobs scheduler started.');
+  }
 
   return app;
 }

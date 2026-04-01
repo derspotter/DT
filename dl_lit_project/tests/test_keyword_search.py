@@ -1,7 +1,12 @@
 import pytest
 
 from dl_lit import keyword_search
-from dl_lit.keyword_search import normalize_query, QuerySyntaxError, openalex_result_to_record
+from dl_lit.keyword_search import (
+    QuerySyntaxError,
+    build_openalex_query_text,
+    normalize_query,
+    openalex_result_to_record,
+)
 
 
 def test_normalize_query_inserts_and():
@@ -15,6 +20,14 @@ def test_normalize_query_parentheses():
 def test_normalize_query_mismatched_parens():
     with pytest.raises(QuerySyntaxError):
         normalize_query("(foo AND bar")
+
+
+def test_build_openalex_query_text_strips_boolean_syntax():
+    assert build_openalex_query_text('(foo OR bar) AND "baz qux"') == "foo bar baz qux"
+
+
+def test_build_openalex_query_text_strips_apostrophes():
+    assert build_openalex_query_text("baumol's disease") == "baumol s disease"
 
 
 def test_openalex_result_to_record_pages():
@@ -55,6 +68,6 @@ def test_search_openalex_field_filter(monkeypatch):
     )
 
     assert "search" not in captured
-    assert captured["filter"].startswith("title.search:foo AND bar")
+    assert captured["filter"].startswith("title.search:foo bar")
     assert "publication_year:>=2020" in captured["filter"]
     assert "publication_year:<=2021" in captured["filter"]
