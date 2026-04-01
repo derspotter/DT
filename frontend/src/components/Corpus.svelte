@@ -6,16 +6,17 @@
   export let metadataTotal;
   export let downloadedTotal;
   export let failedEnrichmentTotal;
+  export let failedDownloadTotal;
   export let shareUsername;
   export let shareRole;
   export let shareStatus;
   export let handleShareCorpus;
   
-  export let selectedCorpusRow;
   export let bucketLabel;
-  export let pipelineStatusLabel;
+  export let formatAuthors;
   export let doiHref;
   export let openAlexHref;
+  export let handleDownloadedCorpusFile;
   
   export let isCorpusItemSelected;
   export let toggleCorpusItemSelection;
@@ -40,6 +41,8 @@
       if (item.status !== 'with_metadata' && item.status !== 'to_download_references') return false;
     } else if (stageFilter === 'failed_enrichment') {
       if (item.status !== 'failed_enrichments') return false;
+    } else if (stageFilter === 'failed_download') {
+      if (item.status !== 'failed_downloads') return false;
     } else if (stageFilter === 'downloaded') {
       if (item.status !== 'downloaded_references') return false;
     }
@@ -63,18 +66,41 @@
     if (item.status === 'downloaded_references') return 'downloaded';
     return 'raw';
   }
+
+  function itemStageLabel(item, bucket = getBucketForItem(item)) {
+    if (!item) return '-';
+    if (item.status === 'failed_enrichments') return 'Enrich failed';
+    if (item.status === 'failed_downloads') return 'Download failed';
+    if (item.status === 'to_download_references') return 'Queued download';
+    if (item.status === 'with_metadata') return 'With metadata';
+    if (item.status === 'downloaded_references') return 'Downloaded';
+    if (!item.status || item.status === 'no_metadata' || item.status === 'extract_references_from_pdf' || item.status === 'pending') {
+      return 'Raw';
+    }
+    return bucketLabel(bucket);
+  }
+
+  function canDownloadSelectedItem(row) {
+    return Boolean(
+      row &&
+      row.bucket === 'downloaded' &&
+      row.item &&
+      row.item.status === 'downloaded_references' &&
+      row.item.file_path
+    );
+  }
 </script>
 
-<div class="card" data-testid="corpus-panel">
-  <div class="corpus-header-row">
-    <div>
-      <h2>Corpus</h2>
+<div class="card corpus-panel" data-testid="corpus-panel">
+  <div class="workspace-panel-header">
+    <div class="workspace-panel-title">
+      <h3>Corpus</h3>
       <p class="muted">
         {corpusSource === 'api' ? 'Live corpus from API.' : 'Sample corpus data.'}
         {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusTotal}.{/if}
       </p>
     </div>
-    <form class="corpus-share" on:submit|preventDefault={handleShareCorpus}>
+    <form class="workspace-panel-actions corpus-share" on:submit|preventDefault={handleShareCorpus}>
       <div>
         <label>
           Share with
@@ -98,103 +124,91 @@
     </form>
   </div>
 
-  <div class="corpus-details">
-    <h3>Selected entry details</h3>
-    <div class="corpus-details-grid" class:muted={!selectedCorpusRow}>
-      <div>
-        <span>Stage</span>
-        <strong>{selectedCorpusRow ? bucketLabel(selectedCorpusRow.bucket) : '-'}</strong>
-      </div>
-      <div>
-        <span>Status</span>
-        <strong>{selectedCorpusRow ? pipelineStatusLabel(selectedCorpusRow.item.status) : '-'}</strong>
-      </div>
-      <div>
-        <span>ID</span>
-        <strong>{selectedCorpusRow?.item.id ?? '-'}</strong>
-      </div>
-      <div>
-        <span>Year</span>
-        <strong>{selectedCorpusRow?.item.year || '-'}</strong>
-      </div>
-      <div class="span-2">
-        <span>Title</span>
-        <strong>{selectedCorpusRow?.item.title || (selectedCorpusRow ? 'Untitled' : '-')}</strong>
-      </div>
-      <div class="span-2">
-        <span>Source</span>
-        <strong>{selectedCorpusRow?.item.source || '-'}</strong>
-      </div>
-      <div class="span-2">
-        <span>DOI</span>
-        {#if selectedCorpusRow?.item.doi}
-          <a href={doiHref(selectedCorpusRow.item.doi)} target="_blank" rel="noreferrer">{selectedCorpusRow.item.doi}</a>
-        {:else}
-          <strong>-</strong>
-        {/if}
-      </div>
-      <div class="span-2">
-        <span>OpenAlex</span>
-        {#if selectedCorpusRow?.item.openalex_id}
-          <a href={openAlexHref(selectedCorpusRow.item.openalex_id)} target="_blank" rel="noreferrer">{selectedCorpusRow.item.openalex_id}</a>
-        {:else}
-          <strong>-</strong>
-        {/if}
-      </div>
+  <div class="table-toolbar corpus-toolbar">
+    <div class="table-toolbar-left corpus-toolbar__filters">
+      <label class="corpus-filter corpus-filter--wide">
+        <span class="muted small">Search Title and/or Year</span>
+        <input type="text" bind:value={textFilter} placeholder="Filter items..." />
+      </label>
+      <label class="corpus-filter corpus-filter--stage">
+        <span class="muted small">Pipeline Stage</span>
+        <select bind:value={stageFilter}>
+          <option value="all">All stages ({corpusTotal || corpusItems.length})</option>
+          <option value="raw">Raw / Seeds ({rawTotal || 0})</option>
+          <option value="metadata">With Metadata ({metadataTotal || 0})</option>
+          <option value="failed_enrichment">Failed enrichments ({failedEnrichmentTotal || 0})</option>
+          <option value="failed_download">Failed downloads ({failedDownloadTotal || 0})</option>
+          <option value="downloaded">Downloaded ({downloadedTotal || 0})</option>
+        </select>
+      </label>
     </div>
-  </div>
-
-  <div class="corpus-filters" style="display: flex; gap: 16px; margin: 20px 0;">
-    <label style="flex: 1; display: flex; flex-direction: column; gap: 6px;">
-      <span class="muted small">Search Title and/or Year</span>
-      <input type="text" bind:value={textFilter} placeholder="Filter items..." style="padding: 10px 12px; border-radius: 10px; border: 1px solid var(--stroke); background: white;" />
-    </label>
-    <label style="width: 220px; display: flex; flex-direction: column; gap: 6px;">
-      <span class="muted small">Pipeline Stage</span>
-      <select bind:value={stageFilter} style="padding: 10px 12px; border-radius: 10px; border: 1px solid var(--stroke); background: white;">
-        <option value="all">All stages ({corpusTotal || corpusItems.length})</option>
-        <option value="raw">Raw / Seeds ({rawTotal || 0})</option>
-        <option value="metadata">With Metadata ({metadataTotal || 0})</option>
-        <option value="failed_enrichment">Failed enrichments ({failedEnrichmentTotal || 0})</option>
-        <option value="downloaded">Downloaded ({downloadedTotal || 0})</option>
-      </select>
-    </label>
   </div>
 
   <div class="corpus-table-unified">
     <div
       class="table table-scroll corpus-table"
-      style="max-height: 500px; overflow-y: auto;"
       on:scroll={handleCorpusColumnScroll}
     >
-      <div class="table-row header" style="grid-template-columns: 2fr 80px 100px;">
+      <div class="table-row header cols-corpus-workspace">
         <span>Title</span>
         <span>Year</span>
         <span>Stage</span>
       </div>
       {#each filteredItems as item}
+        {@const bucket = getBucketForItem(item)}
+        {@const selected = isCorpusItemSelected(item, bucket)}
         <button
-          class={`table-row clickable corpus-select-row ${isCorpusItemSelected(item, getBucketForItem(item)) ? 'selected' : ''}`}
-          class:promotion-target-flash={isPromotionHighlighted(getBucketForItem(item), item.id)}
+          class={`table-row cols-corpus-workspace clickable corpus-select-row ${selected ? 'selected' : ''}`}
+          class:promotion-target-flash={isPromotionHighlighted(bucket, item.id)}
           type="button"
-          style="grid-template-columns: 2fr 80px 100px; text-align: left;"
-          use:bindCorpusRow={{ stage: getBucketForItem(item), key: corpusMotionKey(getBucketForItem(item), item.id) }}
-          on:click={() => toggleCorpusItemSelection(item, getBucketForItem(item))}
+          use:bindCorpusRow={{ stage: bucket, key: corpusMotionKey(bucket, item.id) }}
+          on:click={() => toggleCorpusItemSelection(item, bucket)}
         >
           <span class="line-clamp-2" title={item.title}>{item.title || 'Untitled'}</span>
           <span class="nowrap">{item.year || '-'}</span>
-          <span class="nowrap muted small" style="text-transform: capitalize;">{getBucketForItem(item)}</span>
+          <span class="nowrap muted small corpus-stage-pill">{itemStageLabel(item, bucket)}</span>
         </button>
+        {#if selected}
+          <div class="table-row corpus-inline-detail-row">
+            <div class="inline-detail-card">
+              <div class="inline-detail-main">
+                <strong class="inline-detail-title">{item.title || 'Untitled'}</strong>
+                <div class="inline-detail-meta-row">
+                  {#if canDownloadSelectedItem({ item, bucket })}
+                    <button
+                      class="inline-detail-chip inline-detail-chip--download"
+                      type="button"
+                      on:click={() => handleDownloadedCorpusFile(item)}
+                      title="Download the stored file"
+                    >
+                      Stage: {itemStageLabel(item, bucket)}
+                    </button>
+                  {:else}
+                    <span class="inline-detail-chip">Stage: {itemStageLabel(item, bucket)}</span>
+                  {/if}
+                  <span class="inline-detail-chip">Year: {item.year || '-'}</span>
+                  <span class="inline-detail-chip">Author: {formatAuthors(item) || '-'}</span>
+                  {#if item.doi}
+                    <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI</a>
+                  {/if}
+                  {#if item.openalex_id}
+                    <a class="inline-detail-link" href={openAlexHref(item.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          </div>
+        {/if}
       {/each}
       {#if filteredItems.length === 0}
-        <div class="table-row muted" style="justify-content: center; padding: 20px;">
+        <div class="table-row muted corpus-empty-state">
           No items match your filters.
         </div>
       {/if}
     </div>
   </div>
 
-  <div class="corpus-lazy-status" style="margin-top: 16px;">
+  <div class="corpus-lazy-status">
     <span class="muted">{corpusLoadStatus}</span>
     {#if corpusHasMore}
       <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore || corpusLoading}>

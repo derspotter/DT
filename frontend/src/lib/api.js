@@ -201,6 +201,100 @@ export async function fetchIngestRuns(limit = 20) {
   return response.json()
 }
 
+export async function fetchSeedSources(limit = 100) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/seed/sources?limit=${encodeURIComponent(String(limit))}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load seed sources')
+  }
+  return response.json()
+}
+
+export async function fetchSeedCandidates(sourceType, sourceKey) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates`
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load seed candidates')
+  }
+  return response.json()
+}
+
+export async function promoteSeedCandidates(sourceType, sourceKey, {
+  candidateKeys = [],
+  includeDownstream = false,
+  includeUpstream = false,
+  relatedDepthDownstream = 0,
+  relatedDepthUpstream = 0,
+  maxRelated = 30,
+  enqueueDownload = true,
+  downloadBatchSize = 25,
+  workers = 6,
+} = {}) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/promote`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        candidateKeys,
+        includeDownstream,
+        includeUpstream,
+        relatedDepthDownstream,
+        relatedDepthUpstream,
+        maxRelated,
+        enqueueDownload,
+        downloadBatchSize,
+        workers,
+      }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to promote seed candidates')
+  }
+  return response.json()
+}
+
+export async function dismissSeedCandidates(sourceType, sourceKey, candidateKeys) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/candidates/dismiss`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceType, sourceKey, candidateKeys }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to dismiss seed candidates')
+  }
+  return response.json()
+}
+
+export async function removeSeedSource(sourceType, sourceKey) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}`,
+    {
+      method: 'DELETE',
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to remove seed source')
+  }
+  return response.json()
+}
+
 export async function enqueueIngestEntries(entryIds) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/ingest/enqueue`,
@@ -221,10 +315,10 @@ export async function enqueueIngestEntries(entryIds) {
 
 export async function processMarkedIngestEntries({
   limit = 10,
-  includeDownstream = true,
+  includeDownstream = false,
   includeUpstream = false,
-  relatedDepthDownstream = 1,
-  relatedDepthUpstream = 1,
+  relatedDepthDownstream = 0,
+  relatedDepthUpstream = 0,
   maxRelated = 30,
   enqueueDownload = false,
   downloadBatchSize = 25,
@@ -259,12 +353,13 @@ export async function runKeywordSearch({
   query,
   seedJson,
   field,
+  author,
   yearFrom,
   yearTo,
-  includeDownstream = true,
+  includeDownstream = false,
   includeUpstream = false,
-  relatedDepthDownstream = 1,
-  relatedDepthUpstream = 1,
+  relatedDepthDownstream = 0,
+  relatedDepthUpstream = 0,
   maxRelated = 30,
   enqueue = false,
   fallbackToSample = true,
@@ -277,6 +372,7 @@ export async function runKeywordSearch({
         query,
         seedJson,
         field,
+        author,
         yearFrom,
         yearTo,
         includeDownstream,
@@ -605,6 +701,35 @@ export async function downloadCorpusExport(format, { status = '', yearFrom = '',
 
   return { blob, filename }
 }
+
+export async function downloadCorpusItemFile(itemId) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/corpus/downloaded/${encodeURIComponent(String(itemId || ''))}/file`,
+    { method: 'GET' },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to download file')
+  }
+
+  const blob = await response.blob()
+  const disposition = response.headers.get('content-disposition') || ''
+  let filename = ''
+  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
+  if (star && star[1]) {
+    filename = decodeURIComponent(star[1])
+  } else if (plain && plain[1]) {
+    filename = plain[1]
+  }
+  if (!filename) {
+    filename = `corpus-item-${String(itemId || 'file')}.pdf`
+  }
+  return { blob, filename }
+}
+
 export async function fetchGraph({
   maxNodes = 200,
   relationship = 'both',
