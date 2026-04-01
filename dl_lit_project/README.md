@@ -77,9 +77,12 @@ Required:
 Recommended:
 
 - `OPENALEX_API_KEY`
+- `SEMANTIC_SCHOLAR_API_KEY`
 - `RAG_FEEDER_MAILTO`
 - `RAG_FEEDER_OPENALEX_RPS` (default `30`)
 - `RAG_FEEDER_CROSSREF_RPS` (default `20`)
+- `RAG_FEEDER_SEMANTIC_SCHOLAR_RPS` (default `1`)
+- `RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC` (default `1.1`)
 - `RAG_FEEDER_ENRICH_WORKERS` (default `6`)
 - `RAG_FEEDER_VPN_PROXY_URL` (optional SOCKS/HTTP proxy for download fallback)
 - `RAG_FEEDER_VPN_MODE` (`fallback` | `prefer` | `force`, default `fallback`)

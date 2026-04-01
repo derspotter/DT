@@ -14,8 +14,11 @@ services:
       - RAG_FEEDER_JWT_SECRET=${RAG_FEEDER_JWT_SECRET}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
       - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_RPS=${RAG_FEEDER_SEMANTIC_SCHOLAR_RPS:-1}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC=${RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC:-1.1}
       - RAG_FEEDER_ENRICH_WORKERS=${RAG_FEEDER_ENRICH_WORKERS:-6}
       - RAG_FEEDER_DOWNLOAD_BATCH_MAX=${RAG_FEEDER_DOWNLOAD_BATCH_MAX:-2000}
       - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
@@ -36,26 +39,61 @@ services:
     networks:
       - rag-network
 
-  rag_worker:
+  rag_enrich_worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --db-path /usr/src/app/dl_lit_project/data/literature.db
-    container_name: rag_feeder_worker
+    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role enrich --db-path /usr/src/app/dl_lit_project/data/literature.db
+    container_name: rag_feeder_enrich_worker
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
       - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_RPS=${RAG_FEEDER_SEMANTIC_SCHOLAR_RPS:-1}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC=${RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC:-1.1}
       - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
       - RAG_FEEDER_LIBGEN_RPS=${RAG_FEEDER_LIBGEN_RPS:-2}
       - RAG_FEEDER_GEMINI_PER_MIN=${RAG_FEEDER_GEMINI_PER_MIN:-2000}
       - RAG_FEEDER_GEMINI_TOKENS_PER_MIN=${RAG_FEEDER_GEMINI_TOKENS_PER_MIN:-3000000}
       - RAG_FEEDER_GEMINI_DAILY=${RAG_FEEDER_GEMINI_DAILY:-100000}
+      - RAG_FEEDER_ENRICH_BATCH_SIZE=${RAG_FEEDER_ENRICH_BATCH_SIZE:-10}
+      - RAG_FEEDER_ENRICH_WORKERS=${RAG_FEEDER_ENRICH_WORKERS:-6}
+      - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
+    volumes:
+      - ./backend/src:/usr/src/app/src
+      - ./backend/scripts:/usr/src/app/scripts
+      - ./dl_lit:/usr/src/app/dl_lit
+      - ./dl_lit_project:/usr/src/app/dl_lit_project
+      - rag_feeder_logs:/usr/src/app/logs
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  rag_download_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role download --db-path /usr/src/app/dl_lit_project/data/literature.db
+    container_name: rag_feeder_download_worker
+    environment:
+      - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
+      - RAG_FEEDER_PYTHON=/opt/venv/bin/python
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
+      - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_RPS=${RAG_FEEDER_SEMANTIC_SCHOLAR_RPS:-1}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC=${RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC:-1.1}
+      - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
+      - RAG_FEEDER_LIBGEN_RPS=${RAG_FEEDER_LIBGEN_RPS:-2}
       - RAG_FEEDER_DOWNLOAD_WORKERS=${RAG_FEEDER_DOWNLOAD_WORKERS:-32}
+      - RAG_FEEDER_DOWNLOAD_BATCH_SIZE=${RAG_FEEDER_DOWNLOAD_BATCH_SIZE:-50}
+      - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
     volumes:
       - ./backend/src:/usr/src/app/src
       - ./backend/scripts:/usr/src/app/scripts
