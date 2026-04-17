@@ -1,6 +1,5 @@
 import {
   sampleSearchResults,
-  sampleCorpus,
   sampleDownloads,
   sampleGraph,
 } from './sample-data'
@@ -76,6 +75,67 @@ export async function fetchMe() {
   return response.json()
 }
 
+export async function requestPasswordReset(email) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/auth/forgot-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to send password reset email')
+  }
+  return response.json()
+}
+
+export async function acceptInvite({ token, password }) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/auth/accept-invite`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, password }),
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to accept invite')
+  }
+  const payload = await response.json()
+  if (payload.token) {
+    setAuthToken(payload.token)
+  }
+  return payload
+}
+
+export async function resetPassword({ token, password }) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/auth/reset-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, password }),
+  })
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to reset password')
+  }
+  const payload = await response.json()
+  if (payload.token) {
+    setAuthToken(payload.token)
+  }
+  return payload
+}
+
+export async function createUserInvitation({ username, email }) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/auth/invitations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, email }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to create invitation')
+  }
+  return response.json()
+}
+
 export async function fetchCorpora() {
   const response = await fetchWithTimeout(`${API_BASE}/api/corpora`)
   if (!response.ok) {
@@ -134,6 +194,40 @@ export async function shareCorpus(corpusId, { username, role }) {
   return response.json()
 }
 
+export async function fetchKantroposCorpora() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/kantropos/corpora`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load Kantropos corpora')
+  }
+  return response.json()
+}
+
+export async function fetchCorpusKantroposAssignment(corpusId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/kantropos-assignment`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load Kantropos assignment')
+  }
+  return response.json()
+}
+
+export async function saveCorpusKantroposAssignment(corpusId, targetId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/kantropos-assignment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ targetId }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to save Kantropos assignment')
+  }
+  return response.json()
+}
+
 export async function uploadPdf(file) {
   const formData = new FormData()
   formData.append('file', file)
@@ -181,8 +275,8 @@ export async function fetchBibliographyEntries(baseName) {
   return response.json()
 }
 
-export async function fetchIngestStats() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/stats`)
+export async function fetchIngestStats({ global = false } = {}) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/stats${global ? '?global=1' : ''}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
@@ -418,27 +512,20 @@ export async function fetchRecursionConfig() {
 }
 
 export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
-  try {
-    const params = new URLSearchParams()
-    params.set('limit', String(limit))
-    params.set('offset', String(offset))
-    const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
-    await throwIfUnauthorized(response)
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-    const payload = await response.json()
-    const data = Array.isArray(payload) ? payload : payload.items || []
-    const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
-    const stageTotals = payload?.stage_totals || null
-    const statusCounts = payload?.status_counts || null
-    return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
-  } catch (error) {
-    if (error?.status === 401) {
-      throw error
-    }
-    return { data: sampleCorpus, total: sampleCorpus.length, source: 'sample', stageTotals: null, statusCounts: null, error }
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  params.set('offset', String(offset))
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`)
   }
+  const payload = await response.json()
+  const data = Array.isArray(payload) ? payload : payload.items || []
+  const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
+  const stageTotals = payload?.stage_totals || null
+  const statusCounts = payload?.status_counts || null
+  return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
 }
 
 export async function fetchDownloadQueue() {
@@ -533,8 +620,8 @@ export async function fetchPipelineWorkerStatus() {
   return response.json()
 }
 
-export async function fetchPipelineDaemonStatus() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/daemon/status`)
+export async function fetchPipelineDaemonStatus({ global = false } = {}) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/daemon/status${global ? '?global=1' : ''}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()

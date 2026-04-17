@@ -3,10 +3,17 @@
   import {
     login,
     fetchMe,
+    requestPasswordReset,
+    acceptInvite,
+    resetPassword,
+    createUserInvitation,
     selectCorpus,
     createCorpus,
     deleteCorpus as deleteCorpusApi,
     shareCorpus,
+    fetchKantroposCorpora,
+    fetchCorpusKantroposAssignment,
+    saveCorpusKantroposAssignment,
     setAuthToken,
     uploadPdf,
     extractBibliography,
@@ -39,7 +46,6 @@
     downloadCorpusExport,
     downloadCorpusItemFile,
   } from './lib/api'
-  import { sampleActivity } from './lib/sample-data'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
   import Graph from './components/Graph.svelte'
@@ -74,21 +80,57 @@
   $: diagnosticsEnabled = isAdmin
   $: tabGroups = isAdmin ? [...userTabGroups, ...adminTabGroups] : userTabGroups
   $: showSideNav = tabGroups.some((group) => (group.tabs || []).some((tab) => tab.id !== 'workspace'))
+  $: visibleCorpusNameCounts = corpora.reduce((map, corpus) => {
+    const key = String(corpus?.name || '').trim()
+    map.set(key, (map.get(key) || 0) + 1)
+    return map
+  }, new Map())
+  $: visibleCorpusOwnerCounts = corpora.reduce((map, corpus) => {
+    const key = `${String(corpus?.name || '').trim()}|${String(corpus?.owner_username || '')}`
+    map.set(key, (map.get(key) || 0) + 1)
+    return map
+  }, new Map())
+
+  function corpusOptionLabel(corpus) {
+    if (!corpus) return ''
+    const base = String(corpus.name || '').trim() || `Corpus ${corpus.id}`
+    const owner = String(corpus.owner_username || '').trim()
+    const role = String(corpus.role || '').trim()
+    const duplicateName = (visibleCorpusNameCounts.get(base) || 0) > 1
+    const duplicateOwnerName = (visibleCorpusOwnerCounts.get(`${base}|${owner}`) || 0) > 1
+    const parts = []
+    if (duplicateName && owner) parts.push(owner)
+    if (role && role !== 'owner') parts.push(role)
+    if ((duplicateName && !owner) || duplicateOwnerName) parts.push(`#${corpus.id}`)
+    return parts.length > 0 ? `${base} · ${parts.join(' · ')}` : base
+  }
   let corpora = []
   let currentCorpusId = null
   let loginUsername = ''
   let loginPassword = ''
+  let authFlow = 'login'
+  let authFlowToken = ''
+  let authEmail = ''
+  let authPassword = ''
+  let authPasswordConfirm = ''
+  let authInfo = ''
 
   let uploads = []
   let ingestStats = {
-    no_metadata: 0,
-    with_metadata: 0,
-    to_download_references: 0,
-    downloaded_references: 0,
+    raw_pending: 0,
+    matched: 0,
+    queued_download: 0,
+    downloaded: 0,
   }
-  $: pipelineRawCount = Number(ingestStats.no_metadata || 0)
-  $: pipelineMetadataCount = Number(ingestStats.with_metadata || 0)
-  $: pipelineDownloadedCount = Number(ingestStats.downloaded_references || 0)
+  let globalIngestStats = {
+    raw_pending: 0,
+    matched: 0,
+    queued_download: 0,
+    downloaded: 0,
+  }
+  $: pipelineRawCount = Number(ingestStats.raw_pending || 0)
+  $: pipelineMetadataCount = Number(ingestStats.matched || 0)
+  $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
@@ -173,7 +215,6 @@
   let seedSelections = {}
   let seedSelectionVersions = {}
   let selectedSeedCandidateKeys = {}
-  let selectedSeedCandidateVersions = {}
   let seedActionStatus = ''
   let seedActionBusy = false
   let seedLastRunKey = ''
@@ -218,33 +259,26 @@
   }, 0)
 
   const CORPUS_PAGE_SIZE = 120
-  const RAW_STATUSES = new Set(['no_metadata', 'extract_references_from_pdf', 'pending'])
-  const FAILED_STATUSES = new Set(['failed_enrichments', 'failed_downloads'])
+  const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending'])
+  const FAILED_STATUSES = new Set(['failed_enrichment', 'failed_download'])
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
   let corpusLoading = false
   let corpusLoadingMore = false
+  let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
   let corpusSource = ''
-  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichments: 0, failed_downloads: 0 }
+  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
   $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
-  $: metaItems = corpusItems.filter(i => i.status === 'with_metadata' || i.status === 'to_download_references')
-  $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded_references')
+  $: metaItems = corpusItems.filter(i => i.status === 'enriching' || i.status === 'matched' || i.status === 'queued_download')
+  $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded')
   $: failedItems = corpusItems.filter(i => FAILED_STATUSES.has(i.status))
   $: rawTotal = Number(corpusStageTotals?.raw || 0)
   $: metadataTotal = Number(corpusStageTotals?.metadata || 0)
   $: downloadedTotal = Number(corpusStageTotals?.downloaded || 0)
-  $: failedEnrichmentTotal = Number(corpusStageTotals?.failed_enrichments || 0)
-  $: failedDownloadTotal = Number(corpusStageTotals?.failed_downloads || 0)
-  let selectedCorpusItemKey = ''
-  $: corpusSelectionRows = [
-    ...rawItems.map((item) => ({ bucket: 'raw', item })),
-    ...metaItems.map((item) => ({ bucket: 'metadata', item })),
-    ...downloadedItems.map((item) => ({ bucket: 'downloaded', item })),
-    ...failedItems.map((item) => ({ bucket: 'failed', item })),
-  ]
-  $: selectedCorpusRow = corpusSelectionRows.find((row) => corpusItemKey(row.item, row.bucket) === selectedCorpusItemKey) || null
+  $: failedEnrichmentTotal = Number(corpusStageTotals?.failed_enrichment || 0)
+  $: failedDownloadTotal = Number(corpusStageTotals?.failed_download || 0)
   let corpusRowElements = {
     raw: new Map(),
     metadata: new Map(),
@@ -263,6 +297,7 @@
   let downloadsSource = ''
   let downloadsQuery = ''
   let downloadsStatusFilter = 'all'
+  $: recentDownloads = downloads.filter((item) => item.status === 'downloaded').slice(0, 10)
   $: filteredDownloads = downloads.filter((item) => {
     const statusOk = downloadsStatusFilter === 'all' || item.status === downloadsStatusFilter
     if (!statusOk) return false
@@ -300,7 +335,7 @@
   let workerBacklog = {
     raw_pending: 0,
     enriching: 0,
-    with_metadata: 0,
+    matched: 0,
     queued_download: 0,
     downloading: 0,
     downloaded: 0,
@@ -364,9 +399,22 @@
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
   $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
+  $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && (isAdmin || currentCorpus?.role === 'owner' || currentCorpus?.role === 'editor'))
   let shareUsername = ''
   let shareRole = 'viewer'
   let shareStatus = ''
+  let inviteUsername = ''
+  let inviteEmail = ''
+  let inviteStatus = ''
+  let inviteError = false
+  let kantroposTargets = []
+  let kantroposAssignment = null
+  let selectedKantroposTargetId = ''
+  let kantroposAssignmentStatus = ''
+  let kantroposAssignmentError = false
+  let kantroposAssignmentLoading = false
+  let kantroposAssignmentSaving = false
+  let kantroposAssignmentRequestSeq = 0
 
   const maxLogs = 200
   const maxLogHistory = 5000
@@ -378,12 +426,50 @@
     logsTailStatus = ''
   }
 
+  function resetKantroposAssignmentState() {
+    kantroposAssignment = null
+    selectedKantroposTargetId = ''
+    kantroposAssignmentStatus = ''
+    kantroposAssignmentError = false
+    kantroposAssignmentLoading = false
+    kantroposAssignmentSaving = false
+  }
+
   function formatBytes(bytes) {
     if (bytes === 0) return '0 B'
     const k = 1024
     const sizes = ['B', 'KB', 'MB', 'GB']
     const i = Math.floor(Math.log(bytes) / Math.log(k))
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
+  }
+
+  function parseAuthFlowFromHash() {
+    if (typeof window === 'undefined') return { flow: 'login', token: '' }
+    const raw = String(window.location.hash || '').replace(/^#\/?/, '')
+    const [pathPart = '', queryPart = ''] = raw.split('?')
+    const path = pathPart.trim()
+    const params = new URLSearchParams(queryPart)
+    if (path === 'forgot-password') {
+      return { flow: 'forgot-password', token: '' }
+    }
+    if (path === 'accept-invite') {
+      return { flow: 'accept-invite', token: params.get('token') || '' }
+    }
+    if (path === 'reset-password') {
+      return { flow: 'reset-password', token: params.get('token') || '' }
+    }
+    return { flow: 'login', token: '' }
+  }
+
+  function applyAuthFlowFromHash() {
+    const next = parseAuthFlowFromHash()
+    authFlow = next.flow
+    authFlowToken = next.token
+    authInfo = ''
+    authError = ''
+    authEmail = ''
+    authPassword = ''
+    authPasswordConfirm = ''
   }
 
   function updateUpload(id, patch) {
@@ -403,6 +489,14 @@
     }
     if (Array.isArray(entry.author)) return entry.author.join(', ')
     return entry.authors || entry.author || ''
+  }
+
+  function normalizeCorpusItem(entry) {
+    if (!entry || typeof entry !== 'object') return entry
+    return {
+      ...entry,
+      authors_display: formatAuthors(entry),
+    }
   }
 
   function formatTitle(entry) {
@@ -449,12 +543,13 @@
   function formatPipelineStatus(statusRaw) {
     const status = String(statusRaw || '').trim()
     const map = {
-      no_metadata: { label: 'Raw', tone: 'queued' },
-      with_metadata: { label: 'With metadata', tone: 'completed' },
-      to_download_references: { label: 'With metadata', tone: 'in_progress' },
-      downloaded_references: { label: 'Downloaded', tone: 'completed' },
-      failed_enrichments: { label: 'Enrich failed', tone: 'in_progress' },
-      failed_downloads: { label: 'Download failed', tone: 'in_progress' },
+      raw: { label: 'Raw', tone: 'queued' },
+      enriching: { label: 'Enriching', tone: 'in_progress' },
+      matched: { label: 'Matched', tone: 'completed' },
+      queued_download: { label: 'Queued download', tone: 'in_progress' },
+      downloaded: { label: 'Downloaded', tone: 'completed' },
+      failed_enrichment: { label: 'Enrich failed', tone: 'in_progress' },
+      failed_download: { label: 'Download failed', tone: 'in_progress' },
     }
     if (map[status]) return { ...map[status], raw: status }
     if (!status) return { label: 'Unknown', tone: 'in_progress', raw: '' }
@@ -473,14 +568,6 @@
   function pipelineStatusTitle(statusRaw) {
     const st = formatPipelineStatus(statusRaw)
     return st.raw || st.label
-  }
-
-  function corpusItemKey(item, bucket) {
-    if (!item) return ''
-    const id = String(item.id ?? '')
-    const status = String(item.status || '')
-    const title = String(item.title || '').trim().toLowerCase()
-    return `${bucket || 'unknown'}|${status}|${id}|${title}`
   }
 
   function corpusMotionKey(stage, id) {
@@ -667,20 +754,9 @@
     }
   }
 
-  function isCorpusItemSelected(item, bucket) {
-    const key = corpusItemKey(item, bucket)
-    return key !== '' && key === selectedCorpusItemKey
-  }
-
-  function toggleCorpusItemSelection(item, bucket) {
-    const key = corpusItemKey(item, bucket)
-    if (!key) return
-    selectedCorpusItemKey = selectedCorpusItemKey === key ? '' : key
-  }
-
   function bucketLabel(bucket) {
     if (bucket === 'raw') return 'Raw'
-    if (bucket === 'metadata') return 'With metadata'
+    if (bucket === 'metadata') return 'Metadata'
     if (bucket === 'downloaded') return 'Downloaded'
     if (bucket === 'failed') return 'Failed'
     return 'Unknown'
@@ -840,6 +916,8 @@
         ingestLastProgressSignature = signature
         const refreshTasks = [
           loadIngestStats({ quiet: true }),
+        ...(diagnosticsEnabled ? [loadIngestStats({ quiet: true, global: true }), loadPipelineDaemonStatus({ quiet: true, global: true })] : []),
+          ...(diagnosticsEnabled ? [loadIngestStats({ quiet: true, global: true }), loadPipelineDaemonStatus({ quiet: true, global: true })] : []),
           loadCorpus({ preserveSelection: true, quiet: true }),
         ]
         if (diagnosticsEnabled) {
@@ -1246,8 +1324,11 @@
         const tasks = [
           loadIngestStats({ quiet: true }),
           loadIngestRuns(),
-          loadCorpus({ preserveSelection: true, quiet: true }),
         ]
+        // The corpus tab is selection-heavy; avoid replacing the list on every worker tick.
+        if (activeTab !== 'corpus') {
+          tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
+        }
         if (diagnosticsEnabled) {
           tasks.push(
             loadPipelineWorkerStatus({ quiet: true }),
@@ -1343,7 +1424,7 @@
     }
   }
 
-  async function bootstrapAuth() {
+  async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
     authStatus = 'loading'
     authError = ''
     try {
@@ -1352,9 +1433,16 @@
       corpora = payload.corpora || []
       currentCorpusId = authUser?.last_corpus_id || (corpora[0]?.id ?? null)
       authStatus = 'authenticated'
+      if (!preserveAuthFlow) {
+        authFlow = 'login'
+        authFlowToken = ''
+      }
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
+      if (!preserveAuthFlow) {
+        setActiveTab('workspace', { replace: true })
+      }
     } catch (error) {
       authStatus = 'unauthenticated'
       authError = ''
@@ -1380,14 +1468,124 @@
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
       authStatus = 'authenticated'
+      authFlow = 'login'
+      authFlowToken = ''
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
+      setActiveTab('workspace', { replace: true })
     } catch (error) {
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
       setAuthToken('')
+    }
+  }
+
+  async function handleForgotPassword(event) {
+    event?.preventDefault?.()
+    authError = ''
+    authInfo = ''
+    try {
+      await requestPasswordReset(authEmail.trim())
+      authInfo = 'If that email exists, a reset link has been sent.'
+      authEmail = ''
+    } catch (error) {
+      authError = error.message || 'Failed to send password reset email'
+    }
+  }
+
+  async function handleAcceptInvite(event) {
+    event?.preventDefault?.()
+    authError = ''
+    authInfo = ''
+    if (!authFlowToken) {
+      authError = 'Invite token is missing.'
+      return
+    }
+    if (authPassword.length < 8) {
+      authError = 'Password must be at least 8 characters.'
+      return
+    }
+    if (authPassword !== authPasswordConfirm) {
+      authError = 'Passwords do not match.'
+      return
+    }
+    try {
+      const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
+      if (payload?.user) {
+        authUser = payload.user
+        currentCorpusId = payload.user.last_corpus_id || null
+      }
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
+      authStatus = 'authenticated'
+      authFlow = 'login'
+      authFlowToken = ''
+      await loadRecursionConfig()
+      await refreshAll()
+      connectLogs()
+      setActiveTab('workspace', { replace: true })
+    } catch (error) {
+      authError = error.message || 'Failed to accept invite'
+    }
+  }
+
+  async function handleResetPassword(event) {
+    event?.preventDefault?.()
+    authError = ''
+    authInfo = ''
+    if (!authFlowToken) {
+      authError = 'Reset token is missing.'
+      return
+    }
+    if (authPassword.length < 8) {
+      authError = 'Password must be at least 8 characters.'
+      return
+    }
+    if (authPassword !== authPasswordConfirm) {
+      authError = 'Passwords do not match.'
+      return
+    }
+    try {
+      const payload = await resetPassword({ token: authFlowToken, password: authPassword })
+      if (payload?.user) {
+        authUser = payload.user
+        currentCorpusId = payload.user.last_corpus_id || null
+      }
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
+      authStatus = 'authenticated'
+      authFlow = 'login'
+      authFlowToken = ''
+      await loadRecursionConfig()
+      await refreshAll()
+      connectLogs()
+      setActiveTab('workspace', { replace: true })
+    } catch (error) {
+      authError = error.message || 'Failed to reset password'
+    }
+  }
+
+  async function handleCreateInvitation(event) {
+    event?.preventDefault?.()
+    inviteStatus = ''
+    inviteError = false
+    try {
+      const payload = await createUserInvitation({
+        username: inviteUsername.trim(),
+        email: inviteEmail.trim(),
+      })
+      inviteStatus = `Invitation sent to ${payload.email}.`
+      inviteUsername = ''
+      inviteEmail = ''
+    } catch (error) {
+      inviteStatus = error.message || 'Failed to create invitation'
+      inviteError = true
     }
   }
 
@@ -1409,6 +1607,7 @@
       loadIngestStats(),
       loadIngestRuns(),
       loadCorpus(),
+      loadKantroposAssignment(),
     ]
     if (diagnosticsEnabled) {
       tasks.push(
@@ -1423,7 +1622,7 @@
 
   function resetFrontendState() {
     resetIngestProgressTracking()
-    ingestStats = { no_metadata: 0, with_metadata: 0, to_download_references: 0, downloaded_references: 0 }
+    ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
     ingestStatsStatus = ''
     latestEntries = []
     latestEntriesStatus = ''
@@ -1457,7 +1656,6 @@
     corpusLoadStatus = ''
     corpusSource = ''
     corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
-    selectedCorpusItemKey = ''
     downloads = []
     downloadsSource = ''
     downloadsQuery = ''
@@ -1481,6 +1679,7 @@
     promotionHighlights = new Set()
     corpusActionStatus = ''
     corpusActionError = false
+    resetKantroposAssignmentState()
     finishExtractionProgress()
   }
 
@@ -1598,6 +1797,82 @@
     } catch (error) {
       shareStatus = error.message || 'Failed to share corpus.'
     }
+  }
+
+  async function loadKantroposTargets() {
+    try {
+      const payload = await fetchKantroposCorpora()
+      kantroposTargets = payload?.corpora || []
+    } catch (error) {
+      kantroposTargets = []
+      kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
+      kantroposAssignmentError = true
+    }
+  }
+
+  async function loadKantroposAssignment() {
+    const corpusId = Number(currentCorpusId)
+    const requestSeq = ++kantroposAssignmentRequestSeq
+    resetKantroposAssignmentState()
+    if (!Number.isFinite(corpusId) || corpusId <= 0) return
+    kantroposAssignmentLoading = true
+    try {
+      if (kantroposTargets.length === 0) {
+        await loadKantroposTargets()
+      }
+      const payload = await fetchCorpusKantroposAssignment(corpusId)
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      kantroposTargets = payload?.corpora || kantroposTargets
+      kantroposAssignment = payload?.assignment || null
+      selectedKantroposTargetId = payload?.assignment?.target_id || ''
+      if (!payload?.can_edit && currentCorpus?.role !== 'viewer') {
+        // no-op; backend truth is enough, UI editability still derives from current corpus role
+      }
+    } catch (error) {
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      kantroposAssignmentStatus = error.message || 'Failed to load Kantropos assignment.'
+      kantroposAssignmentError = true
+    } finally {
+      if (requestSeq === kantroposAssignmentRequestSeq && Number(currentCorpusId) === corpusId) {
+        kantroposAssignmentLoading = false
+      }
+    }
+  }
+
+  async function handleSaveKantroposAssignment() {
+    kantroposAssignmentStatus = ''
+    kantroposAssignmentError = false
+    const corpusId = Number(currentCorpusId)
+    if (!Number.isFinite(corpusId) || corpusId <= 0) {
+      kantroposAssignmentStatus = 'Select a corpus first.'
+      kantroposAssignmentError = true
+      return
+    }
+    if (!canConfigureCurrentCorpusKantropos) {
+      kantroposAssignmentStatus = 'Only corpus owners, editors, or the global admin can change the Kantropos assignment.'
+      kantroposAssignmentError = true
+      return
+    }
+    kantroposAssignmentSaving = true
+    try {
+      const payload = await saveCorpusKantroposAssignment(corpusId, selectedKantroposTargetId || null)
+      kantroposAssignment = payload?.assignment || null
+      selectedKantroposTargetId = payload?.assignment?.target_id || ''
+      kantroposAssignmentStatus = kantroposAssignment
+        ? `Assigned to Kantropos corpus "${kantroposAssignment.target_name}".`
+        : 'Cleared Kantropos assignment.'
+      kantroposAssignmentError = false
+    } catch (error) {
+      kantroposAssignmentStatus = error.message || 'Failed to save Kantropos assignment.'
+      kantroposAssignmentError = true
+    } finally {
+      kantroposAssignmentSaving = false
+    }
+  }
+
+  async function handleKantroposTargetChange(event) {
+    selectedKantroposTargetId = String(event?.target?.value || '')
+    await handleSaveKantroposAssignment()
   }
 
   async function loadLatestEntries(baseName, { waitForExtraction = false } = {}) {
@@ -1987,11 +2262,15 @@
     }
   }
 
-  async function loadIngestStats({ quiet = false } = {}) {
+  async function loadIngestStats({ quiet = false, global = false } = {}) {
     if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
     try {
-      const payload = await fetchIngestStats()
-      ingestStats = payload.stats || ingestStats
+      const payload = await fetchIngestStats({ global })
+      if (global) {
+        globalIngestStats = payload.stats || globalIngestStats
+      } else {
+        ingestStats = payload.stats || ingestStats
+      }
       if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
@@ -2066,9 +2345,6 @@
       selectedSeedCandidateKeys = Object.fromEntries(
         Object.entries(selectedSeedCandidateKeys).filter(([key]) => key !== sourceId)
       )
-      selectedSeedCandidateVersions = Object.fromEntries(
-        Object.entries(selectedSeedCandidateVersions).filter(([key]) => key !== sourceId)
-      )
       if (expandedSeedSourceId === sourceId) {
         expandedSeedSourceId = ''
       }
@@ -2081,10 +2357,6 @@
         selectedSeedCandidateKeys = {
           ...selectedSeedCandidateKeys,
           [sourceId]: '',
-        }
-        selectedSeedCandidateVersions = {
-          ...selectedSeedCandidateVersions,
-          [sourceId]: (selectedSeedCandidateVersions[sourceId] || 0) + 1,
         }
       }
     }
@@ -2160,12 +2432,6 @@
     ) || null
   }
 
-  function isActiveSeedCandidate(source, candidate) {
-    const sourceId = seedSourceId(source)
-    const activeKey = String(selectedSeedCandidateKeys[sourceId] || '')
-    return activeKey !== '' && activeKey === String(candidate?.candidate_key || '')
-  }
-
   function selectableSeedCount(source) {
     return getSeedCandidatesForSource(source).filter((candidate) => isSeedCandidateSelectable(candidate)).length
   }
@@ -2190,10 +2456,6 @@
     selectedSeedCandidateKeys = {
       ...selectedSeedCandidateKeys,
       [sourceId]: candidateKey,
-    }
-    selectedSeedCandidateVersions = {
-      ...selectedSeedCandidateVersions,
-      [sourceId]: (selectedSeedCandidateVersions[sourceId] || 0) + 1,
     }
   }
 
@@ -2326,8 +2588,12 @@
       expandedSeedSourceId = ''
       return
     }
+    const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
     expandedSeedSourceId = sourceId
-    await loadSeedCandidatesForSource(source)
+    void loadSeedCandidatesForSource(source, {
+      quiet: hasCachedCandidates,
+      background: hasCachedCandidates,
+    })
   }
 
   async function focusSeedSource(sourceType, sourceKey) {
@@ -2337,9 +2603,13 @@
     }
     const source = seedSources.find((entry) => seedSourceId(entry) === nextSourceId)
     if (!source) return
+    const hasCachedCandidates = Array.isArray(seedCandidatesBySource[nextSourceId])
     expandedSeedSourceId = nextSourceId
     seedLastRunKey = nextSourceId
-    await loadSeedCandidatesForSource(source, { quiet: true })
+    void loadSeedCandidatesForSource(source, {
+      quiet: true,
+      background: hasCachedCandidates,
+    })
   }
 
   async function handlePromoteSeedSource(source) {
@@ -2706,7 +2976,7 @@
             ? ` ${failures.length} item(s) failed${failures[0] ? ` (first: ${failures[0]})` : ''}.`
             : ''
         const pipelineSuffix = startPipeline && queuedSeeds > 0 ? ' Downloader started.' : ''
-        searchQueueStatus = `Queued ${queuedSeeds} seed item(s); ${queuedWorks} work(s) sent to with_metadata queue.${failSuffix}${pipelineSuffix}`
+        searchQueueStatus = `Queued ${queuedSeeds} seed item(s); ${queuedWorks} work(s) sent to the download queue.${failSuffix}${pipelineSuffix}`
       }
     } finally {
       searchQueueBusy = false
@@ -2732,6 +3002,8 @@
     if (!append && corpusLoading) return
     if (!append && quiet && corpusLoadingMore) return
 
+    const requestSeq = ++corpusLoadRequestSeq
+    const requestCorpusId = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
     const scrollSnapshot = !append && preserveSelection ? snapshotCorpusScroll() : null
     if (append) {
       if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
@@ -2740,14 +3012,7 @@
     } else {
       corpusLoading = true
       if (!quiet) {
-        corpusLoadStatus = 'Loading corpus entries...'
-        corpusItems = []
-        corpusTotal = 0
-        corpusHasMore = false
-        corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichments: 0, failed_downloads: 0 }
-      }
-      if (!preserveSelection) {
-        selectedCorpusItemKey = ''
+        corpusLoadStatus = corpusItems.length > 0 ? 'Refreshing corpus entries...' : 'Loading corpus entries...'
       }
     }
     try {
@@ -2759,7 +3024,11 @@
             ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
             : CORPUS_PAGE_SIZE
       const { data, total, source, stageTotals } = await fetchCorpus({ limit: requestedLimit, offset })
-      const incoming = Array.isArray(data) ? data : []
+      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      const currentCorpusNumeric = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+      if (requestSeq !== corpusLoadRequestSeq || requestCorpusId !== currentCorpusNumeric) {
+        return
+      }
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
       corpusHasMore = corpusItems.length < corpusTotal
@@ -2769,8 +3038,8 @@
           raw: Number(stageTotals.raw || 0),
           metadata: Number(stageTotals.metadata || 0),
           downloaded: Number(stageTotals.downloaded || 0),
-          failed_enrichments: Number(stageTotals.failed_enrichments || 0),
-          failed_downloads: Number(stageTotals.failed_downloads || 0),
+          failed_enrichment: Number(stageTotals.failed_enrichment || 0),
+          failed_download: Number(stageTotals.failed_download || 0),
         }
       }
       if (corpusSource === 'sample') {
@@ -2796,8 +3065,10 @@
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
       }
     } finally {
-      corpusLoading = false
-      corpusLoadingMore = false
+      if (requestSeq === corpusLoadRequestSeq) {
+        corpusLoading = false
+        corpusLoadingMore = false
+      }
     }
   }
 
@@ -2830,10 +3101,14 @@
     }
   }
 
-  async function loadPipelineWorkerStatus({ quiet = false } = {}) {
+  async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
     try {
-      const payload = await fetchPipelineDaemonStatus()
+      const payload = await fetchPipelineDaemonStatus({ global })
+      if (global) {
+        globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
+        return
+      }
       daemonStatus = payload?.daemon || daemonStatus
       workerBacklog = payload?.backlog || workerBacklog
       const enrich = daemonStatus?.workers?.enrich || {}
@@ -2927,7 +3202,7 @@
     pipelineWorkerStatus = 'Pausing all pipeline workers...'
     try {
       await pauseAllPipelineWorkers({ force: true })
-      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads()])
+      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads(), ...(diagnosticsEnabled ? [loadIngestStats({ global: true }), loadPipelineDaemonStatus({ global: true })] : [])])
       pipelineWorkerStatus = 'Global pause complete.'
     } catch (error) {
       if (error?.status === 401) {
@@ -3959,8 +4234,12 @@
   }
 
   onMount(() => {
-    const initialTab = readTabFromHash() || activeTab
-    setActiveTab(initialTab, { replace: true })
+    const initialAuthFlow = parseAuthFlowFromHash()
+    applyAuthFlowFromHash()
+    if (initialAuthFlow.flow === 'login') {
+      const initialTab = readTabFromHash() || activeTab
+      setActiveTab(initialTab, { replace: true })
+    }
     reducedMotionMediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
     prefersReducedMotion = Boolean(reducedMotionMediaQuery?.matches)
     const onReducedMotionChange = (event) => {
@@ -3969,6 +4248,15 @@
     reducedMotionMediaQuery?.addEventListener?.('change', onReducedMotionChange)
 
     const onHashChange = () => {
+      const authHash = parseAuthFlowFromHash()
+      if (authHash.flow !== 'login') {
+        applyAuthFlowFromHash()
+        return
+      }
+      if (authStatus !== 'authenticated') {
+        applyAuthFlowFromHash()
+        return
+      }
       const tab = readTabFromHash()
       if (tab && (tab !== activeTab || window.location.hash !== `#/${tab}`)) {
         setActiveTab(tab, { replace: true })
@@ -3984,7 +4272,8 @@
     document.addEventListener('visibilitychange', onFocusOrVisible)
 
     const boot = async () => {
-      await bootstrapAuth()
+      const flow = parseAuthFlowFromHash()
+      await bootstrapAuth({ preserveAuthFlow: flow.flow !== 'login' })
     }
     boot()
 
@@ -4016,26 +4305,93 @@
   })
 </script>
 
-{#if authStatus !== 'authenticated'}
+{#if authStatus !== 'authenticated' || authFlow !== 'login'}
   <div class="login-shell">
     <div class="login-card">
       <p class="eyebrow">Korpus Builder</p>
-      <h1>Sign in</h1>
-      <p class="subtitle">Use your username and password to access corpora.</p>
-      <form class="login-form" on:submit={handleLogin}>
-        <label>
-          Username
-          <input type="text" bind:value={loginUsername} autocomplete="username" required />
-        </label>
-        <label>
-          Password
-          <input type="password" bind:value={loginPassword} autocomplete="current-password" required />
-        </label>
-        {#if authError}
-          <p class="error">{authError}</p>
-        {/if}
-        <button type="submit">Sign in</button>
-      </form>
+      {#if authFlow === 'accept-invite'}
+        <h1>Set your password</h1>
+        <p class="subtitle">Your account has been created. Set a password to activate it.</p>
+        <form class="login-form" on:submit={handleAcceptInvite}>
+          <label>
+            New password
+            <input type="password" bind:value={authPassword} autocomplete="new-password" required minlength="8" />
+          </label>
+          <label>
+            Confirm password
+            <input type="password" bind:value={authPasswordConfirm} autocomplete="new-password" required minlength="8" />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <button type="submit">Activate account</button>
+        </form>
+      {:else if authFlow === 'reset-password'}
+        <h1>Reset password</h1>
+        <p class="subtitle">Choose a new password for your account.</p>
+        <form class="login-form" on:submit={handleResetPassword}>
+          <label>
+            New password
+            <input type="password" bind:value={authPassword} autocomplete="new-password" required minlength="8" />
+          </label>
+          <label>
+            Confirm password
+            <input type="password" bind:value={authPasswordConfirm} autocomplete="new-password" required minlength="8" />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <button type="submit">Save password</button>
+        </form>
+      {:else if authFlow === 'forgot-password'}
+        <h1>Forgot password</h1>
+        <p class="subtitle">Enter your email address and we will send you a reset link.</p>
+        <form class="login-form" on:submit={handleForgotPassword}>
+          <label>
+            Email
+            <input type="email" bind:value={authEmail} autocomplete="email" required />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <div class="auth-actions">
+            <button type="submit">Send reset link</button>
+            <a href="#/login" class="text-link">Back to sign in</a>
+          </div>
+        </form>
+      {:else}
+        <h1>Sign in</h1>
+        <p class="subtitle">Use your username and password to access corpora.</p>
+        <form class="login-form" on:submit={handleLogin}>
+          <label>
+            Username
+            <input type="text" bind:value={loginUsername} autocomplete="username" required />
+          </label>
+          <label>
+            Password
+            <input type="password" bind:value={loginPassword} autocomplete="current-password" required />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <div class="auth-actions">
+            <button type="submit">Sign in</button>
+            <a href="#/forgot-password" class="text-link">Forgot password?</a>
+          </div>
+        </form>
+      {/if}
     </div>
   </div>
 {:else}
@@ -4061,7 +4417,21 @@
             <span class="header-corpus-label">Corpus</span>
             <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
               {#each corpora as corpus}
-                <option value={corpus.id}>{corpus.name}</option>
+                <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            <span class="header-corpus-label">Kantropos target</span>
+            <select
+              bind:value={selectedKantroposTargetId}
+              on:change={handleKantroposTargetChange}
+              disabled={kantroposAssignmentLoading || kantroposAssignmentSaving || !currentCorpusId || !canConfigureCurrentCorpusKantropos}
+              title={canConfigureCurrentCorpusKantropos ? 'Assign this local corpus to a predefined Kantropos corpus' : 'Only owners or editors can change the Kantropos assignment'}
+            >
+              <option value="">No assignment</option>
+              {#each kantroposTargets as target}
+                <option value={target.id}>{target.name}</option>
               {/each}
             </select>
           </label>
@@ -4082,7 +4452,28 @@
           {#if corpusActionStatus}
             <p class={`${corpusActionError ? 'error' : 'muted'} header-corpus-status`}>{corpusActionStatus}</p>
           {/if}
+          {#if kantroposAssignmentStatus}
+            <p class={`${kantroposAssignmentError ? 'error' : 'muted'} header-corpus-status`}>{kantroposAssignmentStatus}</p>
+          {:else if currentCorpusId && kantroposAssignment?.target_name}
+            <p class="muted header-corpus-status">Kantropos: {kantroposAssignment.target_name}</p>
+          {/if}
         </div>
+        {#if isAdmin}
+          <form class="header-invite" on:submit|preventDefault={handleCreateInvitation}>
+            <label>
+              <span class="header-corpus-label">Invite user</span>
+              <input type="text" placeholder="username" bind:value={inviteUsername} required />
+            </label>
+            <label>
+              <span class="header-corpus-label">Email</span>
+              <input type="email" placeholder="user@example.com" bind:value={inviteEmail} required />
+            </label>
+            <button class="secondary" type="submit">Send invite</button>
+            {#if inviteStatus}
+              <p class={`${inviteError ? 'error' : 'muted'} header-corpus-status`}>{inviteStatus}</p>
+            {/if}
+          </form>
+        {/if}
       </div>
     </header>
 
@@ -4115,7 +4506,7 @@
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">
-              <h2>Seed</h2>
+              <h2 class="workspace-section-title">1. Search</h2>
               <p>Collect seed sources, review candidates, and promote selected works into the corpus pipeline.</p>
             </div>
 
@@ -4186,7 +4577,7 @@
           <div class="seed-intake-grid">
             <div class="seed-intake-card seed-intake-card--upload">
               <div class="split">
-                <h3>Upload PDF</h3>
+                <h3>Document Search</h3>
                 {#if extractionProgress.active}
                   <span class="tag queued">extracting</span>
                 {/if}
@@ -4242,7 +4633,7 @@
             </div>
 
             <div class="seed-intake-card seed-intake-card--search">
-              <h3>Search</h3>
+              <h3>Keyword Search</h3>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
                   <label>
@@ -4313,7 +4704,7 @@
         <div class="card seed-sources-panel" data-testid="seed-panel">
           <div class="workspace-panel-header">
             <div class="workspace-panel-title">
-              <h3>Seed</h3>
+              <h3 class="workspace-section-title">2. Seed</h3>
               <p class="muted">PDF extractions and search runs appear here as the same kind of expandable source.</p>
             </div>
             <div class="workspace-panel-actions">
@@ -4361,7 +4752,6 @@
                 {@const isExpanded = expandedSeedSourceId === sourceId}
                 {@const sourceCandidates = getSeedCandidatesForSource(source)}
                 {@const selectionVersion = seedSelectionVersions[sourceId] || 0}
-                {@const selectedCandidateVersion = selectedSeedCandidateVersions[sourceId] || 0}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
                     class="seed-source__summary"
@@ -4501,26 +4891,24 @@
                                 <span aria-hidden="true"></span>
                               </div>
                               {#each sourceCandidates as candidate (candidate.candidate_key)}
-                                {@const active = isActiveSeedCandidate(source, candidate)}
+                                {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
+                                {@const candidateKey = String(candidate?.candidate_key || '')}
+                                {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
                                 <div
-                                  class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''}`}
+                                  class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
                                   on:click={(e) => {
                                     if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
                                     setSelectedSeedCandidate(source, candidate);
-                                    if (!isSeedCandidateSelectable(candidate)) return;
-                                    toggleSeedCandidateSelection(source, candidate);
                                   }}
                                   on:keydown={(e) => {
                                     if (e.key === 'Enter' || e.key === ' ') {
                                       if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
                                       e.preventDefault();
                                       setSelectedSeedCandidate(source, candidate);
-                                      if (!isSeedCandidateSelectable(candidate)) return;
-                                      toggleSeedCandidateSelection(source, candidate);
                                     }
                                   }}
-                                  role="checkbox"
-                                  aria-checked={isSeedCandidateSelected(source, candidate)}
+                                  role="button"
+                                  aria-pressed={active}
                                   tabindex="0"
                                 >
                                   <span class="ingest-select-cell">
@@ -4528,6 +4916,7 @@
                                       <input
                                         type="checkbox"
                                         checked={isSeedCandidateSelected(source, candidate)}
+                                        on:click|stopPropagation
                                         on:change={() => {
                                           setSelectedSeedCandidate(source, candidate);
                                           toggleSeedCandidateSelection(source, candidate);
@@ -4550,10 +4939,9 @@
                                   </span>
                                 </div>
                                 {#if active}
-                                  <div class="table-row seed-inline-detail-row">
+                                  <div class="seed-inline-detail-row">
                                     <div class="inline-detail-card">
                                       <div class="inline-detail-main">
-                                        <strong class="inline-detail-title">{formatTitle(candidate)}</strong>
                                         <div class="inline-detail-meta-row">
                                           <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
                                             Stage: {seedCandidateTag(candidate).label}
@@ -4608,11 +4996,6 @@
                 {doiHref}
                 {openAlexHref}
                 {handleDownloadedCorpusFile}
-                {isCorpusItemSelected}
-                {toggleCorpusItemSelection}
-                {isPromotionHighlighted}
-                {bindCorpusRow}
-                {corpusMotionKey}
                 {corpusLoadStatus}
                 {corpusHasMore}
                 {corpusLoadingMore}
@@ -4623,18 +5006,23 @@
             </div>
           </div>
         </div>
+
         </div>
       {/if}
 
       {#if activeTab === 'dashboard'}
         <Dashboard
+          currentCorpusName={currentCorpus?.name || 'Current corpus'}
           {pipelineRawCount}
           {pipelineMetadataCount}
           {pipelineDownloadedCount}
           {daemonStatus}
           {workerBacklog}
           {pipelineWorkerStatus}
-          {sampleActivity}
+          {recentDownloads}
+          showGlobalOverview={isAdmin}
+          globalStats={globalIngestStats}
+          globalBacklog={globalWorkerBacklog}
         />
       {/if}
 
@@ -5127,18 +5515,18 @@
 
       {#if activeTab === 'downloads'}
         <div class="card" data-testid="downloads-panel">
-          <h2>Download queue</h2>
+          <h2>Download activity</h2>
           <p class="muted">
             {#if !downloadsSource}
               Loading queue...
             {:else if downloadsSource === 'api'}
-              Live queue from API.
+              Live download activity from API.
             {:else if downloadsSource === 'stub'}
-              Stub queue from API.
+              Stub download activity from API.
             {:else if downloadsSource === 'sample'}
-              Sample queue data.
+              Sample download activity.
             {:else}
-              Queue loaded ({downloadsSource}).
+              Download activity loaded ({downloadsSource}).
             {/if}
           </p>
 
@@ -5206,9 +5594,9 @@
                 Status
                 <select bind:value={exportFilterStatus} data-testid="export-filter-status">
                   <option value="all">All</option>
-                  <option value="downloaded_references">Downloaded</option>
-                  <option value="with_metadata">With metadata</option>
-                  <option value="no_metadata">Raw</option>
+                  <option value="downloaded">Downloaded</option>
+                  <option value="matched">Matched</option>
+                  <option value="raw">Raw</option>
                 </select>
               </label>
               <label>
@@ -5256,6 +5644,7 @@
                 <option value="in_progress">In progress</option>
                 <option value="queued">Queued</option>
                 <option value="failed">Failed</option>
+                <option value="downloaded">Downloaded</option>
               </select>
             </div>
             <div class="table-toolbar-right">
@@ -5284,11 +5673,11 @@
               </div>
             {:else}
               <div class="empty-state">
-                <strong>Queue is empty.</strong>
+                <strong>No download items to show.</strong>
                 <span class="muted">
                   {downloadsQuery.trim() || downloadsStatusFilter !== 'all'
                     ? 'No items match the current filters.'
-                    : 'Add works to the download queue via ingest or keyword search.'}
+                    : 'No queued or recently downloaded items are available for this corpus.'}
                 </span>
               </div>
             {/each}
