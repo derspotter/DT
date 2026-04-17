@@ -46,7 +46,9 @@ class PDFDownloader:
             return True
 
         ref_type_val = (ref_type or "").lower()
-        min_pages = 50 if ref_type_val == "book" else 5
+        # Many valid article PDFs are only 1-4 pages; rejecting them creates
+        # false "invalid PDF" failures on working mirrors.
+        min_pages = 20 if ref_type_val == "book" else 1
 
         try:
             with fitz.open(stream=content, filetype="pdf") as doc:
@@ -63,12 +65,40 @@ class PDFDownloader:
         except Exception:
             return False
 
-    def _download_and_save(self, pdf_url: str, destination_filename: str, source: str, ref_type: str | None = None) -> tuple[Path | None, str | None, str | None]:
+    @staticmethod
+    def _classify_error(error_msg: str | None) -> str:
+        text = (error_msg or "").lower()
+        if "no pdf url provided" in text:
+            return "no_pdf_url"
+        if "403" in text or "forbidden" in text:
+            return "forbidden"
+        if "404" in text or "not found" in text:
+            return "not_found"
+        if "429" in text or "too many requests" in text or "rate limit" in text:
+            return "rate_limited"
+        if "timed out" in text or "timeout" in text:
+            return "timeout"
+        if "empty file" in text:
+            return "empty_file"
+        if "failed pdf validation" in text:
+            return "invalid_pdf"
+        if "request failed" in text:
+            return "request_error"
+        return "download_error"
+
+    def _download_and_save(self, pdf_url: str, destination_filename: str, source: str, ref_type: str | None = None) -> tuple[Path | None, str | None, str | None, dict]:
         """
         Generic internal method to download a PDF from a URL and save it.
         """
         if not pdf_url:
-            return None, None, f"No PDF URL provided by {source}."
+            error = f"No PDF URL provided by {source}."
+            return None, None, error, {
+                "source": source,
+                "url": pdf_url,
+                "outcome": "failure",
+                "failure_category": self._classify_error(error),
+                "detail": error,
+            }
 
         try:
             print(f"[Downloader] Attempting to download from {source}: {pdf_url}")
@@ -81,11 +111,25 @@ class PDFDownloader:
 
             pdf_content = response.content
             if not pdf_content:
-                 return None, None, f"Downloaded empty file from {source}."
+                 error = f"Downloaded empty file from {source}."
+                 return None, None, error, {
+                     "source": source,
+                     "url": pdf_url,
+                     "outcome": "failure",
+                     "failure_category": self._classify_error(error),
+                     "detail": error,
+                 }
 
             if not self.validate_pdf(pdf_content, ref_type=ref_type):
                 content_type = response.headers.get('Content-Type', '')
-                return None, None, f"Downloaded file from {source} failed PDF validation. Content-Type: {content_type}"
+                error = f"Downloaded file from {source} failed PDF validation. Content-Type: {content_type}"
+                return None, None, error, {
+                    "source": source,
+                    "url": pdf_url,
+                    "outcome": "failure",
+                    "failure_category": self._classify_error(error),
+                    "detail": error,
+                }
 
             checksum = self._calculate_checksum(pdf_content)
             
@@ -96,22 +140,34 @@ class PDFDownloader:
                 f.write(pdf_content)
             
             print(f"{GREEN}[Downloader] Successfully downloaded from {source} and saved to: {destination_path}{RESET}")
-            return destination_path.resolve(), checksum, None
+            return destination_path.resolve(), checksum, None, {
+                "source": source,
+                "url": pdf_url,
+                "outcome": "success",
+                "detail": str(destination_path.resolve()),
+            }
 
         except requests.exceptions.RequestException as e:
             error_msg = f"Request failed from {source}: {e}"
             print(f"{RED}[Downloader] {error_msg}{RESET}")
-            return None, None, error_msg
+            return None, None, error_msg, {
+                "source": source,
+                "url": pdf_url,
+                "outcome": "failure",
+                "failure_category": self._classify_error(error_msg),
+                "detail": error_msg,
+            }
 
-    def attempt_download(self, metadata: dict, ref_type: str | None = None) -> tuple[Path | None, str | None, str | None]:
+    def attempt_download(self, metadata: dict, ref_type: str | None = None) -> tuple[Path | None, str | None, str | None, list[dict]]:
         """
         Tries to download a PDF using various sources based on the provided metadata.
         The metadata should be the enriched data from OpenAlexScraper.
         
         Returns:
-            A tuple of (path_to_file, checksum, source_of_download).
-            Returns (None, None, None) if all attempts fail.
+            A tuple of (path_to_file, checksum, source_of_download, attempts).
+            Returns (None, None, None, attempts) if all attempts fail.
         """
+        attempts: list[dict] = []
         doi = metadata.get('doi')
         if not doi:
              # Create a fallback filename if no DOI is present
@@ -126,29 +182,32 @@ class PDFDownloader:
         if unpaywall_meta and unpaywall_meta.get('best_oa_location'):
             pdf_url = unpaywall_meta['best_oa_location'].get('url_for_pdf')
             if pdf_url:
-                path, checksum, err = self._download_and_save(pdf_url, filename, "Unpaywall", ref_type=ref_type)
+                path, checksum, err, attempt = self._download_and_save(pdf_url, filename, "Unpaywall", ref_type=ref_type)
+                attempts.append(attempt)
                 if path:
-                    return path, checksum, "Unpaywall"
+                    return path, checksum, "Unpaywall", attempts
                 else:
                     print(f"{YELLOW}[Downloader] Unpaywall download failed: {err}{RESET}")
 
         # Strategy 2: Try OpenAlex's open_access.oa_url
         oa_url = metadata.get('open_access', {}).get('oa_url')
         if oa_url:
-            path, checksum, err = self._download_and_save(oa_url, filename, "OpenAlex OA URL", ref_type=ref_type)
+            path, checksum, err, attempt = self._download_and_save(oa_url, filename, "OpenAlex OA URL", ref_type=ref_type)
+            attempts.append(attempt)
             if path:
-                return path, checksum, "OpenAlex OA URL"
+                return path, checksum, "OpenAlex OA URL", attempts
             else:
                 print(f"{YELLOW}[Downloader] OpenAlex OA URL download failed: {err}{RESET}")
 
         # Strategy 3: Try OpenAlex primary_location's pdf_url
         pdf_url = metadata.get('primary_location', {}).get('pdf_url')
         if pdf_url:
-            path, checksum, err = self._download_and_save(pdf_url, filename, "OpenAlex PDF URL", ref_type=ref_type)
+            path, checksum, err, attempt = self._download_and_save(pdf_url, filename, "OpenAlex PDF URL", ref_type=ref_type)
+            attempts.append(attempt)
             if path:
-                return path, checksum, "OpenAlex PDF URL"
+                return path, checksum, "OpenAlex PDF URL", attempts
             else:
                 print(f"{YELLOW}[Downloader] OpenAlex PDF URL download failed: {err}{RESET}")
 
         print(f"{RED}[Downloader] All download attempts failed for DOI: {doi}{RESET}")
-        return None, None, None
+        return None, None, None, attempts

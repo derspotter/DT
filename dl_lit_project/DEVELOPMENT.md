@@ -22,14 +22,15 @@ Python worker scripts use shared bootstrap logic from `backend/scripts/_bootstra
 - `APIscraper_v2.py`: normalized argument handling and DB-first insertion path; cleaned startup noise.
 - `OpenAlexScraper.py`: remains canonical enrichment/search helper for DB pipeline.
 - `new_dl.py`: canonical location of `BibliographyEnhancer`; legacy standalone script mode is retained for compatibility but DB-first CLI is preferred.
-- `cli.py`: central orchestration surface (`run-pipeline`, `keyword-search`, `enrich-openalex-db`, queue/download commands).
+- `cli.py`: central orchestration surface (`keyword-search`, queue/download commands, import/export helpers).
 
 ## DB-first processing guidance
 
-Prefer this stage flow:
-`no_metadata -> with_metadata -> to_download_references -> downloaded_references`
+Prefer the canonical work-state flow:
+`metadata_status: pending -> in_progress -> matched|failed`
+`download_status: not_requested -> queued -> in_progress -> downloaded|failed`
 
-Ingestion and queue transitions should always pass through `DatabaseManager` helpers to preserve dedupe behavior, merge-log recording, and corpus mapping.
+Ingestion and queue transitions should always pass through `DatabaseManager` helpers to preserve dedupe behavior, merge-log recording, and corpus membership.
 
 ## Library notes
 

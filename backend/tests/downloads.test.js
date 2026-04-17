@@ -63,8 +63,8 @@ describe('GET /api/downloads', () => {
     expect(pauseAll.status).toBe(200)
     expect(pauseAll.body).toHaveProperty('pipeline')
     expect(pauseAll.body).toHaveProperty('downloads')
-    expect(typeof pauseAll.body.pipeline.stopped).toBe('number')
-    expect(typeof pauseAll.body.downloads.stopped).toBe('number')
+    expect(typeof pauseAll.body.message).toBe('string')
+    expect(pauseAll.body.force).toBe(true)
 
     const stopDownload = await request(app).post('/api/downloads/worker/stop').send({ force: true })
     expect(stopDownload.status).toBe(200)

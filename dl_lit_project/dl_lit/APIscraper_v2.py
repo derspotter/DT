@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -48,8 +49,9 @@ except ImportError:
     ConfigDict = None
 
 # --- Configuration ---
-# Use Gemini 3.1 Flash Lite preview for all extraction steps in this script.
-DEFAULT_MODEL_NAME = "gemini-3.1-flash-lite-preview"
+# Use a cheaper model for page/metadata extraction, but a stronger model for inline citation mining.
+DEFAULT_MODEL_NAME = os.getenv("RAG_FEEDER_API_EXTRACT_MODEL", "gemini-3.1-flash-lite-preview")
+INLINE_MODEL_NAME = os.getenv("RAG_FEEDER_API_INLINE_MODEL", "gemini-3.1-pro-preview")
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -63,6 +65,7 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
 
 
 DEFAULT_EXTRACT_WORKERS = _env_int("RAG_FEEDER_API_EXTRACT_WORKERS", 10)
+DEFAULT_INLINE_CHUNK_WORKERS = _env_int("RAG_FEEDER_INLINE_CHUNK_WORKERS", 4)
 DEFAULT_PAGE_BATCH_SIZE = _env_int("RAG_FEEDER_PAGE_BATCH_SIZE", 4)
 REF_PAGE_FILE_RE = re.compile(r"^(?P<prefix>.+?)_refs_physical_p(?P<page>\d+)\.pdf$", re.IGNORECASE)
 
@@ -85,9 +88,22 @@ BIBLIOGRAPHY_PROMPT = (
 INLINE_CITATION_PROMPT = (
     "Extract all cited works from this PDF chunk, including inline citations, footnotes, endnotes, "
     "and per-page references. Return a JSON object with keys 'source_metadata' and 'items' matching the provided schema. "
+    "Set 'source_metadata' to null in this mode and focus entirely on cited works. "
     "Include each cited work once if identifiable. "
+    "Footnote-style references often appear as a note number followed by a full bibliographic string at the bottom of the page; extract those full citations. "
     "CRITICAL: You MUST extract the 'authors' for every cited work. Look closely for names before the year or title. "
-    "Also extract metadata for the source/seed document itself into 'source_metadata' (title, authors, year, doi, source, publisher) when identifiable. "
+    "If no citations are found, return items as an empty list."
+)
+
+INLINE_TEXT_CITATION_PROMPT = (
+    "Extract all cited works from this article text. The text may contain inline citations, footnotes, endnotes, "
+    "and note blocks where a bare note number is followed by a full bibliographic reference. "
+    "Ignore bare numeric note markers in the body, but extract any full cited work details that appear in notes. "
+    "Return a JSON object with keys 'source_metadata' and 'items' matching the provided schema. "
+    "Set 'source_metadata' to null in this mode and focus entirely on cited works. "
+    "Include each cited work once if identifiable. "
+    "Footnote-style references often appear as a note number followed by a full bibliographic string; extract those full citations. "
+    "CRITICAL: You MUST extract the 'authors' for every cited work. Look closely for names before the year or title. "
     "If no citations are found, return items as an empty list."
 )
 
@@ -203,7 +219,7 @@ def configure_api_client():
 
     try:
         api_client = genai.Client(api_key=api_key)
-        print(f"[INFO] Successfully configured Google client ({DEFAULT_MODEL_NAME}).", flush=True)
+        print("[INFO] Successfully configured Google client.", flush=True)
         return True
     except Exception as e:
         print(f"[ERROR] Failed to configure API client: {e}", flush=True)
@@ -242,6 +258,50 @@ def _resolve_prompt(extract_mode: str) -> str:
     return BIBLIOGRAPHY_PROMPT
 
 
+def _resolve_model_name(extract_mode: str) -> str:
+    if extract_mode == "inline":
+        return INLINE_MODEL_NAME
+    return DEFAULT_MODEL_NAME
+
+
+def _run_generate_content(
+    model_name: str,
+    contents,
+    timeout_seconds: int,
+    *,
+    temperature: float = 1.0,
+    use_response_schema: bool = True,
+):
+    def _call_model():
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            response_mime_type="application/json",
+        )
+        if use_response_schema and BaseModel:
+            config.response_schema = BibliographyEntryList
+        return api_client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=config,
+        )
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_call_model)
+    try:
+        response = future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as e:
+        future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    token_count = _extract_total_tokens(response)
+    if token_count:
+        _wait_rate_limit("gemini_tokens", units=token_count)
+    return response
+
+
 def _ascii_safe_pdf_name(filename: str) -> str:
     normalized = unicodedata.normalize("NFKD", filename or "")
     ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
@@ -266,6 +326,109 @@ def _prepare_pdf_upload(pdf_path: str) -> tuple[str, str, str | None]:
         safe_path = os.path.join(safe_dir, safe_name)
         shutil.copy2(source_path, safe_path)
         return safe_path, safe_name, safe_dir
+
+
+def _parse_bibliography_response_text(response_text: str):
+    bibliography_data = []
+    source_metadata = None
+
+    try:
+        parsed_data = json.loads(response_text)
+        if isinstance(parsed_data, dict):
+            source_metadata = _normalize_source_metadata(parsed_data.get("source_metadata"))
+            bibliography_data = parsed_data.get("items") or []
+        elif isinstance(parsed_data, list) and len(parsed_data) == 1 and isinstance(parsed_data[0], dict):
+            source_metadata = _normalize_source_metadata(parsed_data[0].get("source_metadata"))
+            bibliography_data = parsed_data[0].get("items") or []
+        else:
+            bibliography_data = parsed_data
+        if isinstance(bibliography_data, list):
+            print(f"[DEBUG] Parsed JSON successfully as list.", flush=True)
+        else:
+            print(f"[WARNING] API response is not a list, attempting extraction.", flush=True)
+            extracted_data = extract_json_from_text(response_text)
+            if extracted_data is not None:
+                bibliography_data = extracted_data
+            else:
+                print(f"[WARNING] Extraction failed.", flush=True)
+                bibliography_data = []
+    except json.JSONDecodeError as jde:
+        print(f"[ERROR] JSON decode error: {jde}", flush=True)
+        print(f"[ERROR] Response content: {response_text[:500]}...", flush=True)
+        extracted_data = extract_json_from_text(response_text)
+        if extracted_data is not None:
+            bibliography_data = extracted_data
+        else:
+            bibliography_data = []
+
+    if isinstance(bibliography_data, list):
+        bibliography_data = validate_bibliography_entries(bibliography_data)
+    else:
+        bibliography_data = []
+    return bibliography_data, source_metadata
+
+
+def _extract_pdf_text(pdf_path: str) -> str:
+    extraction_errors: list[str] = []
+
+    for module_name in ("pypdf", "PyPDF2"):
+        try:
+            module = __import__(module_name, fromlist=["PdfReader"])
+            PdfReader = getattr(module, "PdfReader")
+            reader = PdfReader(str(pdf_path))
+            text_parts = []
+            for page in reader.pages:
+                try:
+                    text_parts.append(page.extract_text() or "")
+                except Exception as page_error:
+                    extraction_errors.append(f"{module_name} page extract failed: {page_error}")
+            text = "\n\n".join(part for part in text_parts if part)
+            if text.strip():
+                return text
+            extraction_errors.append(f"{module_name} produced no text")
+        except Exception as exc:
+            extraction_errors.append(f"{module_name} unavailable: {exc}")
+
+    result = subprocess.run(
+        ["pdftotext", str(pdf_path), "-"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0 and (result.stdout or "").strip():
+        return result.stdout
+
+    extraction_errors.append((result.stderr or result.stdout or "pdftotext failed").strip())
+    raise RuntimeError("; ".join(err for err in extraction_errors if err))
+
+
+def extract_inline_citations_from_text(
+    pdf_path: str,
+    timeout_seconds: int,
+    model_name: str,
+):
+    if api_client is None:
+        raise RuntimeError("API client not configured")
+
+    text = _extract_pdf_text(pdf_path)
+    prompt = f"{INLINE_TEXT_CITATION_PROMPT}\n\nArticle text:\n{text}"
+    print(f"[INFO] Retrying inline extraction from extracted text for {pdf_path}.", flush=True)
+    _wait_rate_limit("gemini")
+    _wait_rate_limit("gemini_daily")
+    response = _run_generate_content(
+        model_name,
+        prompt,
+        timeout_seconds,
+        temperature=1.0,
+        use_response_schema=False,
+    )
+    response_text = response.text
+    print(f"[DEBUG] Raw text-fallback API response content: {response_text[:200]}...", flush=True)
+    items, source_metadata = _parse_bibliography_response_text(response_text)
+    return {
+        "items": items,
+        "source_metadata": source_metadata,
+    }
 
 
 def _normalize_source_metadata(value):
@@ -495,6 +658,7 @@ def upload_pdf_and_extract_bibliography(
     source_metadata = None
     uploaded_file = None
     temp_upload_dir = None
+    api_error = None
 
     if api_client is None:
         if not configure_api_client():
@@ -519,74 +683,45 @@ def upload_pdf_and_extract_bibliography(
         
         # Prepare the prompt for bibliography extraction
         prompt = _resolve_prompt(extract_mode)
+        model_name = _resolve_model_name(extract_mode)
+        print(f"[INFO] Using model {model_name} for extract_mode={extract_mode}.", flush=True)
         _wait_rate_limit("gemini")
         _wait_rate_limit("gemini_daily")
-        
-        def _call_model():
-            config = types.GenerateContentConfig(
-                temperature=1.0,
-                response_mime_type="application/json",
-            )
-            if BaseModel:
-                config.response_schema = BibliographyEntryList
-            return api_client.models.generate_content(
-                model=DEFAULT_MODEL_NAME,
-                contents=[prompt, uploaded_file],
-                config=config,
-            )
-
-        # Send request to API with uploaded file (timeout guard)
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(_call_model)
-        try:
-            response = future.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError as e:
-            future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-        # Track token usage against internal token/min throttling.
-        token_count = _extract_total_tokens(response)
-        if token_count:
-            _wait_rate_limit("gemini_tokens", units=token_count)
+        response = _run_generate_content(
+            model_name,
+            [prompt, uploaded_file],
+            timeout_seconds,
+            temperature=1.0,
+            use_response_schema=(extract_mode != "inline"),
+        )
 
         response_text = response.text
         print(f"[DEBUG] Raw API response content: {response_text[:200]}...", flush=True)
-        
-        try:
-            parsed_data = json.loads(response_text)
-            if isinstance(parsed_data, dict):
-                source_metadata = _normalize_source_metadata(parsed_data.get("source_metadata"))
-                bibliography_data = parsed_data.get("items") or []
-            else:
-                bibliography_data = parsed_data
-            if isinstance(bibliography_data, list):
-                print(f"[DEBUG] Parsed JSON successfully as list.", flush=True)
-            else:
-                print(f"[WARNING] API response is not a list, attempting extraction.", flush=True)
-                extracted_data = extract_json_from_text(response_text)
-                if extracted_data is not None:
-                    bibliography_data = extracted_data
-                else:
-                    print(f"[WARNING] Extraction failed.", flush=True)
-                    bibliography_data = []
-        except json.JSONDecodeError as jde:
-            print(f"[ERROR] JSON decode error: {jde}", flush=True)
-            print(f"[ERROR] Response content: {response_text[:500]}...", flush=True)
-            extracted_data = extract_json_from_text(response_text)
-            if extracted_data is not None:
-                bibliography_data = extracted_data
-            else:
-                bibliography_data = []
-
-        if isinstance(bibliography_data, list):
-            bibliography_data = validate_bibliography_entries(bibliography_data)
+        bibliography_data, source_metadata = _parse_bibliography_response_text(response_text)
+        if extract_mode == "inline" and not bibliography_data:
+            try:
+                fallback_result = extract_inline_citations_from_text(
+                    pdf_path=str(pdf_path),
+                    timeout_seconds=timeout_seconds,
+                    model_name=model_name,
+                )
+                fallback_items = fallback_result.get("items") or []
+                fallback_source_metadata = fallback_result.get("source_metadata")
+                if fallback_items:
+                    bibliography_data = fallback_items
+                    print(
+                        f"[INFO] Text fallback recovered {len(bibliography_data)} inline citation(s) for {pdf_path}.",
+                        flush=True,
+                    )
+                if not source_metadata and fallback_source_metadata:
+                    source_metadata = fallback_source_metadata
+            except Exception as text_error:
+                print(f"[WARNING] Text fallback failed for {pdf_path}: {text_error}", flush=True)
     except Exception as e:
         print(f"[ERROR] API error while processing {pdf_path}: {e}", flush=True)
         bibliography_data = []
         source_metadata = None
+        api_error = str(e)
     finally:
         if temp_upload_dir and os.path.exists(temp_upload_dir):
             shutil.rmtree(temp_upload_dir, ignore_errors=True)
@@ -603,6 +738,7 @@ def upload_pdf_and_extract_bibliography(
         return {
             "items": bibliography_data if isinstance(bibliography_data, list) else [],
             "source_metadata": source_metadata,
+            "error": api_error,
         }
 
 def extract_json_from_text(text):
@@ -668,6 +804,7 @@ def process_single_pdf(
     extract_mode: str = "page",
     source_pdf_override: str | None = None,
     uploaded_file_name: str | None = None,
+    seed_only: bool = False,
 ):
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
@@ -685,12 +822,16 @@ def process_single_pdf(
         )
         bibliography_data = extraction_result.get("items") if isinstance(extraction_result, dict) else extraction_result
         source_metadata = extraction_result.get("source_metadata") if isinstance(extraction_result, dict) else None
+        api_error = extraction_result.get("error") if isinstance(extraction_result, dict) else None
         source_pdf_value = str(source_pdf_override or pdf_path)
         api_duration = time.time() - stage_start_time
         print(f"[TIMER] Bibliography extraction for {filename} took {api_duration:.2f} seconds.", flush=True)
 
         write_guard = db_write_lock if db_write_lock is not None else nullcontext()
         with write_guard:
+            if api_error:
+                failure_reason = f"API extraction failed: {api_error}"
+                raise RuntimeError(failure_reason)
             _upsert_seed_document_metadata(
                 db_manager=db_manager,
                 ingest_source=ingest_source,
@@ -713,8 +854,10 @@ def process_single_pdf(
                 file_success = True # Treat as success because process completed
                 # Don't save an empty file, just report no data found
             else:
-                # Record entries for UI display and insert into no_metadata stage
-                successes = 0
+                # Extraction should always populate Seed/ingest rows.
+                # Promotion into corpus staging is a separate explicit step.
+                stored_ingest = 0
+                staged_raw = 0
                 for entry in bibliography_data:
                     minimal_ref = {
                         "title": entry.get("title"),
@@ -742,15 +885,30 @@ def process_single_pdf(
                         "corpus_id": corpus_id,
                     }
                     db_manager.insert_ingest_entry(minimal_ref, ingest_source=ingest_source)
-                    row_id, err = db_manager.insert_no_metadata(minimal_ref)
+                    stored_ingest += 1
+                    if seed_only:
+                        continue
+                    row_id, err = db_manager.create_pending_work(minimal_ref)
                     if err:
                         print(f"[WARNING] Skipped entry due to: {err}", flush=True)
                     else:
-                        successes += 1
-                print(f"[SUCCESS] Inserted {successes}/{len(bibliography_data)} entries from {filename} into database.", flush=True)
-                file_success = True if successes else False
-                if not file_success:
-                    failure_reason = "All inserts skipped (duplicates or errors)"
+                        staged_raw += 1
+                if seed_only:
+                    print(
+                        f"[SUCCESS] Inserted {stored_ingest}/{len(bibliography_data)} entries from {filename} into ingest_entries only (seed-only mode).",
+                        flush=True,
+                    )
+                    file_success = True if stored_ingest else False
+                    if not file_success:
+                        failure_reason = "No ingest entries stored"
+                else:
+                    print(
+                        f"[SUCCESS] Inserted {stored_ingest}/{len(bibliography_data)} ingest entries and staged {staged_raw}/{len(bibliography_data)} raw entries from {filename}.",
+                        flush=True,
+                    )
+                    file_success = True if staged_raw else False
+                    if not file_success:
+                        failure_reason = "All inserts skipped (duplicates or errors)"
 
 
     except Exception as e:
@@ -781,6 +939,8 @@ def process_single_pdf_chunked(
     extract_mode: str = "inline",
     chunk_pages: int = 50,
     uploaded_file_name: str | None = None,
+    max_workers: int = DEFAULT_INLINE_CHUNK_WORKERS,
+    seed_only: bool = False,
 ):
     """Fallback extraction for inline/per-page citations by chunking larger PDFs."""
     temp_chunk_dir = None
@@ -795,23 +955,34 @@ def process_single_pdf_chunked(
         return
 
     try:
+        worker_count = max(1, min(int(max_workers or 1), len(chunk_paths)))
         print(
-            f"[INFO] Chunked fallback extraction for {pdf_path}: {len(chunk_paths)} chunk(s), mode={extract_mode}, chunk_pages={chunk_pages}",
+            f"[INFO] Chunked fallback extraction for {pdf_path}: {len(chunk_paths)} chunk(s), mode={extract_mode}, chunk_pages={chunk_pages}, workers={worker_count}",
             flush=True,
         )
-        for chunk_path in chunk_paths:
-            process_single_pdf(
-                chunk_path,
-                db_manager,
-                summary_dict,
-                summary_lock,
-                db_write_lock,
-                ingest_source=ingest_source,
-                corpus_id=corpus_id,
-                extract_mode=extract_mode,
-                source_pdf_override=str(pdf_path),
-                uploaded_file_name=None if chunk_path != str(pdf_path) else uploaded_file_name,
-            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    process_single_pdf,
+                    chunk_path,
+                    db_manager,
+                    summary_dict,
+                    summary_lock,
+                    db_write_lock,
+                    ingest_source,
+                    corpus_id,
+                    extract_mode,
+                    str(pdf_path),
+                    None if chunk_path != str(pdf_path) else uploaded_file_name,
+                    seed_only,
+                )
+                for chunk_path in chunk_paths
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"[ERROR] Chunk worker failed for {pdf_path}: {exc}", flush=True)
     finally:
         if temp_chunk_dir and os.path.exists(temp_chunk_dir):
             shutil.rmtree(temp_chunk_dir, ignore_errors=True)
@@ -825,6 +996,7 @@ def process_directory_v2(
     extract_mode: str = "page",
     chunk_pages: int = 0,
     page_batch_size: int = DEFAULT_PAGE_BATCH_SIZE,
+    seed_only: bool = False,
 ):
     """Processes all PDFs in the input directory concurrently, saving to the specified output dir."""
     print(f"[INFO] Processing directory: {input_dir}", flush=True)
@@ -864,6 +1036,8 @@ def process_directory_v2(
                 corpus_id=corpus_id,
                 extract_mode=extract_mode,
                 chunk_pages=chunk_pages,
+                max_workers=max_workers,
+                seed_only=seed_only,
             )
         print("\n--- Processing Summary ---")
         print(f"Total files found: {len(pdf_files)}")
@@ -901,6 +1075,8 @@ def process_directory_v2(
                     corpus_id,
                     extract_mode,
                     source_pdf_override,
+                    None,
+                    seed_only,
                 )
                 for work_path, source_pdf_override in work_items]
 
@@ -975,6 +1151,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reuse an already uploaded Gemini file (files/<id>) for single-PDF extraction.",
     )
+    parser.add_argument(
+        "--seed-only",
+        action="store_true",
+        help="Store extracted bibliography entries only in ingest_entries/seed metadata; do not stage corpus items.",
+    )
     return parser
 
 
@@ -1014,6 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.extract_mode,
                 args.chunk_pages,
                 args.page_batch_size,
+                args.seed_only,
             )
         elif os.path.isfile(input_path) and str(input_path).lower().endswith(".pdf"):
             print(f"[INFO] Processing single PDF file: {input_path}", flush=True)
@@ -1030,6 +1212,8 @@ def main(argv: list[str] | None = None) -> int:
                     args.extract_mode,
                     args.chunk_pages,
                     args.uploaded_file_name,
+                    args.workers,
+                    args.seed_only,
                 )
             else:
                 process_single_pdf(
@@ -1043,8 +1227,11 @@ def main(argv: list[str] | None = None) -> int:
                     args.extract_mode,
                     None,
                     args.uploaded_file_name,
+                    args.seed_only,
                 )
             print(f"[INFO] Single file processing complete. Summary: {summary}", flush=True)
+            if summary["failed_files"] > 0 and summary["successful_files"] == 0:
+                return 1
         else:
             print(f"[ERROR] Input {input_path} is neither a directory nor a PDF file.", flush=True)
             return 2

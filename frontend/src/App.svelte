@@ -3,16 +3,28 @@
   import {
     login,
     fetchMe,
+    requestPasswordReset,
+    acceptInvite,
+    resetPassword,
+    createUserInvitation,
     selectCorpus,
     createCorpus,
     deleteCorpus as deleteCorpusApi,
     shareCorpus,
+    fetchKantroposCorpora,
+    fetchCorpusKantroposAssignment,
+    saveCorpusKantroposAssignment,
     setAuthToken,
     uploadPdf,
     extractBibliography,
     fetchBibliographyEntries,
     fetchIngestStats,
     fetchIngestRuns,
+    fetchSeedSources,
+    fetchSeedCandidates,
+    promoteSeedCandidates,
+    dismissSeedCandidates as dismissSeedCandidatesApi,
+    removeSeedSource,
     enqueueIngestEntries,
     processMarkedIngestEntries,
     runKeywordSearch,
@@ -24,69 +36,101 @@
     stopDownloadWorker,
     runDownloadWorkerOnce,
     fetchPipelineWorkerStatus,
+    fetchPipelineDaemonStatus,
+    fetchPipelineJobsSummary,
     fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
     pauseAllPipelineWorkers,
     fetchGraph,
     downloadCorpusExport,
+    downloadCorpusItemFile,
   } from './lib/api'
-  import { sampleActivity } from './lib/sample-data'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
   import Graph from './components/Graph.svelte'
   import Corpus from './components/Corpus.svelte'
 
-  const tabGroups = [
+  const userTabGroups = [
     {
-      title: 'Ingest',
+      title: '',
       tabs: [
-        { id: 'ingest', label: 'Seed Document' },
-        { id: 'search', label: 'Keyword Search' },
+        { id: 'workspace', label: 'Workspace' },
       ]
-    },
+    }
+  ]
+  const adminTabGroups = [
     {
-      title: 'Manage',
+      title: 'Diagnostics',
       tabs: [
-        { id: 'corpus', label: 'Corpus' },
         { id: 'downloads', label: 'Downloads' },
-      ]
-    },
-    {
-      title: 'Analyze',
-      tabs: [
         { id: 'graph', label: 'Graph' },
-      ]
-    },
-    {
-      title: 'System',
-      tabs: [
         { id: 'dashboard', label: 'Pipeline Status' },
         { id: 'logs', label: 'Logs' },
       ]
     }
   ]
 
-  let activeTab = 'dashboard'
+  let activeTab = 'workspace'
   let apiStatus = 'unknown'
   let authStatus = 'loading'
   let authError = ''
   let authUser = null
+  $: isAdmin = Boolean(authUser?.is_admin || authUser?.username === 'admin')
+  $: diagnosticsEnabled = isAdmin
+  $: tabGroups = isAdmin ? [...userTabGroups, ...adminTabGroups] : userTabGroups
+  $: showSideNav = tabGroups.some((group) => (group.tabs || []).some((tab) => tab.id !== 'workspace'))
+  $: visibleCorpusNameCounts = corpora.reduce((map, corpus) => {
+    const key = String(corpus?.name || '').trim()
+    map.set(key, (map.get(key) || 0) + 1)
+    return map
+  }, new Map())
+  $: visibleCorpusOwnerCounts = corpora.reduce((map, corpus) => {
+    const key = `${String(corpus?.name || '').trim()}|${String(corpus?.owner_username || '')}`
+    map.set(key, (map.get(key) || 0) + 1)
+    return map
+  }, new Map())
+
+  function corpusOptionLabel(corpus) {
+    if (!corpus) return ''
+    const base = String(corpus.name || '').trim() || `Corpus ${corpus.id}`
+    const owner = String(corpus.owner_username || '').trim()
+    const role = String(corpus.role || '').trim()
+    const duplicateName = (visibleCorpusNameCounts.get(base) || 0) > 1
+    const duplicateOwnerName = (visibleCorpusOwnerCounts.get(`${base}|${owner}`) || 0) > 1
+    const parts = []
+    if (duplicateName && owner) parts.push(owner)
+    if (role && role !== 'owner') parts.push(role)
+    if ((duplicateName && !owner) || duplicateOwnerName) parts.push(`#${corpus.id}`)
+    return parts.length > 0 ? `${base} · ${parts.join(' · ')}` : base
+  }
   let corpora = []
   let currentCorpusId = null
   let loginUsername = ''
   let loginPassword = ''
+  let authFlow = 'login'
+  let authFlowToken = ''
+  let authEmail = ''
+  let authPassword = ''
+  let authPasswordConfirm = ''
+  let authInfo = ''
 
   let uploads = []
   let ingestStats = {
-    no_metadata: 0,
-    with_metadata: 0,
-    to_download_references: 0,
-    downloaded_references: 0,
+    raw_pending: 0,
+    matched: 0,
+    queued_download: 0,
+    downloaded: 0,
   }
-  $: pipelineRawCount = Number(ingestStats.no_metadata || 0)
-  $: pipelineMetadataCount = Number(ingestStats.with_metadata || 0)
-  $: pipelineDownloadedCount = Number(ingestStats.downloaded_references || 0)
+  let globalIngestStats = {
+    raw_pending: 0,
+    matched: 0,
+    queued_download: 0,
+    downloaded: 0,
+  }
+  $: pipelineRawCount = Number(ingestStats.raw_pending || 0)
+  $: pipelineMetadataCount = Number(ingestStats.matched || 0)
+  $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
@@ -104,50 +148,94 @@
     detail: '',
     percent: 0,
     indeterminate: false,
+    backendDone: false,
     pageFilesTotal: 0,
     pageFilesProcessed: 0,
     startedAtMs: 0,
   }
   let extractionProgressRunId = 0
+  let extractionCompletionCheckRunId = 0
   let latestSelection = []
   let selectableLatestCount = 0
   let selectedLatestCount = 0
-  $: selectableLatestCount = (latestEntries || []).reduce((count, entry) => {
-    return isLatestSelectable(entry) ? count + 1 : count
-  }, 0)
-  $: selectedLatestCount = (latestEntries || []).reduce((count, entry, index) => {
-    return isLatestSelectable(entry) && isLatestSelected(entry, index) ? count + 1 : count
-  }, 0)
+  let selectableLatestKeysCurrent = []
   let allLatestSelected = false
-  $: allLatestSelected = selectableLatestCount > 0 && latestEntries
-    .filter((entry) => isLatestSelectable(entry))
-    .every((entry, index) => {
-    const key = latestSelectionKey(entry, index)
-    return key && latestSelection.includes(key)
-  })
+  function selectableLatestKeys(entries = []) {
+    return entries.reduce((keys, entry, index) => {
+      if (!isLatestSelectable(entry)) return keys
+      const key = latestSelectionKey(entry, index)
+      if (key) keys.push(key)
+      return keys
+    }, [])
+  }
+  $: selectableLatestKeysCurrent = selectableLatestKeys(latestEntries || [])
+  $: selectableLatestCount = selectableLatestKeysCurrent.length
+  $: selectedLatestCount = selectableLatestKeysCurrent.reduce((count, key) => {
+    return latestSelection.includes(key) ? count + 1 : count
+  }, 0)
+  $: allLatestSelected = selectableLatestCount > 0 && selectedLatestCount === selectableLatestCount
   let enqueueStatus = ''
   let processMarkedLimit = 10
   let processMarkedStatus = ''
   let processingMarked = false
+  let ingestTrackedRequest = {
+    active: false,
+    requestId: '',
+    jobIds: [],
+    withDownload: false,
+  }
+  let ingestJobProgress = {
+    pending: 0,
+    running: 0,
+    completed: 0,
+    failed: 0,
+    cancelled: 0,
+    total: 0,
+    updatedAt: '',
+    daemonOnline: null,
+    daemonLastSeenAt: '',
+    error: '',
+  }
+  let ingestProgressPollTimer = null
+  let ingestLastProgressSignature = ''
+  const INGEST_PROGRESS_POLL_MS = 2000
+  $: ingestProgressDone = ingestJobProgress.total > 0 &&
+    ingestJobProgress.pending === 0 &&
+    ingestJobProgress.running === 0
+  $: ingestProgressRatio = ingestJobProgress.total > 0
+    ? (ingestJobProgress.completed + ingestJobProgress.failed + ingestJobProgress.cancelled) / ingestJobProgress.total
+    : 0
   let ingestRuns = []
   let ingestRunsStatus = ''
+  let seedSources = []
+  let seedSourcesStatus = ''
+  let expandedSeedSourceId = ''
+  let seedCandidatesBySource = {}
+  let seedCandidatesLoading = {}
+  let seedSelections = {}
+  let seedSelectionVersions = {}
+  let selectedSeedCandidateKeys = {}
+  let seedActionStatus = ''
+  let seedActionBusy = false
+  let seedLastRunKey = ''
 
   let searchQuery = ''
   let searchMode = 'query'
   let searchSeedJson = ''
   let searchField = 'default'
+  let searchAuthor = ''
   let yearFrom = ''
   let yearTo = ''
-  let includeDownstream = true
+  let includeDownstream = false
   let includeUpstream = false
-  let relatedDepthDownstream = 1
-  let relatedDepthUpstream = 1
+  let relatedDepthDownstream = 0
+  let relatedDepthUpstream = 0
   let maxRelated = 30
   let keywordRecursionConfig = {
-    includeDownstream: true,
+    includeDownstream: false,
     includeUpstream: false,
-    relatedDepthDownstream: 1,
-    relatedDepthUpstream: 1,
+    relatedDepthDownstream: 0,
+    relatedDepthUpstream: 0,
     maxRelated: 30,
   }
   let searchResults = []
@@ -171,32 +259,26 @@
   }, 0)
 
   const CORPUS_PAGE_SIZE = 120
-  const RAW_STATUSES = new Set(['no_metadata', 'extract_references_from_pdf', 'pending'])
-  const FAILED_STATUSES = new Set(['failed_enrichments', 'failed_downloads'])
+  const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending'])
+  const FAILED_STATUSES = new Set(['failed_enrichment', 'failed_download'])
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
   let corpusLoading = false
   let corpusLoadingMore = false
+  let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
   let corpusSource = ''
-  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichments: 0, failed_downloads: 0 }
+  let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
   $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
-  $: metaItems = corpusItems.filter(i => i.status === 'with_metadata' || i.status === 'to_download_references')
-  $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded_references')
+  $: metaItems = corpusItems.filter(i => i.status === 'enriching' || i.status === 'matched' || i.status === 'queued_download')
+  $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded')
   $: failedItems = corpusItems.filter(i => FAILED_STATUSES.has(i.status))
   $: rawTotal = Number(corpusStageTotals?.raw || 0)
   $: metadataTotal = Number(corpusStageTotals?.metadata || 0)
   $: downloadedTotal = Number(corpusStageTotals?.downloaded || 0)
-  $: failedEnrichmentTotal = Number(corpusStageTotals?.failed_enrichments || 0)
-  let selectedCorpusItemKey = ''
-  $: corpusSelectionRows = [
-    ...rawItems.map((item) => ({ bucket: 'raw', item })),
-    ...metaItems.map((item) => ({ bucket: 'metadata', item })),
-    ...downloadedItems.map((item) => ({ bucket: 'downloaded', item })),
-    ...failedItems.map((item) => ({ bucket: 'failed', item })),
-  ]
-  $: selectedCorpusRow = corpusSelectionRows.find((row) => corpusItemKey(row.item, row.bucket) === selectedCorpusItemKey) || null
+  $: failedEnrichmentTotal = Number(corpusStageTotals?.failed_enrichment || 0)
+  $: failedDownloadTotal = Number(corpusStageTotals?.failed_download || 0)
   let corpusRowElements = {
     raw: new Map(),
     metadata: new Map(),
@@ -215,6 +297,7 @@
   let downloadsSource = ''
   let downloadsQuery = ''
   let downloadsStatusFilter = 'all'
+  $: recentDownloads = downloads.filter((item) => item.status === 'downloaded').slice(0, 10)
   $: filteredDownloads = downloads.filter((item) => {
     const statusOk = downloadsStatusFilter === 'all' || item.status === downloadsStatusFilter
     if (!statusOk) return false
@@ -225,6 +308,9 @@
   let downloadWorker = {
     running: false,
     in_flight: false,
+    queued_jobs: 0,
+    running_jobs: 0,
+    queued_download_items: 0,
     started_at: null,
     last_tick_at: null,
     last_result: null,
@@ -245,6 +331,17 @@
   }
   let pipelineWorkerStatus = ''
   let pipelineWorkerBusy = false
+  let daemonStatus = { online: false, workers: {}, last_seen_at: null, status: 'offline' }
+  let workerBacklog = {
+    raw_pending: 0,
+    enriching: 0,
+    matched: 0,
+    queued_download: 0,
+    downloading: 0,
+    downloaded: 0,
+    failed_enrichment: 0,
+    failed_download: 0,
+  }
   let exportBusy = false
   let exportStatus = ''
   let exportFilterStatus = 'all'
@@ -302,9 +399,22 @@
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
   $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
+  $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && (isAdmin || currentCorpus?.role === 'owner' || currentCorpus?.role === 'editor'))
   let shareUsername = ''
   let shareRole = 'viewer'
   let shareStatus = ''
+  let inviteUsername = ''
+  let inviteEmail = ''
+  let inviteStatus = ''
+  let inviteError = false
+  let kantroposTargets = []
+  let kantroposAssignment = null
+  let selectedKantroposTargetId = ''
+  let kantroposAssignmentStatus = ''
+  let kantroposAssignmentError = false
+  let kantroposAssignmentLoading = false
+  let kantroposAssignmentSaving = false
+  let kantroposAssignmentRequestSeq = 0
 
   const maxLogs = 200
   const maxLogHistory = 5000
@@ -316,12 +426,50 @@
     logsTailStatus = ''
   }
 
+  function resetKantroposAssignmentState() {
+    kantroposAssignment = null
+    selectedKantroposTargetId = ''
+    kantroposAssignmentStatus = ''
+    kantroposAssignmentError = false
+    kantroposAssignmentLoading = false
+    kantroposAssignmentSaving = false
+  }
+
   function formatBytes(bytes) {
     if (bytes === 0) return '0 B'
     const k = 1024
     const sizes = ['B', 'KB', 'MB', 'GB']
     const i = Math.floor(Math.log(bytes) / Math.log(k))
     return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
+  }
+
+  function parseAuthFlowFromHash() {
+    if (typeof window === 'undefined') return { flow: 'login', token: '' }
+    const raw = String(window.location.hash || '').replace(/^#\/?/, '')
+    const [pathPart = '', queryPart = ''] = raw.split('?')
+    const path = pathPart.trim()
+    const params = new URLSearchParams(queryPart)
+    if (path === 'forgot-password') {
+      return { flow: 'forgot-password', token: '' }
+    }
+    if (path === 'accept-invite') {
+      return { flow: 'accept-invite', token: params.get('token') || '' }
+    }
+    if (path === 'reset-password') {
+      return { flow: 'reset-password', token: params.get('token') || '' }
+    }
+    return { flow: 'login', token: '' }
+  }
+
+  function applyAuthFlowFromHash() {
+    const next = parseAuthFlowFromHash()
+    authFlow = next.flow
+    authFlowToken = next.token
+    authInfo = ''
+    authError = ''
+    authEmail = ''
+    authPassword = ''
+    authPasswordConfirm = ''
   }
 
   function updateUpload(id, patch) {
@@ -341,6 +489,14 @@
     }
     if (Array.isArray(entry.author)) return entry.author.join(', ')
     return entry.authors || entry.author || ''
+  }
+
+  function normalizeCorpusItem(entry) {
+    if (!entry || typeof entry !== 'object') return entry
+    return {
+      ...entry,
+      authors_display: formatAuthors(entry),
+    }
   }
 
   function formatTitle(entry) {
@@ -387,12 +543,13 @@
   function formatPipelineStatus(statusRaw) {
     const status = String(statusRaw || '').trim()
     const map = {
-      no_metadata: { label: 'Raw', tone: 'queued' },
-      with_metadata: { label: 'With metadata', tone: 'completed' },
-      to_download_references: { label: 'With metadata', tone: 'in_progress' },
-      downloaded_references: { label: 'Downloaded', tone: 'completed' },
-      failed_enrichments: { label: 'Enrich failed', tone: 'in_progress' },
-      failed_downloads: { label: 'Download failed', tone: 'in_progress' },
+      raw: { label: 'Raw', tone: 'queued' },
+      enriching: { label: 'Enriching', tone: 'in_progress' },
+      matched: { label: 'Matched', tone: 'completed' },
+      queued_download: { label: 'Queued download', tone: 'in_progress' },
+      downloaded: { label: 'Downloaded', tone: 'completed' },
+      failed_enrichment: { label: 'Enrich failed', tone: 'in_progress' },
+      failed_download: { label: 'Download failed', tone: 'in_progress' },
     }
     if (map[status]) return { ...map[status], raw: status }
     if (!status) return { label: 'Unknown', tone: 'in_progress', raw: '' }
@@ -411,14 +568,6 @@
   function pipelineStatusTitle(statusRaw) {
     const st = formatPipelineStatus(statusRaw)
     return st.raw || st.label
-  }
-
-  function corpusItemKey(item, bucket) {
-    if (!item) return ''
-    const id = String(item.id ?? '')
-    const status = String(item.status || '')
-    const title = String(item.title || '').trim().toLowerCase()
-    return `${bucket || 'unknown'}|${status}|${id}|${title}`
   }
 
   function corpusMotionKey(stage, id) {
@@ -471,6 +620,24 @@
         toStage,
         itemId,
         destItemId: Number.isFinite(destItemId) ? destItemId : null,
+      }
+    } catch (error) {
+      return null
+    }
+  }
+
+  function parseExtractionEventMessage(raw) {
+    if (typeof raw !== 'string' || !raw.startsWith('{')) return null
+    try {
+      const parsed = JSON.parse(raw)
+      if (!parsed || parsed.kind !== 'extraction' || parsed.event !== 'done') return null
+      return {
+        corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
+        baseName: String(parsed.base_name || '').trim(),
+        filename: String(parsed.filename || '').trim(),
+        status: String(parsed.status || 'success').trim().toLowerCase(),
+        mode: String(parsed.mode || '').trim().toLowerCase(),
+        reason: String(parsed.reason || '').trim(),
       }
     } catch (error) {
       return null
@@ -587,20 +754,9 @@
     }
   }
 
-  function isCorpusItemSelected(item, bucket) {
-    const key = corpusItemKey(item, bucket)
-    return key !== '' && key === selectedCorpusItemKey
-  }
-
-  function toggleCorpusItemSelection(item, bucket) {
-    const key = corpusItemKey(item, bucket)
-    if (!key) return
-    selectedCorpusItemKey = selectedCorpusItemKey === key ? '' : key
-  }
-
   function bucketLabel(bucket) {
     if (bucket === 'raw') return 'Raw'
-    if (bucket === 'metadata') return 'With metadata'
+    if (bucket === 'metadata') return 'Metadata'
     if (bucket === 'downloaded') return 'Downloaded'
     if (bucket === 'failed') return 'Failed'
     return 'Unknown'
@@ -634,8 +790,8 @@
 
     includeDownstream = Boolean(next.includeDownstream)
     includeUpstream = Boolean(next.includeUpstream)
-    relatedDepthDownstream = Math.max(1, Number(next.relatedDepthDownstream))
-    relatedDepthUpstream = Math.max(1, Number(next.relatedDepthUpstream))
+    relatedDepthDownstream = Math.max(0, Number(next.relatedDepthDownstream))
+    relatedDepthUpstream = Math.max(0, Number(next.relatedDepthUpstream))
     maxRelated = Math.max(1, Number(next.maxRelated))
 
     keywordRecursionConfig = {
@@ -674,8 +830,162 @@
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
+  function stopIngestProgressPolling() {
+    if (ingestProgressPollTimer) {
+      clearInterval(ingestProgressPollTimer)
+      ingestProgressPollTimer = null
+    }
+  }
+
+  function resetIngestProgressTracking() {
+    stopIngestProgressPolling()
+    ingestTrackedRequest = {
+      active: false,
+      requestId: '',
+      jobIds: [],
+      withDownload: false,
+    }
+    ingestJobProgress = {
+      pending: 0,
+      running: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      total: 0,
+      updatedAt: '',
+      daemonOnline: null,
+      daemonLastSeenAt: '',
+      error: '',
+    }
+    ingestLastProgressSignature = ''
+  }
+
+  function applyIngestJobsSummary(summary) {
+    const counts = summary?.counts || {}
+    const daemon = summary?.daemon || {}
+    const next = {
+      pending: Number(counts.pending || 0),
+      running: Number(counts.running || 0),
+      completed: Number(counts.completed || 0),
+      failed: Number(counts.failed || 0),
+      cancelled: Number(counts.cancelled || 0),
+      total: Number(counts.total || 0),
+      updatedAt: new Date().toISOString(),
+      daemonOnline: daemon?.online === true ? true : daemon?.online === false ? false : null,
+      daemonLastSeenAt: String(daemon?.last_seen_at || '').trim(),
+      error: '',
+    }
+    ingestJobProgress = next
+
+    if (next.running > 0) {
+      processMarkedStatus = `Background processing... running ${next.running}, queued ${next.pending}.`
+      seedActionStatus = `Background processing... running ${next.running}, queued ${next.pending}.`
+    } else if (next.pending > 0) {
+      processMarkedStatus = `Queued for background processing... ${next.pending} job${next.pending === 1 ? '' : 's'} waiting.`
+      seedActionStatus = `Queued for background processing... ${next.pending} job${next.pending === 1 ? '' : 's'} waiting.`
+    } else if (next.total > 0) {
+      if (next.failed > 0 || next.cancelled > 0) {
+        processMarkedStatus = `Finished with issues: ${next.completed} completed, ${next.failed} failed, ${next.cancelled} cancelled.`
+        seedActionStatus = `Finished with issues: ${next.completed} completed, ${next.failed} failed, ${next.cancelled} cancelled.`
+      } else {
+        processMarkedStatus = `Finished: ${next.completed} job${next.completed === 1 ? '' : 's'} completed.`
+        seedActionStatus = `Finished: ${next.completed} job${next.completed === 1 ? '' : 's'} completed.`
+      }
+    }
+  }
+
+  async function refreshIngestJobProgress() {
+    if (!ingestTrackedRequest.active || !Array.isArray(ingestTrackedRequest.jobIds) || ingestTrackedRequest.jobIds.length === 0) {
+      return
+    }
+    try {
+      const summary = await fetchPipelineJobsSummary({
+        jobIds: ingestTrackedRequest.jobIds,
+        recentLimit: Math.max(50, ingestTrackedRequest.jobIds.length),
+      })
+      applyIngestJobsSummary(summary)
+
+      const signature = [
+        ingestJobProgress.pending,
+        ingestJobProgress.running,
+        ingestJobProgress.completed,
+        ingestJobProgress.failed,
+        ingestJobProgress.cancelled,
+      ].join(':')
+      if (signature !== ingestLastProgressSignature) {
+        ingestLastProgressSignature = signature
+        const refreshTasks = [
+          loadIngestStats({ quiet: true }),
+        ...(diagnosticsEnabled ? [loadIngestStats({ quiet: true, global: true }), loadPipelineDaemonStatus({ quiet: true, global: true })] : []),
+          ...(diagnosticsEnabled ? [loadIngestStats({ quiet: true, global: true }), loadPipelineDaemonStatus({ quiet: true, global: true })] : []),
+          loadCorpus({ preserveSelection: true, quiet: true }),
+        ]
+        if (diagnosticsEnabled) {
+          refreshTasks.push(loadDownloads())
+        }
+        await Promise.all(refreshTasks)
+      }
+
+      if (ingestProgressDone) {
+        stopIngestProgressPolling()
+        ingestTrackedRequest = { ...ingestTrackedRequest, active: false }
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      ingestJobProgress = {
+        ...ingestJobProgress,
+        error: error?.message || 'Failed to load queued job progress.',
+      }
+    }
+  }
+
+  function startIngestProgressPolling() {
+    stopIngestProgressPolling()
+    ingestProgressPollTimer = setInterval(() => {
+      refreshIngestJobProgress()
+    }, INGEST_PROGRESS_POLL_MS)
+  }
+
+  async function trackIngestQueuedJobs(payload, { withDownload = false } = {}) {
+    const jobIdsFromPayload = Array.isArray(payload?.jobs)
+      ? payload.jobs.map((job) => Number(job?.id)).filter((v) => Number.isFinite(v) && v > 0)
+      : []
+    const fallbackJobIds = [payload?.enrich_job_id, payload?.download_job_id]
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v) && v > 0)
+    const jobIds = [...new Set([...jobIdsFromPayload, ...fallbackJobIds])]
+
+    if (jobIds.length === 0) {
+      resetIngestProgressTracking()
+      return
+    }
+
+    ingestTrackedRequest = {
+      active: true,
+      requestId: String(payload?.request_id || ''),
+      jobIds,
+      withDownload: Boolean(withDownload),
+    }
+    ingestJobProgress = {
+      ...ingestJobProgress,
+      pending: jobIds.length,
+      total: jobIds.length,
+      updatedAt: new Date().toISOString(),
+      error: '',
+    }
+    await refreshIngestJobProgress()
+    if (ingestTrackedRequest.active) {
+      startIngestProgressPolling()
+    }
+  }
+
   function beginExtractionProgress(baseName, backendFilename = '') {
     extractionProgressRunId += 1
+    extractionCompletionCheckRunId = 0
     extractionProgress = {
       active: true,
       runId: extractionProgressRunId,
@@ -685,6 +995,7 @@
       detail: 'Extraction queued...',
       percent: 2,
       indeterminate: true,
+      backendDone: false,
       pageFilesTotal: 0,
       pageFilesProcessed: 0,
       startedAtMs: Date.now(),
@@ -692,6 +1003,7 @@
   }
 
   function finishExtractionProgress() {
+    extractionCompletionCheckRunId = 0
     extractionProgress = {
       active: false,
       runId: 0,
@@ -701,18 +1013,20 @@
       detail: '',
       percent: 0,
       indeterminate: false,
+      backendDone: false,
       pageFilesTotal: 0,
       pageFilesProcessed: 0,
       startedAtMs: 0,
     }
   }
 
-  function updateExtractionProgress({ phase, detail, percent, indeterminate, pageFilesTotal, pageFilesProcessed } = {}) {
+  function updateExtractionProgress({ phase, detail, percent, indeterminate, backendDone, pageFilesTotal, pageFilesProcessed } = {}) {
     if (!extractionProgress.active) return
     const next = { ...extractionProgress }
     if (phase) next.phase = phase
     if (typeof detail === 'string') next.detail = detail
     if (typeof indeterminate === 'boolean') next.indeterminate = indeterminate
+    if (typeof backendDone === 'boolean') next.backendDone = backendDone
     if (Number.isFinite(Number(pageFilesTotal)) && Number(pageFilesTotal) >= 0) {
       next.pageFilesTotal = Number(pageFilesTotal)
     }
@@ -725,6 +1039,77 @@
       next.percent = Math.max(next.percent || 0, bounded)
     }
     extractionProgress = next
+  }
+
+  async function finalizeExtractionAfterBackendCompletion(detail = 'No bibliography entries found in this PDF.') {
+    if (!extractionProgress.active) return
+    const runId = extractionProgress.runId
+    if (!runId || extractionCompletionCheckRunId === runId) return
+    extractionCompletionCheckRunId = runId
+    const baseName = String(latestEntriesBase || extractionProgress.baseName || '').trim()
+
+    try {
+      if (baseName) {
+        const payload = await fetchBibliographyEntries(baseName)
+        if (!extractionProgress.active || extractionProgress.runId !== runId) return
+        const items = payload.items || []
+        if (payload.seed_document) {
+          latestSeedDocument = payload.seed_document
+        }
+        latestEntries = Array.isArray(items) ? items : []
+        latestSelection = []
+        if (latestEntries.length > 0) {
+          latestEntriesStatus = `Loaded ${latestEntries.length} entries.`
+        } else {
+          latestEntriesStatus = detail
+        }
+        updateExtractionProgress({
+          phase: 'completed',
+          detail: latestEntries.length > 0 ? 'Extraction complete.' : detail,
+          percent: 100,
+          indeterminate: false,
+        })
+        await loadSeedSources({ quiet: true })
+        await focusSeedSource('pdf', baseName)
+        await loadIngestStats()
+        await loadIngestRuns()
+        const completedRunId = extractionProgress.runId
+        setTimeout(() => {
+          if (extractionProgress.active && extractionProgress.runId === completedRunId) {
+            finishExtractionProgress()
+          }
+        }, 1200)
+        return
+      }
+
+      if (!extractionProgress.active || extractionProgress.runId !== runId) return
+      latestEntries = []
+      latestSelection = []
+      latestEntriesStatus = detail
+      updateExtractionProgress({
+        phase: 'completed',
+        detail,
+        percent: 100,
+        indeterminate: false,
+      })
+      finishExtractionProgress()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        finishExtractionProgress()
+        return
+      }
+      if (!extractionProgress.active || extractionProgress.runId !== runId) return
+      latestEntriesStatus = detail
+      updateExtractionProgress({
+        phase: 'completed',
+        detail,
+        percent: 100,
+        indeterminate: false,
+      })
+      finishExtractionProgress()
+    }
   }
 
   function updateExtractionProgressFromLog(logLine) {
@@ -786,6 +1171,16 @@
       return
     }
 
+    if (text.includes('Triggering inline citation fallback') || text.includes('No extracted page PDFs found')) {
+      updateExtractionProgress({
+        phase: 'inline_fallback',
+        detail: 'No reference pages found. Trying inline extraction...',
+        percent: 68,
+        indeterminate: true,
+      })
+      return
+    }
+
     const foundFilesMatch = text.match(/Found\s+(\d+)\s+PDF files/i)
     if (foundFilesMatch && text.includes('[APIscraper')) {
       const total = Number(foundFilesMatch[1])
@@ -833,11 +1228,54 @@
       return
     }
 
+    if (text.includes('No bibliography found by API')) {
+      updateExtractionProgress({
+        phase: 'finalizing',
+        detail: 'No bibliography entries found. Finalizing...',
+        percent: 98,
+        indeterminate: false,
+        backendDone: true,
+      })
+      return
+    }
+
+    const explicitDoneMatch = text.match(/\[extract-status\]\[corpus=.*?\]\[base=(.*?)\]\[file=(.*?)\]\s+done\s+status=(success|failed)(?:\s+mode=([^\s]+))?(?:\s+reason=(.+))?/i)
+    if (explicitDoneMatch) {
+      const [, signalBase = '', signalFile = '', signalStatus = 'success'] = explicitDoneMatch
+      const baseMatches = base && signalBase === base
+      const fileMatches = backendName && signalFile === backendName
+      if (!baseMatches && !fileMatches) return
+      updateExtractionProgress({
+        phase: signalStatus === 'success' ? 'finalizing' : 'completed',
+        detail: signalStatus === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
+        percent: signalStatus === 'success' ? 98 : 100,
+        indeterminate: false,
+        backendDone: true,
+      })
+      if (signalStatus === 'success') {
+        void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
+      } else {
+        latestEntriesStatus = 'Extraction failed.'
+        finishExtractionProgress()
+      }
+      return
+    }
+
     if (text.includes('Bibliography extraction complete for')) {
       updateExtractionProgress({
-        phase: 'completed',
-        detail: 'Extraction complete.',
-        percent: 100,
+        phase: 'finalizing',
+        detail: 'Finalizing extracted entries...',
+        percent: 98,
+        indeterminate: false,
+      })
+      return
+    }
+
+    if (text.includes('Finished APIscraper inline fallback')) {
+      updateExtractionProgress({
+        phase: 'finalizing',
+        detail: 'Finalizing extracted entries...',
+        percent: 98,
         indeterminate: false,
       })
     }
@@ -856,6 +1294,9 @@
       text.includes('[pipeline-worker mark]') ||
       text.includes('[pipeline-worker enrich]') ||
       text.includes('[download-worker] done') ||
+      text.includes('[DAEMON] Picked up job') ||
+      text.includes('[DAEMON] Successfully completed job') ||
+      text.includes('[DAEMON] Job ') ||
       text.includes('[SUCCESS] Inserted') ||
       text.includes('Bibliography extraction complete') ||
       text.includes('Finished APIscraper') ||
@@ -880,14 +1321,22 @@
       if (pipelineRefreshInFlight || authStatus !== 'authenticated') return
       pipelineRefreshInFlight = true
       try {
-        await Promise.all([
+        const tasks = [
           loadIngestStats({ quiet: true }),
           loadIngestRuns(),
-          loadCorpus({ preserveSelection: true, quiet: true }),
-          loadPipelineWorkerStatus({ quiet: true }),
-          loadDownloadWorkerStatus({ quiet: true }),
-          loadDownloads(),
-        ])
+        ]
+        // The corpus tab is selection-heavy; avoid replacing the list on every worker tick.
+        if (activeTab !== 'corpus') {
+          tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
+        }
+        if (diagnosticsEnabled) {
+          tasks.push(
+            loadPipelineWorkerStatus({ quiet: true }),
+            loadDownloadWorkerStatus({ quiet: true }),
+            loadDownloads(),
+          )
+        }
+        await Promise.all(tasks)
       } finally {
         pipelineRefreshInFlight = false
       }
@@ -911,9 +1360,10 @@
 
   function shouldRunLiveRefresh() {
     if (authStatus !== 'authenticated') return false
-    if (pipelineWorker.running || pipelineWorker.in_flight) return true
-    if (downloadWorker.running || downloadWorker.in_flight) return true
-    return activeTab === 'corpus' || activeTab === 'dashboard' || activeTab === 'downloads'
+    if (ingestTrackedRequest.active) return true
+    if (diagnosticsEnabled && (pipelineWorker.running || pipelineWorker.in_flight)) return true
+    if (diagnosticsEnabled && (downloadWorker.running || downloadWorker.in_flight)) return true
+    return activeTab === 'workspace' || activeTab === 'dashboard' || activeTab === 'downloads'
   }
 
   async function runLiveRefreshCycle() {
@@ -921,13 +1371,18 @@
     if (pipelineRefreshInFlight) return
     pipelineRefreshInFlight = true
     try {
-      await Promise.all([
+      const tasks = [
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
-        loadDownloads(),
-        loadDownloadWorkerStatus({ quiet: true }),
-        loadPipelineWorkerStatus({ quiet: true }),
-      ])
+      ]
+      if (diagnosticsEnabled) {
+        tasks.push(
+          loadDownloads(),
+          loadDownloadWorkerStatus({ quiet: true }),
+          loadPipelineWorkerStatus({ quiet: true }),
+        )
+      }
+      await Promise.all(tasks)
     } finally {
       pipelineRefreshInFlight = false
     }
@@ -944,19 +1399,23 @@
     try {
       const tasks = [
         loadIngestStats({ quiet: true }),
-        loadPipelineWorkerStatus({ quiet: true }),
-        loadDownloadWorkerStatus({ quiet: true }),
       ]
-      if (tabId === 'dashboard' || tabId === 'corpus') {
+      if (diagnosticsEnabled) {
+        tasks.push(
+          loadPipelineWorkerStatus({ quiet: true }),
+          loadDownloadWorkerStatus({ quiet: true }),
+        )
+      }
+      if (tabId === 'workspace' && seedSources.length === 0) {
+        tasks.push(loadSeedSources({ quiet: true }))
+      }
+      if (tabId === 'dashboard' || tabId === 'workspace') {
         tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
       }
-      if (tabId === 'dashboard' || tabId === 'downloads') {
+      if (diagnosticsEnabled && (tabId === 'dashboard' || tabId === 'downloads')) {
         tasks.push(loadDownloads())
       }
-      if (tabId === 'ingest') {
-        tasks.push(loadIngestRuns())
-      }
-      if (tabId === 'graph') {
+      if (diagnosticsEnabled && tabId === 'graph') {
         tasks.push(loadGraph())
       }
       await Promise.all(tasks)
@@ -965,7 +1424,7 @@
     }
   }
 
-  async function bootstrapAuth() {
+  async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
     authStatus = 'loading'
     authError = ''
     try {
@@ -974,9 +1433,16 @@
       corpora = payload.corpora || []
       currentCorpusId = authUser?.last_corpus_id || (corpora[0]?.id ?? null)
       authStatus = 'authenticated'
+      if (!preserveAuthFlow) {
+        authFlow = 'login'
+        authFlowToken = ''
+      }
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
+      if (!preserveAuthFlow) {
+        setActiveTab('workspace', { replace: true })
+      }
     } catch (error) {
       authStatus = 'unauthenticated'
       authError = ''
@@ -1002,14 +1468,124 @@
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
       authStatus = 'authenticated'
+      authFlow = 'login'
+      authFlowToken = ''
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
+      setActiveTab('workspace', { replace: true })
     } catch (error) {
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
       setAuthToken('')
+    }
+  }
+
+  async function handleForgotPassword(event) {
+    event?.preventDefault?.()
+    authError = ''
+    authInfo = ''
+    try {
+      await requestPasswordReset(authEmail.trim())
+      authInfo = 'If that email exists, a reset link has been sent.'
+      authEmail = ''
+    } catch (error) {
+      authError = error.message || 'Failed to send password reset email'
+    }
+  }
+
+  async function handleAcceptInvite(event) {
+    event?.preventDefault?.()
+    authError = ''
+    authInfo = ''
+    if (!authFlowToken) {
+      authError = 'Invite token is missing.'
+      return
+    }
+    if (authPassword.length < 8) {
+      authError = 'Password must be at least 8 characters.'
+      return
+    }
+    if (authPassword !== authPasswordConfirm) {
+      authError = 'Passwords do not match.'
+      return
+    }
+    try {
+      const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
+      if (payload?.user) {
+        authUser = payload.user
+        currentCorpusId = payload.user.last_corpus_id || null
+      }
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
+      authStatus = 'authenticated'
+      authFlow = 'login'
+      authFlowToken = ''
+      await loadRecursionConfig()
+      await refreshAll()
+      connectLogs()
+      setActiveTab('workspace', { replace: true })
+    } catch (error) {
+      authError = error.message || 'Failed to accept invite'
+    }
+  }
+
+  async function handleResetPassword(event) {
+    event?.preventDefault?.()
+    authError = ''
+    authInfo = ''
+    if (!authFlowToken) {
+      authError = 'Reset token is missing.'
+      return
+    }
+    if (authPassword.length < 8) {
+      authError = 'Password must be at least 8 characters.'
+      return
+    }
+    if (authPassword !== authPasswordConfirm) {
+      authError = 'Passwords do not match.'
+      return
+    }
+    try {
+      const payload = await resetPassword({ token: authFlowToken, password: authPassword })
+      if (payload?.user) {
+        authUser = payload.user
+        currentCorpusId = payload.user.last_corpus_id || null
+      }
+      const me = await fetchMe()
+      authUser = me.user
+      corpora = me.corpora || []
+      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
+      authStatus = 'authenticated'
+      authFlow = 'login'
+      authFlowToken = ''
+      await loadRecursionConfig()
+      await refreshAll()
+      connectLogs()
+      setActiveTab('workspace', { replace: true })
+    } catch (error) {
+      authError = error.message || 'Failed to reset password'
+    }
+  }
+
+  async function handleCreateInvitation(event) {
+    event?.preventDefault?.()
+    inviteStatus = ''
+    inviteError = false
+    try {
+      const payload = await createUserInvitation({
+        username: inviteUsername.trim(),
+        email: inviteEmail.trim(),
+      })
+      inviteStatus = `Invitation sent to ${payload.email}.`
+      inviteUsername = ''
+      inviteEmail = ''
+    } catch (error) {
+      inviteStatus = error.message || 'Failed to create invitation'
+      inviteError = true
     }
   }
 
@@ -1026,17 +1602,27 @@
   }
 
   async function refreshAll() {
-    await loadIngestStats()
-    await loadIngestRuns()
-    await loadCorpus()
-    await loadDownloads()
-    await loadDownloadWorkerStatus()
-    await loadPipelineWorkerStatus()
-    await loadGraph()
+    const tasks = [
+      loadSeedSources(),
+      loadIngestStats(),
+      loadIngestRuns(),
+      loadCorpus(),
+      loadKantroposAssignment(),
+    ]
+    if (diagnosticsEnabled) {
+      tasks.push(
+        loadDownloads(),
+        loadDownloadWorkerStatus(),
+        loadPipelineWorkerStatus(),
+        loadGraph(),
+      )
+    }
+    await Promise.all(tasks)
   }
 
   function resetFrontendState() {
-    ingestStats = { no_metadata: 0, with_metadata: 0, to_download_references: 0, downloaded_references: 0 }
+    resetIngestProgressTracking()
+    ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
     ingestStatsStatus = ''
     latestEntries = []
     latestEntriesStatus = ''
@@ -1047,6 +1633,15 @@
     processMarkedStatus = ''
     ingestRuns = []
     ingestRunsStatus = ''
+    seedSources = []
+    seedSourcesStatus = ''
+    expandedSeedSourceId = ''
+    seedCandidatesBySource = {}
+    seedCandidatesLoading = {}
+    seedSelections = {}
+    seedActionStatus = ''
+    seedActionBusy = false
+    seedLastRunKey = ''
     searchQuery = ''
     searchSeedJson = ''
     searchResults = []
@@ -1061,7 +1656,6 @@
     corpusLoadStatus = ''
     corpusSource = ''
     corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
-    selectedCorpusItemKey = ''
     downloads = []
     downloadsSource = ''
     downloadsQuery = ''
@@ -1085,6 +1679,7 @@
     promotionHighlights = new Set()
     corpusActionStatus = ''
     corpusActionError = false
+    resetKantroposAssignmentState()
     finishExtractionProgress()
   }
 
@@ -1204,10 +1799,87 @@
     }
   }
 
+  async function loadKantroposTargets() {
+    try {
+      const payload = await fetchKantroposCorpora()
+      kantroposTargets = payload?.corpora || []
+    } catch (error) {
+      kantroposTargets = []
+      kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
+      kantroposAssignmentError = true
+    }
+  }
+
+  async function loadKantroposAssignment() {
+    const corpusId = Number(currentCorpusId)
+    const requestSeq = ++kantroposAssignmentRequestSeq
+    resetKantroposAssignmentState()
+    if (!Number.isFinite(corpusId) || corpusId <= 0) return
+    kantroposAssignmentLoading = true
+    try {
+      if (kantroposTargets.length === 0) {
+        await loadKantroposTargets()
+      }
+      const payload = await fetchCorpusKantroposAssignment(corpusId)
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      kantroposTargets = payload?.corpora || kantroposTargets
+      kantroposAssignment = payload?.assignment || null
+      selectedKantroposTargetId = payload?.assignment?.target_id || ''
+      if (!payload?.can_edit && currentCorpus?.role !== 'viewer') {
+        // no-op; backend truth is enough, UI editability still derives from current corpus role
+      }
+    } catch (error) {
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      kantroposAssignmentStatus = error.message || 'Failed to load Kantropos assignment.'
+      kantroposAssignmentError = true
+    } finally {
+      if (requestSeq === kantroposAssignmentRequestSeq && Number(currentCorpusId) === corpusId) {
+        kantroposAssignmentLoading = false
+      }
+    }
+  }
+
+  async function handleSaveKantroposAssignment() {
+    kantroposAssignmentStatus = ''
+    kantroposAssignmentError = false
+    const corpusId = Number(currentCorpusId)
+    if (!Number.isFinite(corpusId) || corpusId <= 0) {
+      kantroposAssignmentStatus = 'Select a corpus first.'
+      kantroposAssignmentError = true
+      return
+    }
+    if (!canConfigureCurrentCorpusKantropos) {
+      kantroposAssignmentStatus = 'Only corpus owners, editors, or the global admin can change the Kantropos assignment.'
+      kantroposAssignmentError = true
+      return
+    }
+    kantroposAssignmentSaving = true
+    try {
+      const payload = await saveCorpusKantroposAssignment(corpusId, selectedKantroposTargetId || null)
+      kantroposAssignment = payload?.assignment || null
+      selectedKantroposTargetId = payload?.assignment?.target_id || ''
+      kantroposAssignmentStatus = kantroposAssignment
+        ? `Assigned to Kantropos corpus "${kantroposAssignment.target_name}".`
+        : 'Cleared Kantropos assignment.'
+      kantroposAssignmentError = false
+    } catch (error) {
+      kantroposAssignmentStatus = error.message || 'Failed to save Kantropos assignment.'
+      kantroposAssignmentError = true
+    } finally {
+      kantroposAssignmentSaving = false
+    }
+  }
+
+  async function handleKantroposTargetChange(event) {
+    selectedKantroposTargetId = String(event?.target?.value || '')
+    await handleSaveKantroposAssignment()
+  }
+
   async function loadLatestEntries(baseName, { waitForExtraction = false } = {}) {
     if (!waitForExtraction && extractionProgress.active) {
       finishExtractionProgress()
     }
+    const waitRunId = waitForExtraction ? extractionProgress.runId : 0
     latestEntriesBase = baseName
     latestSeedDocument = null
     latestEntriesStatus = waitForExtraction ? 'Waiting for extracted entries...' : 'Loading extracted entries...'
@@ -1218,6 +1890,9 @@
     const pollIntervalMs = waitForExtraction ? 2_000 : 1_500
 
     while (Date.now() - startedAt < maxWaitMs) {
+      if (waitForExtraction && waitRunId && extractionProgress.runId !== waitRunId) {
+        return
+      }
       try {
         const payload = await fetchBibliographyEntries(baseName)
         const items = payload.items || []
@@ -1226,8 +1901,16 @@
         }
         if (Array.isArray(items) && items.length > 0) {
           latestEntries = items
-          latestEntriesStatus = `Loaded ${items.length} entries.`
           if (waitForExtraction) {
+            if (!extractionProgress.backendDone) {
+              latestEntriesStatus = `Extracted ${items.length} entr${items.length === 1 ? 'y' : 'ies'} so far...`
+            } else {
+              latestEntriesStatus = `Loaded ${items.length} entries.`
+            }
+          } else {
+            latestEntriesStatus = `Loaded ${items.length} entries.`
+          }
+          if (waitForExtraction && extractionProgress.backendDone) {
             updateExtractionProgress({
               phase: 'completed',
               detail: 'Extraction complete.',
@@ -1241,8 +1924,11 @@
                 finishExtractionProgress()
               }
             }, 1200)
+            return
           }
-          return
+          if (!waitForExtraction) {
+            return
+          }
         }
       } catch (error) {
         if (error?.status === 401) {
@@ -1259,7 +1945,11 @@
       }
       if (waitForExtraction) {
         const elapsedSec = Math.floor((Date.now() - startedAt) / 1000)
-        latestEntriesStatus = `Waiting for extracted entries... ${elapsedSec}s`
+        if (!latestEntries.length) {
+          latestEntriesStatus = extractionProgress.backendDone
+            ? `Finalizing extracted entries... ${elapsedSec}s`
+            : `Waiting for extracted entries... ${elapsedSec}s`
+        }
       } else {
         latestEntriesStatus = 'Loading extracted entries...'
       }
@@ -1267,11 +1957,35 @@
     }
 
     if (waitForExtraction) {
-      latestEntriesStatus = 'Extraction still running. Waiting for entries to appear...'
+      latestEntriesStatus = extractionProgress.backendDone
+        ? 'Finalizing extracted entries...'
+        : 'Extraction still running. Waiting for entries to appear...'
     } else {
       latestEntriesStatus = 'No extracted entries found.'
     }
   }
+
+  function clearLatestEntriesView() {
+    if (extractionProgress.active) {
+      finishExtractionProgress()
+    }
+    latestEntries = []
+    latestEntriesBase = ''
+    latestSeedDocument = null
+    latestEntriesStatus = ''
+    latestSelection = []
+  }
+
+  async function handleToggleLatestRun(baseName) {
+    const normalized = String(baseName || '').trim()
+    if (!normalized) return
+    if (String(latestEntriesBase || '').trim() === normalized) {
+      clearLatestEntriesView()
+      return
+    }
+    await loadLatestEntries(normalized)
+  }
+
   function latestSelectionKey(entry, index = -1) {
     const primaryId = entry?.id ?? entry?.entry_id
     if (primaryId !== null && primaryId !== undefined && String(primaryId).trim() !== '') {
@@ -1303,11 +2017,21 @@
 
   function latestIngestState(entry) {
     const state = String(entry?.ingest_state || '').trim().toLowerCase()
-    if (state === 'downloaded' || state === 'enriched' || state === 'pending') {
+    if ([
+      'added',
+      'pending',
+      'staged_raw',
+      'queued_enrichment',
+      'enriched',
+      'queued_download',
+      'downloaded',
+      'downloaded_elsewhere',
+      'failed_enrichment',
+      'failed_download',
+    ].includes(state)) {
       return state
     }
-    // Backward compatibility for older API payloads.
-    return Number(entry?.processed || 0) > 0 ? 'enriched' : 'pending'
+    return 'pending'
   }
 
   function isLatestDownloaded(entry) {
@@ -1318,8 +2042,30 @@
     return latestIngestState(entry) === 'enriched'
   }
 
+  function latestIngestTag(entry) {
+    const state = latestIngestState(entry)
+    switch (state) {
+      case 'downloaded':
+        return { label: 'Downloaded', className: 'downloaded' }
+      case 'queued_download':
+        return { label: 'Queued DL', className: 'queued' }
+      case 'enriched':
+        return { label: 'Enriched', className: 'completed' }
+      case 'queued_enrichment':
+        return { label: 'Queued', className: 'queued' }
+      case 'staged_raw':
+        return { label: 'Raw', className: 'pending' }
+      case 'failed_enrichment':
+        return { label: 'Enrich Fail', className: 'failed' }
+      case 'failed_download':
+        return { label: 'Download Fail', className: 'failed' }
+      default:
+        return { label: 'Pending', className: 'pending' }
+    }
+  }
+
   function isLatestSelectable(entry) {
-    return hasLatestEntryId(entry) && latestIngestState(entry) === 'pending'
+    return hasLatestEntryId(entry) && ['pending', 'staged_raw'].includes(latestIngestState(entry))
   }
 
   function isLatestSelected(entry, index = -1) {
@@ -1334,10 +2080,18 @@
   }
 
   function selectAllLatest() {
-    latestSelection = (latestEntries || [])
-      .filter((entry) => isLatestSelectable(entry))
-      .map((entry, index) => latestSelectionKey(entry, index))
-      .filter(Boolean)
+    latestSelection = selectableLatestKeys(latestEntries || [])
+  }
+
+  function toggleLatestSelection(entry, index) {
+    if (!isLatestSelectable(entry)) return;
+    const key = latestSelectionKey(entry, index);
+    if (!key) return;
+    if (latestSelection.includes(key)) {
+      latestSelection = latestSelection.filter(k => k !== key);
+    } else {
+      latestSelection = [...latestSelection, key];
+    }
   }
 
   async function enqueueSelectedLatest(withDownload = false) {
@@ -1353,7 +2107,7 @@
     enqueueStatus = `Marking ${ids.length} entries for enrichment...`
     try {
       const payload = await enqueueIngestEntries(ids)
-      enqueueStatus = `Marked ${payload.marked} (staged: ${payload.staged}, already processed: ${payload.already_processed}, duplicates: ${payload.duplicates}). Starting enrichment...`
+      enqueueStatus = `Marked ${payload.marked} (staged: ${payload.staged}, already present downstream: ${payload.already_processed}, duplicates: ${payload.duplicates}). Starting enrichment...`
       await loadDownloads()
       await loadIngestStats()
       
@@ -1362,12 +2116,6 @@
         // Set limit to match what was just marked, or default to a reasonable batch size
         processMarkedLimit = Math.max(10, payload.marked + payload.staged)
         await processMarkedBatch({ withDownload })
-        
-        // Also ensure the global pipeline worker is running so downloads actually happen
-        if (withDownload && !pipelineWorker.running) {
-          enqueueStatus += ' Starting background downloader...'
-          await handleStartPipelineWorker()
-        }
       } else {
         enqueueStatus += ' No new entries to enrich.'
       }
@@ -1405,7 +2153,12 @@
         enqueueDownload: withDownload,
         downloadBatchSize: Math.max(25, limit),
       })
-      processMarkedStatus = payload.message || 'Enrichment job queued. Check Pipeline Status for progress.'
+      processMarkedStatus = payload.message || 'Jobs queued successfully.'
+      if (payload?.jobs?.length > 0) {
+        await trackIngestQueuedJobs(payload, { withDownload })
+      } else {
+        resetIngestProgressTracking()
+      }
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -1477,9 +2230,11 @@
     try {
       await extractBibliography(item.backendFilename)
       updateUpload(item.id, { status: 'extracted', message: 'Extraction started' })
-      await loadLatestEntries(baseName, { waitForExtraction: true })
-      await loadIngestStats()
-      await loadIngestRuns()
+      latestEntriesBase = baseName
+      latestSeedDocument = null
+      latestEntries = []
+      latestSelection = []
+      latestEntriesStatus = 'Waiting for extraction to finish...'
     } catch (error) {
       finishExtractionProgress()
       if (error?.status === 401) {
@@ -1507,11 +2262,15 @@
     }
   }
 
-  async function loadIngestStats({ quiet = false } = {}) {
+  async function loadIngestStats({ quiet = false, global = false } = {}) {
     if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
     try {
-      const payload = await fetchIngestStats()
-      ingestStats = payload.stats || ingestStats
+      const payload = await fetchIngestStats({ global })
+      if (global) {
+        globalIngestStats = payload.stats || globalIngestStats
+      } else {
+        ingestStats = payload.stats || ingestStats
+      }
       if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
@@ -1524,22 +2283,526 @@
     }
   }
 
-  async function runSearch() {
-    searchStatus = 'Searching...'
+  function seedSourceId(source) {
+    if (!source) return ''
+    return String(source.id || `${source.source_type}:${source.source_key}`)
+  }
+
+  function seedCandidateState(candidate) {
+    const state = String(candidate?.state || '').trim().toLowerCase()
+    if ([
+      'added',
+      'pending',
+      'staged_raw',
+      'queued_enrichment',
+      'enriched',
+      'queued_download',
+      'downloaded',
+      'downloaded_elsewhere',
+      'failed_enrichment',
+      'failed_download',
+    ].includes(state)) {
+      return state
+    }
+    return 'pending'
+  }
+
+  function isSeedCandidateInCorpus(candidate) {
+    return Boolean(candidate?.in_corpus)
+  }
+
+  function summarizeSeedCandidateStates(candidates = []) {
+    const counts = {
+      in_corpus: 0,
+      added: 0,
+      pending: 0,
+      staged_raw: 0,
+      queued_enrichment: 0,
+      enriched: 0,
+      queued_download: 0,
+      downloaded: 0,
+      downloaded_elsewhere: 0,
+      failed_enrichment: 0,
+      failed_download: 0,
+    }
+    for (const candidate of candidates) {
+      if (isSeedCandidateInCorpus(candidate)) {
+        counts.in_corpus += 1
+      }
+      const state = seedCandidateState(candidate)
+      counts[state] = (counts[state] || 0) + 1
+    }
+    return counts
+  }
+
+  function reconcileSeedSourceCandidates(sourceId, candidates) {
+    const nextCandidates = Array.isArray(candidates) ? candidates : []
+    if (nextCandidates.length === 0) {
+      seedSources = seedSources.filter((source) => seedSourceId(source) !== sourceId)
+      seedSelections = Object.fromEntries(
+        Object.entries(seedSelections).filter(([key]) => key !== sourceId)
+      )
+      selectedSeedCandidateKeys = Object.fromEntries(
+        Object.entries(selectedSeedCandidateKeys).filter(([key]) => key !== sourceId)
+      )
+      if (expandedSeedSourceId === sourceId) {
+        expandedSeedSourceId = ''
+      }
+      return
+    }
+    const activeKey = selectedSeedCandidateKeys[sourceId]
+    if (activeKey) {
+      const stillExists = nextCandidates.some((candidate) => String(candidate?.candidate_key || '') === activeKey)
+      if (!stillExists) {
+        selectedSeedCandidateKeys = {
+          ...selectedSeedCandidateKeys,
+          [sourceId]: '',
+        }
+      }
+    }
+    const nextCounts = summarizeSeedCandidateStates(nextCandidates)
+    seedSources = seedSources.map((source) => {
+      if (seedSourceId(source) !== sourceId) return source
+      return {
+        ...source,
+        candidate_count: nextCandidates.length,
+        state_counts: nextCounts,
+      }
+    })
+  }
+
+  function seedCandidateTag(candidate) {
+    switch (seedCandidateState(candidate)) {
+      case 'downloaded':
+        return { label: 'Downloaded', className: 'downloaded' }
+      case 'downloaded_elsewhere':
+        return { label: 'Elsewhere', className: 'elsewhere' }
+      case 'queued_download':
+        return { label: 'Queued DL', className: 'queued' }
+      case 'enriched':
+        return { label: 'Metadata', className: 'completed' }
+      case 'queued_enrichment':
+        return { label: 'Queued', className: 'queued' }
+      case 'staged_raw':
+        return { label: 'Raw', className: 'pending' }
+      case 'added':
+        return { label: 'Added', className: 'completed' }
+      case 'failed_enrichment':
+        return { label: 'Enrich Fail', className: 'failed' }
+      case 'failed_download':
+        return { label: 'Download Fail', className: 'failed' }
+      default:
+        return { label: 'Pending', className: 'pending' }
+    }
+  }
+
+  function isSeedCandidateSelectable(candidate) {
+    return seedCandidateState(candidate) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
+  }
+
+  function getSeedCandidatesForSource(source) {
+    return seedCandidatesBySource[seedSourceId(source)] || []
+  }
+
+  function getSeedSelectionForSource(source) {
+    return seedSelections[seedSourceId(source)] || []
+  }
+
+  function selectedSeedCount(source) {
+    return getSeedSelectionForSource(source).length
+  }
+
+  function promotableSeedCandidateKeys(source) {
+    return getSeedCandidatesForSource(source)
+      .filter((candidate) => isSeedCandidateSelectable(candidate))
+      .map((candidate) => String(candidate?.candidate_key || ''))
+      .filter(Boolean)
+  }
+
+  function promotableSeedCount(source) {
+    return promotableSeedCandidateKeys(source).length
+  }
+
+  function getSelectedSeedCandidate(source) {
+    const sourceId = seedSourceId(source)
+    const activeKey = selectedSeedCandidateKeys[sourceId]
+    if (!activeKey) return null
+    return getSeedCandidatesForSource(source).find((candidate) =>
+      String(candidate?.candidate_key || '') === activeKey
+    ) || null
+  }
+
+  function selectableSeedCount(source) {
+    return getSeedCandidatesForSource(source).filter((candidate) => isSeedCandidateSelectable(candidate)).length
+  }
+
+  function estimatedSelectableSeedCount(source) {
+    const loadedCount = selectableSeedCount(source)
+    if (loadedCount > 0) return loadedCount
+    const total = Number(source?.candidate_count || 0)
+    const inCorpus = Number(source?.state_counts?.in_corpus || 0)
+    const downloaded = Number(source?.state_counts?.downloaded || 0)
+    return Math.max(0, total - Math.max(inCorpus, downloaded))
+  }
+
+  function isSeedCandidateSelected(source, candidate) {
+    return getSeedSelectionForSource(source).includes(String(candidate?.candidate_key || ''))
+  }
+
+  function setSelectedSeedCandidate(source, candidate) {
+    const sourceId = seedSourceId(source)
+    const candidateKey = String(candidate?.candidate_key || '')
+    if (!sourceId || !candidateKey) return
+    selectedSeedCandidateKeys = {
+      ...selectedSeedCandidateKeys,
+      [sourceId]: candidateKey,
+    }
+  }
+
+  function toggleSeedCandidateSelection(source, candidate) {
+    const sourceId = seedSourceId(source)
+    const candidateKey = String(candidate?.candidate_key || '')
+    if (!sourceId || !candidateKey || !isSeedCandidateSelectable(candidate)) return
+    const current = seedSelections[sourceId] || []
+    seedSelections = current.includes(candidateKey)
+      ? { ...seedSelections, [sourceId]: current.filter((value) => value !== candidateKey) }
+      : { ...seedSelections, [sourceId]: [...current, candidateKey] }
+    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+  }
+
+  function clearSeedSelection(source) {
+    const sourceId = seedSourceId(source)
+    if (!sourceId) return
+    seedSelections = { ...seedSelections, [sourceId]: [] }
+    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+  }
+
+  function selectAllSeedCandidates(source) {
+    const sourceId = seedSourceId(source)
+    if (!sourceId) return
+    const keys = getSeedCandidatesForSource(source)
+      .filter((candidate) => isSeedCandidateSelectable(candidate))
+      .map((candidate) => String(candidate.candidate_key || ''))
+      .filter(Boolean)
+    seedSelections = { ...seedSelections, [sourceId]: keys }
+    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+  }
+
+  async function setAllSeedCandidatesSelected(source, checked) {
+    if (checked) {
+      const sourceId = seedSourceId(source)
+      if (!sourceId) return
+      if (!Array.isArray(seedCandidatesBySource[sourceId]) || seedCandidatesBySource[sourceId].length === 0) {
+        await loadSeedCandidatesForSource(source, { quiet: true })
+      }
+      selectAllSeedCandidates(source)
+      return
+    }
+    clearSeedSelection(source)
+  }
+
+  async function loadSeedSources({ quiet = false } = {}) {
+    if (!quiet) seedSourcesStatus = 'Loading seed sources...'
     try {
-      const query = searchMode === 'query' ? searchQuery : ''
-      const seedJson = searchMode === 'seed' ? searchSeedJson : ''
-      const { data, source, expansion } = await runKeywordSearch({
-        query,
-        seedJson,
-        field: searchField,
-        yearFrom,
-        yearTo,
+      const payload = await fetchSeedSources(100)
+      seedSources = payload.sources || []
+      const validSourceIds = new Set(seedSources.map((source) => seedSourceId(source)))
+      if (!quiet && expandedSeedSourceId && !validSourceIds.has(expandedSeedSourceId)) {
+        expandedSeedSourceId = ''
+      }
+      seedSelections = Object.fromEntries(
+        Object.entries(seedSelections).filter(([key]) => validSourceIds.has(key))
+      )
+      if (!quiet) {
+        seedSourcesStatus = seedSources.length > 0
+          ? `Loaded ${seedSources.length} seed source${seedSources.length === 1 ? '' : 's'}.`
+          : 'No seed sources yet.'
+      }
+      if (expandedSeedSourceId) {
+        const expandedSource = seedSources.find((source) => seedSourceId(source) === expandedSeedSourceId)
+        if (expandedSource) {
+          await loadSeedCandidatesForSource(expandedSource, { quiet: true, background: true })
+        }
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seed sources.'
+    }
+  }
+
+  async function loadSeedCandidatesForSource(source, { quiet = false, background = false } = {}) {
+    const sourceId = seedSourceId(source)
+    if (!sourceId) return
+    const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
+    const showLoadingState = !background || !hasCachedCandidates
+    if (showLoadingState) {
+      seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: true }
+    }
+    try {
+      const payload = await fetchSeedCandidates(source.source_type, source.source_key)
+      const nextCandidates = payload.candidates || []
+      seedCandidatesBySource = {
+        ...seedCandidatesBySource,
+        [sourceId]: nextCandidates,
+      }
+      reconcileSeedSourceCandidates(sourceId, nextCandidates)
+      if (nextCandidates.length === 0) {
+        return
+      }
+      const allowed = new Set(nextCandidates.map((candidate) => String(candidate.candidate_key || '')).filter(Boolean))
+      const selectable = new Set(
+        nextCandidates
+          .filter((candidate) => isSeedCandidateSelectable(candidate))
+          .map((candidate) => String(candidate.candidate_key || ''))
+          .filter(Boolean)
+      )
+      seedSelections = {
+        ...seedSelections,
+        [sourceId]: (seedSelections[sourceId] || []).filter((key) => allowed.has(key) && selectable.has(key)),
+      }
+      if (!quiet) {
+        seedActionStatus = ''
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+      } else if (!quiet) {
+        seedActionStatus = error?.message || 'Failed to load seed candidates.'
+      }
+    } finally {
+      if (showLoadingState) {
+        seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: false }
+      }
+    }
+  }
+
+  async function toggleSeedSource(source) {
+    const sourceId = seedSourceId(source)
+    if (!sourceId) return
+    if (expandedSeedSourceId === sourceId) {
+      expandedSeedSourceId = ''
+      return
+    }
+    const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
+    expandedSeedSourceId = sourceId
+    void loadSeedCandidatesForSource(source, {
+      quiet: hasCachedCandidates,
+      background: hasCachedCandidates,
+    })
+  }
+
+  async function focusSeedSource(sourceType, sourceKey) {
+    const nextSourceId = `${sourceType}:${sourceKey}`
+    if (!seedSources.some((source) => seedSourceId(source) === nextSourceId)) {
+      await loadSeedSources({ quiet: true })
+    }
+    const source = seedSources.find((entry) => seedSourceId(entry) === nextSourceId)
+    if (!source) return
+    const hasCachedCandidates = Array.isArray(seedCandidatesBySource[nextSourceId])
+    expandedSeedSourceId = nextSourceId
+    seedLastRunKey = nextSourceId
+    void loadSeedCandidatesForSource(source, {
+      quiet: true,
+      background: hasCachedCandidates,
+    })
+  }
+
+  async function handlePromoteSeedSource(source) {
+    const sourceId = seedSourceId(source)
+    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    if (candidateKeys.length === 0) {
+      seedActionStatus = 'Select at least one seed candidate to promote.'
+      return
+    }
+    seedActionBusy = true
+    seedActionStatus = `Queueing ${candidateKeys.length} candidate(s) for background processing...`
+    try {
+      const payload = await promoteSeedCandidates(source.source_type, source.source_key, {
+        candidateKeys,
         includeDownstream,
         includeUpstream,
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        enqueueDownload: true,
+        downloadBatchSize: Math.max(25, candidateKeys.length),
+        workers: 6,
+      })
+      seedActionStatus = payload.message || 'Promotion queued.'
+      clearSeedSelection(source)
+      if (payload?.jobs?.length > 0) {
+        await trackIngestQueuedJobs(payload, { withDownload: true })
+      } else {
+        resetIngestProgressTracking()
+      }
+      const refreshTasks = [
+        loadIngestStats({ quiet: true }),
+        loadCorpus({ preserveSelection: true, quiet: true }),
+      ]
+      if (diagnosticsEnabled) {
+        refreshTasks.push(
+          loadDownloads(),
+          loadDownloadWorkerStatus({ quiet: true }),
+        )
+      }
+      await Promise.all(refreshTasks)
+      const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
+      if (refreshedSource) {
+        await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      seedActionStatus = error?.message || 'Failed to promote seed candidates.'
+    } finally {
+      seedActionBusy = false
+    }
+  }
+
+  async function handlePromoteWholeSeedSource(source) {
+    const candidateCount = Math.max(
+      0,
+      Number(source?.candidate_count || 0)
+        - Number(source?.state_counts?.in_corpus || 0)
+        - Number(source?.state_counts?.downloaded || 0)
+    )
+    if (candidateCount === 0) {
+      seedActionStatus = 'No promotable seed candidates remain in this source.'
+      return
+    }
+    seedActionBusy = true
+    seedActionStatus = `Queueing all promotable candidates from this source for background processing...`
+    try {
+      const payload = await promoteSeedCandidates(source.source_type, source.source_key, {
+        candidateKeys: [],
+        includeDownstream,
+        includeUpstream,
+        relatedDepthDownstream,
+        relatedDepthUpstream,
+        maxRelated,
+        enqueueDownload: true,
+        downloadBatchSize: Math.max(25, candidateCount),
+        workers: 6,
+      })
+      seedActionStatus = payload.message || 'Promotion queued.'
+      clearSeedSelection(source)
+      if (payload?.jobs?.length > 0) {
+        await trackIngestQueuedJobs(payload, { withDownload: true })
+      } else {
+        resetIngestProgressTracking()
+      }
+      const refreshTasks = [
+        loadIngestStats({ quiet: true }),
+        loadCorpus({ preserveSelection: true, quiet: true }),
+      ]
+      if (diagnosticsEnabled) {
+        refreshTasks.push(
+          loadDownloads(),
+          loadDownloadWorkerStatus({ quiet: true }),
+        )
+      }
+      await Promise.all(refreshTasks)
+      const sourceId = seedSourceId(source)
+      const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
+      if (refreshedSource) {
+        await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      seedActionStatus = error?.message || 'Failed to promote seed candidates.'
+    } finally {
+      seedActionBusy = false
+    }
+  }
+
+  async function handleDismissSelectedSeed(source) {
+    const sourceId = seedSourceId(source)
+    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    if (candidateKeys.length === 0) {
+      seedActionStatus = 'Select at least one seed candidate to dismiss.'
+      return
+    }
+    seedActionBusy = true
+    seedActionStatus = `Removing ${candidateKeys.length} candidate(s) from Seed...`
+    try {
+      await dismissSeedCandidatesApi(source.source_type, source.source_key, candidateKeys)
+      clearSeedSelection(source)
+      await Promise.all([
+        loadIngestStats({ quiet: true }),
+      ])
+      const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
+      if (refreshedSource) {
+        await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
+      }
+      seedActionStatus = `Removed ${candidateKeys.length} candidate(s) from Seed.`
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      seedActionStatus = error?.message || 'Failed to dismiss seed candidates.'
+    } finally {
+      seedActionBusy = false
+    }
+  }
+
+  async function handleRemoveSeedSource(source) {
+    if (!window.confirm(`Remove "${source.label}" from Seed?`)) return
+    seedActionBusy = true
+    seedActionStatus = `Removing ${source.label} from Seed...`
+    try {
+      await removeSeedSource(source.source_type, source.source_key)
+      const sourceId = seedSourceId(source)
+      seedSources = seedSources.filter((entry) => seedSourceId(entry) !== sourceId)
+      seedSelections = Object.fromEntries(
+        Object.entries(seedSelections).filter(([key]) => key !== sourceId)
+      )
+      if (expandedSeedSourceId === sourceId) {
+        expandedSeedSourceId = ''
+      }
+      seedActionStatus = `Removed ${source.label} from Seed.`
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      seedActionStatus = error?.message || 'Failed to remove seed source.'
+    } finally {
+      seedActionBusy = false
+    }
+  }
+
+  async function runSearch() {
+    searchStatus = 'Searching...'
+    try {
+      const query = searchMode === 'query' ? searchQuery : ''
+      const seedJson = searchMode === 'seed' ? searchSeedJson : ''
+      const { data, source, expansion, runId } = await runKeywordSearch({
+        query,
+        seedJson,
+        field: searchField,
+        author: searchAuthor,
+        yearFrom,
+        yearTo,
+        includeDownstream: false,
+        includeUpstream: false,
+        relatedDepthDownstream: 0,
+        relatedDepthUpstream: 0,
+        maxRelated: 30,
       })
       searchResults = data
       searchSource = source
@@ -1547,8 +2810,12 @@
       searchQueueStatus = ''
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
       searchStatus = source === 'api'
-        ? `Results loaded from API.${suffix}`
+        ? `Added ${data.length} candidate(s) to Seed.${suffix}`
         : 'Sample results loaded.'
+      if (source === 'api' && runId) {
+        await loadSeedSources({ quiet: true })
+        await focusSeedSource('search', runId)
+      }
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1572,8 +2839,8 @@
     return {
       includeDownstream: Boolean(includeDownstream),
       includeUpstream: Boolean(includeUpstream),
-      relatedDepthDownstream: Math.max(1, Number(relatedDepthDownstream) || 1),
-      relatedDepthUpstream: Math.max(1, Number(relatedDepthUpstream) || 1),
+      relatedDepthDownstream: Math.max(0, Number(relatedDepthDownstream) || 0),
+      relatedDepthUpstream: Math.max(0, Number(relatedDepthUpstream) || 0),
       maxRelated: Math.max(1, Number(maxRelated) || 1),
     }
   }
@@ -1610,6 +2877,16 @@
 
   function selectAllSearchResults() {
     searchSelection = (searchResults || []).map((result, index) => searchResultKey(result, index)).filter(Boolean)
+  }
+
+  function toggleSearchSelection(result, index) {
+    const key = searchResultKey(result, index);
+    if (!key) return;
+    if (searchSelection.includes(key)) {
+      searchSelection = searchSelection.filter(k => k !== key);
+    } else {
+      searchSelection = [...searchSelection, key];
+    }
   }
 
   function buildSeedItemFromSearchResult(result) {
@@ -1662,10 +2939,11 @@
             query: '',
             seedJson: seedPayload,
             field: 'default',
+            author: '',
             includeDownstream: Boolean(cfg.includeDownstream),
             includeUpstream: Boolean(cfg.includeUpstream),
-            relatedDepthDownstream: Math.max(1, Number(cfg.relatedDepthDownstream) || 1),
-            relatedDepthUpstream: Math.max(1, Number(cfg.relatedDepthUpstream) || 1),
+            relatedDepthDownstream: Math.max(0, Number(cfg.relatedDepthDownstream) || 0),
+            relatedDepthUpstream: Math.max(0, Number(cfg.relatedDepthUpstream) || 0),
             maxRelated: Math.max(1, Number(cfg.maxRelated) || 1),
             enqueue: true,
             fallbackToSample: false,
@@ -1698,7 +2976,7 @@
             ? ` ${failures.length} item(s) failed${failures[0] ? ` (first: ${failures[0]})` : ''}.`
             : ''
         const pipelineSuffix = startPipeline && queuedSeeds > 0 ? ' Downloader started.' : ''
-        searchQueueStatus = `Queued ${queuedSeeds} seed item(s); ${queuedWorks} work(s) sent to with_metadata queue.${failSuffix}${pipelineSuffix}`
+        searchQueueStatus = `Queued ${queuedSeeds} seed item(s); ${queuedWorks} work(s) sent to the download queue.${failSuffix}${pipelineSuffix}`
       }
     } finally {
       searchQueueBusy = false
@@ -1710,9 +2988,9 @@
     searchQuery = ''
     searchSeedJson = ''
     searchField = 'default'
+    searchAuthor = ''
     yearFrom = ''
     yearTo = ''
-    applyKeywordRecursionDefaults(keywordRecursionConfig)
     searchStatus = ''
     searchSource = ''
     searchSelection = []
@@ -1721,6 +2999,11 @@
   }
 
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
+    if (!append && corpusLoading) return
+    if (!append && quiet && corpusLoadingMore) return
+
+    const requestSeq = ++corpusLoadRequestSeq
+    const requestCorpusId = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
     const scrollSnapshot = !append && preserveSelection ? snapshotCorpusScroll() : null
     if (append) {
       if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
@@ -1729,20 +3012,23 @@
     } else {
       corpusLoading = true
       if (!quiet) {
-        corpusLoadStatus = 'Loading corpus entries...'
-        corpusItems = []
-        corpusTotal = 0
-        corpusHasMore = false
-        corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichments: 0, failed_downloads: 0 }
-      }
-      if (!preserveSelection) {
-        selectedCorpusItemKey = ''
+        corpusLoadStatus = corpusItems.length > 0 ? 'Refreshing corpus entries...' : 'Loading corpus entries...'
       }
     }
     try {
       const offset = append ? corpusItems.length : 0
-      const { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset })
-      const incoming = Array.isArray(data) ? data : []
+      const requestedLimit =
+        append
+          ? CORPUS_PAGE_SIZE
+          : quiet && preserveSelection
+            ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
+            : CORPUS_PAGE_SIZE
+      const { data, total, source, stageTotals } = await fetchCorpus({ limit: requestedLimit, offset })
+      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      const currentCorpusNumeric = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+      if (requestSeq !== corpusLoadRequestSeq || requestCorpusId !== currentCorpusNumeric) {
+        return
+      }
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
       corpusHasMore = corpusItems.length < corpusTotal
@@ -1752,8 +3038,8 @@
           raw: Number(stageTotals.raw || 0),
           metadata: Number(stageTotals.metadata || 0),
           downloaded: Number(stageTotals.downloaded || 0),
-          failed_enrichments: Number(stageTotals.failed_enrichments || 0),
-          failed_downloads: Number(stageTotals.failed_downloads || 0),
+          failed_enrichment: Number(stageTotals.failed_enrichment || 0),
+          failed_download: Number(stageTotals.failed_download || 0),
         }
       }
       if (corpusSource === 'sample') {
@@ -1779,8 +3065,10 @@
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
       }
     } finally {
-      corpusLoading = false
-      corpusLoadingMore = false
+      if (requestSeq === corpusLoadRequestSeq) {
+        corpusLoading = false
+        corpusLoadingMore = false
+      }
     }
   }
 
@@ -1813,11 +3101,38 @@
     }
   }
 
-  async function loadPipelineWorkerStatus({ quiet = false } = {}) {
-    if (!quiet) pipelineWorkerStatus = 'Loading global pipeline status...'
+  async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
+    if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
     try {
-      const payload = await fetchPipelineWorkerStatus()
-      pipelineWorker = payload || pipelineWorker
+      const payload = await fetchPipelineDaemonStatus({ global })
+      if (global) {
+        globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
+        return
+      }
+      daemonStatus = payload?.daemon || daemonStatus
+      workerBacklog = payload?.backlog || workerBacklog
+      const enrich = daemonStatus?.workers?.enrich || {}
+      const download = daemonStatus?.workers?.download || {}
+      pipelineWorker = {
+        ...pipelineWorker,
+        running: Boolean(enrich.online),
+        in_flight: String(enrich.status || '').toLowerCase() === 'running',
+        started_at: enrich.last_seen_at || null,
+        last_tick_at: enrich.last_seen_at || null,
+        last_result: enrich.details || null,
+        last_error: enrich.status === 'error' ? JSON.stringify(enrich.details || {}) : null,
+      }
+      downloadWorker = {
+        ...downloadWorker,
+        running: Boolean(download.online),
+        in_flight: String(download.status || '').toLowerCase() === 'running',
+        started_at: download.last_seen_at || null,
+        last_tick_at: download.last_seen_at || null,
+        last_result: download.details || null,
+        last_error: download.status === 'error' ? JSON.stringify(download.details || {}) : null,
+        queued_download_items: Number(workerBacklog?.queued_download || 0),
+        running_jobs: Number(workerBacklog?.downloading || 0),
+      }
       if (!quiet) pipelineWorkerStatus = ''
     } catch (error) {
       if (error?.status === 401) {
@@ -1825,7 +3140,7 @@
         setAuthToken('')
         return
       }
-      if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load global pipeline status.'
+      if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load worker status.'
     }
   }
 
@@ -1887,7 +3202,7 @@
     pipelineWorkerStatus = 'Pausing all pipeline workers...'
     try {
       await pauseAllPipelineWorkers({ force: true })
-      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads()])
+      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads(), ...(diagnosticsEnabled ? [loadIngestStats({ global: true }), loadPipelineDaemonStatus({ global: true })] : [])])
       pipelineWorkerStatus = 'Global pause complete.'
     } catch (error) {
       if (error?.status === 401) {
@@ -1906,9 +3221,13 @@
     downloadWorkerBusy = true
     downloadWorkerStatus = 'Starting worker...'
     try {
-      await startDownloadWorker()
+      const result = await startDownloadWorker()
       await loadDownloadWorkerStatus()
-      downloadWorkerStatus = 'Worker started (auto throughput mode).'
+      if (Number(result?.queued_jobs || 0) === 0 && Number(result?.queued_download_items || 0) === 0) {
+        downloadWorkerStatus = 'No queued download items for this corpus. Enrich/promote items first.'
+      } else {
+        downloadWorkerStatus = 'Worker started (auto throughput mode).'
+      }
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -1993,6 +3312,29 @@
       exportStatus = error?.message || 'Failed to export corpus data.'
     } finally {
       exportBusy = false
+    }
+  }
+
+  async function handleDownloadedCorpusFile(item) {
+    const itemId = Number(item?.id);
+    if (!Number.isFinite(itemId) || itemId <= 0) return;
+    try {
+      const { blob, filename } = await downloadCorpusItemFile(itemId)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      corpusLoadStatus = error?.message || 'Failed to download file.'
     }
   }
   function applyGraphData(data, source, statusText = '') {
@@ -2153,6 +3495,29 @@
         const promotionEvent = parsePromotionEventMessage(event.data)
         if (promotionEvent) {
           queuePromotionAnimation(promotionEvent)
+          return
+        }
+        const extractionEvent = parseExtractionEventMessage(event.data)
+        if (extractionEvent) {
+          const currentCorpus = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+          const corpusMatches = extractionEvent.corpusId === null || currentCorpus === null || extractionEvent.corpusId === currentCorpus
+          const baseMatches = extractionProgress.baseName && extractionEvent.baseName === extractionProgress.baseName
+          const fileMatches = extractionProgress.backendFilename && extractionEvent.filename === extractionProgress.backendFilename
+          if (extractionProgress.active && corpusMatches && (baseMatches || fileMatches)) {
+            updateExtractionProgress({
+              phase: extractionEvent.status === 'success' ? 'finalizing' : 'completed',
+              detail: extractionEvent.status === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
+              percent: extractionEvent.status === 'success' ? 98 : 100,
+              indeterminate: false,
+              backendDone: true,
+            })
+            if (extractionEvent.status === 'success') {
+              void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
+            } else {
+              latestEntriesStatus = 'Extraction failed.'
+              finishExtractionProgress()
+            }
+          }
           return
         }
         const line = event.data
@@ -2828,13 +4193,19 @@
     return label.length > max ? `${label.slice(0, max - 1)}…` : label
   }
 
-  const tabIds = new Set(tabGroups.flatMap(group => group.tabs).map(tab => tab.id))
+  $: tabIds = new Set(tabGroups.flatMap(group => group.tabs).map(tab => tab.id))
+
+  function normalizeTab(tabId) {
+    if (tabId === 'seed' || tabId === 'corpus') return 'workspace'
+    return tabId
+  }
 
   function readTabFromHash() {
     if (typeof window === 'undefined') return null
     const raw = window.location.hash || ''
     const cleaned = raw.replace(/^#\/?/, '').trim()
-    return tabIds.has(cleaned) ? cleaned : null
+    const normalized = normalizeTab(cleaned)
+    return tabIds.has(normalized) ? normalized : null
   }
 
   function updateHash(tabId, replace = false) {
@@ -2849,10 +4220,11 @@
   }
 
   function setActiveTab(tabId, { replace = false } = {}) {
-    const safeTab = tabIds.has(tabId) ? tabId : 'dashboard'
+    const normalized = normalizeTab(tabId)
+    const safeTab = tabIds.has(normalized) ? normalized : 'workspace'
     activeTab = safeTab
     updateHash(safeTab, replace)
-    if (safeTab === 'corpus' && pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
+    if (safeTab === 'workspace' && pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
       promotionFlushTimer = window.setTimeout(() => {
         promotionFlushTimer = null
         flushPromotionAnimations()
@@ -2862,8 +4234,12 @@
   }
 
   onMount(() => {
-    const initialTab = readTabFromHash() || activeTab
-    setActiveTab(initialTab, { replace: true })
+    const initialAuthFlow = parseAuthFlowFromHash()
+    applyAuthFlowFromHash()
+    if (initialAuthFlow.flow === 'login') {
+      const initialTab = readTabFromHash() || activeTab
+      setActiveTab(initialTab, { replace: true })
+    }
     reducedMotionMediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
     prefersReducedMotion = Boolean(reducedMotionMediaQuery?.matches)
     const onReducedMotionChange = (event) => {
@@ -2872,8 +4248,17 @@
     reducedMotionMediaQuery?.addEventListener?.('change', onReducedMotionChange)
 
     const onHashChange = () => {
+      const authHash = parseAuthFlowFromHash()
+      if (authHash.flow !== 'login') {
+        applyAuthFlowFromHash()
+        return
+      }
+      if (authStatus !== 'authenticated') {
+        applyAuthFlowFromHash()
+        return
+      }
       const tab = readTabFromHash()
-      if (tab && tab !== activeTab) {
+      if (tab && (tab !== activeTab || window.location.hash !== `#/${tab}`)) {
         setActiveTab(tab, { replace: true })
       }
     }
@@ -2887,7 +4272,8 @@
     document.addEventListener('visibilitychange', onFocusOrVisible)
 
     const boot = async () => {
-      await bootstrapAuth()
+      const flow = parseAuthFlowFromHash()
+      await bootstrapAuth({ preserveAuthFlow: flow.flow !== 'login' })
     }
     boot()
 
@@ -2910,6 +4296,7 @@
         clearInterval(liveRefreshIntervalId)
         liveRefreshIntervalId = null
       }
+      stopIngestProgressPolling()
       if (promotionFlushTimer) {
         clearTimeout(promotionFlushTimer)
         promotionFlushTimer = null
@@ -2918,30 +4305,97 @@
   })
 </script>
 
-{#if authStatus !== 'authenticated'}
+{#if authStatus !== 'authenticated' || authFlow !== 'login'}
   <div class="login-shell">
     <div class="login-card">
       <p class="eyebrow">Korpus Builder</p>
-      <h1>Sign in</h1>
-      <p class="subtitle">Use your username and password to access corpora.</p>
-      <form class="login-form" on:submit={handleLogin}>
-        <label>
-          Username
-          <input type="text" bind:value={loginUsername} autocomplete="username" required />
-        </label>
-        <label>
-          Password
-          <input type="password" bind:value={loginPassword} autocomplete="current-password" required />
-        </label>
-        {#if authError}
-          <p class="error">{authError}</p>
-        {/if}
-        <button type="submit">Sign in</button>
-      </form>
+      {#if authFlow === 'accept-invite'}
+        <h1>Set your password</h1>
+        <p class="subtitle">Your account has been created. Set a password to activate it.</p>
+        <form class="login-form" on:submit={handleAcceptInvite}>
+          <label>
+            New password
+            <input type="password" bind:value={authPassword} autocomplete="new-password" required minlength="8" />
+          </label>
+          <label>
+            Confirm password
+            <input type="password" bind:value={authPasswordConfirm} autocomplete="new-password" required minlength="8" />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <button type="submit">Activate account</button>
+        </form>
+      {:else if authFlow === 'reset-password'}
+        <h1>Reset password</h1>
+        <p class="subtitle">Choose a new password for your account.</p>
+        <form class="login-form" on:submit={handleResetPassword}>
+          <label>
+            New password
+            <input type="password" bind:value={authPassword} autocomplete="new-password" required minlength="8" />
+          </label>
+          <label>
+            Confirm password
+            <input type="password" bind:value={authPasswordConfirm} autocomplete="new-password" required minlength="8" />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <button type="submit">Save password</button>
+        </form>
+      {:else if authFlow === 'forgot-password'}
+        <h1>Forgot password</h1>
+        <p class="subtitle">Enter your email address and we will send you a reset link.</p>
+        <form class="login-form" on:submit={handleForgotPassword}>
+          <label>
+            Email
+            <input type="email" bind:value={authEmail} autocomplete="email" required />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <div class="auth-actions">
+            <button type="submit">Send reset link</button>
+            <a href="#/login" class="text-link">Back to sign in</a>
+          </div>
+        </form>
+      {:else}
+        <h1>Sign in</h1>
+        <p class="subtitle">Use your username and password to access corpora.</p>
+        <form class="login-form" on:submit={handleLogin}>
+          <label>
+            Username
+            <input type="text" bind:value={loginUsername} autocomplete="username" required />
+          </label>
+          <label>
+            Password
+            <input type="password" bind:value={loginPassword} autocomplete="current-password" required />
+          </label>
+          {#if authInfo}
+            <p class="muted">{authInfo}</p>
+          {/if}
+          {#if authError}
+            <p class="error">{authError}</p>
+          {/if}
+          <div class="auth-actions">
+            <button type="submit">Sign in</button>
+            <a href="#/forgot-password" class="text-link">Forgot password?</a>
+          </div>
+        </form>
+      {/if}
     </div>
   </div>
 {:else}
-  <div class="app-shell">
+  <div class="app-shell" class:workspace-mode={activeTab === 'workspace'}>
     <header class="app-header">
       <div class="header-main">
         <p class="eyebrow">Korpus Builder</p>
@@ -2963,7 +4417,21 @@
             <span class="header-corpus-label">Corpus</span>
             <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
               {#each corpora as corpus}
-                <option value={corpus.id}>{corpus.name}</option>
+                <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            <span class="header-corpus-label">Kantropos target</span>
+            <select
+              bind:value={selectedKantroposTargetId}
+              on:change={handleKantroposTargetChange}
+              disabled={kantroposAssignmentLoading || kantroposAssignmentSaving || !currentCorpusId || !canConfigureCurrentCorpusKantropos}
+              title={canConfigureCurrentCorpusKantropos ? 'Assign this local corpus to a predefined Kantropos corpus' : 'Only owners or editors can change the Kantropos assignment'}
+            >
+              <option value="">No assignment</option>
+              {#each kantroposTargets as target}
+                <option value={target.id}>{target.name}</option>
               {/each}
             </select>
           </label>
@@ -2984,43 +4452,577 @@
           {#if corpusActionStatus}
             <p class={`${corpusActionError ? 'error' : 'muted'} header-corpus-status`}>{corpusActionStatus}</p>
           {/if}
+          {#if kantroposAssignmentStatus}
+            <p class={`${kantroposAssignmentError ? 'error' : 'muted'} header-corpus-status`}>{kantroposAssignmentStatus}</p>
+          {:else if currentCorpusId && kantroposAssignment?.target_name}
+            <p class="muted header-corpus-status">Kantropos: {kantroposAssignment.target_name}</p>
+          {/if}
         </div>
+        {#if isAdmin}
+          <form class="header-invite" on:submit|preventDefault={handleCreateInvitation}>
+            <label>
+              <span class="header-corpus-label">Invite user</span>
+              <input type="text" placeholder="username" bind:value={inviteUsername} required />
+            </label>
+            <label>
+              <span class="header-corpus-label">Email</span>
+              <input type="email" placeholder="user@example.com" bind:value={inviteEmail} required />
+            </label>
+            <button class="secondary" type="submit">Send invite</button>
+            {#if inviteStatus}
+              <p class={`${inviteError ? 'error' : 'muted'} header-corpus-status`}>{inviteStatus}</p>
+            {/if}
+          </form>
+        {/if}
       </div>
     </header>
 
-  <div class="layout">
-    <aside class="side-nav" data-testid="side-nav">
-      {#each tabGroups as group}
-        <div class="nav-group">
-          <span class="nav-group-title">{group.title}</span>
-          {#each group.tabs as tab}
-            <button
-              class:active={activeTab === tab.id}
-              on:click={() => setActiveTab(tab.id)}
-              type="button"
-              data-testid={`tab-${tab.id}`}
-            >
-              {tab.label}
-            </button>
-          {/each}
-        </div>
-      {/each}
-    </aside>
+  <div class="layout" class:no-side-nav={!showSideNav}>
+    {#if showSideNav}
+      <aside class="side-nav" data-testid="side-nav">
+        {#each tabGroups as group}
+          <div class="nav-group">
+            {#if group.title}
+              <span class="nav-group-title">{group.title}</span>
+            {/if}
+            {#each group.tabs as tab}
+              <button
+                class:active={activeTab === tab.id}
+                on:click={() => setActiveTab(tab.id)}
+                type="button"
+                data-testid={`tab-${tab.id}`}
+              >
+                {tab.label}
+              </button>
+            {/each}
+          </div>
+        {/each}
+      </aside>
+    {/if}
 
     <section class="content">
+      {#if activeTab === 'workspace'}
+        <div class="seed-corpus-workspace">
+        <div class="card seed-corpus-toolbar">
+          <div class="seed-corpus-toolbar__header">
+            <div class="seed-corpus-toolbar__intro">
+              <h2 class="workspace-section-title">1. Search</h2>
+              <p>Collect seed sources, review candidates, and promote selected works into the corpus pipeline.</p>
+            </div>
+
+            <div class="seed-corpus-toolbar__meta">
+              {#if seedActionStatus}
+                <p class="muted">{seedActionStatus}</p>
+              {/if}
+              {#if ingestTrackedRequest.requestId || ingestJobProgress.total > 0 || ingestJobProgress.error}
+                <div class="ingest-job-progress seed-toolbar-progress">
+                  <div class="ingest-job-progress__top">
+                    <span class="muted small">
+                      {#if ingestTrackedRequest.requestId}
+                        Request: {ingestTrackedRequest.requestId}
+                      {:else}
+                        Latest queued request
+                      {/if}
+                    </span>
+                    <span class={`tag ${ingestProgressDone ? 'completed' : ingestJobProgress.running > 0 ? 'queued' : 'pending'}`}>
+                      {#if ingestProgressDone}
+                        Finished
+                      {:else if ingestJobProgress.running > 0}
+                        Running
+                      {:else}
+                        Queued
+                      {/if}
+                    </span>
+                  </div>
+                  <div
+                    class="extract-progress-track"
+                    role="progressbar"
+                    aria-label="Promotion queued jobs progress"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow={Math.round(ingestProgressRatio * 100)}
+                  >
+                    <div class="extract-progress-bar" style={`width: ${Math.max(2, Math.min(100, ingestProgressRatio * 100))}%`}></div>
+                  </div>
+                  <div class="ingest-job-progress__stats">
+                    <span>Pending: {ingestJobProgress.pending}</span>
+                    <span>Running: {ingestJobProgress.running}</span>
+                    <span>Completed: {ingestJobProgress.completed}</span>
+                    <span>Failed: {ingestJobProgress.failed}</span>
+                    <span>Cancelled: {ingestJobProgress.cancelled}</span>
+                  </div>
+                  <div class="ingest-job-progress__meta">
+                    <span class="muted small">
+                      Daemon:
+                      {#if ingestJobProgress.daemonOnline === true}
+                        Online
+                      {:else if ingestJobProgress.daemonOnline === false}
+                        Offline
+                      {:else}
+                        Unknown
+                      {/if}
+                    </span>
+                    {#if ingestJobProgress.updatedAt}
+                      <span class="muted small">Updated: {ingestJobProgress.updatedAt}</span>
+                    {/if}
+                  </div>
+                  {#if ingestJobProgress.error}
+                    <p class="error small">{ingestJobProgress.error}</p>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          </div>
+
+          <div class="seed-intake-grid">
+            <div class="seed-intake-card seed-intake-card--upload">
+              <div class="split">
+                <h3>Document Search</h3>
+                {#if extractionProgress.active}
+                  <span class="tag queued">extracting</span>
+                {/if}
+              </div>
+              <div class="uploader">
+                <label class="upload-drop">
+                  <input type="file" multiple accept=".pdf" on:change={handleFiles} />
+                  <span>Drop PDFs or click to upload.</span>
+                </label>
+              </div>
+              {#if uploads.length > 0}
+                <div class="upload-list">
+                  {#each uploads as item}
+                    <div class="upload-item">
+                      <div>
+                        <strong>{item.name}</strong>
+                        <span>{formatBytes(item.size)}</span>
+                      </div>
+                      <div class="upload-actions">
+                        <span class={`status ${item.status}`}>{item.status}</span>
+                        <button
+                          type="button"
+                          on:click={() => extractForItem(item)}
+                          disabled={!item.backendFilename}
+                        >
+                          Extract
+                        </button>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+              {#if extractionProgress.active}
+                <div class="extract-progress">
+                  <div
+                    class={`extract-progress-track ${extractionProgress.indeterminate ? 'indeterminate' : ''}`}
+                    role="progressbar"
+                    aria-label="Extraction progress"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow={Math.round(extractionProgress.percent || 0)}
+                  >
+                    <div
+                      class="extract-progress-bar"
+                      style={extractionProgress.indeterminate ? '' : `width: ${Math.max(2, Math.min(100, extractionProgress.percent || 0))}%`}
+                    ></div>
+                  </div>
+                  {#if extractionProgress.detail}
+                    <p class="muted small">{extractionProgress.detail}</p>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+
+            <div class="seed-intake-card seed-intake-card--search">
+              <h3>Keyword Search</h3>
+              <form class="seed-search-form" on:submit|preventDefault={runSearch}>
+                <div class="seed-search-row">
+                  <label>
+                    <span>Mode</span>
+                    <select bind:value={searchMode}>
+                      <option value="query">Query</option>
+                      <option value="seed">Seed JSON</option>
+                    </select>
+                  </label>
+                  <label class="seed-search-main">
+                    <span>{searchMode === 'query' ? 'Query' : 'Seed list'}</span>
+                    {#if searchMode === 'query'}
+                      <input
+                        type="text"
+                        placeholder="institutional economics AND governance"
+                        bind:value={searchQuery}
+                      />
+                    {:else}
+                      <input
+                        type="text"
+                        placeholder={JSON.stringify(["W2741809807"])}
+                        bind:value={searchSeedJson}
+                      />
+                    {/if}
+                  </label>
+                  <label>
+                    <span>Field</span>
+                    <select bind:value={searchField}>
+                      <option value="default">All fields</option>
+                      <option value="title">Title</option>
+                      <option value="abstract">Abstract</option>
+                      <option value="title_and_abstract">Title + abstract</option>
+                      <option value="fulltext">Full text</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="seed-search-row">
+                  <label class="seed-search-author">
+                    <span>Author</span>
+                    <input
+                      type="text"
+                      placeholder="Elinor Ostrom"
+                      bind:value={searchAuthor}
+                    />
+                  </label>
+                  <label>
+                    <span>Year from</span>
+                    <input type="number" placeholder="Year" bind:value={yearFrom} />
+                  </label>
+                  <label>
+                    <span>Year to</span>
+                    <input type="number" placeholder="Year" bind:value={yearTo} />
+                  </label>
+                  <div class="seed-search-actions">
+                    <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
+                    <button class="primary" type="submit">Search</button>
+                  </div>
+                </div>
+              </form>
+              <p class="muted">{searchStatus}</p>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="seed-corpus-columns">
+          <div class="seed-corpus-column seed-corpus-column--seed">
+        <div class="card seed-sources-panel" data-testid="seed-panel">
+          <div class="workspace-panel-header">
+            <div class="workspace-panel-title">
+              <h3 class="workspace-section-title">2. Seed</h3>
+              <p class="muted">PDF extractions and search runs appear here as the same kind of expandable source.</p>
+            </div>
+            <div class="workspace-panel-actions">
+              <button class="secondary" type="button" on:click={() => loadSeedSources()} disabled={seedActionBusy}>Refresh</button>
+              {#if seedSourcesStatus}
+                <span class="muted">{seedSourcesStatus}</span>
+              {/if}
+            </div>
+          </div>
+
+          <div class="seed-expansion-row seed-expansion-row--panel">
+            <div class="seed-expansion-meta">
+              <span class="muted small seed-expansion-label">Promotion settings</span>
+              <span class="muted small">Applies to the selected Seed candidates when you promote them.</span>
+            </div>
+            <div class="seed-expansion-pill" class:opacity-50={!includeDownstream}>
+              <label class="expansion-toggle">
+                <input type="checkbox" bind:checked={includeDownstream} />
+                <span>Downstream</span>
+              </label>
+              <span class="muted small">Depth</span>
+              <input type="number" min="0" max="4" bind:value={relatedDepthDownstream} disabled={!includeDownstream} class="depth-input" />
+            </div>
+            <div class="seed-expansion-pill" class:opacity-50={!includeUpstream}>
+              <label class="expansion-toggle">
+                <input type="checkbox" bind:checked={includeUpstream} />
+                <span>Upstream</span>
+              </label>
+              <span class="muted small">Depth</span>
+              <input type="number" min="0" max="4" bind:value={relatedDepthUpstream} disabled={!includeUpstream} class="depth-input" />
+            </div>
+            <div class="seed-expansion-divider"></div>
+            <div class="seed-expansion-pill">
+              <span class="muted small">Max Related / Paper</span>
+              <input type="number" min="1" max="100" bind:value={maxRelated} class="short-input" />
+            </div>
+          </div>
+
+          {#if seedSources.length === 0}
+            <p class="muted">No seed sources yet. Upload a PDF or run a search to start staging candidates.</p>
+          {:else}
+            <div class="seed-source-list">
+              {#each seedSources as source (seedSourceId(source))}
+                {@const sourceId = seedSourceId(source)}
+                {@const isExpanded = expandedSeedSourceId === sourceId}
+                {@const sourceCandidates = getSeedCandidatesForSource(source)}
+                {@const selectionVersion = seedSelectionVersions[sourceId] || 0}
+                <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
+                  <div
+                    class="seed-source__summary"
+                    role="button"
+                    tabindex="0"
+                    on:click={(e) => {
+                      if (e.target?.closest?.('.seed-source__select, .seed-source__summary-actions')) return
+                      toggleSeedSource(source)
+                    }}
+                    on:keydown={(e) => {
+                      if (e.target?.closest?.('.seed-source__select, .seed-source__summary-actions')) return
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        toggleSeedSource(source);
+                      }
+                    }}
+                  >
+                    <div class="seed-source__summary-main">
+                      <div class="seed-source__heading">
+                        {#key `${sourceId}:summary-selection:${selectionVersion}`}
+                          <label
+                            class="seed-source__select"
+                            title={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)
+                              ? 'Clear all candidates in this source'
+                              : 'Select all candidates in this source'}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)}
+                              disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
+                              aria-label="Select all candidates in this source"
+                              on:click|stopPropagation
+                              on:keydown|stopPropagation
+                              on:change|stopPropagation={(e) => setAllSeedCandidatesSelected(source, e.currentTarget.checked)}
+                            />
+                          </label>
+                        {/key}
+                        <span class={`tag ${source.source_type === 'pdf' ? 'pending' : 'queued'}`}>{source.source_type === 'pdf' ? 'PDF' : 'Search'}</span>
+                        <strong>{source.label}</strong>
+                      </div>
+                      {#if source.subtitle}
+                        <span class="muted small">{source.subtitle}</span>
+                      {/if}
+                    </div>
+                    <div class="seed-source__summary-side">
+                      {#key `${sourceId}:summary-actions:${selectionVersion}`}
+                        <div class="seed-source__summary-actions">
+                          <button
+                            class="seed-source__action seed-source__action--promote"
+                            type="button"
+                            disabled={seedActionBusy || promotableSeedCount(source) === 0}
+                            title={promotableSeedCount(source) === 0 ? 'No promotable candidates remain in this source' : 'Promote all promotable candidates from this source'}
+                            aria-label="Promote all promotable candidates"
+                            on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
+                          >
+                            →
+                          </button>
+                          <button
+                            class="seed-source__action seed-source__action--remove"
+                            type="button"
+                            disabled={seedActionBusy}
+                            title="Remove this source from Seed"
+                            aria-label="Remove source"
+                            on:click|stopPropagation={() => handleRemoveSeedSource(source)}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      {/key}
+                      <div class="pill-row">
+                        <span class="pill">{source.candidate_count} candidates</span>
+                        {#if source.state_counts.pending}
+                          <span class="pill">Pending: {source.state_counts.pending}</span>
+                        {/if}
+                        {#if source.state_counts.added}
+                          <span class="pill">Added: {source.state_counts.added}</span>
+                        {/if}
+                        {#if source.state_counts.in_corpus}
+                          <span class="pill">In Corpus: {source.state_counts.in_corpus}</span>
+                        {/if}
+                        {#if source.state_counts.staged_raw}
+                          <span class="pill">Raw: {source.state_counts.staged_raw}</span>
+                        {/if}
+                        {#if source.state_counts.enriched}
+                          <span class="pill">Metadata: {source.state_counts.enriched}</span>
+                        {/if}
+                        {#if source.state_counts.downloaded}
+                          <span class="pill">Downloaded: {source.state_counts.downloaded}</span>
+                        {/if}
+                        {#if source.state_counts.downloaded_elsewhere}
+                          <span class="pill">Elsewhere: {source.state_counts.downloaded_elsewhere}</span>
+                        {/if}
+                      </div>
+                      <span class="muted small">{isExpanded ? 'Hide' : 'Show'}</span>
+                    </div>
+                  </div>
+
+                  {#if isExpanded}
+                      <div class="seed-source__body">
+                        {#key `${sourceId}:toolbar:${selectionVersion}`}
+                          <div class="table-toolbar">
+                            <div class="table-toolbar-left">
+                              <span class="muted">Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable</span>
+                              <button class="secondary" type="button" on:click={() => selectAllSeedCandidates(source)} disabled={seedActionBusy}>Select all</button>
+                              <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
+                            </div>
+                            <div class="table-toolbar-right">
+                              <div class="toolbar-actions">
+                                <button class="secondary" type="button" on:click={() => handleDismissSelectedSeed(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
+                                  Dismiss selected
+                                </button>
+                                <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
+                                  Promote to Corpus
+                                </button>
+                                <button class="danger" type="button" on:click={() => handleRemoveSeedSource(source)} disabled={seedActionBusy}>
+                                  Remove source
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        {/key}
+
+                        {#if seedCandidatesLoading[sourceId]}
+                          <p class="muted">Loading candidates...</p>
+                        {:else if sourceCandidates.length === 0}
+                          <p class="muted">No active candidates remain in this seed source.</p>
+                        {:else}
+                          {#key `${sourceId}:selection:${selectionVersion}`}
+                            <div class="table table-scroll seed-candidate-table">
+                              <div class="table-row header cols-7">
+                                <span class="ingest-select-cell">State</span>
+                                <span>Title</span>
+                                <span>Authors</span>
+                                <span>Year</span>
+                                <span>Source</span>
+                                <span>DOI</span>
+                                <span aria-hidden="true"></span>
+                              </div>
+                              {#each sourceCandidates as candidate (candidate.candidate_key)}
+                                {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
+                                {@const candidateKey = String(candidate?.candidate_key || '')}
+                                {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
+                                <div
+                                  class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                  on:click={(e) => {
+                                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                                    setSelectedSeedCandidate(source, candidate);
+                                  }}
+                                  on:keydown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                                      e.preventDefault();
+                                      setSelectedSeedCandidate(source, candidate);
+                                    }
+                                  }}
+                                  role="button"
+                                  aria-pressed={active}
+                                  tabindex="0"
+                                >
+                                  <span class="ingest-select-cell">
+                                    {#if isSeedCandidateSelectable(candidate)}
+                                      <input
+                                        type="checkbox"
+                                        checked={isSeedCandidateSelected(source, candidate)}
+                                        on:click|stopPropagation
+                                        on:change={() => {
+                                          setSelectedSeedCandidate(source, candidate);
+                                          toggleSeedCandidateSelection(source, candidate);
+                                        }}
+                                      />
+                                    {:else}
+                                      <input type="checkbox" disabled />
+                                    {/if}
+                                    <span class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag`}>{seedCandidateTag(candidate).label}</span>
+                                  </span>
+                                  <span>{formatTitle(candidate)}</span>
+                                  <span>{formatAuthors(candidate)}</span>
+                                  <span>{candidate.year || ''}</span>
+                                  <span>{candidate.source || candidate.publisher || ''}</span>
+                                  <span>{candidate.doi || ''}</span>
+                                  <span class="seed-candidate__corpus-cell">
+                                    {#if isSeedCandidateInCorpus(candidate)}
+                                      <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                    {/if}
+                                  </span>
+                                </div>
+                                {#if active}
+                                  <div class="seed-inline-detail-row">
+                                    <div class="inline-detail-card">
+                                      <div class="inline-detail-main">
+                                        <div class="inline-detail-meta-row">
+                                          <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
+                                            Stage: {seedCandidateTag(candidate).label}
+                                          </span>
+                                          <span class="inline-detail-chip">Year: {candidate.year || '-'}</span>
+                                          <span class="inline-detail-chip">Author: {formatAuthors(candidate) || '-'}</span>
+                                          <span class="inline-detail-chip">Source: {candidate.source || candidate.publisher || '-'}</span>
+                                          <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
+                                            In Corpus: {isSeedCandidateInCorpus(candidate) ? 'Yes' : 'No'}
+                                          </span>
+                                          {#if candidate?.doi}
+                                            <a class="inline-detail-link" href={doiHref(candidate.doi)} target="_blank" rel="noreferrer">DOI</a>
+                                          {/if}
+                                          {#if candidate?.openalex_id}
+                                            <a class="inline-detail-link" href={openAlexHref(candidate.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
+                                          {/if}
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                {/if}
+                              {/each}
+                            </div>
+                          {/key}
+                        {/if}
+                      </div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+          </div>
+
+          <div class="seed-corpus-column seed-corpus-column--corpus">
+            <div class="corpus-workspace-shell">
+              <Corpus
+                {corpusSource}
+                {corpusTotal}
+                {corpusItems}
+                {rawTotal}
+                {metadataTotal}
+                {downloadedTotal}
+                {failedEnrichmentTotal}
+                {failedDownloadTotal}
+                bind:shareUsername={shareUsername}
+                bind:shareRole={shareRole}
+                {shareStatus}
+                {handleShareCorpus}
+                {bucketLabel}
+                {formatAuthors}
+                {doiHref}
+                {openAlexHref}
+                {handleDownloadedCorpusFile}
+                {corpusLoadStatus}
+                {corpusHasMore}
+                {corpusLoadingMore}
+                {corpusLoading}
+                {loadCorpus}
+                {handleCorpusColumnScroll}
+              />
+            </div>
+          </div>
+        </div>
+
+        </div>
+      {/if}
+
       {#if activeTab === 'dashboard'}
         <Dashboard
+          currentCorpusName={currentCorpus?.name || 'Current corpus'}
           {pipelineRawCount}
           {pipelineMetadataCount}
           {pipelineDownloadedCount}
-          {pipelineWorker}
-          {downloadWorker}
-          {pipelineWorkerBusy}
+          {daemonStatus}
+          {workerBacklog}
           {pipelineWorkerStatus}
-          {sampleActivity}
-          {handleStartPipelineWorker}
-          {handlePausePipelineWorker}
-          {handlePauseAllPipelineWorkers}
+          {recentDownloads}
+          showGlobalOverview={isAdmin}
+          globalStats={globalIngestStats}
+          globalBacklog={globalWorkerBacklog}
         />
       {/if}
 
@@ -3117,7 +5119,21 @@
                 <span>Source details</span>
               </div>
               {#each ingestRuns as run}
-                <div class="table-row cols-runs">
+                <div 
+                  class="table-row cols-runs clickable"
+                  on:click={(e) => {
+                    if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                    handleToggleLatestRun(run.ingest_source);
+                  }}
+                  on:keydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      handleToggleLatestRun(run.ingest_source);
+                    }
+                  }}
+                  role="button"
+                  tabindex="0"
+                >
                   <span>
                     <button
                       class="link truncate-line"
@@ -3130,7 +5146,7 @@
                         },
                         run.ingest_source
                       )}
-                      on:click={() => loadLatestEntries(run.ingest_source)}
+                      on:click={() => handleToggleLatestRun(run.ingest_source)}
                     >
                       {formatSeedDocumentLabel(
                         {
@@ -3169,7 +5185,7 @@
           {:else}
             <div class="table-toolbar">
               <div class="table-toolbar-left">
-                <span class="muted">Selected: {selectedLatestCount} / {selectableLatestCount} pending</span>
+                <span class="muted">Selected: {selectedLatestCount} / {selectableLatestCount} selectable</span>
                 <button class="secondary" type="button" on:click={selectAllLatest}>Select all</button>
                 <button class="secondary" type="button" on:click={clearLatestSelection}>Clear</button>
               </div>
@@ -3204,7 +5220,7 @@
                   <span>Downstream</span>
                 </label>
                 <span class="muted small" style="margin-left: 4px;">Depth</span>
-                <input type="number" min="1" max="4" bind:value={relatedDepthDownstream} disabled={!includeDownstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
+                <input type="number" min="0" max="4" bind:value={relatedDepthDownstream} disabled={!includeDownstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
               </div>
 
               <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px;" class:opacity-50={!includeUpstream}>
@@ -3213,7 +5229,7 @@
                   <span>Upstream</span>
                 </label>
                 <span class="muted small" style="margin-left: 4px;">Depth</span>
-                <input type="number" min="1" max="4" bind:value={relatedDepthUpstream} disabled={!includeUpstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
+                <input type="number" min="0" max="4" bind:value={relatedDepthUpstream} disabled={!includeUpstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
               </div>
 
               <div style="width: 1px; height: 20px; background: var(--stroke);"></div>
@@ -3229,9 +5245,69 @@
             {#if processMarkedStatus}
               <p class="muted">{processMarkedStatus}</p>
             {/if}
+            {#if ingestTrackedRequest.requestId || ingestJobProgress.total > 0 || ingestJobProgress.error}
+              <div class="ingest-job-progress">
+                <div class="ingest-job-progress__top">
+                  <span class="muted small">
+                    {#if ingestTrackedRequest.requestId}
+                      Request: {ingestTrackedRequest.requestId}
+                    {:else}
+                      Latest queued request
+                    {/if}
+                  </span>
+                  <span class={`tag ${ingestProgressDone ? 'completed' : ingestJobProgress.running > 0 ? 'queued' : 'pending'}`}>
+                    {#if ingestProgressDone}
+                      Finished
+                    {:else if ingestJobProgress.running > 0}
+                      Running
+                    {:else}
+                      Queued
+                    {/if}
+                  </span>
+                </div>
+                <div
+                  class="extract-progress-track"
+                  role="progressbar"
+                  aria-label="Ingest queued jobs progress"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                  aria-valuenow={Math.round(ingestProgressRatio * 100)}
+                >
+                  <div
+                    class="extract-progress-bar"
+                    style={`width: ${Math.max(2, Math.min(100, ingestProgressRatio * 100))}%`}
+                  ></div>
+                </div>
+                <div class="ingest-job-progress__stats">
+                  <span>Pending: {ingestJobProgress.pending}</span>
+                  <span>Running: {ingestJobProgress.running}</span>
+                  <span>Completed: {ingestJobProgress.completed}</span>
+                  <span>Failed: {ingestJobProgress.failed}</span>
+                  <span>Cancelled: {ingestJobProgress.cancelled}</span>
+                </div>
+                <div class="ingest-job-progress__meta">
+                  <span class="muted small">
+                    Daemon:
+                    {#if ingestJobProgress.daemonOnline === true}
+                      Online
+                    {:else if ingestJobProgress.daemonOnline === false}
+                      Offline
+                    {:else}
+                      Unknown
+                    {/if}
+                  </span>
+                  {#if ingestJobProgress.updatedAt}
+                    <span class="muted small">Updated: {ingestJobProgress.updatedAt}</span>
+                  {/if}
+                </div>
+                {#if ingestJobProgress.error}
+                  <p class="error small">{ingestJobProgress.error}</p>
+                {/if}
+              </div>
+            {/if}
             <div class="table">
               <div class="table-row header cols-6">
-                <span>
+                <span class="ingest-select-cell">
                   <input
                     type="checkbox"
                     aria-label="Select all"
@@ -3239,6 +5315,7 @@
                     disabled={selectableLatestCount === 0}
                     on:change={(e) => (e.target.checked ? selectAllLatest() : clearLatestSelection())}
                   />
+                  <span>Status</span>
                 </span>
                 <span>Title</span>
                 <span>Authors</span>
@@ -3247,7 +5324,23 @@
                 <span>DOI</span>
               </div>
               {#each latestEntries as entry, index}
-                <div class={`table-row cols-6 ${isLatestSelected(entry, index) ? 'selected' : ''} ${isLatestDownloaded(entry) ? 'downloaded' : isLatestProcessed(entry) ? 'enriched' : ''}`}>
+                <div 
+                  class={`table-row cols-6 clickable ${isLatestSelected(entry, index) ? 'selected' : ''} ${isLatestDownloaded(entry) ? 'downloaded' : isLatestProcessed(entry) ? 'enriched' : ''}`}
+                  on:click={(e) => {
+                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                    toggleLatestSelection(entry, index);
+                  }}
+                  on:keydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                      e.preventDefault();
+                      toggleLatestSelection(entry, index);
+                    }
+                  }}
+                  role="checkbox"
+                  aria-checked={isLatestSelected(entry, index)}
+                  tabindex="0"
+                >
                   <span class="ingest-select-cell">
                     {#if isLatestSelectable(entry)}
                       <input
@@ -3263,11 +5356,7 @@
                         disabled
                       />
                     {/if}
-                    {#if isLatestDownloaded(entry)}
-                      <span class="tag downloaded ingest-state-tag">Downloaded</span>
-                    {:else if isLatestProcessed(entry)}
-                      <span class="tag completed ingest-state-tag">Enriched</span>
-                    {/if}
+                    <span class={`tag ${latestIngestTag(entry).className} ingest-state-tag`}>{latestIngestTag(entry).label}</span>
                   </span>
                   <span>{formatTitle(entry)}</span>
                   <span>{formatAuthors(entry)}</span>
@@ -3366,6 +5455,16 @@
             </div>
 
             <div class="search-secondary-row">
+              <div class="filter-group search-author-group">
+                <div class="filter-label">Author</div>
+                <input
+                  id="search-author"
+                  type="text"
+                  placeholder="Elinor Ostrom"
+                  bind:value={searchAuthor}
+                  title="Resolve an OpenAlex author first, then filter works by that author ID."
+                />
+              </div>
               <div class="filter-group">
                 <div class="filter-label">Published between</div>
                 <div class="filter-inputs">
@@ -3373,56 +5472,6 @@
                   <span class="range-sep">–</span>
                   <input id="search-year-to" type="number" placeholder="Year" bind:value={yearTo} class="year-input" />
                 </div>
-              </div>
-
-              <div class="filter-group">
-                <div class="filter-label">Cit. Depth (Down/Up)</div>
-                <div class="filter-inputs">
-                   <input
-                    id="search-depth-down"
-                    type="number"
-                    min="0"
-                    max="4"
-                    bind:value={relatedDepthDownstream}
-                    title="Downstream extraction depth"
-                    class="depth-input"
-                  />
-                  <span class="range-sep">/</span>
-                  <input
-                    id="search-depth-up"
-                    type="number"
-                    min="0"
-                    max="4"
-                    bind:value={relatedDepthUpstream}
-                    title="Upstream extraction depth"
-                    class="depth-input"
-                  />
-                </div>
-              </div>
-
-              <div class="filter-group">
-                <div class="filter-label">Expansion</div>
-                <label class="expansion-toggle">
-                  <input
-                    id="search-include-downstream"
-                    type="checkbox"
-                    bind:checked={includeDownstream}
-                  />
-                  <span>Downstream</span>
-                </label>
-                <label class="expansion-toggle">
-                  <input
-                    id="search-include-upstream"
-                    type="checkbox"
-                    bind:checked={includeUpstream}
-                  />
-                  <span>Upstream</span>
-                </label>
-              </div>
-
-              <div class="filter-group">
-                 <div class="filter-label">Max related</div>
-                 <input id="search-max-related" type="number" min="1" max="100" bind:value={maxRelated} class="short-input" />
               </div>
 
               <div class="spacer"></div>
@@ -3443,173 +5492,41 @@
             {/if}
           </form>
           <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
-          {#if searchResults.length > 0}
-            <div class="search-queue-actions">
-              <div class="search-queue-selection">
-                <button class="secondary" type="button" on:click={selectAllSearchResults} disabled={searchQueueBusy}>
-                  Select all
-                </button>
-                <button class="text-btn" type="button" on:click={clearSearchSelection} disabled={searchQueueBusy}>
-                  Clear
-                </button>
-                <span class="muted small">{selectedSearchCount} selected</span>
-              </div>
-              <div class="search-queue-buttons">
-                <button
-                  class="secondary"
-                  type="button"
-                  on:click={() => enqueueSelectedSearchResults(false)}
-                  disabled={searchQueueBusy || selectedSearchCount === 0}
-                >
-                  {searchQueueBusy ? 'Queueing...' : 'Enqueue Selected'}
-                </button>
-                <button
-                  class="primary"
-                  type="button"
-                  on:click={() => enqueueSelectedSearchResults(true)}
-                  disabled={searchQueueBusy || selectedSearchCount === 0}
-                >
-                  {searchQueueBusy ? 'Queueing...' : 'Enqueue + Download'}
-                </button>
-              </div>
-            </div>
-            {#if searchQueueStatus}
-              <p class="muted">{searchQueueStatus}</p>
-            {/if}
-          {/if}
           <div class="table">
             <div class="table-row header cols-search">
-              <span>
-                <input
-                  type="checkbox"
-                  aria-label="Select all search results"
-                  bind:checked={allSearchSelected}
-                  on:change={(e) => (e.target.checked ? selectAllSearchResults() : clearSearchSelection())}
-                />
-              </span>
               <span>Title</span>
               <span>Authors</span>
               <span>Year</span>
               <span>Type</span>
-              <span>Per-Item Expansion</span>
+              <span>DOI</span>
             </div>
             {#each searchResults as result, index}
-              {@const rowKey = searchResultKey(result, index)}
-              {@const rowCfg = getSearchQueueConfig(rowKey)}
-              <div class={`table-row cols-search ${searchSelection.includes(rowKey) ? 'selected' : ''}`}>
-                <span>
-                  <input
-                    type="checkbox"
-                    aria-label={`Select ${result.title || rowKey}`}
-                    bind:group={searchSelection}
-                    value={rowKey}
-                  />
-                </span>
+              <div class="table-row cols-search">
                 <span>{result.title}</span>
                 <span>{result.authors}</span>
                 <span>{result.year}</span>
                 <span>{result.type}</span>
-                <span>
-                  <div class="search-row-controls">
-                    <label class="search-row-toggle">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(rowCfg.includeDownstream)}
-                        on:change={(e) => updateSearchQueueConfig(rowKey, { includeDownstream: e.target.checked })}
-                      />
-                      <span>Down</span>
-                    </label>
-                    <input
-                      class="search-row-input"
-                      type="number"
-                      min="1"
-                      max="4"
-                      value={rowCfg.relatedDepthDownstream}
-                      disabled={!rowCfg.includeDownstream}
-                      on:change={(e) => updateSearchQueueConfig(rowKey, { relatedDepthDownstream: Math.max(1, Number(e.target.value) || 1) })}
-                      title="Downstream depth"
-                    />
-                    <label class="search-row-toggle">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(rowCfg.includeUpstream)}
-                        on:change={(e) => updateSearchQueueConfig(rowKey, { includeUpstream: e.target.checked })}
-                      />
-                      <span>Up</span>
-                    </label>
-                    <input
-                      class="search-row-input"
-                      type="number"
-                      min="1"
-                      max="4"
-                      value={rowCfg.relatedDepthUpstream}
-                      disabled={!rowCfg.includeUpstream}
-                      on:change={(e) => updateSearchQueueConfig(rowKey, { relatedDepthUpstream: Math.max(1, Number(e.target.value) || 1) })}
-                      title="Upstream depth"
-                    />
-                    <span class="muted small">max</span>
-                    <input
-                      class="search-row-input search-row-max"
-                      type="number"
-                      min="1"
-                      max="100"
-                      value={rowCfg.maxRelated}
-                      on:change={(e) => updateSearchQueueConfig(rowKey, { maxRelated: Math.max(1, Number(e.target.value) || 1) })}
-                      title="Max related works"
-                    />
-                  </div>
-                </span>
+                <span>{result.doi || ''}</span>
               </div>
             {/each}
           </div>
         </div>
       {/if}
 
-      {#if activeTab === 'corpus'}
-        <Corpus
-          {corpusSource}
-          {corpusTotal}
-          {corpusItems}
-          {rawTotal}
-          {metadataTotal}
-          {downloadedTotal}
-          {failedEnrichmentTotal}
-          bind:shareUsername={shareUsername}
-          bind:shareRole={shareRole}
-          {shareStatus}
-          {handleShareCorpus}
-          {selectedCorpusRow}
-          {bucketLabel}
-          {pipelineStatusLabel}
-          {doiHref}
-          {openAlexHref}
-          {isCorpusItemSelected}
-          {toggleCorpusItemSelection}
-          {isPromotionHighlighted}
-          {bindCorpusRow}
-          {corpusMotionKey}
-          {corpusLoadStatus}
-          {corpusHasMore}
-          {corpusLoadingMore}
-          {corpusLoading}
-          {loadCorpus}
-        />
-      {/if}
-
       {#if activeTab === 'downloads'}
         <div class="card" data-testid="downloads-panel">
-          <h2>Download queue</h2>
+          <h2>Download activity</h2>
           <p class="muted">
             {#if !downloadsSource}
               Loading queue...
             {:else if downloadsSource === 'api'}
-              Live queue from API.
+              Live download activity from API.
             {:else if downloadsSource === 'stub'}
-              Stub queue from API.
+              Stub download activity from API.
             {:else if downloadsSource === 'sample'}
-              Sample queue data.
+              Sample download activity.
             {:else}
-              Queue loaded ({downloadsSource}).
+              Download activity loaded ({downloadsSource}).
             {/if}
           </p>
 
@@ -3638,7 +5555,7 @@
                     class="primary"
                     type="button"
                     on:click={handleStartDownloadWorker}
-                    disabled={downloadWorkerBusy || pipelineWorker.running}
+                    disabled={downloadWorkerBusy || pipelineWorker.running || Number(downloadWorker?.queued_download_items || 0) === 0}
                   >
                     Start
                   </button>
@@ -3648,6 +5565,9 @@
             <div class="worker-card__meta">
               <span class="muted">{downloadWorkerStatus}</span>
               <span class="muted small">Throughput is auto-managed by the backend for maximum speed.</span>
+              {#if !downloadWorker.running && Number(downloadWorker?.queued_download_items || 0) === 0}
+                <span class="muted small">No queued download items for this corpus. Enrich/promote items first.</span>
+              {/if}
               {#if pipelineWorker.running}
                 <span class="muted small">Download-only worker is disabled while global pipeline is running.</span>
               {/if}
@@ -3674,9 +5594,9 @@
                 Status
                 <select bind:value={exportFilterStatus} data-testid="export-filter-status">
                   <option value="all">All</option>
-                  <option value="downloaded_references">Downloaded</option>
-                  <option value="with_metadata">With metadata</option>
-                  <option value="no_metadata">Raw</option>
+                  <option value="downloaded">Downloaded</option>
+                  <option value="matched">Matched</option>
+                  <option value="raw">Raw</option>
                 </select>
               </label>
               <label>
@@ -3724,6 +5644,7 @@
                 <option value="in_progress">In progress</option>
                 <option value="queued">Queued</option>
                 <option value="failed">Failed</option>
+                <option value="downloaded">Downloaded</option>
               </select>
             </div>
             <div class="table-toolbar-right">
@@ -3752,11 +5673,11 @@
               </div>
             {:else}
               <div class="empty-state">
-                <strong>Queue is empty.</strong>
+                <strong>No download items to show.</strong>
                 <span class="muted">
                   {downloadsQuery.trim() || downloadsStatusFilter !== 'all'
                     ? 'No items match the current filters.'
-                    : 'Add works to the download queue via ingest or keyword search.'}
+                    : 'No queued or recently downloaded items are available for this corpus.'}
                 </span>
               </div>
             {/each}

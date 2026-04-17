@@ -46,8 +46,11 @@ Status: `completed`.
 
 ## M-06 Dokumentation
 
-Status: `completed` baseline, expandable.
+Status: `completed`.
 
-- `dl_lit_project/README.md` added with setup and DB-first workflow.
-- `dl_lit_project/DEVELOPMENT.md` expanded with canonical architecture and module guidance.
+- `dl_lit_project/README.md` now documents the canonical work model, quick start, CLI entrypoints, and doc map.
+- `dl_lit_project/docs/USER_GUIDE.md` provides end-user workflow documentation for search, seed review, corpus work, downloads, graph, logs, export, and password reset.
+- `dl_lit_project/docs/ADMIN_GUIDE.md` documents admin responsibilities including invitations, corpus sharing, Kantropos target assignment, SMTP, and operational responsibilities.
+- `dl_lit_project/docs/OPS_RUNBOOK.md` documents the live Docker stack, environment, restart procedures, health checks, logs, backups, and common failure modes.
+- `dl_lit_project/DEVELOPMENT.md` remains the developer-oriented architecture note.
 - `dl_lit_project/pyproject.toml` + `requirements-dev.txt` include a lint baseline (`ruff`).

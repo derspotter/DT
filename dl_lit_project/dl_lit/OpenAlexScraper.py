@@ -482,10 +482,19 @@ class OpenAlexCrossrefSearcher:
             'Accept': 'application/json',
             'User-Agent': f'OpenAlexScraper/1.0 (mailto:{mailto})'
         }
+        self.semantic_scholar_base_url = 'https://api.semanticscholar.org/graph/v1'
+        self.semantic_scholar_headers = {
+            'Accept': 'application/json',
+            'User-Agent': f'OpenAlexScraper/1.0 (mailto:{mailto})'
+        }
+        semantic_scholar_api_key = os.getenv('SEMANTIC_SCHOLAR_API_KEY') or os.getenv('RAG_FEEDER_SEMANTIC_SCHOLAR_API_KEY')
+        if semantic_scholar_api_key:
+            self.semantic_scholar_headers['x-api-key'] = semantic_scholar_api_key
         self.rate_limiter = rate_limiter or get_global_rate_limiter()
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
         self.api_key = os.getenv('OPENALEX_API_KEY') or os.getenv('RAG_FEEDER_OPENALEX_API_KEY')
+        self.enable_openalex_fallback = os.getenv('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
         global _missing_api_key_warned
         if not self.api_key and not _missing_api_key_warned:
             print(
@@ -494,13 +503,83 @@ class OpenAlexCrossrefSearcher:
             _missing_api_key_warned = True
         self.openalex_timeout = float(os.getenv('RAG_FEEDER_OPENALEX_TIMEOUT', '20'))
         self.crossref_timeout = float(os.getenv('RAG_FEEDER_CROSSREF_TIMEOUT', '20'))
+        self.semantic_scholar_timeout = float(os.getenv('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', '20'))
         self.openalex_session = _build_retry_session()
         self.crossref_session = _build_retry_session()
+        self.semantic_scholar_session = _build_retry_session()
 
     def _with_openalex_auth(self, params):
         if self.api_key:
             params['api_key'] = self.api_key
         return params
+
+    @staticmethod
+    def _semantic_scholar_to_openalex_like(item):
+        if not item:
+            return None
+        external_ids = item.get('externalIds') or {}
+        doi = normalize_doi(external_ids.get('DOI') or external_ids.get('Doi'))
+        paper_id = item.get('paperId') or item.get('paper_id')
+        authorships = []
+        for author in item.get('authors') or []:
+            name = author.get('name') if isinstance(author, dict) else None
+            if name:
+                authorships.append({'author': {'display_name': name}})
+        open_access_url = ((item.get('openAccessPdf') or {}).get('url') if isinstance(item.get('openAccessPdf'), dict) else None)
+        return {
+            'id': f"semantic_scholar:{paper_id}" if paper_id else 'semantic_scholar:',
+            'doi': doi,
+            'display_name': item.get('title'),
+            'publication_year': item.get('year'),
+            'type': ((item.get('publicationTypes') or [None])[0] or item.get('publicationType')),
+            'authorships': authorships,
+            'referenced_works': [],
+            'abstract_inverted_index': None,
+            'keywords': [],
+            'cited_by_api_url': None,
+            'primary_location': {
+                'source': {
+                    'display_name': item.get('venue'),
+                    'publisher': None,
+                }
+            } if item.get('venue') else {},
+            'biblio': {},
+            'open_access': {'oa_url': open_access_url},
+            'semantic_scholar_url': item.get('url'),
+            'semantic_scholar_json': item,
+        }
+
+    def search_semantic_scholar_match(self, title):
+        if not title:
+            return {"step": "s2_match", "results": [], "success": False, "error": "Title required for Semantic Scholar match"}
+        params = {
+            'query': title,
+            'fields': 'title,year,authors,externalIds,venue,url,publicationTypes,openAccessPdf,paperId',
+        }
+        try:
+            print("\nStep s2_match: Semantic Scholar title match")
+            print(f"Query: {title}")
+            self.rate_limiter.wait_if_needed('semantic_scholar')
+            response = self.semantic_scholar_session.get(
+                f'{self.semantic_scholar_base_url}/paper/search/match',
+                params=params,
+                headers=self.semantic_scholar_headers,
+                timeout=self.semantic_scholar_timeout,
+            )
+            if response.status_code == 404:
+                return {"step": "s2_match", "results": [], "success": True}
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and isinstance(data.get('data'), list):
+                raw_item = data['data'][0] if data['data'] else None
+            else:
+                raw_item = data
+            result = self._semantic_scholar_to_openalex_like(raw_item)
+            return {"step": "s2_match", "results": [result] if result else [], "success": True}
+        except requests.exceptions.RequestException as e:
+            return {"step": "s2_match", "results": [], "success": False, "error": str(e)}
+        except Exception as e:
+            return {"step": "s2_match", "results": [], "success": False, "error": f"Unexpected Semantic Scholar error: {str(e)}"}
 
     def search_crossref(self, title, authors, year):
         """Search Crossref for matching works."""
@@ -749,6 +828,28 @@ def normalize_doi(raw_doi: str | None) -> str | None:
     doi = doi.strip().strip(' .;,')
     return doi or None
 
+
+def coerce_year_int(value):
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        try:
+            return int(value)
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.search(r"\b(\d{4})\b", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
 def normalize_title_for_match(title: str | None) -> str | None:
     """Normalize titles for exact-ish comparisons."""
     if not title:
@@ -758,6 +859,21 @@ def normalize_title_for_match(title: str | None) -> str | None:
     normalized = re.sub(r'[^a-z0-9]+', ' ', normalized)
     normalized = re.sub(r'\s+', ' ', normalized).strip()
     return normalized or None
+
+
+def title_token_similarity(left: str | None, right: str | None) -> float:
+    left_norm = normalize_title_for_match(left)
+    right_norm = normalize_title_for_match(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    if left_norm == right_norm:
+        return 1.0
+    token_score = fuzz.token_set_ratio(left_norm, right_norm) / 100.0
+    partial_score = fuzz.partial_ratio(left_norm, right_norm) / 100.0
+    left_tokens = set(left_norm.split())
+    right_tokens = set(right_norm.split())
+    jaccard = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens)) if left_tokens and right_tokens else 0.0
+    return max(token_score, 0.85 * partial_score + 0.15 * jaccard)
 
 def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
     """Process a single JSON bibliography file."""
@@ -817,23 +933,25 @@ def _build_enrichment_payload(ref, best_result):
         pages = f"{first_page}--{last_page}"
 
     return {
-        'title': best_result.get('display_name'),
+        'title': best_result.get('display_name') or best_result.get('title'),
         'authors': [a.get('author', {}).get('display_name') for a in best_result.get('authorships', [])],
         'year': best_result.get('publication_year'),
         'doi': best_result.get('doi'),
-        'openalex_id': best_result.get('id'),
+        'openalex_id': best_result.get('id') if str(best_result.get('id') or '').startswith('https://openalex.org/') else None,
         'abstract': get_abstract(best_result.get('abstract_inverted_index')),
         'keywords': [kw.get('display_name') for kw in best_result.get('keywords', []) if kw.get('display_name')],
-        'source': source_info.get('display_name'),
+        'source': source_info.get('display_name') or best_result.get('venue'),
         'volume': biblio.get('volume'),
         'issue': biblio.get('issue'),
         'pages': pages,
         'publisher': source_info.get('publisher'),
         'type': best_result.get('type'),
-        'url': best_result.get('id'),
+        'url': best_result.get('semantic_scholar_url') or best_result.get('id'),
         'open_access_url': best_result.get('open_access', {}).get('oa_url'),
-        'openalex_json': best_result,
-        'crossref_json': None,
+        'referenced_work_ids': list(best_result.get('referenced_works') or []),
+        'cited_by_api_url': best_result.get('cited_by_api_url'),
+        'openalex_json': best_result if str(best_result.get('id') or '').startswith('https://openalex.org/') else None,
+        'crossref_json': best_result if str(best_result.get('id') or '').startswith('crossref:') else None,
         'source_work_id': ref.get('source_work_id'),
         'relationship_type': ref.get('relationship_type'),
         'ingest_source': ref.get('ingest_source'),
@@ -874,6 +992,76 @@ def process_single_reference(
                 "error": (result_payload or {}).get("error"),
             }
         )
+
+    def _select_best_result(unique_results, ref, ref_authors, ref_editors, ref_year):
+        ref_people_present = bool(ref_authors or ref_editors)
+        matched_results = [
+            (
+                lambda result: {
+                    'result': result,
+                    'provider': 'crossref' if str(result.get('id') or '').startswith('crossref:') else 'other',
+                    'author_match_score': find_best_author_match(ref_authors, result, ref_editors),
+                    'title_similarity': title_token_similarity(ref.get('title'), result.get('display_name') or result.get('title')),
+                    'combined_score': 0.0,
+                    'first_found_in_step': result.get('first_found_in_step', 999),
+                    'passes_author_gate': True,
+                }
+            )(result)
+            for result in unique_results
+        ]
+
+        for match in matched_results:
+            author_bonus = 0.2 if match['author_match_score'] > 0.85 else 0.0
+            result_year = match['result'].get('publication_year')
+            year_bonus = 0.0
+            if ref_year and result_year:
+                try:
+                    if int(ref_year) == int(result_year):
+                        year_bonus = 0.1
+                    elif abs(int(ref_year) - int(result_year)) <= 1:
+                        year_bonus = 0.05
+                except Exception:
+                    year_bonus = 0.0
+            match['combined_score'] = match['title_similarity'] + author_bonus + year_bonus
+            match['min_title_similarity'] = 0.88
+            if match['provider'] == 'crossref' and ref_people_present:
+                match['passes_author_gate'] = match['author_match_score'] > 0.85
+
+        matched_results.sort(key=lambda x: (-x['combined_score'], -x['title_similarity'], -x['author_match_score'], x['first_found_in_step']))
+
+        print("DEBUG: Evaluating potential matches...")
+        for match in matched_results:
+            original_authors = ref.get('authors', 'N/A')
+            result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
+            print(f"  - Provider: {match['provider']} | Combined: {match['combined_score']:.2f} | TitleSim: {match['title_similarity']:.2f} | Author: {match['author_match_score']:.2f} | AuthorGate: {match['passes_author_gate']} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
+            print(f"    Original Ref Authors: {original_authors}")
+            print(f"    API Result Authors:   {result_authors}")
+
+        eligible_matches = [m for m in matched_results if m['passes_author_gate']]
+        if not eligible_matches:
+            return None
+        if eligible_matches[0]['title_similarity'] < eligible_matches[0]['min_title_similarity'] or eligible_matches[0]['combined_score'] < 0.9:
+            return None
+
+        best_result = eligible_matches[0]['result']
+        top_score = eligible_matches[0]['combined_score']
+        tie_candidates = [m for m in eligible_matches if top_score - m['combined_score'] <= 0.05]
+        if len(tie_candidates) > 1:
+            ref_title_norm = normalize_title_for_match(ref.get('title'))
+
+            def tie_key(match):
+                result_title = match['result'].get('display_name') or match['result'].get('title')
+                result_title_norm = normalize_title_for_match(result_title)
+                title_match = 1 if ref_title_norm and result_title_norm and ref_title_norm == result_title_norm else 0
+                result_year = coerce_year_int(match['result'].get('publication_year'))
+                ref_year_int = coerce_year_int(ref_year)
+                year_distance = abs(ref_year_int - result_year) if ref_year_int and result_year else 999
+                return (-match['combined_score'], -match['title_similarity'], -title_match, year_distance, match['first_found_in_step'])
+
+            tie_candidates.sort(key=tie_key)
+            best_result = tie_candidates[0]['result']
+
+        return best_result
 
     title = ref.get('title')
     year = ref.get('year')
@@ -929,18 +1117,61 @@ def process_single_reference(
         else:
             print(f"DOI search failed or no results, proceeding with regular search")
     
-    # If no DOI or DOI search failed, proceed with regular steps 1-9
+    # If no DOI or DOI search failed, use the primary title-based fallback chain:
+    # Semantic Scholar title match -> Crossref -> optional OpenAlex.
     if not title:
         print(f"Skipping reference due to missing title: {ref.get('id', 'Unknown ID')}")
         diagnostics["status"] = "invalid_input"
         if return_diagnostics:
             return None, diagnostics
         return None
-    
-    # Try all steps 1-9 in order, collecting all possible results
-    for step in range(1, 10):
+
+    ref_authors, ref_editors = get_authors_and_editors(ref)
+    ref_year = ref.get('year')
+
+    diagnostics["attempted_steps"].append("s2_match")
+    s2_results = searcher.search_semantic_scholar_match(title)
+    if not s2_results.get("success") and str(s2_results.get("error") or "") not in non_api_errors:
+        _record_api_error("s2_match", s2_results)
+    if s2_results.get('success') and s2_results.get('results'):
+        s2_unique_results = []
+        for result in s2_results['results']:
+            result_id = result.get('id')
+            if not result_id:
+                continue
+            result['first_found_in_step'] = -1
+            s2_unique_results.append(result)
+        best_s2_result = _select_best_result(s2_unique_results, ref, ref_authors, ref_editors, ref_year)
+        if best_s2_result is not None:
+            final_enrichment = _build_enrichment_payload(ref, best_s2_result)
+            final_enrichment = _fetch_related_works(
+                final_enrichment,
+                best_s2_result,
+                searcher,
+                rate_limiter,
+                fetch_references,
+                fetch_citations,
+                max_citations,
+                related_depth_upstream=related_depth_upstream,
+                related_depth=related_depth,
+                max_related_per_reference=max_related_per_reference,
+            )
+            diagnostics["status"] = "matched"
+            if return_diagnostics:
+                return final_enrichment, diagnostics
+            return final_enrichment
+
+    regular_steps = [8]
+    if searcher.enable_openalex_fallback:
+        regular_steps.extend(range(1, 8))
+        regular_steps.append(9)
+
+    for step in regular_steps:
         diagnostics["attempted_steps"].append(step)
-        results = searcher.search(title, year, container_title, abstract, keywords, step, rate_limiter=rate_limiter)
+        if step == "s2_match":
+            results = searcher.search_semantic_scholar_match(title)
+        else:
+            results = searcher.search(title, year, container_title, abstract, keywords, step, rate_limiter=rate_limiter)
         if not results.get("success") and str(results.get("error") or "") not in non_api_errors:
             _record_api_error(step, results)
         
@@ -952,74 +1183,33 @@ def process_single_reference(
                 result_id = result.get('id')
                 if result_id and result_id not in all_results:
                     all_results[result_id] = result
-                    all_results[result_id]['first_found_in_step'] = step
+                    all_results[result_id]['first_found_in_step'] = -1 if step == "s2_match" else step
     
     unique_results = list(all_results.values())
 
-    # If Crossref returned a DOI, try resolving to OpenAlex via DOI lookup.
-    crossref_dois = {
-        normalize_doi(result.get('doi'))
-        for result in unique_results
-        if result.get('id', '').startswith('crossref:') and result.get('doi')
-    }
-    for crossref_doi in sorted({d for d in crossref_dois if d}):
-        diagnostics["attempted_steps"].append("crossref_doi_resolve")
-        doi_lookup = searcher.search(None, None, None, None, None, 0, rate_limiter=rate_limiter, doi=crossref_doi)
-        if not doi_lookup.get("success") and str(doi_lookup.get("error") or "") not in non_api_errors:
-            _record_api_error("crossref_doi_resolve", doi_lookup)
-        if doi_lookup.get('success') and doi_lookup.get('results'):
-            for result in doi_lookup['results']:
-                result_id = result.get('id')
-                if result_id and result_id not in all_results:
-                    result['first_found_in_step'] = 0
-                    all_results[result_id] = result
-    unique_results = list(all_results.values())
+    # Crossref DOI resolution back into OpenAlex is optional and disabled by default.
+    if searcher.enable_openalex_fallback:
+        crossref_dois = {
+            normalize_doi(result.get('doi'))
+            for result in unique_results
+            if result.get('id', '').startswith('crossref:') and result.get('doi')
+        }
+        for crossref_doi in sorted({d for d in crossref_dois if d}):
+            diagnostics["attempted_steps"].append("crossref_doi_resolve")
+            doi_lookup = searcher.search(None, None, None, None, None, 0, rate_limiter=rate_limiter, doi=crossref_doi)
+            if not doi_lookup.get("success") and str(doi_lookup.get("error") or "") not in non_api_errors:
+                _record_api_error("crossref_doi_resolve", doi_lookup)
+            if doi_lookup.get('success') and doi_lookup.get('results'):
+                for result in doi_lookup['results']:
+                    result_id = result.get('id')
+                    if result_id and result_id not in all_results:
+                        result['first_found_in_step'] = 0
+                        all_results[result_id] = result
+        unique_results = list(all_results.values())
     
     if unique_results:
-        ref_authors, ref_editors = get_authors_and_editors(ref)
-        
-        matched_results = [
-            {
-                'result': result,
-                'author_match_score': find_best_author_match(ref_authors, result, ref_editors),
-                'first_found_in_step': all_results[result['id']]['first_found_in_step']
-            }
-            for result in unique_results
-        ]
-
-        matched_results.sort(key=lambda x: (-x['author_match_score'], x['first_found_in_step']))
-
-        # --- DEBUG: Print all match scores ---
-        print("DEBUG: Evaluating potential matches...")
-        for match in matched_results:
-            original_authors = ref.get('authors', 'N/A')
-            result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
-            print(f"  - Score: {match['author_match_score']:.2f} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
-            print(f"    Original Ref Authors: {original_authors}")
-            print(f"    API Result Authors:   {result_authors}")
-        # --- END DEBUG ---
-
-        # Accept the result only if the best score is high enough.
-        if matched_results and matched_results[0]['author_match_score'] > 0.85:
-            best_result = matched_results[0]['result']
-            top_score = matched_results[0]['author_match_score']
-            tie_candidates = [m for m in matched_results if top_score - m['author_match_score'] <= 0.05]
-
-            if len(tie_candidates) > 1:
-                ref_title_norm = normalize_title_for_match(ref.get('title'))
-                ref_year = ref.get('year')
-
-                def tie_key(match):
-                    result_title = match['result'].get('display_name') or match['result'].get('title')
-                    result_title_norm = normalize_title_for_match(result_title)
-                    title_match = 1 if ref_title_norm and result_title_norm and ref_title_norm == result_title_norm else 0
-                    result_year = match['result'].get('publication_year')
-                    year_distance = abs(ref_year - result_year) if ref_year and result_year else 999
-                    return (-match['author_match_score'], -title_match, year_distance, match['first_found_in_step'])
-
-                tie_candidates.sort(key=tie_key)
-                best_result = tie_candidates[0]['result']
-
+        best_result = _select_best_result(unique_results, ref, ref_authors, ref_editors, ref_year)
+        if best_result is not None:
             # CRITICAL FIX: Construct a clean dict with all necessary data.
             # The original `best_result` is the raw JSON, which is good.
             # We need to ensure all keys the DB expects are present, even if None.
@@ -1071,7 +1261,11 @@ def _fetch_related_works(
 ):
     """Helper function to fetch referenced works and citing works for an enriched entry."""
     
-    # Initialize related works fields
+    # Keep raw parent graph pointers even when related expansion is disabled.
+    enrichment_data['referenced_work_ids'] = list(openalex_result.get('referenced_works') or [])
+    enrichment_data['cited_by_api_url'] = openalex_result.get('cited_by_api_url')
+
+    # Initialize expanded related works fields
     enrichment_data['referenced_works'] = []
     enrichment_data['citing_works'] = []
     

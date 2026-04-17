@@ -5,17 +5,29 @@ services:
       dockerfile: Dockerfile
     command: npm run dev -- --legacy-watch
     container_name: rag_feeder_backend
-    ports:
-      - "4000:4000"
+    expose:
+      - "4000"
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175,https://genkia.de
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - RAG_FEEDER_JWT_SECRET=${RAG_FEEDER_JWT_SECRET}
+      - RAG_FEEDER_FRONTEND_URL=${RAG_FEEDER_FRONTEND_URL:-https://genkia.de}
+      - RAG_FEEDER_SMTP_HOST=${RAG_FEEDER_SMTP_HOST:-}
+      - RAG_FEEDER_SMTP_PORT=${RAG_FEEDER_SMTP_PORT:-587}
+      - RAG_FEEDER_SMTP_SECURE=${RAG_FEEDER_SMTP_SECURE:-false}
+      - RAG_FEEDER_SMTP_USER=${RAG_FEEDER_SMTP_USER:-}
+      - RAG_FEEDER_SMTP_PASS=${RAG_FEEDER_SMTP_PASS:-}
+      - RAG_FEEDER_SMTP_FROM=${RAG_FEEDER_SMTP_FROM:-}
+      - RAG_FEEDER_SMTP_TLS_REJECT_UNAUTHORIZED=${RAG_FEEDER_SMTP_TLS_REJECT_UNAUTHORIZED:-true}
+      - RAG_FEEDER_SMTP_IGNORE_TLS=${RAG_FEEDER_SMTP_IGNORE_TLS:-false}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
       - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_RPS=${RAG_FEEDER_SEMANTIC_SCHOLAR_RPS:-1}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC=${RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC:-1.1}
       - RAG_FEEDER_ENRICH_WORKERS=${RAG_FEEDER_ENRICH_WORKERS:-6}
       - RAG_FEEDER_DOWNLOAD_BATCH_MAX=${RAG_FEEDER_DOWNLOAD_BATCH_MAX:-2000}
       - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
@@ -35,27 +47,63 @@ services:
     restart: unless-stopped
     networks:
       - rag-network
+      - proxy-genkia
 
-  rag_worker:
+  rag_enrich_worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --db-path /usr/src/app/dl_lit_project/data/literature.db
-    container_name: rag_feeder_worker
+    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role enrich --db-path /usr/src/app/dl_lit_project/data/literature.db
+    container_name: rag_feeder_enrich_worker
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
       - RAG_FEEDER_CROSSREF_RPS=${RAG_FEEDER_CROSSREF_RPS:-20}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_RPS=${RAG_FEEDER_SEMANTIC_SCHOLAR_RPS:-1}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC=${RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC:-1.1}
       - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
       - RAG_FEEDER_LIBGEN_RPS=${RAG_FEEDER_LIBGEN_RPS:-2}
       - RAG_FEEDER_GEMINI_PER_MIN=${RAG_FEEDER_GEMINI_PER_MIN:-2000}
       - RAG_FEEDER_GEMINI_TOKENS_PER_MIN=${RAG_FEEDER_GEMINI_TOKENS_PER_MIN:-3000000}
       - RAG_FEEDER_GEMINI_DAILY=${RAG_FEEDER_GEMINI_DAILY:-100000}
+      - RAG_FEEDER_ENRICH_BATCH_SIZE=${RAG_FEEDER_ENRICH_BATCH_SIZE:-10}
+      - RAG_FEEDER_ENRICH_WORKERS=${RAG_FEEDER_ENRICH_WORKERS:-6}
+      - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
+    volumes:
+      - ./backend/src:/usr/src/app/src
+      - ./backend/scripts:/usr/src/app/scripts
+      - ./dl_lit:/usr/src/app/dl_lit
+      - ./dl_lit_project:/usr/src/app/dl_lit_project
+      - rag_feeder_logs:/usr/src/app/logs
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+  rag_download_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role download --db-path /usr/src/app/dl_lit_project/data/literature.db
+    container_name: rag_feeder_download_worker
+    environment:
+      - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
+      - RAG_FEEDER_PYTHON=/opt/venv/bin/python
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - OPENALEX_API_KEY=${OPENALEX_API_KEY}
+      - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
+      - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_RPS=${RAG_FEEDER_SEMANTIC_SCHOLAR_RPS:-1}
+      - RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC=${RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC:-1.1}
+      - RAG_FEEDER_SCIHUB_RPS=${RAG_FEEDER_SCIHUB_RPS:-4}
+      - RAG_FEEDER_LIBGEN_RPS=${RAG_FEEDER_LIBGEN_RPS:-2}
       - RAG_FEEDER_DOWNLOAD_WORKERS=${RAG_FEEDER_DOWNLOAD_WORKERS:-32}
+      - RAG_FEEDER_DOWNLOAD_BATCH_SIZE=${RAG_FEEDER_DOWNLOAD_BATCH_SIZE:-50}
+      - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
     volumes:
       - ./backend/src:/usr/src/app/src
       - ./backend/scripts:/usr/src/app/scripts
@@ -70,26 +118,33 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-      target: build
-    command: npm run dev -- --host 0.0.0.0 --port 5175 --strictPort
+      target: dev
     container_name: rag_feeder_frontend
     ports:
-      - "5175:5175"
+      - "127.0.0.1:5175:5175"
     environment:
-      - VITE_API_BASE=http://localhost:4000
+      - NODE_ENV=development
+      - NPM_CONFIG_PRODUCTION=false
       - CHOKIDAR_USEPOLLING=1
+      - VITE_DEV_PROXY_TARGET=http://rag_backend:4000
+      - VITE_HMR_HOST=genkia.de
+      - VITE_HMR_PROTOCOL=wss
+      - VITE_HMR_CLIENT_PORT=443
     volumes:
-      - ./frontend/src:/app/src
-      - ./frontend/index.html:/app/index.html
-      - ./frontend/vite.config.js:/app/vite.config.js
+      - ./frontend:/app
+      - rag_feeder_node_modules:/app/node_modules
     restart: unless-stopped
     networks:
       - rag-network
+      - proxy-genkia
 
 networks:
   rag-network:
     external: true
+  proxy-genkia:
+    external: true
 
 volumes:
+  rag_feeder_node_modules:
   rag_feeder_uploads:
   rag_feeder_logs:

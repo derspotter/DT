@@ -24,14 +24,17 @@ Supported daemon job types in current code:
 - `download`
 - `pipeline_tick` (mark -> enrich -> download)
 
-## Stage Flow
+## Data Model
 
-Primary data flow:
+Primary runtime tables:
 
-`no_metadata -> with_metadata -> downloaded_references`
+- `works`: canonical work records, including metadata/download status and file info
+- `corpus_works`: corpus membership join table
 
-Download queue state is tracked in `with_metadata.download_state` (`queued` / `in_progress` / etc.).
-`to_download_references` remains in schema for compatibility but the current queue path is state-based.
+Status lives directly on `works`:
+
+- `metadata_status`: `pending | in_progress | matched | failed`
+- `download_status`: `not_requested | queued | in_progress | downloaded | failed`
 
 ## Services (docker compose)
 
@@ -46,6 +49,8 @@ Download queue state is tracked in `with_metadata.download_state` (`queued` / `i
    - `docker compose up -d`
 3. Open:
    - `http://localhost:5175`
+
+The production site does not hot reload. Rebuild the frontend when you want changes on the live stack.
 
 ## Paths You Actually Use
 

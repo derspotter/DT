@@ -115,7 +115,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     expect(args).not.toContain('--include-upstream')
   })
 
-  test('maps upload process args for both downstream and upstream', async () => {
+  test('upload process no longer creates pipeline jobs', async () => {
     const res = await doIngestProcess({
       limit: 3,
       workers: 2,
@@ -125,16 +125,14 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       includeUpstream: true,
     })
     expect(res.status).toBe(200)
-    const args = readArgFile(argFile)
-    expect(args).toContain('--related-depth-downstream')
-    expect(args).toContain('4')
-    expect(args).toContain('--related-depth-upstream')
-    expect(args).toContain('3')
-    expect(args).toContain('--include-upstream')
-    expect(args).not.toContain('--no-fetch-references')
+    expect(res.body.jobs).toEqual([])
+    expect(res.body.enrich_job_id).toBeNull()
+    expect(res.body.download_job_id).toBeNull()
+    expect(res.body.tracking).toBeNull()
+    expect(typeof res.body.message).toBe('string')
   })
 
-  test('maps upload process args for upstream-only mode', async () => {
+  test('upload process returns DB-driven background message for upstream-only mode', async () => {
     const res = await doIngestProcess({
       limit: 2,
       workers: 2,
@@ -143,11 +141,18 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       relatedDepthUpstream: 2,
     })
     expect(res.status).toBe(200)
-    const args = readArgFile(argFile)
-    expect(args).toContain('--no-include-downstream')
-    expect(args).toContain('--include-upstream')
-    expect(args).toContain('--related-depth-upstream')
-    expect(args).toContain('2')
-    expect(args).toContain('--no-fetch-references')
+    expect(res.body.jobs).toEqual([])
+    expect(res.body.message).toMatch(/background workers/i)
+  })
+
+  test('defaults upload process to DB-driven background mode', async () => {
+    const res = await doIngestProcess({
+      limit: 2,
+      workers: 2,
+    })
+    expect(res.status).toBe(200)
+    expect(res.body.jobs).toEqual([])
+    expect(res.body.backlog).toBeTruthy()
+    expect(typeof res.body.backlog.raw_pending).toBe('number')
   })
 })

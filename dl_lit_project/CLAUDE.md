@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is `dl_lit`, an automated PDF literature pipeline for academic research. The system extracts bibliographies from PDFs, enriches metadata via APIs (OpenAlex, Crossref), downloads referenced papers, and manages everything in a SQLite database with a staged processing workflow.
+This is `dl_lit`, an automated PDF literature pipeline for academic research. The system extracts bibliographies from PDFs, enriches metadata via APIs (OpenAlex, Crossref), downloads referenced papers, and manages everything in a SQLite database with a canonical `works` workflow.
 
 ## Environment Setup
 
@@ -23,7 +23,7 @@ The main CLI entry point is `python -m dl_lit.cli`. Key commands:
 
 ### Database Management
 - `python -m dl_lit.cli init-db [--db-path PATH]` - Initialize database schema
-- `python -m dl_lit.cli clear-downloaded [--db-path PATH]` - Clear downloaded_references table
+- `python -m dl_lit.cli clear-downloaded [--db-path PATH]` - Clear downloaded work files/state
 - `python -m dl_lit.cli show-sample [--limit N] [--show-all]` - View downloaded entries
 
 ### Automated Pipeline (Recommended)
@@ -66,7 +66,7 @@ python -m dl_lit.cli process-folder <folder> --watch [options]
 ### Import/Export
 - `python -m dl_lit.cli import-bib <bibtex_file> [--pdf-base-dir DIR] [--db-path PATH]` - Import existing BibTeX library
 - `python -m dl_lit.cli export-bibtex <output_file> [--db-path PATH]` - Export to BibTeX format
-- `python -m dl_lit.cli add-to-no-metadata --json-file <file> [--source-pdf PATH]` - Import JSON bibliography entries
+- `python -m dl_lit.cli add-pending-works --json-file <file> [--source-pdf PATH]` - Import JSON bibliography entries
 
 ### Testing
 Run tests with pytest:
@@ -78,22 +78,22 @@ Tests include mocked CLI commands for downloader, enricher, and bibliography ext
 
 ## Architecture
 
-### Staged Database Workflow
-The pipeline uses a 4-stage SQLite database approach to prevent duplicate work:
+### Canonical Database Workflow
+The runtime uses a canonical SQLite work model:
 
-1. **`no_metadata`** - Raw references extracted by APIscraper_v2 from PDFs
-2. **`with_metadata`** - References enriched with OpenAlex/Crossref metadata  
-3. **`to_download_references`** - Final download queue
-4. **`downloaded_references`** - Successfully processed entries (master table)
+1. **`works`** - One stable row per logical work
+2. **`corpus_works`** - Many-to-many corpus membership join table
+3. **`work_aliases`** - Alias titles for matching and dedupe
 
-Additional tables: `duplicate_references`, `failed_downloads`
+Work state is stored on `works`:
+- `metadata_status`: `pending | in_progress | matched | failed`
+- `download_status`: `not_requested | queued | in_progress | downloaded | failed`
 
 ### Key Components
 - **`cli.py`**: Click-based CLI with all commands (manual and automated)
-- **`pipeline.py`**: PipelineOrchestrator class for automated end-to-end processing
 - **`db_manager.py`**: DatabaseManager class handling all SQL operations and schema
 - **`get_bib_pages.py`**: GenAI-powered bibliography page extraction from PDFs
-- **`APIscraper_v2.py`**: GenAI text parsing to structured JSON, streams to `no_metadata` table
+- **`APIscraper_v2.py`**: GenAI text parsing to structured JSON, writes to ingest storage and optionally creates pending `works`
 - **`OpenAlexScraper.py`**: Metadata enrichment via OpenAlex/Crossref APIs
 - **`new_dl.py`**: BibliographyEnhancer class for PDF downloading
 - **`bibtex_formatter.py`**: BibTeX export formatting with JabRef-compatible `file` fields
@@ -107,9 +107,8 @@ PDF → [All steps automatically] → completed/failed folders + pdf_library/
 
 **Manual Step-by-Step Pipeline:**
 ```
-PDF → extract-bib-pages → extract-bib-api → no_metadata → 
-enrich-openalex-db → with_metadata → process-downloads → 
-to_download_references → download-pdfs → downloaded_references
+PDF → extract-bib-pages → extract-bib-api → ingest_entries/works →
+metadata_status=matched → download_status=queued → download_status=downloaded
 ```
 
 **Folder Structure for Automated Pipeline:**
@@ -124,12 +123,12 @@ pdf_library/    # Downloaded referenced papers
 Core libraries: `click`, `sqlite3`, `requests`, `bibtexparser>=2.0.0b8`, `google-genai`, `pikepdf`, `PyMuPDF`, `beautifulsoup4`, `tqdm`, `python-dotenv`, `rapidfuzz`, `colorama`, `google-cloud-aiplatform`
 
 ### Database Schema
-All tables share common columns: `id`, `title`, `authors`, `editors`, `doi`, `normalized_doi`, `openalex_id`, `bibtex_key`, `year`, `journal_conference`, `abstract`, `file_path`, `metadata_source_type`, `bibtex_entry_json`, `date_added`, etc.
+The canonical `works` table contains the bibliographic identity, metadata/download status, and file fields. Corpus membership lives in `corpus_works`.
 
 Key features:
 - DOI normalization for consistent duplicate detection
-- UNIQUE constraints on `doi` and `openalex_id` in final tables
-- Transaction-based moves between staging tables
+- UNIQUE constraints on canonical identifiers such as normalized DOI and OpenAlex ID
+- Status transitions happen on the same `works` row instead of moving data between staging tables
 - In-memory database support for bulk imports
 - **Editor extraction**: Separate `editors` field for book/volume editors to improve matching accuracy
 
@@ -200,9 +199,9 @@ python -m dl_lit.cli process-folder inbox/ --watch --fetch-citations --max-citat
    - Properly handle series editors (e.g., "Obst/Hintner") vs. actual source titles
    - Clean source title extraction without editor contamination
 
-2. **Database Schema Enhancement**: Added `editors` field to all pipeline tables:
-   - `no_metadata`, `with_metadata`, `to_download_references`, `downloaded_references`
-   - `failed_downloads`, `duplicate_references`
+2. **Database Schema Enhancement**: Added `editors` handling to the canonical work model:
+   - `works`
+   - `duplicate_references`
    - JSON array format for consistency with authors field
 
 3. **Improved Author Matching**: Enhanced `OpenAlexScraper.py` with:
@@ -232,7 +231,7 @@ python -m dl_lit.cli process-folder inbox/ --watch --fetch-citations --max-citat
 1. **Metadata Access**: Fixed `bib_entry` extraction in `new_dl.py:645` - downloader now properly accesses enriched metadata
 2. **Rate Limiting**: Fixed `ServiceRateLimiter.wait_if_needed()` in `utils.py` to return `True` instead of `None`
 3. **Author Handling**: Fixed LibGen author surname extraction to handle both dict and string formats
-4. **Database Schema**: Added missing `date_processed` column to `failed_downloads` table
+4. **Database Schema**: Download failure metadata is stored directly on canonical `works` rows
 5. **LibGen Scraping**: Completely rewrote LibGen search/parsing with:
    - Proper table parsing using `#tablelibgen` ID
    - Correct column indexing (extension in column 7, mirrors in rightmost column)

@@ -15,14 +15,14 @@ Transform the current sequential `PipelineOrchestrator` into a concurrent system
   - Graceful shutdown handling
 
 ### 1.2 Implement Stage Workers
-- **Bibliography Extraction Worker**: Process PDFs → `no_metadata` table
-- **Metadata Enrichment Worker**: Process `no_metadata` → `with_metadata` table  
-- **Download Queue Worker**: Process `with_metadata` → `to_download_references` table
-- **PDF Download Worker**: Process `to_download_references` → `downloaded_references` table
+- **Bibliography Extraction Worker**: Process PDFs → pending rows in `works`
+- **Metadata Enrichment Worker**: Process `works.metadata_status` from `pending` to `matched|failed`
+- **Download Queue Worker**: Process `works.download_status` from `not_requested` to `queued`
+- **PDF Download Worker**: Process `works.download_status` from `queued|in_progress` to `downloaded|failed`
 
 ### 1.3 Queue Management System
 - **Inter-stage queues**: `Queue.Queue()` for passing work between stages
-- **Database polling**: Workers check database tables for new work
+- **Database polling**: Workers check canonical `works` state for new work
 - **Priority handling**: Process newer entries first
 - **Backpressure control**: Prevent queue overflow
 

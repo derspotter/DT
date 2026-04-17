@@ -50,9 +50,10 @@
       <span>Status</span>
       <select bind:value={graphStatusFilter}>
         <option value="all">All</option>
-        <option value="with_metadata">With metadata</option>
+        <option value="matched">Matched</option>
         <option value="downloaded">Downloaded</option>
-        <option value="queued">Queued</option>
+        <option value="queued_download">Queued</option>
+        <option value="raw">Raw</option>
       </select>
     </label>
     <label>

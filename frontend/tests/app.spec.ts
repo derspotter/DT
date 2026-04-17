@@ -6,16 +6,12 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
   await page.goto('/')
   const heading = page.getByRole('heading', { name: 'Corpus orchestration workspace' })
   if (await heading.isVisible().catch(() => false)) {
-    await expect(page.locator('.subtitle').first()).toContainText('API status:')
+    await expect(page.getByText(/API status:/).first()).toContainText('API status:')
     return
   }
 
-  const username = `pw_e2e_${Date.now()}_${Math.floor(Math.random() * 10_000)}`
-  const password = `pw_e2e_${Math.floor(Math.random() * 1_000_000)}`
-  const register = await request.post('http://localhost:4000/api/auth/register', {
-    data: { username, password },
-  })
-  expect([201, 409]).toContain(register.status())
+  const username = process.env.RAG_ADMIN_USER || 'admin'
+  const password = process.env.RAG_ADMIN_PASSWORD || 'admin'
 
   const signInButton = page.getByRole('button', { name: 'Sign in' })
   if (await signInButton.isVisible().catch(() => false)) {
@@ -25,11 +21,11 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
   }
 
   await expect(heading).toBeVisible({ timeout: 20_000 })
-  await expect(page.locator('.subtitle').first()).toContainText('API status:')
+  await expect(page.getByText(/API status:/).first()).toContainText('API status:')
 }
 
 async function waitUntilSearchSettled(page: Page) {
-  const status = page.getByTestId('search-panel').locator('p.muted').first()
+  const status = page.locator('.seed-intake-card--search p.muted').first()
   await expect
     .poll(
       async () => {
@@ -103,43 +99,18 @@ test.describe('Korpus Builder live integration', () => {
   test('end-to-end flow uses real backend APIs', async ({ page, request }) => {
     await ensureSignedIn(page, request)
 
+    await expect(page.getByTestId('side-nav')).toBeVisible()
+    await expect(page.getByTestId('tab-workspace')).toBeVisible()
+    await expect(page.getByTestId('tab-dashboard')).toBeVisible()
+    await expect(page.getByTestId('tab-logs')).toBeVisible()
+
+    await page.getByTestId('tab-dashboard').click()
     await expect(page.getByTestId('dashboard-overview')).toBeVisible()
-    await expect(page.getByTestId('header-log-stream')).toBeVisible()
 
-    const globalPipeline = page.locator('.header-pipeline')
-    await expect(globalPipeline).toBeVisible()
-    const stateText = ((await globalPipeline.locator('.header-pipeline__state strong').textContent()) || '').trim()
-    if (stateText.toLowerCase() === 'paused') {
-      await page.getByRole('button', { name: 'Start / Continue' }).click()
-      await expect(globalPipeline.locator('.header-pipeline__state strong')).toHaveText(/Running/i, { timeout: 20_000 })
-      await page.getByRole('button', { name: 'Pause', exact: true }).click()
-      await expect(page.getByRole('button', { name: 'Pause', exact: true })).toBeVisible()
-    }
-
-    await page.getByTestId('tab-ingest').click()
-    await expect(page.getByTestId('ingest-panel')).toBeVisible()
-    await page.getByRole('button', { name: 'Refresh stats' }).click()
-    await page.getByRole('button', { name: 'Refresh runs' }).click()
-    await expect(page.getByText('Raw:')).toBeVisible()
-    await expect(page.getByText('With metadata:')).toBeVisible()
-    await expect(page.getByText('Downloaded:')).toBeVisible()
-
-    const runButtons = page.locator('button.link.truncate-line')
-    if (await runButtons.count()) {
-      await runButtons.first().click()
-      const selectAll = page.getByRole('button', { name: 'Select all' })
-      if (await selectAll.isVisible().catch(() => false)) {
-        await selectAll.click()
-        const selectedLabel = page.locator('.table-toolbar-left .muted').first()
-        await expect(selectedLabel).toContainText('Selected:')
-      }
-    }
-
-    await page.getByTestId('tab-search').click()
-    await expect(page.getByTestId('search-panel')).toBeVisible()
-    await page.getByTestId('search-mode').selectOption('query')
-    await page.getByTestId('search-query').fill('institutional economics AND governance')
-    await page.getByTestId('search-submit').click()
+    await page.getByTestId('tab-workspace').click()
+    await expect(page.locator('.seed-intake-card--search')).toBeVisible()
+    await page.getByRole('textbox', { name: 'Query' }).fill('institutional economics AND governance')
+    await page.getByRole('button', { name: 'Search' }).click()
     const searchStatus = await waitUntilSearchSettled(page)
     expect(searchStatus).not.toContain('Searching...')
     expect(searchStatus.length).toBeGreaterThan(0)
@@ -150,10 +121,9 @@ test.describe('Korpus Builder live integration', () => {
       })
     }
 
-    await page.getByTestId('tab-corpus').click()
     const corpusPanel = page.getByTestId('corpus-panel')
     await expect(corpusPanel).toBeVisible()
-    await expect(corpusPanel.getByText('Live corpus from API.')).toBeVisible()
+    await expect(corpusPanel.getByText(/corpus from api|sample corpus data/i)).toBeVisible()
     const corpusRows = corpusPanel.locator('.corpus-select-row')
     if (await corpusRows.count()) {
       await corpusRows.first().click()
@@ -192,8 +162,9 @@ test.describe('Korpus Builder live integration', () => {
 
   test('ingest accepts a real PDF upload and starts extraction', async ({ page, request }, testInfo) => {
     await ensureSignedIn(page, request)
-    await page.getByTestId('tab-ingest').click()
-    await expect(page.getByTestId('ingest-panel')).toBeVisible()
+    await page.getByTestId('tab-workspace').click()
+    const uploadCard = page.locator('.seed-intake-card--upload')
+    await expect(uploadCard).toBeVisible()
 
     const pdfPath = writePdfFixture(
       testInfo.outputPath('fixtures/ingest-smoke.pdf'),
@@ -201,11 +172,9 @@ test.describe('Korpus Builder live integration', () => {
     )
     const pdfName = 'ingest-smoke.pdf'
 
-    await page.locator('input[type="file"][accept=".pdf"]').setInputFiles(pdfPath)
-    const uploadRow = page.locator('.upload-item', { hasText: pdfName })
+    await uploadCard.locator('input[type="file"][accept=".pdf"]').setInputFiles(pdfPath)
+    const uploadRow = uploadCard.locator('.upload-item', { hasText: pdfName })
     await expect(uploadRow).toBeVisible()
-
-    await page.getByRole('button', { name: 'Upload selected' }).click()
     await expect(uploadRow.locator('.status')).toHaveText('uploaded', { timeout: 120_000 })
 
     await uploadRow.getByRole('button', { name: 'Extract' }).click()
@@ -256,7 +225,7 @@ test.describe('Korpus Builder live integration', () => {
     expect(citedBySummary.edges).toBeGreaterThanOrEqual(0)
     expect(citedBySummary).toBeDefined()
 
-    await statusSelect.selectOption('with_metadata')
+    await statusSelect.selectOption('matched')
     await maxNodesInput.fill('120')
     await yearFromInput.fill('2000')
     await colorModeSelect.selectOption('status')

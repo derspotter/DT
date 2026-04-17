@@ -17,13 +17,6 @@ RESET = "\033[0m"
 class DatabaseManager:
     """Manages all SQLite database interactions for the literature management tool."""
 
-    TABLE_PRIORITY = {
-        "downloaded_references": 4,
-        "with_metadata": 3,
-        "to_download_references": 2,
-        "no_metadata": 1,
-    }
-
     def __init__(self, db_path: str | Path = "data/literature.db"):
         """Initializes the DatabaseManager, connects to the SQLite database,
         and ensures the necessary table schema is created.
@@ -61,76 +54,7 @@ class DatabaseManager:
             print(f"{GREEN}[DB Manager] In-memory database connected.{RESET}")
         else:
             print(f"{GREEN}[DB Manager] Connected to database: {self.db_path.resolve()}{RESET}")
-        self._legacy_queue_migrated = False
         self._create_schema()
-
-    def _ensure_legacy_queue_migrated(self) -> None:
-        """Migrate legacy queue rows lazily so both old and new queue layouts work."""
-        if self._legacy_queue_migrated:
-            return
-        try:
-            self._migrate_legacy_queue_into_with_metadata()
-        finally:
-            # Never repeatedly migrate in hot paths; failures stay visible but do not block runtime.
-            self._legacy_queue_migrated = True
-
-    def retry_failed_downloads(self):
-        """Moves all entries from the failed_downloads table back to no_metadata for reprocessing."""
-        # Use a local cursor and set row_factory to get dict-like access
-        self.conn.row_factory = sqlite3.Row
-        cursor = self.conn.cursor()
-        
-        try:
-            # Select all entries from failed_downloads
-            cursor.execute("SELECT * FROM failed_downloads")
-            failed_entries = cursor.fetchall()
-
-            if not failed_entries:
-                self.conn.row_factory = None # Reset row_factory
-                return 0
-
-            entries_to_move = []
-            ids_to_delete = []
-            for entry in failed_entries:
-                # Prepare data for no_metadata table
-                title = entry['title']
-                authors = entry['authors']
-                doi = entry['doi']
-                
-                normalized_doi = self._normalize_doi(doi)
-                normalized_title = self._normalize_text(title)
-                normalized_authors = self._normalize_text(authors)
-
-                # no_metadata columns: (source_pdf, title, authors, doi, normalized_doi, normalized_title, normalized_authors)
-                # source_pdf is not in failed_downloads, so we use None.
-                entries_to_move.append((
-                    None, title, authors, doi, normalized_doi, normalized_title, normalized_authors
-                ))
-                ids_to_delete.append((entry['id'],))
-
-            # Use INSERT OR IGNORE to avoid crashing on UNIQUE constraint violations
-            # if a retried item somehow already exists in no_metadata.
-            insert_query = """
-                INSERT OR IGNORE INTO no_metadata 
-                (source_pdf, title, authors, doi, normalized_doi, normalized_title, normalized_authors) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """
-            cursor.executemany(insert_query, entries_to_move)
-
-            # Delete entries from failed_downloads
-            delete_query = "DELETE FROM failed_downloads WHERE id = ?"
-            cursor.executemany(delete_query, ids_to_delete)
-
-            self.conn.commit()
-            return len(failed_entries)
-
-        except sqlite3.Error as e:
-            print(f"An error occurred while retrying failed downloads: {e}")
-            self.conn.rollback()
-            raise
-        finally:
-            # It's good practice to reset the row_factory
-            self.conn.row_factory = None
 
     def close_connection(self):
         """Closes the database connection."""
@@ -145,259 +69,85 @@ class DatabaseManager:
         """Creates the database schema, including all necessary tables if they don't exist."""
         cursor = self.conn.cursor()
 
-        # 1. Downloaded References (Master Table)
+        # Canonical schema bootstrap always runs first. Once works_schema_version=1 is present
+        # we do not need to touch or backfill legacy stage tables on every startup.
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS downloaded_references (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bibtex_key TEXT,
-                entry_type TEXT,
-                source_pdf TEXT,
-                title TEXT NOT NULL,
-                authors TEXT, -- JSON list of strings
-                editors TEXT, -- JSON list of strings for book/volume editors
-                year INTEGER,
-                doi TEXT,
-                pmid TEXT,
-                arxiv_id TEXT,
-                openalex_id TEXT, -- Stores 'W123456789'
-                semantic_scholar_id TEXT,
-                mag_id TEXT,
-                url_source TEXT,
-                file_path TEXT,
-                abstract TEXT,
-                keywords TEXT, -- JSON list of strings
-                journal_conference TEXT,
-                volume TEXT,
-                issue TEXT,
-                pages TEXT,
-                publisher TEXT,
-                metadata_source_type TEXT, -- e.g., 'bibtex_import', 'openalex_api', 'grobid'
-                bibtex_entry_json TEXT, -- Full bib entry as JSON from bibtexparser
-                source_work_id INTEGER, -- ID of the work this entry references or cites
-                relationship_type TEXT, -- 'references' or 'cited_by'
-                status_notes TEXT, -- e.g., 'Successfully downloaded and processed'
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_processed TIMESTAMP,
-                checksum_pdf TEXT,
-                source_of_download TEXT, -- e.g., 'scihub', 'libgen', 'unpaywall'
-                ingest_source TEXT,
-                run_id INTEGER,
-                UNIQUE(doi),
-                UNIQUE(openalex_id)
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # 2. To-Download References
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS to_download_references (
+            CREATE TABLE IF NOT EXISTS works (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bibtex_key TEXT,
-                entry_type TEXT,
                 title TEXT NOT NULL,
                 authors TEXT,
-                editors TEXT, -- JSON list of strings for book/volume editors
+                editors TEXT,
                 year INTEGER,
                 doi TEXT,
                 normalized_doi TEXT,
-                pmid TEXT,
-                arxiv_id TEXT,
                 openalex_id TEXT,
                 semantic_scholar_id TEXT,
-                mag_id TEXT,
-                url_source TEXT, -- URL to attempt download from, or API query
-                file_path TEXT, -- Would be NULL initially
-                abstract TEXT,
-                keywords TEXT,
-                journal_conference TEXT,
-                volume TEXT,
-                issue TEXT,
-                pages TEXT,
-                publisher TEXT,
-                metadata_source_type TEXT, -- e.g., 'input_json_list', 'user_added_doi'
-                bibtex_entry_json TEXT, -- Minimal, or to be populated
-                crossref_json TEXT, -- Full CrossRef JSON blob
-                openalex_json TEXT, -- Full OpenAlex JSON blob
-                source_work_id INTEGER, -- ID of the work this entry references or cites
-                relationship_type TEXT, -- 'references' or 'cited_by'
-                normalized_title TEXT,
-                normalized_authors TEXT,
-                status_notes TEXT, -- e.g., 'Pending download', 'Attempt 1 failed - network error'
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_processed TIMESTAMP,
-                checksum_pdf TEXT, -- NULL initially
-                ingest_source TEXT,
-                run_id INTEGER
-            )
-        """)
-
-        # 3. Duplicate References
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS duplicate_references (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bibtex_key TEXT,
-                entry_type TEXT,
-                title TEXT NOT NULL,
-                authors TEXT, -- JSON list of strings
-                editors TEXT, -- JSON list of strings for book/volume editors
-                year INTEGER,
-                doi TEXT, -- Normalized DOI of the duplicate entry
-                openalex_id TEXT, -- Normalized OpenAlex ID of the duplicate entry
-                metadata_source_type TEXT, -- e.g., 'bibtex_import_duplicate'
-                original_bibtex_entry_json TEXT, -- Full original BibTeX entry of the duplicate as JSON
-                source_bibtex_file TEXT, -- Path to the BibTeX file this duplicate came from
-                existing_entry_id INTEGER NOT NULL, -- ID of the entry it duplicates
-                existing_entry_table TEXT NOT NULL, -- Table of the existing entry (e.g., 'downloaded_references')
-                matched_on_field TEXT NOT NULL, -- Field that matched (e.g., 'doi', 'openalex_id')
-                date_detected TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- When the duplicate was detected
-            )
-        """)
-
-        # 4. Failed Enrichments
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS failed_enrichments (
-                id INTEGER PRIMARY KEY,
-                source_pdf TEXT,
-                title TEXT,
-                authors TEXT,
-                year INTEGER,
-                doi TEXT,
-                raw_text_search TEXT,
-                reason TEXT, -- e.g., 'metadata_fetch_failed', 'db_promotion_failed'
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 5. Failed Downloads
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS failed_downloads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bibtex_key TEXT,
-                entry_type TEXT,
-                title TEXT NOT NULL,
-                authors TEXT,
-                editors TEXT, -- JSON list of strings for book/volume editors
-                year INTEGER,
-                doi TEXT,
-                pmid TEXT,
-                arxiv_id TEXT,
-                openalex_id TEXT,
-                semantic_scholar_id TEXT,
-                mag_id TEXT,
-                url_source TEXT, -- URL that failed
-                file_path TEXT, -- NULL
-                abstract TEXT,
-                keywords TEXT,
-                journal_conference TEXT,
-                volume TEXT,
-                issue TEXT,
-                pages TEXT,
-                publisher TEXT,
-                metadata_source_type TEXT,
-                bibtex_entry_json TEXT, -- Data available before failure
-                crossref_json TEXT,
-                openalex_json TEXT,
-                source_work_id INTEGER, -- ID of the work this entry references or cites
-                relationship_type TEXT, -- 'references' or 'cited_by'
-                status_notes TEXT, -- e.g., 'Download failed: 404 Not Found'
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_processed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                checksum_pdf TEXT -- NULL
-            )
-        """)
-
-        # 6. No-Metadata Staging Table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS no_metadata (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_pdf TEXT,
-                title TEXT NOT NULL,
-                authors TEXT,
-                editors TEXT, -- JSON list of strings for book/volume editors
-                year INTEGER,
-                doi TEXT,
-                source TEXT, -- journal/conference/book title (container_title)
-                volume TEXT,
-                issue TEXT,
-                pages TEXT,
-                publisher TEXT,
-                type TEXT,
-                url TEXT,
-                isbn TEXT,
-                issn TEXT,
-                abstract TEXT,
-                keywords TEXT,
-                normalized_doi TEXT UNIQUE,
-                normalized_title TEXT,
-                normalized_authors TEXT,
-                source_work_id INTEGER, -- ID of the work this entry references or cites
-                relationship_type TEXT, -- 'references' or 'cited_by'
-                ingest_source TEXT,
-                run_id INTEGER,
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # 7. With-Metadata Staging Table (Enriched, queue/download state lives here)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS with_metadata (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bibtex_key TEXT,
-                entry_type TEXT,
-                source_pdf TEXT,
-                title TEXT NOT NULL,
-                authors TEXT,
-                editors TEXT, -- JSON list of strings for book/volume editors
-                year INTEGER,
-                doi TEXT,
-                normalized_doi TEXT UNIQUE,
-                pmid TEXT,
-                arxiv_id TEXT,
-                openalex_id TEXT UNIQUE,
-                semantic_scholar_id TEXT,
-                mag_id TEXT,
-                normalized_title TEXT,
-                normalized_authors TEXT,
-                abstract TEXT,
-                metadata_source_type TEXT,
-                bibtex_entry_json TEXT,
-                crossref_json TEXT,
-                openalex_json TEXT,
                 source TEXT,
-                journal_conference TEXT,
+                publisher TEXT,
                 volume TEXT,
                 issue TEXT,
                 pages TEXT,
-                publisher TEXT,
                 type TEXT,
                 url TEXT,
-                url_source TEXT,
-                file_path TEXT,
                 isbn TEXT,
                 issn TEXT,
+                abstract TEXT,
                 keywords TEXT,
-                source_work_id INTEGER, -- ID of the work this entry references or cites
-                relationship_type TEXT, -- 'references' or 'cited_by'
-                status_notes TEXT,
-                date_processed TIMESTAMP,
-                checksum_pdf TEXT,
-                download_state TEXT DEFAULT 'with_metadata',
+                normalized_title TEXT,
+                normalized_authors TEXT,
+                metadata_status TEXT NOT NULL DEFAULT 'pending',
+                metadata_source TEXT,
+                metadata_error TEXT,
+                metadata_updated_at TIMESTAMP,
+                download_status TEXT NOT NULL DEFAULT 'not_requested',
+                download_source TEXT,
+                download_error TEXT,
+                downloaded_at TIMESTAMP,
+                metadata_claimed_by TEXT,
+                metadata_claimed_at INTEGER,
+                metadata_lease_expires_at INTEGER,
+                metadata_attempt_count INTEGER NOT NULL DEFAULT 0,
+                metadata_last_attempt_at INTEGER,
                 download_claimed_by TEXT,
                 download_claimed_at INTEGER,
                 download_lease_expires_at INTEGER,
-                download_attempt_count INTEGER DEFAULT 0,
+                download_attempt_count INTEGER NOT NULL DEFAULT 0,
                 download_last_attempt_at INTEGER,
-                download_last_error TEXT,
-                ingest_source TEXT,
+                file_path TEXT,
+                file_checksum TEXT,
+                origin_type TEXT,
+                origin_key TEXT,
+                source_pdf TEXT,
                 run_id INTEGER,
-                date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                source_work_id INTEGER,
+                relationship_type TEXT,
+                crossref_json TEXT,
+                openalex_json TEXT,
+                bibtex_entry_json TEXT,
+                status_notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # 8. Work Aliases (translations / alternate titles)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS corpus_works (
+                corpus_id INTEGER NOT NULL,
+                work_id INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (corpus_id, work_id)
+            )
+        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS work_aliases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_table TEXT NOT NULL, -- 'no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references'
+                work_table TEXT NOT NULL,
                 work_id INTEGER NOT NULL,
                 alias_title TEXT NOT NULL,
                 normalized_alias_title TEXT NOT NULL,
@@ -407,8 +157,26 @@ class DatabaseManager:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # 9. Merge log for deduplication decisions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS duplicate_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bibtex_key TEXT,
+                entry_type TEXT,
+                title TEXT NOT NULL,
+                authors TEXT,
+                editors TEXT,
+                year INTEGER,
+                doi TEXT,
+                openalex_id TEXT,
+                metadata_source_type TEXT,
+                original_bibtex_entry_json TEXT,
+                source_bibtex_file TEXT,
+                existing_entry_id INTEGER NOT NULL,
+                existing_entry_table TEXT NOT NULL,
+                matched_on_field TEXT NOT NULL,
+                date_detected TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS merge_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -423,22 +191,6 @@ class DatabaseManager:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-
-        # 10. Pipeline Jobs (for background daemon)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pipeline_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                corpus_id INTEGER,
-                job_type TEXT NOT NULL, -- e.g., 'enrich', 'download', 'keyword_search'
-                status TEXT DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed'
-                parameters_json TEXT, -- any parameters needed for the job
-                result_json TEXT, -- output results or error messages
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                started_at TIMESTAMP,
-                finished_at TIMESTAMP
-            )
-        """)
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS citation_edges (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -454,7 +206,110 @@ class DatabaseManager:
                 UNIQUE(source_id, target_id, relationship_type)
             )
         """)
-
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ingest_source TEXT,
+                source_pdf TEXT,
+                title TEXT,
+                authors TEXT,
+                year INTEGER,
+                doi TEXT,
+                source TEXT,
+                publisher TEXT,
+                url TEXT,
+                entry_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                corpus_id INTEGER,
+                processed INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_source_metadata (
+                corpus_id INTEGER NOT NULL DEFAULT 0,
+                ingest_source TEXT NOT NULL,
+                source_pdf TEXT,
+                title TEXT,
+                authors TEXT,
+                year INTEGER,
+                doi TEXT,
+                source TEXT,
+                publisher TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (corpus_id, ingest_source)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                filters_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                search_run_id INTEGER NOT NULL,
+                openalex_id TEXT,
+                doi TEXT,
+                title TEXT,
+                year INTEGER,
+                raw_json TEXT,
+                work_id INTEGER,
+                FOREIGN KEY(search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_run_corpora (
+                search_run_id INTEGER PRIMARY KEY,
+                corpus_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS seed_sources_hidden (
+                corpus_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                hidden_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (corpus_id, source_type, source_key)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS seed_candidates_dismissed (
+                corpus_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                candidate_key TEXT NOT NULL,
+                dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+                daemon_name TEXT PRIMARY KEY,
+                worker_id TEXT,
+                status TEXT,
+                details_json TEXT,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pipeline_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                corpus_id INTEGER,
+                job_type TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                parameters_json TEXT,
+                result_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP
+            )
+        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pipeline_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -466,570 +321,280 @@ class DatabaseManager:
                 notes TEXT
             )
         """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ingest_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                corpus_id INTEGER,
-                ingest_source TEXT,
-                source_pdf TEXT,
-                title TEXT,
-                authors TEXT,
-                year INTEGER,
-                doi TEXT,
-                source TEXT,
-                publisher TEXT,
-                url TEXT,
-                entry_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS corpus_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                corpus_id INTEGER NOT NULL,
-                table_name TEXT NOT NULL,
-                row_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(corpus_id, table_name, row_id)
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                last_corpus_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS corpora (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                owner_user_id INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_corpora (
-                user_id INTEGER NOT NULL,
-                corpus_id INTEGER NOT NULL,
-                role TEXT DEFAULT 'viewer',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, corpus_id)
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                checksum TEXT UNIQUE,
-                file_path TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS search_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                query TEXT NOT NULL,
-                filters_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS search_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                search_run_id INTEGER NOT NULL,
-                openalex_id TEXT,
-                doi TEXT,
-                title TEXT,
-                year INTEGER,
-                raw_json TEXT,
-                FOREIGN KEY(search_run_id) REFERENCES search_runs(id) ON DELETE CASCADE
-            )
-        """)
-
-
-        # Add missing columns to failed_downloads if they don't exist
-        self._add_missing_columns_to_failed_downloads()
-        
-        # Legacy queue table compatibility: keep columns current for older DBs.
-        self._add_normalized_columns_to_download_queue()
-        self._add_claim_columns_to_download_queue()
-        self._add_missing_columns_to_no_metadata()
-        self._add_missing_columns_to_with_metadata()
-        self._add_missing_columns_to_downloaded_references()
-        self._add_missing_columns_to_ingest_entries()
-        self._migrate_legacy_queue_into_with_metadata()
-        self._backfill_normalized_contributors()
-
-        # Helpful indices for quick look-ups (after ensuring columns exist)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_norm_doi ON no_metadata(normalized_doi)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_openalex ON with_metadata(openalex_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_doi ON with_metadata(normalized_doi)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_state_lease ON with_metadata(download_state, download_lease_expires_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_openalex ON to_download_references(openalex_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_doi ON to_download_references(normalized_doi)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_corpus ON ingest_entries(corpus_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_openalex ON search_results(openalex_id)")
-        
-        # Add indexes for title/author/year duplicate detection
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_source_pdf ON downloaded_references(source_pdf)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_title_year ON downloaded_references(normalized_title, year)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_authors ON downloaded_references(normalized_authors)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_title_year ON with_metadata(normalized_title, year)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_with_metadata_authors ON with_metadata(normalized_authors)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_title_year ON no_metadata(normalized_title, year)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_no_metadata_authors ON no_metadata(normalized_authors)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_title_year ON to_download_references(normalized_title, year)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_authors ON to_download_references(normalized_authors)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_to_download_state_lease ON to_download_references(download_state, download_lease_expires_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_norm_title ON work_aliases(normalized_alias_title)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_owner ON work_aliases(work_table, work_id)")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_title_year ON works(normalized_title, year)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_authors ON works(normalized_authors)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_metadata_status ON works(metadata_status, metadata_lease_expires_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_download_status ON works(download_status, download_lease_expires_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_origin ON works(origin_type, origin_key)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_works_corpus ON corpus_works(corpus_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_works_work ON corpus_works(work_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_duplicate_references_existing ON duplicate_references(existing_entry_table, existing_entry_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_items_lookup ON corpus_items(corpus_id, table_name, row_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
 
-        self.conn.commit()
-        print(f"{GREEN}[DB Manager] Schema created/verified successfully.{RESET}")
-
-    def _add_missing_columns_to_failed_downloads(self):
-        """Add missing columns to failed_downloads table if they don't exist."""
-        cursor = self.conn.cursor()
-        
-        # Check if source_work_id column exists
-        cursor.execute("PRAGMA table_info(failed_downloads)")
-        columns = [col[1] for col in cursor.fetchall()]
-        
-        if 'source_work_id' not in columns:
-            try:
-                cursor.execute("ALTER TABLE failed_downloads ADD COLUMN source_work_id INTEGER")
-                print(f"{GREEN}[DB Manager] Added source_work_id column to failed_downloads table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add source_work_id column: {e}{RESET}")
-        
-        if 'relationship_type' not in columns:
-            try:
-                cursor.execute("ALTER TABLE failed_downloads ADD COLUMN relationship_type TEXT")
-                print(f"{GREEN}[DB Manager] Added relationship_type column to failed_downloads table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add relationship_type column: {e}{RESET}")
-
-    def _add_missing_columns_to_ingest_entries(self):
-        """Add missing compatibility columns to ingest_entries table if they don't exist."""
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA table_info(ingest_entries)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if 'corpus_id' not in columns:
-            try:
-                cursor.execute("ALTER TABLE ingest_entries ADD COLUMN corpus_id INTEGER")
-                print(f"{GREEN}[DB Manager] Added corpus_id column to ingest_entries table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add corpus_id column: {e}{RESET}")
-        if 'processed' not in columns:
-            try:
-                cursor.execute("ALTER TABLE ingest_entries ADD COLUMN processed INTEGER DEFAULT 0")
-                print(f"{GREEN}[DB Manager] Added processed column to ingest_entries table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add processed column: {e}{RESET}")
-
-    def _add_normalized_columns_to_download_queue(self):
-        """Add missing normalized columns to to_download_references table if they don't exist."""
-        cursor = self.conn.cursor()
-        
-        # Check if normalized columns exist
-        cursor.execute("PRAGMA table_info(to_download_references)")
-        columns = [col[1] for col in cursor.fetchall()]
-        
-        if 'normalized_doi' not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_doi TEXT")
-                print(f"{GREEN}[DB Manager] Added normalized_doi column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_doi column: {e}{RESET}")
-
-        if 'normalized_title' not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_title TEXT")
-                print(f"{GREEN}[DB Manager] Added normalized_title column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_title column: {e}{RESET}")
-        
-        if 'normalized_authors' not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN normalized_authors TEXT")
-                print(f"{GREEN}[DB Manager] Added normalized_authors column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add normalized_authors column: {e}{RESET}")
-
-        if 'ingest_source' not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN ingest_source TEXT")
-                print(f"{GREEN}[DB Manager] Added ingest_source column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add ingest_source column: {e}{RESET}")
-
-        if 'run_id' not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN run_id INTEGER")
-                print(f"{GREEN}[DB Manager] Added run_id column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add run_id column: {e}{RESET}")
-
-    def _add_claim_columns_to_download_queue(self) -> None:
-        """Add missing worker-claim/lease columns to to_download_references table if they don't exist.
-
-        These fields allow atomic claiming of queue rows so concurrent workers cannot process the
-        same item, and interrupted workers don't immediately churn the same bad rows.
-        """
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA table_info(to_download_references)")
-        columns = [col[1] for col in cursor.fetchall()]
-
-        # State machine: queued -> in_progress (row removed on success/fail)
-        if "download_state" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_state TEXT DEFAULT 'queued'")
-                print(f"{GREEN}[DB Manager] Added download_state column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_state column: {e}{RESET}")
-
-        if "download_claimed_by" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_claimed_by TEXT")
-                print(f"{GREEN}[DB Manager] Added download_claimed_by column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_claimed_by column: {e}{RESET}")
-
-        if "download_claimed_at" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_claimed_at INTEGER")
-                print(f"{GREEN}[DB Manager] Added download_claimed_at column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_claimed_at column: {e}{RESET}")
-
-        if "download_lease_expires_at" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_lease_expires_at INTEGER")
-                print(f"{GREEN}[DB Manager] Added download_lease_expires_at column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_lease_expires_at column: {e}{RESET}")
-
-        if "download_attempt_count" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_attempt_count INTEGER DEFAULT 0")
-                print(f"{GREEN}[DB Manager] Added download_attempt_count column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_attempt_count column: {e}{RESET}")
-
-        if "download_last_attempt_at" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_last_attempt_at INTEGER")
-                print(f"{GREEN}[DB Manager] Added download_last_attempt_at column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_last_attempt_at column: {e}{RESET}")
-
-        if "download_last_error" not in columns:
-            try:
-                cursor.execute("ALTER TABLE to_download_references ADD COLUMN download_last_error TEXT")
-                print(f"{GREEN}[DB Manager] Added download_last_error column to to_download_references table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add download_last_error column: {e}{RESET}")
-
-    def _add_missing_columns_to_no_metadata(self):
-        """Add missing provenance columns to no_metadata table if they don't exist."""
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA table_info(no_metadata)")
-        columns = [col[1] for col in cursor.fetchall()]
-
-        if 'ingest_source' not in columns:
-            try:
-                cursor.execute("ALTER TABLE no_metadata ADD COLUMN ingest_source TEXT")
-                print(f"{GREEN}[DB Manager] Added ingest_source column to no_metadata table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add ingest_source column: {e}{RESET}")
-
-        if 'run_id' not in columns:
-            try:
-                cursor.execute("ALTER TABLE no_metadata ADD COLUMN run_id INTEGER")
-                print(f"{GREEN}[DB Manager] Added run_id column to no_metadata table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add run_id column: {e}{RESET}")
-
-        if 'selected_for_enrichment' not in columns:
-            try:
-                cursor.execute("ALTER TABLE no_metadata ADD COLUMN selected_for_enrichment INTEGER DEFAULT 0")
-                print(f"{GREEN}[DB Manager] Added selected_for_enrichment column to no_metadata table.{RESET}")
-            except sqlite3.Error as e:
-                print(f"{YELLOW}[DB Manager] Warning: Could not add selected_for_enrichment column: {e}{RESET}")
-
-    def _add_missing_columns_to_with_metadata(self):
-        """Add missing source/provenance columns to with_metadata table if they don't exist."""
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA table_info(with_metadata)")
-        columns = [col[1] for col in cursor.fetchall()]
-
-        for col_name, col_type in [
-            ('bibtex_key', 'TEXT'),
-            ('entry_type', 'TEXT'),
-            ('source', 'TEXT'),
-            ('journal_conference', 'TEXT'),
-            ('volume', 'TEXT'),
-            ('issue', 'TEXT'),
-            ('pages', 'TEXT'),
-            ('publisher', 'TEXT'),
-            ('type', 'TEXT'),
-            ('url', 'TEXT'),
-            ('url_source', 'TEXT'),
-            ('file_path', 'TEXT'),
-            ('isbn', 'TEXT'),
-            ('issn', 'TEXT'),
-            ('keywords', 'TEXT'),
-            ('pmid', 'TEXT'),
-            ('arxiv_id', 'TEXT'),
-            ('semantic_scholar_id', 'TEXT'),
-            ('mag_id', 'TEXT'),
-            ('metadata_source_type', 'TEXT'),
-            ('bibtex_entry_json', 'TEXT'),
-            ('status_notes', 'TEXT'),
-            ('date_processed', 'TIMESTAMP'),
-            ('checksum_pdf', 'TEXT'),
-            ('download_state', "TEXT DEFAULT 'with_metadata'"),
-            ('download_claimed_by', 'TEXT'),
-            ('download_claimed_at', 'INTEGER'),
-            ('download_lease_expires_at', 'INTEGER'),
-            ('download_attempt_count', 'INTEGER DEFAULT 0'),
-            ('download_last_attempt_at', 'INTEGER'),
-            ('download_last_error', 'TEXT'),
-            ('ingest_source', 'TEXT'),
-            ('run_id', 'INTEGER'),
-        ]:
-            if col_name not in columns:
-                try:
-                    cursor.execute(f"ALTER TABLE with_metadata ADD COLUMN {col_name} {col_type}")
-                    print(f"{GREEN}[DB Manager] Added {col_name} column to with_metadata table.{RESET}")
-                except sqlite3.Error as e:
-                    print(f"{YELLOW}[DB Manager] Warning: Could not add {col_name} column: {e}{RESET}")
-
-
-    def _migrate_legacy_queue_into_with_metadata(self) -> None:
-        """Fold legacy to_download_references rows into with_metadata once per startup."""
-        cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='to_download_references'")
-            if not cursor.fetchone():
-                return
+            has_search_results = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_results' LIMIT 1"
+            ).fetchone()
+            if has_search_results and "work_id" not in [row[1] for row in cursor.execute("PRAGMA table_info(search_results)").fetchall()]:
+                cursor.execute("ALTER TABLE search_results ADD COLUMN work_id INTEGER")
+        except sqlite3.Error:
+            pass
 
-            cursor.execute("SELECT COUNT(*) FROM to_download_references")
-            legacy_count = cursor.fetchone()[0]
-            if not legacy_count:
-                return
-
-            cursor.execute("SELECT * FROM to_download_references")
-            columns = [d[0] for d in cursor.description]
-            rows = [dict(zip(columns, r)) for r in cursor.fetchall()]
-
-            for row in rows:
-                doi = self._normalize_doi(row.get('doi'))
-                openalex_id = self._normalize_openalex_id(row.get('openalex_id'))
-                normalized_title = row.get('normalized_title') or self._normalize_text(row.get('title'))
-                normalized_authors = row.get('normalized_authors') or self._normalize_contributor_fields(
-                    row.get('authors'),
-                    row.get('editors'),
-                )
-                year = row.get('year')
-
-                existing_id = None
-                if openalex_id:
-                    cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (openalex_id,))
-                    found = cursor.fetchone()
-                    if found:
-                        existing_id = found[0]
-                if existing_id is None and doi:
-                    cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (doi,))
-                    found = cursor.fetchone()
-                    if found:
-                        existing_id = found[0]
-                if existing_id is None and normalized_title and normalized_authors and year is not None:
-                    cursor.execute(
-                        """SELECT id FROM with_metadata
-                           WHERE normalized_title = ? AND normalized_authors = ? AND CAST(year AS TEXT) = CAST(? AS TEXT)
-                           LIMIT 1""",
-                        (normalized_title, normalized_authors, year),
-                    )
-                    found = cursor.fetchone()
-                    if found:
-                        existing_id = found[0]
-
-                if existing_id is not None:
-                    cursor.execute(
-                        """UPDATE with_metadata
-                           SET download_state = COALESCE(?, download_state, 'queued'),
-                               download_claimed_by = COALESCE(?, download_claimed_by),
-                               download_claimed_at = COALESCE(?, download_claimed_at),
-                               download_lease_expires_at = COALESCE(?, download_lease_expires_at),
-                               download_attempt_count = MAX(COALESCE(download_attempt_count, 0), COALESCE(?, 0)),
-                               download_last_attempt_at = COALESCE(?, download_last_attempt_at),
-                               download_last_error = COALESCE(?, download_last_error),
-                               status_notes = COALESCE(?, status_notes)
-                           WHERE id = ?""",
-                        (
-                            row.get('download_state') or 'queued',
-                            row.get('download_claimed_by'),
-                            row.get('download_claimed_at'),
-                            row.get('download_lease_expires_at'),
-                            row.get('download_attempt_count'),
-                            row.get('download_last_attempt_at'),
-                            row.get('download_last_error'),
-                            row.get('status_notes'),
-                            existing_id,
-                        ),
-                    )
-
-                    self.update_work_alias_owner('to_download_references', int(row['id']), 'with_metadata', existing_id)
-                    self.reassign_corpus_items('to_download_references', int(row['id']), 'with_metadata', existing_id)
-                    cursor.execute("DELETE FROM to_download_references WHERE id = ?", (row['id'],))
-                    continue
-
-                cursor.execute(
-                    """INSERT INTO with_metadata (
-                           bibtex_key, entry_type, source_pdf, title, authors, editors, year, doi, normalized_doi,
-                           pmid, arxiv_id, openalex_id, semantic_scholar_id, mag_id,
-                           normalized_title, normalized_authors, abstract, metadata_source_type, bibtex_entry_json,
-                           crossref_json, openalex_json, source, journal_conference, volume, issue, pages,
-                           publisher, type, url, url_source, file_path, isbn, issn, keywords,
-                           source_work_id, relationship_type, status_notes,
-                           download_state, download_claimed_by, download_claimed_at, download_lease_expires_at,
-                           download_attempt_count, download_last_attempt_at, download_last_error,
-                           ingest_source, run_id, date_added, date_processed, checksum_pdf
-                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        row.get('bibtex_key'),
-                        row.get('entry_type'),
-                        row.get('source_pdf'),
-                        row.get('title'),
-                        row.get('authors'),
-                        row.get('editors'),
-                        row.get('year'),
-                        row.get('doi'),
-                        doi,
-                        row.get('pmid'),
-                        row.get('arxiv_id'),
-                        openalex_id,
-                        row.get('semantic_scholar_id'),
-                        row.get('mag_id'),
-                        normalized_title,
-                        normalized_authors,
-                        row.get('abstract'),
-                        row.get('metadata_source_type'),
-                        row.get('bibtex_entry_json'),
-                        row.get('crossref_json'),
-                        row.get('openalex_json'),
-                        row.get('journal_conference') or row.get('source'),
-                        row.get('journal_conference'),
-                        row.get('volume'),
-                        row.get('issue'),
-                        row.get('pages'),
-                        row.get('publisher'),
-                        row.get('entry_type'),
-                        row.get('url_source'),
-                        row.get('url_source'),
-                        row.get('file_path'),
-                        row.get('isbn'),
-                        row.get('issn'),
-                        row.get('keywords'),
-                        row.get('source_work_id'),
-                        row.get('relationship_type'),
-                        row.get('status_notes'),
-                        row.get('download_state') or 'queued',
-                        row.get('download_claimed_by'),
-                        row.get('download_claimed_at'),
-                        row.get('download_lease_expires_at'),
-                        row.get('download_attempt_count') or 0,
-                        row.get('download_last_attempt_at'),
-                        row.get('download_last_error'),
-                        row.get('ingest_source'),
-                        row.get('run_id'),
-                        row.get('date_added'),
-                        row.get('date_processed'),
-                        row.get('checksum_pdf'),
-                    ),
-                )
-                new_id = cursor.lastrowid
-                self.update_work_alias_owner('to_download_references', int(row['id']), 'with_metadata', new_id)
-                self.reassign_corpus_items('to_download_references', int(row['id']), 'with_metadata', new_id)
-                cursor.execute("DELETE FROM to_download_references WHERE id = ?", (row['id'],))
-
+        meta_row = cursor.execute("SELECT value FROM app_meta WHERE key = 'works_schema_version'").fetchone()
+        if not meta_row:
+            self._set_meta("works_schema_version", "1")
+            meta_row = ("1",)
+        if str(meta_row[0]) == "1":
             self.conn.commit()
-        except sqlite3.Error as e:
-            self.conn.rollback()
-            print(f"{YELLOW}[DB Manager] Warning: legacy queue migration failed: {e}{RESET}")
+            print(f"{GREEN}[DB Manager] Canonical works schema verified successfully.{RESET}")
+            return
 
-    def _add_missing_columns_to_downloaded_references(self):
-        """Add missing provenance columns to downloaded_references table if they don't exist."""
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA table_info(downloaded_references)")
-        columns = [col[1] for col in cursor.fetchall()]
+    def _get_meta(self, key: str) -> str | None:
+        cur = self.conn.cursor()
+        cur.execute("SELECT value FROM app_meta WHERE key = ?", (str(key),))
+        row = cur.fetchone()
+        return row[0] if row else None
 
-        for col_name, col_type in [
-            ('source_pdf', 'TEXT'),
-            ('ingest_source', 'TEXT'),
-            ('run_id', 'INTEGER'),
-            ('normalized_title', 'TEXT'),
-            ('normalized_authors', 'TEXT'),
-        ]:
-            if col_name not in columns:
-                try:
-                    cursor.execute(f"ALTER TABLE downloaded_references ADD COLUMN {col_name} {col_type}")
-                    print(f"{GREEN}[DB Manager] Added {col_name} column to downloaded_references table.{RESET}")
-                except sqlite3.Error as e:
-                    print(f"{YELLOW}[DB Manager] Warning: Could not add {col_name} column: {e}{RESET}")
+    def _set_meta(self, key: str, value: str) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT INTO app_meta(key, value, updated_at)
+               VALUES(?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+            (str(key), str(value)),
+        )
+        self.conn.commit()
 
-    def move_no_meta_entry_to_failed(self, no_meta_id: int, reason: str) -> tuple[int | None, str | None]:
-        """Moves an entry from no_metadata to failed_enrichments."""
+    def _clean_json_text(self, value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value)
+        except Exception:
+            return str(value)
+
+    def _apply_work_merge_priority(self, existing: dict, incoming: dict) -> dict:
+        merged = dict(existing)
+        preferred_download_rank = {
+            "downloaded": 3,
+            "in_progress": 2,
+            "queued": 1,
+            "not_requested": 0,
+            "failed": 0,
+        }
+        if preferred_download_rank.get(str(incoming.get("download_status") or ""), -1) > preferred_download_rank.get(str(existing.get("download_status") or ""), -1):
+            merged["download_status"] = incoming.get("download_status")
+            merged["download_source"] = incoming.get("download_source")
+            merged["download_error"] = incoming.get("download_error")
+            merged["downloaded_at"] = incoming.get("downloaded_at")
+            merged["file_path"] = incoming.get("file_path") or existing.get("file_path")
+            merged["file_checksum"] = incoming.get("file_checksum") or existing.get("file_checksum")
+        metadata_rank = {"matched": 3, "in_progress": 2, "pending": 1, "failed": 0}
+        if metadata_rank.get(str(incoming.get("metadata_status") or ""), -1) > metadata_rank.get(str(existing.get("metadata_status") or ""), -1):
+            merged["metadata_status"] = incoming.get("metadata_status")
+            merged["metadata_source"] = incoming.get("metadata_source") or existing.get("metadata_source")
+            merged["metadata_error"] = incoming.get("metadata_error")
+            merged["metadata_updated_at"] = incoming.get("metadata_updated_at") or existing.get("metadata_updated_at")
+        for key, value in incoming.items():
+            if key in {"download_status", "download_source", "download_error", "downloaded_at", "file_path", "file_checksum", "metadata_status", "metadata_source", "metadata_error", "metadata_updated_at"}:
+                continue
+            if merged.get(key) in (None, "", "[]", "{}") and value not in (None, "", "[]", "{}"):
+                merged[key] = value
+        return merged
+
+    def _find_existing_work(self, *, doi=None, openalex_id=None, title=None, authors=None, editors=None, year=None, exclude_id: int | None = None) -> tuple[int | None, str | None]:
+        cur = self.conn.cursor()
+        normalized_contributors = self._normalize_contributor_fields(authors, editors)
+        def _one(query, params, field):
+            cur.execute(query, params)
+            row = cur.fetchone()
+            return (int(row[0]), field) if row else (None, None)
+        normalized_doi = self._normalize_doi(doi)
+        if normalized_doi:
+            params = [normalized_doi]
+            query = "SELECT id FROM works WHERE normalized_doi = ?"
+            if exclude_id:
+                query += " AND id != ?"
+                params.append(int(exclude_id))
+            found_id, field = _one(query, params, "normalized_doi")
+            if found_id:
+                return found_id, field
+        normalized_openalex = self._normalize_openalex_id(openalex_id)
+        if normalized_openalex:
+            params = [normalized_openalex]
+            query = "SELECT id FROM works WHERE openalex_id = ?"
+            if exclude_id:
+                query += " AND id != ?"
+                params.append(int(exclude_id))
+            found_id, field = _one(query, params, "openalex_id")
+            if found_id:
+                return found_id, field
+        normalized_title = self._normalize_text(title)
+        year_str = str(year).strip() if year is not None and str(year).strip() else None
+        if normalized_title:
+            if year_str and normalized_contributors:
+                params = [normalized_title, normalized_contributors, year_str]
+                query = "SELECT id FROM works WHERE normalized_title = ? AND normalized_authors = ? AND CAST(year AS TEXT) = ?"
+                if exclude_id:
+                    query += " AND id != ?"
+                    params.append(int(exclude_id))
+                found_id, field = _one(query, params, "title_authors_year")
+                if found_id:
+                    return found_id, field
+            if normalized_contributors:
+                params = [normalized_title, normalized_contributors]
+                query = "SELECT id FROM works WHERE normalized_title = ? AND normalized_authors = ?"
+                if exclude_id:
+                    query += " AND id != ?"
+                    params.append(int(exclude_id))
+                found_id, field = _one(query, params, "title_authors")
+                if found_id:
+                    return found_id, field
+            if year_str:
+                params = [normalized_title, year_str]
+                query = "SELECT id FROM works WHERE normalized_title = ? AND CAST(year AS TEXT) = ?"
+                if exclude_id:
+                    query += " AND id != ?"
+                    params.append(int(exclude_id))
+                found_id, field = _one(query, params, "title_year")
+                if found_id:
+                    return found_id, field
+            # alias fallback
+            params = [normalized_title]
+            query = "SELECT work_id FROM work_aliases WHERE work_table = 'works' AND normalized_alias_title = ?"
+            if year_str and year_str.isdigit():
+                query += " AND (alias_year IS NULL OR alias_year BETWEEN ? AND ?)"
+                params.extend([int(year_str) - 1, int(year_str) + 1])
+            cur.execute(query, params)
+            row = cur.fetchone()
+            if row and (exclude_id is None or int(row[0]) != int(exclude_id)):
+                return int(row[0]), "alias_title"
+        return None, None
+
+    def _insert_work_record(self, data: dict) -> int:
+        payload = {k: v for k, v in data.items() if v is not None}
+        cols = ", ".join(payload.keys())
+        placeholders = ", ".join(["?"] * len(payload))
+        cur = self.conn.cursor()
+        cur.execute(f"INSERT INTO works ({cols}) VALUES ({placeholders})", tuple(payload.values()))
+        return int(cur.lastrowid)
+
+    def _update_work_record(self, work_id: int, data: dict) -> None:
+        payload = {k: v for k, v in data.items() if k != "id"}
+        if not payload:
+            return
+        assignments = ", ".join([f"{k} = ?" for k in payload.keys()]) + ", updated_at = CURRENT_TIMESTAMP"
+        self.conn.cursor().execute(f"UPDATE works SET {assignments} WHERE id = ?", tuple(payload.values()) + (int(work_id),))
+
+    def _resolve_or_create_work(self, data: dict, *, allow_merge: bool = True, commit: bool = True) -> tuple[int, str | None]:
+        existing_id, matched_field = self._find_existing_work(
+            doi=data.get("doi"),
+            openalex_id=data.get("openalex_id"),
+            title=data.get("title"),
+            authors=data.get("authors"),
+            editors=data.get("editors"),
+            year=data.get("year"),
+        )
+        if existing_id:
+            existing = self.get_entry_by_id("works", existing_id) or {}
+            merged = self._apply_work_merge_priority(existing, data) if allow_merge else existing
+            self._update_work_record(existing_id, merged)
+            if commit:
+                self.conn.commit()
+            return existing_id, matched_field
+        new_id = self._insert_work_record(data)
+        if commit:
+            self.conn.commit()
+        return new_id, None
+
+    def _resolve_work_id_from_legacy_pointer(self, table_name: str, row_id: int | None) -> int | None:
+        if row_id is None:
+            return None
+        try:
+            row_id = int(row_id)
+        except (TypeError, ValueError):
+            return None
+        if table_name == "works":
+            return row_id
+        origin_key = f"{table_name}:{row_id}"
+        cur = self.conn.cursor()
+        cur.execute("SELECT id FROM works WHERE origin_key = ? LIMIT 1", (origin_key,))
+        row = cur.fetchone()
+        if row:
+            return int(row[0])
+        return None
+
+    def _serialize_name_list(self, value):
+        names = self._parse_name_list(value)
+        return json.dumps(names) if names else None
+
+    def _build_raw_work_payload(self, ref: dict) -> dict:
+        authors = self._parse_name_list(ref.get("authors"))
+        editors = self._parse_name_list(ref.get("editors"))
+        doi = ref.get("doi")
+        title = ref.get("title") or "[Untitled]"
+        openalex_id = self._normalize_openalex_id(ref.get("openalex_id"))
+        return {
+            "title": title,
+            "authors": json.dumps(authors) if authors else None,
+            "editors": json.dumps(editors) if editors else None,
+            "year": ref.get("year"),
+            "doi": doi,
+            "normalized_doi": self._normalize_doi(doi),
+            "openalex_id": openalex_id,
+            "semantic_scholar_id": ref.get("semantic_scholar_id"),
+            "source": ref.get("source"),
+            "publisher": ref.get("publisher"),
+            "volume": ref.get("volume"),
+            "issue": ref.get("issue"),
+            "pages": ref.get("pages"),
+            "type": ref.get("type") or ref.get("entry_type"),
+            "url": ref.get("url") or ref.get("url_source"),
+            "isbn": ref.get("isbn"),
+            "issn": ref.get("issn"),
+            "abstract": ref.get("abstract"),
+            "keywords": json.dumps(ref.get("keywords")) if ref.get("keywords") is not None and not isinstance(ref.get("keywords"), str) else ref.get("keywords"),
+            "normalized_title": self._normalize_text(title),
+            "normalized_authors": self._normalize_contributor_fields(authors, editors),
+            "metadata_status": "pending",
+            "download_status": "not_requested",
+            "origin_type": ref.get("origin_type") or "promotion",
+            "origin_key": ref.get("origin_key") or ref.get("candidate_key") or ref.get("ingest_source") or (f"search:{ref.get('run_id')}" if ref.get("run_id") else None),
+            "source_pdf": ref.get("source_pdf"),
+            "run_id": ref.get("run_id"),
+            "source_work_id": ref.get("source_work_id"),
+            "relationship_type": ref.get("relationship_type"),
+            "crossref_json": self._clean_json_text(ref.get("crossref_json")),
+            "openalex_json": self._clean_json_text(ref.get("openalex_json")),
+            "bibtex_entry_json": self._clean_json_text(ref.get("bibtex_entry_json")),
+            "status_notes": ref.get("status_notes"),
+        }
+
+    def mark_metadata_failed(self, work_id: int, reason: str) -> tuple[int | None, str | None]:
+        """Mark a canonical work as failed during metadata enrichment."""
         cur = self.conn.cursor()
         try:
-            # 1. Get the original row data
-            cur.execute("SELECT * FROM no_metadata WHERE id = ?", (no_meta_id,))
-            row_data = cur.fetchone()
-            if not row_data:
-                return None, f"No entry found in no_metadata with id {no_meta_id}"
-
-            # 2. Insert into failed_enrichments by explicitly mapping columns
-            # row_data from no_metadata: (id, source_pdf, title, authors, doi, ...)
-            # failed_enrichments columns: (id, source_pdf, title, authors, year, doi, raw_text_search, reason)
-            # year and raw_text_search are not in no_metadata, so we pass None.
-            insert_data = (
-                row_data[0],  # id
-                row_data[1],  # source_pdf
-                row_data[2],  # title
-                row_data[3],  # authors
-                None,         # year
-                row_data[4],  # doi
-                None,         # raw_text_search
-                reason        # reason
+            cur.execute(
+                """UPDATE works
+                   SET metadata_status = 'failed',
+                       metadata_error = ?,
+                       metadata_claimed_by = NULL,
+                       metadata_claimed_at = NULL,
+                       metadata_lease_expires_at = NULL
+                 WHERE id = ?""",
+                (reason, int(work_id)),
             )
-            cur.execute("""
-                INSERT INTO failed_enrichments (id, source_pdf, title, authors, year, doi, raw_text_search, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, insert_data)
-            failed_id = cur.lastrowid
-
-            # 3. Delete from no_metadata
-            cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
-            self.delete_work_aliases("no_metadata", no_meta_id)
-
             self.conn.commit()
-            return failed_id, None
+            return int(work_id), None
         except sqlite3.Error as e:
             self.conn.rollback()
             return None, str(e)
@@ -1083,14 +648,6 @@ class DatabaseManager:
         if table and row_id:
             return f"{table}:{row_id}"
         return None
-
-    def _fetch_with_metadata_identifiers(self, row_id: int) -> tuple[str | None, str | None, int | None]:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT openalex_id, doi, run_id FROM with_metadata WHERE id = ?", (row_id,))
-        row = cursor.fetchone()
-        if not row:
-            return None, None, None
-        return row[0], row[1], row[2]
 
     def _insert_citation_edge(
         self,
@@ -1172,57 +729,7 @@ class DatabaseManager:
             return self._normalize_authors_value(editor_list)
         return None
 
-    def _backfill_normalized_contributors(self) -> None:
-        """Fill missing normalized_authors from authors/editor fields for legacy rows."""
-        cursor = self.conn.cursor()
-        table_specs = [
-            ("no_metadata", "id"),
-            ("with_metadata", "id"),
-            ("to_download_references", "id"),
-            ("downloaded_references", "id"),
-        ]
-        total_updated = 0
-
-        for table_name, pk_col in table_specs:
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns = {row[1] for row in cursor.fetchall()}
-            required = {pk_col, "authors", "editors", "normalized_authors"}
-            if not required.issubset(columns):
-                continue
-
-            cursor.execute(
-                f"""
-                SELECT {pk_col}, authors, editors, normalized_authors
-                FROM {table_name}
-                WHERE (normalized_authors IS NULL OR TRIM(normalized_authors) = '')
-                  AND (
-                    (authors IS NOT NULL AND TRIM(authors) NOT IN ('', '[]'))
-                    OR
-                    (editors IS NOT NULL AND TRIM(editors) NOT IN ('', '[]'))
-                  )
-                """
-            )
-            rows = cursor.fetchall()
-            updates: list[tuple[str, int]] = []
-            for row_id, authors_raw, editors_raw, _ in rows:
-                normalized = self._normalize_contributor_fields(authors_raw, editors_raw)
-                if normalized:
-                    updates.append((normalized, row_id))
-
-            if updates:
-                cursor.executemany(
-                    f"UPDATE {table_name} SET normalized_authors = ? WHERE {pk_col} = ?",
-                    updates,
-                )
-                total_updated += len(updates)
-
-        if total_updated:
-            self.conn.commit()
-            print(
-                f"{GREEN}[DB Manager] Backfilled normalized contributors for {total_updated} row(s).{RESET}"
-            )
-
-    def add_entries_to_no_metadata_from_json(
+    def add_pending_works_from_json(
         self,
         json_file_path: str | Path,
         source_pdf: str | None = None,
@@ -1232,7 +739,7 @@ class DatabaseManager:
         resolve_potential_duplicates: bool = False
     ) -> tuple[int, int, list]:
         """
-        Adds entries from a JSON file (from API extraction) into the no_metadata table.
+        Adds entries from a JSON file (from API extraction) as pending works.
 
         Args:
             json_file_path: Path to the JSON file containing a list of reference dicts.
@@ -1262,7 +769,7 @@ class DatabaseManager:
             if source_pdf:
                 entry["source_pdf"] = source_pdf
 
-            row_id, err = self.insert_no_metadata(
+            row_id, err = self.create_pending_work(
                 entry,
                 searcher=searcher,
                 rate_limiter=rate_limiter,
@@ -1331,170 +838,19 @@ class DatabaseManager:
         exclude_id: int | None = None,
         exclude_table: str | None = None
     ) -> tuple[str | None, int | None, str | None]:
-        """Checks if an entry with the given DOI, OpenAlex ID, or title/authors/year exists in relevant tables.
-
-        Can exclude a specific entry ID from a specific table from the check,
-        which is useful for checking for duplicates of an existing entry.
-
-        Args:
-            doi: The DOI to check.
-            openalex_id: The OpenAlex ID to check (e.g., 'W12345').
-            title: The title to check (will be normalized).
-            authors: The authors to check (list or JSON string, will be normalized).
-            editors: The editors to check (used as contributor fallback when authors are missing).
-            year: The year to check.
-            exclude_id: An entry ID to exclude from the search.
-            exclude_table: The table name associated with exclude_id.
-
-        Returns:
-            A tuple (table_name, entry_id, matched_field_name) if found, else (None, None, None).
-        """
-        cursor = self.conn.cursor()
-
-        normalized_contributors = self._normalize_contributor_fields(authors, editors)
-
-        def _execute_check(table, field, value):
-            query = f"SELECT id FROM {table} WHERE {field} = ?"
-            params = [value]
-            if table == exclude_table and exclude_id is not None:
-                query += " AND id != ?"
-                params.append(exclude_id)
-            
-            cursor.execute(query, tuple(params))
-            row = cursor.fetchone()
-            if row:
-                return table, row[0], field
-            return None, None, None
-
-        priority_tables = ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]
-
-        # Prioritize DOI if available
-        if doi:
-            normalized_doi = self._normalize_doi(doi)
-            if normalized_doi:
-                for table in priority_tables:
-                    if table == "downloaded_references":
-                        field = "doi"
-                    else:
-                        field = "normalized_doi"
-                    tbl, eid, fld = _execute_check(table, field, normalized_doi)
-                    if tbl:
-                        return tbl, eid, fld
-
-        # Then check OpenAlex ID if available
-        if openalex_id:
-            normalized_openalex_id = self._normalize_openalex_id(openalex_id)
-            if normalized_openalex_id:
-                for table in ["downloaded_references", "with_metadata", "to_download_references"]:
-                    tbl, eid, fld = _execute_check(table, "openalex_id", normalized_openalex_id)
-                    if tbl: return tbl, eid, fld
-
-        # Check aliases by normalized title
-        if title:
-            normalized_title = self._normalize_text(title)
-            year_int = None
-            if year is not None:
-                try:
-                    year_int = int(year)
-                except (TypeError, ValueError):
-                    year_int = None
-
-            if year_int is not None:
-                cursor.execute(
-                    """SELECT work_table, work_id, alias_year
-                       FROM work_aliases
-                       WHERE normalized_alias_title = ?
-                       AND (alias_year IS NULL OR alias_year BETWEEN ? AND ?)""",
-                    (normalized_title, year_int - 1, year_int + 1),
-                )
-                row = cursor.fetchone()
-                if row:
-                    alias_table, alias_id, alias_year = row
-                    if alias_table == exclude_table and exclude_id is not None and alias_id == exclude_id:
-                        pass
-                    else:
-                        field = "alias_title_year" if alias_year is not None else "alias_title"
-                        return alias_table, alias_id, field
-            else:
-                cursor.execute(
-                    "SELECT work_table, work_id FROM work_aliases WHERE normalized_alias_title = ?",
-                    (normalized_title,),
-                )
-                row = cursor.fetchone()
-                if row:
-                    alias_table, alias_id = row
-                    if alias_table == exclude_table and exclude_id is not None and alias_id == exclude_id:
-                        pass
-                    else:
-                        return alias_table, alias_id, "alias_title"
-
-        # Fallbacks using normalized title/authors/year when identifiers are missing
-        year_str = None
-        year_present = False
-        if year is not None:
-            year_value = str(year).strip()
-            if year_value:
-                year_str = year_value
-                year_present = True
-
-        if title and normalized_contributors and year_present and year_str is not None:
-            normalized_title = self._normalize_text(title)
-            for table in ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]:
-                query = f"""
-                    SELECT id FROM {table} 
-                    WHERE normalized_title = ? 
-                    AND normalized_authors = ? 
-                    AND CAST(year AS TEXT) = ?
-                """
-                params = [normalized_title, normalized_contributors, year_str]
-                
-                if table == exclude_table and exclude_id is not None:
-                    query += " AND id != ?"
-                    params.append(exclude_id)
-                
-                cursor.execute(query, params)
-                row = cursor.fetchone()
-                if row:
-                    return table, row[0], "title_authors_year"
-
-        # If year is missing but we have contributors, use title+contributors to avoid punctuation-only duplicates.
-        if title and normalized_contributors and not year_present:
-            normalized_title = self._normalize_text(title)
-            if normalized_title:
-                for table in ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]:
-                    query = f"""
-                        SELECT id FROM {table}
-                        WHERE normalized_title = ?
-                        AND normalized_authors = ?
-                    """
-                    params = [normalized_title, normalized_contributors]
-                    if table == exclude_table and exclude_id is not None:
-                        query += " AND id != ?"
-                        params.append(exclude_id)
-                    cursor.execute(query, params)
-                    row = cursor.fetchone()
-                    if row:
-                        return table, row[0], "title_authors"
-
-        # If contributors are missing but we have a year, use title+year.
-        if title and year_present and not normalized_contributors and year_str is not None:
-            normalized_title = self._normalize_text(title)
-            if normalized_title:
-                for table in ["downloaded_references", "with_metadata", "no_metadata", "to_download_references"]:
-                    query = f"""
-                        SELECT id FROM {table}
-                        WHERE normalized_title = ?
-                        AND CAST(year AS TEXT) = ?
-                    """
-                    params = [normalized_title, year_str]
-                    if table == exclude_table and exclude_id is not None:
-                        query += " AND id != ?"
-                        params.append(exclude_id)
-                    cursor.execute(query, params)
-                    row = cursor.fetchone()
-                    if row:
-                        return table, row[0], "title_year"
-        
+        """Checks if an entry already exists in the canonical works table."""
+        effective_exclude_id = exclude_id if exclude_table == "works" else None
+        work_id, field = self._find_existing_work(
+            doi=doi,
+            openalex_id=openalex_id,
+            title=title,
+            authors=authors,
+            editors=editors,
+            year=year,
+            exclude_id=effective_exclude_id,
+        )
+        if work_id:
+            return "works", int(work_id), field
         return None, None, None
 
     def add_work_alias(
@@ -1601,56 +957,53 @@ class DatabaseManager:
         return dict(zip(columns, row))
 
     def add_corpus_item(self, corpus_id: int, table_name: str, row_id: int) -> None:
-        """Associate a record with a corpus, if corpus_id is provided."""
-        if not corpus_id:
+        """Associate a work with a corpus using the canonical join table."""
+        if not corpus_id or not row_id:
+            return
+        work_id = None
+        if table_name == "works":
+            work_id = int(row_id)
+        else:
+            try:
+                work_id = self._resolve_work_id_from_legacy_pointer(table_name, int(row_id))
+            except Exception:
+                work_id = None
+        if not work_id:
             return
         cur = self.conn.cursor()
         try:
             cur.execute(
-                """INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
-                   VALUES (?, ?, ?)""",
-                (corpus_id, table_name, row_id),
+                """INSERT OR IGNORE INTO corpus_works (corpus_id, work_id, added_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)""",
+                (int(corpus_id), int(work_id)),
             )
             self.conn.commit()
         except sqlite3.Error as e:
-            print(f"{YELLOW}[DB Manager] Warning: failed to add corpus item: {e}{RESET}")
+            print(f"{YELLOW}[DB Manager] Warning: failed to add corpus work: {e}{RESET}")
             self.conn.rollback()
 
     def _get_corpus_ids_for_item(self, table_name: str, row_id: int) -> list[int]:
-        """Fetch all corpus IDs that include the given table+row."""
+        """Fetch all corpus IDs that include the given work."""
+        work_id = None
+        if table_name == "works":
+            work_id = int(row_id)
+        else:
+            work_id = self._resolve_work_id_from_legacy_pointer(table_name, int(row_id))
+        if not work_id:
+            return []
         cur = self.conn.cursor()
-        cur.execute(
-            "SELECT corpus_id FROM corpus_items WHERE table_name = ? AND row_id = ?",
-            (table_name, row_id),
-        )
-        return [row[0] for row in cur.fetchall()]
+        cur.execute("SELECT corpus_id FROM corpus_works WHERE work_id = ?", (int(work_id),))
+        return [int(row[0]) for row in cur.fetchall()]
 
-    def reassign_corpus_items(
+    def reassign_corpus_membership(
         self,
         old_table: str,
         old_row_id: int,
         new_table: str,
         new_row_id: int,
     ) -> None:
-        """Move corpus associations from one table/row to another."""
-        cur = self.conn.cursor()
-        try:
-            corpus_ids = self._get_corpus_ids_for_item(old_table, old_row_id)
-            if not corpus_ids:
-                return
-            cur.executemany(
-                """INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
-                   VALUES (?, ?, ?)""",
-                [(cid, new_table, new_row_id) for cid in corpus_ids],
-            )
-            cur.execute(
-                "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
-                (old_table, old_row_id),
-            )
-            self.conn.commit()
-        except sqlite3.Error as e:
-            print(f"{YELLOW}[DB Manager] Warning: failed to reassign corpus items: {e}{RESET}")
-            self.conn.rollback()
+        """Compatibility no-op in the unified work model."""
+        return None
 
     def _prepare_resolution_ref(self, ref: dict) -> dict:
         """Build a minimal ref dict for OpenAlex/Crossref resolution."""
@@ -1812,22 +1165,15 @@ class DatabaseManager:
                         ),
                     )
 
-            # Preserve corpus membership when collapsing duplicates across stages.
-            cur.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'corpus_items' LIMIT 1"
-            )
-            if cur.fetchone():
+            if canonical_table == "works" and duplicate_table == "works":
                 cur.execute(
-                    """INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id)
-                       SELECT corpus_id, ?, ?
-                         FROM corpus_items
-                        WHERE table_name = ? AND row_id = ?""",
-                    (canonical_table, canonical_id, duplicate_table, duplicate_id),
+                    """INSERT OR IGNORE INTO corpus_works (corpus_id, work_id, added_at)
+                       SELECT corpus_id, ?, CURRENT_TIMESTAMP
+                         FROM corpus_works
+                        WHERE work_id = ?""",
+                    (canonical_id, duplicate_id),
                 )
-                cur.execute(
-                    "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
-                    (duplicate_table, duplicate_id),
-                )
+                cur.execute("DELETE FROM corpus_works WHERE work_id = ?", (duplicate_id,))
 
             # Delete duplicate row
             cur.execute(f"DELETE FROM {duplicate_table} WHERE id = ?", (duplicate_id,))
@@ -1977,10 +1323,10 @@ class DatabaseManager:
             return False, str(e)
 
     # ------------------------------------------------------------------
-    # NEW: Staged-table helper methods (no_metadata → with_metadata → queue)
+    # Canonical works workflow helpers
     # ------------------------------------------------------------------
 
-    def insert_no_metadata(
+    def create_pending_work(
         self,
         ref: dict,
         *,
@@ -1988,19 +1334,7 @@ class DatabaseManager:
         rate_limiter=None,
         resolve_potential_duplicates: bool = False
     ) -> tuple[int | None, str | None]:
-        """Insert a reference produced by APIscraper_v2 into the
-        ``no_metadata`` table, performing duplicate checks across all tables.
-
-        Args:
-            ref: Dict with at least title. Keys recognised:
-                 title, authors (list[str] or str), year, doi, source, volume, issue, 
-                 pages, publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
-                 translated_title, translated_year, translated_language, translation_relationship,
-                 corpus_id.
-
-        Returns:
-            (row_id, None) on success or (None, error_msg) if duplicate/failed.
-        """
+        """Insert or merge a raw reference into the canonical works table."""
         title = ref.get("title")
         if not title:
             return None, "Title is required"
@@ -2013,18 +1347,16 @@ class DatabaseManager:
         editors_raw = self._parse_name_list(ref.get("editors"))
         norm_authors = self._normalize_contributor_fields(authors_raw, editors_raw)
 
-        # Duplicate search using existing helper (will search downloaded & queue)
-        # Pass title, authors, and year for comprehensive duplicate detection
         tbl, eid, field = self.check_if_exists(
             doi=norm_doi, 
-            openalex_id=None,
+            openalex_id=ref.get("openalex_id"),
             title=title,
             authors=authors_raw,
             editors=editors_raw,
             year=ref.get("year")
         )
         if tbl:
-            high_confidence = field in {"doi", "openalex_id", "title_authors_year", "alias_title_year"}
+            high_confidence = field in {"normalized_doi", "openalex_id", "title_authors_year", "alias_title_year"}
             incoming_ref_for_merge = {
                 **ref,
                 "authors": json.dumps(authors_raw) if authors_raw else None,
@@ -2061,14 +1393,10 @@ class DatabaseManager:
                                 incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
                             if corpus_id:
                                 self.add_corpus_item(corpus_id, tbl, eid)
-                            self._merge_incoming_into_existing(
-                                tbl,
-                                eid,
-                                incoming_ref_for_merge,
-                                field,
-                                notes="resolved_ids_match",
-                                action="merged",
-                            )
+                            work_row = self.get_entry_by_id("works", int(eid)) or {}
+                            merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
+                            self._update_work_record(int(eid), merged)
+                            self.conn.commit()
                             return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
                         else:
                             # Resolved IDs disagree; keep both and log.
@@ -2090,14 +1418,10 @@ class DatabaseManager:
             if high_confidence and not resolved_conflict:
                 if corpus_id:
                     self.add_corpus_item(corpus_id, tbl, eid)
-                self._merge_incoming_into_existing(
-                    tbl,
-                    eid,
-                    incoming_ref_for_merge,
-                    field,
-                    notes="high_confidence_duplicate",
-                    action="merged",
-                )
+                work_row = self.get_entry_by_id("works", int(eid)) or {}
+                merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
+                self._update_work_record(int(eid), merged)
+                self.conn.commit()
                 return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
 
             # Low-confidence duplicates are logged but allowed to insert.
@@ -2112,50 +1436,17 @@ class DatabaseManager:
                 updates=None,
             )
 
-        cursor = self.conn.cursor()
         try:
-            cursor.execute(
-                """INSERT INTO no_metadata (source_pdf, title, authors, editors, year, doi, source, volume, 
-                                            issue, pages, publisher, type, url, isbn, issn, abstract, 
-                                            keywords, normalized_doi, normalized_title, normalized_authors,
-                                            ingest_source, run_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    ref.get("source_pdf"),
-                    title,
-                    json.dumps(authors_raw),
-                    json.dumps(editors_raw) if editors_raw else None,
-                    ref.get("year"),
-                    doi_raw,
-                    ref.get("source"),
-                    ref.get("volume"),
-                    ref.get("issue"),
-                    ref.get("pages"),
-                    ref.get("publisher"),
-                    ref.get("type"),
-                    ref.get("url"),
-                    ref.get("isbn"),
-                    ref.get("issn"),
-                    ref.get("abstract"),
-                    json.dumps(ref.get("keywords")) if ref.get("keywords") else None,
-                    norm_doi,
-                    norm_title,
-                    norm_authors,
-                    ref.get("ingest_source"),
-                    ref.get("run_id"),
-                ),
-            )
-            self.conn.commit()
-            new_id = cursor.lastrowid
-
+            payload = self._build_raw_work_payload(ref)
+            new_id, _ = self._resolve_or_create_work(payload, allow_merge=True)
             if corpus_id:
-                self.add_corpus_item(corpus_id, "no_metadata", new_id)
+                self.add_corpus_item(corpus_id, "works", int(new_id))
 
             translated_title = ref.get("translated_title")
             if translated_title:
                 self.add_work_alias(
-                    work_table="no_metadata",
-                    work_id=new_id,
+                    work_table="works",
+                    work_id=int(new_id),
                     alias_title=translated_title,
                     alias_year=ref.get("translated_year"),
                     alias_language=ref.get("translated_language"),
@@ -2163,8 +1454,9 @@ class DatabaseManager:
                 )
 
             return new_id, None
+            return int(new_id), None
         except sqlite3.IntegrityError as e:
-            return None, f"IntegrityError inserting into no_metadata: {e}"
+            return None, f"IntegrityError inserting into works: {e}"
 
     def insert_ingest_entry(self, ref: dict, ingest_source: str | None = None) -> None:
         """Insert raw extracted entry for UI display, without dedupe enforcement."""
@@ -2197,35 +1489,33 @@ class DatabaseManager:
             print(f"{YELLOW}[DB Manager] Warning: failed to insert ingest entry: {e}{RESET}")
 
     # ------------------------------------------------------------------
-    # Convenience method: fetch a batch of rows from no_metadata for enrichment
+    # Convenience method: fetch a batch of pending works for enrichment
     # ------------------------------------------------------------------
 
-    def fetch_with_metadata_batch(self, limit: int = 50) -> list[int]:
-        """Return IDs of enriched rows that are not yet queued for download."""
+    def fetch_matched_work_batch(self, limit: int = 50) -> list[int]:
+        """Return IDs of matched works that are not yet queued for download."""
         cur = self.conn.cursor()
         cur.execute(
             """SELECT id
-               FROM with_metadata
-               WHERE download_state IS NULL OR download_state = 'with_metadata'
+               FROM works
+               WHERE metadata_status = 'matched'
+                 AND COALESCE(download_status, 'not_requested') = 'not_requested'
                ORDER BY id
                LIMIT ?""",
             (limit,),
         )
         return [row[0] for row in cur.fetchall()]
 
-    def fetch_no_metadata_batch(self, limit: int = 50) -> list[dict]:
-        """Return up to ``limit`` rows from ``no_metadata`` as a list of dicts.
-
-        The list is ordered by ascending ``id`` so that older items are processed first.
-        Only a small subset of columns that are useful for enrichment are returned.
-        """
+    def fetch_pending_metadata_batch(self, limit: int = 50) -> list[dict]:
+        """Return up to ``limit`` pending works for enrichment as a list of dicts."""
         cursor = self.conn.cursor()
         cursor.execute(
             """SELECT id, title, authors, editors, year, doi, source, volume, issue, pages,
                       publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
-                      ingest_source, run_id
-               FROM no_metadata
-               ORDER BY selected_for_enrichment DESC, id
+                      origin_key, run_id
+               FROM works
+               WHERE metadata_status IN ('pending', 'in_progress')
+               ORDER BY id
                LIMIT ?""",
             (limit,),
         )
@@ -2235,7 +1525,7 @@ class DatabaseManager:
         for row in rows:
             (row_id, title, authors_json, editors_json, year, doi, source, volume, issue, pages,
              publisher, entry_type, url, isbn, issn, abstract, keywords_json, source_pdf,
-             ingest_source, run_id) = row
+             origin_key, run_id) = row
             authors: list[str] | None = None
             if authors_json:
                 try:
@@ -2277,169 +1567,101 @@ class DatabaseManager:
                     "abstract": abstract,
                     "keywords": keywords,
                     "source_pdf": source_pdf,
-                    "ingest_source": ingest_source,
+                    "ingest_source": origin_key,
                     "run_id": run_id,
                 }
             )
         return result
 
-    def promote_to_with_metadata(
+    def apply_enriched_metadata(
         self,
-        no_meta_id: int,
+        work_id: int,
         enrichment: dict,
         *,
         expand_related: bool = False,
         max_related_per_source: int = 40,
     ) -> tuple[int | None, str | None]:
-        """Move a row from ``no_metadata`` to ``with_metadata`` adding enrichment.
-
-        Args:
-            no_meta_id: Primary-key ID of the row in no_metadata.
-            enrichment: Dict from OpenAlex/Crossref.
-
-        Returns:
-            (new_id, None) on success or (None, error_msg).
-        """
+        """Update a pending work with enriched metadata."""
         cur = self.conn.cursor()
         try:
             cur.execute("BEGIN")
-            cur.execute("SELECT * FROM no_metadata WHERE id = ?", (no_meta_id,))
-            row = cur.fetchone()
-            if not row:
+            base = self.get_entry_by_id("works", work_id)
+            if not base:
                 cur.execute("ROLLBACK")
-                return None, "Row not found in no_metadata"
+                return None, "Row not found in works"
 
-            columns = [d[0] for d in cur.description]
-            base = dict(zip(columns, row))
-
-            # Merge enrichment – simple overlay
-            merged: dict = {
+            authors = enrichment.get("authors")
+            if authors is not None and not isinstance(authors, str):
+                authors = json.dumps(authors)
+            editors = enrichment.get("editors")
+            if editors is not None and not isinstance(editors, str):
+                editors = json.dumps(editors)
+            keywords = enrichment.get("keywords")
+            if keywords is not None and not isinstance(keywords, str):
+                keywords = json.dumps(keywords)
+            merged = {
                 **base,
-                **enrichment,
+                **{k: v for k, v in enrichment.items() if v is not None},
+                "authors": authors if authors is not None else base.get("authors"),
+                "editors": editors if editors is not None else base.get("editors"),
+                "keywords": keywords if keywords is not None else base.get("keywords"),
+                "doi": enrichment.get("doi") or base.get("doi"),
                 "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
-                "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id")),
+                "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id") or enrichment.get("id") or base.get("openalex_id")),
+                "normalized_title": self._normalize_text(enrichment.get("title") or base.get("title")),
+                "normalized_authors": self._normalize_contributor_fields(authors if authors is not None else base.get("authors"), editors if editors is not None else base.get("editors")),
+                "metadata_status": "matched",
+                "metadata_source": enrichment.get("metadata_source_type") or base.get("metadata_source") or "enrichment",
+                "metadata_error": None,
+                "metadata_updated_at": datetime.now().isoformat(),
+                "download_status": "not_requested" if str(base.get("download_status") or "not_requested") == "not_requested" else base.get("download_status"),
+                "crossref_json": self._clean_json_text(enrichment.get("crossref_json")) or base.get("crossref_json"),
+                "openalex_json": self._clean_json_text(enrichment.get("openalex_json") or enrichment),
+                "bibtex_entry_json": self._clean_json_text(enrichment.get("bibtex_entry_json")) or base.get("bibtex_entry_json"),
             }
-            merged["normalized_title"] = self._normalize_text(merged.get("title"))
-            merged["normalized_authors"] = self._normalize_contributor_fields(
-                merged.get("authors"),
-                merged.get("editors"),
-            )
 
-            # Check for duplicates before promotion
-            tbl, eid, field = self.check_if_exists(
+            existing_id, field = self._find_existing_work(
                 doi=merged.get("doi"),
                 openalex_id=merged.get("openalex_id"),
                 title=merged.get("title"),
                 authors=merged.get("authors"),
                 editors=merged.get("editors"),
                 year=merged.get("year"),
-                exclude_id=no_meta_id,
-                exclude_table="no_metadata"
+                exclude_id=int(work_id),
             )
-            
-            if tbl and tbl in ["downloaded_references", "to_download_references", "with_metadata"]:
-                cur.execute("ROLLBACK")
-                self._merge_records(
-                    canonical_table=tbl,
-                    canonical_id=eid,
-                    duplicate_table="no_metadata",
-                    duplicate_id=no_meta_id,
-                    match_field=field,
-                    notes="promote_duplicate",
-                )
-                queue_id: int | None = None
-                queue_err: str | None = None
-                # If duplicate merged into canonical with_metadata row, ensure it enters download queue.
-                if tbl == "with_metadata":
-                    queue_id, queue_err = self.enqueue_for_download(int(eid))
-                marker = (
-                    f"DUPLICATE_MERGED|table={tbl}|id={eid}|field={field}|"
-                    f"queued={1 if queue_id else 0}|queue_id={queue_id or ''}|queue_error={queue_err or ''}"
-                )
-                return None, f"Entry already exists in {tbl} (ID {eid}) on {field} [{marker}]"
+            if existing_id:
+                existing = self.get_entry_by_id("works", int(existing_id)) or {}
+                self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
+                self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"))
+                self.conn.execute("DELETE FROM works WHERE id = ?", (int(work_id),))
+                cur.execute("COMMIT")
+                marker = f"DUPLICATE_MERGED|table=works|id={existing_id}|field={field}|queued=0|queue_id=|queue_error="
+                return None, f"Entry already exists in works (ID {existing_id}) on {field} [{marker}]"
 
-            cur.execute(
-                """INSERT INTO with_metadata (source_pdf,title,authors,editors,year,doi,normalized_doi,openalex_id,
-                                               normalized_title,normalized_authors,abstract,crossref_json,openalex_json,
-                                               source,volume,issue,pages,publisher,type,url,isbn,issn,keywords,
-                                               source_work_id,relationship_type,ingest_source,run_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    merged.get("source_pdf"),
-                    merged.get("title"),
-                    json.dumps(merged.get("authors")) if merged.get("authors") is not None else None,
-                    json.dumps(merged.get("editors")) if merged.get("editors") is not None else None,
-                    merged.get("year"),
-                    merged.get("doi"),
-                    merged.get("normalized_doi"),
-                    merged.get("openalex_id"),
-                    merged.get("normalized_title"),
-                    merged.get("normalized_authors"),
-                    merged.get("abstract"),
-                    json.dumps(merged.get("crossref_json")) if merged.get("crossref_json") is not None else None,
-                    json.dumps(merged.get("openalex_json")) if merged.get("openalex_json") is not None else None,
-                    merged.get("source"),
-                    merged.get("volume"),
-                    merged.get("issue"),
-                    merged.get("pages"),
-                    merged.get("publisher"),
-                    merged.get("type"),
-                    merged.get("url"),
-                    merged.get("isbn"),
-                    merged.get("issn"),
-                    json.dumps(merged.get("keywords")) if merged.get("keywords") is not None else None,
-                    merged.get("source_work_id"),
-                    merged.get("relationship_type"),
-                    merged.get("ingest_source"),
-                    merged.get("run_id"),
-                ),
-            )
-            new_id = cur.lastrowid
-
-            self.reassign_corpus_items("no_metadata", no_meta_id, "with_metadata", new_id)
-            
-            # Store related works as separate entries in with_metadata table
-            if enrichment.get('referenced_works'):
-                self.add_referenced_works_to_with_metadata(
-                    new_id,
-                    enrichment['referenced_works'],
-                    expand_related=expand_related,
-                    max_related_per_source=max_related_per_source,
-                )
-            
-            if enrichment.get('citing_works'):
-                self.add_citing_works_to_with_metadata(
-                    new_id,
-                    enrichment['citing_works'],
-                    expand_related=expand_related,
-                    max_related_per_source=max_related_per_source,
-                )
-
-            self.update_work_alias_owner("no_metadata", no_meta_id, "with_metadata", new_id)
-            cur.execute("DELETE FROM no_metadata WHERE id = ?", (no_meta_id,))
+            self._update_work_record(int(work_id), merged)
             cur.execute("COMMIT")
-            return new_id, None
+            return int(work_id), None
         except sqlite3.Error as e:
             cur.execute("ROLLBACK")
             return None, f"A database error occurred during promotion: {e}"
 
     def enqueue_for_download(self, with_meta_id: int) -> tuple[int | None, str | None]:
-        """Mark a with_metadata row as queued for download."""
+        """Mark a canonical work row as queued for download."""
         cur = self.conn.cursor()
         try:
             cur.execute("BEGIN")
-            cur.execute("SELECT id FROM with_metadata WHERE id = ?", (with_meta_id,))
+            cur.execute("SELECT id FROM works WHERE id = ?", (with_meta_id,))
             if not cur.fetchone():
                 cur.execute("ROLLBACK")
-                return None, "Row not found in with_metadata"
+                return None, "Row not found in works"
 
             cur.execute(
-                """UPDATE with_metadata
-                   SET download_state = 'queued',
+                """UPDATE works
+                   SET download_status = 'queued',
                        download_claimed_by = NULL,
                        download_claimed_at = NULL,
                        download_lease_expires_at = NULL,
-                       download_last_error = NULL
+                       download_error = NULL
                    WHERE id = ?""",
                 (with_meta_id,),
             )
@@ -2449,9 +1671,194 @@ class DatabaseManager:
             cur.execute("ROLLBACK")
             return None, f"Transaction failed: {e}"
 
-    def get_entries_to_download(self, limit: int = None) -> list[dict]:
-        """Fetch queued rows from with_metadata for legacy callers."""
-        self._ensure_legacy_queue_migrated()
+    def queue_for_enrichment(self, no_meta_id: int) -> tuple[int | None, str | None]:
+        """Mark a work row as pending enrichment and clear any stale claim."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute("BEGIN")
+            cur.execute("SELECT id FROM works WHERE id = ?", (no_meta_id,))
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                return None, "Row not found in works"
+
+            cur.execute(
+                """UPDATE works
+                      SET metadata_status = 'pending',
+                          metadata_claimed_by = NULL,
+                          metadata_claimed_at = NULL,
+                          metadata_lease_expires_at = NULL,
+                          metadata_error = NULL
+                    WHERE id = ?""",
+                (no_meta_id,),
+            )
+            cur.execute("COMMIT")
+            return int(no_meta_id), None
+        except sqlite3.Error as e:
+            cur.execute("ROLLBACK")
+            return None, f"Transaction failed: {e}"
+
+    def claim_enrich_batch(
+        self,
+        *,
+        limit: int,
+        corpus_id: int | None,
+        claimed_by: str,
+        lease_seconds: int = 15 * 60,
+        max_attempts: int | None = None,
+        target_ids: list[int] | None = None,
+    ) -> list[dict]:
+        """Atomically claim pending work rows for enrichment processing."""
+        if limit <= 0:
+            return []
+
+        target_ids = [int(value) for value in (target_ids or []) if int(value) > 0]
+        now = int(time.time())
+        lease_expires_at = now + int(max(1, lease_seconds))
+        eligible_state_sql = """
+            (
+              COALESCE(metadata_status, 'pending') = 'pending'
+              OR (
+                   metadata_status = 'in_progress'
+                   AND metadata_lease_expires_at IS NOT NULL
+                   AND metadata_lease_expires_at <= ?
+                 )
+            )
+        """
+        params: list = [now]
+        attempts_sql = ""
+        if max_attempts is not None:
+            attempts_sql = " AND COALESCE(metadata_attempt_count, 0) < ?"
+            params.append(int(max_attempts))
+
+        cur = self.conn.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            where_clauses = [eligible_state_sql]
+            query_params: list = list(params)
+
+            if corpus_id is not None:
+                where_clauses.append(
+                    "EXISTS (SELECT 1 FROM corpus_works cw WHERE cw.work_id = nm.id AND cw.corpus_id = ?)"
+                )
+                query_params.append(int(corpus_id))
+
+            if target_ids:
+                placeholders = ",".join("?" for _ in target_ids)
+                where_clauses.append(f"nm.id IN ({placeholders})")
+                query_params.extend(target_ids)
+
+            where_sql = " AND ".join(where_clauses)
+            cur.execute(
+                f"""
+                SELECT nm.id
+                  FROM works nm
+                 WHERE {where_sql}
+                   {attempts_sql}
+                 ORDER BY nm.id ASC
+                 LIMIT ?
+                """,
+                query_params + [int(limit)],
+            )
+            ids = [int(r[0]) for r in cur.fetchall()]
+            if not ids:
+                self.conn.commit()
+                return []
+
+            placeholders = ",".join(["?"] * len(ids))
+            claim_sql = f"""
+                UPDATE works
+                   SET metadata_status = 'in_progress',
+                       metadata_claimed_by = ?,
+                       metadata_claimed_at = ?,
+                       metadata_lease_expires_at = ?,
+                       metadata_attempt_count = COALESCE(metadata_attempt_count, 0) + 1,
+                       metadata_last_attempt_at = ?,
+                       metadata_error = NULL
+                 WHERE id IN ({placeholders})
+                   AND {eligible_state_sql}
+                   {attempts_sql}
+            """
+            cur.execute(
+                claim_sql,
+                [claimed_by, now, lease_expires_at, now] + ids + params,
+            )
+            cur.execute(
+                f"""
+                SELECT id, title, authors, year, doi, source, volume, issue, pages,
+                       publisher, type, url, isbn, issn, abstract, keywords
+                  FROM works
+                 WHERE id IN ({placeholders})
+                   AND metadata_claimed_by = ?
+                   AND metadata_claimed_at = ?
+                 ORDER BY id ASC
+                """,
+                ids + [claimed_by, now],
+            )
+            rows = cur.fetchall()
+            self.conn.commit()
+
+            out: list[dict] = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": r[0],
+                        "title": r[1],
+                        "authors": r[2],
+                        "year": r[3],
+                        "doi": r[4],
+                        "source": r[5],
+                        "volume": r[6],
+                        "issue": r[7],
+                        "pages": r[8],
+                        "publisher": r[9],
+                        "type": r[10],
+                        "url": r[11],
+                        "isbn": r[12],
+                        "issn": r[13],
+                        "abstract": r[14],
+                        "keywords": r[15],
+                    }
+                )
+            return out
+        except sqlite3.Error:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return []
+
+    def reset_enrich_claim(self, no_meta_id: int, *, state: str = "pending", error: str | None = None, selected: int = 0) -> tuple[bool, str | None]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """UPDATE works
+                      SET metadata_status = ?,
+                          metadata_claimed_by = NULL,
+                          metadata_claimed_at = NULL,
+                          metadata_lease_expires_at = NULL,
+                          metadata_error = ?
+                    WHERE id = ?""",
+                (state, error, no_meta_id),
+            )
+            self.conn.commit()
+            return True, None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            return False, str(e)
+
+    def delete_work(self, work_id: int) -> tuple[bool, str | None]:
+        cur = self.conn.cursor()
+        try:
+            cur.execute("DELETE FROM works WHERE id = ?", (work_id,))
+            self.delete_work_aliases("works", work_id)
+            self.conn.commit()
+            return True, None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            return False, str(e)
+
+    def fetch_download_queue(self, limit: int = None) -> list[dict]:
+        """Fetch queued works."""
         cursor = self.conn.cursor()
         cursor.row_factory = sqlite3.Row
         query = """
@@ -2461,8 +1868,16 @@ class DatabaseManager:
                    pages, publisher, metadata_source_type, bibtex_entry_json,
                    crossref_json, openalex_json, status_notes, date_added,
                    date_processed, checksum_pdf
-            FROM with_metadata
-            WHERE download_state = 'queued'
+            FROM (
+                SELECT id, NULL AS bibtex_key, type AS entry_type, title, authors, year, doi, NULL AS pmid,
+                       NULL AS arxiv_id, openalex_id, semantic_scholar_id, NULL AS mag_id, url AS url_source,
+                       file_path, abstract, keywords, source AS journal_conference, volume, issue,
+                       pages, publisher, metadata_source AS metadata_source_type, bibtex_entry_json,
+                       crossref_json, openalex_json, status_notes, created_at AS date_added,
+                       downloaded_at AS date_processed, file_checksum AS checksum_pdf
+                FROM works
+                WHERE download_status = 'queued'
+            )
             ORDER BY date_added ASC
         """
 
@@ -2496,12 +1911,12 @@ class DatabaseManager:
         return ' '.join(word_list)
 
     def move_entry_to_downloaded(self, source_id: int, enriched_metadata: dict, file_path: str, checksum: str, source_of_download: str):
-        """Move an in-progress with_metadata row to downloaded_references."""
+        """Mark a matched work as downloaded."""
         cursor = self.conn.cursor()
         try:
-            original_entry = self.get_entry_by_id('with_metadata', source_id)
+            original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
-                raise sqlite3.Error(f"No entry found in with_metadata with ID {source_id}")
+                raise sqlite3.Error(f"No entry found in works with ID {source_id}")
 
             authorships = enriched_metadata.get('authorships', [])
             authors = json.dumps([author['author']['display_name'] for author in authorships]) if authorships else original_entry.get('authors')
@@ -2515,84 +1930,175 @@ class DatabaseManager:
             primary_location = enriched_metadata.get('primary_location', {})
             source_info = primary_location.get('source', {}) if primary_location and primary_location.get('source') else {}
 
-            data_to_insert = {
-                'bibtex_key': enriched_metadata.get('bibtex_key', original_entry.get('bibtex_key')),
-                'entry_type': enriched_metadata.get('type', original_entry.get('entry_type')),
-                'source_pdf': original_entry.get('source_pdf'),
-                'title': enriched_metadata.get('title', original_entry.get('title')),
-                'authors': authors,
-                'year': enriched_metadata.get('publication_year', original_entry.get('year')),
-                'doi': enriched_metadata.get('doi', original_entry.get('doi')),
-                'openalex_id': enriched_metadata.get('id', original_entry.get('openalex_id')),
-                'url_source': enriched_metadata.get('url_source', original_entry.get('url_source')),
-                'file_path': file_path,
-                'abstract': abstract,
-                'keywords': keywords,
-                'journal_conference': source_info.get('display_name', original_entry.get('journal_conference') or original_entry.get('source')),
-                'volume': biblio.get('volume', original_entry.get('volume')),
-                'issue': biblio.get('issue', original_entry.get('issue')),
-                'pages': pages,
-                'publisher': source_info.get('publisher', original_entry.get('publisher')),
-                'metadata_source_type': 'openalex_api',
-                'bibtex_entry_json': json.dumps(enriched_metadata),
-                'status_notes': 'Successfully downloaded and processed',
-                'date_processed': datetime.now().isoformat(),
-                'checksum_pdf': checksum,
-                'source_of_download': source_of_download,
-                'ingest_source': original_entry.get('ingest_source'),
-                'run_id': original_entry.get('run_id'),
-                'normalized_title': original_entry.get('normalized_title'),
-                'normalized_authors': original_entry.get('normalized_authors'),
+            merged = {
+                **original_entry,
+                "title": enriched_metadata.get('title', original_entry.get('title')),
+                "authors": authors,
+                "year": enriched_metadata.get('publication_year', original_entry.get('year')),
+                "doi": enriched_metadata.get('doi', original_entry.get('doi')),
+                "normalized_doi": self._normalize_doi(enriched_metadata.get('doi', original_entry.get('doi'))),
+                "openalex_id": self._normalize_openalex_id(enriched_metadata.get('id', original_entry.get('openalex_id'))),
+                "url": enriched_metadata.get('url_source', original_entry.get('url')),
+                "file_path": file_path,
+                "abstract": abstract,
+                "keywords": keywords,
+                "source": source_info.get('display_name', original_entry.get('source')),
+                "volume": biblio.get('volume', original_entry.get('volume')),
+                "issue": biblio.get('issue', original_entry.get('issue')),
+                "pages": pages,
+                "publisher": source_info.get('publisher', original_entry.get('publisher')),
+                "metadata_source": original_entry.get('metadata_source') or 'openalex_api',
+                "bibtex_entry_json": json.dumps(enriched_metadata),
+                "status_notes": 'Successfully downloaded and processed',
+                "file_checksum": checksum,
+                "download_status": "downloaded",
+                "download_source": source_of_download,
+                "download_error": None,
+                "downloaded_at": datetime.now().isoformat(),
+                "download_claimed_by": None,
+                "download_claimed_at": None,
+                "download_lease_expires_at": None,
+                "normalized_title": self._normalize_text(enriched_metadata.get('title', original_entry.get('title'))),
+                "normalized_authors": self._normalize_contributor_fields(authors, original_entry.get('editors')),
             }
-
-            final_data = {k: v for k, v in data_to_insert.items() if v is not None}
-            cols = ', '.join(final_data.keys())
-            placeholders = ', '.join(['?'] * len(final_data))
-
-            cursor.execute(f"INSERT INTO downloaded_references ({cols}) VALUES ({placeholders})", list(final_data.values()))
-            new_id = cursor.lastrowid
-
-            self.update_work_alias_owner('with_metadata', source_id, 'downloaded_references', new_id)
-            self.reassign_corpus_items('with_metadata', source_id, 'downloaded_references', new_id)
-            cursor.execute("DELETE FROM with_metadata WHERE id = ?", (source_id,))
-
+            self._update_work_record(int(source_id), merged)
             self.conn.commit()
-            return new_id, None
+            return int(source_id), None
         except sqlite3.Error as e:
             self.conn.rollback()
             print(f"{RED}[DB Manager] Error moving entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
 
-    def move_entry_to_failed(self, source_id: int, reason: str) -> tuple[int | None, str | None]:
-        """Moves an entry from with_metadata into failed_downloads."""
+    def mark_raw_work_downloaded(
+        self,
+        source_id: int,
+        download_result: dict,
+        file_path: str,
+        checksum: str,
+        source_of_download: str,
+    ) -> tuple[int | None, str | None]:
+        """Mark a raw work row as downloaded after raw-download fallback."""
         cursor = self.conn.cursor()
         try:
-            original_entry = self.get_entry_by_id('with_metadata', source_id)
+            original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
-                return None, f"No entry found in with_metadata with ID {source_id}"
+                raise sqlite3.Error(f"No entry found in works with ID {source_id}")
 
-            original_entry.pop('id', None)
-            original_entry['status_notes'] = reason
-            original_entry['date_processed'] = datetime.now().isoformat()
+            title = download_result.get('title') or original_entry.get('title')
+            authors = download_result.get('authors')
+            if authors is None:
+                authors = original_entry.get('authors')
+            elif isinstance(authors, list):
+                authors = json.dumps(authors)
+            elif not isinstance(authors, str):
+                authors = json.dumps([str(authors)])
 
-            cursor.execute("PRAGMA table_info(failed_downloads)")
-            failed_cols = {row[1] for row in cursor.fetchall()}
-            filtered = {k: v for k, v in original_entry.items() if k in failed_cols}
+            doi = download_result.get('doi') or original_entry.get('doi')
+            openalex_id = download_result.get('openalex_id') or original_entry.get('openalex_id')
+            url_source = download_result.get('url') or download_result.get('open_access_url') or original_entry.get('url')
+            metadata_blob = json.dumps(download_result)
+            normalized_title = self._normalize_text(title)
+            normalized_authors = self._normalize_contributor_fields(authors, original_entry.get('editors'))
 
-            cols = ', '.join(filtered.keys())
-            placeholders = ', '.join(['?'] * len(filtered))
-
-            cursor.execute(f"INSERT INTO failed_downloads ({cols}) VALUES ({placeholders})", list(filtered.values()))
-            inserted_id = cursor.lastrowid
-            self.delete_work_aliases("with_metadata", source_id)
-            cursor.execute(
-                "DELETE FROM corpus_items WHERE table_name = ? AND row_id = ?",
-                ("with_metadata", source_id),
+            duplicate_table, duplicate_id, duplicate_field = self.check_if_exists(
+                doi=doi,
+                openalex_id=openalex_id,
+                title=title,
+                authors=authors,
+                editors=original_entry.get('editors'),
+                year=download_result.get('year') or original_entry.get('year'),
+                exclude_id=source_id,
+                exclude_table="works",
             )
-            cursor.execute("DELETE FROM with_metadata WHERE id = ?", (source_id,))
+            if duplicate_table == "works" and duplicate_id is not None:
+                existing = self.get_entry_by_id("works", int(duplicate_id)) or {}
+                payload = {
+                    **original_entry,
+                    "title": title,
+                    "authors": authors,
+                    "year": download_result.get('year') or original_entry.get('year'),
+                    "doi": doi,
+                    "normalized_doi": self._normalize_doi(doi),
+                    "openalex_id": self._normalize_openalex_id(openalex_id),
+                    "url": url_source,
+                    "file_path": file_path,
+                    "abstract": download_result.get('abstract') or original_entry.get('abstract'),
+                    "keywords": json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
+                    "source": download_result.get('source') or original_entry.get('source'),
+                    "volume": download_result.get('volume') or original_entry.get('volume'),
+                    "issue": download_result.get('issue') or original_entry.get('issue'),
+                    "pages": download_result.get('pages') or original_entry.get('pages'),
+                    "publisher": download_result.get('publisher') or original_entry.get('publisher'),
+                    "metadata_source": 'raw_download_fallback',
+                    "bibtex_entry_json": metadata_blob,
+                    "status_notes": 'Downloaded after metadata enrichment failed',
+                    "file_checksum": checksum,
+                    "download_status": 'downloaded',
+                    "download_source": source_of_download,
+                    "download_error": None,
+                    "downloaded_at": datetime.now().isoformat(),
+                    "normalized_title": normalized_title,
+                    "normalized_authors": normalized_authors,
+                }
+                self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
+                cursor.execute("DELETE FROM works WHERE id = ?", (int(source_id),))
+                self.conn.commit()
+                return int(duplicate_id), None
+
+            payload = {
+                **original_entry,
+                'type': download_result.get('type') or original_entry.get('type'),
+                'title': title,
+                'authors': authors,
+                'year': download_result.get('year') or original_entry.get('year'),
+                'doi': doi,
+                'normalized_doi': self._normalize_doi(doi),
+                'openalex_id': self._normalize_openalex_id(openalex_id),
+                'url': url_source,
+                'file_path': file_path,
+                'abstract': download_result.get('abstract') or original_entry.get('abstract'),
+                'keywords': json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
+                'source': download_result.get('source') or original_entry.get('source'),
+                'volume': download_result.get('volume') or original_entry.get('volume'),
+                'issue': download_result.get('issue') or original_entry.get('issue'),
+                'pages': download_result.get('pages') or original_entry.get('pages'),
+                'publisher': download_result.get('publisher') or original_entry.get('publisher'),
+                'metadata_source': 'raw_download_fallback',
+                'bibtex_entry_json': metadata_blob,
+                'status_notes': 'Downloaded after metadata enrichment failed',
+                'file_checksum': checksum,
+                'download_status': 'downloaded',
+                'download_source': source_of_download,
+                'download_error': None,
+                'downloaded_at': datetime.now().isoformat(),
+                'normalized_title': normalized_title,
+                'normalized_authors': normalized_authors,
+            }
+            self._update_work_record(int(source_id), payload)
             self.conn.commit()
-            print(f"{GREEN}[DB Manager] Moved entry ID {source_id} to failed_downloads.{RESET}")
-            return inserted_id, None
+            return int(source_id), None
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            print(f"{RED}[DB Manager] Error moving raw entry {source_id} to downloaded: {e}{RESET}")
+            return None, str(e)
+
+    def move_entry_to_failed(self, source_id: int, reason: str) -> tuple[int | None, str | None]:
+        """Mark a canonical work as failed during download."""
+        cursor = self.conn.cursor()
+        try:
+            original_entry = self.get_entry_by_id('works', source_id)
+            if not original_entry:
+                return None, f"No entry found in works with ID {source_id}"
+            original_entry['download_status'] = 'failed'
+            original_entry['download_error'] = reason
+            original_entry['download_claimed_by'] = None
+            original_entry['download_claimed_at'] = None
+            original_entry['download_lease_expires_at'] = None
+            original_entry['status_notes'] = reason
+            self._update_work_record(int(source_id), original_entry)
+            self.conn.commit()
+            print(f"{GREEN}[DB Manager] Marked work ID {source_id} as failed download.{RESET}")
+            return int(source_id), None
         except sqlite3.Error as e:
             self.conn.rollback()
             print(f"{RED}[DB Manager] Error moving entry {source_id} to failed: {e}{RESET}")
@@ -2608,37 +2114,21 @@ class DatabaseManager:
 
     def add_bibtex_entry_to_downloaded(
         self,
-        entry: object, # This is bibtexparser.model.Entry
+        entry: object,
         pdf_base_dir: Path | str | None = None,
-        input_doi: str | None = None, # New parameter
-        input_openalex_id: str | None = None, # New parameter
-        original_bibtex_entry_json: str | None = None, # Added based on CLI usage
-        source_bibtex_file: str | None = None # Added based on CLI usage
+        input_doi: str | None = None,
+        input_openalex_id: str | None = None,
+        original_bibtex_entry_json: str | None = None,
+        source_bibtex_file: str | None = None,
     ) -> tuple[int | None, str | None]:
-        """Adds a parsed BibTeX entry (bibtexparser.model.Entry object)
-        to the 'downloaded_references' table.
-
-        Args:
-            entry: A bibtexparser.model.Entry object.
-            pdf_base_dir: Optional base directory for resolving relative PDF paths.
-            input_doi: Optional DOI to use instead of extracting from the entry.
-            input_openalex_id: Optional OpenAlex ID to use instead of extracting from the entry.
-
-        Returns:
-            A tuple: (row_id, None) on successful insertion,
-                     (None, error_message_string) if insertion failed.
-        """
-        cursor = self.conn.cursor()
-
+        """Add a BibTeX entry as a downloaded canonical work."""
         def get_primitive_val(data_object, default=None):
-            """Safely extracts the primitive string value from a bibtexparser Field object or returns the value if already primitive."""
             if data_object is None:
                 return default
-            if hasattr(data_object, 'value'): # It's a Field object
-                return str(data_object.value) # Get the actual value and ensure it's a string
-            return str(data_object) # Already a primitive type (e.g. string from ENTRYTYPE) or needs string conversion
+            if hasattr(data_object, 'value'):
+                return str(data_object.value)
+            return str(data_object)
 
-        # Process authors
         authors_list = []
         raw_author_data = entry.get('author')
         if raw_author_data:
@@ -2650,7 +2140,17 @@ class DatabaseManager:
                     authors_list = [name.strip() for name in author_string.split(' and ')]
         authors_json = json.dumps([self._clean_string_value(str(author)) for author in authors_list if author]) if authors_list else None
 
-        # Process keywords
+        editors_list = []
+        raw_editor_data = entry.get('editor')
+        if raw_editor_data:
+            if isinstance(raw_editor_data, list):
+                editors_list = [get_primitive_val(editor_item) for editor_item in raw_editor_data]
+            else:
+                editor_string = get_primitive_val(raw_editor_data)
+                if editor_string:
+                    editors_list = [name.strip() for name in editor_string.split(' and ')]
+        editors_json = json.dumps([self._clean_string_value(str(editor)) for editor in editors_list if editor]) if editors_list else None
+
         keywords_list = []
         raw_keyword_data = entry.get('keywords')
         if raw_keyword_data:
@@ -2659,14 +2159,17 @@ class DatabaseManager:
             else:
                 keyword_string = get_primitive_val(raw_keyword_data)
                 if keyword_string:
-                    keywords_list = [kw.strip() for kw in keyword_string.split(',')]       
+                    keywords_list = [kw.strip() for kw in keyword_string.split(',')]
         keywords_json = json.dumps([self._clean_string_value(str(kw)) for kw in keywords_list if kw]) if keywords_list else None
-        
+
         serializable_entry_dict = {k: get_primitive_val(v) for k, v in entry.items()}
-        original_bibtex_json = json.dumps(serializable_entry_dict)
+        bibtex_json = original_bibtex_entry_json or json.dumps(serializable_entry_dict)
 
         bibtex_key_val = self._clean_string_value(entry.key if hasattr(entry, 'key') else None)
         entry_type_val = self._clean_string_value(entry.entry_type if hasattr(entry, 'entry_type') else None)
+        title_val = self._clean_string_value(get_primitive_val(entry.get('title')))
+        if not title_val:
+            title_val = f"[Title from Key: {bibtex_key_val}]" if bibtex_key_val else "[No Title or Key Available]"
 
         year_str_raw = get_primitive_val(entry.get('year'))
         year_int = None
@@ -2676,88 +2179,63 @@ class DatabaseManager:
                 try:
                     year_int = int(year_str_cleaned)
                 except ValueError:
-                    print(f"{RED}[DB Manager] Warning: Could not parse year '{year_str_raw}' (cleaned to: '{year_str_cleaned}') as int for entry {bibtex_key_val if bibtex_key_val else 'N/A'}{RESET}")
-        
-        title_val = self._clean_string_value(get_primitive_val(entry.get('title')))
-        
-        # Use passed-in DOI and OpenAlex ID
-        cleaned_doi_val = self._clean_string_value(input_doi)
-        doi_val = self._normalize_doi(cleaned_doi_val)
+                    year_int = None
 
-        cleaned_openalex_id_val = self._clean_string_value(input_openalex_id)
-        openalexid_val = self._normalize_openalex_id(cleaned_openalex_id_val)
-
-        pmid_val = self._clean_string_value(get_primitive_val(entry.get('pmid')))
-        arxiv_val = self._clean_string_value(get_primitive_val(entry.get('arxiv')))
-        semanticscholarid_val = self._clean_string_value(get_primitive_val(entry.get('semanticscholarid')))
-        magid_val = self._clean_string_value(get_primitive_val(entry.get('magid')))
+        doi_val = self._normalize_doi(self._clean_string_value(input_doi))
+        openalexid_val = self._normalize_openalex_id(self._clean_string_value(input_openalex_id))
         url_source_val = self._clean_string_value(get_primitive_val(entry.get('url')) or get_primitive_val(entry.get('link')))
-        # Process file path
         raw_file_field = get_primitive_val(entry.get('file'))
         parsed_filename = parse_bibtex_file_field(raw_file_field)
         file_path_val = None
         if parsed_filename:
             if pdf_base_dir:
-                # Construct the full path and resolve it to be absolute
                 full_path = Path(pdf_base_dir) / parsed_filename
-                # Check if the file actually exists before storing the path
-                if full_path.is_file():
-                    file_path_val = str(full_path.resolve())
-                else:
-                    # Log a warning if the resolved file path doesn't exist
-                    print(f"{YELLOW}[DB Manager] Warning: Resolved PDF path does not exist: {full_path.resolve()} for entry {bibtex_key_val if bibtex_key_val else 'N/A'}{RESET}")
-                    # Store the intended path anyway, as it might be resolved later or on a different system
-                    file_path_val = str(full_path.resolve())
+                file_path_val = str(full_path.resolve())
             else:
-                # If no base directory is given, store just the parsed filename
                 file_path_val = parsed_filename
-        abstract_val = self._clean_string_value(get_primitive_val(entry.get('abstract')))
-        journal_conference_val = self._clean_string_value(get_primitive_val(entry.get('journal')) or get_primitive_val(entry.get('booktitle')))
-        volume_val = self._clean_string_value(get_primitive_val(entry.get('volume')))
-        issue_val = self._clean_string_value(get_primitive_val(entry.get('number')) or get_primitive_val(entry.get('issue')))
-        pages_val = self._clean_string_value(get_primitive_val(entry.get('pages')))
-        publisher_val = self._clean_string_value(get_primitive_val(entry.get('publisher')))
 
-        sql = """
-            INSERT INTO downloaded_references (
-                bibtex_key, entry_type, title, authors, year, doi, pmid, arxiv_id, 
-                openalex_id, semantic_scholar_id, mag_id, url_source, file_path, 
-                abstract, keywords, journal_conference, volume, issue, pages, publisher, 
-                metadata_source_type, bibtex_entry_json, status_notes, date_processed
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """
+        data = {
+            'title': title_val,
+            'authors': authors_json,
+            'editors': editors_json,
+            'year': year_int,
+            'doi': doi_val,
+            'normalized_doi': doi_val,
+            'openalex_id': openalexid_val,
+            'semantic_scholar_id': self._clean_string_value(get_primitive_val(entry.get('semanticscholarid'))),
+            'source': self._clean_string_value(get_primitive_val(entry.get('journal')) or get_primitive_val(entry.get('booktitle'))),
+            'publisher': self._clean_string_value(get_primitive_val(entry.get('publisher'))),
+            'volume': self._clean_string_value(get_primitive_val(entry.get('volume'))),
+            'issue': self._clean_string_value(get_primitive_val(entry.get('number')) or get_primitive_val(entry.get('issue'))),
+            'pages': self._clean_string_value(get_primitive_val(entry.get('pages'))),
+            'type': entry_type_val,
+            'url': url_source_val,
+            'abstract': self._clean_string_value(get_primitive_val(entry.get('abstract'))),
+            'keywords': keywords_json,
+            'normalized_title': self._normalize_text(title_val),
+            'normalized_authors': self._normalize_contributor_fields(authors_json, editors_json),
+            'metadata_status': 'matched',
+            'metadata_source': 'bibtex_import',
+            'download_status': 'downloaded',
+            'download_source': 'bibtex_import',
+            'downloaded_at': datetime.now().isoformat(),
+            'file_path': file_path_val,
+            'origin_type': 'bibtex_import',
+            'origin_key': source_bibtex_file or bibtex_key_val,
+            'bibtex_entry_json': bibtex_json,
+            'status_notes': 'Imported from BibTeX file',
+        }
         try:
-            # If title is missing, use bibtex_key as a placeholder, or a generic string if key is also missing.
-            if not title_val:
-                if bibtex_key_val:
-                    title_val = f"[Title from Key: {bibtex_key_val}]"
-                    print(f"{YELLOW}[DB Manager] Info: Missing title for entry. Using bibtex_key as placeholder: '{title_val}' for key '{bibtex_key_val}'{RESET}")
-                else:
-                    title_val = "[No Title or Key Available]"
-                    print(f"{YELLOW}[DB Manager] Info: Missing title and bibtex_key for entry. Using generic placeholder: '{title_val}'{RESET}")
-            
-            cursor.execute(sql, (
-                bibtex_key_val, entry_type_val, title_val, authors_json, 
-                year_int, doi_val, pmid_val, arxiv_val,
-                openalexid_val, semanticscholarid_val, magid_val,
-                url_source_val, file_path_val, abstract_val, keywords_json, 
-                journal_conference_val, volume_val, issue_val, pages_val, publisher_val,
-                'bibtex_import', original_bibtex_json, 'Imported from BibTeX file'
-            ))
-            self.conn.commit()
-            return cursor.lastrowid, None
+            work_id, _ = self._resolve_or_create_work(data, allow_merge=True, commit=True)
+            return work_id, None
         except sqlite3.IntegrityError as e:
-            error_msg = str(e.args[0] if e.args else str(e))
-            print(f"{YELLOW}[DB Manager] Integrity error for entry {bibtex_key_val if bibtex_key_val else 'N/A'}: {error_msg}{RESET}")
-            return None, error_msg
+            return None, str(e.args[0] if e.args else str(e))
         except sqlite3.Error as e:
-            error_msg = f"SQLite error: {e}"
-            print(f"{RED}[DB Manager] Error adding BibTeX entry to downloaded_references: {e} (Entry details: Key='{bibtex_key_val}', Title='{title_val}'){RESET}")
+            print(f"{RED}[DB Manager] Error adding BibTeX entry to works: {e} (Entry details: Key='{bibtex_key_val}', Title='{title_val}'){RESET}")
             return None, str(e)
         except Exception as e:
-            error_msg = f"General error: {e}"
-            print(f"{RED}[DB Manager] {error_msg} while adding BibTeX entry {bibtex_key_val if bibtex_key_val else 'N/A'}{RESET}")
-            return None, error_msg
+            print(f"{RED}[DB Manager] General error while adding BibTeX entry {bibtex_key_val if bibtex_key_val else 'N/A'}: {e}{RESET}")
+            return None, str(e)
 
     def add_entry_to_download_queue(
         self,
@@ -2766,8 +2244,7 @@ class DatabaseManager:
         exclude_table: str | None = None,
         corpus_id: int | None = None,
     ) -> tuple[str, int | None, str, str | None]:
-        """Queue an entry for download by storing/updating it in with_metadata."""
-        cursor = self.conn.cursor()
+        """Queue an entry for download in the canonical works table."""
         if corpus_id is None:
             corpus_id = parsed_data.get("corpus_id")
 
@@ -2790,25 +2267,53 @@ class DatabaseManager:
         )
 
         if table_name and existing_id is not None:
-            if table_name == 'with_metadata':
-                try:
-                    cursor.execute(
-                        """UPDATE with_metadata
-                           SET download_state = 'queued',
-                               download_claimed_by = NULL,
-                               download_claimed_at = NULL,
-                               download_lease_expires_at = NULL,
-                               download_last_error = NULL
-                           WHERE id = ?""",
-                        (existing_id,),
+            if table_name == 'works':
+                existing_id = int(existing_id)
+                existing = self.get_entry_by_id("works", existing_id) or {}
+                if corpus_id:
+                    self.add_corpus_item(corpus_id, 'works', existing_id)
+
+                download_status = str(existing.get("download_status") or "not_requested").strip().lower()
+                if download_status == "downloaded":
+                    dup_log_id, dup_log_err = self.add_entry_to_duplicates(
+                        entry=parsed_data.get('original_json_object', parsed_data),
+                        input_doi=input_doi,
+                        input_openalex_id=input_openalex_id,
+                        source_bibtex_file=None,
+                        existing_entry_id=existing_id,
+                        existing_entry_table="works",
+                        matched_on_field=matched_field,
                     )
+                    if dup_log_id:
+                        msg = f"Duplicate of work ID {existing_id}. Logged as duplicate ID {dup_log_id}."
+                        return "duplicate", existing_id, msg, "works"
+                    err_msg = f"Duplicate of work ID {existing_id} but failed to log: {dup_log_err}"
+                    return "error", None, err_msg, None
+
+                incoming = self._build_raw_work_payload(parsed_data)
+                incoming.update(
+                    {
+                        "metadata_status": "matched",
+                        "metadata_source": parsed_data.get("metadata_source_type") or existing.get("metadata_source") or "queue_request",
+                        "metadata_error": None,
+                        "metadata_updated_at": datetime.now().isoformat(),
+                        "download_status": "queued" if download_status not in {"queued", "in_progress"} else download_status,
+                        "download_claimed_by": None,
+                        "download_claimed_at": None,
+                        "download_lease_expires_at": None,
+                        "download_error": None,
+                        "bibtex_entry_json": self._clean_json_text(parsed_data.get('bibtex_entry_json')) or existing.get("bibtex_entry_json"),
+                        "crossref_json": self._clean_json_text(parsed_data.get('crossref_json')) or existing.get("crossref_json"),
+                        "openalex_json": self._clean_json_text(parsed_data.get('openalex_json')) or existing.get("openalex_json"),
+                    }
+                )
+                try:
+                    self._update_work_record(existing_id, self._apply_work_merge_priority(existing, incoming))
                     self.conn.commit()
+                    return "added_to_queue", existing_id, "Existing work queued.", 'works'
                 except sqlite3.Error as e:
                     self.conn.rollback()
-                    return "error", None, f"Failed to queue existing with_metadata row: {e}", None
-                if corpus_id:
-                    self.add_corpus_item(corpus_id, 'with_metadata', existing_id)
-                return "added_to_queue", existing_id, "Existing with_metadata entry queued.", 'with_metadata'
+                    return "error", None, f"Failed to queue existing work: {e}", None
 
             dup_log_id, dup_log_err = self.add_entry_to_duplicates(
                 entry=parsed_data.get('original_json_object', parsed_data),
@@ -2828,60 +2333,27 @@ class DatabaseManager:
             return "error", None, err_msg, None
 
         try:
-            authors_value = parsed_data.get('authors')
-            authors_json = json.dumps(authors_value) if isinstance(authors_value, list) else authors_value
-            normalized_title = self._normalize_text(parsed_data.get('title'))
-            normalized_authors = self._normalize_contributor_fields(
-                authors_value,
-                parsed_data.get('editors'),
+            payload = self._build_raw_work_payload(parsed_data)
+            payload.update(
+                {
+                    "metadata_status": "matched",
+                    "metadata_source": parsed_data.get("metadata_source_type") or "queue_request",
+                    "metadata_error": None,
+                    "metadata_updated_at": datetime.now().isoformat(),
+                    "download_status": "queued",
+                    "download_claimed_by": None,
+                    "download_claimed_at": None,
+                    "download_lease_expires_at": None,
+                    "download_error": None,
+                    "bibtex_entry_json": self._clean_json_text(parsed_data.get('bibtex_entry_json')),
+                    "crossref_json": self._clean_json_text(parsed_data.get('crossref_json')),
+                    "openalex_json": self._clean_json_text(parsed_data.get('openalex_json')),
+                }
             )
-            normalized_doi = self._normalize_doi(parsed_data.get('doi'))
-
-            insert_data = {
-                "bibtex_key": parsed_data.get('bibtex_key'),
-                "entry_type": parsed_data.get('entry_type'),
-                "title": parsed_data.get('title'),
-                "authors": authors_json,
-                "editors": json.dumps(parsed_data.get('editors')) if isinstance(parsed_data.get('editors'), list) else parsed_data.get('editors'),
-                "year": parsed_data.get('year'),
-                "doi": normalized_doi,
-                "normalized_doi": normalized_doi,
-                "openalex_id": self._normalize_openalex_id(parsed_data.get('openalex_id')),
-                "abstract": parsed_data.get('abstract'),
-                "keywords": json.dumps(parsed_data.get('keywords')) if isinstance(parsed_data.get('keywords'), list) else parsed_data.get('keywords'),
-                "source": parsed_data.get('source') or parsed_data.get('journal_conference'),
-                "journal_conference": parsed_data.get('journal_conference') or parsed_data.get('source'),
-                "volume": parsed_data.get('volume'),
-                "issue": parsed_data.get('issue'),
-                "pages": parsed_data.get('pages'),
-                "publisher": parsed_data.get('publisher'),
-                "type": parsed_data.get('type') or parsed_data.get('entry_type'),
-                "url": parsed_data.get('url') or parsed_data.get('url_source'),
-                "url_source": parsed_data.get('url_source') or parsed_data.get('url'),
-                "source_work_id": parsed_data.get('source_work_id'),
-                "relationship_type": parsed_data.get('relationship_type'),
-                "metadata_source_type": parsed_data.get('metadata_source_type'),
-                "bibtex_entry_json": parsed_data.get('bibtex_entry_json'),
-                "crossref_json": parsed_data.get('crossref_json'),
-                "openalex_json": parsed_data.get('openalex_json'),
-                "normalized_title": normalized_title,
-                "normalized_authors": normalized_authors,
-                "ingest_source": parsed_data.get('ingest_source'),
-                "run_id": parsed_data.get('run_id'),
-                "date_added": datetime.now().isoformat(),
-                "download_state": 'queued',
-            }
-
-            columns = ', '.join(insert_data.keys())
-            placeholders = ', '.join(['?' for _ in insert_data.values()])
-            sql = f"INSERT INTO with_metadata ({columns}) VALUES ({placeholders})"
-
-            cursor.execute(sql, tuple(insert_data.values()))
-            last_id = cursor.lastrowid
-            self.conn.commit()
+            last_id, _ = self._resolve_or_create_work(payload, allow_merge=True)
             if corpus_id:
-                self.add_corpus_item(corpus_id, "with_metadata", last_id)
-            return "added_to_queue", last_id, "Entry added to with_metadata queue.", None
+                self.add_corpus_item(corpus_id, "works", int(last_id))
+            return "added_to_queue", int(last_id), "Entry added to download queue.", None
         except sqlite3.Error as e:
             err_msg = f"SQLite error adding entry '{title}' to queue: {e}"
             return "error", None, err_msg, None
@@ -2908,7 +2380,7 @@ class DatabaseManager:
             input_openalex_id: The OpenAlex ID extracted from the duplicate entry.
             source_bibtex_file: The path to the BibTeX file from which this duplicate was read.
             existing_entry_id: The ID of the entry it duplicates in the database.
-            existing_entry_table: The table where the existing entry is stored (e.g., 'downloaded_references').
+            existing_entry_table: The table where the existing entry is stored (normally 'works').
             matched_on_field: The field that caused the duplicate detection (e.g., 'doi', 'openalex_id').
 
         Returns:
@@ -3014,39 +2486,76 @@ class DatabaseManager:
         self.conn.commit()
         return len(rows)
 
-    def get_all_downloaded_references_as_dicts(self) -> list[dict]:
-        """Fetches all entries from the downloaded_references table as a list of dictionaries."""
+    def get_all_downloaded_works_as_dicts(self) -> list[dict]:
+        """Fetch downloaded works as dictionaries using the canonical works table."""
         self.conn.row_factory = sqlite3.Row
         cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT * FROM downloaded_references ORDER BY id")
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    id AS work_id,
+                    NULL AS bibtex_key,
+                    type AS entry_type,
+                    source_pdf,
+                    title,
+                    authors,
+                    editors,
+                    year,
+                    doi,
+                    NULL AS pmid,
+                    NULL AS arxiv_id,
+                    openalex_id,
+                    semantic_scholar_id,
+                    NULL AS mag_id,
+                    url AS url_source,
+                    file_path,
+                    abstract,
+                    keywords,
+                    source AS journal_conference,
+                    volume,
+                    issue,
+                    pages,
+                    publisher,
+                    metadata_source AS metadata_source_type,
+                    bibtex_entry_json,
+                    status_notes,
+                    downloaded_at AS date_processed,
+                    file_checksum AS checksum_pdf,
+                    download_source AS source_of_download,
+                    origin_key AS ingest_source,
+                    run_id,
+                    normalized_title,
+                    normalized_authors,
+                    normalized_doi
+                FROM works
+                WHERE download_status = 'downloaded'
+                ORDER BY id
+                """
+            )
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
-            print(f"{RED}[DB Manager] Error fetching all downloaded references: {e}{RESET}")
+            print(f"{RED}[DB Manager] Error fetching downloaded works: {e}{RESET}")
             return []
         finally:
-            self.conn.row_factory = None # Reset row_factory
+            self.conn.row_factory = None
 
-    def get_sample_downloaded_references(self, limit: int = 5) -> list[tuple]:
-        """Fetches a sample of entries from the downloaded_references table.
-
-        Args:
-            limit: The maximum number of entries to fetch.
-
-        Returns:
-            A list of tuples, where each tuple represents a row from the table.
-        """
+    def get_sample_downloaded_works(self, limit: int = 5) -> list[tuple]:
+        """Fetch a sample of downloaded works from the canonical works table."""
         if not self.conn:
             print(f"{RED}[DB Manager] Database connection is not open.{RESET}")
             return []
         cursor = self.conn.cursor()
         try:
-            cursor.execute(f"SELECT * FROM downloaded_references LIMIT ?", (limit,))
-            rows = cursor.fetchall()
-            return rows
+            cursor.execute(
+                "SELECT id, title, authors, year, doi, openalex_id, file_path FROM works WHERE download_status = 'downloaded' ORDER BY id LIMIT ?",
+                (limit,),
+            )
+            return cursor.fetchall()
         except sqlite3.Error as e:
-            print(f"{RED}[DB Manager] SQLite error while fetching sample entries: {e}{RESET}")
+            print(f"{RED}[DB Manager] SQLite error while fetching sample downloaded works: {e}{RESET}")
             return []
 
     def save_to_disk(self, target_disk_path: Path | str) -> bool:
@@ -3086,12 +2595,11 @@ class DatabaseManager:
             return False
 
     def get_all_from_queue(self) -> list[dict]:
-        """Fetch all currently queued or in-progress rows from with_metadata."""
-        self._ensure_legacy_queue_migrated()
+        """Fetch all currently queued or in-progress works."""
         self.conn.row_factory = sqlite3.Row
         cursor = self.conn.cursor()
         try:
-            cursor.execute("SELECT * FROM with_metadata WHERE download_state IN ('queued', 'in_progress')")
+            cursor.execute("SELECT * FROM works WHERE download_status IN ('queued', 'in_progress')")
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
@@ -3109,8 +2617,7 @@ class DatabaseManager:
         lease_seconds: int = 15 * 60,
         max_attempts: int | None = None,
     ) -> list[dict]:
-        """Atomically claim queued with_metadata rows for download processing."""
-        self._ensure_legacy_queue_migrated()
+        """Atomically claim queued works for download processing."""
         if limit <= 0:
             return []
 
@@ -3119,9 +2626,9 @@ class DatabaseManager:
 
         eligible_state_sql = """
             (
-              download_state = 'queued'
+              download_status = 'queued'
               OR (
-                   download_state = 'in_progress'
+                   download_status = 'in_progress'
                    AND download_lease_expires_at IS NOT NULL
                    AND download_lease_expires_at <= ?
                  )
@@ -3141,14 +2648,12 @@ class DatabaseManager:
                 cur.execute(
                     f"""
                     SELECT t.id
-                    FROM with_metadata t
-                    JOIN corpus_items ci
-                      ON ci.table_name = 'with_metadata'
-                     AND ci.row_id = t.id
-                    WHERE ci.corpus_id = ?
+                    FROM works t
+                    JOIN corpus_works cw ON cw.work_id = t.id
+                    WHERE cw.corpus_id = ?
                       AND {eligible_state_sql}
                       {attempts_sql}
-                    ORDER BY t.date_added ASC
+                    ORDER BY t.created_at ASC
                     LIMIT ?
                     """,
                     [int(corpus_id)] + params + [int(limit)],
@@ -3157,10 +2662,10 @@ class DatabaseManager:
                 cur.execute(
                     f"""
                     SELECT t.id
-                    FROM with_metadata t
+                    FROM works t
                     WHERE {eligible_state_sql}
                       {attempts_sql}
-                    ORDER BY t.date_added ASC
+                    ORDER BY t.created_at ASC
                     LIMIT ?
                     """,
                     params + [int(limit)],
@@ -3173,14 +2678,14 @@ class DatabaseManager:
 
             placeholders = ",".join(["?"] * len(ids))
             claim_sql = f"""
-                UPDATE with_metadata
-                   SET download_state = 'in_progress',
+                UPDATE works
+                   SET download_status = 'in_progress',
                        download_claimed_by = ?,
                        download_claimed_at = ?,
                        download_lease_expires_at = ?,
                        download_attempt_count = COALESCE(download_attempt_count, 0) + 1,
                        download_last_attempt_at = ?,
-                       download_last_error = NULL
+                       download_error = NULL
                  WHERE id IN ({placeholders})
                    AND {eligible_state_sql}
                    {attempts_sql}
@@ -3191,12 +2696,12 @@ class DatabaseManager:
             )
 
             fetch_sql = f"""
-                SELECT id, title, authors, year, doi, openalex_id, entry_type, type, url, url_source, openalex_json
-                  FROM with_metadata
+                SELECT id, title, authors, year, doi, openalex_id, NULL AS entry_type, type, url, url, openalex_json
+                  FROM works
                  WHERE id IN ({placeholders})
                    AND download_claimed_by = ?
                    AND download_claimed_at = ?
-                 ORDER BY date_added ASC
+                 ORDER BY created_at ASC
             """
             cur.execute(fetch_sql, ids + [claimed_by, now])
             rows = cur.fetchall()
@@ -3238,445 +2743,44 @@ class DatabaseManager:
         word_positions.sort(key=lambda x: x[1])
         return " ".join(word for word, _ in word_positions)
 
-    def move_queue_entry_to_downloaded(self, queue_id: int, enriched_data: dict, file_path: str, checksum: str) -> tuple[int | None, str | None]:
-        """Backward-compatible wrapper for with_metadata-backed queue rows."""
+    def mark_downloaded_work(self, queue_id: int, enriched_data: dict, file_path: str, checksum: str) -> tuple[int | None, str | None]:
+        """Mark a queued work as downloaded."""
         return self.move_entry_to_downloaded(queue_id, enriched_data, file_path, checksum, enriched_data.get('download_source', 'unknown'))
 
-    def retry_failed_enrichments(self) -> tuple[int, str | None]:
-        """Moves all entries from the failed_enrichments table back to no_metadata for reprocessing."""
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("BEGIN")
-
-            # Fetch all failed enrichments
-            cursor.execute("SELECT id, source_pdf, title, authors, year, doi FROM failed_enrichments")
-            failed_entries = cursor.fetchall()
-
-            if not failed_entries:
-                print(f"{YELLOW}[DB Manager] No failed enrichments to retry.{RESET}")
-                return 0, None
-
-            moved_count = 0
-            for entry in failed_entries:
-                entry_id, source_pdf, title, authors, year, doi = entry
-
-                # Parse authors if stored as JSON string
-                authors_value = authors
-                if isinstance(authors_value, str):
-                    authors_str = authors_value.strip()
-                    if authors_str.startswith("[") and authors_str.endswith("]"):
-                        try:
-                            authors_value = json.loads(authors_str)
-                        except json.JSONDecodeError:
-                            authors_value = authors
-
-                tbl, eid, field = self.check_if_exists(
-                    doi=doi,
-                    openalex_id=None,
-                    title=title,
-                    authors=authors_value,
-                    year=year,
-                )
-                if tbl:
-                    cursor.execute("DELETE FROM failed_enrichments WHERE id = ?", (entry_id,))
-                    continue
-
-                normalized_doi = self._normalize_doi(doi)
-                normalized_title = self._normalize_text(title)
-                normalized_authors = self._normalize_authors_value(authors_value)
-
-                cursor.execute(
-                    """INSERT INTO no_metadata (source_pdf, title, authors, year, doi,
-                                                normalized_doi, normalized_title, normalized_authors)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        source_pdf,
-                        title,
-                        json.dumps(authors_value) if isinstance(authors_value, list) else authors_value,
-                        year,
-                        doi,
-                        normalized_doi,
-                        normalized_title,
-                        normalized_authors,
-                    ),
-                )
-                cursor.execute("DELETE FROM failed_enrichments WHERE id = ?", (entry_id,))
-                moved_count += 1
-
-            # Clear the failed_enrichments table
-            self.conn.commit()
-            print(f"{GREEN}[DB Manager] Successfully moved {moved_count} entries from 'failed_enrichments' to 'no_metadata'.{RESET}")
-            return moved_count, None
-
-        except sqlite3.Error as e:
-            self.conn.rollback()
-            error_msg = f"Transaction failed during retry_failed_enrichments: {e}"
-            print(f"{RED}[DB Manager] {error_msg}{RESET}")
-            return 0, error_msg
-
-    def move_queue_entry_to_failed(self, queue_id: int, reason: str) -> tuple[int | None, str | None]:
-        """Backward-compatible wrapper for with_metadata-backed queue rows."""
+    def mark_download_failed(self, queue_id: int, reason: str) -> tuple[int | None, str | None]:
+        """Mark a queued work as failed."""
         return self.move_entry_to_failed(queue_id, reason)
 
-    def drop_queue_entry_as_duplicate(
+    def merge_duplicate_queued_work(
         self,
         queue_id: int,
         existing_table: str,
         existing_id: int,
         matched_field: str | None = None
     ) -> tuple[bool, str | None]:
-        """Delete a queued with_metadata row when it's a duplicate of an existing record."""
-        if not self._fetch_record_dict("with_metadata", queue_id):
+        """Merge a queued work row into an existing canonical work."""
+        if not self._fetch_record_dict("works", queue_id):
             return False, f"Queue entry {queue_id} not found."
-
-        ok, err = self._merge_records(
-            canonical_table=existing_table,
-            canonical_id=existing_id,
-            duplicate_table="with_metadata",
-            duplicate_id=queue_id,
-            match_field=matched_field,
-            notes="queue_duplicate",
-        )
-        if not ok:
+        if existing_table != "works":
+            existing_work_id = self._resolve_work_id_from_legacy_pointer(existing_table, existing_id)
+        else:
+            existing_work_id = int(existing_id)
+        if not existing_work_id:
+            return False, f"Canonical work not found for duplicate queue entry {queue_id}."
+        duplicate = self.get_entry_by_id("works", int(queue_id)) or {}
+        canonical = self.get_entry_by_id("works", int(existing_work_id)) or {}
+        try:
+            self._update_work_record(int(existing_work_id), self._apply_work_merge_priority(canonical, duplicate))
+            self.conn.execute("DELETE FROM works WHERE id = ?", (int(queue_id),))
+            self.conn.commit()
+        except sqlite3.Error as err:
+            self.conn.rollback()
             return False, f"SQLite error dropping duplicate queue entry {queue_id}: {err}"
 
         msg = f"Queue entry {queue_id} is duplicate of {existing_table} ID {existing_id}"
         if matched_field:
             msg += f" (matched on {matched_field})"
         return True, msg
-
-    def add_referenced_works_to_with_metadata(
-        self,
-        source_work_id: int,
-        referenced_works: list,
-        *,
-        expand_related: bool = False,
-        max_related_per_source: int = 40,
-    ) -> int:
-        """Add referenced works as separate entries in the with_metadata table."""
-        if not referenced_works:
-            return 0
-            
-        cursor = self.conn.cursor()
-        stored_count = 0
-        edge_count = 0
-        source_openalex_id, source_doi, source_run_id = self._fetch_with_metadata_identifiers(source_work_id)
-        source_node_id = self._make_node_id(source_openalex_id, source_doi, "with_metadata", source_work_id)
-        
-        def _insert_related_work(ref_work: dict, parent_work_id: int, relationship: str) -> tuple[int | None, str | None, str | None]:
-            title = ref_work.get('title')
-            if not title:
-                return None, None, None
-
-            authors_json = json.dumps(ref_work.get('authors', [])) if ref_work.get('authors') else None
-            year = ref_work.get('year')
-            doi = ref_work.get('doi')
-            openalex_id = ref_work.get('openalex_id')
-            normalized_doi = self._normalize_doi(doi)
-            normalized_openalex_id = self._normalize_openalex_id(openalex_id)
-            normalized_title = self._normalize_text(title)
-            normalized_authors = self._normalize_text(str(ref_work.get('authors', [])))
-
-            openalex_json = {
-                'id': openalex_id,
-                'title': title,
-                'display_name': title,
-                'authorships': [{'author': {'display_name': author}} for author in ref_work.get('authors', [])],
-                'publication_year': year,
-                'doi': doi,
-                'type': ref_work.get('type'),
-            }
-
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO with_metadata
-                (source_pdf, title, authors, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors,
-                 abstract, crossref_json, openalex_json, source_work_id, relationship_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    None,
-                    title,
-                    authors_json,
-                    year,
-                    doi,
-                    normalized_doi,
-                    normalized_openalex_id,
-                    normalized_title,
-                    normalized_authors,
-                    None,
-                    None,
-                    json.dumps(openalex_json),
-                    parent_work_id,
-                    relationship,
-                ),
-            )
-
-            target_row_id = None
-            if cursor.rowcount > 0:
-                target_row_id = cursor.lastrowid
-            else:
-                if normalized_openalex_id:
-                    cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (normalized_openalex_id,))
-                    row = cursor.fetchone()
-                    if row:
-                        target_row_id = row[0]
-                elif normalized_doi:
-                    cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (normalized_doi,))
-                    row = cursor.fetchone()
-                    if row:
-                        target_row_id = row[0]
-            return target_row_id, normalized_openalex_id, doi
-
-        try:
-            for ref_work in referenced_works:
-                if not isinstance(ref_work, dict):
-                    continue
-
-                target_row_id, normalized_openalex_id, doi = _insert_related_work(
-                    ref_work, source_work_id, "references"
-                )
-                if target_row_id:
-                    stored_count += 1
-
-                target_node_id = self._make_node_id(normalized_openalex_id, doi, "with_metadata", target_row_id)
-                if self._insert_citation_edge(
-                    source_node_id,
-                    target_node_id,
-                    "references",
-                    source_table="with_metadata",
-                    target_table="with_metadata",
-                    source_row_id=source_work_id,
-                    target_row_id=target_row_id,
-                    run_id=source_run_id,
-                ):
-                    edge_count += 1
-
-                if (
-                    expand_related
-                    and target_row_id
-                    and ref_work.get("referenced_works_expanded")
-                ):
-                    child_source_node_id = self._make_node_id(
-                        normalized_openalex_id, doi, "with_metadata", target_row_id
-                    )
-                    for child in ref_work.get("referenced_works_expanded", [])[:max_related_per_source]:
-                        child_row_id, child_openalex_id, child_doi = _insert_related_work(
-                            child, target_row_id, "references"
-                        )
-                        child_node_id = self._make_node_id(
-                            child_openalex_id, child_doi, "with_metadata", child_row_id
-                        )
-                        if self._insert_citation_edge(
-                            child_source_node_id,
-                            child_node_id,
-                            "references",
-                            source_table="with_metadata",
-                            target_table="with_metadata",
-                            source_row_id=target_row_id,
-                            target_row_id=child_row_id,
-                            run_id=source_run_id,
-                        ):
-                            edge_count += 1
-            
-            print(f"{GREEN}[DB Manager] Added {stored_count} referenced works and {edge_count} edges for work ID {source_work_id}{RESET}")
-            return stored_count
-            
-        except sqlite3.Error as e:
-            print(f"{RED}[DB Manager] Error adding referenced works to with_metadata: {e}{RESET}")
-            return 0
-
-    def add_citing_works_to_with_metadata(
-        self,
-        source_work_id: int,
-        citing_works: list,
-        expand_related: bool = False,
-        max_related_per_source: int = 40,
-    ) -> int:
-        """Add citing works as separate entries in the with_metadata table."""
-        if not citing_works:
-            return 0
-            
-        cursor = self.conn.cursor()
-        stored_count = 0
-        edge_count = 0
-        source_openalex_id, source_doi, source_run_id = self._fetch_with_metadata_identifiers(source_work_id)
-        source_node_id = self._make_node_id(source_openalex_id, source_doi, "with_metadata", source_work_id)
-        
-        try:
-            for citing_work in citing_works:
-                if not isinstance(citing_work, dict):
-                    continue
-                    
-                # Extract relevant fields from the citing work
-                title = citing_work.get('title')
-                if not title:
-                    continue
-                    
-                authors_json = json.dumps(citing_work.get('authors', [])) if citing_work.get('authors') else None
-                year = citing_work.get('year')
-                doi = citing_work.get('doi')
-                openalex_id = citing_work.get('openalex_id')
-                normalized_doi = self._normalize_doi(doi)
-                normalized_openalex_id = self._normalize_openalex_id(openalex_id)
-                normalized_title = self._normalize_text(title)
-                normalized_authors = self._normalize_text(str(citing_work.get('authors', [])))
-                
-                # Create a mock OpenAlex JSON entry for the citing work
-                openalex_json = {
-                    'id': openalex_id,
-                    'title': title,
-                    'display_name': title,
-                    'authorships': [{'author': {'display_name': author}} for author in citing_work.get('authors', [])],
-                    'publication_year': year,
-                    'doi': doi,
-                    'type': citing_work.get('type')
-                }
-                
-                # Insert into with_metadata table with relationship info
-                cursor.execute("""
-                    INSERT OR IGNORE INTO with_metadata 
-                    (source_pdf, title, authors, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, 
-                     abstract, crossref_json, openalex_json, source_work_id, relationship_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (None, title, authors_json, year, doi, normalized_doi, normalized_openalex_id, 
-                      normalized_title, normalized_authors, None, None, json.dumps(openalex_json), 
-                      source_work_id, 'cited_by'))
-                
-                target_row_id = None
-                if cursor.rowcount > 0:
-                    stored_count += 1
-                    target_row_id = cursor.lastrowid
-                else:
-                    if normalized_openalex_id:
-                        cursor.execute("SELECT id FROM with_metadata WHERE openalex_id = ? LIMIT 1", (normalized_openalex_id,))
-                        row = cursor.fetchone()
-                        if row:
-                            target_row_id = row[0]
-                    elif normalized_doi:
-                        cursor.execute("SELECT id FROM with_metadata WHERE normalized_doi = ? LIMIT 1", (normalized_doi,))
-                        row = cursor.fetchone()
-                        if row:
-                            target_row_id = row[0]
-
-                target_node_id = self._make_node_id(normalized_openalex_id, doi, "with_metadata", target_row_id)
-                if self._insert_citation_edge(
-                    source_node_id,
-                    target_node_id,
-                    "cited_by",
-                    source_table="with_metadata",
-                    target_table="with_metadata",
-                    source_row_id=source_work_id,
-                    target_row_id=target_row_id,
-                    run_id=source_run_id,
-                ):
-                    edge_count += 1
-
-                if (
-                    expand_related
-                    and target_row_id
-                    and citing_work.get("citing_works_expanded")
-                ):
-                    child_source_node_id = self._make_node_id(
-                        normalized_openalex_id,
-                        doi,
-                        "with_metadata",
-                        target_row_id,
-                    )
-                    for child in citing_work.get("citing_works_expanded", [])[:max_related_per_source]:
-                        child_row_id, child_openalex_id, child_doi = _insert_related_work(
-                            child,
-                            target_row_id,
-                            "cited_by",
-                        )
-                        child_node_id = self._make_node_id(
-                            child_openalex_id,
-                            child_doi,
-                            "with_metadata",
-                            child_row_id,
-                        )
-                        if self._insert_citation_edge(
-                            child_source_node_id,
-                            child_node_id,
-                            "cited_by",
-                            source_table="with_metadata",
-                            target_table="with_metadata",
-                            source_row_id=target_row_id,
-                            target_row_id=child_row_id,
-                            run_id=source_run_id,
-                        ):
-                            edge_count += 1
-            
-            print(f"{GREEN}[DB Manager] Added {stored_count} citing works and {edge_count} edges for work ID {source_work_id}{RESET}")
-            return stored_count
-            
-        except sqlite3.Error as e:
-            print(f"{RED}[DB Manager] Error adding citing works to with_metadata: {e}{RESET}")
-            return 0
-
-    def backfill_citation_edges(
-        self,
-        *,
-        source_table: str = "with_metadata",
-        limit: int | None = None,
-        dry_run: bool = False,
-    ) -> dict:
-        """Populate citation_edges from existing relationship rows."""
-        if source_table != "with_metadata":
-            raise ValueError("Only with_metadata backfill is supported currently.")
-
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT id, openalex_id, doi, run_id FROM with_metadata")
-        row_map = {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
-
-        cursor.execute(
-            "SELECT id, source_work_id, relationship_type, openalex_id, doi, run_id "
-            "FROM with_metadata WHERE source_work_id IS NOT NULL"
-        )
-        rows = cursor.fetchall()
-        if limit is not None:
-            rows = rows[:limit]
-
-        inserted = 0
-        skipped = 0
-        for row_id, source_work_id, relationship_type, openalex_id, doi, run_id in rows:
-            source_info = row_map.get(source_work_id)
-            if not source_info:
-                skipped += 1
-                continue
-            source_openalex, source_doi, source_run_id = source_info
-            source_node_id = self._make_node_id(source_openalex, source_doi, "with_metadata", source_work_id)
-            target_node_id = self._make_node_id(openalex_id, doi, "with_metadata", row_id)
-            rel = relationship_type or "references"
-            if dry_run:
-                if source_node_id and target_node_id and source_node_id != target_node_id:
-                    inserted += 1
-                else:
-                    skipped += 1
-                continue
-
-            if self._insert_citation_edge(
-                source_node_id,
-                target_node_id,
-                rel,
-                source_table="with_metadata",
-                target_table="with_metadata",
-                source_row_id=source_work_id,
-                target_row_id=row_id,
-                run_id=source_run_id or run_id,
-            ):
-                inserted += 1
-            else:
-                skipped += 1
-
-        if not dry_run:
-            self.conn.commit()
-
-        return {
-            "rows_seen": len(rows),
-            "edges_inserted": inserted,
-            "edges_skipped": skipped,
-        }
 
 if __name__ == '__main__':
     # Example usage: Initialize and create DB if run directly

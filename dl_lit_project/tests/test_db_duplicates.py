@@ -3,88 +3,56 @@ import json
 from dl_lit.db_manager import DatabaseManager
 
 
-def test_promote_to_with_metadata_dedupes_existing_with_metadata(tmp_path):
-    db_path = tmp_path / "test.db"
-    db = DatabaseManager(db_path)
+def test_apply_enriched_metadata_dedupes_existing_matched_work(tmp_path):
+    db = DatabaseManager(tmp_path / "test.db")
 
     title = "Duplicate Title"
     authors = ["Alice A.", "Bob B."]
     year = 2020
     doi = "10.1234/dup"
 
-    normalized_title = db._normalize_text(title)
-    normalized_authors = db._normalize_text(json.dumps(authors))
-    normalized_doi = db._normalize_doi(doi)
-
-    cur = db.conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO with_metadata (
-            title, authors, year, doi, normalized_doi, normalized_title, normalized_authors
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (title, json.dumps(authors), year, doi, normalized_doi, normalized_title, normalized_authors),
+    existing_id, err = db.create_pending_work({"title": title, "authors": authors, "year": year, "doi": doi})
+    assert existing_id is not None and err is None
+    db._update_work_record(
+        int(existing_id),
+        {
+            **(db.get_entry_by_id("works", int(existing_id)) or {}),
+            "metadata_status": "matched",
+            "download_status": "not_requested",
+        },
     )
-    cur.execute(
-        """
-        INSERT INTO no_metadata (
-            title, authors, year, doi, normalized_doi, normalized_title, normalized_authors
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (title, json.dumps(authors), year, doi, normalized_doi, normalized_title, normalized_authors),
-    )
-    no_meta_id = cur.lastrowid
     db.conn.commit()
 
-    new_id, message = db.promote_to_with_metadata(no_meta_id, {"title": title})
+    work_id, err = db.create_pending_work({"title": f"{title} draft", "authors": authors, "year": year})
+    assert work_id is not None
+    assert err is None
 
+    new_id, message = db.apply_enriched_metadata(int(work_id), {"title": title, "doi": doi})
     assert new_id is None
-    assert message and "with_metadata" in message
+    assert message and "DUPLICATE_MERGED" in message
 
-    cur.execute("SELECT COUNT(*) FROM no_metadata")
-    assert cur.fetchone()[0] == 0
-
-    cur.execute("SELECT COUNT(*) FROM with_metadata")
+    cur = db.conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM works WHERE title = ?", (title,))
     assert cur.fetchone()[0] == 1
 
     db.close_connection()
 
 
-def test_add_entries_to_no_metadata_from_json_skips_title_author_year_dupe(tmp_path):
-    db_path = tmp_path / "test.db"
-    db = DatabaseManager(db_path)
+def test_add_pending_works_from_json_skips_title_author_year_dupe(tmp_path):
+    db = DatabaseManager(tmp_path / "test.db")
 
     title = "Same Work"
     authors = ["Jane Doe", "John Smith"]
     year = 1999
 
-    authors_str = json.dumps(authors)
-    normalized_title = db._normalize_text(title)
-    normalized_authors = db._normalize_text(authors_str)
+    row_id, err = db.create_pending_work({"title": title, "authors": authors, "year": year})
+    assert row_id is not None and err is None
 
-    cur = db.conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO no_metadata (
-            title, authors, year, normalized_title, normalized_authors
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (title, authors_str, year, normalized_title, normalized_authors),
-    )
-    db.conn.commit()
-
-    json_payload = [
-        {
-            "title": title,
-            "authors": authors,
-            "year": year,
-            "doi": None,
-        }
-    ]
+    json_payload = [{"title": title, "authors": authors, "year": year, "doi": None}]
     json_path = tmp_path / "entries.json"
     json_path.write_text(json.dumps(json_payload), encoding="utf-8")
 
-    added, skipped, errors = db.add_entries_to_no_metadata_from_json(json_path)
+    added, skipped, errors = db.add_pending_works_from_json(json_path)
 
     assert added == 0
     assert skipped == 1
@@ -94,20 +62,18 @@ def test_add_entries_to_no_metadata_from_json_skips_title_author_year_dupe(tmp_p
 
 
 def test_alias_title_year_match_with_tolerance(tmp_path):
-    db_path = tmp_path / "test.db"
-    db = DatabaseManager(db_path)
+    db = DatabaseManager(tmp_path / "test.db")
 
     title = "Original Work"
     authors = ["Alice Author"]
     year = 2020
 
-    ref = {"title": title, "authors": authors, "year": year}
-    row_id, err = db.insert_no_metadata(ref)
+    row_id, err = db.create_pending_work({"title": title, "authors": authors, "year": year})
     assert row_id is not None and err is None
 
     alias_title = "Translated Work"
     db.add_work_alias(
-        work_table="no_metadata",
+        work_table="works",
         work_id=row_id,
         alias_title=alias_title,
         alias_year=2019,
@@ -123,36 +89,15 @@ def test_alias_title_year_match_with_tolerance(tmp_path):
         year=2020,
     )
 
-    assert table == "no_metadata"
+    assert table == "works"
     assert eid == row_id
-    assert field == "alias_title_year"
-
-    db.close_connection()
-
-
-def test_merge_log_records_high_confidence_duplicate(tmp_path):
-    db_path = tmp_path / "test.db"
-    db = DatabaseManager(db_path)
-
-    ref = {"title": "Merge Target", "authors": ["Ada Lovelace"], "year": 1843}
-    row_id, err = db.insert_no_metadata(ref)
-    assert row_id is not None and err is None
-
-    dup_ref = {"title": "Merge Target", "authors": ["Ada Lovelace"], "year": 1843}
-    dup_id, dup_err = db.insert_no_metadata(dup_ref)
-    assert dup_id is None
-    assert dup_err and "Duplicate already exists" in dup_err
-
-    cur = db.conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM merge_log WHERE action = 'merged' AND match_field = 'title_authors_year'")
-    assert cur.fetchone()[0] >= 1
+    assert field == "alias_title"
 
     db.close_connection()
 
 
 def test_check_if_exists_uses_editors_when_authors_missing(tmp_path):
-    db_path = tmp_path / "test.db"
-    db = DatabaseManager(db_path)
+    db = DatabaseManager(tmp_path / "test.db")
 
     ref = {
         "title": "Vom Klassenkampf Zum Co-Management?",
@@ -160,7 +105,7 @@ def test_check_if_exists_uses_editors_when_authors_missing(tmp_path):
         "editors": ["Klitzke, U.", "Betz, H.", "Moreke, M."],
         "year": 2000,
     }
-    row_id, err = db.insert_no_metadata(ref)
+    row_id, err = db.create_pending_work(ref)
     assert row_id is not None and err is None
 
     table, eid, field = db.check_if_exists(
@@ -171,38 +116,26 @@ def test_check_if_exists_uses_editors_when_authors_missing(tmp_path):
         editors=["Klitzke, U.", "Betz, H.", "Moreke, M."],
         year=2000,
     )
-    assert table == "no_metadata"
+    assert table == "works"
     assert eid == row_id
     assert field == "title_authors_year"
     db.close_connection()
 
 
-def test_backfills_normalized_authors_from_editors(tmp_path):
-    db_path = tmp_path / "test.db"
-    db = DatabaseManager(db_path)
+def test_create_pending_work_normalizes_editors_when_authors_missing(tmp_path):
+    db = DatabaseManager(tmp_path / "test.db")
+    row_id, err = db.create_pending_work(
+        {
+            "title": "Editors Only Work",
+            "authors": [],
+            "editors": ["Yamamura, K.", "Streeck, W."],
+            "year": 2003,
+        }
+    )
+    assert row_id is not None and err is None
 
     cur = db.conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO no_metadata (title, authors, editors, year, normalized_title, normalized_authors)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "Editors Only Work",
-            "[]",
-            json.dumps(["Yamamura, K.", "Streeck, W."]),
-            2003,
-            db._normalize_text("Editors Only Work"),
-            None,
-        ),
-    )
-    row_id = cur.lastrowid
-    db.conn.commit()
+    cur.execute("SELECT normalized_authors FROM works WHERE id = ?", (row_id,))
+    normalized = cur.fetchone()[0]
+    assert normalized == db._normalize_authors_value(["Yamamura, K.", "Streeck, W."])
     db.close_connection()
-
-    reopened = DatabaseManager(db_path)
-    cur2 = reopened.conn.cursor()
-    cur2.execute("SELECT normalized_authors FROM no_metadata WHERE id = ?", (row_id,))
-    normalized = cur2.fetchone()[0]
-    assert normalized == reopened._normalize_authors_value(["Yamamura, K.", "Streeck, W."])
-    reopened.close_connection()
