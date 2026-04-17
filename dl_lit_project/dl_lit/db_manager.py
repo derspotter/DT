@@ -433,11 +433,16 @@ class DatabaseManager:
                 status TEXT DEFAULT 'pending', -- 'pending', 'running', 'completed', 'failed'
                 parameters_json TEXT, -- any parameters needed for the job
                 result_json TEXT, -- output results or error messages
+                worker_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP,
                 finished_at TIMESTAMP
             )
         """)
+        cursor.execute("PRAGMA table_info(pipeline_jobs)")
+        pipeline_columns = {row[1] for row in cursor.fetchall()}
+        if "worker_id" not in pipeline_columns:
+            cursor.execute("ALTER TABLE pipeline_jobs ADD COLUMN worker_id TEXT")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS citation_edges (

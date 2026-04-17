@@ -4,7 +4,7 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     load_dotenv = None
 
 

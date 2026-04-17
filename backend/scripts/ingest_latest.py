@@ -113,20 +113,6 @@ def is_row_downloaded(cur, row, has_downloaded_references, has_work_aliases):
         if cur.fetchone():
             return True
 
-    if normalized_title and year_str and not normalized_authors:
-        cur.execute(
-            """
-            SELECT 1
-            FROM downloaded_references
-            WHERE normalized_title = ?
-              AND CAST(year AS TEXT) = ?
-            LIMIT 1
-            """,
-            (normalized_title, year_str),
-        )
-        if cur.fetchone():
-            return True
-
     # Alias fallback: catches translated/alternate titles linked to downloaded rows.
     if has_work_aliases and normalized_title:
         if year_str:

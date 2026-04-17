@@ -2,10 +2,11 @@ import request from 'supertest'
 import { createApp } from '../src/app.js'
 
 describe('POST /api/keyword-search', () => {
-  const app = createApp({ broadcast: () => {} })
+  let app
 
   beforeAll(() => {
     process.env.RAG_FEEDER_STUB = '1'
+    app = createApp({ broadcast: () => {} })
   })
 
   afterAll(() => {

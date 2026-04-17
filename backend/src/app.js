@@ -6,7 +6,6 @@ import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import crypto from 'crypto';
 import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
@@ -85,9 +84,6 @@ const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
-const JWT_SECRET = process.env.RAG_FEEDER_JWT_SECRET || crypto.randomUUID();
-const ADMIN_USERNAME = process.env.RAG_ADMIN_USER || 'admin';
-const ADMIN_PASSWORD = process.env.RAG_ADMIN_PASSWORD || 'admin';
 const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
@@ -102,6 +98,35 @@ const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const DOWNLOAD_WORKER_ONCE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'download_worker_once.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
+
+function isStubMode() {
+  return process.env.RAG_FEEDER_STUB === '1';
+}
+
+function resolveAuthConfig() {
+  if (isStubMode()) {
+    return {
+      jwtSecret: 'stub-jwt-secret',
+      adminUsername: 'stub-admin',
+      adminPassword: 'stub-password',
+    };
+  }
+
+  const jwtSecret = String(process.env.RAG_FEEDER_JWT_SECRET || '').trim();
+  const adminUsername = String(process.env.RAG_ADMIN_USER || '').trim();
+  const adminPassword = String(process.env.RAG_ADMIN_PASSWORD || '');
+  const missing = [];
+
+  if (!jwtSecret) missing.push('RAG_FEEDER_JWT_SECRET');
+  if (!adminUsername) missing.push('RAG_ADMIN_USER');
+  if (!adminPassword) missing.push('RAG_ADMIN_PASSWORD');
+
+  if (missing.length) {
+    throw new Error(`[auth] Missing required environment variables: ${missing.join(', ')}`);
+  }
+
+  return { jwtSecret, adminUsername, adminPassword };
+}
 
 const STUB_RESULTS = {
   keywordResults: [
@@ -228,23 +253,38 @@ function ensureAuthSchema(db) {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, ingest_source)
     );
+    CREATE TABLE IF NOT EXISTS pipeline_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      corpus_id INTEGER,
+      job_type TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      parameters_json TEXT,
+      result_json TEXT,
+      worker_id TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      started_at TIMESTAMP,
+      finished_at TIMESTAMP
+    );
   `);
   if (tableExists(db, 'ingest_entries')) {
     ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
   }
+  if (tableExists(db, 'pipeline_jobs')) {
+    ensureColumn(db, 'pipeline_jobs', 'worker_id', 'TEXT');
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_items_lookup ON corpus_items(corpus_id, table_name, row_id);`);
 }
 
-function bootstrapDefaultCorpus(db) {
-  const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(ADMIN_USERNAME);
+function bootstrapDefaultCorpus(db, authConfig) {
+  const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(authConfig.adminUsername);
   let adminId = admin?.id;
   if (!adminId) {
-    const hash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+    const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
     const result = db
       .prepare('INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)')
-      .run(ADMIN_USERNAME, hash);
+      .run(authConfig.adminUsername, hash);
     if (result.changes === 0) {
-      adminId = db.prepare('SELECT id FROM users WHERE username = ?').get(ADMIN_USERNAME)?.id;
+      adminId = db.prepare('SELECT id FROM users WHERE username = ?').get(authConfig.adminUsername)?.id;
     } else {
       adminId = result.lastInsertRowid;
     }
@@ -331,9 +371,9 @@ function getUserById(db, userId) {
     .get(userId);
 }
 
-function requireAuth(db) {
+function requireAuth(db, jwtSecret) {
   return (req, res, next) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
+    if (isStubMode()) {
       req.user = { id: 0, username: 'stub', last_corpus_id: null };
       req.corpusId = null;
       return next();
@@ -344,7 +384,7 @@ function requireAuth(db) {
       return res.status(401).json({ error: 'Missing Authorization header' });
     }
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
+      const payload = jwt.verify(token, jwtSecret);
       const user = getUserById(db, payload.sub);
       if (!user) {
         return res.status(401).json({ error: 'Unknown user' });
@@ -867,6 +907,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
   const pipelineWorkers = new Map(); // corpusId -> state
+  const authConfig = resolveAuthConfig();
 
   // Ensure temporary and output directories exist
   fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
@@ -887,15 +928,12 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // timeout option already helps; pragma is best-effort
   }
   ensureAuthSchema(authDb);
-  const defaultCorpusId = bootstrapDefaultCorpus(authDb);
+  const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
-  if (!process.env.RAG_FEEDER_JWT_SECRET) {
-    console.warn('[auth] RAG_FEEDER_JWT_SECRET not set; tokens will reset on restart.');
-  }
-  const requireAuthMiddleware = requireAuth(authDb);
+  const requireAuthMiddleware = requireAuth(authDb, authConfig.jwtSecret);
   const hasWorkerAccess = (req) => {
-    if (process.env.RAG_FEEDER_STUB === '1') return true;
+    if (isStubMode()) return true;
     const role = getCorpusRoleForUser(authDb, req.user?.id, req.corpusId);
     return role === 'owner' || role === 'editor';
   };
@@ -959,9 +997,12 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const corpusTag = corpusId || 'none';
     
     try {
-      authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      ).run(corpusId, 'download', JSON.stringify({ batchSize }));
+      enqueuePipelineJob({
+        corpusId,
+        jobType: 'download',
+        parameters: { batchSize },
+        dedupeStatuses: ['pending', 'running'],
+      });
     } catch (error) {
       state.lastError = error?.message || String(error);
       console.error(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
@@ -1042,50 +1083,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return { pending, running };
   }
 
-  function cancelAllDownloadJobs({ includeRunning = true, reason = 'stopped_by_user' } = {}) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    const resultPayload = JSON.stringify({
-      cancelled: true,
-      reason: String(reason || 'stopped_by_user'),
-      at: new Date().toISOString(),
-    });
-    let pending = 0;
-    let running = 0;
-    try {
-      pending = Number(
-        authDb
-          .prepare(
-            `UPDATE pipeline_jobs
-             SET status = 'cancelled',
-                 finished_at = CURRENT_TIMESTAMP,
-                 result_json = COALESCE(result_json, ?)
-             WHERE job_type = 'download'
-               AND status = 'pending'`
-          )
-          .run(resultPayload).changes || 0
-      );
-      if (includeRunning) {
-        running = Number(
-          authDb
-            .prepare(
-              `UPDATE pipeline_jobs
-               SET status = 'cancelled',
-                   finished_at = CURRENT_TIMESTAMP,
-                   result_json = COALESCE(result_json, ?)
-               WHERE job_type = 'download'
-                 AND status = 'running'`
-            )
-            .run(resultPayload).changes || 0
-        );
-      }
-    } catch (error) {
-      console.warn(`[download-worker] Failed to cancel all download jobs: ${error?.message || error}`);
-    }
-    return { pending, running };
-  }
-
   function countDownloadPipelineJobs(corpusId) {
     if (!tableExists(authDb, 'pipeline_jobs')) {
       return { pending: 0, running: 0 };
@@ -1117,6 +1114,51 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       return { pending: 0, running: 0 };
     }
+  }
+
+  function findExistingPipelineJob(jobType, corpusId, statuses = ['pending', 'running']) {
+    if (!statuses.length) return null;
+    const placeholders = statuses.map(() => '?').join(', ');
+    return authDb
+      .prepare(
+        `SELECT id, status
+         FROM pipeline_jobs
+         WHERE job_type = ?
+           AND corpus_id IS ?
+           AND status IN (${placeholders})
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1`
+      )
+      .get(jobType, corpusId ?? null, ...statuses);
+  }
+
+  function enqueuePipelineJob({ corpusId = null, jobType, parameters = {}, dedupeStatuses = [] }) {
+    if (!tableExists(authDb, 'pipeline_jobs')) {
+      throw new Error('pipeline_jobs table is not available');
+    }
+    const tx = authDb.transaction(() => {
+      const existing = dedupeStatuses.length
+        ? findExistingPipelineJob(jobType, corpusId, dedupeStatuses)
+        : null;
+      if (existing) {
+        return {
+          inserted: false,
+          jobId: Number(existing.id),
+          status: existing.status,
+        };
+      }
+
+      const result = authDb
+        .prepare("INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)")
+        .run(corpusId ?? null, jobType, JSON.stringify(parameters ?? {}));
+      return {
+        inserted: true,
+        jobId: Number(result.lastInsertRowid),
+        status: 'pending',
+      };
+    });
+
+    return tx();
   }
 
   function countQueuedDownloads(corpusId) {
@@ -1220,9 +1262,12 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     state.lastError = null;
     
     try {
-      authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      ).run(corpusId, 'pipeline_tick', JSON.stringify({ config: state.config }));
+      enqueuePipelineJob({
+        corpusId,
+        jobType: 'pipeline_tick',
+        parameters: { config: state.config },
+        dedupeStatuses: ['pending', 'running'],
+      });
     } catch (error) {
       state.lastError = error?.message || String(error);
       console.error(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
@@ -1272,98 +1317,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return state;
   }
 
-  function pauseAllPipelineWorkers({ force = false } = {}) {
-    const result = {
-      requestedForce: Boolean(force),
-      stopped: 0,
-      inFlight: 0,
-      wasRunning: 0,
-      states: {},
-    };
-    for (const [key, state] of pipelineWorkers.entries()) {
-      const hadInFlight = Boolean(state.inFlight);
-      const hadRunning = Boolean(state.running);
-      state.running = false;
-      if (state.intervalId) {
-        clearInterval(state.intervalId);
-        state.intervalId = null;
-      }
-      if (force && Array.isArray(state.children)) {
-        state.children.forEach((child) => {
-          try {
-            child.kill('SIGTERM');
-          } catch (error) {
-            // ignore
-          }
-        });
-      }
-      if (force) {
-        state.inFlight = false;
-        state.children = [];
-      }
-      const keyLabel = key === 0 ? 'none' : String(key);
-      result.states[keyLabel] = {
-        running: state.running,
-        inFlight: state.inFlight,
-      };
-      if (hadRunning) {
-        result.wasRunning += 1;
-      }
-      if (hadInFlight) {
-        result.inFlight += 1;
-      }
-      if (hadRunning || hadInFlight) {
-        result.stopped += 1;
-      }
-    }
-    return result;
-  }
-
-  function stopAllDownloadWorkers({ force = false } = {}) {
-    const result = {
-      requestedForce: Boolean(force),
-      stopped: 0,
-      inFlight: 0,
-      wasRunning: 0,
-      states: {},
-    };
-    for (const [key, state] of downloadWorkers.entries()) {
-      const hadInFlight = Boolean(state.inFlight);
-      const hadRunning = Boolean(state.running);
-      state.running = false;
-      if (state.intervalId) {
-        clearInterval(state.intervalId);
-        state.intervalId = null;
-      }
-      if (force && state.child) {
-        try {
-          state.child.kill('SIGTERM');
-        } catch (error) {
-          // ignore
-        }
-      }
-      if (force) {
-        state.inFlight = false;
-        state.child = null;
-      }
-      const keyLabel = key === 0 ? 'none' : String(key);
-      result.states[keyLabel] = {
-        running: state.running,
-        inFlight: state.inFlight,
-      };
-      if (hadRunning) {
-        result.wasRunning += 1;
-      }
-      if (hadInFlight) {
-        result.inFlight += 1;
-      }
-      if (hadRunning || hadInFlight) {
-        result.stopped += 1;
-      }
-    }
-    return result;
-  }
-
   // Middleware
   // Configure CORS to allow requests specifically from the frontend origin
   const allowedOrigins = (process.env.RAG_FEEDER_FRONTEND_ORIGIN || 'http://localhost:5175,http://localhost:3000')
@@ -1403,13 +1356,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       lastCorpusId = corpus?.corpus_id || defaultCorpusId;
       authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
     }
-    const token = jwt.sign({ sub: user.id, username: user.username }, JWT_SECRET, {
+    const token = jwt.sign({ sub: user.id, username: user.username }, authConfig.jwtSecret, {
       expiresIn: '7d',
     });
     return res.json({ token, user: { id: user.id, username: user.username, last_corpus_id: lastCorpusId } });
   });
 
   app.post('/api/auth/register', (req, res) => {
+    if (!isStubMode()) {
+      return res.status(404).json({ error: 'Not found' });
+    }
     const { username, password } = req.body || {};
     if (!username || !password) {
       return res.status(400).json({ error: 'Missing username or password' });
@@ -2196,20 +2152,28 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         shouldFetchReferences: expansion.includeDownstream
       };
 
-      const insertJobStmt = authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      );
       const insertProcessMarkedJobs = authDb.transaction(() => {
-        const enrichResult = insertJobStmt.run(req.corpusId, 'enrich', JSON.stringify(jobParams));
+        const enrichResult = enqueuePipelineJob({
+          corpusId: req.corpusId,
+          jobType: 'enrich',
+          parameters: jobParams,
+        });
         let downloadJobId = null;
+        let downloadInserted = false;
         if (enqueueDownload) {
-          const dlParams = { batchSize: downloadBatchSize };
-          const dlResult = insertJobStmt.run(req.corpusId, 'download', JSON.stringify(dlParams));
-          downloadJobId = dlResult.lastInsertRowid;
+          const dlResult = enqueuePipelineJob({
+            corpusId: req.corpusId,
+            jobType: 'download',
+            parameters: { batchSize: downloadBatchSize },
+            dedupeStatuses: ['pending', 'running'],
+          });
+          downloadJobId = dlResult.jobId;
+          downloadInserted = dlResult.inserted;
         }
         return {
-          enrichJobId: enrichResult.lastInsertRowid,
+          enrichJobId: enrichResult.jobId,
           downloadJobId,
+          downloadInserted,
         };
       });
       const queued = insertProcessMarkedJobs();
@@ -2220,7 +2184,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         enrich_job_id: queued.enrichJobId,
         download_job_id: queued.downloadJobId,
         message: enqueueDownload
-          ? 'Enrichment and download jobs queued successfully.'
+          ? (queued.downloadInserted
+            ? 'Enrichment and download jobs queued successfully.'
+            : 'Enrichment job queued; download queue already has pending or running work for this corpus.')
           : 'Enrichment job queued successfully.'
       });
     } catch (error) {
@@ -2374,25 +2340,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.json({ running: false });
   });
 
-  app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {
-    if (!hasWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Insufficient corpus role to manage workers' });
-    }
-
-    const pipeline = pauseAllPipelineWorkers({ force: true });
-    const downloads = stopAllDownloadWorkers({ force: true });
-    const cancelledJobs = cancelAllDownloadJobs({
-      includeRunning: true,
-      reason: 'pipeline_pause_all',
-    });
-    return res.json({
-      pipeline,
-      downloads,
-      cancelled_jobs: cancelledJobs,
-      force: true,
-    });
-  });
-
   app.get('/api/downloads/worker/status', requireAuthMiddleware, (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } });
@@ -2459,15 +2406,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     try {
       let queuedJobs = 0;
       if (jobsToQueue > 0) {
-        const insert = authDb.prepare(
-          "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-        );
         const enqueueMany = authDb.transaction(() => {
           for (let index = 0; index < jobsToQueue; index += 1) {
             const remaining = Math.max(1, queueDepth - index * perJobMax);
             const batchSize = Math.max(1, Math.min(perJobMax, remaining));
-            insert.run(req.corpusId, 'download', JSON.stringify({ batchSize }));
-            queuedJobs += 1;
+            const queued = enqueuePipelineJob({
+              corpusId: req.corpusId,
+              jobType: 'download',
+              parameters: { batchSize },
+            });
+            if (queued.inserted) {
+              queuedJobs += 1;
+            }
           }
         });
         enqueueMany();
@@ -2525,16 +2475,21 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const batchSize = resolveAutoDownloadBatchSize(req.corpusId);
     
     try {
-      const result = authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      ).run(req.corpusId, 'download', JSON.stringify({ batchSize }));
+      const result = enqueuePipelineJob({
+        corpusId: req.corpusId,
+        jobType: 'download',
+        parameters: { batchSize },
+        dedupeStatuses: ['pending', 'running'],
+      });
 
       return res.json({ 
         success: true, 
-        job_id: result.lastInsertRowid,
+        job_id: result.jobId,
         batch_size: batchSize,
         mode: 'auto',
-        message: 'Download job queued successfully (auto throughput mode).'
+        message: result.inserted
+          ? 'Download job queued successfully (auto throughput mode).'
+          : 'Download queue already has pending or running work for this corpus.'
       });
     } catch (error) {
       console.error('[/api/downloads/worker/run-once] Error:', error);

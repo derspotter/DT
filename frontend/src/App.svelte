@@ -27,7 +27,6 @@
     fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
-    pauseAllPipelineWorkers,
     fetchGraph,
     downloadCorpusExport,
   } from './lib/api'
@@ -1363,7 +1362,7 @@
         processMarkedLimit = Math.max(10, payload.marked + payload.staged)
         await processMarkedBatch({ withDownload })
         
-        // Also ensure the global pipeline worker is running so downloads actually happen
+        // Also ensure the corpus pipeline worker is running so downloads actually happen
         if (withDownload && !pipelineWorker.running) {
           enqueueStatus += ' Starting background downloader...'
           await handleStartPipelineWorker()
@@ -1814,7 +1813,7 @@
   }
 
   async function loadPipelineWorkerStatus({ quiet = false } = {}) {
-    if (!quiet) pipelineWorkerStatus = 'Loading global pipeline status...'
+    if (!quiet) pipelineWorkerStatus = 'Loading pipeline status...'
     try {
       const payload = await fetchPipelineWorkerStatus()
       pipelineWorker = payload || pipelineWorker
@@ -1825,14 +1824,14 @@
         setAuthToken('')
         return
       }
-      if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load global pipeline status.'
+      if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load pipeline status.'
     }
   }
 
   async function handleStartPipelineWorker() {
     if (pipelineWorkerBusy) return
     pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Starting global pipeline...'
+    pipelineWorkerStatus = 'Starting pipeline...'
     try {
       await startPipelineWorker({
         intervalSeconds: Number(pipelineWorker?.config?.intervalSeconds) || 15,
@@ -1848,14 +1847,14 @@
         loadDownloads(),
         loadDownloadWorkerStatus(),
       ])
-      pipelineWorkerStatus = 'Global pipeline running.'
+      pipelineWorkerStatus = 'Pipeline running.'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
         return
       }
-      pipelineWorkerStatus = error?.message || 'Failed to start global pipeline.'
+      pipelineWorkerStatus = error?.message || 'Failed to start pipeline.'
     } finally {
       pipelineWorkerBusy = false
     }
@@ -1864,38 +1863,18 @@
   async function handlePausePipelineWorker() {
     if (pipelineWorkerBusy) return
     pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Pausing global pipeline...'
+    pipelineWorkerStatus = 'Pausing pipeline...'
     try {
       await pausePipelineWorker({ force: false })
       await loadPipelineWorkerStatus()
-      pipelineWorkerStatus = 'Global pipeline paused.'
+      pipelineWorkerStatus = 'Pipeline paused.'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
         return
       }
-      pipelineWorkerStatus = error?.message || 'Failed to pause global pipeline.'
-    } finally {
-      pipelineWorkerBusy = false
-    }
-  }
-
-  async function handlePauseAllPipelineWorkers() {
-    if (pipelineWorkerBusy) return
-    pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Pausing all pipeline workers...'
-    try {
-      await pauseAllPipelineWorkers({ force: true })
-      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads()])
-      pipelineWorkerStatus = 'Global pause complete.'
-    } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
-      pipelineWorkerStatus = error?.message || 'Failed to pause all workers.'
+      pipelineWorkerStatus = error?.message || 'Failed to pause pipeline.'
     } finally {
       pipelineWorkerBusy = false
     }
@@ -3014,13 +2993,11 @@
           {pipelineMetadataCount}
           {pipelineDownloadedCount}
           {pipelineWorker}
-          {downloadWorker}
           {pipelineWorkerBusy}
           {pipelineWorkerStatus}
           {sampleActivity}
           {handleStartPipelineWorker}
           {handlePausePipelineWorker}
-          {handlePauseAllPipelineWorkers}
         />
       {/if}
 
@@ -3649,7 +3626,7 @@
               <span class="muted">{downloadWorkerStatus}</span>
               <span class="muted small">Throughput is auto-managed by the backend for maximum speed.</span>
               {#if pipelineWorker.running}
-                <span class="muted small">Download-only worker is disabled while global pipeline is running.</span>
+                <span class="muted small">Download-only worker is disabled while the corpus pipeline is running.</span>
               {/if}
               {#if downloadWorker.last_error}
                 <span class="error">{downloadWorker.last_error}</span>

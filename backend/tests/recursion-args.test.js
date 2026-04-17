@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import Database from 'better-sqlite3'
 import request from 'supertest'
 
 const readArgFile = (filePath) => {
@@ -14,6 +15,7 @@ describe('recursion arg propagation', () => {
   let authToken = ''
   let argFile = ''
   let originalPython
+  let originalDbPath
   let tempDir = ''
 
   const createFakePython = () => {
@@ -34,18 +36,23 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
 
     fs.writeFileSync(argFile, '[]', 'utf8')
     originalPython = process.env.RAG_FEEDER_PYTHON
+    originalDbPath = process.env.RAG_FEEDER_DB_PATH
     process.env.RAG_FEEDER_PYTHON = fakePython
+    process.env.RAG_FEEDER_DB_PATH = path.join(tempDir, 'recursion.db')
     process.env.ARG_DUMP_FILE = argFile
   }
 
   beforeAll(async () => {
     createFakePython()
+    process.env.RAG_FEEDER_JWT_SECRET = 'recursion-secret'
+    process.env.RAG_ADMIN_USER = 'recursion-admin'
+    process.env.RAG_ADMIN_PASSWORD = 'recursion-password'
     const { createApp } = await import('../src/app.js')
     app = createApp({ broadcast: () => {} })
 
     const login = await request(app).post('/api/auth/login').send({
-      username: 'admin',
-      password: process.env.ADMIN_PASSWORD || 'admin',
+      username: process.env.RAG_ADMIN_USER,
+      password: process.env.RAG_ADMIN_PASSWORD,
     })
     authToken = login.body.token
   })
@@ -56,7 +63,15 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     } else {
       process.env.RAG_FEEDER_PYTHON = originalPython
     }
+    if (originalDbPath === undefined) {
+      delete process.env.RAG_FEEDER_DB_PATH
+    } else {
+      process.env.RAG_FEEDER_DB_PATH = originalDbPath
+    }
     delete process.env.ARG_DUMP_FILE
+    delete process.env.RAG_FEEDER_JWT_SECRET
+    delete process.env.RAG_ADMIN_USER
+    delete process.env.RAG_ADMIN_PASSWORD
     if (tempDir && fs.existsSync(tempDir)) {
       try {
         fs.rmSync(tempDir, { recursive: true, force: true })
@@ -83,6 +98,18 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       fs.writeFileSync(argFile, '[]', 'utf8')
     }
   })
+
+  const readLatestJob = (jobType) => {
+    const db = new Database(process.env.RAG_FEEDER_DB_PATH)
+    try {
+      const row = db
+        .prepare('SELECT parameters_json FROM pipeline_jobs WHERE job_type = ? ORDER BY id DESC LIMIT 1')
+        .get(jobType)
+      return row ? JSON.parse(row.parameters_json || '{}') : null
+    } finally {
+      db.close()
+    }
+  }
 
   test('passes separate downstream/upstream depths for keyword search', async () => {
     const res = await doKeywordSearch({
@@ -125,13 +152,11 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       includeUpstream: true,
     })
     expect(res.status).toBe(200)
-    const args = readArgFile(argFile)
-    expect(args).toContain('--related-depth-downstream')
-    expect(args).toContain('4')
-    expect(args).toContain('--related-depth-upstream')
-    expect(args).toContain('3')
-    expect(args).toContain('--include-upstream')
-    expect(args).not.toContain('--no-fetch-references')
+    const params = readLatestJob('enrich')
+    expect(params?.expansion?.relatedDepthDownstream).toBe(4)
+    expect(params?.expansion?.relatedDepthUpstream).toBe(3)
+    expect(params?.expansion?.includeDownstream).toBe(true)
+    expect(params?.expansion?.includeUpstream).toBe(true)
   })
 
   test('maps upload process args for upstream-only mode', async () => {
@@ -143,11 +168,9 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       relatedDepthUpstream: 2,
     })
     expect(res.status).toBe(200)
-    const args = readArgFile(argFile)
-    expect(args).toContain('--no-include-downstream')
-    expect(args).toContain('--include-upstream')
-    expect(args).toContain('--related-depth-upstream')
-    expect(args).toContain('2')
-    expect(args).toContain('--no-fetch-references')
+    const params = readLatestJob('enrich')
+    expect(params?.expansion?.includeDownstream).toBe(false)
+    expect(params?.expansion?.includeUpstream).toBe(true)
+    expect(params?.expansion?.relatedDepthUpstream).toBe(2)
   })
 })

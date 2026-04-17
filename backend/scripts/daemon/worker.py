@@ -82,73 +82,104 @@ class PipelineDaemon:
         )
         self.running = True
         self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}"
-        self._requeue_running_jobs_on_startup()
+        self.job_timeout_seconds = max(60, int(os.getenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "1800") or "1800"))
+        self._recover_stale_running_jobs()
         log(f"Initialized daemon worker {self.worker_id} at {db_path}")
 
-    def _requeue_running_jobs_on_startup(self):
-        """Requeue previously running jobs after daemon restarts."""
+    def _recover_stale_running_jobs(self):
+        """Requeue stale running jobs that exceeded the runtime lease."""
         cur = self.db.conn.cursor()
         cur.execute(
             """
             UPDATE pipeline_jobs
-            SET status = 'pending', started_at = NULL
-            WHERE status = 'running'
-            """
+               SET status = 'pending',
+                   started_at = NULL,
+                   worker_id = NULL
+             WHERE status = 'running'
+               AND (
+                    started_at IS NULL
+                    OR datetime(started_at) <= datetime('now', ?)
+               )
+            """,
+            (f"-{self.job_timeout_seconds} seconds",),
         )
         requeued = int(cur.rowcount or 0)
         self.db.conn.commit()
         if requeued:
-            log(f"Requeued {requeued} previously running pipeline job(s) on startup.")
+            log(f"Recovered {requeued} stale pipeline job(s) older than {self.job_timeout_seconds}s.")
 
     def fetch_next_job(self):
         """Fetch the next pending job from the queue with interactive-priority ordering."""
         cur = self.db.conn.cursor()
-        cur.execute(
-            """
-            SELECT id, corpus_id, job_type, parameters_json
-            FROM pipeline_jobs
-            WHERE status = 'pending'
-            ORDER BY
-                CASE
-                    WHEN job_type = 'enrich' AND corpus_id IS NOT NULL THEN 0
-                    WHEN job_type = 'enrich' THEN 1
-                    WHEN job_type = 'pipeline_tick' THEN 2
-                    WHEN job_type = 'download' AND corpus_id IS NOT NULL THEN 3
-                    WHEN job_type = 'download' THEN 4
-                    ELSE 5
-                END ASC,
-                CASE
-                    WHEN job_type = 'enrich' THEN created_at
-                    ELSE NULL
-                END DESC,
-                created_at ASC
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-            
-        job_id, corpus_id, job_type, params_json = row
-        
-        cur.execute(
-            "UPDATE pipeline_jobs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = ?", 
-            (job_id,)
-        )
-        self.db.conn.commit()
-        
-        return {
-            "id": job_id,
-            "corpus_id": corpus_id,
-            "job_type": job_type,
-            "params": json.loads(params_json) if params_json else {}
-        }
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                """
+                SELECT id, corpus_id, job_type, parameters_json
+                FROM pipeline_jobs
+                WHERE status = 'pending'
+                ORDER BY
+                    CASE
+                        WHEN job_type = 'enrich' AND corpus_id IS NOT NULL THEN 0
+                        WHEN job_type = 'enrich' THEN 1
+                        WHEN job_type = 'pipeline_tick' THEN 2
+                        WHEN job_type = 'download' AND corpus_id IS NOT NULL THEN 3
+                        WHEN job_type = 'download' THEN 4
+                        ELSE 5
+                    END ASC,
+                    CASE
+                        WHEN job_type = 'enrich' THEN created_at
+                        ELSE NULL
+                    END DESC,
+                    created_at ASC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+            if not row:
+                self.db.conn.commit()
+                return None
+
+            job_id, corpus_id, job_type, params_json = row
+            cur.execute(
+                """
+                UPDATE pipeline_jobs
+                   SET status = 'running',
+                       started_at = CURRENT_TIMESTAMP,
+                       worker_id = ?
+                 WHERE id = ?
+                   AND status = 'pending'
+                """,
+                (self.worker_id, job_id),
+            )
+            if int(cur.rowcount or 0) != 1:
+                self.db.conn.rollback()
+                return None
+
+            self.db.conn.commit()
+            return {
+                "id": job_id,
+                "corpus_id": corpus_id,
+                "job_type": job_type,
+                "params": json.loads(params_json) if params_json else {}
+            }
+        except Exception:
+            self.db.conn.rollback()
+            raise
 
     def mark_job_completed(self, job_id: int, result: dict):
         cur = self.db.conn.cursor()
         cur.execute(
-            "UPDATE pipeline_jobs SET status = 'completed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ? AND status = 'running'",
-            (json.dumps(result), job_id)
+            """
+            UPDATE pipeline_jobs
+               SET status = 'completed',
+                   finished_at = CURRENT_TIMESTAMP,
+                   result_json = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND worker_id = ?
+            """,
+            (json.dumps(result), job_id, self.worker_id)
         )
         self.db.conn.commit()
         return int(cur.rowcount or 0) > 0
@@ -156,8 +187,16 @@ class PipelineDaemon:
     def mark_job_failed(self, job_id: int, error_msg: str):
         cur = self.db.conn.cursor()
         cur.execute(
-            "UPDATE pipeline_jobs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, result_json = ? WHERE id = ? AND status = 'running'",
-            (json.dumps({"error": error_msg}), job_id)
+            """
+            UPDATE pipeline_jobs
+               SET status = 'failed',
+                   finished_at = CURRENT_TIMESTAMP,
+                   result_json = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND worker_id = ?
+            """,
+            (json.dumps({"error": error_msg}), job_id, self.worker_id)
         )
         self.db.conn.commit()
         return int(cur.rowcount or 0) > 0

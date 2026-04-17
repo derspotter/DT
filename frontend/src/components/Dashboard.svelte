@@ -3,13 +3,11 @@
   export let pipelineMetadataCount;
   export let pipelineDownloadedCount;
   export let pipelineWorker;
-  export let downloadWorker;
   export let pipelineWorkerBusy;
   export let pipelineWorkerStatus;
   export let sampleActivity;
   export let handleStartPipelineWorker;
   export let handlePausePipelineWorker;
-  export let handlePauseAllPipelineWorkers;
 </script>
 
 <div class="grid">
@@ -48,8 +46,8 @@
     </ul>
   </div>
   <div class="card">
-    <h2>Global Pipeline</h2>
-    <p>Control the background workers for extracting, enriching, and downloading references.</p>
+    <h2>Corpus Pipeline</h2>
+    <p>Control the background workers for extracting, enriching, and downloading references in the current corpus.</p>
     
     <div class="header-pipeline" style="border: none; padding-top: 0;">
       <div class="header-pipeline__title">
@@ -94,15 +92,6 @@
           disabled={!pipelineWorker.running && !pipelineWorker.in_flight}
         >
           Pause
-        </button>
-        <button
-          class="secondary danger"
-          type="button"
-          on:click={handlePauseAllPipelineWorkers}
-          disabled={pipelineWorkerBusy || (!pipelineWorker.running && !pipelineWorker.in_flight && !downloadWorker.running && !downloadWorker.in_flight)}
-          title="Stop all pipeline and download workers across all corpora (force)."
-        >
-          Pause all
         </button>
       </div>
       {#if pipelineWorkerStatus}

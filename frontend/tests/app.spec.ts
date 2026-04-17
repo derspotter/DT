@@ -10,12 +10,10 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
     return
   }
 
-  const username = `pw_e2e_${Date.now()}_${Math.floor(Math.random() * 10_000)}`
-  const password = `pw_e2e_${Math.floor(Math.random() * 1_000_000)}`
-  const register = await request.post('http://localhost:4000/api/auth/register', {
-    data: { username, password },
-  })
-  expect([201, 409]).toContain(register.status())
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD for Playwright login').toBeTruthy()
 
   const signInButton = page.getByRole('button', { name: 'Sign in' })
   if (await signInButton.isVisible().catch(() => false)) {
