@@ -8,14 +8,17 @@ def _seed_queue(db: DatabaseManager, *, corpus_id: int, n: int) -> list[int]:
     ids: list[int] = []
     for i in range(n):
         cur.execute(
-            "INSERT INTO with_metadata (title, authors, year, doi, normalized_doi, entry_type, download_state) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (f"Paper {i}", '["A. Author"]', 2000 + i, f"10.0000/test{i}", f"10.0000/test{i}".upper(), "article", "queued"),
+            """
+            INSERT INTO works
+            (title, authors, year, doi, normalized_doi, type, metadata_status, download_status)
+            VALUES (?, ?, ?, ?, ?, ?, 'matched', 'queued')
+            """,
+            (f"Paper {i}", '["A. Author"]', 2000 + i, f"10.0000/test{i}", f"10.0000/test{i}".upper(), "article"),
         )
         qid = int(cur.lastrowid)
         ids.append(qid)
         cur.execute(
-            "INSERT OR IGNORE INTO corpus_items (corpus_id, table_name, row_id) VALUES (?, 'with_metadata', ?)",
+            "INSERT OR IGNORE INTO corpus_works (corpus_id, work_id) VALUES (?, ?)",
             (int(corpus_id), qid),
         )
     db.conn.commit()
@@ -40,7 +43,7 @@ def test_claim_batch_scoped_to_corpus(tmp_path):
         # Rows should be marked in_progress for claimed items.
         cur = db.conn.cursor()
         cur.execute(
-            "SELECT id, download_state, download_claimed_by, download_lease_expires_at FROM with_metadata ORDER BY id"
+            "SELECT id, download_status, download_claimed_by, download_lease_expires_at FROM works ORDER BY id"
         )
         rows = cur.fetchall()
         assert len(rows) == 3
@@ -79,7 +82,7 @@ def test_claim_reclaims_after_lease_expires(tmp_path):
         # Force the lease into the past to simulate an interrupted worker.
         cur = db.conn.cursor()
         cur.execute(
-            "UPDATE with_metadata SET download_lease_expires_at = ? WHERE id = ?",
+            "UPDATE works SET download_lease_expires_at = ? WHERE id = ?",
             (int(time.time()) - 10, int(ids[0])),
         )
         db.conn.commit()

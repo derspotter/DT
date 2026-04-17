@@ -50,31 +50,6 @@ def main():
         params.append(args.limit)
         cur.execute(query, params)
         runs = [dict(row) for row in cur.fetchall()]
-    else:
-        # Fallback for older DBs: infer runs from no_metadata rows.
-        joins = ""
-        conditions = []
-        params = []
-        if args.corpus_id is not None:
-            joins = "JOIN corpus_items ci ON ci.table_name = 'no_metadata' AND ci.row_id = no_metadata.id"
-            conditions.append("ci.corpus_id = ?")
-            params.append(args.corpus_id)
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"""
-            SELECT COALESCE(no_metadata.source_pdf, 'unknown') AS ingest_source,
-                   COUNT(*) AS entry_count,
-                   MAX(no_metadata.date_added) AS last_created_at,
-                   MAX(no_metadata.source_pdf) AS source_pdf
-            FROM no_metadata
-            {joins}
-            {where_clause}
-            GROUP BY COALESCE(no_metadata.source_pdf, 'unknown')
-            ORDER BY last_created_at DESC
-            LIMIT ?
-        """
-        params.append(args.limit)
-        cur.execute(query, params)
-        runs = [dict(row) for row in cur.fetchall()]
 
     for run in runs:
         seed_authors = run.get("seed_authors")

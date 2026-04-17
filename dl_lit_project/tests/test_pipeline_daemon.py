@@ -38,6 +38,7 @@ def make_daemon(conn, worker_id="worker-1", timeout_seconds=300):
     daemon.db = SimpleNamespace(conn=conn)
     daemon.worker_id = worker_id
     daemon.job_timeout_seconds = timeout_seconds
+    daemon.role = "all"
     return daemon
 
 

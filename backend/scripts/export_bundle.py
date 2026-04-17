@@ -8,28 +8,15 @@ from datetime import datetime
 from pathlib import Path
 
 
-TABLES = [
-    ("downloaded_references", "downloaded_references"),
-    ("with_metadata", "with_metadata"),
-    ("no_metadata", "no_metadata"),
-    ("to_download_references", "to_download_references"),  # legacy fallback
-]
-
-TABLE_PRIORITY = {
-    "downloaded_references": 4,
-    "to_download_references": 3,
-    "with_metadata": 2,
-    "no_metadata": 1,
+VALID_STATUSES = {
+    "downloaded",
+    "matched",
+    "raw",
+    "queued_download",
+    "failed_enrichment",
+    "failed_download",
+    "enriching",
 }
-VALID_STATUSES = set(TABLE_PRIORITY.keys())
-
-
-def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return bool(row)
 
 
 def normalize_doi(value):
@@ -68,13 +55,31 @@ def parse_authors(value):
     return str(value)
 
 
+def work_status(row_dict):
+    metadata = str(row_dict.get("metadata_status") or "pending").strip().lower()
+    download = str(row_dict.get("download_status") or "not_requested").strip().lower()
+    if download == "downloaded":
+        return "downloaded"
+    if download in {"queued", "in_progress"}:
+        return "queued_download"
+    if download == "failed":
+        return "failed_download"
+    if metadata == "in_progress":
+        return "enriching"
+    if metadata == "failed":
+        return "failed_enrichment"
+    if metadata == "matched":
+        return "matched"
+    return "raw"
+
+
 def build_source(row_dict):
     return (
-        row_dict.get("ingest_source")
+        row_dict.get("origin_key")
         or row_dict.get("source_pdf")
-        or row_dict.get("metadata_source_type")
-        or row_dict.get("journal_conference")
+        or row_dict.get("metadata_source")
         or row_dict.get("source")
+        or row_dict.get("publisher")
         or ""
     )
 
@@ -89,67 +94,43 @@ def pick_key(item):
     year_key = item.get("year") or ""
     if title_key:
         return f"tay:{title_key}|{author_key}|{year_key}"
-    return f"{item['status']}:{item['id']}"
-
-
-def should_replace(existing, candidate):
-    existing_p = TABLE_PRIORITY.get(existing["status"], 0)
-    candidate_p = TABLE_PRIORITY.get(candidate["status"], 0)
-    if candidate_p != existing_p:
-        return candidate_p > existing_p
-    if candidate.get("file_path") and not existing.get("file_path"):
-        return True
-    return False
+    return f"works:{item['id']}"
 
 
 def load_items(conn: sqlite3.Connection, corpus_id: int | None):
+    if corpus_id is None:
+        rows = conn.execute("SELECT * FROM works").fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT w.*
+            FROM works w
+            JOIN corpus_works cw ON cw.work_id = w.id
+            WHERE cw.corpus_id = ?
+            """,
+            (corpus_id,),
+        ).fetchall()
+
     items_by_key = {}
-    for table_name, status in TABLES:
-        if not table_exists(conn, table_name):
-            continue
-        if corpus_id is None:
-            rows = conn.execute(f"SELECT * FROM {table_name}").fetchall()
-        else:
-            if not table_exists(conn, "corpus_items"):
-                rows = []
-            else:
-                rows = conn.execute(
-                    f"""SELECT t.* FROM {table_name} t
-                        JOIN corpus_items ci
-                          ON ci.table_name = ? AND ci.row_id = t.id
-                       WHERE ci.corpus_id = ?""",
-                    (table_name, corpus_id),
-                ).fetchall()
-        for row in rows:
-            data = dict(row)
-            item_status = status
-            if table_name == 'with_metadata':
-                state = (data.get('download_state') or '').strip().lower()
-                if state in ('queued', 'in_progress'):
-                    item_status = 'to_download_references'
-                elif state == 'failed':
-                    item_status = 'failed_downloads'
-                else:
-                    item_status = 'with_metadata'
-            item = {
-                "id": data.get("id"),
-                "status": item_status,
-                "title": data.get("title") or "",
-                "authors": parse_authors(data.get("authors")),
-                "year": data.get("year"),
-                "doi": data.get("doi"),
-                "normalized_doi": normalize_doi(data.get("doi") or data.get("normalized_doi")),
-                "openalex_id": data.get("openalex_id"),
-                "source": build_source(data),
-                "entry_type": data.get("entry_type") or data.get("type") or "misc",
-                "bibtex_key": data.get("bibtex_key"),
-                "bibtex_entry_json": data.get("bibtex_entry_json"),
-                "file_path": data.get("file_path"),
-            }
-            key = pick_key(item)
-            existing = items_by_key.get(key)
-            if existing is None or should_replace(existing, item):
-                items_by_key[key] = item
+    for row in rows:
+        data = dict(row)
+        item = {
+            "id": data.get("id"),
+            "status": work_status(data),
+            "title": data.get("title") or "",
+            "authors": parse_authors(data.get("authors")),
+            "year": data.get("year"),
+            "doi": data.get("doi"),
+            "normalized_doi": normalize_doi(data.get("doi") or data.get("normalized_doi")),
+            "openalex_id": data.get("openalex_id"),
+            "source": build_source(data),
+            "entry_type": data.get("type") or "misc",
+            "bibtex_key": None,
+            "bibtex_entry_json": data.get("bibtex_entry_json"),
+            "file_path": data.get("file_path"),
+        }
+        items_by_key[pick_key(item)] = item
+
     items = list(items_by_key.values())
 
     def _year(value):
@@ -240,8 +221,7 @@ def render_bibtex_text(items):
 
 def write_bibtex_export(items, out_path: Path):
     out_path.write_text(render_bibtex_text(items), encoding="utf-8")
-    entries = [item for item in items if item.get("title")]
-    return {"exported_count": len(entries)}
+    return {"exported_count": len([item for item in items if item.get("title")])}
 
 
 def collect_pdf_files(items):
@@ -259,124 +239,37 @@ def collect_pdf_files(items):
     return existing_files, missing
 
 
-def write_pdf_zip_export(items, out_path: Path):
-    existing_files, missing = collect_pdf_files(items)
-    used_names = set()
-    added = 0
+def write_pdf_zip(items, out_path: Path):
+    files, missing = collect_pdf_files(items)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        manifest = []
-        for item, p in existing_files:
-            base_name = p.name
-            if base_name in used_names:
-                base_name = f"{item.get('id')}_{base_name}"
-            used_names.add(base_name)
-            zf.write(p, arcname=base_name)
-            manifest.append(
-                {
-                    "id": item.get("id"),
-                    "title": item.get("title"),
-                    "status": item.get("status"),
-                    "file_name": base_name,
-                }
-            )
-            added += 1
-        zf.writestr(
-            "manifest.json",
-            json.dumps(
-                {
-                    "generated_at": datetime.utcnow().isoformat() + "Z",
-                    "files": manifest,
-                },
-                indent=2,
-            ),
-        )
-    return {"exported_count": added, "missing_files": missing}
+        for item, pdf_path in files:
+            zf.write(pdf_path, arcname=pdf_path.name)
+    return {"exported_count": len(files), "missing_files": missing}
 
 
-def write_bundle_zip_export(items, out_path: Path, filters):
-    existing_files, missing = collect_pdf_files(items)
-    used_names = set()
-    added = 0
+def write_bundle_zip(items, out_path: Path):
+    files, missing = collect_pdf_files(items)
+    json_payload = json.dumps(render_json_payload(items), ensure_ascii=False, indent=2)
+    bibtex_text = render_bibtex_text(items)
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(
-            "references.json",
-            json.dumps(render_json_payload(items), ensure_ascii=False, indent=2),
-        )
-        zf.writestr("references.bib", render_bibtex_text(items))
-
-        file_manifest = []
-        for item, p in existing_files:
-            base_name = p.name
-            if base_name in used_names:
-                base_name = f"{item.get('id')}_{base_name}"
-            used_names.add(base_name)
-            arc_name = f"pdfs/{base_name}"
-            zf.write(p, arcname=arc_name)
-            file_manifest.append(
-                {
-                    "id": item.get("id"),
-                    "title": item.get("title"),
-                    "status": item.get("status"),
-                    "file_name": arc_name,
-                }
-            )
-            added += 1
-
-        zf.writestr(
-            "manifest.json",
-            json.dumps(
-                {
-                    "generated_at": datetime.utcnow().isoformat() + "Z",
-                    "filters": filters,
-                    "totals": {
-                        "items": len(items),
-                        "pdfs_added": added,
-                        "pdfs_missing": missing,
-                    },
-                    "pdf_files": file_manifest,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-        )
-    return {"exported_count": len(items), "pdfs_added": added, "missing_files": missing}
+        zf.writestr("metadata.json", json_payload)
+        zf.writestr("references.bib", bibtex_text)
+        for item, pdf_path in files:
+            zf.write(pdf_path, arcname=f"pdfs/{pdf_path.name}")
+    return {"exported_count": len(items), "pdf_count": len(files), "missing_files": missing}
 
 
-def parse_status_filter(raw_status):
-    if not raw_status:
-        return set()
-    return {
-        str(part).strip().lower()
-        for part in str(raw_status).split(",")
-        if str(part).strip()
-    }
-
-
-def parse_year(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def apply_filters(items, statuses, year_from, year_to, source_substring):
-    source_substring = (source_substring or "").strip().lower()
-    filtered = []
-    for item in items:
-        if statuses and item.get("status") not in statuses:
-            continue
-
-        year = parse_year(item.get("year"))
-        if year_from is not None and (year is None or year < year_from):
-            continue
-        if year_to is not None and (year is None or year > year_to):
-            continue
-
-        source = str(item.get("source") or "").lower()
-        if source_substring and source_substring not in source:
-            continue
-
-        filtered.append(item)
+def filter_items(items, *, status=None, year_from=None, year_to=None, source=None):
+    filtered = items
+    if status:
+        filtered = [item for item in filtered if item.get("status") == status]
+    if year_from is not None:
+        filtered = [item for item in filtered if item.get("year") is not None and int(item.get("year")) >= year_from]
+    if year_to is not None:
+        filtered = [item for item in filtered if item.get("year") is not None and int(item.get("year")) <= year_to]
+    if source:
+        needle = source.strip().lower()
+        filtered = [item for item in filtered if needle in str(item.get("source") or "").lower()]
     return filtered
 
 
@@ -385,109 +278,59 @@ def main():
     parser.add_argument("--db-path", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--format", required=True, choices=["json", "bibtex", "pdfs_zip", "bundle_zip"])
-    parser.add_argument("--corpus-id", type=int, default=None)
-    parser.add_argument("--status", default="")
+    parser.add_argument("--status", default="", help="Optional status filter.")
     parser.add_argument("--year-from", type=int, default=None)
     parser.add_argument("--year-to", type=int, default=None)
     parser.add_argument("--source", default="")
+    parser.add_argument("--corpus-id", type=int, default=None)
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.status and args.status not in VALID_STATUSES:
+        raise SystemExit(f"Invalid status: {args.status}")
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    corpus_suffix = f"corpus-{args.corpus_id}" if args.corpus_id is not None else "corpus-all"
-    ext = {"json": "json", "bibtex": "bib", "pdfs_zip": "zip", "bundle_zip": "zip"}[args.format]
-    filename = f"references-{corpus_suffix}-{timestamp}.{ext}"
-    output_path = output_dir / filename
-    requested_statuses = parse_status_filter(args.status)
-    selected_statuses = set(s for s in requested_statuses if s in VALID_STATUSES)
-    applied_filters = {
-        "status": sorted(list(selected_statuses)),
-        "year_from": args.year_from,
-        "year_to": args.year_to,
-        "source": args.source or "",
-    }
-
-    if os.environ.get("RAG_FEEDER_STUB") == "1":
-        if args.format == "json":
-            output_path.write_text(
-                json.dumps(
-                    {
-                        "generated_at": datetime.utcnow().isoformat() + "Z",
-                        "total": 0,
-                        "items": [],
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            stats = {"exported_count": 0}
-        elif args.format == "bibtex":
-            output_path.write_text("", encoding="utf-8")
-            stats = {"exported_count": 0}
-        elif args.format == "pdfs_zip":
-            with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED):
-                pass
-            stats = {"exported_count": 0, "missing_files": 0}
-        else:
-            with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("references.json", json.dumps(render_json_payload([]), indent=2))
-                zf.writestr("references.bib", "")
-                zf.writestr(
-                    "manifest.json",
-                    json.dumps(
-                        {
-                            "generated_at": datetime.utcnow().isoformat() + "Z",
-                            "filters": applied_filters,
-                            "totals": {"items": 0, "pdfs_added": 0, "pdfs_missing": 0},
-                            "pdf_files": [],
-                        },
-                        indent=2,
-                    ),
-                )
-            stats = {"exported_count": 0, "pdfs_added": 0, "missing_files": 0}
-        print(
-            json.dumps(
-                {
-                    "format": args.format,
-                    "filename": filename,
-                    "output_path": str(output_path),
-                    **stats,
-                    "applied_filters": applied_filters,
-                    "source": "stub",
-                }
-            )
-        )
-        return
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
-    try:
-        items = load_items(conn, args.corpus_id)
-    finally:
-        conn.close()
+    items = load_items(conn, args.corpus_id)
+    conn.close()
 
-    items = apply_filters(items, selected_statuses, args.year_from, args.year_to, args.source)
+    items = filter_items(
+        items,
+        status=args.status or None,
+        year_from=args.year_from,
+        year_to=args.year_to,
+        source=args.source or None,
+    )
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    suffix_map = {
+        "json": ".json",
+        "bibtex": ".bib",
+        "pdfs_zip": ".zip",
+        "bundle_zip": ".zip",
+    }
+    filename = f"export_{timestamp}{suffix_map[args.format]}"
+    out_path = out_dir / filename
 
     if args.format == "json":
-        stats = write_json_export(items, output_path)
+        stats = write_json_export(items, out_path)
     elif args.format == "bibtex":
-        stats = write_bibtex_export(items, output_path)
+        stats = write_bibtex_export(items, out_path)
     elif args.format == "pdfs_zip":
-        stats = write_pdf_zip_export(items, output_path)
+        stats = write_pdf_zip(items, out_path)
     else:
-        stats = write_bundle_zip_export(items, output_path, applied_filters)
+        stats = write_bundle_zip(items, out_path)
 
     print(
         json.dumps(
             {
-                "format": args.format,
+                "output_path": str(out_path),
                 "filename": filename,
-                "output_path": str(output_path),
-                **stats,
-                "applied_filters": applied_filters,
-                "source": "db",
+                "format": args.format,
+                "count": len(items),
+                "stats": stats,
             }
         )
     )

@@ -25,6 +25,7 @@ class ServiceRateLimiter:
         self.request_logs = {service: deque() for service in service_config}
         self.request_totals = {service: 0 for service in service_config}
         self.locks = {service: threading.Lock() for service in service_config}
+        self.last_request_ts = {service: 0.0 for service in service_config}
 
     def wait_if_needed(self, service_name, units=1):
         """
@@ -40,9 +41,11 @@ class ServiceRateLimiter:
             self.locks[service_name] = threading.Lock()
             self.request_logs[service_name] = deque()
             self.request_totals[service_name] = 0
+            self.last_request_ts[service_name] = 0.0
 
         limit = config['limit']
         window = timedelta(seconds=config['window'])
+        min_interval = float(config.get('min_interval', 0) or 0)
         try:
             units = int(units)
         except Exception:
@@ -52,6 +55,20 @@ class ServiceRateLimiter:
 
         with self.locks[service_name]:
             now = datetime.now()
+            now_ts = time.monotonic()
+
+            # Some APIs enforce strict per-request spacing and will still 429
+            # even when an average RPS bucket is respected.
+            if min_interval > 0:
+                elapsed = now_ts - self.last_request_ts[service_name]
+                if elapsed < min_interval:
+                    wait_seconds = min_interval - elapsed
+                    print(
+                        f"Rate spacing for '{service_name}' reached. Waiting for {wait_seconds:.2f} seconds."
+                    )
+                    time.sleep(wait_seconds)
+                    now = datetime.now()
+                    now_ts = time.monotonic()
 
             # Remove old requests from the log that are outside the time window
             while self.request_logs[service_name] and (now - self.request_logs[service_name][0][0]) > window:
@@ -75,9 +92,22 @@ class ServiceRateLimiter:
             # Log the new request time
             self.request_logs[service_name].append((datetime.now(), units))
             self.request_totals[service_name] += units
+            self.last_request_ts[service_name] = time.monotonic()
             
             # Return True to indicate the request can proceed
             return True
+
+    def backoff(self, service_name, wait_seconds):
+        if wait_seconds is None:
+            return
+        try:
+            delay = max(0.0, float(wait_seconds))
+        except Exception:
+            return
+        if delay <= 0:
+            return
+        print(f"Backing off '{service_name}' for {delay:.2f} seconds after upstream throttling.")
+        time.sleep(delay)
 
 
 # Global shared rate limiter instance for the entire application
@@ -94,6 +124,16 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(default))
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return max(minimum, float(default))
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return max(minimum, float(default))
+
+
 def get_global_rate_limiter():
     """Get the shared rate limiter instance for the entire application."""
     global _global_rate_limiter
@@ -101,9 +141,12 @@ def get_global_rate_limiter():
         default_rps = _env_int('RAG_FEEDER_API_DEFAULT_RPS', 40)
         openalex_rps = _env_int('RAG_FEEDER_OPENALEX_RPS', 30)
         crossref_rps = _env_int('RAG_FEEDER_CROSSREF_RPS', 20)
+        semantic_scholar_rps = _env_int('RAG_FEEDER_SEMANTIC_SCHOLAR_RPS', 1)
+        semantic_scholar_min_interval = _env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC', 1.1)
         unpaywall_rps = _env_int('RAG_FEEDER_UNPAYWALL_RPS', 10)
         scihub_rps = _env_int('RAG_FEEDER_SCIHUB_RPS', 8)
         libgen_rps = _env_int('RAG_FEEDER_LIBGEN_RPS', 6)
+        libgen_min_interval = _env_float('RAG_FEEDER_LIBGEN_MIN_INTERVAL_SEC', 0.4)
         gemini_per_minute = _env_int('RAG_FEEDER_GEMINI_PER_MIN', 2000)
         gemini_daily = _env_int('RAG_FEEDER_GEMINI_DAILY', 100000)
         gemini_tokens_per_min = _env_int('RAG_FEEDER_GEMINI_TOKENS_PER_MIN', 3000000)
@@ -111,9 +154,18 @@ def get_global_rate_limiter():
             'default': {'limit': default_rps, 'window': 1},
             'openalex': {'limit': openalex_rps, 'window': 1},
             'crossref': {'limit': crossref_rps, 'window': 1},
+            'semantic_scholar': {
+                'limit': semantic_scholar_rps,
+                'window': 1,
+                'min_interval': semantic_scholar_min_interval,
+            },
             'unpaywall': {'limit': unpaywall_rps, 'window': 1},
             'scihub': {'limit': scihub_rps, 'window': 1},
-            'libgen': {'limit': libgen_rps, 'window': 1},
+            'libgen': {
+                'limit': libgen_rps,
+                'window': 1,
+                'min_interval': libgen_min_interval,
+            },
             'gemini': {'limit': gemini_per_minute, 'window': 60},
             'gemini_daily': {'limit': gemini_daily, 'window': 86400},
             'gemini_tokens': {'limit': gemini_tokens_per_min, 'window': 60},

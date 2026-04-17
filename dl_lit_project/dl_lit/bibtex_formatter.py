@@ -81,7 +81,7 @@ class BibTeXFormatter:
 
     def format_entry(self, db_entry_dict: dict) -> str | None:
         """
-        Formats a dictionary (representing a row from 'downloaded_references')
+        Formats a dictionary representing a canonical downloaded work row.
         into a BibTeX entry string.
         Relies on 'bibtex_entry_json' for most fields, but 'file_path' from
         the database is the source of truth for the 'file' field in the output.

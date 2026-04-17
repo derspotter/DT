@@ -252,8 +252,8 @@ test.describe('Real PDF pipeline performance', () => {
     const downloadSeconds = (Date.now() - downloadStart) / 1000
     const statsAfterDownload = await authedJson(request, token, '/api/ingest/stats')
 
-    const downloadedBefore = Number(statsBeforeDownload?.stats?.downloaded_references || 0)
-    const downloadedAfter = Number(statsAfterDownload?.stats?.downloaded_references || 0)
+    const downloadedBefore = Number(statsBeforeDownload?.stats?.downloaded || 0)
+    const downloadedAfter = Number(statsAfterDownload?.stats?.downloaded || 0)
     const downloadedDelta = Math.max(0, downloadedAfter - downloadedBefore)
 
     const metrics = {

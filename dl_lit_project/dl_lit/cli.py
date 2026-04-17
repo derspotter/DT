@@ -46,15 +46,24 @@ def cli():
 
 @cli.command("clear-downloaded")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.confirmation_option(prompt='Are you sure you want to clear all entries from the downloaded_references table?')
+@click.confirmation_option(prompt='Are you sure you want to clear downloaded file state from all works?')
 def clear_downloaded_command(db_path):
-    """Clears all entries from the downloaded_references table."""
+    """Clears downloaded file state from canonical works."""
     db_manager = DatabaseManager(db_path)
     try:
         cursor = db_manager.conn.cursor()
-        cursor.execute("DELETE FROM downloaded_references")
+        cursor.execute("""
+            UPDATE works
+               SET download_status = 'not_requested',
+                   download_source = NULL,
+                   download_error = NULL,
+                   downloaded_at = NULL,
+                   file_path = NULL,
+                   file_checksum = NULL
+             WHERE download_status = 'downloaded'
+        """)
         db_manager.conn.commit()
-        click.echo(f"Successfully cleared all entries from 'downloaded_references' in {db_path}.")
+        click.echo(f"Successfully cleared downloaded file state in {db_path}.")
     except Exception as e:
         click.echo(f"Error clearing table: {e}", err=True)
     finally:
@@ -81,14 +90,14 @@ def init_db_command(db_path):
 @click.option('--limit', default=10, help='Number of entries to show. Shows all if 0.')
 @click.option('--show-all', is_flag=True, help='Show all entries, overrides --limit.')
 def show_sample_command(db_path, limit, show_all):
-    """Shows entries from the downloaded_references table."""
+    """Shows downloaded works from the canonical works table."""
     db_manager = DatabaseManager(db_path=db_path)
     try:
-        click.echo(f"{CYAN}Fetching entries from downloaded_references...{RESET}")
-        all_entries_dicts = db_manager.get_all_downloaded_references_as_dicts()
+        click.echo(f"{CYAN}Fetching downloaded works...{RESET}")
+        all_entries_dicts = db_manager.get_all_downloaded_works_as_dicts()
         
         if not all_entries_dicts:
-            click.echo(f"{YELLOW}No entries found in downloaded_references.{RESET}")
+            click.echo(f"{YELLOW}No downloaded works found.{RESET}")
             return
 
         display_limit = len(all_entries_dicts) if show_all else limit
@@ -137,7 +146,7 @@ def show_sample_command(db_path, limit, show_all):
               help='Path to the SQLite database file.', 
               type=click.Path(dir_okay=False, writable=True))
 def import_bib_command(bibtex_file, pdf_base_dir, db_path):
-    """Imports references from a BibTeX file into the 'downloaded_references' table."""
+    """Imports references from a BibTeX file into canonical works as downloaded items."""
     click.echo(f"Attempting to import from BibTeX file: {bibtex_file}")
     if pdf_base_dir:
         click.echo(f"Using PDF base directory: {pdf_base_dir}")
@@ -248,7 +257,7 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
                     failed_imports.append((str(entry_display_identifier)[:100], f"Duplicate logging error: {dup_log_err}"))
                 continue 
 
-            # 4. Not a duplicate, try to add to downloaded_references
+            # 4. Not a duplicate, add it as a canonical downloaded work
             original_entry_json = json.dumps({
                 'ID': entry_obj.key, 
                 'ENTRYTYPE': entry_obj.entry_type, 
@@ -322,8 +331,8 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
               type=click.Path(exists=True, dir_okay=False, readable=True, resolve_path=True))
 @click.option('--skip-pdf-check', is_flag=True, default=False, help="Skip checking if the PDF file exists on disk.")
 def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
-    """Exports the 'downloaded_references' table to a BibTeX file."""
-    click.echo(f"Exporting downloaded references from '{Path(db_path).resolve()}' to '{Path(output_bib_file).resolve()}'...")
+    """Exports downloaded canonical works to a BibTeX file."""
+    click.echo(f"Exporting downloaded works from '{Path(db_path).resolve()}' to '{Path(output_bib_file).resolve()}'...")
     
     db_manager = None
     output_file = Path(output_bib_file)
@@ -333,7 +342,7 @@ def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
         db_manager = DatabaseManager(db_path=Path(db_path))
         formatter = BibTeXFormatter()
 
-        all_entries_dicts = db_manager.get_all_downloaded_references_as_dicts()
+        all_entries_dicts = db_manager.get_all_downloaded_works_as_dicts()
         
         # DEBUG PRINT START
         # click.echo(f"[CLI DEBUG] Retrieved {len(all_entries_dicts)} entries from DB for export.", err=True)
@@ -344,7 +353,7 @@ def export_bibtex_command(output_bib_file, db_path, skip_pdf_check):
         # DEBUG PRINT END
             
         if not all_entries_dicts:
-            click.echo(f"{YELLOW}No entries found in 'downloaded_references' table to export.{RESET}")
+            click.echo(f"{YELLOW}No downloaded works found to export.{RESET}")
             if db_manager:
                 db_manager.close_connection()
             return
@@ -428,7 +437,7 @@ def extract_bib_pages_command(input_path, output_dir):
 
     click.echo(f"\n{GREEN}Batch bibliography page extraction process completed.{RESET}")
 
-@cli.command("add-to-no-metadata")
+@cli.command("add-pending-works")
 @click.option('--json-file', 
               type=click.Path(exists=True, dir_okay=False, readable=True), 
               required=True,
@@ -440,12 +449,12 @@ def extract_bib_pages_command(input_path, output_dir):
 @click.option('--db-path', 
               default=str(DEFAULT_DB_PATH), 
               help='Path to the SQLite database file.')
-def add_to_no_metadata_command(json_file, source_pdf, db_path):
-    """Loads extracted bibliography entries from a JSON file into the no_metadata table."""
+def add_pending_works_command(json_file, source_pdf, db_path):
+    """Loads extracted bibliography entries from a JSON file as pending works."""
     click.echo(f"Loading entries from {json_file} into the database...")
     db_manager = DatabaseManager(db_path)
     try:
-        added, skipped, errors = db_manager.add_entries_to_no_metadata_from_json(json_file, source_pdf)
+        added, skipped, errors = db_manager.add_pending_works_from_json(json_file, source_pdf)
         click.echo(f"{GREEN}Successfully added {added} new entries.{RESET}")
         if skipped > 0:
             click.echo(f"{YELLOW}Skipped {skipped} entries (duplicates or missing title).{RESET}")
@@ -525,76 +534,6 @@ def extract_bib_api_command(input_path, db_path, workers):
             click.echo("Database connection closed.")
 
 
-@cli.command("run-pipeline")
-@click.argument('input_path', type=click.Path(exists=True, resolve_path=True))
-@click.option('--db-path',
-              type=click.Path(dir_okay=False, writable=True, resolve_path=True),
-              default=str(DEFAULT_DB_PATH),
-              help='Path to the SQLite database file.')
-@click.option('--output-dir',
-              type=click.Path(file_okay=False, writable=True, resolve_path=True),
-              default=str(Path.cwd() / "extracted_refs"),
-              help='Directory to store extracted reference pages.')
-@click.option('--json-dir',
-              type=click.Path(file_okay=False, writable=True, resolve_path=True),
-              default=None,
-              help='Directory to store extracted bibliography JSON files.')
-@click.option('--batch-size', default=50, show_default=True, help='Batch size for enrichment.')
-@click.option('--queue-batch', default=50, show_default=True, help='Batch size for enqueueing downloads.')
-@click.option('--mailto', default='spott@wzb.eu', show_default=True, help='Email for API politeness.')
-@click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works during enrichment.')
-@click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works during enrichment.')
-@click.option('--max-citations', default=100, show_default=True, help='Maximum citing works to fetch per paper.')
-@click.option('--related-depth', default=2, show_default=True, help='Reference expansion depth (1 = direct refs only).')
-@click.option('--max-related', default=40, show_default=True, help='Max nested references per work when depth > 1.')
-@click.option('--max-ref-pages', type=int, default=None, help='Limit the number of extracted reference pages per PDF.')
-@click.option('--max-entries', type=int, default=None, help='Limit the number of extracted entries processed per run.')
-@click.option('--enrich/--no-enrich', default=True, show_default=True, help='Run OpenAlex/Crossref enrichment after insertion.')
-def run_pipeline_command(input_path, db_path, output_dir, json_dir, batch_size, queue_batch, mailto, fetch_references, fetch_citations, max_citations, related_depth, max_related, max_ref_pages, max_entries, enrich):
-    """Run extract → enrich → queue pipeline for PDFs (no download step)."""
-    try:
-        from .pipeline import run_pipeline
-
-        summary = run_pipeline(
-            input_path=input_path,
-            db_path=db_path,
-            output_dir=output_dir,
-            json_dir=json_dir,
-            batch_size=batch_size,
-            queue_batch=queue_batch,
-            mailto=mailto,
-            fetch_references=fetch_references,
-            fetch_citations=fetch_citations,
-            max_citations=max_citations,
-            related_depth=related_depth,
-            max_related=max_related,
-            max_ref_pages=max_ref_pages,
-            max_entries=max_entries,
-            run_enrichment=enrich,
-        )
-
-        click.echo("\n--- Pipeline Summary ---")
-        for key in [
-            "processed_files",
-            "extracted_pages",
-            "extracted_entries",
-            "inserted_entries",
-            "skipped_entries",
-            "enriched_promoted",
-            "enriched_failed",
-            "queued",
-            "skipped_queue",
-        ]:
-            click.echo(f"{key.replace('_', ' ').title()}: {summary.get(key, 0)}")
-        if summary.get("errors"):
-            click.echo(f"{RED}Errors:{RESET}")
-            for err in summary["errors"]:
-                click.echo(f"  - {err}")
-        click.echo(f"{GREEN}Pipeline complete.{RESET}")
-    finally:
-        pass
-
-
 @cli.command("keyword-search")
 @click.option('--query', required=True, help='Boolean keyword query (AND/OR/NOT).')
 @click.option('--max-results', default=200, show_default=True, help='Maximum number of OpenAlex results to fetch.')
@@ -664,120 +603,17 @@ def keyword_search_command(query, max_results, year_from, year_to, field, mailto
         click.echo(f"{GREEN}Keyword search complete.{RESET}")
     finally:
         db.close_connection()
-@cli.command("enrich-openalex-db")
-@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.option('--batch-size', default=50, help='Number of entries to process in one batch.')
-@click.option('--mailto', default='spott@wzb.eu', help='Email for API politeness.')
-@click.option('--fetch-references/--no-fetch-references', default=True, show_default=True, help='Fetch referenced works for enriched papers.')
-@click.option('--fetch-citations/--no-fetch-citations', default=False, show_default=True, help='Fetch citing works for enriched papers (API intensive).')
-@click.option('--max-citations', default=100, show_default=True, help='Maximum number of citing works to fetch per paper.')
-@click.option('--related-depth', default=2, show_default=True, help='Reference expansion depth (1 = direct refs only).')
-@click.option('--max-related', default=40, show_default=True, help='Max nested references per work when depth > 1.')
-def enrich_openalex_db_command(db_path, batch_size, mailto, fetch_references, fetch_citations, max_citations, related_depth, max_related):
-    """Fetches metadata from OpenAlex/Crossref for entries in the no_metadata table."""
-    click.echo(f"Starting DB enrichment – DB: {db_path} | Batch: {batch_size}")
-    db_manager = DatabaseManager(db_path)
-    
-    # Use the more advanced searcher from OpenAlexScraper
-    searcher = OpenAlexCrossrefSearcher(mailto=mailto)
-    # Use the global rate limiter shared across all components
-    rate_limiter = get_global_rate_limiter() 
-
-    promoted_count = 0
-    failed_count = 0
-    
-    try:
-        entries_to_process = db_manager.fetch_no_metadata_batch(batch_size)
-        if not entries_to_process:
-            click.echo("No entries found in 'no_metadata' table to process.")
-            return
-
-        for entry in entries_to_process:
-            click.echo(f"\n[ENRICH] Processing ID {entry['id']} – {entry['title'][:50]}")
-            
-            # Adapt the DB entry to the format expected by process_single_reference
-            ref_for_scraper = {
-                'title': entry.get('title'),
-                'authors': entry.get('authors') if entry.get('authors') else [],
-                'doi': entry.get('doi'),
-                'year': entry.get('year'),  # Use extracted year
-                'container-title': entry.get('source'),  # Use extracted source/journal
-                'volume': entry.get('volume'),
-                'issue': entry.get('issue'),
-                'pages': entry.get('pages'),
-                'abstract': entry.get('abstract'),
-                'keywords': entry.get('keywords')
-            }
-
-            # Use the powerful multi-step search process with related works options
-            enriched_data = process_single_reference(
-                ref_for_scraper,
-                searcher,
-                rate_limiter,
-                fetch_references=fetch_references,
-                fetch_citations=fetch_citations,
-                max_citations=max_citations,
-                related_depth=related_depth,
-                max_related_per_reference=max_related,
-            )
-            
-            if enriched_data:
-                db_manager.promote_to_with_metadata(
-                    entry['id'],
-                    enriched_data,
-                    expand_related=related_depth > 1,
-                    max_related_per_source=max_related,
-                )
-                promoted_count += 1
-                click.echo(f"  -> metadata found, promoted to with_metadata.")
-                # Pretty print the enriched data for immediate review
-                click.echo(f"{BLUE}--- Enriched Data ---{RESET}")
-                click.echo(pprint.pformat(enriched_data))
-                click.echo(f"{BLUE}-----------------------{RESET}")
-            else:
-                reason = "Metadata fetch failed (no match found in OpenAlex/Crossref)"
-                failed_id, error_msg = db_manager.move_no_meta_entry_to_failed(entry['id'], reason)
-                if failed_id:
-                    click.echo(f"  ! metadata fetch failed, moved to failed_enrichments.")
-                else:
-                    click.echo(f"  ! FAILED to move entry {entry['id']} to failed_enrichments: {error_msg}")
-                failed_count += 1
-
-    except Exception as e:
-        click.echo(f"{RED}An unexpected error occurred during enrichment: {e}{RESET}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        click.echo(f"\nEnrichment finished: {promoted_count} promoted, {failed_count} failed.")
-        db_manager.close_connection()
-
-
-@cli.command("retry-failed-enrichments")
-@click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-def retry_failed_enrichments_command(db_path):
-    """Moves all entries from failed_enrichments back to no_metadata."""
-    click.echo("Retrying failed enrichments...")
-    db_manager = DatabaseManager(db_path)
-    try:
-        moved_count, error = db_manager.retry_failed_enrichments()
-        if error:
-            click.echo(f"{RED}An error occurred: {error}{RESET}")
-        # The success message is already printed by the db_manager method
-    finally:
-        db_manager.close_connection()
-
-
 @cli.command("process-downloads")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, writable=True, resolve_path=True), help='Path to SQLite database file.')
-@click.option('--batch-size', default=50, show_default=True, help='Max number of with_metadata rows to enqueue.')
+@click.option('--batch-size', default=50, show_default=True, help='Max number of matched works to enqueue.')
 def process_downloads_command(db_path, batch_size):
-    """Move enriched references into the download queue (`to_download_references`)."""
-    click.echo(f"Queueing up to {batch_size} items from with_metadata…")
+    """Queue matched works for PDF download."""
+    click.echo(f"Queueing up to {batch_size} matched works…")
 
     db = DatabaseManager(db_path)
-    ids = db.fetch_with_metadata_batch(limit=batch_size)
+    ids = db.fetch_matched_work_batch(limit=batch_size)
     if not ids:
-        click.echo("No items in with_metadata.")
+        click.echo("No matched works to queue.")
         db.close_connection()
         return
 
@@ -801,20 +637,6 @@ def process_downloads_command(db_path, batch_size):
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
 
-@cli.command("retry-failed-downloads")
-@click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(), help='SQLite database path.')
-def retry_failed_downloads_command(db_path):
-    """Move all entries from failed_downloads back to no_metadata for reprocessing."""
-    click.echo("Retrying failed downloads...")
-    db_manager = DatabaseManager(db_path=db_path)
-    try:
-        moved_count = db_manager.retry_failed_downloads()
-        click.echo(f"Successfully moved {moved_count} entries from 'failed_downloads' to 'no_metadata'.")
-    except Exception as e:
-        click.echo(f"An error occurred: {e}", err=True)
-    finally:
-        db_manager.close_connection()
-
 @cli.command("download-pdfs")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, resolve_path=True), help='SQLite database path.')
 @click.option('--limit', default=10, show_default=True, help='Number of queue entries to process per run.')
@@ -830,7 +652,7 @@ def download_pdfs_command(db_path, limit, download_dir):
     db = DatabaseManager(db_path)
     enhancer = BibliographyEnhancer(db_manager=db, rate_limiter=rl, email='spott@wzb.eu', output_folder=download_dir)
 
-    queue = db.get_entries_to_download(limit=limit)
+    queue = db.fetch_download_queue(limit=limit)
     if not queue:
         click.echo("Queue is empty.")
         db.close_connection()
@@ -879,7 +701,7 @@ def download_pdfs_command(db_path, limit, download_dir):
             except (json.JSONDecodeError, TypeError):
                 pass # Keep lists empty if data is malformed
 
-        # Drop queue entry if it is already in downloaded_references
+        # Drop queue entry if it already resolves to an existing downloaded work
         dup_table, dup_id, dup_field = db.check_if_exists(
             doi=row.get('doi'),
             openalex_id=row.get('openalex_id'),
@@ -887,10 +709,10 @@ def download_pdfs_command(db_path, limit, download_dir):
             authors=author_structs or row.get('authors'),
             year=row.get('year'),
             exclude_id=row['id'],
-            exclude_table='with_metadata'
+            exclude_table='works'
         )
-        if dup_table == 'downloaded_references' and dup_id is not None:
-            ok, msg = db.drop_queue_entry_as_duplicate(row['id'], dup_table, dup_id, dup_field)
+        if dup_table == 'works' and dup_id is not None:
+            ok, msg = db.merge_duplicate_queued_work(row['id'], dup_table, dup_id, dup_field)
             click.echo(f"  ↺ duplicate detected: {msg}")
             continue
 
@@ -922,7 +744,7 @@ def download_pdfs_command(db_path, limit, download_dir):
             click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
             ok += 1
         else:
-            db.move_queue_entry_to_failed(row['id'], 'download_failed')
+            db.mark_download_failed(row['id'], 'download_failed')
             click.echo("  ✗ download failed")
             failed += 1
 
@@ -988,115 +810,68 @@ def enrich_openalex_command(input_path, output_dir, mailto, fetch_citations):
 
 @cli.command("inspect-tables")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), help='Path to the SQLite database file.')
-@click.option('--table', type=click.Choice(['all', 'no_metadata', 'with_metadata', 'to_download_references', 'downloaded_references', 'failed_enrichments', 'failed_downloads', 'duplicate_references', 'merge_log']), default='all', help='Specific table to inspect.')
+@click.option('--table', type=click.Choice(['all', 'works', 'corpus_works', 'duplicate_references', 'merge_log']), default='all', help='Specific table to inspect.')
 @click.option('--limit', default=5, help='Number of entries to show per table.')
 def inspect_tables_command(db_path, table, limit):
-    """Inspects database tables to debug data flow issues."""
+    """Inspect canonical database tables and workflow buckets."""
     try:
         db_manager = DatabaseManager(db_path=db_path)
         cursor = db_manager.conn.cursor()
         cursor.row_factory = sqlite3.Row
-        
-        # Define workflow tables
-        workflow_tables = [
-            ("no_metadata", "Raw extracted references (before enrichment)"),
-            ("with_metadata", "Enriched references (after OpenAlex/Crossref lookup)"),
-            ("to_download_references", "Queue state on with_metadata (download_state=queued/in_progress)"),
-            ("downloaded_references", "Successfully downloaded papers"),
-            ("failed_enrichments", "References that failed metadata enrichment"),
-            ("failed_downloads", "References that failed PDF download"),
-            ("duplicate_references", "Detected duplicates"),
-            ("merge_log", "Deduplication merge decisions")
-        ]
-        
-        tables_to_check = workflow_tables if table == 'all' else [(table, "Selected table")]
-        
+
+        tables_to_check = [
+            ('works', 'Canonical works'),
+            ('corpus_works', 'Corpus membership join table'),
+            ('duplicate_references', 'Detected duplicates'),
+            ('merge_log', 'Deduplication merge decisions'),
+        ] if table == 'all' else [(table, 'Selected table')]
+
         click.echo(f"{CYAN}Database Inspection: {Path(db_path).resolve()}{RESET}")
-        click.echo("=" * 80)
-        
-        total_items = 0
-        
+        click.echo('=' * 80)
+
         for table_name, description in tables_to_check:
-            # Skip if specific table requested but doesn't match
-            if table != 'all' and table_name != table:
-                continue
-                
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
             count = cursor.fetchone()[0]
-            total_items += count
-            
-            status_icon = "✅" if count > 0 else "📭"
+            status_icon = '✅' if count > 0 else '📭'
             click.echo(f"\n{status_icon} {BLUE}{table_name.upper()}{RESET} ({count} rows)")
             click.echo(f"    {description}")
-            
-            if count > 0:
-                # Get column names
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns = cursor.fetchall()
-                col_names = [col[1] for col in columns]
-                
-                # Show sample rows
-                display_limit = min(limit, count)
-                cursor.execute(f"SELECT * FROM {table_name} LIMIT {display_limit}")
-                rows = cursor.fetchall()
-                
-                click.echo(f"    {WHITE}Columns:{RESET} {', '.join(col_names)}")
-                click.echo(f"    {WHITE}Sample entries (showing {display_limit} of {count}):{RESET}")
-                
-                for i, row in enumerate(rows, 1):
-                    click.echo(f"\n    {GREEN}Entry {i}:{RESET}")
-                    for col_name in col_names:
-                        value = row[col_name]
-                        # Handle special formatting for different column types
-                        if value is None:
-                            display_value = f"{YELLOW}None{RESET}"
-                        elif isinstance(value, str):
-                            if col_name in ['authors', 'keywords', 'crossref_json', 'openalex_json', 'bibtex_entry_json']:
-                                # JSON fields - show truncated
-                                if len(value) > 100:
-                                    display_value = f"{value[:97]}..."
-                                else:
-                                    display_value = value
-                            elif col_name in ['title', 'abstract']:
-                                # Text fields - show truncated
-                                if len(value) > 80:
-                                    display_value = f"{value[:77]}..."
-                                else:
-                                    display_value = value
-                            else:
-                                display_value = value
-                        else:
-                            display_value = str(value)
-                        
-                        click.echo(f"      {CYAN}{col_name}:{RESET} {display_value}")
-            else:
-                click.echo(f"    {YELLOW}Empty table{RESET}")
-        
+            if count <= 0:
+                continue
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            col_names = [col[1] for col in cursor.fetchall()]
+            display_limit = min(limit, count)
+            cursor.execute(f"SELECT * FROM {table_name} LIMIT {display_limit}")
+            rows = cursor.fetchall()
+            click.echo(f"    {WHITE}Columns:{RESET} {', '.join(col_names)}")
+            click.echo(f"    {WHITE}Sample entries (showing {display_limit} of {count}):{RESET}")
+            for i, row in enumerate(rows, 1):
+                click.echo(f"\n    {GREEN}Entry {i}:{RESET}")
+                for col_name in col_names:
+                    value = row[col_name]
+                    if value is None:
+                        display_value = f"{YELLOW}None{RESET}"
+                    elif isinstance(value, str) and len(value) > 100:
+                        display_value = f"{value[:97]}..."
+                    else:
+                        display_value = str(value)
+                    click.echo(f"      {CYAN}{col_name}:{RESET} {display_value}")
+
         if table == 'all':
-            click.echo(f"\n{CYAN}Total items across workflow: {total_items}{RESET}")
-            
-            # Check for potential workflow issues
-            cursor.execute("SELECT COUNT(*) FROM no_metadata")
-            no_meta_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM with_metadata")
-            with_meta_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM with_metadata WHERE download_state IN ('queued', 'in_progress')")
-            queue_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM downloaded_references")
-            downloaded_count = cursor.fetchone()[0]
-            
-            click.echo(f"\n{YELLOW}Workflow Analysis:{RESET}")
-            if no_meta_count > 0 and with_meta_count == 0:
-                click.echo(f"  ⚠️  {no_meta_count} items stuck in no_metadata (enrichment may have failed)")
-            elif with_meta_count > 0 and queue_count == 0:
-                click.echo(f"  ⚠️  {with_meta_count} items stuck in with_metadata (run process-downloads)")
-            elif queue_count > 0:
-                click.echo(f"  📥 {queue_count} items ready for download (run download-pdfs)")
-            elif downloaded_count > 0:
-                click.echo(f"  ✅ {downloaded_count} items successfully processed")
-            else:
-                click.echo(f"  📭 No items in the workflow pipeline")
-        
+            counts = {
+                'pending': cursor.execute("SELECT COUNT(*) FROM works WHERE metadata_status IN ('pending','in_progress')").fetchone()[0],
+                'matched': cursor.execute("SELECT COUNT(*) FROM works WHERE metadata_status = 'matched' AND COALESCE(download_status,'not_requested') = 'not_requested'").fetchone()[0],
+                'queued': cursor.execute("SELECT COUNT(*) FROM works WHERE download_status IN ('queued','in_progress')").fetchone()[0],
+                'downloaded': cursor.execute("SELECT COUNT(*) FROM works WHERE download_status = 'downloaded'").fetchone()[0],
+                'failed_enrichment': cursor.execute("SELECT COUNT(*) FROM works WHERE metadata_status = 'failed'").fetchone()[0],
+                'failed_download': cursor.execute("SELECT COUNT(*) FROM works WHERE download_status = 'failed'").fetchone()[0],
+            }
+            click.echo(f"\n{YELLOW}Canonical Workflow Analysis:{RESET}")
+            click.echo(f"  Pending metadata: {counts['pending']}")
+            click.echo(f"  Matched metadata: {counts['matched']}")
+            click.echo(f"  Queued/in-progress downloads: {counts['queued']}")
+            click.echo(f"  Downloaded: {counts['downloaded']}")
+            click.echo(f"  Failed enrichments: {counts['failed_enrichment']}")
+            click.echo(f"  Failed downloads: {counts['failed_download']}")
     except Exception as e:
         click.echo(f"{RED}Error inspecting tables: {e}{RESET}")
 
@@ -1152,219 +927,5 @@ def merge_log_command(db_path, limit, action, table_filter):
         if 'db_manager' in locals():
             db_manager.close_connection()
 
-@cli.command("process-pdf")
-@click.argument('pdf_path', type=click.Path(exists=True))
-@click.option('--fetch-references/--no-fetch-references', default=True, 
-              help='Fetch referenced works from enriched papers.')
-@click.option('--fetch-citations/--no-fetch-citations', default=False,
-              help='Fetch citing works for enriched papers.')
-@click.option('--max-citations', default=100, type=int,
-              help='Maximum number of citing works to fetch per paper.')
-@click.option('--move-completed/--no-move-completed', default=False,
-              help='Move PDF to completed/failed folder after processing.')
-@click.option('--db-path', default=str(DEFAULT_DB_PATH), 
-              help='Path to the SQLite database file.')
-def process_pdf_command(pdf_path, fetch_references, fetch_citations, max_citations, 
-                       move_completed, db_path):
-    """Process a single PDF through the entire pipeline."""
-    from .pipeline import PipelineOrchestrator
-    
-    click.echo(f"\n{CYAN}Processing PDF: {pdf_path}{RESET}")
-    
-    # Set up options
-    options = {
-        'fetch_references': fetch_references,
-        'fetch_citations': fetch_citations,
-        'max_citations': max_citations,
-        'move_on_complete': move_completed,
-        'completed_folder': 'completed',
-        'failed_folder': 'failed'
-    }
-    
-    try:
-        # Create orchestrator and process PDF
-        orchestrator = PipelineOrchestrator(db_path=db_path)
-        result = orchestrator.process_pdf_complete(pdf_path, options)
-        
-        # Display summary
-        click.echo(f"\n{'='*60}")
-        click.echo(f"{CYAN}Processing Complete{RESET}")
-        click.echo(f"{'='*60}")
-        
-        if result['success']:
-            click.echo(f"{GREEN}✓ Success{RESET}")
-        else:
-            click.echo(f"{RED}✗ Failed{RESET}")
-            
-        click.echo(f"\nStatistics:")
-        click.echo(f"  Extracted references: {result['extracted_refs']}")
-        click.echo(f"  Parsed references: {result['parsed_refs']}")
-        click.echo(f"  Enriched references: {result['enriched_refs']}")
-        click.echo(f"  Queued for download: {result['queued_downloads']}")
-        click.echo(f"  Successfully downloaded: {result['successful_downloads']}")
-        click.echo(f"  Failed downloads: {result['failed_downloads']}")
-        
-        if result['errors']:
-            click.echo(f"\n{RED}Errors:{RESET}")
-            for error in result['errors']:
-                click.echo(f"  • {error}")
-                
-        # Processing time
-        summary = result.get('processing_summary', {})
-        if summary:
-            click.echo(f"\nTotal processing time: {summary['total_time']:.1f} seconds")
-            
-    except Exception as e:
-        click.echo(f"{RED}Error: {e}{RESET}")
-        import traceback
-        traceback.print_exc()
-
-
-@cli.command("expand-openalex-links")
-@click.option("--db-path", default=str(DEFAULT_DB_PATH), show_default=True, help="Path to the SQLite database.")
-@click.option("--mailto", required=True, help="Email address for OpenAlex API politeness.")
-@click.option("--limit", default=50, show_default=True, help="Maximum number of works to expand.")
-@click.option("--offset", default=0, show_default=True, help="Offset into the with_metadata table.")
-@click.option(
-    "--include-related/--primary-only",
-    default=False,
-    show_default=True,
-    help="Include related works (references/cited_by) as expansion targets.",
-)
-@click.option(
-    "--fetch-references/--no-fetch-references",
-    default=True,
-    show_default=True,
-    help="Fetch referenced works for each target.",
-)
-@click.option(
-    "--fetch-citations/--no-fetch-citations",
-    default=False,
-    show_default=True,
-    help="Fetch citing works for each target.",
-)
-@click.option("--max-citations", default=50, show_default=True, help="Max citing works per target.")
-@click.option("--force", is_flag=True, help="Re-fetch even if citation edges already exist.")
-@click.option(
-    "--update-openalex-json/--no-update-openalex-json",
-    default=True,
-    show_default=True,
-    help="Persist refreshed OpenAlex JSON on the source work.",
-)
-def expand_openalex_links(
-    db_path,
-    mailto,
-    limit,
-    offset,
-    include_related,
-    fetch_references,
-    fetch_citations,
-    max_citations,
-    force,
-    update_openalex_json,
-):
-    """Expand graph links by fetching references/citations for works already in the database."""
-    from .expand_openalex import expand_openalex_links as expand_links
-
-    stats = expand_links(
-        db_path=db_path,
-        mailto=mailto,
-        limit=limit,
-        offset=offset,
-        include_related=include_related,
-        fetch_references=fetch_references,
-        fetch_citations=fetch_citations,
-        max_citations=max_citations,
-        force=force,
-        update_openalex_json=update_openalex_json,
-    )
-
-    click.echo(f"{CYAN}Expansion complete{RESET}")
-    click.echo(f"  Processed: {stats.processed}")
-    click.echo(f"  Skipped (existing): {stats.skipped_existing}")
-    click.echo(f"  Skipped (invalid): {stats.skipped_invalid}")
-    click.echo(f"  Fetched: {stats.fetched}")
-    click.echo(f"  Added refs: {stats.added_refs}")
-    click.echo(f"  Added citations: {stats.added_citations}")
-    click.echo(f"  Errors: {stats.errors}")
-
-@cli.command("process-folder")
-@click.argument('folder_path', type=click.Path(exists=True))
-@click.option('--watch/--no-watch', default=False,
-              help='Continuously watch folder for new PDFs.')
-@click.option('--interval', default=5, type=int,
-              help='Watch interval in seconds (only with --watch).')
-@click.option('--fetch-references/--no-fetch-references', default=True,
-              help='Fetch referenced works from enriched papers.')
-@click.option('--fetch-citations/--no-fetch-citations', default=False,
-              help='Fetch citing works for enriched papers.')
-@click.option('--max-citations', default=100, type=int,
-              help='Maximum number of citing works to fetch per paper.')
-@click.option('--related-depth', default=2, show_default=True, help='Reference expansion depth (1 = direct refs only).')
-@click.option('--max-related', default=40, show_default=True, help='Max nested references per work when depth > 1.')
-@click.option('--db-path', default=str(DEFAULT_DB_PATH),
-              help='Path to the SQLite database file.')
-def process_folder_command(folder_path, watch, interval, fetch_references, 
-                          fetch_citations, max_citations, related_depth, max_related, db_path):
-    """Process all PDFs in a folder (optionally with continuous watching)."""
-    from .pipeline import PipelineOrchestrator
-    
-    # Set up options
-    options = {
-        'fetch_references': fetch_references,
-        'fetch_citations': fetch_citations,
-        'max_citations': max_citations,
-        'related_depth': related_depth,
-        'max_related': max_related,
-        'move_on_complete': watch,  # Only move files when watching
-        'completed_folder': 'completed',
-        'failed_folder': 'failed'
-    }
-    
-    try:
-        orchestrator = PipelineOrchestrator(db_path=db_path)
-        
-        if watch:
-            # Continuous watching mode
-            click.echo(f"\n{CYAN}Starting folder watch: {folder_path}{RESET}")
-            click.echo(f"Check interval: {interval} seconds")
-            click.echo(f"Press Ctrl+C to stop...\n")
-            
-            orchestrator.watch_folder(folder_path, options, interval)
-        else:
-            # One-time processing
-            click.echo(f"\n{CYAN}Processing all PDFs in: {folder_path}{RESET}")
-            
-            results = orchestrator.process_folder(folder_path, options)
-            
-            # Display summary
-            if results:
-                successful = sum(1 for r in results if r['success'])
-                failed = len(results) - successful
-                
-                click.echo(f"\n{'='*60}")
-                click.echo(f"{CYAN}Batch Processing Complete{RESET}")
-                click.echo(f"{'='*60}")
-                click.echo(f"Total PDFs processed: {len(results)}")
-                click.echo(f"  {GREEN}✓ Successful: {successful}{RESET}")
-                click.echo(f"  {RED}✗ Failed: {failed}{RESET}")
-                
-                # Aggregate statistics
-                total_refs = sum(r['parsed_refs'] for r in results)
-                total_enriched = sum(r['enriched_refs'] for r in results)
-                total_downloaded = sum(r['successful_downloads'] for r in results)
-                
-                click.echo(f"\nAggregate Statistics:")
-                click.echo(f"  Total references parsed: {total_refs}")
-                click.echo(f"  Total references enriched: {total_enriched}")
-                click.echo(f"  Total papers downloaded: {total_downloaded}")
-                
-    except KeyboardInterrupt:
-        click.echo(f"\n{YELLOW}Processing interrupted by user.{RESET}")
-    except Exception as e:
-        click.echo(f"{RED}Error: {e}{RESET}")
-        import traceback
-        traceback.print_exc()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     cli()

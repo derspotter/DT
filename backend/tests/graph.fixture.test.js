@@ -8,11 +8,10 @@ function createGraphDb(dbPath) {
   const db = new Database(dbPath)
 
   db.exec(`
-    CREATE TABLE with_metadata (
+    CREATE TABLE works (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source_pdf TEXT,
       title TEXT,
-      entry_type TEXT,
+      type TEXT,
       year INTEGER,
       doi TEXT,
       normalized_doi TEXT,
@@ -21,49 +20,20 @@ function createGraphDb(dbPath) {
       normalized_authors TEXT,
       crossref_json TEXT,
       openalex_json TEXT,
-      download_state TEXT,
+      metadata_status TEXT,
+      download_status TEXT,
       source_work_id TEXT,
       relationship_type TEXT,
       run_id INTEGER,
-      ingest_source TEXT
+      source_pdf TEXT,
+      origin_key TEXT
     );
 
-    CREATE TABLE to_download_references (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source_pdf TEXT,
-      title TEXT,
-      entry_type TEXT,
-      year INTEGER,
-      doi TEXT,
-      normalized_doi TEXT,
-      openalex_id TEXT,
-      normalized_title TEXT,
-      normalized_authors TEXT,
-      crossref_json TEXT,
-      openalex_json TEXT,
-      source_work_id TEXT,
-      relationship_type TEXT,
-      run_id INTEGER,
-      ingest_source TEXT
-    );
-
-    CREATE TABLE downloaded_references (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source_pdf TEXT,
-      title TEXT,
-      entry_type TEXT,
-      year INTEGER,
-      doi TEXT,
-      normalized_doi TEXT,
-      openalex_id TEXT,
-      normalized_title TEXT,
-      normalized_authors TEXT,
-      crossref_json TEXT,
-      openalex_json TEXT,
-      source_work_id TEXT,
-      relationship_type TEXT,
-      run_id INTEGER,
-      ingest_source TEXT
+    CREATE TABLE corpus_works (
+      corpus_id INTEGER NOT NULL,
+      work_id INTEGER NOT NULL,
+      added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (corpus_id, work_id)
     );
 
     CREATE TABLE citation_edges (
@@ -74,21 +44,23 @@ function createGraphDb(dbPath) {
     );
   `)
 
-  const withMetadataInsert = db.prepare(`
-    INSERT INTO with_metadata
-    (source_pdf, title, entry_type, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, download_state, source_work_id, relationship_type, run_id, ingest_source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  const worksInsert = db.prepare(`
+    INSERT INTO works
+    (source_pdf, origin_key, title, type, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, metadata_status, download_status, source_work_id, relationship_type, run_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
 
-  const toDownloadInsert = db.prepare(`
-    INSERT INTO to_download_references
-    (source_pdf, title, entry_type, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, source_work_id, relationship_type, run_id, ingest_source)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `)
+  worksInsert.run('seed.pdf', 'seed_pdf', 'Seed Paper', 'journal-article', 2020, '10.1000/seed', '10.1000/seed', 'W100', 'seed paper', 'author-a', 'matched', 'not_requested', null, 'references', 1)
+  worksInsert.run('seed.pdf', 'seed_pdf', 'Downstream Paper', 'book-chapter', 2021, '10.1000/downstream', '10.1000/downstream', 'W200', 'downstream paper', 'author-b', 'matched', 'queued', null, 'references', 1)
+  worksInsert.run('seed.pdf', 'seed_pdf', 'Queued Cite Source', 'conference-paper', 2022, '10.1000/queued', '10.1000/queued', 'W300', 'queued cite source', 'author-c', 'matched', 'queued', 'W200', 'references', 1)
 
-  withMetadataInsert.run('seed.pdf', 'Seed Paper', 'journal-article', 2020, '10.1000/seed', '10.1000/seed', 'W100', 'seed paper', 'author-a', 'with_metadata', null, 'references', 1, 'seed_pdf')
-  withMetadataInsert.run('seed.pdf', 'Downstream Paper', 'book-chapter', 2021, '10.1000/downstream', '10.1000/downstream', 'W200', 'downstream paper', 'author-b', 'queued', null, 'references', 1, 'seed_pdf')
-  toDownloadInsert.run('seed.pdf', 'Queued Cite Source', 'conference-paper', 2022, '10.1000/queued', '10.1000/queued', 'W300', 'queued cite source', 'author-c', 'W200', 'references', 1, 'seed_pdf')
+  const corpusInsert = db.prepare(`
+    INSERT INTO corpus_works (corpus_id, work_id)
+    VALUES (?, ?)
+  `)
+  corpusInsert.run(1, 1)
+  corpusInsert.run(1, 2)
+  corpusInsert.run(1, 3)
 
   const edges = db.prepare(`
     INSERT INTO citation_edges (source_id, target_id, relationship_type, run_id)
@@ -180,11 +152,15 @@ describe('GET /api/graph (fixture db)', () => {
 
   test('respects status filters', async () => {
     const queued = await request(app)
-      .get('/api/graph?status=to_download_references&relationship=both&hide_isolates=0')
+      .get('/api/graph?status=queued_download&relationship=both&hide_isolates=0')
       .set('Authorization', `Bearer ${token}`)
     expect(queued.status).toBe(200)
-    expect(queued.body.nodes).toHaveLength(1)
-    expect(queued.body.nodes[0]).toMatchObject({ id: 'W300', status: 'to_download_references' })
-    expect(queued.body.edges).toHaveLength(0)
+    expect(queued.body.nodes).toHaveLength(2)
+    expect(queued.body.nodes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'W200', status: 'queued_download' }),
+        expect.objectContaining({ id: 'W300', status: 'queued_download' }),
+      ])
+    )
   })
 })

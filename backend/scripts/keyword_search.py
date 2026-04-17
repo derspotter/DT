@@ -505,6 +505,7 @@ def main():
     mode.add_argument('--seed-json', default=None)
     parser.add_argument('--db-path', required=True)
     parser.add_argument('--max-results', type=int, default=200)
+    parser.add_argument('--author', default=None)
     parser.add_argument('--year-from', type=int, default=None)
     parser.add_argument('--year-to', type=int, default=None)
     parser.add_argument('--field', default='default')
@@ -541,9 +542,9 @@ def main():
         return
 
     db_path = Path(args.db_path)
-    related_depth = max(1, int(args.related_depth or 1))
+    related_depth = max(0, int(args.related_depth or 0))
     related_depth_downstream = max(
-        1,
+        0,
         int(
             args.related_depth_downstream
             if args.related_depth_downstream is not None
@@ -551,7 +552,7 @@ def main():
         ),
     )
     related_depth_upstream = max(
-        1,
+        0,
         int(
             args.related_depth_upstream
             if args.related_depth_upstream is not None
@@ -568,6 +569,7 @@ def main():
             'max_results': args.max_results,
             'year_from': args.year_from,
             'year_to': args.year_to,
+            'author': args.author,
             'field': args.field,
             'mailto': args.mailto,
             'related_depth': related_depth,
@@ -586,6 +588,7 @@ def main():
                 max_results=args.max_results,
                 year_from=args.year_from,
                 year_to=args.year_to,
+                author=args.author,
                 field=args.field,
                 mailto=args.mailto,
             )

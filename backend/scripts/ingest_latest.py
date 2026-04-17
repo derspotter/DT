@@ -10,36 +10,6 @@ def parse_maybe_json_list(value):
     if isinstance(value, list):
         return value
     if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            return value
-    return value
-
-
-def normalize_text(text):
-    if not text:
-        return None
-    return re.sub(r'[^a-z0-9\s]', '', str(text).lower()).strip() or None
-
-
-def normalize_doi(doi):
-    if not doi:
-        return None
-    match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', str(doi), re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    return str(doi).upper()
-
-
-def parse_name_list(value):
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, str):
         raw = value.strip()
         if not raw:
             return []
@@ -47,108 +17,168 @@ def parse_name_list(value):
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, list):
-                    return [str(item).strip() for item in parsed if str(item).strip()]
+                    return parsed
             except Exception:
                 pass
         return [raw]
-    val = str(value).strip()
-    return [val] if val else []
+    return [str(value)]
+
+
+def parse_name_list(value):
+    parsed = parse_maybe_json_list(value)
+    if parsed is None:
+        return []
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    raw = str(parsed).strip()
+    return [raw] if raw else []
+
+
+def normalize_text(text):
+    if not text:
+        return None
+    return re.sub(r"[^a-z0-9\s]", "", str(text).lower()).strip() or None
+
+
+def normalize_doi(doi):
+    if not doi:
+        return None
+    match = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", str(doi), re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return str(doi).upper()
 
 
 def normalize_contributors(authors):
     names = parse_name_list(authors)
     if not names:
         return None
-    joined = " ".join(names)
-    return normalize_text(joined)
+    return normalize_text(" ".join(names))
 
 
 def normalize_year(value):
     if value is None:
         return None
     raw = str(value).strip()
-    return raw if raw else None
+    return raw or None
 
 
-def is_row_downloaded(cur, row, has_downloaded_references, has_work_aliases):
-    if not has_downloaded_references:
-        return False
-
-    doi = normalize_doi(row.get("doi"))
-    if doi:
-        cur.execute("SELECT 1 FROM downloaded_references WHERE doi = ? LIMIT 1", (doi,))
-        if cur.fetchone():
-            return True
-
-    normalized_title = normalize_text(row.get("title"))
-    normalized_authors = normalize_contributors(row.get("authors"))
-    year_str = normalize_year(row.get("year"))
-
-    if normalized_title and normalized_authors and year_str:
-        cur.execute(
+def build_work_indexes(conn, corpus_id=None):
+    if corpus_id is not None:
+        rows = conn.execute(
             """
-            SELECT 1
-            FROM downloaded_references
-            WHERE normalized_title = ?
-              AND normalized_authors = ?
-              AND CAST(year AS TEXT) = ?
-            LIMIT 1
+            SELECT w.id, w.title, w.authors, w.year, w.doi, w.metadata_status, w.download_status
+            FROM works w
+            JOIN corpus_works cw ON cw.work_id = w.id
+            WHERE cw.corpus_id = ?
             """,
-            (normalized_title, normalized_authors, year_str),
-        )
-        if cur.fetchone():
-            return True
+            (corpus_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, title, authors, year, doi, metadata_status, download_status FROM works"
+        ).fetchall()
 
-    if normalized_title and normalized_authors and not year_str:
-        cur.execute(
-            """
-            SELECT 1
-            FROM downloaded_references
-            WHERE normalized_title = ?
-              AND normalized_authors = ?
-            LIMIT 1
-            """,
-            (normalized_title, normalized_authors),
-        )
-        if cur.fetchone():
-            return True
+    indexes = {
+        "downloaded": {"doi": set(), "tay": set(), "ta": set()},
+        "failed_download": {"doi": set(), "tay": set(), "ta": set()},
+        "queued_download": {"doi": set(), "tay": set(), "ta": set()},
+        "matched": {"doi": set(), "tay": set(), "ta": set()},
+        "failed_enrichment": {"doi": set(), "tay": set(), "ta": set()},
+        "raw": {"doi": set(), "tay": set(), "ta": set()},
+    }
 
-    # Alias fallback: catches translated/alternate titles linked to downloaded rows.
-    if has_work_aliases and normalized_title:
-        if year_str:
-            try:
-                year_int = int(year_str)
-            except Exception:
-                year_int = None
-            if year_int is not None:
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM work_aliases
-                    WHERE work_table = 'downloaded_references'
-                      AND normalized_alias_title = ?
-                      AND (alias_year IS NULL OR alias_year BETWEEN ? AND ?)
-                    LIMIT 1
-                    """,
-                    (normalized_title, year_int - 1, year_int + 1),
-                )
-                if cur.fetchone():
-                    return True
+    def add(index_name, row):
+        doi = normalize_doi(row["doi"])
+        title = normalize_text(row["title"])
+        authors = normalize_contributors(row["authors"])
+        year = normalize_year(row["year"])
+        if doi:
+            indexes[index_name]["doi"].add(doi)
+        if title and authors and year:
+            indexes[index_name]["tay"].add((title, authors, year))
+        if title and authors:
+            indexes[index_name]["ta"].add((title, authors))
+
+    for row in rows:
+        metadata = str(row["metadata_status"] or "pending").strip().lower()
+        download = str(row["download_status"] or "not_requested").strip().lower()
+        if download == "downloaded":
+            add("downloaded", row)
+        elif download == "failed":
+            add("failed_download", row)
+        elif download in {"queued", "in_progress"}:
+            add("queued_download", row)
+        elif metadata == "matched":
+            add("matched", row)
+        elif metadata == "failed":
+            add("failed_enrichment", row)
         else:
-            cur.execute(
-                """
-                SELECT 1
-                FROM work_aliases
-                WHERE work_table = 'downloaded_references'
-                  AND normalized_alias_title = ?
-                LIMIT 1
-                """,
-                (normalized_title,),
-            )
-            if cur.fetchone():
-                return True
+            add("raw", row)
 
+    return indexes
+
+
+def matches_index(row, index):
+    doi = normalize_doi(row.get("doi"))
+    if doi and doi in index["doi"]:
+        return True
+    title = normalize_text(row.get("title"))
+    authors = normalize_contributors(row.get("authors"))
+    year = normalize_year(row.get("year"))
+    if title and authors and year and (title, authors, year) in index["tay"]:
+        return True
+    if title and authors and (title, authors) in index["ta"]:
+        return True
     return False
+
+
+def is_downloaded_by_alias(conn, row, corpus_id=None):
+    normalized_title = normalize_text(row.get("title"))
+    if not normalized_title:
+        return False
+    year = normalize_year(row.get("year"))
+    params = [normalized_title]
+    sql = """
+        SELECT 1
+        FROM work_aliases wa
+        JOIN works w ON w.id = wa.work_id
+    """
+    if corpus_id is not None:
+        sql += " JOIN corpus_works cw ON cw.work_id = w.id "
+    sql += """
+        WHERE w.download_status = 'downloaded'
+          AND wa.normalized_alias_title = ?
+    """
+    if corpus_id is not None:
+        sql += " AND cw.corpus_id = ?"
+        params.append(corpus_id)
+    if year:
+        try:
+            year_int = int(year)
+        except Exception:
+            year_int = None
+        if year_int is not None:
+            sql += " AND (wa.alias_year IS NULL OR wa.alias_year BETWEEN ? AND ?)"
+            params.extend([year_int - 1, year_int + 1])
+    sql += " LIMIT 1"
+    return conn.execute(sql, params).fetchone() is not None
+
+
+def derive_ingest_state(conn, row, indexes, corpus_id=None):
+    if matches_index(row, indexes["downloaded"]) or is_downloaded_by_alias(conn, row, corpus_id=corpus_id):
+        return "downloaded"
+    if matches_index(row, indexes["failed_download"]):
+        return "failed_download"
+    if matches_index(row, indexes["queued_download"]):
+        return "queued_download"
+    if matches_index(row, indexes["matched"]):
+        return "enriched"
+    if matches_index(row, indexes["failed_enrichment"]):
+        return "failed_enrichment"
+    if matches_index(row, indexes["raw"]):
+        return "staged_raw"
+    return "pending"
 
 
 def main():
@@ -161,104 +191,60 @@ def main():
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
 
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingest_entries'")
-    has_ingest_entries = cur.fetchone() is not None
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingest_source_metadata'")
-    has_source_metadata = cur.fetchone() is not None
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='downloaded_references'")
-    has_downloaded_references = cur.fetchone() is not None
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='work_aliases'")
-    has_work_aliases = cur.fetchone() is not None
-    ingest_entries_columns = set()
-    if has_ingest_entries:
-        cur.execute("PRAGMA table_info(ingest_entries)")
-        ingest_entries_columns = {str(row["name"]) for row in cur.fetchall()}
+    conditions = []
+    params = []
+    if args.base_name:
+        conditions.append("ingest_source = ?")
+        params.append(args.base_name)
+    if args.corpus_id is not None:
+        conditions.append("corpus_id = ?")
+        params.append(args.corpus_id)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"""
+        SELECT id, title, authors, year, doi, source, publisher, url, source_pdf,
+               created_at AS date_added
+        FROM ingest_entries
+        {where_clause}
+        ORDER BY created_at DESC LIMIT ?
+    """
+    params.append(args.limit)
+    rows = [dict(row) for row in conn.execute(query, params).fetchall()]
 
-    if has_ingest_entries:
-        has_processed_column = "processed" in ingest_entries_columns
-        conditions = []
-        params = []
-        if args.base_name:
-            conditions.append("ingest_source = ?")
-            params.append(args.base_name)
-        if args.corpus_id is not None:
-            conditions.append("corpus_id = ?")
-            params.append(args.corpus_id)
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        processed_select = "processed" if has_processed_column else "0"
-        query = f"""
-            SELECT id, title, authors, year, doi, source, publisher, url, source_pdf,
-                   created_at AS date_added, {processed_select} AS processed
-            FROM ingest_entries
-            {where_clause}
-            ORDER BY created_at DESC LIMIT ?
-        """
-        params.append(args.limit)
-    else:
-        joins = ""
-        conditions = []
-        params = []
-        if args.corpus_id is not None:
-            joins = "JOIN corpus_items ci ON ci.table_name = 'no_metadata' AND ci.row_id = no_metadata.id"
-            conditions.append("ci.corpus_id = ?")
-            params.append(args.corpus_id)
-        if args.base_name:
-            conditions.append("no_metadata.source_pdf LIKE ?")
-            params.append(f"%{args.base_name}%")
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"""
-            SELECT no_metadata.id, no_metadata.title, no_metadata.authors, no_metadata.year, no_metadata.doi,
-                   no_metadata.source, no_metadata.publisher, no_metadata.url, no_metadata.source_pdf,
-                   no_metadata.date_added, 0 AS processed
-            FROM no_metadata
-            {joins}
-            {where_clause}
-            ORDER BY no_metadata.date_added DESC LIMIT ?
-        """
-        params.append(args.limit)
-
-    cur.execute(query, params)
-    rows = [dict(row) for row in cur.fetchall()]
+    indexes = build_work_indexes(conn, corpus_id=args.corpus_id)
     for row in rows:
         row["authors"] = parse_maybe_json_list(row.get("authors"))
-        downloaded = is_row_downloaded(cur, row, has_downloaded_references, has_work_aliases)
-        processed = int(row.get("processed") or 0) > 0
-        if downloaded:
-            row["ingest_state"] = "downloaded"
-        elif processed:
-            row["ingest_state"] = "enriched"
-        else:
-            row["ingest_state"] = "pending"
+        row["ingest_state"] = derive_ingest_state(conn, row, indexes, corpus_id=args.corpus_id)
 
     seed_document = None
-    if args.base_name and has_source_metadata:
-        metadata_params = [args.base_name]
-        corpus_filter = ""
-        if args.corpus_id is not None:
-            corpus_filter = "AND corpus_id = ?"
-            metadata_params.append(args.corpus_id)
-        else:
-            corpus_filter = "AND corpus_id = 0"
+    metadata_params = []
+    metadata_conditions = []
+    if args.base_name:
+        metadata_conditions.append("ingest_source = ?")
+        metadata_params.append(args.base_name)
+    if args.corpus_id is not None:
+        metadata_conditions.append("corpus_id = ?")
+        metadata_params.append(args.corpus_id)
+    elif args.base_name:
+        metadata_conditions.append("corpus_id = 0")
 
-        cur.execute(
+    if metadata_conditions:
+        md_where = f"WHERE {' AND '.join(metadata_conditions)}"
+        md_row = conn.execute(
             f"""
             SELECT title, authors, year, doi, source, publisher, source_pdf, ingest_source, updated_at, created_at
             FROM ingest_source_metadata
-            WHERE ingest_source = ?
-            {corpus_filter}
+            {md_where}
             ORDER BY updated_at DESC, created_at DESC
             LIMIT 1
             """,
             metadata_params,
-        )
-        md_row = cur.fetchone()
+        ).fetchone()
         if md_row:
             seed_document = dict(md_row)
             seed_document["authors"] = parse_maybe_json_list(seed_document.get("authors"))
-    conn.close()
 
+    conn.close()
     print(json.dumps({"items": rows, "total": len(rows), "source": "db", "seed_document": seed_document}))
 
 

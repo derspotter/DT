@@ -69,7 +69,7 @@ This plan implements the signed Werkvertrag (WISY‑2025‑00021) and the Pflich
    - Add a `graph_exports` table to persist snapshots if needed
 
 2) **Data extraction**
-   - Build a graph builder that converts `with_metadata` + `downloaded_references` + `work_aliases` into nodes
+   - Build a graph builder that converts canonical `works` + `work_aliases` into nodes
    - Use `source_work_id` + `relationship_type` to generate citation edges
    - Add filters: time range, source PDF, run_id, max nodes
 

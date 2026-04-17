@@ -13,11 +13,10 @@ function createTestDb(filename, setupRows) {
   const db = new Database(filename);
 
   db.exec(`
-    CREATE TABLE with_metadata (
+    CREATE TABLE works (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      source_pdf TEXT,
       title TEXT,
-      entry_type TEXT,
+      type TEXT,
       year INTEGER,
       doi TEXT,
       normalized_doi TEXT,
@@ -27,10 +26,13 @@ function createTestDb(filename, setupRows) {
       abstract TEXT,
       crossref_json TEXT,
       openalex_json TEXT,
-      download_state TEXT,
+      metadata_status TEXT,
+      download_status TEXT,
       source_work_id INTEGER,
       relationship_type TEXT,
-      run_id INTEGER
+      run_id INTEGER,
+      origin_key TEXT,
+      source_pdf TEXT
     )
   `);
 
@@ -68,14 +70,14 @@ describe('graph_export fallback edge mapping', () => {
     try {
       createTestDb(dbPath, (db) => {
         const insert = db.prepare(`
-          INSERT INTO with_metadata
-          (title, entry_type, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, download_state, source_work_id, relationship_type, run_id)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO works
+          (title, type, year, doi, normalized_doi, openalex_id, normalized_title, normalized_authors, metadata_status, download_status, source_work_id, relationship_type, run_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
 
-        insert.run('Source work', 'journal-article', 2020, '10.1/source', '10.1/source', 'W1', 'source work', 'a1', 'with_metadata', null, null, 1);
-        insert.run('Row-id edge target', 'journal-article', 2021, '10.1/row', '10.1/row', 'W2', 'row-id edge target', 'a2', 'with_metadata', 1, 'references', 1);
-        insert.run('OpenAlex edge target', 'journal-article', 2022, '10.1/oa', '10.1/oa', 'W3', 'openalex edge target', 'a3', 'with_metadata', 'W1', 'cited_by', 1);
+        insert.run('Source work', 'journal-article', 2020, '10.1/source', '10.1/source', 'W1', 'source work', 'a1', 'matched', 'not_requested', null, null, 1);
+        insert.run('Row-id edge target', 'journal-article', 2021, '10.1/row', '10.1/row', 'W2', 'row-id edge target', 'a2', 'matched', 'not_requested', 1, 'references', 1);
+        insert.run('OpenAlex edge target', 'journal-article', 2022, '10.1/oa', '10.1/oa', 'W3', 'openalex edge target', 'a3', 'matched', 'not_requested', 'W1', 'cited_by', 1);
       });
 
       const payload = runGraphExport(dbPath);
