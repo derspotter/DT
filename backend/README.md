@@ -53,7 +53,7 @@ Continuous interval scheduling logic exists in code but is in a transitional wir
 - `src/app.js`: API routes + queue insertion + Python spawning
 - `scripts/daemon/worker.py`: `pipeline_jobs` consumer
 - `scripts/ingest_enqueue.py`: marks selected ingest rows for enrichment
-- `scripts/ingest_process_marked.py`: standalone enrich runner (DB-scoped)
+- `scripts/migrate_to_works.py`: one-time canonical schema migration
 
 ## Environment
 

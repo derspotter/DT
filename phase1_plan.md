@@ -108,8 +108,8 @@
 - Gemini SDK update (Jan 26, 2026): switched to the new Google GenAI Python SDK + Files API (`google-genai`), including `client.files.upload/delete` and `client.models.generate_content` with JSON output config.
 - Download pipeline hygiene (Jan 26, 2026): `BibliographyEnhancer` now uses `PDFDownloader` for OpenAlex/OA downloads before falling back to direct URL/Sci‑Hub logic.
 - Download pipeline hygiene (Jan 26, 2026): centralized PDF validation in `pdf_downloader.py` and reuse it for direct URL downloads; queue worker now drops entries already present in `downloaded_references`.
-- Duplicate handling (Jan 26, 2026): `promote_to_with_metadata` now drops duplicates found in `with_metadata` too; JSON ingestion now checks title/authors/year in `check_if_exists`.
-- Duplicate handling tests (Jan 27, 2026): added db-level tests covering `promote_to_with_metadata` dedupe and JSON ingestion title/author/year skips.
+- Duplicate handling (Jan 26, 2026): enriched metadata application now merges duplicates into the canonical `works` table; JSON ingestion checks title/authors/year in `check_if_exists`.
+- Duplicate handling tests (Jan 27, 2026): added db-level tests covering canonical enrichment dedupe and JSON ingestion title/author/year skips.
 - Duplicate handling upgrades (Jan 27, 2026): alias matching now allows ±1 year; new `merge_log` table records dedupe decisions; duplicates are merged into the highest-priority survivor (downloaded > queue > with_metadata > no_metadata) with field backfill; pipeline ingestion can resolve identifiers for potential duplicates before insertion.
 - Duplicate handling tests (Jan 28, 2026): added tests for alias-year tolerance and merge_log entries.
 - CLI inspection update (Jan 28, 2026): `inspect-tables` now includes `merge_log` for dedupe auditing.

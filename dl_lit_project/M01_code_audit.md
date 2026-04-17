@@ -22,8 +22,8 @@ Scope audited (Pflichtenheft M-01):
 
 ## Consolidation status
 
-- Database pipeline is canonicalized around staged tables (`no_metadata` -> `with_metadata` -> `downloaded_references`) with corpus scoping via `corpus_items`.
-- CLI surface is stable and DB-first commands remain canonical (`extract-bib-pages`, `extract-bib-api`, `run-pipeline`, `keyword-search`, `enrich-openalex-db`, download commands).
+- Database pipeline is canonicalized around `works` plus `corpus_works`, with state stored directly on `works`.
+- CLI surface is stable and DB-first commands remain canonical (`extract-bib-pages`, `extract-bib-api`, `keyword-search`, queue/download commands).
 - Legacy compatibility is preserved; behavior is aligned to DB-first runtime.
 
 ## Verification
