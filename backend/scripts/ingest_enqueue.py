@@ -35,12 +35,11 @@ def _mark_selected(db: DatabaseManager, no_meta_id: int, selected: int = 1) -> N
         return
     cur = db.conn.cursor()
     cur.execute(
-        """UPDATE no_metadata
-              SET selected_for_enrichment = 0,
-                  enrich_state = 'pending',
-                  enrich_claimed_by = NULL,
-                  enrich_claimed_at = NULL,
-                  enrich_lease_expires_at = NULL
+        """UPDATE works
+              SET metadata_status = 'pending',
+                  metadata_claimed_by = NULL,
+                  metadata_claimed_at = NULL,
+                  metadata_lease_expires_at = NULL
             WHERE id = ?""",
         (no_meta_id,),
     )
@@ -49,7 +48,7 @@ def _mark_selected(db: DatabaseManager, no_meta_id: int, selected: int = 1) -> N
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Mark selected ingest_entries as selected_for_enrichment in no_metadata (no stage skipping)."
+        description="Stage selected ingest_entries as pending works for enrichment."
     )
     parser.add_argument("--db-path", required=True, help="Path to SQLite DB.")
     parser.add_argument("--entry-ids", required=True, help="Comma-separated ingest_entries ids.")
@@ -71,7 +70,7 @@ def main():
         where += " AND corpus_id = ?"
         params.append(args.corpus_id)
 
-    # Prefer entry_json for lossless re-staging if we need to insert missing rows into no_metadata.
+    # Prefer entry_json for lossless re-staging if we need to insert missing works.
     cur.execute(
         f"""
         SELECT id, entry_json, title, authors, year, doi, source, publisher, url, source_pdf, ingest_source
@@ -132,14 +131,31 @@ def main():
             year=entry.get("year"),
         )
 
-        if tbl == "no_metadata" and eid is not None:
-            _mark_selected(db, int(eid), selected=1)
-            marked += 1
-            results.append({"ingest_entry_id": ingest_id, "action": "marked", "no_metadata_id": int(eid)})
-            continue
+        if tbl == "works" and eid is not None:
+            work_row = db.get_entry_by_id("works", int(eid)) or {}
+            if args.corpus_id is not None:
+                db.add_corpus_item(args.corpus_id, "works", int(eid))
+            metadata_status = str(work_row.get("metadata_status") or "pending").strip().lower()
+            download_status = str(work_row.get("download_status") or "not_requested").strip().lower()
+            if download_status == "downloaded":
+                already_processed += 1
+                results.append(
+                    {
+                        "ingest_entry_id": ingest_id,
+                        "action": "already_processed",
+                        "existing_table": tbl,
+                        "existing_id": int(eid),
+                        "matched_on": field,
+                    }
+                )
+                continue
 
-        if tbl in ("with_metadata", "to_download_references", "downloaded_references") and eid is not None:
-            # Do not skip stages: these are already past raw. We just report.
+            if metadata_status in {"pending", "failed"} and download_status in {"not_requested", ""}:
+                _mark_selected(db, int(eid), selected=1)
+                marked += 1
+                results.append({"ingest_entry_id": ingest_id, "action": "marked", "work_id": int(eid)})
+                continue
+
             already_processed += 1
             results.append(
                 {
@@ -152,13 +168,13 @@ def main():
             )
             continue
 
-        # Not staged yet: insert into no_metadata, then mark selected.
-        no_meta_id, err = db.insert_no_metadata(entry, resolve_potential_duplicates=False)
-        if no_meta_id:
+        # Not staged yet: insert into canonical works, then mark selected.
+        work_id, err = db.create_pending_work(entry, resolve_potential_duplicates=False)
+        if work_id:
             staged += 1
-            _mark_selected(db, int(no_meta_id), selected=1)
+            _mark_selected(db, int(work_id), selected=1)
             marked += 1
-            results.append({"ingest_entry_id": ingest_id, "action": "staged_and_marked", "no_metadata_id": int(no_meta_id)})
+            results.append({"ingest_entry_id": ingest_id, "action": "staged_and_marked", "work_id": int(work_id)})
         else:
             duplicates += 1
             results.append({"ingest_entry_id": ingest_id, "action": "duplicate_or_skipped", "message": err})

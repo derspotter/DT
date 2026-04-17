@@ -104,16 +104,16 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
   const joins = []
   const where = []
   const params = []
-  if (corpusId !== null && ['no_metadata', 'with_metadata', 'downloaded_references', 'to_download_references', 'failed_enrichments', 'failed_downloads'].includes(table)) {
-    joins.push(`JOIN corpus_items ci ON ci.table_name = '${table}' AND ci.row_id = t.id`)
-    where.push('ci.corpus_id = ?')
+  if (corpusId !== null && table === 'works') {
+    joins.push('JOIN corpus_works cw ON cw.work_id = t.id')
+    where.push('cw.corpus_id = ?')
     params.push(corpusId)
   }
-  if (table === 'no_metadata' && requireSelected) {
-    where.push('COALESCE(t.selected_for_enrichment, 0) = 1')
+  if (table === 'works' && requireSelected) {
+    where.push(`COALESCE(t.metadata_status, 'pending') = 'pending'`)
   }
-  if (table === 'with_metadata' && onlyQueued) {
-    where.push(`COALESCE(t.download_state, 'with_metadata') IN ('queued', 'in_progress')`)
+  if (table === 'works' && onlyQueued) {
+    where.push(`COALESCE(t.download_status, 'not_requested') IN ('queued', 'in_progress')`)
   }
 
   const columns = ['t.id', 't.title', 't.authors', 't.year', 't.doi']
@@ -122,6 +122,8 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
     if (cols.includes('openalex_id')) columns.push('t.openalex_id')
     if (cols.includes('download_state')) columns.push('t.download_state')
     if (cols.includes('download_last_error')) columns.push('t.download_last_error')
+    if (cols.includes('metadata_status')) columns.push('t.metadata_status')
+    if (cols.includes('download_status')) columns.push('t.download_status')
   }
 
   const query = `
@@ -271,25 +273,33 @@ function findIdsWithAliases(row, lookup, aliasIndex) {
 }
 
 function createStateResolver(db, corpusId) {
-  const localDownloadedRows = loadMatchRows(db, 'downloaded_references', { corpusId })
-  const localRawRows = loadMatchRows(db, 'no_metadata', { corpusId })
-  const localWithMetadataRows = loadMatchRows(db, 'with_metadata', { corpusId })
-  const localFailedEnrichmentRows = loadMatchRows(db, 'failed_enrichments', { corpusId })
-  const localFailedDownloadRows = loadMatchRows(db, 'failed_downloads', { corpusId })
+  const allRows = loadMatchRows(db, 'works')
+  const localRows = loadMatchRows(db, 'works', { corpusId })
+  const localDownloadedRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
+  const localRawRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'pending')
+  const localWithMetadataRows = localRows.filter((row) => {
+    const metadata = String(row?.metadata_status || '').trim().toLowerCase()
+    const download = String(row?.download_status || '').trim().toLowerCase()
+    return metadata === 'matched' && !['queued', 'in_progress', 'downloaded', 'failed'].includes(download)
+  })
+  const localFailedEnrichmentRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'failed')
+  const localFailedDownloadRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'failed')
+  const localQueuedEnrichmentRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'in_progress')
+  const localQueuedDownloadRows = localRows.filter((row) => ['queued', 'in_progress'].includes(String(row?.download_status || '').trim().toLowerCase()))
   const indexes = {
     raw: buildMatchIndex(localRawRows),
-    queuedEnrichment: buildMatchIndex(loadMatchRows(db, 'no_metadata', { corpusId, requireSelected: true })),
+    queuedEnrichment: buildMatchIndex(localQueuedEnrichmentRows),
     withMetadata: buildMatchIndex(localWithMetadataRows),
-    queuedDownload: buildMatchIndex(loadMatchRows(db, 'with_metadata', { corpusId, onlyQueued: true })),
-    downloaded: buildMatchLookup(loadMatchRows(db, 'downloaded_references')),
+    queuedDownload: buildMatchIndex(localQueuedDownloadRows),
+    downloaded: buildMatchLookup(allRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')),
     failedDownloadLookup: buildMatchLookup(localFailedDownloadRows),
     failedEnrichment: buildMatchIndex(localFailedEnrichmentRows),
     failedDownload: buildMatchIndex(localFailedDownloadRows),
   }
   const localDownloadedIds = new Set(localDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localFailedDownloadIds = new Set(localFailedDownloadRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
-  const downloadedAliasIndex = loadAliasIndex(db, 'downloaded_references')
-  const failedDownloadAliasIndex = loadAliasIndex(db, 'failed_downloads', localFailedDownloadIds)
+  const downloadedAliasIndex = loadAliasIndex(db, 'works')
+  const failedDownloadAliasIndex = loadAliasIndex(db, 'works', localFailedDownloadIds)
   const isInCorpus = (row) => {
     const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
     for (const matchedId of downloadedIds) {
@@ -426,9 +436,7 @@ function normalizeSearchCandidate(row, resolverBundle) {
     url: raw?.primary_location?.pdf_url || raw?.primary_location?.landing_page_url || raw?.id || null,
     openalex_id: row.openalex_id || raw.id || null,
     type: raw?.type || null,
-    abstract: raw?.abstract_inverted_index ? JSON.stringify(raw.abstract_inverted_index) : null,
     created_at: row.created_at || null,
-    raw_json: raw,
   }
   candidate.state = resolverBundle.resolveState(candidate)
   candidate.in_corpus = resolverBundle.isInCorpus(candidate)
@@ -457,29 +465,14 @@ export function ensureSeedSchema(db) {
       dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
     );
-    CREATE TABLE IF NOT EXISTS seed_candidates_in_corpus (
-      corpus_id INTEGER NOT NULL,
-      source_type TEXT NOT NULL,
-      source_key TEXT NOT NULL,
-      candidate_key TEXT NOT NULL,
-      marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
-    );
     CREATE INDEX IF NOT EXISTS idx_search_run_corpora_corpus ON search_run_corpora(corpus_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_seed_sources_hidden_lookup ON seed_sources_hidden(corpus_id, source_type, source_key);
     CREATE INDEX IF NOT EXISTS idx_seed_candidates_dismissed_lookup ON seed_candidates_dismissed(corpus_id, source_type, source_key);
-    CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_lookup ON seed_candidates_in_corpus(corpus_id, source_type, source_key);
   `)
 }
 
 function loadInCorpusCandidateKeySet(db, corpusId, sourceType, sourceKey) {
-  if (!tableExists(db, 'seed_candidates_in_corpus')) return new Set()
-  const rows = db.prepare(
-    `SELECT candidate_key
-     FROM seed_candidates_in_corpus
-     WHERE corpus_id = ? AND source_type = ? AND source_key = ?`
-  ).all(corpusId, sourceType, String(sourceKey))
-  return new Set(rows.map((row) => String(row.candidate_key || '')))
+  return new Set()
 }
 
 export function upsertSearchRunCorpus(db, { searchRunId, corpusId }) {

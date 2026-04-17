@@ -1,46 +1,44 @@
 import argparse
 import json
-import re
-import sqlite3
 import os
+import sqlite3
+
 
 STUB_ITEMS = [
     {
-        'id': 101,
-        'title': 'The New Institutional Economics',
-        'status': 'queued',
-        'attempts': 0,
+        "id": 101,
+        "title": "The New Institutional Economics",
+        "status": "queued",
+        "attempts": 0,
+        "downloaded_at": None,
     },
     {
-        'id': 102,
-        'title': 'Markets and Hierarchies',
-        'status': 'in_progress',
-        'attempts': 1,
+        "id": 102,
+        "title": "Markets and Hierarchies",
+        "status": "in_progress",
+        "attempts": 1,
+        "downloaded_at": None,
+    },
+    {
+        "id": 103,
+        "title": "The Nature of the Firm",
+        "status": "downloaded",
+        "attempts": 1,
+        "downloaded_at": "2026-04-08T10:00:00",
     },
 ]
-
-ATTEMPT_RE = re.compile(r'Attempt\s+(\d+)', re.IGNORECASE)
-
-
-def parse_attempts(status_notes):
-    if not status_notes:
-        return 0
-    match = ATTEMPT_RE.search(status_notes)
-    if match:
-        return int(match.group(1))
-    return 0
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--db-path', required=True)
-    parser.add_argument('--limit', type=int, default=200)
-    parser.add_argument('--offset', type=int, default=0)
-    parser.add_argument('--corpus-id', type=int, default=None)
+    parser.add_argument("--db-path", required=True)
+    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--corpus-id", type=int, default=None)
     args = parser.parse_args()
 
-    if os.environ.get('RAG_FEEDER_STUB') == '1':
-        print(json.dumps({'items': STUB_ITEMS, 'total': len(STUB_ITEMS), 'source': 'stub'}))
+    if os.environ.get("RAG_FEEDER_STUB") == "1":
+        print(json.dumps({"items": STUB_ITEMS, "total": len(STUB_ITEMS), "source": "stub"}))
         return
 
     conn = sqlite3.connect(args.db_path)
@@ -48,33 +46,42 @@ def main():
 
     items = []
     try:
+        params = []
+        corpus_join = ''
+        corpus_where = ''
         if args.corpus_id is not None:
-            rows = conn.execute(
-                """SELECT t.* FROM with_metadata t
-                   JOIN corpus_items ci
-                     ON ci.table_name = 'with_metadata' AND ci.row_id = t.id
-                  WHERE ci.corpus_id = ?
-                    AND t.download_state IN ('queued', 'in_progress')""",
-                (args.corpus_id,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM with_metadata WHERE download_state IN ('queued', 'in_progress')"
-            ).fetchall()
+            corpus_join = 'JOIN corpus_works cw ON cw.work_id = w.id'
+            corpus_where = 'cw.corpus_id = ? AND'
+            params.append(args.corpus_id)
+
+        rows = conn.execute(
+            f"""
+            SELECT w.id, w.title, w.download_status, w.download_attempt_count, w.downloaded_at
+            FROM works w
+            {corpus_join}
+            WHERE {corpus_where} w.download_status IN ('queued', 'in_progress', 'downloaded')
+            ORDER BY
+              CASE w.download_status
+                WHEN 'in_progress' THEN 0
+                WHEN 'queued' THEN 1
+                WHEN 'downloaded' THEN 2
+                ELSE 9
+              END,
+              CASE WHEN w.download_status = 'downloaded' THEN datetime(w.downloaded_at) END DESC,
+              w.id DESC
+            """,
+            params,
+        ).fetchall()
 
         for row in rows:
             data = dict(row)
-            status_notes = data.get('status_notes')
-            status = (data.get('download_state') or '').strip() or 'queued'
-            attempts = data.get('download_attempt_count')
-            if attempts is None:
-                attempts = parse_attempts(status_notes)
             items.append(
                 {
-                    'id': data.get('id'),
-                    'title': data.get('title'),
-                    'status': status,
-                    'attempts': int(attempts or 0),
+                    "id": data.get("id"),
+                    "title": data.get("title"),
+                    "status": (data.get("download_status") or "").strip() or "queued",
+                    "attempts": int(data.get("download_attempt_count") or 0),
+                    "downloaded_at": data.get("downloaded_at"),
                 }
             )
     except sqlite3.Error:
@@ -82,15 +89,13 @@ def main():
     finally:
         conn.close()
 
-    status_rank = {'in_progress': 0, 'queued': 1, 'failed': 2}
-    items.sort(key=lambda x: (status_rank.get(x.get('status') or '', 99), -int(x.get('id') or 0)))
     total = len(items)
     start = max(args.offset, 0)
     end = start + max(args.limit, 0)
     items = items[start:end]
 
-    print(json.dumps({'items': items, 'total': total}))
+    print(json.dumps({"items": items, "total": total}))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

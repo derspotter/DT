@@ -357,34 +357,30 @@ class PipelineDaemon:
     def do_mark(self, corpus_id: int, limit: int):
         cur = self.db.conn.cursor()
         if corpus_id is None:
-            cur.execute("SELECT COUNT(*) FROM no_metadata WHERE COALESCE(selected_for_enrichment, 0) = 0")
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM works
+                WHERE COALESCE(metadata_status, 'pending') IN ('pending', 'in_progress')
+                  AND COALESCE(download_status, 'not_requested') = 'not_requested'
+                """
+            )
             available = int(cur.fetchone()[0])
-            cur.execute("SELECT id FROM no_metadata WHERE COALESCE(selected_for_enrichment, 0) = 0 ORDER BY id LIMIT ?", (limit,))
         else:
             cur.execute(
                 """
-                SELECT COUNT(*) FROM no_metadata nm
-                JOIN corpus_items ci ON ci.table_name = 'no_metadata' AND ci.row_id = nm.id
-                WHERE ci.corpus_id = ? AND COALESCE(nm.selected_for_enrichment, 0) = 0
+                SELECT COUNT(*)
+                FROM works w
+                JOIN corpus_works cw ON cw.work_id = w.id
+                WHERE cw.corpus_id = ?
+                  AND COALESCE(w.metadata_status, 'pending') IN ('pending', 'in_progress')
+                  AND COALESCE(w.download_status, 'not_requested') = 'not_requested'
                 """, (corpus_id,)
             )
             available = int(cur.fetchone()[0])
-            cur.execute(
-                """
-                SELECT nm.id FROM no_metadata nm
-                JOIN corpus_items ci ON ci.table_name = 'no_metadata' AND ci.row_id = nm.id
-                WHERE ci.corpus_id = ? AND COALESCE(nm.selected_for_enrichment, 0) = 0
-                ORDER BY nm.id LIMIT ?
-                """, (corpus_id, limit)
-            )
-        
-        ids = [int(row[0]) for row in cur.fetchall()]
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
-            cur.execute(f"UPDATE no_metadata SET selected_for_enrichment = 1 WHERE id IN ({placeholders})", ids)
-            self.db.conn.commit()
-            
-        return {"requested": limit, "marked": len(ids), "available": available, "ids": ids}
+
+        # Canonical works no longer require a separate raw-marking step.
+        return {"requested": limit, "marked": 0, "available": available, "ids": []}
 
     # --- ENRICHMENT LOGIC ---
     def _enrich_single(self, entry, fetch_refs, fetch_cites, max_cites, rel_down, rel_up, max_rel):
@@ -415,7 +411,7 @@ class PipelineDaemon:
         return int(entry["id"]), None, {"status": status, "attempts": attempt + 1, "diagnostics": last_diag}
 
     def _attempt_raw_download(self, entry: dict) -> tuple[bool, dict]:
-        no_meta_id = int(entry["id"])
+        pending_work_id = int(entry["id"])
         ref = {
             "title": entry.get("title"),
             "authors": entry.get("authors") or [],
@@ -430,7 +426,7 @@ class PipelineDaemon:
             result = self.enhancer.enhance_bibliography(ref, self.download_dir)
         except Exception as exc:
             return False, {
-                "no_metadata_id": no_meta_id,
+                "pending_work_id": pending_work_id,
                 "action": "raw_download_failed",
                 "failure_category": "enhancer_exception",
                 "failure_detail": str(exc),
@@ -439,7 +435,7 @@ class PipelineDaemon:
         download_result = result if isinstance(result, dict) else ref
         if not download_result or not download_result.get("downloaded_file"):
             return False, {
-                "no_metadata_id": no_meta_id,
+                "pending_work_id": pending_work_id,
                 "action": "raw_download_failed",
                 "failure_category": download_result.get("download_failure_category") if isinstance(download_result, dict) else "download_failed",
                 "failure_detail": download_result.get("download_failure_detail") if isinstance(download_result, dict) else "download_failed",
@@ -454,8 +450,8 @@ class PipelineDaemon:
             checksum = ""
 
         with self.db_lock:
-            downloaded_id, move_error = self.db.move_no_metadata_entry_to_downloaded(
-                no_meta_id,
+            downloaded_id, move_error = self.db.mark_raw_work_downloaded(
+                pending_work_id,
                 download_result,
                 fp,
                 checksum,
@@ -464,22 +460,22 @@ class PipelineDaemon:
 
         if move_error or not downloaded_id:
             return False, {
-                "no_metadata_id": no_meta_id,
+                "pending_work_id": pending_work_id,
                 "action": "raw_download_failed",
                 "failure_category": "move_to_downloaded_failed",
                 "failure_detail": move_error or "move_to_downloaded_failed",
             }
 
         return True, {
-            "no_metadata_id": no_meta_id,
+            "pending_work_id": pending_work_id,
             "action": "downloaded_after_enrich_failure",
             "downloaded_id": int(downloaded_id),
             "source": download_result.get("download_source", "unknown"),
             "route": download_result.get("download_route"),
         }
 
-    def do_enrich(self, corpus_id: int, limit: int, workers: int, expansion: dict, no_metadata_ids: list[int] | None = None):
-        target_ids = [int(value) for value in (no_metadata_ids or []) if str(value).strip().isdigit() and int(value) > 0]
+    def do_enrich(self, corpus_id: int, limit: int, workers: int, expansion: dict, pending_work_ids: list[int] | None = None):
+        target_ids = [int(value) for value in (pending_work_ids or []) if str(value).strip().isdigit() and int(value) > 0]
         to_process = self.db.claim_enrich_batch(
             limit=max(1, int(limit or 1)),
             corpus_id=corpus_id,
@@ -532,7 +528,7 @@ class PipelineDaemon:
                 }
                 for future in as_completed(futures):
                     entry = futures[future]
-                    no_meta_id = int(entry["id"])
+                    pending_work_id = int(entry["id"])
                     processed += 1
                     try:
                         _, enriched, enrich_meta = future.result()
@@ -547,15 +543,15 @@ class PipelineDaemon:
                             continue
                         failed += 1
                         reason = "Metadata fetch failed"
-                        moved_id, err = self.db.move_no_meta_entry_to_failed(no_meta_id, reason)
-                        result_payload = {"no_metadata_id": no_meta_id, "action": "failed_enrichment"}
+                        moved_id, err = self.db.mark_metadata_failed(pending_work_id, reason)
+                        result_payload = {"pending_work_id": pending_work_id, "action": "failed_enrichment"}
                         if raw_download_result:
                             result_payload["raw_download"] = raw_download_result
                         results.append(result_payload)
                         continue
 
-                    wid, err = self.db.promote_to_with_metadata(
-                        no_meta_id, enriched, expand_related=(rel_down > 1 and fetch_refs), max_related_per_source=max_rel
+                    wid, err = self.db.apply_enriched_metadata(
+                        pending_work_id, enriched, expand_related=(rel_down > 1 and fetch_refs), max_related_per_source=max_rel
                     )
                     if not wid:
                         dup = parse_duplicate_merge_marker(err)
@@ -565,11 +561,11 @@ class PipelineDaemon:
                             canonical_id_raw = dup.get("id") or ""
                             queue_id_raw = dup.get("queue_id") or ""
                             queued_flag = (dup.get("queued") or "") == "1"
-                            if canonical_table == "with_metadata" and queued_flag:
+                            if canonical_table == "works" and queued_flag:
                                 queued += 1
                             results.append(
                                 {
-                                    "no_metadata_id": no_meta_id,
+                                    "pending_work_id": pending_work_id,
                                     "action": "duplicate_merged",
                                     "canonical_table": canonical_table,
                                     "canonical_id": int(canonical_id_raw) if canonical_id_raw.isdigit() else None,
@@ -579,26 +575,33 @@ class PipelineDaemon:
                             )
                         else:
                             failed += 1
-                            errors.append(err or f"Promotion failed for no_metadata:{no_meta_id}")
-                            self.db.reset_enrich_claim(no_meta_id, state="pending", error=err or "promotion_failed", selected=0)
-                            results.append({"no_metadata_id": no_meta_id, "action": "promotion_failed", "error": err})
+                            errors.append(err or f"Promotion failed for pending work {pending_work_id}")
+                            self.db.reset_enrich_claim(pending_work_id, state="pending", error=err or "promotion_failed", selected=0)
+                            results.append({"pending_work_id": pending_work_id, "action": "promotion_failed", "error": err})
                         if dup:
-                            self.db.delete_no_metadata_entry(no_meta_id)
+                            self.db.delete_work(pending_work_id)
                         continue
 
                     promoted += 1
                     qid, qerr = self.db.enqueue_for_download(int(wid))
                     if qid:
                         queued += 1
-                        results.append({"no_metadata_id": no_meta_id, "with_metadata_id": int(wid), "queue_id": int(qid), "action": "queued"})
+                        results.append({"pending_work_id": pending_work_id, "work_id": int(wid), "queue_id": int(qid), "action": "queued"})
                     else:
-                        results.append({"no_metadata_id": no_meta_id, "with_metadata_id": int(wid), "action": "enqueue_skipped"})
+                        results.append({"pending_work_id": pending_work_id, "work_id": int(wid), "action": "enqueue_skipped"})
 
             if remaining_entries and self._has_pending_corpus_download_jobs():
                 deferred_reason = "pending_download"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
                 log(
-                    f"Yielding enrich batch after {processed} item(s); {len(remaining_ids)} no_metadata row(s) remain and a corpus download job is pending."
+                    f"Yielding enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and a corpus download job is pending."
+                )
+                break
+            if corpus_id is None and remaining_entries and self._has_pending_interactive_jobs():
+                deferred_reason = "interactive_backlog"
+                remaining_ids = [int(entry["id"]) for entry in remaining_entries]
+                log(
+                    f"Yielding global enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and an interactive corpus job is waiting."
                 )
                 break
 
@@ -611,7 +614,7 @@ class PipelineDaemon:
             "targeted_ids": target_ids,
             "deferred": bool(remaining_ids),
             "deferred_reason": deferred_reason,
-            "remaining_no_metadata_ids": remaining_ids,
+            "remaining_pending_work_ids": remaining_ids,
             "errors": errors,
             "results": results,
         }
@@ -631,11 +634,16 @@ class PipelineDaemon:
         with self.db_lock:
             dup_table, dup_id, dup_field = self.db.check_if_exists(
                 doi=row.get("doi"), openalex_id=row.get("openalex_id"), title=row.get("title"),
-                authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="with_metadata"
+                authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="works"
             )
-        if dup_table == "downloaded_references" and dup_id is not None:
+        if dup_table == "works" and dup_id is not None:
+            existing = self.db.get_entry_by_id("works", int(dup_id)) or {}
+            if str(existing.get("download_status") or "").strip().lower() != "downloaded":
+                dup_table = None
+                dup_id = None
+        if dup_table == "works" and dup_id is not None:
             with self.db_lock:
-                ok, msg = self.db.drop_queue_entry_as_duplicate(qid, dup_table, dup_id, dup_field)
+                ok, msg = self.db.merge_duplicate_queued_work(qid, dup_table, dup_id, dup_field)
             return "skipped", {"queue_id": qid, "action": "dropped_duplicate"}
 
         ref = {
@@ -679,7 +687,7 @@ class PipelineDaemon:
                 downloaded_id, move_error = self.db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
             if move_error or not downloaded_id:
                 with self.db_lock:
-                    self.db.move_queue_entry_to_failed(qid, "move_to_downloaded_failed")
+                    self.db.mark_download_failed(qid, "move_to_downloaded_failed")
                 return "failed", {
                     "queue_id": qid,
                     "action": "failed",
@@ -701,7 +709,7 @@ class PipelineDaemon:
             failure_category = download_result.get("download_failure_category") or "download_failed"
             failure_detail = download_result.get("download_failure_detail") or download_result.get("download_reason") or "download_failed"
             with self.db_lock:
-                self.db.move_queue_entry_to_failed(qid, failure_category)
+                self.db.mark_download_failed(qid, failure_category)
             return "failed", {
                 "queue_id": qid,
                 "action": "failed",
@@ -810,12 +818,123 @@ class PipelineDaemon:
         result = self.do_download(None, default_limit)
         return result if (result or {}).get("processed", 0) > 0 else None
 
+    def _process_job(self, job: dict) -> None:
+        log(f"Picked up job {job['id']} of type '{job['job_type']}'")
+        self._heartbeat(
+            "running",
+            {
+                "state": "running_job",
+                "job_id": int(job["id"]),
+                "job_type": str(job["job_type"]),
+                "corpus_id": job.get("corpus_id"),
+            },
+            force=True,
+        )
+        heartbeat_stop, heartbeat_thread = self._start_job_heartbeat(job)
+        corpus_id = job.get("corpus_id")
+        params = job.get("params", {})
+        result = None
+
+        try:
+            if job["job_type"] == "enrich":
+                limit = params.get("limit", 10)
+                workers = params.get("workers", 6)
+                expansion = params.get("expansion", {})
+                pending_work_ids = params.get("pending_work_ids") or []
+                result = self.do_enrich(corpus_id, limit, workers, expansion, pending_work_ids=pending_work_ids)
+                remaining_ids = [int(value) for value in (result or {}).get("remaining_pending_work_ids") or [] if str(value).isdigit()]
+                if remaining_ids:
+                    continuation_params = dict(params)
+                    continuation_params["pending_work_ids"] = remaining_ids
+                    continuation_params["limit"] = len(remaining_ids)
+                    continuation_id = self.enqueue_job(corpus_id, "enrich", continuation_params)
+                    result["continuation_job_id"] = continuation_id
+
+            elif job["job_type"] == "download":
+                limit = params.get("batchSize", 3)
+                result = self.do_download(corpus_id, limit)
+
+            elif job["job_type"] == "pipeline_tick":
+                cfg = params.get("config", {})
+                limit = cfg.get("promoteBatchSize", 10)
+                workers = cfg.get("promoteWorkers", 6)
+
+                if corpus_id is None and self._has_pending_interactive_jobs():
+                    result = {
+                        "deferred": True,
+                        "reason": "interactive_backlog_before_mark",
+                    }
+                else:
+                    m_res = self.do_mark(corpus_id, limit)
+                    if corpus_id is None and self._has_pending_interactive_jobs():
+                        result = {
+                            "marked": m_res,
+                            "deferred": True,
+                            "reason": "interactive_backlog_after_mark",
+                        }
+                    else:
+                        e_res = self.do_enrich(corpus_id, limit, workers, {})
+                        if corpus_id is None and self._has_pending_interactive_jobs():
+                            result = {
+                                "marked": m_res,
+                                "enriched": e_res,
+                                "deferred": True,
+                                "reason": "interactive_backlog_after_enrich",
+                            }
+                        else:
+                            result = {"marked": m_res, "enriched": e_res}
+
+            else:
+                raise ValueError(f"Unknown job type: {job['job_type']}")
+
+            updated = self.mark_job_completed(job["id"], result or {})
+            if updated:
+                log(f"Successfully completed job {job['id']}")
+            else:
+                log(f"Job {job['id']} finished execution but was already cancelled; completion not recorded.")
+            self._heartbeat(
+                "idle",
+                {
+                    "state": "job_completed",
+                    "job_id": int(job["id"]),
+                    "job_type": str(job["job_type"]),
+                    "corpus_id": corpus_id,
+                },
+                force=True,
+            )
+
+        except Exception as e:
+            import traceback
+            err_msg = traceback.format_exc()
+            log(f"Job {job['id']} failed: {e}")
+            updated = self.mark_job_failed(job["id"], err_msg)
+            if not updated:
+                log(f"Job {job['id']} failure not recorded because it was already cancelled.")
+            self._heartbeat(
+                "error",
+                {
+                    "state": "job_failed",
+                    "job_id": int(job["id"]),
+                    "job_type": str(job["job_type"]),
+                    "corpus_id": corpus_id,
+                    "error": str(e),
+                },
+                force=True,
+            )
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1)
+
     def run(self):
         log(f"{self.role} daemon starting. Waiting for work...")
         if self.role in {"enrich", "download"}:
             while self.running:
                 try:
                     self._heartbeat("idle", {"state": "polling", "mode": "db-driven", "role": self.role})
+                    job = self.fetch_next_job()
+                    if job:
+                        self._process_job(job)
+                        continue
                     direct_result = None
                     heartbeat_stop = None
                     heartbeat_thread = None
@@ -871,113 +990,7 @@ class PipelineDaemon:
                     if not direct_result:
                         time.sleep(5)
                     continue
-                    
-                log(f"Picked up job {job['id']} of type '{job['job_type']}'")
-                self._heartbeat(
-                    "running",
-                    {
-                        "state": "running_job",
-                        "job_id": int(job["id"]),
-                        "job_type": str(job["job_type"]),
-                        "corpus_id": job.get("corpus_id"),
-                    },
-                    force=True,
-                )
-                heartbeat_stop, heartbeat_thread = self._start_job_heartbeat(job)
-                corpus_id = job.get("corpus_id")
-                params = job.get("params", {})
-                result = None
-                
-                try:
-                    if job["job_type"] == "enrich":
-                        limit = params.get("limit", 10)
-                        workers = params.get("workers", 6)
-                        expansion = params.get("expansion", {})
-                        no_metadata_ids = params.get("no_metadata_ids") or []
-                        result = self.do_enrich(corpus_id, limit, workers, expansion, no_metadata_ids=no_metadata_ids)
-                        remaining_ids = [int(value) for value in (result or {}).get("remaining_no_metadata_ids") or [] if str(value).isdigit()]
-                        if remaining_ids:
-                            continuation_params = dict(params)
-                            continuation_params["no_metadata_ids"] = remaining_ids
-                            continuation_params["limit"] = len(remaining_ids)
-                            continuation_id = self.enqueue_job(corpus_id, "enrich", continuation_params)
-                            result["continuation_job_id"] = continuation_id
-                        
-                    elif job["job_type"] == "download":
-                        limit = params.get("batchSize", 3)
-                        result = self.do_download(corpus_id, limit)
-                        
-                    elif job["job_type"] == "pipeline_tick":
-                        cfg = params.get("config", {})
-                        limit = cfg.get("promoteBatchSize", 10)
-                        workers = cfg.get("promoteWorkers", 6)
-
-                        # Global background ticks should yield to explicit corpus jobs.
-                        if corpus_id is None and self._has_pending_interactive_jobs():
-                            result = {
-                                "deferred": True,
-                                "reason": "interactive_backlog_before_mark",
-                            }
-                        else:
-                            m_res = self.do_mark(corpus_id, limit)
-                            if corpus_id is None and self._has_pending_interactive_jobs():
-                                result = {
-                                    "marked": m_res,
-                                    "deferred": True,
-                                    "reason": "interactive_backlog_after_mark",
-                                }
-                            else:
-                                e_res = self.do_enrich(corpus_id, limit, workers, {})
-                                if corpus_id is None and self._has_pending_interactive_jobs():
-                                    result = {
-                                        "marked": m_res,
-                                        "enriched": e_res,
-                                        "deferred": True,
-                                        "reason": "interactive_backlog_after_enrich",
-                                    }
-                                else:
-                                    result = {"marked": m_res, "enriched": e_res}
-                        
-                    else:
-                        raise ValueError(f"Unknown job type: {job['job_type']}")
-                        
-                    updated = self.mark_job_completed(job["id"], result or {})
-                    if updated:
-                        log(f"Successfully completed job {job['id']}")
-                    else:
-                        log(f"Job {job['id']} finished execution but was already cancelled; completion not recorded.")
-                    self._heartbeat(
-                        "idle",
-                        {
-                            "state": "job_completed",
-                            "job_id": int(job["id"]),
-                            "job_type": str(job["job_type"]),
-                            "corpus_id": corpus_id,
-                        },
-                        force=True,
-                    )
-                    
-                except Exception as e:
-                    import traceback
-                    err_msg = traceback.format_exc()
-                    log(f"Job {job['id']} failed: {e}")
-                    updated = self.mark_job_failed(job["id"], err_msg)
-                    if not updated:
-                        log(f"Job {job['id']} failure not recorded because it was already cancelled.")
-                    self._heartbeat(
-                        "error",
-                        {
-                            "state": "job_failed",
-                            "job_id": int(job["id"]),
-                            "job_type": str(job["job_type"]),
-                            "corpus_id": corpus_id,
-                            "error": str(e),
-                        },
-                        force=True,
-                    )
-                finally:
-                    heartbeat_stop.set()
-                    heartbeat_thread.join(timeout=1)
+                self._process_job(job)
                     
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")
