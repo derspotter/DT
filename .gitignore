@@ -64,3 +64,11 @@ dl_lit_project/artifacts/
 # OCR output directories
 ocr/ocr_results/
 ocr/translated/
+
+# Local workspace artifacts
+/.codex
+/.codex/
+/.tmp/
+/logs/
+/Abrechnung_ohne_Visualisierung_Entwurf.md
+/Rechnung_MS1.qmd
