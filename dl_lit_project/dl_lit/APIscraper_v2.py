@@ -888,7 +888,7 @@ def process_single_pdf(
                     stored_ingest += 1
                     if seed_only:
                         continue
-                    row_id, err = db_manager.insert_no_metadata(minimal_ref)
+                    row_id, err = db_manager.create_pending_work(minimal_ref)
                     if err:
                         print(f"[WARNING] Skipped entry due to: {err}", flush=True)
                     else:

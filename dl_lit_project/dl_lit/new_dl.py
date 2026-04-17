@@ -276,7 +276,7 @@ class BibliographyEnhancer:
         if not text:
             return ''
 
-        # Common raw format in no_metadata is "Lastname, A.".
+        # Common raw author format is "Lastname, A.".
         if ',' in text:
             left = text.split(',', 1)[0].strip()
             if left:
