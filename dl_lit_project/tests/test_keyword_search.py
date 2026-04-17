@@ -51,7 +51,8 @@ def test_search_openalex_field_filter(monkeypatch):
         def wait_if_needed(self, *_args, **_kwargs):
             return None
 
-    def fake_request(params, rate_limiter, retries: int = 3):
+    def fake_request(endpoint, params, rate_limiter, retries: int = 3):
+        assert endpoint == "works"
         captured.update(params)
         return {"results": [], "meta": {}}
 
@@ -69,5 +70,4 @@ def test_search_openalex_field_filter(monkeypatch):
 
     assert "search" not in captured
     assert captured["filter"].startswith("title.search:foo bar")
-    assert "publication_year:>=2020" in captured["filter"]
-    assert "publication_year:<=2021" in captured["filter"]
+    assert "publication_year:2020-2021" in captured["filter"]

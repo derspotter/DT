@@ -41,7 +41,6 @@
     fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
-    pauseAllPipelineWorkers,
     fetchGraph,
     downloadCorpusExport,
     downloadCorpusItemFile,
@@ -3147,7 +3146,7 @@
   async function handleStartPipelineWorker() {
     if (pipelineWorkerBusy) return
     pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Starting global pipeline...'
+    pipelineWorkerStatus = 'Starting pipeline...'
     try {
       await startPipelineWorker({
         intervalSeconds: Number(pipelineWorker?.config?.intervalSeconds) || 15,
@@ -3163,14 +3162,14 @@
         loadDownloads(),
         loadDownloadWorkerStatus(),
       ])
-      pipelineWorkerStatus = 'Global pipeline running.'
+      pipelineWorkerStatus = 'Pipeline running.'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
         return
       }
-      pipelineWorkerStatus = error?.message || 'Failed to start global pipeline.'
+      pipelineWorkerStatus = error?.message || 'Failed to start pipeline.'
     } finally {
       pipelineWorkerBusy = false
     }
@@ -3179,38 +3178,18 @@
   async function handlePausePipelineWorker() {
     if (pipelineWorkerBusy) return
     pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Pausing global pipeline...'
+    pipelineWorkerStatus = 'Pausing pipeline...'
     try {
       await pausePipelineWorker({ force: false })
       await loadPipelineWorkerStatus()
-      pipelineWorkerStatus = 'Global pipeline paused.'
+      pipelineWorkerStatus = 'Pipeline paused.'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
         return
       }
-      pipelineWorkerStatus = error?.message || 'Failed to pause global pipeline.'
-    } finally {
-      pipelineWorkerBusy = false
-    }
-  }
-
-  async function handlePauseAllPipelineWorkers() {
-    if (pipelineWorkerBusy) return
-    pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Pausing all pipeline workers...'
-    try {
-      await pauseAllPipelineWorkers({ force: true })
-      await Promise.all([loadPipelineWorkerStatus(), loadDownloadWorkerStatus(), loadIngestStats(), loadCorpus(), loadDownloads(), ...(diagnosticsEnabled ? [loadIngestStats({ global: true }), loadPipelineDaemonStatus({ global: true })] : [])])
-      pipelineWorkerStatus = 'Global pause complete.'
-    } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
-      pipelineWorkerStatus = error?.message || 'Failed to pause all workers.'
+      pipelineWorkerStatus = error?.message || 'Failed to pause pipeline.'
     } finally {
       pipelineWorkerBusy = false
     }
@@ -5569,7 +5548,7 @@
                 <span class="muted small">No queued download items for this corpus. Enrich/promote items first.</span>
               {/if}
               {#if pipelineWorker.running}
-                <span class="muted small">Download-only worker is disabled while global pipeline is running.</span>
+                <span class="muted small">Download-only worker is disabled while the corpus pipeline is running.</span>
               {/if}
               {#if downloadWorker.last_error}
                 <span class="error">{downloadWorker.last_error}</span>

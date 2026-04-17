@@ -80,12 +80,12 @@ def build_work_indexes(conn, corpus_id=None):
         ).fetchall()
 
     indexes = {
-        "downloaded": {"doi": set(), "tay": set(), "ta": set(), "ty": set()},
-        "failed_download": {"doi": set(), "tay": set(), "ta": set(), "ty": set()},
-        "queued_download": {"doi": set(), "tay": set(), "ta": set(), "ty": set()},
-        "matched": {"doi": set(), "tay": set(), "ta": set(), "ty": set()},
-        "failed_enrichment": {"doi": set(), "tay": set(), "ta": set(), "ty": set()},
-        "raw": {"doi": set(), "tay": set(), "ta": set(), "ty": set()},
+        "downloaded": {"doi": set(), "tay": set(), "ta": set()},
+        "failed_download": {"doi": set(), "tay": set(), "ta": set()},
+        "queued_download": {"doi": set(), "tay": set(), "ta": set()},
+        "matched": {"doi": set(), "tay": set(), "ta": set()},
+        "failed_enrichment": {"doi": set(), "tay": set(), "ta": set()},
+        "raw": {"doi": set(), "tay": set(), "ta": set()},
     }
 
     def add(index_name, row):
@@ -99,8 +99,6 @@ def build_work_indexes(conn, corpus_id=None):
             indexes[index_name]["tay"].add((title, authors, year))
         if title and authors:
             indexes[index_name]["ta"].add((title, authors))
-        if title and year:
-            indexes[index_name]["ty"].add((title, year))
 
     for row in rows:
         metadata = str(row["metadata_status"] or "pending").strip().lower()
@@ -131,8 +129,6 @@ def matches_index(row, index):
     if title and authors and year and (title, authors, year) in index["tay"]:
         return True
     if title and authors and (title, authors) in index["ta"]:
-        return True
-    if title and year and (title, year) in index["ty"]:
         return True
     return False
 

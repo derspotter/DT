@@ -19,7 +19,7 @@ describe('GET /api/exports/:format', () => {
     const login = await request(app)
       .post('/api/auth/login')
       .set('Content-Type', 'application/json')
-      .send({ username: 'admin', password: 'admin' })
+      .send({ username: 'stub-admin', password: 'stub-password' })
     token = login.body?.token || ''
   })
 

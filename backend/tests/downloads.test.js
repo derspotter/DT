@@ -2,10 +2,11 @@ import request from 'supertest'
 import { createApp } from '../src/app.js'
 
 describe('GET /api/downloads', () => {
-  const app = createApp({ broadcast: () => {} })
+  let app
 
   beforeAll(() => {
     process.env.RAG_FEEDER_STUB = '1'
+    app = createApp({ broadcast: () => {} })
   })
 
   afterAll(() => {
@@ -53,20 +54,8 @@ describe('GET /api/downloads', () => {
     expect(pause.body).toHaveProperty('running')
   })
 
-  test('supports global pause-all worker controls (stub)', async () => {
-    const startPipeline = await request(app)
-      .post('/api/pipeline/worker/start')
-      .send({ intervalSeconds: 30, promoteBatchSize: 10, downloadBatchSize: 3, downloadWorkers: 0 })
-    expect(startPipeline.status).toBe(200)
-
+  test('does not expose global pause-all worker controls', async () => {
     const pauseAll = await request(app).post('/api/pipeline/worker/pause-all').send({ force: true })
-    expect(pauseAll.status).toBe(200)
-    expect(pauseAll.body).toHaveProperty('pipeline')
-    expect(pauseAll.body).toHaveProperty('downloads')
-    expect(typeof pauseAll.body.message).toBe('string')
-    expect(pauseAll.body.force).toBe(true)
-
-    const stopDownload = await request(app).post('/api/downloads/worker/stop').send({ force: true })
-    expect(stopDownload.status).toBe(200)
+    expect(pauseAll.status).toBe(404)
   })
 })

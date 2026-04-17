@@ -33,10 +33,10 @@ async function ensureSignedIn(page: Page, request: APIRequestContext): Promise<s
     if (existingToken) return existingToken
   }
 
-  const username = `perf_e2e_${Date.now()}_${Math.floor(Math.random() * 10_000)}`
-  const password = `perf_${Math.floor(Math.random() * 1_000_000)}`
-  const register = await request.post(`${API_BASE}/api/auth/register`, { data: { username, password } })
-  expect([201, 409]).toContain(register.status())
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD for Playwright login').toBeTruthy()
 
   await page.getByRole('textbox', { name: 'Username' }).fill(username)
   await page.getByRole('textbox', { name: 'Password' }).fill(password)

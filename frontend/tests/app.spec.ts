@@ -10,8 +10,10 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
     return
   }
 
-  const username = process.env.RAG_ADMIN_USER || 'admin'
-  const password = process.env.RAG_ADMIN_PASSWORD || 'admin'
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD for Playwright login').toBeTruthy()
 
   const signInButton = page.getByRole('button', { name: 'Sign in' })
   if (await signInButton.isVisible().catch(() => false)) {

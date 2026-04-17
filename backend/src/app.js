@@ -94,9 +94,6 @@ const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
-const JWT_SECRET = process.env.RAG_FEEDER_JWT_SECRET || crypto.randomUUID();
-const ADMIN_USERNAME = process.env.RAG_ADMIN_USER || 'admin';
-const ADMIN_PASSWORD = process.env.RAG_ADMIN_PASSWORD || 'admin';
 const FRONTEND_URL = process.env.RAG_FEEDER_FRONTEND_URL || 'https://genkia.de';
 const SMTP_FROM = process.env.RAG_FEEDER_SMTP_FROM || process.env.SMTP_FROM || 'noreply@example.com';
 const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
@@ -121,6 +118,35 @@ const EMPTY_ZIP_BUFFER = Buffer.from([
   0x00, 0x00, 0x00, 0x00,
   0x00, 0x00,
 ]);
+
+function isStubMode() {
+  return process.env.RAG_FEEDER_STUB === '1';
+}
+
+function resolveAuthConfig() {
+  if (isStubMode()) {
+    return {
+      jwtSecret: 'stub-jwt-secret',
+      adminUsername: 'stub-admin',
+      adminPassword: 'stub-password',
+    };
+  }
+
+  const jwtSecret = String(process.env.RAG_FEEDER_JWT_SECRET || '').trim();
+  const adminUsername = String(process.env.RAG_ADMIN_USER || '').trim();
+  const adminPassword = String(process.env.RAG_ADMIN_PASSWORD || '');
+  const missing = [];
+
+  if (!jwtSecret) missing.push('RAG_FEEDER_JWT_SECRET');
+  if (!adminUsername) missing.push('RAG_ADMIN_USER');
+  if (!adminPassword) missing.push('RAG_ADMIN_PASSWORD');
+
+  if (missing.length) {
+    throw new Error(`[auth] Missing required environment variables: ${missing.join(', ')}`);
+  }
+
+  return { jwtSecret, adminUsername, adminPassword };
+}
 
 function slugifyKantroposCorpusName(name) {
   return String(name || '')
@@ -394,9 +420,24 @@ function ensureAuthSchema(db) {
       last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS pipeline_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      corpus_id INTEGER,
+      job_type TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      parameters_json TEXT,
+      result_json TEXT,
+      worker_id TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      started_at TIMESTAMP,
+      finished_at TIMESTAMP
+    );
   `);
   if (tableExists(db, 'ingest_entries')) {
     ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
+  }
+  if (tableExists(db, 'pipeline_jobs')) {
+    ensureColumn(db, 'pipeline_jobs', 'worker_id', 'TEXT');
   }
   ensureColumn(db, 'users', 'email', 'TEXT');
   ensureColumn(db, 'users', 'email_verified_at', 'TIMESTAMP');
@@ -412,16 +453,16 @@ function ensureAuthSchema(db) {
   db.prepare("UPDATE users SET account_status = 'active' WHERE account_status IS NULL OR TRIM(account_status) = ''").run();
 }
 
-function bootstrapDefaultCorpus(db) {
-  const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(ADMIN_USERNAME);
+function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
+  const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(authConfig.adminUsername);
   let adminId = admin?.id;
   if (!adminId) {
-    const hash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+    const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
     const result = db
       .prepare('INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)')
-      .run(ADMIN_USERNAME, hash);
+      .run(authConfig.adminUsername, hash);
     if (result.changes === 0) {
-      adminId = db.prepare('SELECT id FROM users WHERE username = ?').get(ADMIN_USERNAME)?.id;
+      adminId = db.prepare('SELECT id FROM users WHERE username = ?').get(authConfig.adminUsername)?.id;
     } else {
       adminId = result.lastInsertRowid;
     }
@@ -433,7 +474,7 @@ function bootstrapDefaultCorpus(db) {
   if (!corpus) {
     const result = db
       .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
-      .run(defaultCorpusNameForUsername(ADMIN_USERNAME), adminId);
+      .run(defaultCorpusNameForUsername(authConfig.adminUsername), adminId);
     corpus = { id: result.lastInsertRowid };
   }
 
@@ -617,30 +658,30 @@ async function sendTransactionalMail({ to, subject, html, text }) {
   });
 }
 
-function issueAuthToken(user) {
-  return jwt.sign({ sub: user.id, username: user.username }, JWT_SECRET, {
+function issueAuthToken(user, authConfig = resolveAuthConfig()) {
+  return jwt.sign({ sub: user.id, username: user.username }, authConfig.jwtSecret, {
     expiresIn: '7d',
   });
 }
 
-function authUserPayload(user, lastCorpusId = null) {
+function authUserPayload(user, lastCorpusId = null, authConfig = resolveAuthConfig()) {
   return {
     id: user.id,
     username: user.username,
     email: user.email || null,
     account_status: user.account_status || 'active',
     last_corpus_id: lastCorpusId,
-    is_admin: isAdminUser(user),
+    is_admin: isAdminUser(user, authConfig),
   };
 }
 
-function isAdminUser(user) {
-  return String(user?.username || '') === ADMIN_USERNAME;
+function isAdminUser(user, authConfig = resolveAuthConfig()) {
+  return String(user?.username || '') === authConfig.adminUsername;
 }
 
-function requireAuth(db) {
+function requireAuth(db, authConfig = resolveAuthConfig()) {
   return (req, res, next) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
+    if (isStubMode()) {
       req.user = { id: 0, username: 'stub', last_corpus_id: null };
       req.corpusId = null;
       return next();
@@ -651,7 +692,7 @@ function requireAuth(db) {
       return res.status(401).json({ error: 'Missing Authorization header' });
     }
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
+      const payload = jwt.verify(token, authConfig.jwtSecret);
       const user = getUserById(db, payload.sub);
       if (!user) {
         return res.status(401).json({ error: 'Unknown user' });
@@ -1174,6 +1215,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
   const pipelineWorkers = new Map(); // corpusId -> state
+  const authConfig = resolveAuthConfig();
 
   // Ensure temporary and output directories exist
   fs.mkdirSync(ARTIFACTS_DIR, { recursive: true });
@@ -1195,21 +1237,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   }
   ensureAuthSchema(authDb);
   ensureSeedSchema(authDb);
-  const defaultCorpusId = bootstrapDefaultCorpus(authDb);
+  const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
-  if (!process.env.RAG_FEEDER_JWT_SECRET) {
-    console.warn('[auth] RAG_FEEDER_JWT_SECRET not set; tokens will reset on restart.');
-  }
-  const requireAuthMiddleware = requireAuth(authDb);
+  const requireAuthMiddleware = requireAuth(authDb, authConfig);
   const hasWorkerAccess = (req) => {
-    if (process.env.RAG_FEEDER_STUB === '1') return true;
+    if (isStubMode()) return true;
     const role = getCorpusRoleForUser(authDb, req.user?.id, req.corpusId);
     return role === 'owner' || role === 'editor';
   };
   const hasAdminWorkerAccess = (req) => {
-    if (process.env.RAG_FEEDER_STUB === '1') return true;
-    return isAdminUser(req.user);
+    if (isStubMode()) return true;
+    return isAdminUser(req.user, authConfig);
   };
 
   // Ensure uploads directory exists (already present, keeping for clarity)
@@ -1391,9 +1430,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const corpusTag = corpusId || 'none';
     
     try {
-      authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      ).run(corpusId, 'download', JSON.stringify({ batchSize }));
+      enqueuePipelineJob(corpusId, 'download', { batchSize }, { dedupeStatuses: ['pending', 'running'] });
     } catch (error) {
       state.lastError = error?.message || String(error);
       console.error(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
@@ -1402,15 +1439,40 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   }
 
-  function enqueuePipelineJob(corpusId, jobType, parameters = {}) {
-    return Number(
-      authDb
-        .prepare(
-          "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-        )
-        .run(corpusId ?? null, String(jobType), JSON.stringify(parameters || {}))
-        .lastInsertRowid
-    );
+  function findExistingPipelineJob(jobType, corpusId, statuses = ['pending', 'running']) {
+    if (!statuses.length) return null;
+    const placeholders = statuses.map(() => '?').join(', ');
+    return authDb
+      .prepare(
+        `SELECT id, status
+         FROM pipeline_jobs
+         WHERE job_type = ?
+           AND corpus_id IS ?
+           AND status IN (${placeholders})
+         ORDER BY created_at ASC, id ASC
+         LIMIT 1`
+      )
+      .get(String(jobType), corpusId ?? null, ...statuses);
+  }
+
+  function enqueuePipelineJob(corpusId, jobType, parameters = {}, { dedupeStatuses = [] } = {}) {
+    const tx = authDb.transaction(() => {
+      const existing = dedupeStatuses.length
+        ? findExistingPipelineJob(jobType, corpusId, dedupeStatuses)
+        : null;
+      if (existing) {
+        return Number(existing.id);
+      }
+      return Number(
+        authDb
+          .prepare(
+            "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
+          )
+          .run(corpusId ?? null, String(jobType), JSON.stringify(parameters || {}))
+          .lastInsertRowid
+      );
+    });
+    return tx();
   }
 
   function startDownloadWorker(corpusId, config = {}) {
@@ -1701,9 +1763,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         state.inFlight = false;
         return;
       }
-      authDb.prepare(
-        "INSERT INTO pipeline_jobs (corpus_id, job_type, status, parameters_json) VALUES (?, ?, 'pending', ?)"
-      ).run(corpusId, 'pipeline_tick', JSON.stringify({ config: state.config }));
+      enqueuePipelineJob(corpusId, 'pipeline_tick', { config: state.config }, { dedupeStatuses: ['pending', 'running'] });
     } catch (error) {
       state.lastError = error?.message || String(error);
       console.error(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
@@ -1972,12 +2032,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
     }
     return res.json({
-      token: issueAuthToken(user),
-      user: authUserPayload(user, lastCorpusId),
+      token: issueAuthToken(user, authConfig),
+      user: authUserPayload(user, lastCorpusId, authConfig),
     });
   });
 
   app.post('/api/auth/register', (req, res) => {
+    if (!isStubMode()) {
+      return res.status(404).json({ error: 'Not found' });
+    }
     const { username, password, email } = req.body || {};
     if (!username || !password || !email) {
       return res.status(400).json({ error: 'Missing username, password, or email' });
@@ -2006,7 +2069,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.post('/api/auth/invitations', requireAuthMiddleware, async (req, res) => {
-    if (!isAdminUser(req.user)) {
+    if (!isAdminUser(req.user, authConfig)) {
       return res.status(403).json({ error: 'Only admins can create invited users' });
     }
     const username = String(req.body?.username || '').trim();
@@ -2087,8 +2150,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     return res.json({
       accepted: true,
-      token: issueAuthToken(user),
-      user: authUserPayload(user, lastCorpusId),
+      token: issueAuthToken(user, authConfig),
+      user: authUserPayload(user, lastCorpusId, authConfig),
     });
   });
 
@@ -2153,15 +2216,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     return res.json({
       reset: true,
-      token: issueAuthToken(user),
-      user: authUserPayload(user, lastCorpusId),
+      token: issueAuthToken(user, authConfig),
+      user: authUserPayload(user, lastCorpusId, authConfig),
     });
   });
 
   app.get('/api/auth/me', requireAuthMiddleware, (req, res) => {
     const corpora = listCorporaForUser(authDb, req.user.id);
     return res.json({
-      user: authUserPayload(req.user, req.user.last_corpus_id),
+      user: authUserPayload(req.user, req.user.last_corpus_id, authConfig),
       corpora,
     });
   });
@@ -2239,7 +2302,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       assignment: getCorpusKantroposAssignment(authDb, corpusId),
       corpora: KANTROPOS_TARGETS,
       root_path: KANTROPOS_CORPORA_ROOT,
-      can_edit: canConfigureCorpus(role) || isAdminUser(req.user),
+      can_edit: canConfigureCorpus(role) || isAdminUser(req.user, authConfig),
     });
   });
 
@@ -2249,7 +2312,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!role) {
       return res.status(403).json({ error: 'No access to corpus' });
     }
-    if (!(canConfigureCorpus(role) || isAdminUser(req.user))) {
+    if (!(canConfigureCorpus(role) || isAdminUser(req.user, authConfig))) {
       return res.status(403).json({ error: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus' });
     }
     const nextTargetIdRaw = req.body?.targetId;
@@ -2994,7 +3057,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (shouldQueueDownload) {
         downloadJobId = enqueuePipelineJob(req.corpusId, 'download', {
           batchSize: downloadBatchSize,
-        });
+        }, { dedupeStatuses: ['pending', 'running'] });
         jobs.push({ id: downloadJobId, type: 'download' });
       }
 
@@ -3339,7 +3402,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (enqueueDownload) {
         downloadJobId = enqueuePipelineJob(req.corpusId, 'download', {
           batchSize: downloadBatchSize,
-        });
+        }, { dedupeStatuses: ['pending', 'running'] });
         jobs.push({ id: downloadJobId, type: 'download' });
       }
 
@@ -3379,7 +3442,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.get('/api/ingest/stats', requireAuthMiddleware, async (req, res) => {
     const dbPath = DB_PATH;
     const globalScope = String(req.query?.global || '').trim() === '1';
-    if (globalScope && !isAdminUser(req.user)) {
+    if (globalScope && !isAdminUser(req.user, authConfig)) {
       return res.status(403).json({ error: 'Admin access required for global ingest stats' });
     }
     const args = ['--db-path', dbPath];
@@ -3399,7 +3462,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.get('/api/pipeline/daemon/status', requireAuthMiddleware, (req, res) => {
     try {
       const globalScope = String(req.query?.global || '').trim() === '1';
-      if (globalScope && !isAdminUser(req.user)) {
+      if (globalScope && !isAdminUser(req.user, authConfig)) {
         return res.status(403).json({ error: 'Admin access required for global daemon status' });
       }
       return res.json({
@@ -3659,17 +3722,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.post('/api/pipeline/worker/pause-all', requireAuthMiddleware, (req, res) => {
-    if (!hasAdminWorkerAccess(req)) {
-      return res.status(403).json({ error: 'Admin access required to manage pipeline workers' });
-    }
-
-    return res.json({
-      pipeline: { running: true, in_flight: false },
-      downloads: { running: true, in_flight: false },
-      cancelled_jobs: { pending: 0, running: 0 },
-      force: true,
-      message: 'DB-driven workers are managed outside the app. Global pause is not supported from the UI.',
-    });
+    return res.status(404).json({ error: 'Not found' });
   });
 
   app.get('/api/downloads/worker/status', requireAuthMiddleware, (req, res) => {

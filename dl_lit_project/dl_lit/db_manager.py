@@ -305,11 +305,16 @@ class DatabaseManager:
                 status TEXT DEFAULT 'pending',
                 parameters_json TEXT,
                 result_json TEXT,
+                worker_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP,
                 finished_at TIMESTAMP
             )
         """)
+        cursor.execute("PRAGMA table_info(pipeline_jobs)")
+        pipeline_columns = {row[1] for row in cursor.fetchall()}
+        if "worker_id" not in pipeline_columns:
+            cursor.execute("ALTER TABLE pipeline_jobs ADD COLUMN worker_id TEXT")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pipeline_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

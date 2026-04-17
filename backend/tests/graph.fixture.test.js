@@ -85,19 +85,25 @@ describe('GET /api/graph (fixture db)', () => {
 
     process.env.RAG_FEEDER_STUB = '0'
     process.env.RAG_FEEDER_DB_PATH = dbPath
+    process.env.RAG_FEEDER_JWT_SECRET = 'graph-fixture-secret'
+    process.env.RAG_ADMIN_USER = 'fixture-admin'
+    process.env.RAG_ADMIN_PASSWORD = 'fixture-password'
     const { createApp } = await import('../src/app.js')
     app = createApp({ broadcast: () => {} })
 
     const login = await request(app)
       .post('/api/auth/login')
       .set('Content-Type', 'application/json')
-      .send({ username: 'admin', password: 'admin' })
+      .send({ username: process.env.RAG_ADMIN_USER, password: process.env.RAG_ADMIN_PASSWORD })
     token = login.body?.token || ''
   })
 
   afterAll(() => {
     delete process.env.RAG_FEEDER_DB_PATH
     delete process.env.RAG_FEEDER_STUB
+    delete process.env.RAG_FEEDER_JWT_SECRET
+    delete process.env.RAG_ADMIN_USER
+    delete process.env.RAG_ADMIN_PASSWORD
     if (tmpDir && fs.existsSync(tmpDir)) {
       fs.rmSync(tmpDir, { recursive: true, force: true })
     }

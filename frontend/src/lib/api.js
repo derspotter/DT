@@ -725,24 +725,6 @@ export async function pausePipelineWorker({ force = false } = {}) {
   return response.json()
 }
 
-export async function pauseAllPipelineWorkers({ force = true } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/pipeline/worker/pause-all`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to pause all workers')
-  }
-  return response.json()
-}
-
 export async function downloadCorpusExport(format, { status = '', yearFrom = '', yearTo = '', source = '' } = {}) {
   const params = new URLSearchParams()
   if (status) params.set('status', String(status))
