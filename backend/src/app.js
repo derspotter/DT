@@ -280,6 +280,42 @@ function ensureColumn(db, tableName, columnName, columnType) {
   }
 }
 
+function tableRowCount(db, tableName) {
+  if (!tableExists(db, tableName)) return 0;
+  try {
+    const row = db.prepare(`SELECT COUNT(*) AS count FROM ${tableName}`).get();
+    return Number(row?.count || 0);
+  } catch {
+    return 0;
+  }
+}
+
+function assertNoLegacyLibraryData(db) {
+  if (isStubMode()) return;
+  const hasWorksTable = tableExists(db, 'works');
+  const worksCount = hasWorksTable ? tableRowCount(db, 'works') : 0;
+  if (worksCount > 0) return;
+
+  const legacyCounts = {
+    no_metadata: tableRowCount(db, 'no_metadata'),
+    with_metadata: tableRowCount(db, 'with_metadata'),
+    downloaded_references: tableRowCount(db, 'downloaded_references'),
+    to_download_references: tableRowCount(db, 'to_download_references'),
+  };
+  const legacyRows = Object.values(legacyCounts).reduce((sum, count) => sum + Number(count || 0), 0);
+  if (legacyRows === 0) return;
+
+  const present = Object.entries(legacyCounts)
+    .filter(([, count]) => Number(count) > 0)
+    .map(([name, count]) => `${name}=${count}`)
+    .join(', ');
+
+  throw new Error(
+    `[migration] Legacy library data detected (${present}) but works is empty. ` +
+    `Run backend/scripts/migrate_to_works.py first or start with a fresh database.`
+  );
+}
+
 function ensureAuthSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -487,6 +523,28 @@ function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
   }
 
   return corpus.id;
+}
+
+function cleanupInvitedUser(db, userId) {
+  if (!Number.isFinite(Number(userId)) || Number(userId) <= 0) return;
+  const ownedCorpusRows = db
+    .prepare('SELECT id FROM corpora WHERE owner_user_id = ?')
+    .all(Number(userId));
+
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM auth_invite_tokens WHERE user_id = ?').run(Number(userId));
+    db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(Number(userId));
+    db.prepare('DELETE FROM user_corpora WHERE user_id = ?').run(Number(userId));
+    for (const row of ownedCorpusRows) {
+      const corpusId = Number(row.id);
+      db.prepare('DELETE FROM corpus_kantropos_assignments WHERE corpus_id = ?').run(corpusId);
+      db.prepare('DELETE FROM user_corpora WHERE corpus_id = ?').run(corpusId);
+      db.prepare('DELETE FROM corpora WHERE id = ?').run(corpusId);
+    }
+    db.prepare("DELETE FROM users WHERE id = ? AND account_status = 'invited'").run(Number(userId));
+  });
+
+  tx();
 }
 
 function migrateExistingToCorpus(db, corpusId) {
@@ -1235,6 +1293,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   } catch (error) {
     // timeout option already helps; pragma is best-effort
   }
+  assertNoLegacyLibraryData(authDb);
   ensureAuthSchema(authDb);
   ensureSeedSchema(authDb);
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
@@ -2092,7 +2151,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         accountStatus: 'invited',
         invitedByUserId: req.user.id,
       });
-      const delivery = await sendInviteEmail({ userId, username, email, invitedByUserId: req.user.id });
+      let delivery;
+      try {
+        delivery = await sendInviteEmail({ userId, username, email, invitedByUserId: req.user.id });
+      } catch (error) {
+        error.userId = userId;
+        throw error;
+      }
       return res.status(201).json({
         invited: true,
         user_id: userId,
@@ -2102,6 +2167,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       });
     } catch (error) {
       console.error('[auth invite] Failed:', error);
+      if (error?.userId) {
+        try {
+          cleanupInvitedUser(authDb, error.userId);
+        } catch (cleanupError) {
+          console.error('[auth invite] Cleanup failed:', cleanupError);
+        }
+      }
       return res.status(500).json({ error: error?.message || 'Failed to create invitation' });
     }
   });
