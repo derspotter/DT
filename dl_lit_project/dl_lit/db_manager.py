@@ -2125,8 +2125,14 @@ class DatabaseManager:
         input_openalex_id: str | None = None,
         original_bibtex_entry_json: str | None = None,
         source_bibtex_file: str | None = None,
-    ) -> tuple[int | None, str | None]:
-        """Add a BibTeX entry as a downloaded canonical work."""
+    ) -> tuple[int | None, str | None, str | None]:
+        """Add a BibTeX entry as a downloaded canonical work.
+
+        Returns:
+            A tuple of ``(work_id, error_message, resolution)`` where resolution is
+            ``created`` when a new work row is inserted and ``merged`` when the
+            BibTeX entry updates an existing canonical work.
+        """
         def get_primitive_val(data_object, default=None):
             if data_object is None:
                 return default
@@ -2231,16 +2237,17 @@ class DatabaseManager:
             'status_notes': 'Imported from BibTeX file',
         }
         try:
-            work_id, _ = self._resolve_or_create_work(data, allow_merge=True, commit=True)
-            return work_id, None
+            work_id, matched_field = self._resolve_or_create_work(data, allow_merge=True, commit=True)
+            resolution = 'merged' if matched_field else 'created'
+            return work_id, None, resolution
         except sqlite3.IntegrityError as e:
-            return None, str(e.args[0] if e.args else str(e))
+            return None, str(e.args[0] if e.args else str(e)), None
         except sqlite3.Error as e:
             print(f"{RED}[DB Manager] Error adding BibTeX entry to works: {e} (Entry details: Key='{bibtex_key_val}', Title='{title_val}'){RESET}")
-            return None, str(e)
+            return None, str(e), None
         except Exception as e:
             print(f"{RED}[DB Manager] General error while adding BibTeX entry {bibtex_key_val if bibtex_key_val else 'N/A'}: {e}{RESET}")
-            return None, str(e)
+            return None, str(e), None
 
     def add_entry_to_download_queue(
         self,

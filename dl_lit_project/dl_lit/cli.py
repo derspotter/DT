@@ -191,6 +191,8 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
         click.echo(f"Found {len(bib_database.entries)} entries in {bibtex_file}.")
         
         successful_imports = 0
+        created_imports = 0
+        merged_imports = 0
         failed_imports = []
         duplicates_logged = 0 # For tracking logged duplicates
 
@@ -265,7 +267,7 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
             })
             pdf_dir_path = Path(pdf_base_dir) if pdf_base_dir else None # pdf_base_dir is the function param from import_bib_command
 
-            entry_id, error_msg = db_manager.add_bibtex_entry_to_downloaded(
+            entry_id, error_msg, resolution = db_manager.add_bibtex_entry_to_downloaded(
                 entry=entry_obj,
                 input_doi=doi_to_check,
                 input_openalex_id=openalex_id_to_check,
@@ -276,12 +278,19 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
             
             if entry_id:
                 successful_imports += 1
+                if resolution == 'merged':
+                    merged_imports += 1
+                else:
+                    created_imports += 1
             else:
                 reason = error_msg if error_msg else "Unknown import error"
                 failed_imports.append((str(entry_display_identifier)[:100], reason))
         
         click.echo("\n--- Import Summary ---")
-        click.echo(f"{GREEN}Successfully imported: {successful_imports} new entries{RESET}")
+        click.echo(f"{GREEN}Successfully processed: {successful_imports} entries{RESET}")
+        click.echo(f"{GREEN}New works created: {created_imports}{RESET}")
+        if merged_imports > 0:
+            click.echo(f"{YELLOW}Merged into existing works: {merged_imports} entries{RESET}")
         
         if duplicates_logged > 0:
             click.echo(f"{YELLOW}Duplicates found and logged: {duplicates_logged} entries{RESET}")
@@ -290,8 +299,8 @@ def import_bib_command(bibtex_file, pdf_base_dir, db_path):
             click.echo(f"{RED}Failed to import (or log as duplicate): {len(failed_imports)} entries{RESET}")
             for i, (item_id, reason) in enumerate(failed_imports):
                 click.echo(f"  {RED}Failure {i+1}: {item_id} - Reason: {reason}{RESET}")
-        elif successful_imports > 0 and duplicates_logged == 0:
-             click.echo(f"{GREEN}No import failures or duplicates encountered among processed entries.{RESET}")
+        elif successful_imports > 0 and duplicates_logged == 0 and merged_imports == 0:
+            click.echo(f"{GREEN}No import failures, merges, or duplicates encountered among processed entries.{RESET}")
         elif successful_imports == 0 and duplicates_logged == 0 and not failed_imports and len(bib_database.entries) > 0 :
              click.echo(f"{YELLOW}No new entries were imported, and no duplicates found among the {len(bib_database.entries)} processed entries.{RESET}")
         elif len(bib_database.entries) == 0:
