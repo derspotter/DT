@@ -3,19 +3,26 @@ import { svelte } from '@sveltejs/vite-plugin-svelte'
 
 // https://vite.dev/config/
 const devProxyTarget = process.env.VITE_DEV_PROXY_TARGET || 'http://localhost:4000'
+const disableHmr = ['1', 'true', 'yes'].includes(String(process.env.VITE_DISABLE_HMR || '').trim().toLowerCase())
 const hmrHost = process.env.VITE_HMR_HOST
 const hmrProtocol = process.env.VITE_HMR_PROTOCOL
 const hmrClientPort = process.env.VITE_HMR_CLIENT_PORT ? Number(process.env.VITE_HMR_CLIENT_PORT) : undefined
+const allowedHosts = String(process.env.VITE_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
 
-const hmr = hmrHost
-  ? {
-      host: hmrHost,
-      protocol: hmrProtocol || 'ws',
-      clientPort: hmrClientPort,
-    }
-  : {
-      clientPort: 5175,
-    }
+const hmr = disableHmr
+  ? false
+  : hmrHost
+    ? {
+        host: hmrHost,
+        protocol: hmrProtocol || 'ws',
+        clientPort: hmrClientPort,
+      }
+    : {
+        clientPort: 5175,
+      }
 
 export default defineConfig({
   plugins: [svelte()],
@@ -23,6 +30,7 @@ export default defineConfig({
     port: 5175,
     strictPort: true,
     host: '0.0.0.0',
+    allowedHosts,
     watch: {
       usePolling: true,
     },
@@ -31,6 +39,7 @@ export default defineConfig({
       '/api': {
         target: devProxyTarget,
         changeOrigin: true,
+        ws: true,
       },
     },
   },

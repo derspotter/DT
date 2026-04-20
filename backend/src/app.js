@@ -598,6 +598,301 @@ function getKantroposTargetById(targetId) {
   return KANTROPOS_TARGETS.find((target) => String(target.id) === String(targetId)) || null;
 }
 
+function countBibEntriesInFile(filePath) {
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    const matches = content.match(/@[A-Za-z]+\s*\{/g);
+    return Array.isArray(matches) ? matches.length : 0;
+  } catch {
+    return null;
+  }
+}
+
+function listKantroposCorporaOverview(db) {
+  const assignmentRows = tableExists(db, 'corpus_kantropos_assignments')
+    ? db
+        .prepare(
+          `SELECT a.target_id, a.corpus_id, c.name AS corpus_name, c.owner_user_id, u.username AS owner_username,
+                  uc.role, a.updated_at
+           FROM corpus_kantropos_assignments a
+           JOIN corpora c ON c.id = a.corpus_id
+           LEFT JOIN users u ON u.id = c.owner_user_id
+           LEFT JOIN user_corpora uc ON uc.corpus_id = c.id AND uc.user_id = c.owner_user_id
+           ORDER BY LOWER(c.name), c.id`
+        )
+        .all()
+    : [];
+
+  const assignmentsByTarget = assignmentRows.reduce((map, row) => {
+    const key = String(row.target_id || '').trim();
+    if (!key) return map;
+    const next = map.get(key) || [];
+    next.push({
+      corpus_id: Number(row.corpus_id),
+      corpus_name: String(row.corpus_name || '').trim() || `Corpus ${row.corpus_id}`,
+      owner_user_id: Number(row.owner_user_id || 0) || null,
+      owner_username: String(row.owner_username || '').trim(),
+      role: String(row.role || '').trim() || 'owner',
+      updated_at: String(row.updated_at || '').trim(),
+    });
+    map.set(key, next);
+    return map;
+  }, new Map());
+
+  return KANTROPOS_TARGETS.map((target) => {
+    const targetPath = String(target.path || '').trim();
+    const directoryExists = Boolean(targetPath) && fs.existsSync(targetPath);
+    const metadataBibPath = targetPath ? path.join(targetPath, 'metadata.bib') : '';
+    const metadataBibExists = Boolean(metadataBibPath) && fs.existsSync(metadataBibPath);
+    let metadataBibSize = null;
+    let metadataBibModifiedAt = '';
+    if (metadataBibExists) {
+      try {
+        const stats = fs.statSync(metadataBibPath);
+        metadataBibSize = Number(stats.size || 0);
+        metadataBibModifiedAt = stats.mtime?.toISOString?.() || '';
+      } catch {
+        metadataBibSize = null;
+        metadataBibModifiedAt = '';
+      }
+    }
+    const assignments = assignmentsByTarget.get(String(target.id)) || [];
+    return {
+      ...target,
+      directory_exists: directoryExists,
+      metadata_bib_exists: metadataBibExists,
+      metadata_bib_path: metadataBibExists ? metadataBibPath : '',
+      metadata_bib_size: metadataBibSize,
+      metadata_bib_modified_at: metadataBibModifiedAt,
+      metadata_entry_count: metadataBibExists ? countBibEntriesInFile(metadataBibPath) : null,
+      assignment_count: assignments.length,
+      assigned_corpora: assignments,
+    };
+  });
+}
+
+function statusFromWorkRow(data) {
+  const metadata = String(data?.metadata_status || 'pending').trim().toLowerCase();
+  const download = String(data?.download_status || 'not_requested').trim().toLowerCase();
+  if (download === 'downloaded') return 'downloaded';
+  if (download === 'queued' || download === 'in_progress') return 'queued_download';
+  if (download === 'failed') return 'failed_download';
+  if (metadata === 'in_progress') return 'enriching';
+  if (metadata === 'failed') return 'failed_enrichment';
+  if (metadata === 'matched') return 'matched';
+  return 'raw';
+}
+
+function mapWorkRowToBrowserItem(data, extra = {}) {
+  return {
+    id: Number(data?.id),
+    work_id: Number(data?.id),
+    title: data?.title || '',
+    authors: data?.authors || '',
+    year: data?.year ?? null,
+    source: data?.origin_key || data?.source_pdf || data?.metadata_source || data?.source || '',
+    status: statusFromWorkRow(data),
+    metadata_status: data?.metadata_status || '',
+    download_status: data?.download_status || '',
+    doi: data?.doi || null,
+    openalex_id: data?.openalex_id || null,
+    file_path: data?.file_path || null,
+    ...extra,
+  };
+}
+
+function listAssignedCorporaForKantroposTarget(db, targetId) {
+  if (!tableExists(db, 'corpus_kantropos_assignments')) return [];
+  return db
+    .prepare(
+      `SELECT c.id, c.name, c.owner_user_id, u.username AS owner_username, a.updated_at
+       FROM corpus_kantropos_assignments a
+       JOIN corpora c ON c.id = a.corpus_id
+       LEFT JOIN users u ON u.id = c.owner_user_id
+       WHERE a.target_id = ?
+       ORDER BY LOWER(c.name), c.id`
+    )
+    .all(String(targetId || ''))
+    .map((row) => ({
+      id: Number(row.id),
+      name: String(row.name || '').trim() || `Corpus ${row.id}`,
+      owner_user_id: Number(row.owner_user_id || 0) || null,
+      owner_username: String(row.owner_username || '').trim(),
+      updated_at: String(row.updated_at || '').trim(),
+      downloaded_count: 0,
+      pending_count: 0,
+    }));
+}
+
+function listImportedKantroposWorkItemCount(db, target) {
+  const metadataBibPath = String(path.join(String(target?.path || ''), 'metadata.bib'));
+  return Number(
+    db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM works
+         WHERE origin_type = 'bibtex_import'
+           AND origin_key = ?`
+      )
+      .get(metadataBibPath)?.count || 0
+  );
+}
+
+function listImportedKantroposWorkIdSet(db, target) {
+  const metadataBibPath = String(path.join(String(target?.path || ''), 'metadata.bib'));
+  const rows = db
+    .prepare(
+      `SELECT id
+       FROM works
+       WHERE origin_type = 'bibtex_import'
+         AND origin_key = ?`
+    )
+    .all(metadataBibPath);
+  return new Set(rows.map((row) => Number(row.id)).filter((value) => Number.isFinite(value) && value > 0));
+}
+
+function listImportedKantroposWorkItems(db, target, limit = null) {
+  const metadataBibPath = String(path.join(String(target?.path || ''), 'metadata.bib'));
+  const normalizedLimit = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.max(1, Math.min(500, Number(limit))) : null;
+  const statement = normalizedLimit
+    ? db.prepare(
+        `SELECT *
+         FROM works
+         WHERE origin_type = 'bibtex_import'
+           AND origin_key = ?
+         ORDER BY COALESCE(year, 0) DESC, id DESC
+         LIMIT ?`
+      )
+    : db
+    .prepare(
+      `SELECT *
+       FROM works
+       WHERE origin_type = 'bibtex_import'
+         AND origin_key = ?
+       ORDER BY COALESCE(year, 0) DESC, id DESC`
+    );
+  const rows = normalizedLimit ? statement.all(metadataBibPath, normalizedLimit) : statement.all(metadataBibPath);
+  return rows.map((row) => mapWorkRowToBrowserItem(row));
+}
+
+function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
+  if (!tableExists(db, 'corpus_kantropos_assignments')) return [];
+  const rows = db
+    .prepare(
+      `SELECT w.*, c.id AS corpus_id, c.name AS corpus_name, u.username AS owner_username
+       FROM works w
+       JOIN corpus_works cw ON cw.work_id = w.id
+       JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
+       JOIN corpora c ON c.id = cw.corpus_id
+       LEFT JOIN users u ON u.id = c.owner_user_id
+       WHERE a.target_id = ?
+         AND w.download_status = 'downloaded'
+       ORDER BY COALESCE(w.year, 0) DESC, w.id DESC, LOWER(c.name), c.id`
+    )
+    .all(String(targetId || ''));
+
+  const itemsByWorkId = new Map();
+  for (const row of rows) {
+    const workId = Number(row.id);
+    if (!Number.isFinite(workId) || workId <= 0) continue;
+    if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
+
+    const sourceCorpus = {
+      id: Number(row.corpus_id),
+      name: String(row.corpus_name || '').trim() || `Corpus ${row.corpus_id}`,
+      owner_username: String(row.owner_username || '').trim(),
+    };
+
+    if (!itemsByWorkId.has(workId)) {
+      itemsByWorkId.set(
+        workId,
+        mapWorkRowToBrowserItem(row, {
+          source_corpora: [sourceCorpus],
+          source_corpus_ids: [sourceCorpus.id],
+          source_corpora_count: 1,
+          provisional: importedWorkIdSet.size === 0,
+        })
+      );
+      continue;
+    }
+
+    const existing = itemsByWorkId.get(workId);
+    if (!existing.source_corpus_ids.includes(sourceCorpus.id)) {
+      existing.source_corpora = [...existing.source_corpora, sourceCorpus];
+      existing.source_corpus_ids = [...existing.source_corpus_ids, sourceCorpus.id];
+      existing.source_corpora_count = existing.source_corpora.length;
+    }
+  }
+
+  return [...itemsByWorkId.values()];
+}
+
+function buildKantroposBrowsePayload(db, targetId, options = {}) {
+  const target = getKantroposTargetById(targetId);
+  if (!target) return null;
+
+  const currentLimit = Math.max(1, Math.min(500, coerceInt(options.currentLimit, 120) || 120));
+  const pendingLimit = Math.max(1, Math.min(500, coerceInt(options.pendingLimit, 120) || 120));
+
+  const overview = listKantroposCorporaOverview(db).find((entry) => String(entry.id) === String(targetId)) || null;
+  const assignedCorpora = listAssignedCorporaForKantroposTarget(db, targetId);
+  const currentItemsCount = listImportedKantroposWorkItemCount(db, target);
+  const importedWorkIdSet = listImportedKantroposWorkIdSet(db, target);
+  const currentItems = listImportedKantroposWorkItems(db, target, currentLimit);
+  const pendingItemsAll = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet);
+  const pendingItemsCount = pendingItemsAll.length;
+  const pendingItems = pendingItemsAll.slice(0, pendingLimit);
+
+  const assignedById = new Map(assignedCorpora.map((corpus) => [Number(corpus.id), { ...corpus }]));
+  for (const item of pendingItemsAll) {
+    for (const sourceCorpus of item.source_corpora || []) {
+      const bucket = assignedById.get(Number(sourceCorpus.id));
+      if (!bucket) continue;
+      bucket.pending_count += 1;
+    }
+  }
+  const downloadedRows = db
+    .prepare(
+      `SELECT cw.corpus_id, COUNT(DISTINCT w.id) AS downloaded_count
+       FROM corpus_works cw
+       JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
+       JOIN works w ON w.id = cw.work_id
+       WHERE a.target_id = ?
+         AND w.download_status = 'downloaded'
+       GROUP BY cw.corpus_id`
+    )
+    .all(String(targetId || ''));
+  for (const row of downloadedRows) {
+    const bucket = assignedById.get(Number(row.corpus_id));
+    if (bucket) {
+      bucket.downloaded_count = Number(row.downloaded_count || 0);
+    }
+  }
+
+  return {
+    source: 'api',
+    target: overview || target,
+    summary: {
+      current_items_count: currentItemsCount,
+      pending_items_count: pendingItemsCount,
+      assigned_corpora_count: assignedCorpora.length,
+      metadata_bib_modified_at: overview?.metadata_bib_modified_at || '',
+      metadata_bib_exists: Boolean(overview?.metadata_bib_exists),
+      metadata_bib_path: overview?.metadata_bib_path || '',
+      metadata_entry_count: overview?.metadata_entry_count ?? null,
+      has_imported_current: currentItemsCount > 0,
+      pending_is_provisional: currentItemsCount === 0,
+      current_items_loaded: currentItems.length,
+      pending_items_loaded: pendingItems.length,
+      current_items_has_more: currentItems.length < currentItemsCount,
+      pending_items_has_more: pendingItems.length < pendingItemsCount,
+    },
+    assigned_corpora: [...assignedById.values()],
+    current_items: currentItems,
+    pending_items: pendingItems,
+  };
+}
+
 function getCorpusKantroposAssignment(db, corpusId) {
   if (!Number.isFinite(Number(corpusId)) || Number(corpusId) <= 0) return null;
   const row = db
@@ -2308,10 +2603,31 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.get('/api/kantropos/corpora', requireAuthMiddleware, (_req, res) => {
+    const corpora = listKantroposCorporaOverview(authDb);
     return res.json({
       root_path: KANTROPOS_CORPORA_ROOT,
-      corpora: KANTROPOS_TARGETS,
+      corpora,
     });
+  });
+
+  app.get('/api/kantropos/corpora/:id/browse', requireAuthMiddleware, (req, res) => {
+    try {
+      const targetId = String(req.params?.id || '').trim();
+      if (!targetId) {
+        return res.status(400).json({ error: 'Missing Kantropos corpus id' });
+      }
+      const payload = buildKantroposBrowsePayload(authDb, targetId, {
+        currentLimit: req.query?.current_limit ?? req.query?.currentLimit,
+        pendingLimit: req.query?.pending_limit ?? req.query?.pendingLimit,
+      });
+      if (!payload) {
+        return res.status(404).json({ error: 'Unknown Kantropos corpus target' });
+      }
+      return res.json(payload);
+    } catch (error) {
+      console.error('[/api/kantropos/corpora/:id/browse] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load Kantropos corpus browser data' });
+    }
   });
 
   app.post('/api/corpora', requireAuthMiddleware, (req, res) => {

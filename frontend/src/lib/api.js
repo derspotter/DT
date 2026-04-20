@@ -204,6 +204,24 @@ export async function fetchKantroposCorpora() {
   return response.json()
 }
 
+export async function fetchKantroposCorpusBrowse(targetId, options = {}) {
+  const params = new URLSearchParams()
+  if (Number.isFinite(Number(options.currentLimit)) && Number(options.currentLimit) > 0) {
+    params.set('current_limit', String(Number(options.currentLimit)))
+  }
+  if (Number.isFinite(Number(options.pendingLimit)) && Number(options.pendingLimit) > 0) {
+    params.set('pending_limit', String(Number(options.pendingLimit)))
+  }
+  const suffix = params.size > 0 ? `?${params.toString()}` : ''
+  const response = await fetchWithTimeout(`${API_BASE}/api/kantropos/corpora/${encodeURIComponent(String(targetId || ''))}/browse${suffix}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load Kantropos corpus browser data')
+  }
+  return response.json()
+}
+
 export async function fetchCorpusKantroposAssignment(corpusId) {
   const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/kantropos-assignment`)
   await throwIfUnauthorized(response)

@@ -7,10 +7,6 @@
   export let downloadedTotal;
   export let failedEnrichmentTotal;
   export let failedDownloadTotal;
-  export let shareUsername;
-  export let shareRole;
-  export let shareStatus;
-  export let handleShareCorpus;
   
   export let bucketLabel;
   export let formatAuthors;
@@ -124,28 +120,6 @@
         {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusTotal}.{/if}
       </p>
     </div>
-    <form class="workspace-panel-actions corpus-share" on:submit|preventDefault={handleShareCorpus}>
-      <div>
-        <label>
-          Share with
-          <input type="text" placeholder="username" bind:value={shareUsername} />
-        </label>
-      </div>
-      <div>
-        <label>
-          Role
-          <select bind:value={shareRole}>
-            <option value="viewer">Viewer</option>
-            <option value="editor">Editor</option>
-            <option value="owner">Owner</option>
-          </select>
-        </label>
-      </div>
-      <button class="secondary" type="submit">Share</button>
-      {#if shareStatus}
-        <span class="muted">{shareStatus}</span>
-      {/if}
-    </form>
   </div>
 
   <div class="table-toolbar corpus-toolbar">

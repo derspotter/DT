@@ -12,6 +12,7 @@
     deleteCorpus as deleteCorpusApi,
     shareCorpus,
     fetchKantroposCorpora,
+    fetchKantroposCorpusBrowse,
     fetchCorpusKantroposAssignment,
     saveCorpusKantroposAssignment,
     setAuthToken,
@@ -49,16 +50,25 @@
   import Logs from './components/Logs.svelte'
   import Graph from './components/Graph.svelte'
   import Corpus from './components/Corpus.svelte'
+  import UpstreamBrowser from './components/UpstreamBrowser.svelte'
+  import AdminPanel from './components/AdminPanel.svelte'
 
   const userTabGroups = [
     {
       title: '',
       tabs: [
         { id: 'workspace', label: 'Workspace' },
+        { id: 'upstream', label: 'Korpus Management' },
       ]
     }
   ]
   const adminTabGroups = [
+    {
+      title: 'Administration',
+      tabs: [
+        { id: 'admin', label: 'Admin' },
+      ]
+    },
     {
       title: 'Diagnostics',
       tabs: [
@@ -341,6 +351,16 @@
     failed_enrichment: 0,
     failed_download: 0,
   }
+  let globalWorkerBacklog = {
+    raw_pending: 0,
+    enriching: 0,
+    matched: 0,
+    queued_download: 0,
+    downloading: 0,
+    downloaded: 0,
+    failed_enrichment: 0,
+    failed_download: 0,
+  }
   let exportBusy = false
   let exportStatus = ''
   let exportFilterStatus = 'all'
@@ -414,6 +434,20 @@
   let kantroposAssignmentLoading = false
   let kantroposAssignmentSaving = false
   let kantroposAssignmentRequestSeq = 0
+  let selectedUpstreamTargetId = ''
+  let selectedUpstreamAssignedCorpusId = null
+  let upstreamBrowse = {
+    target: null,
+    summary: {},
+    assigned_corpora: [],
+    current_items: [],
+    pending_items: [],
+  }
+  let upstreamBrowseStatus = ''
+  let upstreamBrowseLoading = false
+  let upstreamBrowseRequestSeq = 0
+  let upstreamCurrentLimit = CORPUS_PAGE_SIZE
+  let upstreamPendingLimit = CORPUS_PAGE_SIZE
 
   const maxLogs = 200
   const maxLogHistory = 5000
@@ -432,6 +466,24 @@
     kantroposAssignmentError = false
     kantroposAssignmentLoading = false
     kantroposAssignmentSaving = false
+  }
+
+  function resetUpstreamBrowseState({ preserveTargetSelection = true } = {}) {
+    if (!preserveTargetSelection) {
+      selectedUpstreamTargetId = ''
+    }
+    upstreamCurrentLimit = CORPUS_PAGE_SIZE
+    upstreamPendingLimit = CORPUS_PAGE_SIZE
+    selectedUpstreamAssignedCorpusId = null
+    upstreamBrowse = {
+      target: null,
+      summary: {},
+      assigned_corpora: [],
+      current_items: [],
+      pending_items: [],
+    }
+    upstreamBrowseStatus = ''
+    upstreamBrowseLoading = false
   }
 
   function formatBytes(bytes) {
@@ -495,6 +547,16 @@
     return {
       ...entry,
       authors_display: formatAuthors(entry),
+    }
+  }
+
+  function normalizeUpstreamBrowseItem(entry) {
+    if (!entry || typeof entry !== 'object') return entry
+    return {
+      ...entry,
+      authors_display: formatAuthors(entry),
+      source_corpora: Array.isArray(entry.source_corpora) ? entry.source_corpora : [],
+      source_corpus_ids: Array.isArray(entry.source_corpus_ids) ? entry.source_corpus_ids : [],
     }
   }
 
@@ -1411,6 +1473,9 @@
       if (tabId === 'dashboard' || tabId === 'workspace') {
         tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
       }
+      if (tabId === 'upstream') {
+        tasks.push(loadUpstreamBrowse({ quiet: true }))
+      }
       if (diagnosticsEnabled && (tabId === 'dashboard' || tabId === 'downloads')) {
         tasks.push(loadDownloads())
       }
@@ -1679,6 +1744,7 @@
     corpusActionStatus = ''
     corpusActionError = false
     resetKantroposAssignmentState()
+    resetUpstreamBrowseState()
     finishExtractionProgress()
   }
 
@@ -1802,11 +1868,103 @@
     try {
       const payload = await fetchKantroposCorpora()
       kantroposTargets = payload?.corpora || []
+      const hasCurrentSelection = kantroposTargets.some((target) => String(target.id) === String(selectedUpstreamTargetId))
+      if (!hasCurrentSelection) {
+        const preferredTargetId = kantroposAssignment?.target_id || kantroposTargets[0]?.id || ''
+        selectedUpstreamTargetId = String(preferredTargetId || '')
+      }
     } catch (error) {
       kantroposTargets = []
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
       kantroposAssignmentError = true
+      if (!selectedUpstreamTargetId) {
+        selectedUpstreamTargetId = ''
+      }
     }
+  }
+
+  async function loadUpstreamBrowse({ quiet = false, appendCurrent = false, appendPending = false } = {}) {
+    const requestSeq = ++upstreamBrowseRequestSeq
+    if (!quiet) {
+      upstreamBrowseStatus = upstreamBrowse.target ? 'Refreshing upstream corpus browser...' : 'Loading upstream corpus browser...'
+    }
+    upstreamBrowseLoading = true
+    try {
+      if (kantroposTargets.length === 0) {
+        await loadKantroposTargets()
+      }
+      const targetId = String(selectedUpstreamTargetId || kantroposAssignment?.target_id || kantroposTargets[0]?.id || '').trim()
+      if (!targetId) {
+        if (!quiet) upstreamBrowseStatus = 'No upstream corpora are configured.'
+        resetUpstreamBrowseState()
+        return
+      }
+      selectedUpstreamTargetId = targetId
+      const nextCurrentLimit = appendCurrent
+        ? Math.max(CORPUS_PAGE_SIZE, Number(upstreamCurrentLimit || CORPUS_PAGE_SIZE) + CORPUS_PAGE_SIZE)
+        : Math.max(CORPUS_PAGE_SIZE, Number(upstreamCurrentLimit || CORPUS_PAGE_SIZE))
+      const nextPendingLimit = appendPending
+        ? Math.max(CORPUS_PAGE_SIZE, Number(upstreamPendingLimit || CORPUS_PAGE_SIZE) + CORPUS_PAGE_SIZE)
+        : Math.max(CORPUS_PAGE_SIZE, Number(upstreamPendingLimit || CORPUS_PAGE_SIZE))
+      const payload = await fetchKantroposCorpusBrowse(targetId, {
+        currentLimit: nextCurrentLimit,
+        pendingLimit: nextPendingLimit,
+      })
+      if (requestSeq !== upstreamBrowseRequestSeq || String(selectedUpstreamTargetId) !== targetId) return
+      upstreamCurrentLimit = nextCurrentLimit
+      upstreamPendingLimit = nextPendingLimit
+
+      const assignedCorpora = Array.isArray(payload?.assigned_corpora) ? payload.assigned_corpora : []
+      const stillValidAssignedFilter = assignedCorpora.some((entry) => Number(entry.id) === Number(selectedUpstreamAssignedCorpusId))
+      if (!stillValidAssignedFilter) {
+        selectedUpstreamAssignedCorpusId = null
+      }
+
+      upstreamBrowse = {
+        target: payload?.target || null,
+        summary: payload?.summary || {},
+        assigned_corpora: assignedCorpora,
+        current_items: (Array.isArray(payload?.current_items) ? payload.current_items : []).map((item) => normalizeUpstreamBrowseItem(item)),
+        pending_items: (Array.isArray(payload?.pending_items) ? payload.pending_items : []).map((item) => normalizeUpstreamBrowseItem(item)),
+      }
+      if (!quiet) {
+        upstreamBrowseStatus = 'Loaded upstream corpus browser.'
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      if (!quiet) {
+        upstreamBrowseStatus = error?.message || 'Failed to load upstream corpus browser.'
+      }
+    } finally {
+      if (requestSeq === upstreamBrowseRequestSeq) {
+        upstreamBrowseLoading = false
+      }
+    }
+  }
+
+  async function handleSelectUpstreamTarget(targetId) {
+    const normalized = String(targetId || '').trim()
+    if (!normalized || normalized === String(selectedUpstreamTargetId || '').trim()) return
+    selectedUpstreamTargetId = normalized
+    selectedUpstreamAssignedCorpusId = null
+    await loadUpstreamBrowse()
+  }
+
+  function handleToggleUpstreamAssignedCorpus(corpusId) {
+    if (corpusId === null || corpusId === undefined || corpusId === '') {
+      selectedUpstreamAssignedCorpusId = null
+      return
+    }
+    const normalized = Number(corpusId)
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+      selectedUpstreamAssignedCorpusId = null
+      return
+    }
+    selectedUpstreamAssignedCorpusId = Number(selectedUpstreamAssignedCorpusId) === normalized ? null : normalized
   }
 
   async function loadKantroposAssignment() {
@@ -4374,85 +4532,23 @@
     </div>
   </div>
 {:else}
-  <div class="app-shell" class:workspace-mode={activeTab === 'workspace'}>
+  <div class="app-shell" class:workspace-mode={activeTab === 'workspace'} class:upstream-mode={activeTab === 'upstream'}>
     <header class="app-header">
-      <div class="header-main">
-        <p class="eyebrow">Korpus Builder</p>
+      <div class="header-main header-main--workspace">
+        <div class="header-main__top">
+          <p class="eyebrow">Korpus Builder</p>
+          <div class="header-user header-user--compact">
+            <span class="eyebrow">Signed in</span>
+            <strong>{authUser?.username}</strong>
+            <button class="secondary logout-button" type="button" on:click={handleLogout}>
+              Log out
+            </button>
+          </div>
+        </div>
         <h1>Corpus orchestration workspace</h1>
         <p class="subtitle">
           Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
         </p>
-      </div>
-      <div class="header-panel">
-        <div class="header-user">
-          <span class="eyebrow">Signed in</span>
-          <strong>{authUser?.username}</strong>
-          <button class="secondary logout-button" type="button" on:click={handleLogout}>
-            Log out
-          </button>
-        </div>
-        <div class="header-corpus">
-          <label>
-            <span class="header-corpus-label">Corpus</span>
-            <select on:change={handleSelectCorpus} bind:value={currentCorpusId}>
-              {#each corpora as corpus}
-                <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
-              {/each}
-            </select>
-          </label>
-          <label>
-            <span class="header-corpus-label">Kantropos target</span>
-            <select
-              bind:value={selectedKantroposTargetId}
-              on:change={handleKantroposTargetChange}
-              disabled={kantroposAssignmentLoading || kantroposAssignmentSaving || !currentCorpusId || !canConfigureCurrentCorpusKantropos}
-              title={canConfigureCurrentCorpusKantropos ? 'Assign this local corpus to a predefined Kantropos corpus' : 'Only owners or editors can change the Kantropos assignment'}
-            >
-              <option value="">No assignment</option>
-              {#each kantroposTargets as target}
-                <option value={target.id}>{target.name}</option>
-              {/each}
-            </select>
-          </label>
-          <div class="header-corpus-actions">
-            <button class="secondary" type="button" on:click={handleCreateCorpus} disabled={creatingCorpus || deletingCorpus}>
-              {creatingCorpus ? 'Creating...' : 'New corpus'}
-            </button>
-            <button
-              class="danger"
-              type="button"
-              on:click={handleDeleteCorpus}
-              disabled={deletingCorpus || creatingCorpus || !currentCorpusId || !canDeleteCurrentCorpus}
-              title={canDeleteCurrentCorpus ? 'Delete selected corpus' : 'Only owners can delete corpora'}
-            >
-              {deletingCorpus ? 'Deleting...' : 'Delete corpus'}
-            </button>
-          </div>
-          {#if corpusActionStatus}
-            <p class={`${corpusActionError ? 'error' : 'muted'} header-corpus-status`}>{corpusActionStatus}</p>
-          {/if}
-          {#if kantroposAssignmentStatus}
-            <p class={`${kantroposAssignmentError ? 'error' : 'muted'} header-corpus-status`}>{kantroposAssignmentStatus}</p>
-          {:else if currentCorpusId && kantroposAssignment?.target_name}
-            <p class="muted header-corpus-status">Kantropos: {kantroposAssignment.target_name}</p>
-          {/if}
-        </div>
-        {#if isAdmin}
-          <form class="header-invite" on:submit|preventDefault={handleCreateInvitation}>
-            <label>
-              <span class="header-corpus-label">Invite user</span>
-              <input type="text" placeholder="username" bind:value={inviteUsername} required />
-            </label>
-            <label>
-              <span class="header-corpus-label">Email</span>
-              <input type="email" placeholder="user@example.com" bind:value={inviteEmail} required />
-            </label>
-            <button class="secondary" type="submit">Send invite</button>
-            {#if inviteStatus}
-              <p class={`${inviteError ? 'error' : 'muted'} header-corpus-status`}>{inviteStatus}</p>
-            {/if}
-          </form>
-        {/if}
       </div>
     </header>
 
@@ -4966,10 +5062,6 @@
                 {downloadedTotal}
                 {failedEnrichmentTotal}
                 {failedDownloadTotal}
-                bind:shareUsername={shareUsername}
-                bind:shareRole={shareRole}
-                {shareStatus}
-                {handleShareCorpus}
                 {bucketLabel}
                 {formatAuthors}
                 {doiHref}
@@ -4987,6 +5079,59 @@
         </div>
 
         </div>
+      {/if}
+
+      {#if activeTab === 'upstream'}
+        <UpstreamBrowser
+          corpora={corpora}
+          currentCorpus={currentCorpus}
+          currentCorpusId={currentCorpusId}
+          corpusOptionLabel={corpusOptionLabel}
+          onSelectCorpusChange={handleSelectCorpus}
+          onCreateCorpus={handleCreateCorpus}
+          onDeleteCorpus={handleDeleteCorpus}
+          creatingCorpus={creatingCorpus}
+          deletingCorpus={deletingCorpus}
+          canDeleteCurrentCorpus={canDeleteCurrentCorpus}
+          corpusActionStatus={corpusActionStatus}
+          corpusActionError={corpusActionError}
+          targets={kantroposTargets}
+          selectedTargetId={selectedUpstreamTargetId}
+          selectTarget={handleSelectUpstreamTarget}
+          selectedKantroposTargetId={selectedKantroposTargetId}
+          onKantroposTargetChange={handleKantroposTargetChange}
+          canConfigureCurrentCorpusKantropos={canConfigureCurrentCorpusKantropos}
+          kantroposAssignmentLoading={kantroposAssignmentLoading}
+          kantroposAssignmentSaving={kantroposAssignmentSaving}
+          kantroposAssignment={kantroposAssignment}
+          kantroposAssignmentStatus={kantroposAssignmentStatus}
+          kantroposAssignmentError={kantroposAssignmentError}
+          bind:shareUsername={shareUsername}
+          bind:shareRole={shareRole}
+          {shareStatus}
+          {handleShareCorpus}
+          refresh={loadUpstreamBrowse}
+          loadMoreCurrent={() => loadUpstreamBrowse({ appendCurrent: true })}
+          loadMorePending={() => loadUpstreamBrowse({ appendPending: true })}
+          loading={upstreamBrowseLoading}
+          status={upstreamBrowseStatus}
+          browse={upstreamBrowse}
+          selectedAssignedCorpusId={selectedUpstreamAssignedCorpusId}
+          toggleAssignedCorpus={handleToggleUpstreamAssignedCorpus}
+          {formatAuthors}
+          {doiHref}
+          {openAlexHref}
+        />
+      {/if}
+
+      {#if activeTab === 'admin'}
+        <AdminPanel
+          bind:inviteUsername={inviteUsername}
+          bind:inviteEmail={inviteEmail}
+          {inviteStatus}
+          {inviteError}
+          {handleCreateInvitation}
+        />
       {/if}
 
       {#if activeTab === 'dashboard'}
