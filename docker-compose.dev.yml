@@ -3,7 +3,11 @@ services:
     command: sh -c "npm install && npm run dev"
     environment:
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
+      - RAG_ADMIN_USER=${RAG_ADMIN_USER}
+      - RAG_ADMIN_PASSWORD=${RAG_ADMIN_PASSWORD}
+      - RAG_FEEDER_JWT_SECRET=${RAG_FEEDER_JWT_SECRET}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
       - CHOKIDAR_USEPOLLING=1
     volumes:

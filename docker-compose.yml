@@ -1,8 +1,8 @@
 services:
   rag_backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     command: npm run dev -- --legacy-watch
     container_name: rag_feeder_backend
     expose:
@@ -12,6 +12,8 @@ services:
       - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175,https://genkia.de
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - RAG_FEEDER_JWT_SECRET=${RAG_FEEDER_JWT_SECRET}
+      - RAG_ADMIN_USER=${RAG_ADMIN_USER}
+      - RAG_ADMIN_PASSWORD=${RAG_ADMIN_PASSWORD}
       - RAG_FEEDER_FRONTEND_URL=${RAG_FEEDER_FRONTEND_URL:-https://genkia.de}
       - RAG_FEEDER_SMTP_HOST=${RAG_FEEDER_SMTP_HOST:-}
       - RAG_FEEDER_SMTP_PORT=${RAG_FEEDER_SMTP_PORT:-587}
@@ -22,6 +24,7 @@ services:
       - RAG_FEEDER_SMTP_TLS_REJECT_UNAUTHORIZED=${RAG_FEEDER_SMTP_TLS_REJECT_UNAUTHORIZED:-true}
       - RAG_FEEDER_SMTP_IGNORE_TLS=${RAG_FEEDER_SMTP_IGNORE_TLS:-false}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
       - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_OPENALEX_RPS=${RAG_FEEDER_OPENALEX_RPS:-30}
@@ -47,18 +50,18 @@ services:
     restart: unless-stopped
     networks:
       - rag-network
-      - proxy-genkia
 
   rag_enrich_worker:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role enrich --db-path /usr/src/app/dl_lit_project/data/literature.db
     container_name: rag_feeder_enrich_worker
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
       - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
@@ -86,14 +89,15 @@ services:
 
   rag_download_worker:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role download --db-path /usr/src/app/dl_lit_project/data/literature.db
     container_name: rag_feeder_download_worker
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - OPENALEX_API_KEY=${OPENALEX_API_KEY}
       - SEMANTIC_SCHOLAR_API_KEY=${SEMANTIC_SCHOLAR_API_KEY}
       - RAG_FEEDER_MAILTO=${RAG_FEEDER_MAILTO:-spott@wzb.eu}
@@ -127,21 +131,20 @@ services:
       - NPM_CONFIG_PRODUCTION=false
       - CHOKIDAR_USEPOLLING=1
       - VITE_DEV_PROXY_TARGET=http://rag_backend:4000
-      - VITE_HMR_HOST=genkia.de
-      - VITE_HMR_PROTOCOL=wss
-      - VITE_HMR_CLIENT_PORT=443
+      - VITE_HMR_HOST=${VITE_HMR_HOST:-}
+      - VITE_HMR_PROTOCOL=${VITE_HMR_PROTOCOL:-}
+      - VITE_HMR_CLIENT_PORT=${VITE_HMR_CLIENT_PORT:-}
     volumes:
       - ./frontend:/app
       - rag_feeder_node_modules:/app/node_modules
     restart: unless-stopped
     networks:
       - rag-network
-      - proxy-genkia
+      - reverse_proxy
 
 networks:
   rag-network:
-    external: true
-  proxy-genkia:
+  reverse_proxy:
     external: true
 
 volumes:

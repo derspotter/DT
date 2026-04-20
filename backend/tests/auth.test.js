@@ -36,6 +36,9 @@ describe('auth hardening', () => {
   })
 
   test('fails fast when required auth env vars are missing', () => {
+    delete process.env.RAG_FEEDER_JWT_SECRET
+    delete process.env.RAG_ADMIN_USER
+    delete process.env.RAG_ADMIN_PASSWORD
     expect(() => createApp({ broadcast: () => {} })).toThrow(/Missing required environment variables/)
   })
 

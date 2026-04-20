@@ -1,0 +1,20 @@
+services:
+  rag_backend:
+    environment:
+      - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175,https://corpus4uol.university-of-labour.de
+      - RAG_FEEDER_FRONTEND_URL=https://corpus4uol.university-of-labour.de
+
+  rag_feeder:
+    environment:
+      - VITE_ALLOWED_HOSTS=corpus4uol.university-of-labour.de
+      - VITE_DISABLE_HMR=1
+    labels:
+      caddy: corpus4uol.university-of-labour.de
+      caddy.reverse_proxy: "{{upstreams 5175}}"
+      caddy_ingress_network: reverse_proxy
+    networks:
+      - reverse_proxy
+
+networks:
+  reverse_proxy:
+    external: true

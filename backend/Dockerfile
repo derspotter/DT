@@ -14,17 +14,15 @@ RUN apt-get update \
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install necessary Python packages in one command.
-# Keep this aligned with dl_lit_project runtime imports used by the backend scripts.
-RUN pip install --no-cache-dir \
-  google-genai google-api-core pikepdf pdfminer.six openai python-dotenv PyPDF2 rapidfuzz \
-  requests beautifulsoup4 colorama bibtexparser lxml
-
 # Set the working directory inside the container
 WORKDIR /usr/src/app
 
+# Install Python dependencies from the canonical project requirements.
+COPY dl_lit_project/requirements.txt /tmp/dl_lit_project-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/dl_lit_project-requirements.txt
+
 # Copy package.json for faster, quieter installs
-COPY package*.json ./
+COPY backend/package*.json ./
 
 # Remove existing node_modules to force fresh install
 RUN rm -rf node_modules
@@ -33,7 +31,7 @@ RUN rm -rf node_modules
 RUN npm install --no-fund --no-audit --loglevel=error
 
 # Copy the rest of the application code
-COPY . .
+COPY backend/ .
 
 # Expose the port the app runs on
 EXPOSE 4000
