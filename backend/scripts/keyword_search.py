@@ -295,10 +295,10 @@ def _crawl_direction(
     global_ids,
     rate_limiter,
 ):
-    if max_depth <= 1 or not base_items:
+    if max_depth <= 0 or not base_items:
         return {'added': 0, 'processed': 0, 'matched': 0}
 
-    queue = deque((item, 1) for item in base_items)
+    queue = deque((item, 0) for item in base_items)
     local_seen = {_normalize_candidate_id(item.get('id')) for item in base_items if _normalize_candidate_id(item.get('id'))}
     processed = 0
     added = 0
@@ -381,7 +381,7 @@ def expand_references_recursive(
             'upstream_added': 0,
         }
 
-    if related_depth_downstream <= 1 and related_depth_upstream <= 1:
+    if related_depth_downstream <= 0 and related_depth_upstream <= 0:
         return base_items, {
             'added': 0,
             'processed': 0,
