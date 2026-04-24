@@ -1829,6 +1829,55 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return tx();
   }
 
+  const extractionQueueStates = new Map();
+
+  function extractionQueueKey(corpusId) {
+    return corpusId == null ? '__none__' : String(corpusId);
+  }
+
+  function getOrInitExtractionQueueState(corpusId) {
+    const key = extractionQueueKey(corpusId);
+    let state = extractionQueueStates.get(key);
+    if (!state) {
+      state = {
+        running: false,
+        pending: 0,
+        tail: Promise.resolve(),
+      };
+      extractionQueueStates.set(key, state);
+    }
+    return state;
+  }
+
+  function enqueueExtractionTask(corpusId, task) {
+    const key = extractionQueueKey(corpusId);
+    const state = getOrInitExtractionQueueState(corpusId);
+    const queued = state.running || state.pending > 0;
+    const queuePosition = queued ? state.pending + (state.running ? 1 : 0) : 0;
+    state.pending += 1;
+
+    const run = state.tail
+      .catch(() => {})
+      .then(async () => {
+        state.pending = Math.max(0, state.pending - 1);
+        state.running = true;
+        try {
+          await task();
+        } catch (error) {
+          console.error(`[extraction-queue] Extraction task failed for corpus=${key}:`, error);
+        } finally {
+          state.running = false;
+          if (!state.running && state.pending === 0) {
+            state.tail = Promise.resolve();
+            extractionQueueStates.delete(key);
+          }
+        }
+      });
+
+    state.tail = run;
+    return { queued, queuePosition };
+  }
+
   function startDownloadWorker(corpusId, config = {}) {
     const state = getOrInitWorkerState(corpusId);
     const intervalSeconds = coerceInt(config.intervalSeconds, state.config.intervalSeconds) || state.config.intervalSeconds;
@@ -2926,305 +2975,337 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       });
     }
 
-    // --- Send Immediate Response ---
-    res.status(202).json({
-      message: inputExists
-        ? 'Bibliography extraction process started.'
-        : 'Bibliography parsing started (reusing previously extracted reference pages).',
-    });
-    // Status 202 Accepted indicates the request is accepted for processing, but is not complete.
-    // --- End Immediate Response ---
+    const queueState = enqueueExtractionTask(corpusId, async () => {
+      await new Promise((resolveTask) => {
+        let settled = false;
+        let sharedUploadedFileName = null;
 
-    let sharedUploadedFileName = null;
-    const sendExtractionSignal = ({ status = 'success', mode = '', reason = '' } = {}) => {
-      const parts = [
-        '[extract-status]',
-        `[corpus=${corpusTag}]`,
-        `[base=${baseName}]`,
-        `[file=${filename}]`,
-        'done',
-        `status=${status}`,
-      ];
-      if (mode) parts.push(`mode=${mode}`);
-      if (reason) parts.push(`reason=${reason}`);
-      send(parts.join(' '));
-      sendEvent({
-        kind: 'extraction',
-        event: 'done',
-        corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
-        base_name: baseName,
-        filename,
-        status,
-        mode: mode || null,
-        reason: reason || null,
-      });
-    };
-    const cleanupSharedUpload = () => {
-      if (!sharedUploadedFileName) return;
-      const toDelete = sharedUploadedFileName;
-      sharedUploadedFileName = null;
-      geminiDeleteUploadedSync(toDelete);
-    };
-
-    // --- Run Scripts in Background ---
-    try {
-      const inputPageCount = inputExists ? getPdfPageCountSync(inputPdfPath) : null;
-      if (inputPageCount) {
-        console.log(`[/api/extract-bibliography] PDF page count: ${inputPageCount}`);
-      }
-
-      // For small PDFs, pre-upload once and reuse the same Gemini file in
-      // get_bib_pages and inline fallback to avoid a second upload.
-      if (inputExists && inputPageCount && inputPageCount <= 50) {
-        try {
-          sharedUploadedFileName = geminiUploadPdfSync(inputPdfPath);
-          console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
-          send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
-        } catch (uploadErr) {
-          console.warn(`[/api/extract-bibliography] Shared upload failed, continuing without reuse: ${uploadErr?.message || uploadErr}`);
-          send(`[/api/extract-bibliography][corpus=${corpusTag}] Shared upload unavailable; continuing with regular flow.`);
+        const finishTask = () => {
+          if (settled) return;
+          settled = true;
+          resolveTask();
+        };
+        const sendExtractionStarted = () => {
+          send(`[extract-status][corpus=${corpusTag}][base=${baseName}][file=${filename}] started`);
+          sendEvent({
+            kind: 'extraction',
+            event: 'started',
+            corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
+            base_name: baseName,
+            filename,
+          });
+        };
+        const sendExtractionSignal = ({ status = 'success', mode = '', reason = '' } = {}) => {
+          const parts = [
+            '[extract-status]',
+            `[corpus=${corpusTag}]`,
+            `[base=${baseName}]`,
+            `[file=${filename}]`,
+            'done',
+            `status=${status}`,
+          ];
+          if (mode) parts.push(`mode=${mode}`);
+          if (reason) parts.push(`reason=${reason}`);
+          send(parts.join(' '));
+          sendEvent({
+            kind: 'extraction',
+            event: 'done',
+            corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
+            base_name: baseName,
+            filename,
+            status,
+            mode: mode || null,
+            reason: reason || null,
+          });
+        };
+        const cleanupSharedUpload = () => {
+          if (!sharedUploadedFileName) return;
+          const toDelete = sharedUploadedFileName;
           sharedUploadedFileName = null;
-        }
-      }
-      const runApiScraper = ({
-        inputDir = null,
-        inputPdf = null,
-        extractMode = 'page',
-        chunkPages = 0,
-        uploadedFileName = null,
-        modelOverride = null,
-        inlineModelOverride = null,
-        label = 'APIscraper',
-      }) => {
-        return new Promise((resolve) => {
-          const dbPath = DB_PATH;
-          const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
-          if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
-          if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
-          if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
-          if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
-          scrapeApiArgs.push('--seed-only');
-          if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
+          geminiDeleteUploadedSync(toDelete);
+        };
 
-          console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
-          send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
-          const child = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
+        try {
+          sendExtractionStarted();
+
+          const inputPageCount = inputExists ? getPdfPageCountSync(inputPdfPath) : null;
+          if (inputPageCount) {
+            console.log(`[/api/extract-bibliography] PDF page count: ${inputPageCount}`);
+          }
+
+          // For small PDFs, pre-upload once and reuse the same Gemini file in
+          // get_bib_pages and inline fallback to avoid a second upload.
+          if (inputExists && inputPageCount && inputPageCount <= 50) {
+            try {
+              sharedUploadedFileName = geminiUploadPdfSync(inputPdfPath);
+              console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
+            } catch (uploadErr) {
+              console.warn(`[/api/extract-bibliography] Shared upload failed, continuing without reuse: ${uploadErr?.message || uploadErr}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] Shared upload unavailable; continuing with regular flow.`);
+              sharedUploadedFileName = null;
+            }
+          }
+          const runApiScraper = ({
+            inputDir = null,
+            inputPdf = null,
+            extractMode = 'page',
+            chunkPages = 0,
+            uploadedFileName = null,
+            modelOverride = null,
+            inlineModelOverride = null,
+            label = 'APIscraper',
+          }) => {
+            return new Promise((resolve) => {
+              const dbPath = DB_PATH;
+              const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
+              if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
+              if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
+              if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
+              if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
+              scrapeApiArgs.push('--seed-only');
+              if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
+
+              console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
+              const child = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
+                env: {
+                  ...process.env,
+                  ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
+                  ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
+                  PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
+                  RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
+                  RAG_FEEDER_DB_PATH: DB_PATH,
+                },
+              });
+
+              child.stdout.on('data', (data) => {
+                const message = data.toString();
+                console.log(`[${label} stdout]: ${message}`);
+                send(`[${label}] [corpus=${corpusTag}] ${message}`);
+              });
+
+              child.stderr.on('data', (data) => {
+                const message = data.toString();
+                console.error(`[${label} stderr]: ${message}`);
+                send(`[${label} ERROR] [corpus=${corpusTag}] ${message}`);
+              });
+
+              child.on('close', (code) => {
+                if (code !== 0) {
+                  console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
+                  resolve(false);
+                  return;
+                }
+                console.log(`[/api/extract-bibliography] Finished ${label}.`);
+                resolve(true);
+              });
+            });
+          };
+
+          const runInlineFallback = async (reason) => {
+            if (!inputExists) {
+              console.error(`[/api/extract-bibliography] Cannot run inline fallback: input PDF missing (${inputPdfPath}).`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] Inline fallback skipped (input PDF missing).`);
+              return false;
+            }
+            const chunkPages = inputPageCount && inputPageCount > 12 ? 10 : 0;
+            const inlineUploadedFileName = chunkPages > 0 ? null : sharedUploadedFileName;
+            const why = reason || 'reference page extraction returned no usable pages';
+            console.warn(`[/api/extract-bibliography] Triggering inline citation fallback: ${why}`);
+            send(
+              `[/api/extract-bibliography][corpus=${corpusTag}] Triggering inline citation fallback (${why}, chunk_pages=${chunkPages || 0}).`
+            );
+            const ok = await runApiScraper({
+              inputPdf: inputPdfPath,
+              extractMode: 'inline',
+              chunkPages,
+              uploadedFileName: inlineUploadedFileName,
+              inlineModelOverride: 'gemini-3.1-pro-preview',
+              label: 'APIscraper inline fallback',
+            });
+            if (ok) {
+              sendExtractionSignal({ status: 'success', mode: 'inline', reason: why });
+            }
+            return ok;
+          };
+
+          // Fast-path: if the upload is missing but we already have extracted page PDFs, run the scraper only.
+          if (!inputExists && pagesExist) {
+            console.log(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Upload missing; reusing extracted pages in ${existingPagesDir}`);
+            try {
+              const sourceMetadataPath = path.join(existingPagesDir, 'source_metadata.json');
+              if (fs.existsSync(sourceMetadataPath)) {
+                const parsed = JSON.parse(fs.readFileSync(sourceMetadataPath, 'utf8'));
+                const sourceMetadata = normalizeIngestSourceMetadata(parsed?.source_metadata);
+                if (sourceMetadata) {
+                  const saved = upsertIngestSourceMetadata(authDb, {
+                    corpusId,
+                    ingestSource: baseName,
+                    sourcePdf: null,
+                    sourceMetadata,
+                  });
+                  if (saved) {
+                    send(`[/api/extract-bibliography][corpus=${corpusTag}] Loaded source metadata from existing extraction.`);
+                  }
+                }
+              }
+            } catch (sourceMetaErr) {
+              console.warn(`[/api/extract-bibliography] Failed to read source metadata sidecar from reused pages: ${sourceMetaErr?.message || sourceMetaErr}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar could not be loaded from reused pages.`);
+            }
+            runApiScraper({
+              inputDir: existingPagesDir,
+              extractMode: 'page',
+              label: 'APIscraper (reused pages)',
+            })
+              .then((ok) => {
+                sendExtractionSignal({ status: ok ? 'success' : 'failed', mode: 'page_reuse' });
+              })
+              .catch((error) => {
+                console.error(`[/api/extract-bibliography] Reused-page extraction failed for ${filename}:`, error);
+                sendExtractionSignal({ status: 'failed', mode: 'page_reuse', reason: 'page_reuse_error' });
+              })
+              .finally(() => {
+                cleanupSharedUpload();
+                finishTask();
+              });
+            return;
+          }
+
+          // 3. Run get_bib_pages.py in background
+          const getPagesArgs = [
+            '--input-pdf', inputPdfPath,
+            '--output-dir', BIB_OUTPUT_DIR
+          ];
+          if (sharedUploadedFileName) {
+            getPagesArgs.push('--uploaded-file-name', sharedUploadedFileName);
+          }
+
+          console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
+          const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], {
             env: {
               ...process.env,
-              ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
-              ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
               PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
               RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
               RAG_FEEDER_DB_PATH: DB_PATH,
             },
           });
 
-          child.stdout.on('data', (data) => {
+          getPagesProcess.stdout.on('data', (data) => {
             const message = data.toString();
-            console.log(`[${label} stdout]: ${message}`);
-            send(`[${label}] [corpus=${corpusTag}] ${message}`);
+            console.log(`[get_bib_pages stdout]: ${message}`);
+            send(`[get_bib_pages][corpus=${corpusTag}] ${message}`);
           });
 
-          child.stderr.on('data', (data) => {
+          getPagesProcess.stderr.on('data', (data) => {
             const message = data.toString();
-            console.error(`[${label} stderr]: ${message}`);
-            send(`[${label} ERROR] [corpus=${corpusTag}] ${message}`);
+            console.error(`[get_bib_pages stderr]: ${message}`);
+            send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${message}`);
           });
 
-          child.on('close', (code) => {
-            if (code !== 0) {
-              console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
-              send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
-              resolve(false);
-              return;
-            }
-            console.log(`[/api/extract-bibliography] Finished ${label}.`);
-            resolve(true);
-          });
-        });
-      };
-
-      const runInlineFallback = async (reason) => {
-        if (!inputExists) {
-          console.error(`[/api/extract-bibliography] Cannot run inline fallback: input PDF missing (${inputPdfPath}).`);
-          send(`[/api/extract-bibliography][corpus=${corpusTag}] Inline fallback skipped (input PDF missing).`);
-          return false;
-        }
-        const chunkPages = inputPageCount && inputPageCount > 12 ? 10 : 0;
-        const inlineUploadedFileName = chunkPages > 0 ? null : sharedUploadedFileName;
-        const why = reason || 'reference page extraction returned no usable pages';
-        console.warn(`[/api/extract-bibliography] Triggering inline citation fallback: ${why}`);
-        send(
-          `[/api/extract-bibliography][corpus=${corpusTag}] Triggering inline citation fallback (${why}, chunk_pages=${chunkPages || 0}).`
-        );
-        const ok = await runApiScraper({
-          inputPdf: inputPdfPath,
-          extractMode: 'inline',
-          chunkPages,
-          uploadedFileName: inlineUploadedFileName,
-          inlineModelOverride: 'gemini-3.1-pro-preview',
-          label: 'APIscraper inline fallback',
-        });
-        if (ok) {
-          sendExtractionSignal({ status: 'success', mode: 'inline', reason: why });
-        }
-        return ok;
-      };
-
-      // Fast-path: if the upload is missing but we already have extracted page PDFs, run the scraper only.
-      if (!inputExists && pagesExist) {
-        console.log(`[/api/extract-bibliography] Upload missing; reusing extracted pages in ${existingPagesDir}`);
-        send(`[/api/extract-bibliography][corpus=${corpusTag}] Upload missing; reusing extracted pages in ${existingPagesDir}`);
-        try {
-          const sourceMetadataPath = path.join(existingPagesDir, 'source_metadata.json');
-          if (fs.existsSync(sourceMetadataPath)) {
-            const parsed = JSON.parse(fs.readFileSync(sourceMetadataPath, 'utf8'));
-            const sourceMetadata = normalizeIngestSourceMetadata(parsed?.source_metadata);
-            if (sourceMetadata) {
-              const saved = upsertIngestSourceMetadata(authDb, {
-                corpusId,
-                ingestSource: baseName,
-                sourcePdf: null,
-                sourceMetadata,
-              });
-              if (saved) {
-                send(`[/api/extract-bibliography][corpus=${corpusTag}] Loaded source metadata from existing extraction.`);
-              }
-            }
-          }
-        } catch (sourceMetaErr) {
-          console.warn(`[/api/extract-bibliography] Failed to read source metadata sidecar from reused pages: ${sourceMetaErr?.message || sourceMetaErr}`);
-          send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar could not be loaded from reused pages.`);
-        }
-        runApiScraper({
-          inputDir: existingPagesDir,
-          extractMode: 'page',
-          label: 'APIscraper (reused pages)',
-        })
-          .then((ok) => {
-            sendExtractionSignal({ status: ok ? 'success' : 'failed', mode: 'page_reuse' });
-          })
-          .finally(() => cleanupSharedUpload());
-        return;
-      }
-
-      // 3. Run get_bib_pages.py in background
-      const getPagesArgs = [
-        '--input-pdf', inputPdfPath,
-        '--output-dir', BIB_OUTPUT_DIR // Keep this, it seems to place output in BIB_OUTPUT_DIR/baseName/
-      ];
-      if (sharedUploadedFileName) {
-        getPagesArgs.push('--uploaded-file-name', sharedUploadedFileName);
-      }
-
-      console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
-      const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], {
-        env: {
-          ...process.env,
-          PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-          RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-          RAG_FEEDER_DB_PATH: DB_PATH,
-        },
-      });
-
-      getPagesProcess.stdout.on('data', (data) => {
-        const message = data.toString();
-        console.log(`[get_bib_pages stdout]: ${message}`);
-        send(`[get_bib_pages][corpus=${corpusTag}] ${message}`);
-      });
-
-      getPagesProcess.stderr.on('data', (data) => {
-        const message = data.toString();
-        console.error(`[get_bib_pages stderr]: ${message}`);
-        send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${message}`);
-      });
-
-      getPagesProcess.on('close', async (code) => {
-        try {
-          console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
-          if (code !== 0) {
-            const errorMessage = `[/api/extract-bibliography] get_bib_pages.py exited with code ${code}.`;
-            send(`[/api/extract-bibliography][corpus=${corpusTag}] get_bib_pages.py exited with code ${code}.`);
-            console.error(errorMessage);
-            const ok = await runInlineFallback(`get_bib_pages failed with code ${code}`);
-            if (!ok) {
-              sendExtractionSignal({ status: 'failed', mode: 'inline', reason: `get_bib_pages_exit_${code}` });
-            }
-            return;
-          }
-
-          // get_bib_pages now writes source_metadata.json from the same Gemini call
-          // that detects reference sections; ingest it before page/inline extraction.
-          try {
-            const sourceMetadataPath = path.join(existingPagesDir, 'source_metadata.json');
-            if (fs.existsSync(sourceMetadataPath)) {
-              const parsed = JSON.parse(fs.readFileSync(sourceMetadataPath, 'utf8'));
-              const sourceMetadata = normalizeIngestSourceMetadata(parsed?.source_metadata);
-              if (sourceMetadata) {
-                const saved = upsertIngestSourceMetadata(authDb, {
-                  corpusId,
-                  ingestSource: baseName,
-                  sourcePdf: inputPdfPath,
-                  sourceMetadata,
-                });
-                if (saved) {
-                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata extracted and saved.`);
+          getPagesProcess.on('close', (code) => {
+            void (async () => {
+              try {
+                console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
+                if (code !== 0) {
+                  const errorMessage = `[/api/extract-bibliography] get_bib_pages.py exited with code ${code}.`;
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] get_bib_pages.py exited with code ${code}.`);
+                  console.error(errorMessage);
+                  const ok = await runInlineFallback(`get_bib_pages failed with code ${code}`);
+                  if (!ok) {
+                    sendExtractionSignal({ status: 'failed', mode: 'inline', reason: `get_bib_pages_exit_${code}` });
+                  }
+                  return;
                 }
-              } else {
-                send(`[/api/extract-bibliography][corpus=${corpusTag}] No source metadata inferred from section-detection call.`);
+
+                // get_bib_pages now writes source_metadata.json from the same Gemini call
+                // that detects reference sections; ingest it before page/inline extraction.
+                try {
+                  const sourceMetadataPath = path.join(existingPagesDir, 'source_metadata.json');
+                  if (fs.existsSync(sourceMetadataPath)) {
+                    const parsed = JSON.parse(fs.readFileSync(sourceMetadataPath, 'utf8'));
+                    const sourceMetadata = normalizeIngestSourceMetadata(parsed?.source_metadata);
+                    if (sourceMetadata) {
+                      const saved = upsertIngestSourceMetadata(authDb, {
+                        corpusId,
+                        ingestSource: baseName,
+                        sourcePdf: inputPdfPath,
+                        sourceMetadata,
+                      });
+                      if (saved) {
+                        send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata extracted and saved.`);
+                      }
+                    } else {
+                      send(`[/api/extract-bibliography][corpus=${corpusTag}] No source metadata inferred from section-detection call.`);
+                    }
+                  } else {
+                    send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar not found after section extraction.`);
+                  }
+                } catch (sourceMetaErr) {
+                  console.warn(`[/api/extract-bibliography] Failed to read source metadata sidecar: ${sourceMetaErr?.message || sourceMetaErr}`);
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar could not be parsed.`);
+                }
+
+                // Proceed to page-level parsing when extracted pages exist; otherwise fallback to inline citation extraction.
+                const jsonSubDir = existingPagesDir;
+                const pageFiles = fs.existsSync(jsonSubDir)
+                  ? fs.readdirSync(jsonSubDir).filter((file) => file.endsWith('.pdf'))
+                  : [];
+
+                if (pageFiles.length === 0) {
+                  const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}.`;
+                  console.error(errorMessage);
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] No extracted page PDFs found in: ${jsonSubDir}.`);
+                  const ok = await runInlineFallback('no extracted bibliography pages found');
+                  if (!ok) {
+                    sendExtractionSignal({ status: 'failed', mode: 'inline', reason: 'no_extracted_pages' });
+                  }
+                  return;
+                }
+
+                const ok = await runApiScraper({
+                  inputDir: jsonSubDir,
+                  extractMode: 'page',
+                  label: 'APIscraper (page mode)',
+                });
+                if (ok) {
+                  console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename}.`);
+                  sendExtractionSignal({ status: 'success', mode: 'page' });
+                } else {
+                  sendExtractionSignal({ status: 'failed', mode: 'page' });
+                }
+              } catch (error) {
+                console.error(`[/api/extract-bibliography] Unexpected post-processing error for ${filename}:`, error);
+                sendExtractionSignal({ status: 'failed', reason: 'post_process_error' });
+              } finally {
+                cleanupSharedUpload();
+                finishTask();
               }
-            } else {
-              send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar not found after section extraction.`);
-            }
-          } catch (sourceMetaErr) {
-            console.warn(`[/api/extract-bibliography] Failed to read source metadata sidecar: ${sourceMetaErr?.message || sourceMetaErr}`);
-            send(`[/api/extract-bibliography][corpus=${corpusTag}] Source metadata sidecar could not be parsed.`);
-          }
-
-          // Proceed to page-level parsing when extracted pages exist; otherwise fallback to inline citation extraction.
-          const jsonSubDir = existingPagesDir; // Subdirectory named after the base PDF name
-          const pageFiles = fs.existsSync(jsonSubDir)
-            ? fs.readdirSync(jsonSubDir).filter((file) => file.endsWith('.pdf'))
-            : [];
-
-          if (pageFiles.length === 0) {
-            const errorMessage = `[/api/extract-bibliography] No extracted page PDFs found in: ${jsonSubDir}.`;
-            console.error(errorMessage);
-            send(`[/api/extract-bibliography][corpus=${corpusTag}] No extracted page PDFs found in: ${jsonSubDir}.`);
-            const ok = await runInlineFallback('no extracted bibliography pages found');
-            if (!ok) {
-              sendExtractionSignal({ status: 'failed', mode: 'inline', reason: 'no_extracted_pages' });
-            }
-            return;
-          }
-
-          const ok = await runApiScraper({
-            inputDir: jsonSubDir,
-            extractMode: 'page',
-            label: 'APIscraper (page mode)',
+            })();
           });
-          if (ok) {
-            console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
-            send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename}.`);
-            sendExtractionSignal({ status: 'success', mode: 'page' });
-          } else {
-            sendExtractionSignal({ status: 'failed', mode: 'page' });
-          }
-        } finally {
+        } catch (error) {
+          console.error(`[/api/extract-bibliography] Synchronous error setting up processing for ${filename}:`, error);
           cleanupSharedUpload();
+          sendExtractionSignal({ status: 'failed', reason: 'setup_error' });
+          finishTask();
         }
-      }); // End get_bib_pages callback
+      });
+    });
 
-    } catch (error) {
-      // This catch block likely only catches synchronous errors like fs.mkdirSync failure
-      console.error(`[/api/extract-bibliography] Synchronous error setting up processing for ${filename}:`, error);
-      cleanupSharedUpload();
-      // Cannot send response here as it might have already been sent.
-    }
-    // Removed Finally block as cleanup is handled in callbacks now.
-    // finally {
-    //   // 6. Clean up temporary directory - MOVED
-    // }
+    res.status(202).json({
+      message: queueState.queued
+        ? 'Bibliography extraction queued.'
+        : inputExists
+          ? 'Bibliography extraction process started.'
+          : 'Bibliography parsing started (reusing previously extracted reference pages).',
+      state: queueState.queued ? 'queued' : 'started',
+      queued: queueState.queued,
+      queue_position: queueState.queuePosition,
+    });
   });
   // --- END NEW ENDPOINT ---
 

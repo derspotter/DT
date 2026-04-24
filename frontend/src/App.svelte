@@ -527,6 +527,14 @@
     uploads = uploads.map((item) => (item.id === id ? { ...item, ...patch } : item))
   }
 
+  function updateUploadByBackendFilename(backendFilename, patch) {
+    const normalized = String(backendFilename || '').trim()
+    if (!normalized) return
+    uploads = uploads.map((item) =>
+      String(item.backendFilename || '').trim() === normalized ? { ...item, ...patch } : item
+    )
+  }
+
   function formatAuthors(entry) {
     if (!entry) return ''
     if (Array.isArray(entry.authors)) return entry.authors.join(', ')
@@ -691,8 +699,10 @@
     if (typeof raw !== 'string' || !raw.startsWith('{')) return null
     try {
       const parsed = JSON.parse(raw)
-      if (!parsed || parsed.kind !== 'extraction' || parsed.event !== 'done') return null
+      const event = String(parsed?.event || '').trim().toLowerCase()
+      if (!parsed || parsed.kind !== 'extraction' || !['started', 'done'].includes(event)) return null
       return {
+        event,
         corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
         baseName: String(parsed.base_name || '').trim(),
         filename: String(parsed.filename || '').trim(),
@@ -1063,6 +1073,25 @@
     }
   }
 
+  function ensureExtractionRunActive(baseName, backendFilename = '') {
+    const normalizedBase = String(baseName || '').trim()
+    const normalizedFile = String(backendFilename || '').trim()
+    const sameRun =
+      extractionProgress.active &&
+      extractionProgress.baseName === normalizedBase &&
+      extractionProgress.backendFilename === normalizedFile
+
+    if (!sameRun) {
+      beginExtractionProgress(normalizedBase, normalizedFile)
+    }
+
+    latestEntriesBase = normalizedBase
+    latestSeedDocument = null
+    latestEntries = []
+    latestSelection = []
+    latestEntriesStatus = 'Waiting for extraction to finish...'
+  }
+
   function finishExtractionProgress() {
     extractionCompletionCheckRunId = 0
     extractionProgress = {
@@ -1306,6 +1335,12 @@
       const baseMatches = base && signalBase === base
       const fileMatches = backendName && signalFile === backendName
       if (!baseMatches && !fileMatches) return
+      updateUploadByBackendFilename(
+        signalFile,
+        signalStatus === 'success'
+          ? { status: 'extracted', message: 'Extraction complete' }
+          : { status: 'failed', message: 'Extraction failed' }
+      )
       updateExtractionProgress({
         phase: signalStatus === 'success' ? 'finalizing' : 'completed',
         detail: signalStatus === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
@@ -2382,16 +2417,17 @@
   async function extractForItem(item) {
     if (!item.backendFilename) return
     const baseName = item.backendFilename.replace(/\.pdf$/i, '')
-    beginExtractionProgress(baseName, item.backendFilename)
-    updateUpload(item.id, { status: 'extracting', message: 'Extracting bibliography' })
+    updateUpload(item.id, { status: 'extracting', message: 'Submitting extraction request...' })
     try {
-      await extractBibliography(item.backendFilename)
-      updateUpload(item.id, { status: 'extracted', message: 'Extraction started' })
-      latestEntriesBase = baseName
-      latestSeedDocument = null
-      latestEntries = []
-      latestSelection = []
-      latestEntriesStatus = 'Waiting for extraction to finish...'
+      const payload = await extractBibliography(item.backendFilename)
+      const state = String(payload?.state || 'started').trim().toLowerCase()
+      if (state === 'queued') {
+        updateUpload(item.id, { status: 'queued', message: 'Queued for extraction' })
+      } else {
+        updateUpload(item.id, { status: 'extracting', message: 'Extracting bibliography' })
+        ensureExtractionRunActive(baseName, item.backendFilename)
+      }
+      apiStatus = 'online'
     } catch (error) {
       finishExtractionProgress()
       if (error?.status === 401) {
@@ -3638,6 +3674,23 @@
         if (extractionEvent) {
           const currentCorpus = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
           const corpusMatches = extractionEvent.corpusId === null || currentCorpus === null || extractionEvent.corpusId === currentCorpus
+          if (extractionEvent.event === 'started') {
+            updateUploadByBackendFilename(extractionEvent.filename, {
+              status: 'extracting',
+              message: 'Extracting bibliography',
+            })
+            if (corpusMatches) {
+              ensureExtractionRunActive(extractionEvent.baseName, extractionEvent.filename)
+            }
+            return
+          }
+
+          updateUploadByBackendFilename(
+            extractionEvent.filename,
+            extractionEvent.status === 'success'
+              ? { status: 'extracted', message: 'Extraction complete' }
+              : { status: 'failed', message: 'Extraction failed' }
+          )
           const baseMatches = extractionProgress.baseName && extractionEvent.baseName === extractionProgress.baseName
           const fileMatches = extractionProgress.backendFilename && extractionEvent.filename === extractionProgress.backendFilename
           if (extractionProgress.active && corpusMatches && (baseMatches || fileMatches)) {
@@ -4676,7 +4729,7 @@
                         <button
                           type="button"
                           on:click={() => extractForItem(item)}
-                          disabled={!item.backendFilename}
+                          disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
                         >
                           Extract
                         </button>
@@ -5175,7 +5228,7 @@
                     <button
                       type="button"
                       on:click={() => extractForItem(item)}
-                      disabled={!item.backendFilename}
+                      disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
                     >
                       Extract
                     </button>

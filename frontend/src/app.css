@@ -1002,6 +1002,11 @@ select {
   color: #1b9a59;
 }
 
+.status.queued,
+.status.extracting {
+  color: #9a6700;
+}
+
 .status.failed {
   color: #b91c1c;
 }
@@ -3226,7 +3231,7 @@ button.danger:disabled {
 }
 
 .seed-corpus-toolbar .seed-intake-card--upload .upload-list {
-  max-height: 48px;
+  max-height: 120px;
   overflow-y: auto;
 }
 
@@ -3347,7 +3352,7 @@ button.danger:disabled {
 
 .seed-corpus-columns {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: 1fr;
   gap: 18px;
   flex: 0 0 auto;
   min-height: auto;
@@ -3949,7 +3954,7 @@ button.danger:disabled {
   }
 
   .seed-corpus-toolbar .seed-intake-card--upload .upload-list {
-    max-height: 40px;
+    max-height: 120px;
   }
 
   .seed-corpus-toolbar__intro p {
