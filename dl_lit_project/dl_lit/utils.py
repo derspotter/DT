@@ -5,6 +5,19 @@ import threading
 from collections import deque
 from datetime import datetime, timedelta
 import os
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
+
+import requests
+
+
+OPENALEX_BASE_URL = 'https://api.openalex.org'
+
+
+class OpenAlexRateLimitExceeded(RuntimeError):
+    """Raised when OpenAlex is unavailable due to throttling or daily quota exhaustion."""
+
+
+_missing_openalex_api_key_warned = False
 
 
 class ServiceRateLimiter:
@@ -26,6 +39,7 @@ class ServiceRateLimiter:
         self.request_totals = {service: 0 for service in service_config}
         self.locks = {service: threading.Lock() for service in service_config}
         self.last_request_ts = {service: 0.0 for service in service_config}
+        self.blocked_until_ts = {service: 0.0 for service in service_config}
 
     def wait_if_needed(self, service_name, units=1):
         """
@@ -42,6 +56,7 @@ class ServiceRateLimiter:
             self.request_logs[service_name] = deque()
             self.request_totals[service_name] = 0
             self.last_request_ts[service_name] = 0.0
+            self.blocked_until_ts[service_name] = 0.0
 
         limit = config['limit']
         window = timedelta(seconds=config['window'])
@@ -56,6 +71,16 @@ class ServiceRateLimiter:
         with self.locks[service_name]:
             now = datetime.now()
             now_ts = time.monotonic()
+
+            blocked_until = self.blocked_until_ts.get(service_name, 0.0)
+            if blocked_until > now_ts:
+                wait_seconds = blocked_until - now_ts
+                print(
+                    f"Service '{service_name}' is temporarily unavailable. Waiting for {wait_seconds:.2f} seconds."
+                )
+                time.sleep(wait_seconds)
+                now = datetime.now()
+                now_ts = time.monotonic()
 
             # Some APIs enforce strict per-request spacing and will still 429
             # even when an average RPS bucket is respected.
@@ -97,6 +122,34 @@ class ServiceRateLimiter:
             # Return True to indicate the request can proceed
             return True
 
+    def impose_block(self, service_name, wait_seconds):
+        if wait_seconds is None:
+            return
+        try:
+            delay = max(0.0, float(wait_seconds))
+        except Exception:
+            return
+        if delay <= 0:
+            return
+
+        if service_name not in self.locks:
+            self.locks[service_name] = threading.Lock()
+            self.request_logs[service_name] = deque()
+            self.request_totals[service_name] = 0
+            self.last_request_ts[service_name] = 0.0
+            self.blocked_until_ts[service_name] = 0.0
+
+        with self.locks[service_name]:
+            blocked_until = time.monotonic() + delay
+            self.blocked_until_ts[service_name] = max(
+                self.blocked_until_ts.get(service_name, 0.0),
+                blocked_until,
+            )
+
+    def remaining_block_seconds(self, service_name):
+        blocked_until = self.blocked_until_ts.get(service_name, 0.0)
+        return max(0.0, blocked_until - time.monotonic())
+
     def backoff(self, service_name, wait_seconds):
         if wait_seconds is None:
             return
@@ -132,6 +185,231 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return max(minimum, float(raw))
     except ValueError:
         return max(minimum, float(default))
+
+
+def _env_str(name: str, default: str = "") -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip()
+
+
+def get_openalex_api_key() -> str | None:
+    api_key = _env_str('OPENALEX_API_KEY') or _env_str('RAG_FEEDER_OPENALEX_API_KEY')
+    return api_key or None
+
+
+def get_openalex_mailto() -> str | None:
+    mailto = _env_str('RAG_FEEDER_MAILTO')
+    return mailto or None
+
+
+def _warn_missing_openalex_api_key() -> None:
+    global _missing_openalex_api_key_warned
+    if _missing_openalex_api_key_warned:
+        return
+    print(
+        "[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key."
+    )
+    _missing_openalex_api_key_warned = True
+
+
+def _merge_query_params(url: str, extra_params: dict[str, object] | None) -> tuple[str, dict[str, object]]:
+    if not extra_params:
+        return url, {}
+    parsed = urlsplit(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    merged_params = {}
+    for key, value in extra_params.items():
+        if value is None:
+            continue
+        if key in query:
+            continue
+        merged_params[key] = value
+    if not merged_params:
+        return url, {}
+    cleaned_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+    return cleaned_url, merged_params
+
+
+def _normalize_openalex_params(url: str, params: dict[str, object] | None) -> tuple[str, dict[str, str]]:
+    parsed = urlsplit(url)
+    query_items = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    normalized = {str(key): str(value) for key, value in query_items.items()}
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        normalized[str(key)] = str(value)
+    return parsed.path, normalized
+
+
+def _is_openalex_lookup_request(url: str, params: dict[str, object] | None) -> bool:
+    path, normalized = _normalize_openalex_params(url, params)
+    path_parts = [part for part in path.split('/') if part]
+
+    if len(path_parts) >= 2 and path_parts[0] in {'works', 'authors', 'sources', 'institutions', 'topics', 'publishers'}:
+        return True
+
+    search_value = (normalized.get('search') or '').strip()
+    if search_value:
+        return False
+
+    filter_value = (normalized.get('filter') or '').strip()
+    if not filter_value:
+        return False
+
+    allowed_lookup_prefixes = ('doi:', 'openalex_id:')
+    for clause in filter_value.split(','):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if any(clause.startswith(prefix) for prefix in allowed_lookup_prefixes):
+            continue
+        return False
+
+    return True
+
+
+def _parse_header_seconds(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def _openalex_quota_message(wait_seconds: float | None) -> str:
+    if wait_seconds is None:
+        return 'OpenAlex rate limit exceeded.'
+    return f'OpenAlex rate limit exceeded. Retry after {wait_seconds:.0f}s.'
+
+
+def _apply_openalex_response_limits(
+    response,
+    rate_limiter: ServiceRateLimiter | None,
+    *,
+    billable_request: bool,
+) -> float | None:
+    if rate_limiter is None:
+        return None
+
+    retry_after = _parse_header_seconds(response.headers.get('Retry-After'))
+    reset_seconds = _parse_header_seconds(response.headers.get('X-RateLimit-Reset'))
+    remaining = response.headers.get('X-RateLimit-Remaining')
+
+    wait_seconds = retry_after if retry_after is not None else reset_seconds
+    try:
+        remaining_value = int(str(remaining).strip()) if remaining is not None else None
+    except Exception:
+        remaining_value = None
+
+    if billable_request and remaining_value is not None and remaining_value <= 0 and reset_seconds:
+        rate_limiter.impose_block('openalex_billable', reset_seconds)
+        return reset_seconds
+
+    if response.status_code == 429 and wait_seconds:
+        rate_limiter.impose_block('openalex', wait_seconds)
+        return wait_seconds
+
+    return wait_seconds
+
+
+def openalex_request_json(
+    *,
+    endpoint: str | None = None,
+    url: str | None = None,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: float = 30,
+    session=None,
+    rate_limiter: ServiceRateLimiter | None = None,
+    retries: int = 3,
+    mailto: str | None = None,
+):
+    if endpoint and url:
+        raise ValueError('Provide either endpoint or url, not both')
+    if not endpoint and not url:
+        raise ValueError('Either endpoint or url is required')
+
+    rate_limiter = rate_limiter or get_global_rate_limiter()
+    request_headers = {'Accept': 'application/json'}
+    if headers:
+        request_headers.update(headers)
+
+    api_key = get_openalex_api_key()
+    if not api_key:
+        _warn_missing_openalex_api_key()
+
+    extra_params = dict(params or {})
+    if api_key and 'api_key' not in extra_params:
+        extra_params['api_key'] = api_key
+    if mailto and 'mailto' not in extra_params:
+        extra_params['mailto'] = mailto
+
+    request_url = url or f"{OPENALEX_BASE_URL}/{endpoint.lstrip('/')}"
+    request_url, request_params = _merge_query_params(request_url, extra_params)
+    wait_cap_seconds = _env_float('RAG_FEEDER_OPENALEX_MAX_WAIT_SEC', 15.0)
+    http = session or requests
+    billable_request = not _is_openalex_lookup_request(request_url, request_params)
+
+    remaining_block = rate_limiter.remaining_block_seconds('openalex_billable') if (rate_limiter and billable_request) else 0.0
+    if remaining_block > wait_cap_seconds:
+        raise OpenAlexRateLimitExceeded(_openalex_quota_message(remaining_block))
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            if rate_limiter:
+                remaining_block = rate_limiter.remaining_block_seconds('openalex_billable') if billable_request else 0.0
+                if remaining_block > wait_cap_seconds:
+                    raise OpenAlexRateLimitExceeded(_openalex_quota_message(remaining_block))
+                rate_limiter.wait_if_needed('openalex')
+
+            response = http.get(
+                request_url,
+                headers=request_headers,
+                params=request_params,
+                timeout=timeout,
+            )
+            wait_seconds = _apply_openalex_response_limits(
+                response,
+                rate_limiter,
+                billable_request=billable_request,
+            )
+
+            if response.status_code == 429:
+                if wait_seconds is None:
+                    wait_seconds = 2 ** attempt
+                if billable_request and wait_seconds > wait_cap_seconds:
+                    raise OpenAlexRateLimitExceeded(_openalex_quota_message(wait_seconds))
+                if attempt == retries - 1:
+                    raise OpenAlexRateLimitExceeded(_openalex_quota_message(wait_seconds))
+                time.sleep(wait_seconds)
+                continue
+
+            if response.status_code in (500, 502, 503, 504):
+                if attempt == retries - 1:
+                    response.raise_for_status()
+                time.sleep(2 ** attempt)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+        except OpenAlexRateLimitExceeded:
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError('OpenAlex request failed after retries')
 
 
 def get_global_rate_limiter():

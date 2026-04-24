@@ -4,7 +4,7 @@ import time
 from typing import Iterable
 import requests
 
-from .utils import get_global_rate_limiter
+from .utils import get_global_rate_limiter, openalex_request_json
 
 TOKEN_RE = re.compile(r'"[^"]+"|\(|\)|\bAND\b|\bOR\b|\bNOT\b|[^()\s]+', re.IGNORECASE)
 OPENALEX_TERM_CLEAN_RE = re.compile(r"[^\w\s-]+", re.UNICODE)
@@ -111,19 +111,13 @@ def build_openalex_query_text(query: str) -> str:
 
 
 def _openalex_request(endpoint: str, params: dict, rate_limiter, retries: int = 3) -> dict:
-    for attempt in range(retries):
-        try:
-            rate_limiter.wait_if_needed('openalex')
-            response = requests.get(f"https://api.openalex.org/{endpoint}", params=params, timeout=30)
-            if response.status_code in (429, 500, 502, 503, 504):
-                raise requests.RequestException(f"HTTP {response.status_code}")
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException:
-            if attempt == retries - 1:
-                raise
-            time.sleep(2 ** attempt)
-    raise RuntimeError(f"OpenAlex request to /{endpoint} failed after retries")
+    return openalex_request_json(
+        endpoint=endpoint,
+        params=params,
+        timeout=30,
+        rate_limiter=rate_limiter,
+        retries=retries,
+    )
 
 
 def resolve_openalex_author_ids(author: str, mailto: str | None = None, max_results: int = 5) -> list[str]:

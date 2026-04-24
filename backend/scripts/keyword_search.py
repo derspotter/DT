@@ -23,7 +23,11 @@ from dl_lit.OpenAlexScraper import (
 )
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.keyword_search import dedupe_results, search_openalex
-from dl_lit.utils import get_global_rate_limiter
+from dl_lit.utils import (
+    OpenAlexRateLimitExceeded,
+    get_global_rate_limiter,
+    openalex_request_json,
+)
 from reference_expansion import (
     DEFAULT_INCLUDE_DOWNSTREAM,
     DEFAULT_INCLUDE_UPSTREAM,
@@ -90,23 +94,17 @@ def _normalize_candidate_id(value):
 
 
 def _openalex_get(params, mailto=None, retries=3):
-    rate_limiter = get_global_rate_limiter()
-    headers = {'Accept': 'application/json'}
-    for attempt in range(retries):
-        try:
-            rate_limiter.wait_if_needed('openalex')
-            request_params = dict(params)
-            if mailto:
-                request_params['mailto'] = mailto
-            response = requests.get(OPENALEX_WORKS_URL, headers=headers, params=request_params, timeout=30)
-            if response.status_code in (429, 500, 502, 503, 504):
-                raise requests.RequestException(f"HTTP {response.status_code}")
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException:
-            if attempt == retries - 1:
-                raise
-    return {}
+    request_params = dict(params)
+    if mailto:
+        request_params['mailto'] = mailto
+    return openalex_request_json(
+        url=OPENALEX_WORKS_URL,
+        params=request_params,
+        headers={'Accept': 'application/json'},
+        timeout=30,
+        rate_limiter=get_global_rate_limiter(),
+        retries=retries,
+    )
 
 
 def fetch_work_by_openalex_id(openalex_id, mailto=None):
@@ -309,25 +307,33 @@ def _crawl_direction(
         processed += 1
         if level >= max_depth:
             continue
-        downstream_ids, upstream_ids = _collect_candidate_ids(
-            current,
-            max_related=max_related,
-            rate_limiter=rate_limiter,
-            mailto=mailto,
-            direction=direction,
-        )
+        try:
+            downstream_ids, upstream_ids = _collect_candidate_ids(
+                current,
+                max_related=max_related,
+                rate_limiter=rate_limiter,
+                mailto=mailto,
+                direction=direction,
+            )
+        except OpenAlexRateLimitExceeded as exc:
+            print(f"[OpenAlex WARN] Expansion stopped early: {exc}")
+            break
         candidate_ids = downstream_ids + upstream_ids
         if not candidate_ids:
             continue
 
         candidate_norms = {_normalize_candidate_id(item_id) for item_id in candidate_ids if _normalize_candidate_id(item_id)}
 
-        ref_details = fetch_referenced_work_details(
-            candidate_ids,
-            rate_limiter,
-            mailto=mailto or 'spott@wzb.eu',
-            include_links=(level + 1 < max_depth),
-        )
+        try:
+            ref_details = fetch_referenced_work_details(
+                candidate_ids,
+                rate_limiter,
+                mailto=mailto or 'spott@wzb.eu',
+                include_links=(level + 1 < max_depth),
+            )
+        except OpenAlexRateLimitExceeded as exc:
+            print(f"[OpenAlex WARN] Expansion detail fetch stopped early: {exc}")
+            break
 
         resolved = set()
         resolved_items = []

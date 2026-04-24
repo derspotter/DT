@@ -8,7 +8,7 @@ from pathlib import Path
 import argparse
 import concurrent.futures
 import os
-from .utils import get_global_rate_limiter
+from .utils import OpenAlexRateLimitExceeded, get_global_rate_limiter, openalex_request_json
 
 try:
     from rapidfuzz import fuzz
@@ -99,12 +99,16 @@ def fetch_citing_work_ids(
 
     while url and len(citing_work_ids) < max_citations:
         try:
-            # Apply rate limiting
-            rate_limiter.wait_if_needed('openalex')
             http = session or requests
-            response = http.get(url, headers={"Accept": "application/json"}, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
+            data = openalex_request_json(
+                url=url,
+                params={'api_key': api_key} if api_key else None,
+                headers={"Accept": "application/json"},
+                timeout=timeout,
+                session=http,
+                rate_limiter=rate_limiter,
+                retries=3,
+            )
 
             results = data.get("results", [])
             for work in results:
@@ -134,6 +138,9 @@ def fetch_citing_work_ids(
             else:
                 url = None # No more pages or reached limit
 
+        except OpenAlexRateLimitExceeded as e:
+            print(f"OpenAlex quota exhausted while fetching citing works: {str(e)}")
+            url = None
         except requests.exceptions.RequestException as e:
             print(f"Error fetching citing works from {url}: {str(e)}")
             # Stop fetching if there's an error
@@ -185,15 +192,18 @@ def fetch_referenced_work_details(
         if include_links:
             select_fields += ",referenced_works,cited_by_api_url"
         url = f"https://api.openalex.org/works?filter=openalex_id:{ids_query}&select={select_fields}&per-page=50&mailto={mailto}"
-        if api_key:
-            url = f"{url}&api_key={quote_plus(api_key)}"
         
         try:
-            rate_limiter.wait_if_needed('openalex')
             http = session or requests
-            response = http.get(url, headers={"Accept": "application/json"}, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
+            data = openalex_request_json(
+                url=url,
+                params={'api_key': api_key} if api_key else None,
+                headers={"Accept": "application/json"},
+                timeout=timeout,
+                session=http,
+                rate_limiter=rate_limiter,
+                retries=3,
+            )
             
             batch_results = []
             for work in data.get("results", []):
@@ -211,6 +221,9 @@ def fetch_referenced_work_details(
                 batch_results.append(work_details)
             return batch_results
             
+        except OpenAlexRateLimitExceeded as e:
+            print(f"OpenAlex quota exhausted while fetching referenced work details: {str(e)}")
+            return []
         except requests.exceptions.RequestException as e:
             print(f"Error fetching referenced work details: {str(e)}")
             return []
@@ -504,7 +517,7 @@ class OpenAlexCrossrefSearcher:
         self.openalex_timeout = float(os.getenv('RAG_FEEDER_OPENALEX_TIMEOUT', '20'))
         self.crossref_timeout = float(os.getenv('RAG_FEEDER_CROSSREF_TIMEOUT', '20'))
         self.semantic_scholar_timeout = float(os.getenv('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', '20'))
-        self.openalex_session = _build_retry_session()
+        self.openalex_session = requests.Session()
         self.crossref_session = _build_retry_session()
         self.semantic_scholar_session = _build_retry_session()
 
@@ -656,15 +669,15 @@ class OpenAlexCrossrefSearcher:
             try:
                 print(f"\nStep {step}: DOI Direct Search")
                 print(f"DOI: {doi}")
-                rate_limiter.wait_if_needed('openalex')
-                response = self.openalex_session.get(
-                    self.base_url,
-                    headers=self.headers,
+                data = openalex_request_json(
+                    url=self.base_url,
                     params=params,
+                    headers=self.headers,
                     timeout=self.openalex_timeout,
+                    session=self.openalex_session,
+                    rate_limiter=rate_limiter,
+                    retries=3,
                 )
-                response.raise_for_status()
-                data = response.json()
                 
                 results = data.get('results', [])
                 if results:
@@ -803,15 +816,15 @@ class OpenAlexCrossrefSearcher:
             try:
                 print(f"\nStep {step}: OpenAlex Query")
                 print(f"Params: {params}")
-                rate_limiter.wait_if_needed('openalex')
-                response = self.openalex_session.get(
-                    self.base_url,
-                    headers=self.headers,
+                data = openalex_request_json(
+                    url=self.base_url,
                     params=params,
+                    headers=self.headers,
                     timeout=self.openalex_timeout,
+                    session=self.openalex_session,
+                    rate_limiter=rate_limiter,
+                    retries=3,
                 )
-                response.raise_for_status()
-                data = response.json()
                 return {"step": step, "results": data.get('results', []), "success": True, "meta": data.get('meta')}
             except requests.exceptions.RequestException as e:
                 return {"step": step, "results": [], "success": False, "error": str(e)}
