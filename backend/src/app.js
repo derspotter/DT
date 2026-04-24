@@ -468,6 +468,53 @@ function ensureAuthSchema(db) {
       started_at TIMESTAMP,
       finished_at TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS scraper_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_type TEXT NOT NULL,
+      query_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      requested_by_user_id INTEGER,
+      total_count INTEGER NOT NULL DEFAULT 0,
+      downloaded_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      started_at TIMESTAMP,
+      finished_at TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS scraper_artifacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id INTEGER NOT NULL,
+      source_type TEXT NOT NULL,
+      source_id TEXT,
+      title TEXT,
+      date TEXT,
+      year INTEGER,
+      source_url TEXT,
+      download_url TEXT,
+      local_artifact_path TEXT,
+      file_name TEXT,
+      raw_metadata_json TEXT,
+      bibtex_key TEXT,
+      bibtex_entry TEXT,
+      metadata_completeness TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      error TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS scraper_apply_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_id TEXT NOT NULL,
+      target_path TEXT NOT NULL,
+      user_id INTEGER,
+      artifact_ids_json TEXT,
+      applied_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      error_count INTEGER NOT NULL DEFAULT 0,
+      details_json TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
   `);
   if (tableExists(db, 'ingest_entries')) {
     ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
@@ -483,6 +530,8 @@ function ensureAuthSchema(db) {
   ensureColumn(db, 'users', 'password_set_at', 'TIMESTAMP');
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_lookup ON corpus_works(corpus_id, work_id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_kantropos_assignments_target ON corpus_kantropos_assignments(target_id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_runs_created ON scraper_runs(created_at DESC, id DESC);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_artifacts_run ON scraper_artifacts(run_id, id);`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email COLLATE NOCASE) WHERE email IS NOT NULL;`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_auth_invite_tokens_user ON auth_invite_tokens(user_id, used_at, expires_at);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user ON password_reset_tokens(user_id, used_at, expires_at);`);
@@ -606,6 +655,123 @@ function countBibEntriesInFile(filePath) {
   } catch {
     return null;
   }
+}
+
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(String(value || ''));
+  } catch {
+    return fallback;
+  }
+}
+
+function parseBibtexKeys(content) {
+  const keys = new Set();
+  const regex = /@[A-Za-z]+\s*\{\s*([^,\s]+)\s*,/g;
+  let match;
+  while ((match = regex.exec(String(content || ''))) !== null) {
+    keys.add(String(match[1] || '').trim());
+  }
+  return keys;
+}
+
+function escapeBibtexValue(value) {
+  return String(value ?? '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[{}]/g, (ch) => `\\${ch}`);
+}
+
+function scraperSourceDir(sourceType) {
+  return String(sourceType || '') === 'expert_groups' ? 'expert_groups' : 'eurlex';
+}
+
+function bibtexFileKind(fileName) {
+  const ext = path.extname(String(fileName || '')).toLowerCase();
+  if (ext === '.html' || ext === '.htm') return 'HTML';
+  if (ext === '.pdf') return 'PDF';
+  return ext ? ext.slice(1).toUpperCase() : 'FILE';
+}
+
+function buildScraperBibtexEntry(artifact, relativeFilePath) {
+  const sourceType = String(artifact?.source_type || '').trim();
+  const key = String(artifact?.bibtex_key || '').trim();
+  const title = String(artifact?.title || '').trim() || (
+    sourceType === 'expert_groups' ? 'Untitled expert group document' : 'Untitled EUR-Lex document'
+  );
+  const fields = {
+    title,
+    url: artifact?.source_url || artifact?.download_url || '',
+    file: `${relativeFilePath}:${bibtexFileKind(relativeFilePath)}`,
+    source: sourceType,
+  };
+  if (artifact?.year) fields.year = String(artifact.year);
+  if (artifact?.date) fields.date = String(artifact.date);
+  if (sourceType === 'eurlex') {
+    fields.institution = 'European Union';
+    if (artifact?.source_id) fields.celex = String(artifact.source_id);
+  } else {
+    fields.institution = 'European Commission';
+    try {
+      const raw = JSON.parse(artifact?.raw_metadata_json || '{}');
+      if (raw?.expert_group_id) fields.group_id = String(raw.expert_group_id);
+      if (raw?.group_title) fields.group_title = String(raw.group_title);
+      if (raw?.meeting_url) fields.meeting_url = String(raw.meeting_url);
+    } catch {
+      // Keep the generated BibTeX minimal when raw sidecar data is malformed.
+    }
+  }
+
+  const entries = Object.entries(fields)
+    .filter(([, value]) => String(value ?? '').trim())
+    .map(([name, value]) => `  ${name} = {{${escapeBibtexValue(value)}}}`);
+  return [`@misc{${key},`, entries.join(',\n'), '}'].filter(Boolean).join('\n');
+}
+
+function safeTimestampForFilename() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function mapScraperRunRow(row) {
+  return {
+    id: Number(row.id),
+    source_type: row.source_type,
+    query: safeJsonParse(row.query_json, {}),
+    status: row.status,
+    requested_by_user_id: row.requested_by_user_id == null ? null : Number(row.requested_by_user_id),
+    total_count: Number(row.total_count || 0),
+    downloaded_count: Number(row.downloaded_count || 0),
+    failed_count: Number(row.failed_count || 0),
+    error: row.error || '',
+    created_at: row.created_at || '',
+    started_at: row.started_at || '',
+    finished_at: row.finished_at || '',
+  };
+}
+
+function mapScraperArtifactRow(row) {
+  return {
+    id: Number(row.id),
+    run_id: Number(row.run_id),
+    source_type: row.source_type,
+    source_id: row.source_id || '',
+    title: row.title || '',
+    date: row.date || '',
+    year: row.year == null ? null : Number(row.year),
+    source_url: row.source_url || '',
+    download_url: row.download_url || '',
+    local_artifact_path: row.local_artifact_path || '',
+    file_name: row.file_name || '',
+    raw_metadata: safeJsonParse(row.raw_metadata_json, {}),
+    bibtex_key: row.bibtex_key || '',
+    bibtex_entry: row.bibtex_entry || '',
+    metadata_completeness: row.metadata_completeness || '',
+    status: row.status || '',
+    error: row.error || '',
+    created_at: row.created_at || '',
+    updated_at: row.updated_at || '',
+  };
 }
 
 function listKantroposCorporaOverview(db) {
@@ -2679,6 +2845,220 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
+  app.post('/api/scraper/runs', requireAuthMiddleware, (req, res) => {
+    try {
+      const sourceType = String(req.body?.sourceType || req.body?.source_type || '').trim();
+      if (!['eurlex', 'expert_groups'].includes(sourceType)) {
+        return res.status(400).json({ error: 'sourceType must be one of: eurlex, expert_groups' });
+      }
+      const query = req.body?.query && typeof req.body.query === 'object' ? req.body.query : {};
+      if (sourceType === 'eurlex') {
+        const hasQuery = ['fm_coded', 'dd_year', 'celex_id', 'lang', 'text_query', 'expert_query']
+          .some((key) => String(query?.[key] || '').trim());
+        if (!hasQuery) {
+          return res.status(400).json({ error: 'EUR-Lex scrape requires at least one query field' });
+        }
+      }
+      if (sourceType === 'expert_groups' && !String(query?.group_id || query?.query || '').trim()) {
+        return res.status(400).json({ error: 'Expert Groups scrape requires group_id' });
+      }
+
+      const runId = Number(
+        authDb
+          .prepare(
+            `INSERT INTO scraper_runs (source_type, query_json, status, requested_by_user_id)
+             VALUES (?, ?, 'pending', ?)`
+          )
+          .run(sourceType, JSON.stringify(query), req.user.id)
+          .lastInsertRowid
+      );
+      const jobType = sourceType === 'eurlex' ? 'scrape_eurlex' : 'scrape_expert_groups';
+      const jobId = enqueuePipelineJob(null, jobType, {
+        run_id: runId,
+        artifacts_root: ARTIFACTS_DIR,
+      });
+      return res.status(201).json({ run: mapScraperRunRow(authDb.prepare('SELECT * FROM scraper_runs WHERE id = ?').get(runId)), job_id: jobId });
+    } catch (error) {
+      console.error('[/api/scraper/runs] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to create scraper run' });
+    }
+  });
+
+  app.get('/api/scraper/runs', requireAuthMiddleware, (req, res) => {
+    try {
+      const limit = Math.max(1, Math.min(200, coerceInt(req.query?.limit, 50) || 50));
+      const rows = authDb
+        .prepare(
+          `SELECT *
+           FROM scraper_runs
+           ORDER BY created_at DESC, id DESC
+           LIMIT ?`
+        )
+        .all(limit);
+      return res.json({ runs: rows.map(mapScraperRunRow) });
+    } catch (error) {
+      console.error('[/api/scraper/runs GET] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load scraper runs' });
+    }
+  });
+
+  app.get('/api/scraper/runs/:id', requireAuthMiddleware, (req, res) => {
+    try {
+      const runId = Number(req.params.id);
+      if (!Number.isFinite(runId) || runId <= 0) {
+        return res.status(400).json({ error: 'Invalid scraper run id' });
+      }
+      const run = authDb.prepare('SELECT * FROM scraper_runs WHERE id = ?').get(runId);
+      if (!run) return res.status(404).json({ error: 'Scraper run not found' });
+      const artifactRows = authDb
+        .prepare(
+          `SELECT *
+           FROM scraper_artifacts
+           WHERE run_id = ?
+           ORDER BY id ASC`
+        )
+        .all(runId);
+      return res.json({ run: mapScraperRunRow(run), artifacts: artifactRows.map(mapScraperArtifactRow) });
+    } catch (error) {
+      console.error('[/api/scraper/runs/:id] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load scraper run' });
+    }
+  });
+
+  app.post('/api/scraper/apply', requireAuthMiddleware, (req, res) => {
+    try {
+      const targetId = String(req.body?.targetId || req.body?.target_id || '').trim();
+      const target = getKantroposTargetById(targetId);
+      if (!target) return res.status(400).json({ error: 'Unknown Kantropos corpus target' });
+
+      const artifactIds = Array.isArray(req.body?.artifactIds || req.body?.artifact_ids)
+        ? (req.body.artifactIds || req.body.artifact_ids)
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value) && value > 0)
+        : [];
+      const uniqueArtifactIds = [...new Set(artifactIds)];
+      if (uniqueArtifactIds.length === 0) {
+        return res.status(400).json({ error: 'No artifact ids supplied' });
+      }
+
+      const targetPath = path.resolve(String(target.path || ''));
+      const configuredPath = path.resolve(String(target.path || ''));
+      if (!targetPath || targetPath !== configuredPath) {
+        return res.status(400).json({ error: 'Invalid target path' });
+      }
+      fs.mkdirSync(targetPath, { recursive: true });
+      const metadataBibPath = path.join(targetPath, 'metadata.bib');
+      const existingBib = fs.existsSync(metadataBibPath) ? fs.readFileSync(metadataBibPath, 'utf8') : '';
+      const existingKeys = parseBibtexKeys(existingBib);
+      const appendedEntries = [];
+      const details = [];
+      let appliedCount = 0;
+      let skippedCount = 0;
+      let errorCount = 0;
+
+      const placeholders = uniqueArtifactIds.map(() => '?').join(', ');
+      const artifacts = authDb
+        .prepare(
+          `SELECT *
+           FROM scraper_artifacts
+           WHERE id IN (${placeholders})
+           ORDER BY id ASC`
+        )
+        .all(...uniqueArtifactIds);
+      const foundIds = new Set(artifacts.map((row) => Number(row.id)));
+      for (const id of uniqueArtifactIds) {
+        if (!foundIds.has(id)) {
+          errorCount += 1;
+          details.push({ artifact_id: id, status: 'error', reason: 'artifact_not_found' });
+        }
+      }
+
+      for (const artifact of artifacts) {
+        const artifactId = Number(artifact.id);
+        const key = String(artifact.bibtex_key || '').trim();
+        const sourceType = String(artifact.source_type || '').trim();
+        const sourceDir = scraperSourceDir(sourceType);
+        const fileName = path.basename(String(artifact.file_name || path.basename(artifact.local_artifact_path || key)));
+        const sourcePath = path.resolve(String(artifact.local_artifact_path || ''));
+        const destDir = path.join(targetPath, 'scraper', sourceDir);
+        const destPath = path.join(destDir, fileName);
+        const sidecarPath = path.join(destDir, `${path.basename(fileName, path.extname(fileName))}.json`);
+        const relFilePath = path.posix.join('scraper', sourceDir, fileName);
+
+        if (!key) {
+          errorCount += 1;
+          details.push({ artifact_id: artifactId, status: 'error', reason: 'missing_bibtex_key' });
+          continue;
+        }
+        if (existingKeys.has(key)) {
+          skippedCount += 1;
+          details.push({ artifact_id: artifactId, status: 'skipped', reason: 'bibtex_key_exists', bibtex_key: key });
+          continue;
+        }
+        if (String(artifact.status || '') !== 'downloaded') {
+          skippedCount += 1;
+          details.push({ artifact_id: artifactId, status: 'skipped', reason: 'artifact_not_downloaded', bibtex_key: key });
+          continue;
+        }
+        if (!sourcePath || !fs.existsSync(sourcePath)) {
+          errorCount += 1;
+          details.push({ artifact_id: artifactId, status: 'error', reason: 'source_file_missing', bibtex_key: key });
+          continue;
+        }
+        if (fs.existsSync(destPath)) {
+          skippedCount += 1;
+          details.push({ artifact_id: artifactId, status: 'skipped', reason: 'destination_file_exists', bibtex_key: key });
+          continue;
+        }
+
+        fs.mkdirSync(destDir, { recursive: true });
+        fs.copyFileSync(sourcePath, destPath);
+        fs.writeFileSync(sidecarPath, artifact.raw_metadata_json || '{}', 'utf8');
+        const bibtexEntry = buildScraperBibtexEntry(artifact, relFilePath);
+        appendedEntries.push(bibtexEntry);
+        existingKeys.add(key);
+        appliedCount += 1;
+        details.push({ artifact_id: artifactId, status: 'applied', bibtex_key: key, file: relFilePath });
+        authDb
+          .prepare('UPDATE scraper_artifacts SET bibtex_entry = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(bibtexEntry, artifactId);
+      }
+
+      if (appendedEntries.length > 0) {
+        if (fs.existsSync(metadataBibPath)) {
+          fs.copyFileSync(metadataBibPath, `${metadataBibPath}.bak-${safeTimestampForFilename()}`);
+        }
+        const prefix = existingBib && !existingBib.endsWith('\n') ? '\n\n' : existingBib ? '\n' : '';
+        fs.appendFileSync(metadataBibPath, `${prefix}${appendedEntries.join('\n\n')}\n`, 'utf8');
+      }
+
+      const eventId = Number(
+        authDb
+          .prepare(
+            `INSERT INTO scraper_apply_events (
+               target_id, target_path, user_id, artifact_ids_json,
+               applied_count, skipped_count, error_count, details_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .run(
+            target.id,
+            targetPath,
+            req.user.id,
+            JSON.stringify(uniqueArtifactIds),
+            appliedCount,
+            skippedCount,
+            errorCount,
+            JSON.stringify(details)
+          )
+          .lastInsertRowid
+      );
+      return res.json({ event_id: eventId, applied_count: appliedCount, skipped_count: skippedCount, error_count: errorCount, details });
+    } catch (error) {
+      console.error('[/api/scraper/apply] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to apply scraper artifacts' });
+    }
+  });
+
   app.post('/api/corpora', requireAuthMiddleware, (req, res) => {
     const { name } = req.body || {};
     if (!name) {
@@ -3969,7 +4349,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         ? [...new Set(rawJobIds.split(',').map((part) => Number(part.trim())).filter((v) => Number.isFinite(v) && v > 0))]
         : [];
       const rawTypes = String(req.query?.types || '').trim().toLowerCase();
-      const allowedTypes = new Set(['enrich', 'download', 'pipeline_tick']);
+      const allowedTypes = new Set(['enrich', 'download', 'pipeline_tick', 'scrape_eurlex', 'scrape_expert_groups']);
       const requestedTypes = rawTypes
         ? [...new Set(rawTypes.split(',').map((part) => part.trim()).filter((value) => allowedTypes.has(value)))]
         : [];

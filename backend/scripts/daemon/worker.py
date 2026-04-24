@@ -80,6 +80,7 @@ from dl_lit.db_manager import DatabaseManager
 from dl_lit.utils import get_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
+from dl_lit.scraper_lab import execute_scraper_job
 
 # Import constants
 from reference_expansion import (
@@ -263,7 +264,7 @@ class PipelineDaemon:
         cur = self.db.conn.cursor()
         role_filter = ""
         if self.role == "enrich":
-            role_filter = "AND job_type IN ('enrich', 'pipeline_tick')"
+            role_filter = "AND job_type IN ('enrich', 'pipeline_tick', 'scrape_eurlex', 'scrape_expert_groups')"
         elif self.role == "download":
             role_filter = "AND job_type = 'download'"
         try:
@@ -922,6 +923,13 @@ class PipelineDaemon:
                             }
                         else:
                             result = {"marked": m_res, "enriched": e_res}
+
+            elif job["job_type"] in {"scrape_eurlex", "scrape_expert_groups"}:
+                run_id = int(params.get("run_id") or 0)
+                if run_id <= 0:
+                    raise ValueError("Scraper job missing run_id")
+                artifacts_root = str(params.get("artifacts_root") or os.getenv("RAG_FEEDER_ARTIFACTS_DIR") or "artifacts")
+                result = execute_scraper_job(self.db_path, run_id, artifacts_root)
 
             else:
                 raise ValueError(f"Unknown job type: {job['job_type']}")

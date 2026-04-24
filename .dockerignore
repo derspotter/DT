@@ -1,0 +1,9 @@
+backend/node_modules
+frontend/node_modules
+**/__pycache__
+.git
+.pytest_cache
+.ruff_cache
+.uv_cache
+.venv
+Scraper_first_version

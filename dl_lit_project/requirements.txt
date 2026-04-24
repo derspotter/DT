@@ -3,6 +3,8 @@ google-genai
 requests
 PySocks
 beautifulsoup4
+playwright
+zeep
 pikepdf
 PyMuPDF
 bibtexparser>=2.0.0b8

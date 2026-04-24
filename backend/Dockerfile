@@ -21,6 +21,9 @@ WORKDIR /usr/src/app
 COPY dl_lit_project/requirements.txt /tmp/dl_lit_project-requirements.txt
 RUN pip install --no-cache-dir -r /tmp/dl_lit_project-requirements.txt
 
+# Expert Groups scraping uses Playwright/Chromium in the Python worker path.
+RUN python -m playwright install --with-deps chromium
+
 # Copy package.json for faster, quieter installs
 COPY backend/package*.json ./
 
