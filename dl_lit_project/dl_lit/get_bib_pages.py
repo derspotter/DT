@@ -66,7 +66,20 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(default))
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return max(minimum, float(default))
+    try:
+        return max(minimum, float(raw))
+    except Exception:
+        return max(minimum, float(default))
+
+
 GET_BIB_CHUNK_WORKERS = _env_int("RAG_FEEDER_GET_BIB_CHUNK_WORKERS", 6)
+GET_BIB_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_GET_BIB_TIMEOUT_SECONDS", 180)
+GET_BIB_TIMEOUT_RETRIES = _env_int("RAG_FEEDER_GET_BIB_TIMEOUT_RETRIES", 1, minimum=0)
+GET_BIB_RETRY_BACKOFF_SECONDS = _env_float("RAG_FEEDER_GET_BIB_RETRY_BACKOFF_SECONDS", 5.0, minimum=0.0)
 
 
 load_dotenv()
@@ -81,6 +94,9 @@ if api_key:
 
 SECTION_JSON_RE = re.compile(r"```json\s*([\s\S]*?)\s*```", re.IGNORECASE)
 SOURCE_METADATA_FILENAME = "source_metadata.json"
+LOCATION_LIKE_SOURCE_RE = re.compile(
+    r"^[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3},\s*(?:[A-Z]{2}|[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3})$"
+)
 
 
 def _clean_json_response(text: str) -> str:
@@ -97,6 +113,15 @@ def _clean_json_response(text: str) -> str:
     if text.endswith("```"):
         text = text[:-3]
     return text.strip()
+
+
+def _looks_like_location_label(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = " ".join(value.strip().split())
+    if not candidate or len(candidate) > 80:
+        return False
+    return bool(LOCATION_LIKE_SOURCE_RE.fullmatch(candidate))
 
 
 def _normalize_sections(sections: list[dict], total_pages: int) -> list[dict]:
@@ -146,13 +171,15 @@ def _normalize_source_metadata(value: dict | None) -> dict | None:
     if isinstance(doi, str) and doi.strip():
         normalized["doi"] = doi.strip()
 
-    source = value.get("source")
-    if isinstance(source, str) and source.strip():
-        normalized["source"] = source.strip()
-
     publisher = value.get("publisher")
     if isinstance(publisher, str) and publisher.strip():
         normalized["publisher"] = publisher.strip()
+
+    source = value.get("source")
+    if isinstance(source, str) and source.strip():
+        cleaned_source = source.strip()
+        if not _looks_like_location_label(cleaned_source):
+            normalized["source"] = cleaned_source
 
     return normalized or None
 
@@ -219,7 +246,7 @@ def _extract_total_tokens(response) -> int | None:
 def _find_reference_section_pages(
     uploaded_pdf,
     total_physical_pages: int,
-    timeout_seconds: int = 180,
+    timeout_seconds: int = GET_BIB_TIMEOUT_SECONDS,
     include_source_metadata: bool = True,
 ) -> tuple[list[dict], dict | None]:
     if api_client is None:
@@ -246,7 +273,9 @@ Rules:
 - start_page = page where the references section begins (title or first entry). Be inclusive.
 - end_page = page where the last reference entry ends (do not include unrelated pages after).
 - Include every distinct bibliography/reference section, especially after chapters.
-- For source_metadata, infer from the attached PDF. If unavailable, use null per field.
+- For source_metadata, use 'source' only for the journal, book, proceedings, or series title of the seed document.
+- Do not put a city or place of publication such as 'Cambridge, MA' or 'New York' in 'source'.
+- Put publishing house or imprint names in 'publisher'. If unavailable, use null per field.
 
 Document has {total_physical_pages} physical pages.
 """.strip()
@@ -281,13 +310,27 @@ Document has {total_physical_pages} physical pages.
             ),
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_call)
-        try:
-            resp = future.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from exc
+    max_attempts = max(1, GET_BIB_TIMEOUT_RETRIES + 1)
+    for attempt in range(1, max_attempts + 1):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call)
+            try:
+                resp = future.result(timeout=timeout_seconds)
+                break
+            except concurrent.futures.TimeoutError as exc:
+                future.cancel()
+                if attempt >= max_attempts:
+                    raise TimeoutError(
+                        f"Gemini request timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
+                    ) from exc
+                delay = GET_BIB_RETRY_BACKOFF_SECONDS * attempt
+                print(
+                    f"[WARNING] Gemini section detection timed out after {timeout_seconds}s "
+                    f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s...",
+                    flush=True,
+                )
+                if delay > 0:
+                    time.sleep(delay)
 
     token_count = _extract_total_tokens(resp)
     if token_count:

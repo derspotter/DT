@@ -64,9 +64,30 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(default))
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return max(minimum, float(default))
+    try:
+        return max(minimum, float(raw))
+    except Exception:
+        return max(minimum, float(default))
+
+
 DEFAULT_EXTRACT_WORKERS = _env_int("RAG_FEEDER_API_EXTRACT_WORKERS", 10)
 DEFAULT_INLINE_CHUNK_WORKERS = _env_int("RAG_FEEDER_INLINE_CHUNK_WORKERS", 4)
 DEFAULT_PAGE_BATCH_SIZE = _env_int("RAG_FEEDER_PAGE_BATCH_SIZE", 4)
+DEFAULT_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_API_TIMEOUT_SECONDS", 120)
+INLINE_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_API_INLINE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
+INLINE_CHUNK_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_API_INLINE_CHUNK_TIMEOUT_SECONDS", INLINE_TIMEOUT_SECONDS)
+GEMINI_TIMEOUT_RETRIES = _env_int("RAG_FEEDER_GEMINI_TIMEOUT_RETRIES", 2, minimum=0)
+GEMINI_RETRY_BACKOFF_SECONDS = _env_float("RAG_FEEDER_GEMINI_RETRY_BACKOFF_SECONDS", 5.0, minimum=0.0)
+INLINE_CHUNK_FAILURE_RETRIES = _env_int("RAG_FEEDER_INLINE_CHUNK_FAILURE_RETRIES", 1, minimum=0)
+INLINE_CHUNK_RETRY_BACKOFF_SECONDS = _env_float(
+    "RAG_FEEDER_INLINE_CHUNK_RETRY_BACKOFF_SECONDS",
+    GEMINI_RETRY_BACKOFF_SECONDS,
+    minimum=0.0,
+)
 REF_PAGE_FILE_RE = re.compile(r"^(?P<prefix>.+?)_refs_physical_p(?P<page>\d+)\.pdf$", re.IGNORECASE)
 
 # Global client
@@ -81,6 +102,9 @@ BIBLIOGRAPHY_PROMPT = (
     "'source_metadata' and 'items' matching the provided schema. "
     "CRITICAL: You MUST extract the 'authors' for every entry if they exist in the text. "
     "Look closely for names at the beginning of each citation. Never leave the 'authors' list empty if names are visible. "
+    "Use 'source' only for the container title such as a journal, book, proceedings, or series title. "
+    "If a citation includes a city or place of publication such as 'Cambridge, MA' or 'New York', put that in 'location', not 'source'. "
+    "Put publishing house or imprint names in 'publisher'. "
     "For 'source_metadata', infer metadata for the seed/source document only if clearly identifiable on these pages; otherwise return null. "
     "If no bibliography entries are found, return items as an empty list."
 )
@@ -92,6 +116,9 @@ INLINE_CITATION_PROMPT = (
     "Include each cited work once if identifiable. "
     "Footnote-style references often appear as a note number followed by a full bibliographic string at the bottom of the page; extract those full citations. "
     "CRITICAL: You MUST extract the 'authors' for every cited work. Look closely for names before the year or title. "
+    "Use 'source' only for the container title such as a journal, book, proceedings, or series title. "
+    "If a citation includes a city or place of publication such as 'Cambridge, MA' or 'New York', put that in 'location', not 'source'. "
+    "Put publishing house or imprint names in 'publisher'. "
     "If no citations are found, return items as an empty list."
 )
 
@@ -104,6 +131,9 @@ INLINE_TEXT_CITATION_PROMPT = (
     "Include each cited work once if identifiable. "
     "Footnote-style references often appear as a note number followed by a full bibliographic string; extract those full citations. "
     "CRITICAL: You MUST extract the 'authors' for every cited work. Look closely for names before the year or title. "
+    "Use 'source' only for the container title such as a journal, book, proceedings, or series title. "
+    "If a citation includes a city or place of publication such as 'Cambridge, MA' or 'New York', put that in 'location', not 'source'. "
+    "Put publishing house or imprint names in 'publisher'. "
     "If no citations are found, return items as an empty list."
 )
 
@@ -111,6 +141,8 @@ SOURCE_METADATA_PROMPT = (
     "Extract metadata of the source/seed document from the attached PDF. "
     "Return a JSON object with keys 'source_metadata' and 'items'. "
     "Populate 'source_metadata' with: title, authors, year, doi, source, publisher. "
+    "Use 'source' only for the journal, book, proceedings, or series title of the seed document. "
+    "Do not put a city or place of publication in 'source'. Put publishing house or imprint names in 'publisher'. "
     "Use null for unknown fields. "
     "Set 'items' to an empty list."
 )
@@ -264,6 +296,44 @@ def _resolve_model_name(extract_mode: str) -> str:
     return DEFAULT_MODEL_NAME
 
 
+def _resolve_timeout_seconds(extract_mode: str, *, is_chunk: bool = False) -> int:
+    if extract_mode == "inline":
+        return INLINE_CHUNK_TIMEOUT_SECONDS if is_chunk else INLINE_TIMEOUT_SECONDS
+    return DEFAULT_TIMEOUT_SECONDS
+
+
+def _run_gemini_request(
+    call_model,
+    timeout_seconds: int,
+    *,
+    timeout_retries: int = GEMINI_TIMEOUT_RETRIES,
+    retry_backoff_seconds: float = GEMINI_RETRY_BACKOFF_SECONDS,
+    action_label: str = "Gemini request",
+):
+    max_attempts = max(1, int(timeout_retries) + 1)
+    for attempt in range(1, max_attempts + 1):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(call_model)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            if attempt >= max_attempts:
+                raise TimeoutError(
+                    f"Gemini request timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
+                ) from exc
+            delay = max(0.0, float(retry_backoff_seconds)) * attempt
+            print(
+                f"[WARNING] {action_label} timed out after {timeout_seconds}s "
+                f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s...",
+                flush=True,
+            )
+            if delay > 0:
+                time.sleep(delay)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _run_generate_content(
     model_name: str,
     contents,
@@ -285,16 +355,11 @@ def _run_generate_content(
             config=config,
         )
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_call_model)
-    try:
-        response = future.result(timeout=timeout_seconds)
-    except concurrent.futures.TimeoutError as e:
-        future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        raise TimeoutError(f"Gemini request timed out after {timeout_seconds}s") from e
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    response = _run_gemini_request(
+        _call_model,
+        timeout_seconds,
+        action_label=f"Gemini generate_content ({model_name})",
+    )
 
     token_count = _extract_total_tokens(response)
     if token_count:
@@ -311,6 +376,32 @@ def _ascii_safe_pdf_name(filename: str) -> str:
     if not sanitized.lower().endswith(".pdf"):
         sanitized += ".pdf"
     return sanitized
+
+
+LOCATION_LIKE_SOURCE_RE = re.compile(
+    r"^[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3},\s*(?:[A-Z]{2}|[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3})$"
+)
+
+
+def _looks_like_location_label(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    candidate = " ".join(value.strip().split())
+    if not candidate or len(candidate) > 80:
+        return False
+    return bool(LOCATION_LIKE_SOURCE_RE.fullmatch(candidate))
+
+
+def _normalize_source_and_location_fields(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+    source = data.get("source")
+    if not _looks_like_location_label(source):
+        return data
+    if not data.get("location"):
+        data["location"] = source
+    data.pop("source", None)
+    return data
 
 
 def _prepare_pdf_upload(pdf_path: str) -> tuple[str, str, str | None]:
@@ -453,12 +544,14 @@ def _normalize_source_metadata(value):
     doi = value.get("doi")
     if isinstance(doi, str) and doi.strip():
         metadata["doi"] = doi.strip()
-    source = value.get("source")
-    if isinstance(source, str) and source.strip():
-        metadata["source"] = source.strip()
     publisher = value.get("publisher")
     if isinstance(publisher, str) and publisher.strip():
         metadata["publisher"] = publisher.strip()
+    source = value.get("source")
+    if isinstance(source, str) and source.strip():
+        cleaned_source = source.strip()
+        if not _looks_like_location_label(cleaned_source):
+            metadata["source"] = cleaned_source
     return metadata or None
 
 
@@ -785,6 +878,8 @@ def validate_bibliography_entries(entries):
             if "year" in data and isinstance(data["year"], int):
                 data["year"] = data["year"]
 
+            data = _normalize_source_and_location_fields(data)
+
             validated.append(data)
         except ValidationError as e:
             print(f"[WARNING] Skipping invalid entry: {e}", flush=True)
@@ -805,6 +900,7 @@ def process_single_pdf(
     source_pdf_override: str | None = None,
     uploaded_file_name: str | None = None,
     seed_only: bool = False,
+    record_summary: bool = True,
 ):
     """Processes a single PDF file: upload directly, call API, save result."""
     filename = os.path.basename(pdf_path)
@@ -815,8 +911,10 @@ def process_single_pdf(
     try:
         # Get Bibliography via API by uploading PDF directly
         stage_start_time = time.time()
+        is_chunk = bool(source_pdf_override) and os.path.abspath(str(source_pdf_override)) != os.path.abspath(str(pdf_path))
         extraction_result = upload_pdf_and_extract_bibliography(
             pdf_path,
+            timeout_seconds=_resolve_timeout_seconds(extract_mode, is_chunk=is_chunk),
             extract_mode=extract_mode,
             uploaded_file_name=uploaded_file_name,
         )
@@ -919,13 +1017,23 @@ def process_single_pdf(
         file_success = False
 
     # Update shared summary dictionary safely
-    with summary_lock:
-        summary_dict["processed_files"] += 1
-        if file_success:
-            summary_dict["successful_files"] += 1
-        else:
-            summary_dict["failed_files"] += 1
-            summary_dict["failures"].append({"file": filename, "reason": failure_reason})
+    if record_summary:
+        with summary_lock:
+            summary_dict["processed_files"] += 1
+            if file_success:
+                summary_dict["successful_files"] += 1
+            else:
+                summary_dict["failed_files"] += 1
+                summary_dict["failures"].append({"file": filename, "reason": failure_reason})
+
+    return file_success, failure_reason
+
+
+def _is_timeout_failure_reason(reason: str | None) -> bool:
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    return "timed out" in text or "timeout" in text
 
 
 def process_single_pdf_chunked(
@@ -956,14 +1064,16 @@ def process_single_pdf_chunked(
 
     try:
         worker_count = max(1, min(int(max_workers or 1), len(chunk_paths)))
+        max_chunk_attempts = max(1, INLINE_CHUNK_FAILURE_RETRIES + 1)
         print(
             f"[INFO] Chunked fallback extraction for {pdf_path}: {len(chunk_paths)} chunk(s), mode={extract_mode}, chunk_pages={chunk_pages}, workers={worker_count}",
             flush=True,
         )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(
-                    process_single_pdf,
+
+        def _process_chunk_with_retries(chunk_path: str):
+            last_reason = "Unknown"
+            for attempt in range(1, max_chunk_attempts + 1):
+                success, reason = process_single_pdf(
                     chunk_path,
                     db_manager,
                     summary_dict,
@@ -975,14 +1085,55 @@ def process_single_pdf_chunked(
                     str(pdf_path),
                     None if chunk_path != str(pdf_path) else uploaded_file_name,
                     seed_only,
+                    record_summary=False,
                 )
+                if success:
+                    if attempt > 1:
+                        print(
+                            f"[INFO] Chunk retry succeeded for {chunk_path} on attempt {attempt}/{max_chunk_attempts}.",
+                            flush=True,
+                        )
+                    return True, reason
+                last_reason = reason or "Unknown"
+                if attempt >= max_chunk_attempts or not _is_timeout_failure_reason(last_reason):
+                    break
+                delay = INLINE_CHUNK_RETRY_BACKOFF_SECONDS * attempt
+                print(
+                    f"[WARNING] Retrying chunk {chunk_path} after timeout "
+                    f"(attempt {attempt}/{max_chunk_attempts}, next delay {delay:.1f}s).",
+                    flush=True,
+                )
+                if delay > 0:
+                    time.sleep(delay)
+            return False, last_reason
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(_process_chunk_with_retries, chunk_path)
                 for chunk_path in chunk_paths
             ]
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    future.result()
+                    success, failure_reason = future.result()
+                    with summary_lock:
+                        summary_dict["processed_files"] += 1
+                        if success:
+                            summary_dict["successful_files"] += 1
+                        else:
+                            summary_dict["failed_files"] += 1
+                            summary_dict["failures"].append({
+                                "file": os.path.basename(str(pdf_path)),
+                                "reason": failure_reason or "Unknown",
+                            })
                 except Exception as exc:
                     print(f"[ERROR] Chunk worker failed for {pdf_path}: {exc}", flush=True)
+                    with summary_lock:
+                        summary_dict["processed_files"] += 1
+                        summary_dict["failed_files"] += 1
+                        summary_dict["failures"].append({
+                            "file": os.path.basename(str(pdf_path)),
+                            "reason": str(exc),
+                        })
     finally:
         if temp_chunk_dir and os.path.exists(temp_chunk_dir):
             shutil.rmtree(temp_chunk_dir, ignore_errors=True)

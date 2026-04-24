@@ -6,7 +6,8 @@ import pikepdf
 from click.testing import CliRunner
 
 from dl_lit.cli import cli
-from dl_lit.get_bib_pages import extract_reference_sections
+from dl_lit.get_bib_pages import extract_reference_sections, _normalize_source_metadata
+from dl_lit.APIscraper_v2 import validate_bibliography_entries
 
 
 class TestGetBibPages(unittest.TestCase):
@@ -130,6 +131,42 @@ class TestGetBibPages(unittest.TestCase):
         expected_suffixes |= {f'large_dummy/large_dummy_refs_physical_p{n}.pdf' for n in range(55, 61)}
         for suffix in expected_suffixes:
             self.assertTrue(any(path.endswith(suffix) for path in saved_files), f"Missing expected file suffix: {suffix}")
+
+    def test_normalize_source_metadata_drops_location_like_source(self):
+        normalized = _normalize_source_metadata({
+            'title': 'Collected Essays',
+            'source': 'Cambridge, MA',
+            'publisher': 'MIT Press',
+        })
+
+        self.assertEqual(normalized, {
+            'title': 'Collected Essays',
+            'publisher': 'MIT Press',
+        })
+
+    def test_validate_bibliography_entries_moves_location_like_source(self):
+        validated = validate_bibliography_entries([
+            {
+                'title': 'Test Entry',
+                'source': 'Cambridge, MA',
+                'publisher': 'MIT Press',
+            }
+        ])
+
+        self.assertEqual(validated[0].get('location'), 'Cambridge, MA')
+        self.assertNotIn('source', validated[0])
+
+    def test_validate_bibliography_entries_keeps_legitimate_source(self):
+        validated = validate_bibliography_entries([
+            {
+                'title': 'Test Entry',
+                'source': 'Cambridge Journal of Economics',
+                'publisher': 'Oxford University Press',
+            }
+        ])
+
+        self.assertEqual(validated[0].get('source'), 'Cambridge Journal of Economics')
+        self.assertNotIn('location', validated[0])
 
 if __name__ == '__main__':
     unittest.main()
