@@ -246,6 +246,62 @@ export async function saveCorpusKantroposAssignment(corpusId, targetId) {
   return response.json()
 }
 
+export async function createScraperRun({ sourceType, query }) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/scraper/runs`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sourceType, query }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to create scraper run')
+  }
+  return response.json()
+}
+
+export async function fetchScraperRuns(limit = 50) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/scraper/runs?limit=${encodeURIComponent(String(limit))}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load scraper runs')
+  }
+  return response.json()
+}
+
+export async function fetchScraperRun(runId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/scraper/runs/${encodeURIComponent(String(runId || ''))}`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load scraper run')
+  }
+  return response.json()
+}
+
+export async function applyScraperArtifacts({ targetId, artifactIds }) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/scraper/apply`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetId, artifactIds }),
+    },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to apply scraper artifacts')
+  }
+  return response.json()
+}
+
 export async function uploadPdf(file) {
   const formData = new FormData()
   formData.append('file', file)

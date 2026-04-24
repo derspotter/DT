@@ -52,6 +52,7 @@
   import Corpus from './components/Corpus.svelte'
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
+  import ScraperLab from './components/ScraperLab.svelte'
 
   const userTabGroups = [
     {
@@ -59,6 +60,7 @@
       tabs: [
         { id: 'workspace', label: 'Workspace' },
         { id: 'upstream', label: 'Korpus Management' },
+        { id: 'scraper', label: 'Scraper Lab' },
       ]
     }
   ]
@@ -1526,6 +1528,7 @@
   async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
     authStatus = 'loading'
     authError = ''
+    const startupTab = !preserveAuthFlow ? readTabFromHash() : null
     try {
       const payload = await fetchMe()
       authUser = payload.user
@@ -1540,7 +1543,7 @@
       await refreshAll()
       connectLogs()
       if (!preserveAuthFlow) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab(startupTab || activeTab || 'workspace', { replace: true })
       }
     } catch (error) {
       authStatus = 'unauthenticated'
@@ -4588,8 +4591,14 @@
   <div class="app-shell" class:workspace-mode={activeTab === 'workspace'} class:upstream-mode={activeTab === 'upstream'}>
     <header class="app-header">
       <div class="header-main header-main--workspace">
-        <div class="header-main__top">
+        <div class="header-main__copy">
           <p class="eyebrow">Korpus Builder</p>
+          <h1>Corpus orchestration workspace</h1>
+          <p class="subtitle">
+            Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
+          </p>
+        </div>
+        <div class="header-main__top">
           <div class="header-user header-user--compact">
             <span class="eyebrow">Signed in</span>
             <strong>{authUser?.username}</strong>
@@ -4598,10 +4607,6 @@
             </button>
           </div>
         </div>
-        <h1>Corpus orchestration workspace</h1>
-        <p class="subtitle">
-          Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
-        </p>
       </div>
     </header>
 
@@ -4630,6 +4635,20 @@
 
     <section class="content">
       {#if activeTab === 'workspace'}
+        <section class="tab-hero tab-hero--workspace">
+          <div class="tab-hero__copy">
+            <p class="eyebrow">Workspace</p>
+            <h2>Search, review, and build the working literature corpus.</h2>
+            <p>
+              Start with search results or bibliography uploads, promote the useful candidates, and track the pipeline from metadata to downloaded files.
+            </p>
+          </div>
+          <div class="tab-hero__stats">
+            <span><strong>{seedSources.length}</strong> seed sources</span>
+            <span><strong>{pipelineMetadataCount}</strong> metadata</span>
+            <span><strong>{pipelineDownloadedCount}</strong> downloaded</span>
+          </div>
+        </section>
         <div class="seed-corpus-workspace">
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
@@ -5175,6 +5194,10 @@
           {doiHref}
           {openAlexHref}
         />
+      {/if}
+
+      {#if activeTab === 'scraper'}
+        <ScraperLab />
       {/if}
 
       {#if activeTab === 'admin'}

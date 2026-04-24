@@ -147,11 +147,26 @@
 </script>
 
 <div class="upstream-browser">
+  <section class="tab-hero tab-hero--upstream">
+    <div class="tab-hero__copy">
+      <p class="eyebrow">Korpus Management</p>
+      <h2>Keep local corpora aligned with the upstream baseline.</h2>
+      <p>
+        Map app corpora to their upstream targets, share access, and compare pending local additions against the imported metadata.bib baseline.
+      </p>
+    </div>
+    <div class="tab-hero__stats">
+      <span><strong>{targets.length}</strong> targets</span>
+      <span><strong>{browse?.summary?.pending_items_count || 0}</strong> pending</span>
+      <span><strong>{browse?.summary?.current_items_count || 0}</strong> upstream</span>
+    </div>
+  </section>
+
   <div class="card upstream-browser__toolbar">
     <div class="workspace-panel-header">
       <div class="workspace-panel-title upstream-browser__title">
-        <h2 class="workspace-section-title">Korpus Management</h2>
-        <p>Manage corpus sharing, assign the current corpus to an upstream target, and browse imported upstream baselines.</p>
+        <h2 class="workspace-section-title">Management Console</h2>
+        <p>Choose the active upstream target, configure corpus mapping, and manage sharing for the selected local corpus.</p>
       </div>
       <div class="workspace-panel-actions upstream-browser__toolbar-controls">
         <label class="upstream-browser__target-select">
