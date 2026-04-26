@@ -229,7 +229,10 @@ class BibliographyEnhancer:
 
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
-            if self.is_likely_pdf_url(href):
+            if href.strip() in {"", "#"}:
+                continue
+            anchor_text = a_tag.get_text(" ", strip=True)
+            if self.is_likely_pdf_url(href) or self._is_repository_pdf_link(href, anchor_text, response.url):
                 print(f"  Found PDF link: {href}")
                 found_link = href
                 break
@@ -1001,6 +1004,34 @@ class BibliographyEnhancer:
             return True
         
         return False
+
+    @staticmethod
+    def _is_repository_pdf_link(href: str, text: str = "", base_url: str = "") -> bool:
+        """Detect repository file routes whose URL does not include a .pdf suffix."""
+        if not isinstance(href, str) or not href.strip():
+            return False
+        text_lower = (text or "").strip().lower()
+        if not text_lower.endswith(".pdf") and " pdf" not in f" {text_lower} ":
+            return False
+
+        absolute = urljoin(base_url or "", href)
+        parsed = urlparse(absolute)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        if host.endswith("ora.ox.ac.uk") and "/files/" in path:
+            return True
+        if "/bitstream/" in path or "/handle/" in path or "/record/" in path:
+            return True
+        return False
+
+    @staticmethod
+    def _is_transient_libgen_download_error(url: str, source: str, status_code: int | None = None) -> bool:
+        text = f"{url or ''} {source or ''}".lower()
+        if not any(token in text for token in ("libgen", "booksdl", "get.php")):
+            return False
+        if status_code is None:
+            return True
+        return status_code in {500, 502, 503, 504}
         
     def try_extract_pdf_link(self, html_url, source: str | None = None, allow_vpn_fallback: bool = False, force_vpn: bool = False):
         try:
@@ -1403,6 +1434,20 @@ class BibliographyEnhancer:
             elif response.status_code != 200:
                 print(f"  HTTP error {response.status_code}")
                 self._record_download_event(ref, source=source, outcome="failure", category=self._classify_http_status(response.status_code), detail=f"HTTP {response.status_code}", url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
+                if (
+                    not _vpn_retry_used
+                    and self._is_transient_libgen_download_error(url, source, response.status_code)
+                ):
+                    print("  Transient LibGen/CDN response; retrying candidate once...")
+                    time.sleep(1.0)
+                    return self.try_download_url(
+                        url,
+                        source,
+                        ref,
+                        downloads_dir,
+                        _force_vpn=_force_vpn,
+                        _vpn_retry_used=True,
+                    )
                 return False
                     
             content = response.content
@@ -1475,6 +1520,20 @@ class BibliographyEnhancer:
                          )
                      detail = f"No PDF link extracted from response (content-type={content_type or 'unknown'})"
                      self._record_download_event(ref, source=f"{source} HTML", outcome="failure", category="no_pdf_link", detail=detail, url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
+                     if (
+                         not _vpn_retry_used
+                         and self._is_transient_libgen_download_error(url, source)
+                     ):
+                         print("  LibGen/CDN HTML did not expose a PDF; retrying candidate once...")
+                         time.sleep(1.0)
+                         return self.try_download_url(
+                             url,
+                             source,
+                             ref,
+                             downloads_dir,
+                             _force_vpn=_force_vpn,
+                             _vpn_retry_used=True,
+                         )
                 # --- END MODIFICATION ---
 
             return False # Return False if download wasn't valid PDF and no link extracted/retried
