@@ -52,6 +52,20 @@ Status lives directly on `works`:
 
 The production site does not hot reload. Rebuild the frontend when you want changes on the live stack.
 
+## Live Deploys Behind Caddy
+
+Do not patch tracked compose files on the server. Keep the live host and Caddy labels in an untracked `docker-compose.override.yml` instead so a `git pull` cannot wipe them.
+
+1. Add the live host to `.env`:
+   - `RAG_FEEDER_PUBLIC_HOST=corpus4uol.university-of-labour.de`
+   - `RAG_FEEDER_PROXY_NETWORK=reverse_proxy`
+2. Create a local override once:
+   - `cp docker-compose.override.example.yml docker-compose.override.yml`
+3. Deploy normally after pulls:
+   - `docker compose up -d`
+
+`docker compose` loads `docker-compose.override.yml` automatically, so the frontend keeps its `caddy` labels and host overrides without requiring a special command.
+
 ## Paths You Actually Use
 
 - SQLite DB: `dl_lit_project/data/literature.db`

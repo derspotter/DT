@@ -1,0 +1,21 @@
+services:
+  rag_backend:
+    environment:
+      - RAG_FEEDER_FRONTEND_ORIGIN=http://localhost:5175,https://${RAG_FEEDER_PUBLIC_HOST}
+      - RAG_FEEDER_FRONTEND_URL=https://${RAG_FEEDER_PUBLIC_HOST}
+
+  rag_feeder:
+    environment:
+      - VITE_ALLOWED_HOSTS=${RAG_FEEDER_PUBLIC_HOST}
+      - VITE_DISABLE_HMR=1
+    labels:
+      caddy: ${RAG_FEEDER_PUBLIC_HOST}
+      caddy.reverse_proxy: "{{upstreams 5175}}"
+      caddy_ingress_network: ${RAG_FEEDER_PROXY_NETWORK:-reverse_proxy}
+    networks:
+      - reverse_proxy
+
+networks:
+  reverse_proxy:
+    external: true
+    name: ${RAG_FEEDER_PROXY_NETWORK:-reverse_proxy}

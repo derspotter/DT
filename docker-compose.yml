@@ -165,7 +165,7 @@ networks:
   rag-network:
   reverse_proxy:
     external: true
-    name: caddy
+    name: ${RAG_FEEDER_PROXY_NETWORK:-reverse_proxy}
 
 volumes:
   rag_feeder_node_modules:
