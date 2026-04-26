@@ -110,6 +110,8 @@ const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
 const KANTROPOS_CORPORA_ROOT =
   process.env.RAG_FEEDER_KANTROPOS_CORPORA_ROOT || '/data/projects/kantropos/corpora';
+const PDF_LIBRARY_DIR =
+  process.env.RAG_FEEDER_PDF_LIBRARY_DIR || path.join(path.dirname(DB_PATH), 'pdf_library');
 const EMPTY_ZIP_BUFFER = Buffer.from([
   0x50, 0x4b, 0x05, 0x06,
   0x00, 0x00, 0x00, 0x00,
@@ -1267,6 +1269,34 @@ function parseJsonFromOutput(output) {
   throw new Error(`No valid JSON output from python. Output was: ${output}`);
 }
 
+function resolveDownloadedFilePath(storedPath) {
+  const rawPath = String(storedPath || '').trim();
+  if (!rawPath) return null;
+
+  const candidates = [];
+  if (path.isAbsolute(rawPath)) {
+    candidates.push(path.resolve(rawPath));
+    const containerPrefix = `${path.sep}usr${path.sep}src${path.sep}app${path.sep}`;
+    if (rawPath.startsWith(containerPrefix)) {
+      candidates.push(path.resolve(REPO_ROOT, rawPath.slice(containerPrefix.length)));
+    }
+  } else {
+    const libraryPath = path.resolve(PDF_LIBRARY_DIR, rawPath);
+    const libraryRoot = path.resolve(PDF_LIBRARY_DIR);
+    if (libraryPath === libraryRoot || libraryPath.startsWith(`${libraryRoot}${path.sep}`)) {
+      candidates.push(libraryPath);
+    }
+    candidates.push(path.resolve(rawPath));
+  }
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || null;
+}
+
+function findDownloadedFilePath(storedPath) {
+  const resolved = resolveDownloadedFilePath(storedPath);
+  return resolved && fs.existsSync(resolved) ? resolved : null;
+}
+
 function normalizeIngestSourceMetadata(value) {
   if (!value || typeof value !== 'object') return null;
   const out = {};
@@ -1769,6 +1799,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const hasAdminWorkerAccess = (req) => {
     if (isStubMode()) return true;
     return isAdminUser(req.user, authConfig);
+  };
+  const requireCorpusWriteAccess = (req, res, next) => {
+    if (isStubMode()) return next();
+    if (!Number.isFinite(Number(req.corpusId)) || Number(req.corpusId) <= 0) {
+      return res.status(403).json({ error: 'Select a corpus before changing corpus data' });
+    }
+    if (!hasWorkerAccess(req)) {
+      return res.status(403).json({ error: 'Only corpus owners or editors can change corpus data' });
+    }
+    return next();
   };
 
   // Ensure uploads directory exists (already present, keeping for clarity)
@@ -3090,8 +3130,12 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.post('/api/corpora/:id/share', requireAuthMiddleware, (req, res) => {
     const corpusId = Number(req.params.id);
     const { username, role = 'viewer' } = req.body || {};
+    const normalizedRole = String(role || 'viewer').trim().toLowerCase();
     if (!username) {
       return res.status(400).json({ error: 'Missing username' });
+    }
+    if (!['viewer', 'editor'].includes(normalizedRole)) {
+      return res.status(400).json({ error: 'Role must be viewer or editor' });
     }
     const access = authDb
       .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
@@ -3103,9 +3147,12 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!target) {
       return res.status(404).json({ error: 'User not found' });
     }
+    if (Number(target.id) === Number(req.user.id)) {
+      return res.status(400).json({ error: 'Cannot change your own corpus role' });
+    }
     authDb
       .prepare('INSERT OR REPLACE INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, ?)')
-      .run(target.id, corpusId, role);
+      .run(target.id, corpusId, normalizedRole);
     return res.json({ shared: true });
   });
 
@@ -3286,7 +3333,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   // --- MODIFIED ENDPOINT: Upload PDF ---
   // Renamed conceptually, but keeping path for minimal frontend changes initially
-  app.post('/api/process_pdf', requireAuthMiddleware, upload.single('file'), (req, res) => { // Made non-async
+  app.post('/api/process_pdf', requireAuthMiddleware, requireCorpusWriteAccess, upload.single('file'), (req, res) => { // Made non-async
     console.log('[/api/process_pdf -> /api/upload] Received upload request');
     try {
       console.log('[/api/upload] Inside TRY block.');
@@ -3329,7 +3376,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   // --- END MODIFIED UPLOAD ENDPOINT ---
 
   // --- NEW ENDPOINT: Extract Bibliography ---
-  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, async (req, res) => {
+  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const { filename } = req.params;
     const corpusId = req.corpusId;
     const corpusTag = String(corpusId || 'none');
@@ -3691,11 +3738,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   // Legacy `/api/bibliographies/consolidate` endpoint removed (DB-first pipeline).
 
-  app.post('/api/keyword-search', requireAuthMiddleware, async (req, res) => {
+  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const query = req.body?.query?.trim();
     const seedJson = req.body?.seedJson;
-    if (!query && !seedJson) {
-      return res.status(400).json({ error: 'query or seedJson is required' });
+    const author = req.body?.author?.trim() || '';
+    const yearFrom = coerceInt(req.body?.yearFrom, null);
+    const yearTo = coerceInt(req.body?.yearTo, null);
+    if (!query && !seedJson && !author && !yearFrom && !yearTo) {
+      return res.status(400).json({ error: 'query, seedJson, author, or year filter is required' });
     }
 
     if (process.env.RAG_FEEDER_STUB === '1') {
@@ -3703,10 +3753,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     const field = req.body?.field || 'default';
-    const author = req.body?.author?.trim() || '';
     const maxResults = coerceInt(req.body?.maxResults, 200);
-    const yearFrom = coerceInt(req.body?.yearFrom, null);
-    const yearTo = coerceInt(req.body?.yearTo, null);
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
     const dbPath = DB_PATH;
@@ -3721,14 +3768,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       includeUpstream: req.body?.includeUpstream,
     });
 
-    if (query) args.push('--query', query);
-    if (!query && seedJson) {
+    if (seedJson) {
       const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
       args.push('--seed-json', seedPayload);
+    } else {
+      args.push('--query', query || '');
     }
-    if (query && author) args.push('--author', author);
-    if (query && yearFrom) args.push('--year-from', String(yearFrom));
-    if (query && yearTo) args.push('--year-to', String(yearTo));
+    if (author) args.push('--author', author);
+    if (yearFrom) args.push('--year-from', String(yearFrom));
+    if (yearTo) args.push('--year-to', String(yearTo));
     if (mailto) args.push('--mailto', String(mailto));
     if (enqueue) args.push('--enqueue');
     applyKeywordSearchExpansionArgs(args, expansion);
@@ -3751,7 +3799,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.get('/api/seed/sources', requireAuthMiddleware, (req, res) => {
     try {
       const limit = Math.max(1, Math.min(500, coerceInt(req.query?.limit, 100) || 100));
-      const sources = listSeedSources(authDb, req.corpusId, { limit });
+      const sources = listSeedSources(authDb, req.corpusId, { limit, resolveDownloadedFilePath: findDownloadedFilePath });
       return res.json({ source: 'db', sources, total: sources.length });
     } catch (error) {
       console.error('[/api/seed/sources] Error:', error);
@@ -3766,8 +3814,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
-      const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey);
-      const sourceSummary = listSeedSources(authDb, req.corpusId, { limit: 500 }).find(
+      const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
+        stateResolver: null,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+      });
+      const sourceSummary = listSeedSources(authDb, req.corpusId, { limit: 500, resolveDownloadedFilePath: findDownloadedFilePath }).find(
         (source) => source.source_type === sourceType && String(source.source_key) === sourceKey
       ) || null;
       return res.json({
@@ -3782,7 +3833,53 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.post('/api/seed/sources/:sourceType/:sourceKey/promote', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/seed/sources/:sourceType/:sourceKey/candidates/:candidateKey/file', requireAuthMiddleware, (req, res) => {
+    try {
+      const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
+      const sourceKey = String(req.params?.sourceKey || '').trim();
+      const candidateKey = String(req.params?.candidateKey || '').trim();
+      if (!['pdf', 'search'].includes(sourceType) || !sourceKey || !candidateKey) {
+        return res.status(400).json({ error: 'Invalid seed candidate' });
+      }
+
+      const candidate = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
+        stateResolver: null,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+      })
+        .find((item) => String(item?.candidate_key || '') === candidateKey);
+      const state = String(candidate?.state || '').trim().toLowerCase();
+      const workId = coerceInt(candidate?.downloaded_work_id, null);
+      if (!candidate || !['downloaded', 'downloaded_elsewhere'].includes(state) || !Number.isFinite(workId) || workId <= 0) {
+        return res.status(404).json({ error: 'Downloaded file not found for this seed candidate' });
+      }
+
+      const db = new Database(DB_PATH, { readonly: true });
+      const row = db.prepare(
+        `SELECT id, title, file_path
+           FROM works
+          WHERE id = ?
+            AND download_status = 'downloaded'
+          LIMIT 1`
+      ).get(workId);
+      db.close();
+
+      if (!row) {
+        return res.status(404).json({ error: 'Downloaded file not found' });
+      }
+
+      const filePath = resolveDownloadedFilePath(row.file_path);
+      if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Downloaded file is missing on disk' });
+      }
+
+      return res.download(filePath, path.basename(filePath));
+    } catch (error) {
+      console.error('[/api/seed/sources/:sourceType/:sourceKey/candidates/:candidateKey/file] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to download seed candidate file' });
+    }
+  });
+
+  app.post('/api/seed/sources/:sourceType/:sourceKey/promote', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
     const sourceKey = String(req.params?.sourceKey || '').trim();
     if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
@@ -3810,7 +3907,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     try {
-      const availableCandidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey);
+      const availableCandidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
+        stateResolver: null,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+      });
       const promotableCandidates = availableCandidates.filter((candidate) => {
         const state = String(candidate?.state || '').trim().toLowerCase();
         return !Boolean(candidate?.in_corpus) && state !== 'downloaded';
@@ -3829,10 +3929,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         openalex_id: candidate?.openalex_id || null,
         source: candidate?.source || null,
         publisher: candidate?.publisher || null,
+        volume: candidate?.volume || null,
+        issue: candidate?.issue || null,
+        pages: candidate?.pages || null,
         url: candidate?.url || null,
+        open_access_url: candidate?.open_access_url || null,
         type: candidate?.type || null,
         abstract: candidate?.abstract || null,
         keywords: candidate?.keywords || null,
+        openalex_json: candidate?.openalex_json || null,
+        metadata_source_type: candidate?.metadata_source_type || null,
         source_pdf: candidate?.source_pdf || null,
         ingest_source: candidate?.ingest_source || null,
         run_id: candidate?.run_id || null,
@@ -3887,7 +3993,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           Number(promotion?.queued_existing_download || 0) > 0 ||
           Number(promotion?.already_enriched || 0) > 0 ||
           Number(promotion?.already_queued_download || 0) > 0 ||
-          Number(promotion?.failed_download_existing || 0) > 0
+          Number(promotion?.queued_new_download || 0) > 0
         )
       );
 
@@ -3929,7 +4035,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.post('/api/seed/candidates/dismiss', requireAuthMiddleware, (req, res) => {
+  app.post('/api/seed/candidates/dismiss', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
     try {
       const sourceType = String(req.body?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.body?.sourceKey || '').trim();
@@ -3948,7 +4054,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.delete('/api/seed/sources/:sourceType/:sourceKey', requireAuthMiddleware, (req, res) => {
+  app.delete('/api/seed/sources/:sourceType/:sourceKey', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
     try {
       const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.params?.sourceKey || '').trim();
@@ -3986,7 +4092,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!Number.isFinite(itemId) || itemId <= 0) {
       return res.status(400).json({ error: 'Invalid downloaded item id' });
     }
-
     try {
       const db = new Database(DB_PATH, { readonly: true });
       const row = db.prepare(
@@ -4004,7 +4109,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(404).json({ error: 'Downloaded file not found in this corpus' });
       }
 
-      const filePath = path.resolve(String(row.file_path || ''));
+      const filePath = resolveDownloadedFilePath(row.file_path);
       if (!filePath || !fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'Downloaded file is missing on disk' });
       }
@@ -4180,7 +4285,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.post('/api/ingest/enqueue', requireAuthMiddleware, async (req, res) => {
+  app.post('/api/ingest/enqueue', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const rawIds = req.body?.entryIds;
     if (!Array.isArray(rawIds) || rawIds.length === 0) {
       return res.status(400).json({ error: 'entryIds must be a non-empty array' });
@@ -4201,7 +4306,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.post('/api/ingest/process-marked', requireAuthMiddleware, async (req, res) => {
+  app.post('/api/ingest/process-marked', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const limit = coerceInt(req.body?.limit, 10);
     const workers = coerceInt(req.body?.workers, 6);
     const enqueueDownload = Boolean(req.body?.enqueueDownload);

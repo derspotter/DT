@@ -139,3 +139,31 @@ def test_create_pending_work_normalizes_editors_when_authors_missing(tmp_path):
     normalized = cur.fetchone()[0]
     assert normalized == db._normalize_authors_value(["Yamamura, K.", "Streeck, W."])
     db.close_connection()
+
+
+def test_apply_enriched_metadata_ignores_non_schema_api_fields(tmp_path):
+    db = DatabaseManager(tmp_path / "test.db")
+    row_id, err = db.create_pending_work({"title": "Schema Drift Work", "authors": ["Alice"], "year": 2024})
+    assert row_id is not None and err is None
+
+    updated_id, message = db.apply_enriched_metadata(
+        int(row_id),
+        {
+            "title": "Schema Drift Work",
+            "authors": ["Alice"],
+            "year": 2024,
+            "doi": "10.1234/schema-drift",
+            "open_access_url": "https://example.test/open.pdf",
+            "referenced_work_ids": ["https://openalex.org/W1"],
+            "cited_by_api_url": "https://api.openalex.org/works?filter=cites:W1",
+            "referenced_works": [{"id": "https://openalex.org/W2"}],
+            "citing_works": [{"id": "https://openalex.org/W3"}],
+        },
+    )
+
+    assert updated_id == row_id
+    assert message is None
+    row = db.get_entry_by_id("works", int(row_id))
+    assert row["metadata_status"] == "matched"
+    assert row["doi"] == "10.1234/schema-drift"
+    db.close_connection()

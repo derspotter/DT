@@ -56,6 +56,12 @@ class DatabaseManager:
             print(f"{GREEN}[DB Manager] Connected to database: {self.db_path.resolve()}{RESET}")
         self._create_schema()
 
+    def _table_columns(self, table_name: str) -> set[str]:
+        """Return concrete DB columns so payloads can carry extra API metadata safely."""
+        cur = self.conn.cursor()
+        cur.execute(f"PRAGMA table_info({table_name})")
+        return {str(row[1]) for row in cur.fetchall()}
+
     def close_connection(self):
         """Closes the database connection."""
         if hasattr(self, 'conn') and self.conn:
@@ -486,7 +492,8 @@ class DatabaseManager:
         return None, None
 
     def _insert_work_record(self, data: dict) -> int:
-        payload = {k: v for k, v in data.items() if v is not None}
+        columns = self._table_columns("works")
+        payload = {k: v for k, v in data.items() if v is not None and k in columns}
         cols = ", ".join(payload.keys())
         placeholders = ", ".join(["?"] * len(payload))
         cur = self.conn.cursor()
@@ -494,7 +501,8 @@ class DatabaseManager:
         return int(cur.lastrowid)
 
     def _update_work_record(self, work_id: int, data: dict) -> None:
-        payload = {k: v for k, v in data.items() if k != "id"}
+        columns = self._table_columns("works")
+        payload = {k: v for k, v in data.items() if k != "id" and k in columns}
         if not payload:
             return
         assignments = ", ".join([f"{k} = ?" for k in payload.keys()]) + ", updated_at = CURRENT_TIMESTAMP"

@@ -272,9 +272,10 @@ function findIdsWithAliases(row, lookup, aliasIndex) {
   return matched
 }
 
-function createStateResolver(db, corpusId) {
+function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
   const allRows = loadMatchRows(db, 'works')
   const localRows = loadMatchRows(db, 'works', { corpusId })
+  const allDownloadedRows = allRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localDownloadedRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localRawRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'pending')
   const localWithMetadataRows = localRows.filter((row) => {
@@ -291,14 +292,15 @@ function createStateResolver(db, corpusId) {
     queuedEnrichment: buildMatchIndex(localQueuedEnrichmentRows),
     withMetadata: buildMatchIndex(localWithMetadataRows),
     queuedDownload: buildMatchIndex(localQueuedDownloadRows),
-    downloaded: buildMatchLookup(allRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')),
+    downloaded: buildMatchLookup(allDownloadedRows),
     failedDownloadLookup: buildMatchLookup(localFailedDownloadRows),
     failedEnrichment: buildMatchIndex(localFailedEnrichmentRows),
     failedDownload: buildMatchIndex(localFailedDownloadRows),
   }
+  const downloadedIds = new Set(allDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localDownloadedIds = new Set(localDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localFailedDownloadIds = new Set(localFailedDownloadRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
-  const downloadedAliasIndex = loadAliasIndex(db, 'works')
+  const downloadedAliasIndex = loadAliasIndex(db, 'works', downloadedIds)
   const failedDownloadAliasIndex = loadAliasIndex(db, 'works', localFailedDownloadIds)
   const isInCorpus = (row) => {
     const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
@@ -333,8 +335,42 @@ function createStateResolver(db, corpusId) {
     if (matchesIndex(row, indexes.raw)) return 'staged_raw'
     return 'pending'
   }
+  const resolveDownloadedWorkId = (row) => {
+    const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
+    for (const matchedId of downloadedIds) {
+      if (localDownloadedIds.has(matchedId)) return Number(matchedId)
+    }
+    const firstDownloadedId = [...downloadedIds][0]
+    return Number.isFinite(Number(firstDownloadedId)) ? Number(firstDownloadedId) : null
+  }
+  const resolveDownloadedAvailability = (row) => {
+    const workId = resolveDownloadedWorkId(row)
+    if (!Number.isFinite(Number(workId)) || Number(workId) <= 0) {
+      return { downloaded_work_id: null, file_available: false, file_path: null }
+    }
+    let filePath = null
+    if (tableExists(db, 'works')) {
+      try {
+        const record = db.prepare('SELECT file_path FROM works WHERE id = ? AND download_status = ?').get(Number(workId), 'downloaded')
+        filePath = record?.file_path || null
+      } catch {
+        filePath = null
+      }
+    }
+    let fileAvailable = Boolean(filePath)
+    if (filePath && typeof resolveDownloadedFilePath === 'function') {
+      fileAvailable = Boolean(resolveDownloadedFilePath(filePath))
+    }
+    return {
+      downloaded_work_id: Number(workId),
+      file_available: fileAvailable,
+      file_path: filePath,
+    }
+  }
   return {
     resolveState,
+    resolveDownloadedWorkId,
+    resolveDownloadedAvailability,
     isInCorpus,
   }
 }
@@ -400,6 +436,12 @@ function normalizePdfCandidate(row, sourceKey, resolverBundle) {
     source_pdf: row.source_pdf || null,
   }
   candidate.state = resolverBundle.resolveState(candidate)
+  const availability = resolverBundle.resolveDownloadedAvailability
+    ? resolverBundle.resolveDownloadedAvailability(candidate)
+    : { downloaded_work_id: resolverBundle.resolveDownloadedWorkId(candidate) }
+  candidate.downloaded_work_id = availability.downloaded_work_id
+  candidate.file_available = Boolean(availability.file_available)
+  candidate.downloaded_file_path = availability.file_path || null
   candidate.in_corpus = resolverBundle.isInCorpus(candidate)
   return candidate
 }
@@ -416,10 +458,39 @@ function extractAuthorsFromRawJson(raw) {
   return []
 }
 
+function abstractFromOpenAlex(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  if (typeof raw.abstract === 'string') return raw.abstract
+  const inverted = raw.abstract_inverted_index
+  if (!inverted || typeof inverted !== 'object' || Array.isArray(inverted)) return null
+  const words = []
+  for (const [word, positions] of Object.entries(inverted)) {
+    if (!Array.isArray(positions)) continue
+    for (const position of positions) {
+      const index = Number(position)
+      if (Number.isInteger(index) && index >= 0) words[index] = word
+    }
+  }
+  return words.filter(Boolean).join(' ') || null
+}
+
+function keywordsFromOpenAlex(raw) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.keywords)) return null
+  const keywords = raw.keywords
+    .map((item) => item?.display_name || item?.keyword || item?.name || '')
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+  return keywords.length ? keywords : null
+}
+
 function normalizeSearchCandidate(row, resolverBundle) {
   const raw = parseJson(row.raw_json, {}) || {}
   const authors = extractAuthorsFromRawJson(raw)
+  const biblio = raw?.biblio || {}
   const primarySource = raw?.primary_location?.source || raw?.host_venue || {}
+  const openAccess = raw?.open_access || {}
+  const firstPage = biblio.first_page || null
+  const lastPage = biblio.last_page || null
   const candidate = {
     candidate_key: buildCandidateKey('search', row.id),
     source_type: 'search',
@@ -432,13 +503,27 @@ function normalizeSearchCandidate(row, resolverBundle) {
     year: row.year || raw.publication_year || null,
     doi: row.doi || raw.doi || null,
     source: primarySource.display_name || raw?.primary_location?.landing_page_url || null,
-    publisher: primarySource.host_organization_name || raw?.host_organization_name || null,
-    url: raw?.primary_location?.pdf_url || raw?.primary_location?.landing_page_url || raw?.id || null,
+    publisher: primarySource.publisher || primarySource.host_organization_name || raw?.host_organization_name || null,
+    volume: biblio.volume || null,
+    issue: biblio.issue || null,
+    pages: firstPage && lastPage ? `${firstPage}--${lastPage}` : firstPage || null,
+    url: openAccess.oa_url || raw?.primary_location?.pdf_url || raw?.primary_location?.landing_page_url || raw?.id || null,
+    open_access_url: openAccess.oa_url || null,
     openalex_id: row.openalex_id || raw.id || null,
     type: raw?.type || null,
+    abstract: abstractFromOpenAlex(raw),
+    keywords: keywordsFromOpenAlex(raw),
+    openalex_json: raw,
+    metadata_source_type: 'openalex_search',
     created_at: row.created_at || null,
   }
   candidate.state = resolverBundle.resolveState(candidate)
+  const availability = resolverBundle.resolveDownloadedAvailability
+    ? resolverBundle.resolveDownloadedAvailability(candidate)
+    : { downloaded_work_id: resolverBundle.resolveDownloadedWorkId(candidate) }
+  candidate.downloaded_work_id = availability.downloaded_work_id
+  candidate.file_available = Boolean(availability.file_available)
+  candidate.downloaded_file_path = availability.file_path || null
   candidate.in_corpus = resolverBundle.isInCorpus(candidate)
   return candidate
 }
@@ -465,14 +550,38 @@ export function ensureSeedSchema(db) {
       dismissed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
     );
+    CREATE TABLE IF NOT EXISTS seed_candidates_in_corpus (
+      corpus_id INTEGER NOT NULL,
+      source_type TEXT NOT NULL,
+      source_key TEXT NOT NULL,
+      candidate_key TEXT NOT NULL,
+      work_id INTEGER,
+      marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
+    );
     CREATE INDEX IF NOT EXISTS idx_search_run_corpora_corpus ON search_run_corpora(corpus_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_seed_sources_hidden_lookup ON seed_sources_hidden(corpus_id, source_type, source_key);
     CREATE INDEX IF NOT EXISTS idx_seed_candidates_dismissed_lookup ON seed_candidates_dismissed(corpus_id, source_type, source_key);
+    CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_lookup ON seed_candidates_in_corpus(corpus_id, source_type, source_key);
   `)
 }
 
 function loadInCorpusCandidateKeySet(db, corpusId, sourceType, sourceKey) {
-  return new Set()
+  if (!tableExists(db, 'seed_candidates_in_corpus')) return new Set()
+  const rows = db.prepare(
+    `SELECT candidate_key
+     FROM seed_candidates_in_corpus
+     WHERE corpus_id = ? AND source_type = ? AND source_key = ?`
+  ).all(corpusId, sourceType, String(sourceKey))
+  return new Set(rows.map((row) => String(row.candidate_key || '')).filter(Boolean))
+}
+
+function applyExplicitCorpusMembership(candidate, inCorpusMarked) {
+  if (!inCorpusMarked.has(candidate.candidate_key)) return candidate
+  candidate.in_corpus = true
+  if (candidate.state === 'pending') candidate.state = 'added'
+  if (candidate.state === 'downloaded_elsewhere') candidate.state = 'downloaded'
+  return candidate
 }
 
 export function upsertSearchRunCorpus(db, { searchRunId, corpusId }) {
@@ -487,12 +596,12 @@ export function upsertSearchRunCorpus(db, { searchRunId, corpusId }) {
   return true
 }
 
-export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null } = {}) {
+export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null } = {}) {
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   if (!sourceRef || !['pdf', 'search'].includes(sourceKind)) return []
 
-  const resolverBundle = stateResolver || createStateResolver(db, corpusId)
+  const resolverBundle = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
   const dismissed = loadDismissedCandidateKeySet(db, corpusId, sourceKind, sourceRef)
   const inCorpusMarked = loadInCorpusCandidateKeySet(db, corpusId, sourceKind, sourceRef)
 
@@ -506,9 +615,7 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
     return sortSeedCandidates(rows
       .map((row) => {
         const candidate = normalizePdfCandidate(row, sourceRef, resolverBundle)
-        if (inCorpusMarked.has(candidate.candidate_key)) candidate.in_corpus = true
-        if (candidate.in_corpus && candidate.state === 'pending') candidate.state = 'added'
-        return candidate
+        return applyExplicitCorpusMembership(candidate, inCorpusMarked)
       })
       .filter((candidate) => !dismissed.has(candidate.candidate_key)))
   }
@@ -526,9 +633,7 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
   return sortSeedCandidates(rows
     .map((row) => {
       const candidate = normalizeSearchCandidate(row, resolverBundle)
-      if (inCorpusMarked.has(candidate.candidate_key)) candidate.in_corpus = true
-      if (candidate.in_corpus && candidate.state === 'pending') candidate.state = 'added'
-      return candidate
+      return applyExplicitCorpusMembership(candidate, inCorpusMarked)
     })
     .filter((candidate) => !dismissed.has(candidate.candidate_key)))
 }
@@ -544,6 +649,8 @@ function summarizeStates(candidates) {
     queued_download: 0,
     downloaded: 0,
     downloaded_elsewhere: 0,
+    downloaded_elsewhere_available: 0,
+    downloaded_elsewhere_missing: 0,
     failed_enrichment: 0,
     failed_download: 0,
   }
@@ -555,12 +662,19 @@ function summarizeStates(candidates) {
     if (Object.prototype.hasOwnProperty.call(stateCounts, key)) {
       stateCounts[key] += 1
     }
+    if (key === 'downloaded_elsewhere') {
+      if (candidate?.file_available === true) {
+        stateCounts.downloaded_elsewhere_available += 1
+      } else {
+        stateCounts.downloaded_elsewhere_missing += 1
+      }
+    }
   })
   return stateCounts
 }
 
-export function listSeedSources(db, corpusId, { limit = 200 } = {}) {
-  const resolver = createStateResolver(db, corpusId)
+export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFilePath = null } = {}) {
+  const resolver = createStateResolver(db, corpusId, { resolveDownloadedFilePath })
   const pdfSources = db.prepare(
     `SELECT ie.ingest_source AS source_key,
             MAX(ie.created_at) AS created_at,

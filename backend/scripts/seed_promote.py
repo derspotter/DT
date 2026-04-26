@@ -1,5 +1,6 @@
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 
 from _bootstrap import ensure_import_paths
@@ -10,7 +11,23 @@ from dl_lit.db_manager import DatabaseManager  # noqa: E402
 
 
 def _ensure_seed_membership_schema(db: DatabaseManager) -> None:
-    return None
+    cur = db.conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS seed_candidates_in_corpus (
+          corpus_id INTEGER NOT NULL,
+          source_type TEXT NOT NULL,
+          source_key TEXT NOT NULL,
+          candidate_key TEXT NOT NULL,
+          work_id INTEGER,
+          marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_lookup
+          ON seed_candidates_in_corpus(corpus_id, source_type, source_key);
+        """
+    )
+    db.conn.commit()
 
 
 def _parse_candidates(value: str | None = None, file_path: str | None = None):
@@ -63,12 +80,21 @@ def _candidate_ref(candidate: dict, corpus_id: int) -> dict:
         "year": candidate.get("year"),
         "doi": candidate.get("doi"),
         "openalex_id": candidate.get("openalex_id"),
+        "semantic_scholar_id": candidate.get("semantic_scholar_id"),
         "source": candidate.get("source"),
         "publisher": candidate.get("publisher"),
+        "volume": candidate.get("volume"),
+        "issue": candidate.get("issue"),
+        "pages": candidate.get("pages"),
         "url": candidate.get("url"),
+        "open_access_url": candidate.get("open_access_url"),
         "type": candidate.get("type"),
         "abstract": candidate.get("abstract"),
         "keywords": candidate.get("keywords"),
+        "openalex_json": candidate.get("openalex_json"),
+        "crossref_json": candidate.get("crossref_json"),
+        "bibtex_entry_json": candidate.get("bibtex_entry_json"),
+        "metadata_source_type": candidate.get("metadata_source_type"),
         "source_pdf": candidate.get("source_pdf"),
         "ingest_source": candidate.get("ingest_source"),
         "run_id": candidate.get("run_id"),
@@ -77,8 +103,45 @@ def _candidate_ref(candidate: dict, corpus_id: int) -> dict:
     return ref
 
 
-def _mark_candidate_in_corpus(db: DatabaseManager, corpus_id: int, candidate: dict) -> None:
-    return None
+def _has_openalex_metadata(candidate: dict, ref: dict) -> bool:
+    return (
+        str(candidate.get("source_type") or "").strip().lower() == "search"
+        and bool(ref.get("openalex_id"))
+        and isinstance(ref.get("openalex_json"), dict)
+        and bool(ref.get("title"))
+    )
+
+
+def _mark_candidate_in_corpus(
+    db: DatabaseManager,
+    corpus_id: int,
+    candidate: dict,
+    work_id: int | None = None,
+) -> None:
+    source_type = str(candidate.get("source_type") or "").strip().lower()
+    source_key = str(candidate.get("source_key") or "").strip()
+    candidate_key = str(candidate.get("candidate_key") or "").strip()
+    if source_type not in {"pdf", "search"} or not source_key or not candidate_key:
+        return
+    normalized_work_id = int(work_id) if work_id is not None else None
+    cur = db.conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO seed_candidates_in_corpus (
+              corpus_id, source_type, source_key, candidate_key, work_id, marked_at
+            )
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(corpus_id, source_type, source_key, candidate_key)
+            DO UPDATE SET
+              work_id = COALESCE(excluded.work_id, seed_candidates_in_corpus.work_id),
+              marked_at = CURRENT_TIMESTAMP
+            """,
+            (int(corpus_id), source_type, source_key, candidate_key, normalized_work_id),
+        )
+        db.conn.commit()
+    except sqlite3.Error:
+        db.conn.rollback()
 
 
 def _add_existing_to_corpus(db: DatabaseManager, corpus_id: int, table_name: str, row_id: int) -> None:
@@ -190,6 +253,7 @@ def main():
     failed_enrichment_existing = 0
     failed_download_existing = 0
     queued_existing_download = 0
+    queued_new_download = 0
     errors: list[str] = []
     results: list[dict] = []
 
@@ -207,9 +271,68 @@ def main():
             year=ref.get("year"),
         )
 
+        if tbl and eid is not None and _has_openalex_metadata(candidate, ref):
+            existing = db.get_entry_by_id("works", int(eid)) if tbl == "works" else {}
+            existing_download_status = str(existing.get("download_status") or "not_requested").strip().lower()
+            if existing_download_status == "failed":
+                result, _meta = _handle_existing(
+                    db,
+                    args.corpus_id,
+                    tbl,
+                    int(eid),
+                    enqueue_download=False,
+                    ref=ref,
+                    matched_on=field,
+                )
+                _mark_candidate_in_corpus(db, args.corpus_id, candidate, int(eid))
+                result.update(
+                    {
+                        "candidate_key": candidate.get("candidate_key"),
+                        "matched_on": field,
+                        "existing_table": tbl,
+                    }
+                )
+                results.append(result)
+                failed_download_existing += 1
+                continue
+            action, work_id, message, table_name = db.add_entry_to_download_queue(ref, corpus_id=args.corpus_id)
+            if action in {"added_to_queue", "duplicate"} and work_id:
+                _mark_candidate_in_corpus(db, args.corpus_id, candidate, int(work_id))
+                queued_now = action == "added_to_queue" and existing_download_status not in {"queued", "in_progress"}
+                if queued_now:
+                    queued_existing_download += 1
+                elif existing_download_status in {"queued", "in_progress"}:
+                    already_queued_download += 1
+                elif action == "duplicate":
+                    already_downloaded += 1
+                results.append(
+                    {
+                        "candidate_key": candidate.get("candidate_key"),
+                        "action": "queued_openalex_download" if queued_now else "already_queued_download" if existing_download_status in {"queued", "in_progress"} else "already_downloaded" if action == "duplicate" else "already_present",
+                        "work_id": int(work_id),
+                        "queue_id": int(work_id) if action == "added_to_queue" else None,
+                        "existing_table": table_name or tbl or "works",
+                        "matched_on": field,
+                        "message": message,
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "candidate_key": candidate.get("candidate_key"),
+                    "action": "error",
+                    "error": message or "Failed to queue existing OpenAlex candidate for download.",
+                    "matched_on": field,
+                    "existing_table": tbl,
+                }
+            )
+            if message:
+                errors.append(message)
+            continue
+
         if tbl and eid is not None:
             result, meta = _handle_existing(db, args.corpus_id, tbl, int(eid), enqueue_download=args.enqueue_download, ref=ref, matched_on=field)
-            _mark_candidate_in_corpus(db, args.corpus_id, candidate)
+            _mark_candidate_in_corpus(db, args.corpus_id, candidate, int(eid))
             result.update(
                 {
                     "candidate_key": candidate.get("candidate_key"),
@@ -237,11 +360,38 @@ def main():
                 failed_download_existing += 1
             continue
 
+        if _has_openalex_metadata(candidate, ref):
+            action, work_id, message, table_name = db.add_entry_to_download_queue(ref, corpus_id=args.corpus_id)
+            if action in {"added_to_queue", "duplicate"} and work_id:
+                _mark_candidate_in_corpus(db, args.corpus_id, candidate, int(work_id))
+                queued_new_download += 1 if action == "added_to_queue" else 0
+                results.append(
+                    {
+                        "candidate_key": candidate.get("candidate_key"),
+                        "action": "queued_openalex_download" if action == "added_to_queue" else "already_present",
+                        "work_id": int(work_id),
+                        "queue_id": int(work_id) if action == "added_to_queue" else None,
+                        "existing_table": table_name or "works",
+                        "message": message,
+                    }
+                )
+                continue
+            results.append(
+                {
+                    "candidate_key": candidate.get("candidate_key"),
+                    "action": "error",
+                    "error": message or "Failed to queue OpenAlex candidate for download.",
+                }
+            )
+            if message:
+                errors.append(message)
+            continue
+
         work_id, err = db.create_pending_work(ref, resolve_potential_duplicates=False)
         if work_id:
             work_id = int(work_id)
             _mark_selected(db, work_id, selected=1)
-            _mark_candidate_in_corpus(db, args.corpus_id, candidate)
+            _mark_candidate_in_corpus(db, args.corpus_id, candidate, work_id)
             staged_raw += 1
             if work_id not in pending_work_ids:
                 pending_work_ids.append(work_id)
@@ -266,7 +416,7 @@ def main():
         )
         if tbl and eid is not None:
             result, meta = _handle_existing(db, args.corpus_id, tbl, int(eid), enqueue_download=args.enqueue_download, ref=ref, matched_on=field)
-            _mark_candidate_in_corpus(db, args.corpus_id, candidate)
+            _mark_candidate_in_corpus(db, args.corpus_id, candidate, int(eid))
             result.update(
                 {
                     "candidate_key": candidate.get("candidate_key"),
@@ -315,6 +465,7 @@ def main():
         "failed_enrichment_existing": failed_enrichment_existing,
         "failed_download_existing": failed_download_existing,
         "queued_existing_download": queued_existing_download,
+        "queued_new_download": queued_new_download,
         "pending_work_ids": pending_work_ids,
         "results": results,
         "errors": errors,
