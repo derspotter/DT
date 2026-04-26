@@ -23,6 +23,7 @@
     fetchIngestRuns,
     fetchSeedSources,
     fetchSeedCandidates,
+    downloadSeedCandidateFile,
     promoteSeedCandidates,
     dismissSeedCandidates as dismissSeedCandidatesApi,
     removeSeedSource,
@@ -38,7 +39,6 @@
     runDownloadWorkerOnce,
     fetchPipelineWorkerStatus,
     fetchPipelineDaemonStatus,
-    fetchPipelineJobsSummary,
     fetchLogsTail,
     startPipelineWorker,
     pausePipelineWorker,
@@ -81,6 +81,7 @@
       ]
     }
   ]
+  const knownTabIds = new Set([...userTabGroups, ...adminTabGroups].flatMap(group => group.tabs).map(tab => tab.id))
 
   let activeTab = 'workspace'
   let apiStatus = 'unknown'
@@ -189,35 +190,9 @@
   let processMarkedLimit = 10
   let processMarkedStatus = ''
   let processingMarked = false
-  let ingestTrackedRequest = {
-    active: false,
-    requestId: '',
-    jobIds: [],
-    withDownload: false,
-  }
-  let ingestJobProgress = {
-    pending: 0,
-    running: 0,
-    completed: 0,
-    failed: 0,
-    cancelled: 0,
-    total: 0,
-    updatedAt: '',
-    daemonOnline: null,
-    daemonLastSeenAt: '',
-    error: '',
-  }
-  let ingestProgressPollTimer = null
-  let ingestLastProgressSignature = ''
-  const INGEST_PROGRESS_POLL_MS = 2000
-  $: ingestProgressDone = ingestJobProgress.total > 0 &&
-    ingestJobProgress.pending === 0 &&
-    ingestJobProgress.running === 0
-  $: ingestProgressRatio = ingestJobProgress.total > 0
-    ? (ingestJobProgress.completed + ingestJobProgress.failed + ingestJobProgress.cancelled) / ingestJobProgress.total
-    : 0
   let ingestRuns = []
   let ingestRunsStatus = ''
+  $: recentDocumentRuns = (ingestRuns || []).slice(0, 6)
   let seedSources = []
   let seedSourcesStatus = ''
   let expandedSeedSourceId = ''
@@ -231,8 +206,6 @@
   let seedLastRunKey = ''
 
   let searchQuery = ''
-  let searchMode = 'query'
-  let searchSeedJson = ''
   let searchField = 'default'
   let searchAuthor = ''
   let yearFrom = ''
@@ -527,6 +500,7 @@
 
   function updateUpload(id, patch) {
     uploads = uploads.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    persistStoredUploads()
   }
 
   function updateUploadByBackendFilename(backendFilename, patch) {
@@ -535,6 +509,86 @@
     uploads = uploads.map((item) =>
       String(item.backendFilename || '').trim() === normalized ? { ...item, ...patch } : item
     )
+    persistStoredUploads()
+  }
+
+  function uploadStorageKey() {
+    const corpusId = Number(currentCorpusId)
+    if (!Number.isFinite(corpusId) || corpusId <= 0) return ''
+    return `rag-feeder:uploads:${corpusId}`
+  }
+
+  function normalizeStoredUploadStatus(status) {
+    const value = String(status || '').trim().toLowerCase()
+    if (value === 'extracted' || value === 'failed') return value
+    if (value === 'queued' || value === 'extracting' || value === 'uploading') return 'uploaded'
+    return 'uploaded'
+  }
+
+  function persistStoredUploads(nextUploads = uploads) {
+    if (typeof window === 'undefined') return
+    const key = uploadStorageKey()
+    if (!key) return
+    const extractedBaseNames = new Set(
+      (ingestRuns || [])
+        .map((run) => String(run?.ingest_source || '').trim())
+        .filter(Boolean)
+    )
+    const persisted = (nextUploads || [])
+      .filter((item) => String(item?.backendFilename || '').trim())
+      .filter((item) => !extractedBaseNames.has(String(item.backendFilename || '').replace(/\.pdf$/i, '')))
+      .filter((item) => normalizeStoredUploadStatus(item.status) !== 'extracted')
+      .map((item) => ({
+        id: String(item.id || item.backendFilename),
+        name: String(item.name || item.backendFilename),
+        size: Number(item.size || 0),
+        status: normalizeStoredUploadStatus(item.status),
+        backendFilename: String(item.backendFilename || ''),
+        message: String(item.message || ''),
+      }))
+    window.localStorage.setItem(key, JSON.stringify(persisted))
+  }
+
+  function restoreStoredUploads() {
+    if (typeof window === 'undefined') return
+    const key = uploadStorageKey()
+    if (!key) return
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(key) || '[]')
+      uploads = Array.isArray(parsed)
+        ? parsed
+          .filter((item) => String(item?.backendFilename || '').trim())
+          .map((item) => ({
+            id: String(item.id || item.backendFilename),
+            file: null,
+            name: String(item.name || item.backendFilename),
+            size: Number(item.size || 0),
+            status: normalizeStoredUploadStatus(item.status),
+            backendFilename: String(item.backendFilename || ''),
+            message: String(item.message || ''),
+          }))
+        : []
+    } catch {
+      uploads = []
+    }
+  }
+
+  function pruneExtractedUploads() {
+    const extractedBaseNames = new Set(
+      (ingestRuns || [])
+        .map((run) => String(run?.ingest_source || '').trim())
+        .filter(Boolean)
+    )
+    if (extractedBaseNames.size === 0) return
+    const nextUploads = uploads.filter((item) => {
+      const backendFilename = String(item?.backendFilename || '').trim()
+      const baseName = backendFilename.replace(/\.pdf$/i, '')
+      return backendFilename && !extractedBaseNames.has(baseName) && normalizeStoredUploadStatus(item.status) !== 'extracted'
+    })
+    if (nextUploads.length !== uploads.length) {
+      uploads = nextUploads
+      persistStoredUploads(nextUploads)
+    }
   }
 
   function formatAuthors(entry) {
@@ -901,159 +955,6 @@
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
-  }
-
-  function stopIngestProgressPolling() {
-    if (ingestProgressPollTimer) {
-      clearInterval(ingestProgressPollTimer)
-      ingestProgressPollTimer = null
-    }
-  }
-
-  function resetIngestProgressTracking() {
-    stopIngestProgressPolling()
-    ingestTrackedRequest = {
-      active: false,
-      requestId: '',
-      jobIds: [],
-      withDownload: false,
-    }
-    ingestJobProgress = {
-      pending: 0,
-      running: 0,
-      completed: 0,
-      failed: 0,
-      cancelled: 0,
-      total: 0,
-      updatedAt: '',
-      daemonOnline: null,
-      daemonLastSeenAt: '',
-      error: '',
-    }
-    ingestLastProgressSignature = ''
-  }
-
-  function applyIngestJobsSummary(summary) {
-    const counts = summary?.counts || {}
-    const daemon = summary?.daemon || {}
-    const next = {
-      pending: Number(counts.pending || 0),
-      running: Number(counts.running || 0),
-      completed: Number(counts.completed || 0),
-      failed: Number(counts.failed || 0),
-      cancelled: Number(counts.cancelled || 0),
-      total: Number(counts.total || 0),
-      updatedAt: new Date().toISOString(),
-      daemonOnline: daemon?.online === true ? true : daemon?.online === false ? false : null,
-      daemonLastSeenAt: String(daemon?.last_seen_at || '').trim(),
-      error: '',
-    }
-    ingestJobProgress = next
-
-    if (next.running > 0) {
-      processMarkedStatus = `Background processing... running ${next.running}, queued ${next.pending}.`
-      seedActionStatus = `Background processing... running ${next.running}, queued ${next.pending}.`
-    } else if (next.pending > 0) {
-      processMarkedStatus = `Queued for background processing... ${next.pending} job${next.pending === 1 ? '' : 's'} waiting.`
-      seedActionStatus = `Queued for background processing... ${next.pending} job${next.pending === 1 ? '' : 's'} waiting.`
-    } else if (next.total > 0) {
-      if (next.failed > 0 || next.cancelled > 0) {
-        processMarkedStatus = `Finished with issues: ${next.completed} completed, ${next.failed} failed, ${next.cancelled} cancelled.`
-        seedActionStatus = `Finished with issues: ${next.completed} completed, ${next.failed} failed, ${next.cancelled} cancelled.`
-      } else {
-        processMarkedStatus = `Finished: ${next.completed} job${next.completed === 1 ? '' : 's'} completed.`
-        seedActionStatus = `Finished: ${next.completed} job${next.completed === 1 ? '' : 's'} completed.`
-      }
-    }
-  }
-
-  async function refreshIngestJobProgress() {
-    if (!ingestTrackedRequest.active || !Array.isArray(ingestTrackedRequest.jobIds) || ingestTrackedRequest.jobIds.length === 0) {
-      return
-    }
-    try {
-      const summary = await fetchPipelineJobsSummary({
-        jobIds: ingestTrackedRequest.jobIds,
-        recentLimit: Math.max(50, ingestTrackedRequest.jobIds.length),
-      })
-      applyIngestJobsSummary(summary)
-
-      const signature = [
-        ingestJobProgress.pending,
-        ingestJobProgress.running,
-        ingestJobProgress.completed,
-        ingestJobProgress.failed,
-        ingestJobProgress.cancelled,
-      ].join(':')
-      if (signature !== ingestLastProgressSignature) {
-        ingestLastProgressSignature = signature
-        const refreshTasks = [
-          loadIngestStats({ quiet: true }),
-        ...(diagnosticsEnabled ? [loadIngestStats({ quiet: true, global: true }), loadPipelineDaemonStatus({ quiet: true, global: true })] : []),
-          ...(diagnosticsEnabled ? [loadIngestStats({ quiet: true, global: true }), loadPipelineDaemonStatus({ quiet: true, global: true })] : []),
-          loadCorpus({ preserveSelection: true, quiet: true }),
-        ]
-        if (diagnosticsEnabled) {
-          refreshTasks.push(loadDownloads())
-        }
-        await Promise.all(refreshTasks)
-      }
-
-      if (ingestProgressDone) {
-        stopIngestProgressPolling()
-        ingestTrackedRequest = { ...ingestTrackedRequest, active: false }
-      }
-    } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
-      ingestJobProgress = {
-        ...ingestJobProgress,
-        error: error?.message || 'Failed to load queued job progress.',
-      }
-    }
-  }
-
-  function startIngestProgressPolling() {
-    stopIngestProgressPolling()
-    ingestProgressPollTimer = setInterval(() => {
-      refreshIngestJobProgress()
-    }, INGEST_PROGRESS_POLL_MS)
-  }
-
-  async function trackIngestQueuedJobs(payload, { withDownload = false } = {}) {
-    const jobIdsFromPayload = Array.isArray(payload?.jobs)
-      ? payload.jobs.map((job) => Number(job?.id)).filter((v) => Number.isFinite(v) && v > 0)
-      : []
-    const fallbackJobIds = [payload?.enrich_job_id, payload?.download_job_id]
-      .map((v) => Number(v))
-      .filter((v) => Number.isFinite(v) && v > 0)
-    const jobIds = [...new Set([...jobIdsFromPayload, ...fallbackJobIds])]
-
-    if (jobIds.length === 0) {
-      resetIngestProgressTracking()
-      return
-    }
-
-    ingestTrackedRequest = {
-      active: true,
-      requestId: String(payload?.request_id || ''),
-      jobIds,
-      withDownload: Boolean(withDownload),
-    }
-    ingestJobProgress = {
-      ...ingestJobProgress,
-      pending: jobIds.length,
-      total: jobIds.length,
-      updatedAt: new Date().toISOString(),
-      error: '',
-    }
-    await refreshIngestJobProgress()
-    if (ingestTrackedRequest.active) {
-      startIngestProgressPolling()
-    }
   }
 
   function beginExtractionProgress(baseName, backendFilename = '') {
@@ -1458,7 +1359,6 @@
 
   function shouldRunLiveRefresh() {
     if (authStatus !== 'authenticated') return false
-    if (ingestTrackedRequest.active) return true
     if (diagnosticsEnabled && (pipelineWorker.running || pipelineWorker.in_flight)) return true
     if (diagnosticsEnabled && (downloadWorker.running || downloadWorker.in_flight)) return true
     return activeTab === 'workspace' || activeTab === 'dashboard' || activeTab === 'downloads'
@@ -1528,7 +1428,7 @@
   async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
     authStatus = 'loading'
     authError = ''
-    const startupTab = !preserveAuthFlow ? readTabFromHash() : null
+    const startupTab = !preserveAuthFlow ? readTabFromHash({ includeUnavailable: true }) : null
     try {
       const payload = await fetchMe()
       authUser = payload.user
@@ -1543,7 +1443,8 @@
       await refreshAll()
       connectLogs()
       if (!preserveAuthFlow) {
-        setActiveTab(startupTab || activeTab || 'workspace', { replace: true })
+        const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
+        setActiveTab(latestTab, { replace: true })
       }
     } catch (error) {
       authStatus = 'unauthenticated'
@@ -1704,6 +1605,7 @@
   }
 
   async function refreshAll() {
+    restoreStoredUploads()
     const tasks = [
       loadSeedSources(),
       loadIngestStats(),
@@ -1723,7 +1625,6 @@
   }
 
   function resetFrontendState() {
-    resetIngestProgressTracking()
     ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
     ingestStatsStatus = ''
     latestEntries = []
@@ -1745,7 +1646,6 @@
     seedActionBusy = false
     seedLastRunKey = ''
     searchQuery = ''
-    searchSeedJson = ''
     searchResults = []
     searchStatus = ''
     searchSource = ''
@@ -2349,11 +2249,6 @@
         downloadBatchSize: Math.max(25, limit),
       })
       processMarkedStatus = payload.message || 'Jobs queued successfully.'
-      if (payload?.jobs?.length > 0) {
-        await trackIngestQueuedJobs(payload, { withDownload })
-      } else {
-        resetIngestProgressTracking()
-      }
       await loadDownloads()
       await loadIngestStats()
     } catch (error) {
@@ -2448,6 +2343,7 @@
     try {
       const payload = await fetchIngestRuns(20)
       ingestRuns = payload.runs || []
+      pruneExtractedUploads()
       ingestRunsStatus = ''
     } catch (error) {
       if (error?.status === 401) {
@@ -2518,6 +2414,8 @@
       queued_download: 0,
       downloaded: 0,
       downloaded_elsewhere: 0,
+      downloaded_elsewhere_available: 0,
+      downloaded_elsewhere_missing: 0,
       failed_enrichment: 0,
       failed_download: 0,
     }
@@ -2527,6 +2425,13 @@
       }
       const state = seedCandidateState(candidate)
       counts[state] = (counts[state] || 0) + 1
+      if (state === 'downloaded_elsewhere') {
+        if (candidate?.file_available === true) {
+          counts.downloaded_elsewhere_available += 1
+        } else {
+          counts.downloaded_elsewhere_missing += 1
+        }
+      }
     }
     return counts
   }
@@ -2570,9 +2475,15 @@
   function seedCandidateTag(candidate) {
     switch (seedCandidateState(candidate)) {
       case 'downloaded':
-        return { label: 'Downloaded', className: 'downloaded' }
+        return {
+          label: candidate?.file_available === false ? 'Missing file' : 'Downloaded',
+          className: candidate?.file_available === false ? 'failed' : 'downloaded',
+        }
       case 'downloaded_elsewhere':
-        return { label: 'Elsewhere', className: 'elsewhere' }
+        return {
+          label: candidate?.file_available === true ? 'Available' : 'Missing file',
+          className: candidate?.file_available === true ? 'downloaded' : 'failed',
+        }
       case 'queued_download':
         return { label: 'Queued DL', className: 'queued' }
       case 'enriched':
@@ -2633,12 +2544,13 @@
   }
 
   function estimatedSelectableSeedCount(source) {
-    const loadedCount = selectableSeedCount(source)
-    if (loadedCount > 0) return loadedCount
+    const sourceId = seedSourceId(source)
+    if (Array.isArray(seedCandidatesBySource[sourceId])) {
+      return selectableSeedCount(source)
+    }
     const total = Number(source?.candidate_count || 0)
     const inCorpus = Number(source?.state_counts?.in_corpus || 0)
-    const downloaded = Number(source?.state_counts?.downloaded || 0)
-    return Math.max(0, total - Math.max(inCorpus, downloaded))
+    return Math.max(0, total - inCorpus)
   }
 
   function isSeedCandidateSelected(source, candidate) {
@@ -2802,7 +2714,7 @@
     const hasCachedCandidates = Array.isArray(seedCandidatesBySource[nextSourceId])
     expandedSeedSourceId = nextSourceId
     seedLastRunKey = nextSourceId
-    void loadSeedCandidatesForSource(source, {
+    await loadSeedCandidatesForSource(source, {
       quiet: true,
       background: hasCachedCandidates,
     })
@@ -2816,9 +2728,9 @@
       return
     }
     seedActionBusy = true
-    seedActionStatus = `Queueing ${candidateKeys.length} candidate(s) for background processing...`
+    seedActionStatus = `Promoting ${candidateKeys.length} candidate(s) into the corpus...`
     try {
-      const payload = await promoteSeedCandidates(source.source_type, source.source_key, {
+      await promoteSeedCandidates(source.source_type, source.source_key, {
         candidateKeys,
         includeDownstream,
         includeUpstream,
@@ -2829,14 +2741,9 @@
         downloadBatchSize: Math.max(25, candidateKeys.length),
         workers: 6,
       })
-      seedActionStatus = payload.message || 'Promotion queued.'
       clearSeedSelection(source)
-      if (payload?.jobs?.length > 0) {
-        await trackIngestQueuedJobs(payload, { withDownload: true })
-      } else {
-        resetIngestProgressTracking()
-      }
       const refreshTasks = [
+        loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
       ]
@@ -2851,6 +2758,7 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
+      seedActionStatus = `Promoted ${candidateKeys.length} candidate(s). Corpus updated; workers continue in the background.`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -2864,21 +2772,21 @@
   }
 
   async function handlePromoteWholeSeedSource(source) {
-    const candidateCount = Math.max(
-      0,
-      Number(source?.candidate_count || 0)
-        - Number(source?.state_counts?.in_corpus || 0)
-        - Number(source?.state_counts?.downloaded || 0)
-    )
-    if (candidateCount === 0) {
-      seedActionStatus = 'No promotable seed candidates remain in this source.'
-      return
-    }
     seedActionBusy = true
-    seedActionStatus = `Queueing all promotable candidates from this source for background processing...`
     try {
-      const payload = await promoteSeedCandidates(source.source_type, source.source_key, {
-        candidateKeys: [],
+      const sourceId = seedSourceId(source)
+      if (!Array.isArray(seedCandidatesBySource[sourceId])) {
+        await loadSeedCandidatesForSource(source, { quiet: true })
+      }
+      const candidateKeys = promotableSeedCandidateKeys(source)
+      const candidateCount = candidateKeys.length
+      if (candidateCount === 0) {
+        seedActionStatus = 'No promotable seed candidates remain in this source.'
+        return
+      }
+      seedActionStatus = `Promoting ${candidateCount} candidate(s) into the corpus...`
+      await promoteSeedCandidates(source.source_type, source.source_key, {
+        candidateKeys,
         includeDownstream,
         includeUpstream,
         relatedDepthDownstream,
@@ -2888,14 +2796,9 @@
         downloadBatchSize: Math.max(25, candidateCount),
         workers: 6,
       })
-      seedActionStatus = payload.message || 'Promotion queued.'
       clearSeedSelection(source)
-      if (payload?.jobs?.length > 0) {
-        await trackIngestQueuedJobs(payload, { withDownload: true })
-      } else {
-        resetIngestProgressTracking()
-      }
       const refreshTasks = [
+        loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
       ]
@@ -2906,11 +2809,11 @@
         )
       }
       await Promise.all(refreshTasks)
-      const sourceId = seedSourceId(source)
       const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
+      seedActionStatus = `Promoted ${candidateCount} candidate(s). Corpus updated; workers continue in the background.`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -2985,11 +2888,9 @@
   async function runSearch() {
     searchStatus = 'Searching...'
     try {
-      const query = searchMode === 'query' ? searchQuery : ''
-      const seedJson = searchMode === 'seed' ? searchSeedJson : ''
       const { data, source, expansion, runId } = await runKeywordSearch({
-        query,
-        seedJson,
+        query: searchQuery,
+        seedJson: '',
         field: searchField,
         author: searchAuthor,
         yearFrom,
@@ -2999,19 +2900,18 @@
         relatedDepthDownstream: 0,
         relatedDepthUpstream: 0,
         maxRelated: 30,
+        fallbackToSample: false,
       })
       searchResults = data
       searchSource = source
       initializeSearchQueueConfig(data)
       searchQueueStatus = ''
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
-      searchStatus = source === 'api'
-        ? `Added ${data.length} candidate(s) to Seed.${suffix}`
-        : 'Sample results loaded.'
-      if (source === 'api' && runId) {
-        await loadSeedSources({ quiet: true })
+      if (runId) {
+        await loadSeedSources()
         await focusSeedSource('search', runId)
       }
+      searchStatus = `Search complete. Added ${data.length} candidate(s) to Seed.${suffix}`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -3180,9 +3080,7 @@
   }
 
   function resetSearchForm() {
-    searchMode = 'query'
     searchQuery = ''
-    searchSeedJson = ''
     searchField = 'default'
     searchAuthor = ''
     yearFrom = ''
@@ -3512,6 +3410,42 @@
       }
       corpusLoadStatus = error?.message || 'Failed to download file.'
     }
+  }
+
+  async function handleSeedCandidateFile(candidate) {
+    const workId = Number(candidate?.downloaded_work_id)
+    const sourceType = String(candidate?.source_type || '').trim()
+    const sourceKey = String(candidate?.source_key || '').trim()
+    const candidateKey = String(candidate?.candidate_key || '').trim()
+    if (!Number.isFinite(workId) || workId <= 0 || !sourceType || !sourceKey || !candidateKey) return
+    try {
+      const { blob, filename } = await downloadSeedCandidateFile(sourceType, sourceKey, candidateKey)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      seedActionStatus = `Downloaded ${filename}.`
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      seedActionStatus = error?.message || 'Failed to download seed candidate file.'
+    }
+  }
+
+  function canDownloadSeedCandidate(candidate) {
+    const state = seedCandidateState(candidate)
+    const workId = Number(candidate?.downloaded_work_id)
+    return (state === 'downloaded' || state === 'downloaded_elsewhere') &&
+      Number.isFinite(workId) &&
+      workId > 0 &&
+      candidate?.file_available === true
   }
   function applyGraphData(data, source, statusText = '') {
     graphNodes = data.nodes || []
@@ -4393,12 +4327,13 @@
     return tabId
   }
 
-  function readTabFromHash() {
+  function readTabFromHash({ includeUnavailable = false } = {}) {
     if (typeof window === 'undefined') return null
     const raw = window.location.hash || ''
     const cleaned = raw.replace(/^#\/?/, '').trim()
     const normalized = normalizeTab(cleaned)
-    return tabIds.has(normalized) ? normalized : null
+    const allowedTabs = includeUnavailable ? knownTabIds : tabIds
+    return allowedTabs.has(normalized) ? normalized : null
   }
 
   function updateHash(tabId, replace = false) {
@@ -4430,8 +4365,12 @@
     const initialAuthFlow = parseAuthFlowFromHash()
     applyAuthFlowFromHash()
     if (initialAuthFlow.flow === 'login') {
-      const initialTab = readTabFromHash() || activeTab
-      setActiveTab(initialTab, { replace: true })
+      const initialTab = readTabFromHash({ includeUnavailable: true })
+      if (initialTab && !tabIds.has(initialTab)) {
+        activeTab = initialTab
+      } else {
+        setActiveTab(initialTab || activeTab, { replace: true })
+      }
     }
     reducedMotionMediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
     prefersReducedMotion = Boolean(reducedMotionMediaQuery?.matches)
@@ -4489,7 +4428,6 @@
         clearInterval(liveRefreshIntervalId)
         liveRefreshIntervalId = null
       }
-      stopIngestProgressPolling()
       if (promotionFlushTimer) {
         clearTimeout(promotionFlushTimer)
         promotionFlushTimer = null
@@ -4653,70 +4591,13 @@
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">
-              <h2 class="workspace-section-title">1. Search</h2>
-              <p>Collect seed sources, review candidates, and promote selected works into the corpus pipeline.</p>
+              <h2 class="workspace-section-title">1. Seed intake</h2>
+              <p>Collect PDF and keyword-search seed sources, review candidates, and add selected works to the corpus pipeline.</p>
             </div>
 
             <div class="seed-corpus-toolbar__meta">
               {#if seedActionStatus}
                 <p class="muted">{seedActionStatus}</p>
-              {/if}
-              {#if ingestTrackedRequest.requestId || ingestJobProgress.total > 0 || ingestJobProgress.error}
-                <div class="ingest-job-progress seed-toolbar-progress">
-                  <div class="ingest-job-progress__top">
-                    <span class="muted small">
-                      {#if ingestTrackedRequest.requestId}
-                        Request: {ingestTrackedRequest.requestId}
-                      {:else}
-                        Latest queued request
-                      {/if}
-                    </span>
-                    <span class={`tag ${ingestProgressDone ? 'completed' : ingestJobProgress.running > 0 ? 'queued' : 'pending'}`}>
-                      {#if ingestProgressDone}
-                        Finished
-                      {:else if ingestJobProgress.running > 0}
-                        Running
-                      {:else}
-                        Queued
-                      {/if}
-                    </span>
-                  </div>
-                  <div
-                    class="extract-progress-track"
-                    role="progressbar"
-                    aria-label="Promotion queued jobs progress"
-                    aria-valuemin="0"
-                    aria-valuemax="100"
-                    aria-valuenow={Math.round(ingestProgressRatio * 100)}
-                  >
-                    <div class="extract-progress-bar" style={`width: ${Math.max(2, Math.min(100, ingestProgressRatio * 100))}%`}></div>
-                  </div>
-                  <div class="ingest-job-progress__stats">
-                    <span>Pending: {ingestJobProgress.pending}</span>
-                    <span>Running: {ingestJobProgress.running}</span>
-                    <span>Completed: {ingestJobProgress.completed}</span>
-                    <span>Failed: {ingestJobProgress.failed}</span>
-                    <span>Cancelled: {ingestJobProgress.cancelled}</span>
-                  </div>
-                  <div class="ingest-job-progress__meta">
-                    <span class="muted small">
-                      Daemon:
-                      {#if ingestJobProgress.daemonOnline === true}
-                        Online
-                      {:else if ingestJobProgress.daemonOnline === false}
-                        Offline
-                      {:else}
-                        Unknown
-                      {/if}
-                    </span>
-                    {#if ingestJobProgress.updatedAt}
-                      <span class="muted small">Updated: {ingestJobProgress.updatedAt}</span>
-                    {/if}
-                  </div>
-                  {#if ingestJobProgress.error}
-                    <p class="error small">{ingestJobProgress.error}</p>
-                  {/if}
-                </div>
               {/if}
             </div>
           </div>
@@ -4736,15 +4617,15 @@
                 </label>
               </div>
               {#if uploads.length > 0}
-                <div class="upload-list">
-                  {#each uploads as item}
-                    <div class="upload-item">
-                      <div>
-                        <strong>{item.name}</strong>
-                        <span>{formatBytes(item.size)}</span>
-                      </div>
-                      <div class="upload-actions">
-                        <span class={`status ${item.status}`}>{item.status}</span>
+	                <div class="upload-list">
+	                  {#each uploads as item}
+	                    <div class="upload-item">
+	                      <div>
+	                        <strong>{item.name}</strong>
+	                        <span>{item.size ? formatBytes(item.size) : item.backendFilename}</span>
+	                      </div>
+	                      <div class="upload-actions">
+	                        <span class={`status ${item.status}`}>{item.status}</span>
                         <button
                           type="button"
                           on:click={() => extractForItem(item)}
@@ -4752,12 +4633,44 @@
                         >
                           Extract
                         </button>
-                      </div>
-                    </div>
-                  {/each}
-                </div>
-              {/if}
-              {#if extractionProgress.active}
+	                      </div>
+	                    </div>
+	                  {/each}
+	                </div>
+	              {/if}
+	              {#if recentDocumentRuns.length > 0}
+	                <div class="document-run-list">
+	                  <div class="document-run-list__header">
+	                    <span class="muted small">Extracted PDFs</span>
+	                    <button class="link" type="button" on:click={loadIngestRuns}>Refresh</button>
+	                  </div>
+	                  {#each recentDocumentRuns as run}
+	                    <button
+	                      class="document-run"
+	                      type="button"
+	                      title={formatSeedDocumentDetails({
+	                        authors: run.seed_authors,
+	                        source: run.seed_source,
+	                        publisher: run.seed_publisher,
+	                      }) || (run.source_pdf || '')}
+	                      on:click={() => focusSeedSource('pdf', run.ingest_source)}
+	                    >
+	                      <span class="truncate-line">
+	                        {formatSeedDocumentLabel(
+	                          {
+	                            title: run.seed_title,
+	                            year: run.seed_year,
+	                            doi: run.seed_doi,
+	                          },
+	                          run.ingest_source
+	                        )}
+	                      </span>
+	                      <span class="muted small">{run.entry_count} entries</span>
+	                    </button>
+	                  {/each}
+	                </div>
+	              {/if}
+	              {#if extractionProgress.active}
                 <div class="extract-progress">
                   <div
                     class={`extract-progress-track ${extractionProgress.indeterminate ? 'indeterminate' : ''}`}
@@ -4783,28 +4696,13 @@
               <h3>Keyword Search</h3>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
-                  <label>
-                    <span>Mode</span>
-                    <select bind:value={searchMode}>
-                      <option value="query">Query</option>
-                      <option value="seed">Seed JSON</option>
-                    </select>
-                  </label>
                   <label class="seed-search-main">
-                    <span>{searchMode === 'query' ? 'Query' : 'Seed list'}</span>
-                    {#if searchMode === 'query'}
-                      <input
-                        type="text"
-                        placeholder="institutional economics AND governance"
-                        bind:value={searchQuery}
-                      />
-                    {:else}
-                      <input
-                        type="text"
-                        placeholder={JSON.stringify(["W2741809807"])}
-                        bind:value={searchSeedJson}
-                      />
-                    {/if}
+                    <span>Query</span>
+                    <input
+                      type="text"
+                      placeholder="institutional economics AND governance"
+                      bind:value={searchQuery}
+                    />
                   </label>
                   <label>
                     <span>Field</span>
@@ -4816,8 +4714,6 @@
                       <option value="fulltext">Full text</option>
                     </select>
                   </label>
-                </div>
-                <div class="seed-search-row">
                   <label class="seed-search-author">
                     <span>Author</span>
                     <input
@@ -4827,11 +4723,11 @@
                     />
                   </label>
                   <label>
-                    <span>Year from</span>
+                    <span>From</span>
                     <input type="number" placeholder="Year" bind:value={yearFrom} />
                   </label>
                   <label>
-                    <span>Year to</span>
+                    <span>To</span>
                     <input type="number" placeholder="Year" bind:value={yearTo} />
                   </label>
                   <div class="seed-search-actions">
@@ -4949,8 +4845,8 @@
                           <button
                             class="seed-source__action seed-source__action--promote"
                             type="button"
-                            disabled={seedActionBusy || promotableSeedCount(source) === 0}
-                            title={promotableSeedCount(source) === 0 ? 'No promotable candidates remain in this source' : 'Promote all promotable candidates from this source'}
+                            disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
+                            title={estimatedSelectableSeedCount(source) === 0 ? 'No promotable candidates remain in this source' : 'Promote all promotable candidates from this source'}
                             aria-label="Promote all promotable candidates"
                             on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
                           >
@@ -4988,9 +4884,12 @@
                         {#if source.state_counts.downloaded}
                           <span class="pill">Downloaded: {source.state_counts.downloaded}</span>
                         {/if}
-                        {#if source.state_counts.downloaded_elsewhere}
-                          <span class="pill">Elsewhere: {source.state_counts.downloaded_elsewhere}</span>
-                        {/if}
+	                        {#if source.state_counts.downloaded_elsewhere}
+	                          <span class="pill">Available: {source.state_counts.downloaded_elsewhere_available || 0}</span>
+	                          {#if source.state_counts.downloaded_elsewhere_missing}
+	                            <span class="pill">Missing file: {source.state_counts.downloaded_elsewhere_missing}</span>
+	                          {/if}
+	                        {/if}
                       </div>
                       <span class="muted small">{isExpanded ? 'Hide' : 'Show'}</span>
                     </div>
@@ -5072,7 +4971,23 @@
                                     {:else}
                                       <input type="checkbox" disabled />
                                     {/if}
-                                    <span class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag`}>{seedCandidateTag(candidate).label}</span>
+                                    {#if canDownloadSeedCandidate(candidate)}
+	                                      <button
+	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag seed-download-tag`}
+	                                        type="button"
+	                                        title={`Download available file from work ${candidate.downloaded_work_id}`}
+	                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
+	                                      >
+	                                        {seedCandidateTag(candidate).label}
+	                                      </button>
+	                                    {:else}
+	                                      <span
+	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag`}
+	                                        title={candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : ''}
+	                                      >
+	                                        {seedCandidateTag(candidate).label}
+	                                      </span>
+	                                    {/if}
                                   </span>
                                   <span>{formatTitle(candidate)}</span>
                                   <span>{formatAuthors(candidate)}</span>
@@ -5445,66 +5360,6 @@
             {#if processMarkedStatus}
               <p class="muted">{processMarkedStatus}</p>
             {/if}
-            {#if ingestTrackedRequest.requestId || ingestJobProgress.total > 0 || ingestJobProgress.error}
-              <div class="ingest-job-progress">
-                <div class="ingest-job-progress__top">
-                  <span class="muted small">
-                    {#if ingestTrackedRequest.requestId}
-                      Request: {ingestTrackedRequest.requestId}
-                    {:else}
-                      Latest queued request
-                    {/if}
-                  </span>
-                  <span class={`tag ${ingestProgressDone ? 'completed' : ingestJobProgress.running > 0 ? 'queued' : 'pending'}`}>
-                    {#if ingestProgressDone}
-                      Finished
-                    {:else if ingestJobProgress.running > 0}
-                      Running
-                    {:else}
-                      Queued
-                    {/if}
-                  </span>
-                </div>
-                <div
-                  class="extract-progress-track"
-                  role="progressbar"
-                  aria-label="Ingest queued jobs progress"
-                  aria-valuemin="0"
-                  aria-valuemax="100"
-                  aria-valuenow={Math.round(ingestProgressRatio * 100)}
-                >
-                  <div
-                    class="extract-progress-bar"
-                    style={`width: ${Math.max(2, Math.min(100, ingestProgressRatio * 100))}%`}
-                  ></div>
-                </div>
-                <div class="ingest-job-progress__stats">
-                  <span>Pending: {ingestJobProgress.pending}</span>
-                  <span>Running: {ingestJobProgress.running}</span>
-                  <span>Completed: {ingestJobProgress.completed}</span>
-                  <span>Failed: {ingestJobProgress.failed}</span>
-                  <span>Cancelled: {ingestJobProgress.cancelled}</span>
-                </div>
-                <div class="ingest-job-progress__meta">
-                  <span class="muted small">
-                    Daemon:
-                    {#if ingestJobProgress.daemonOnline === true}
-                      Online
-                    {:else if ingestJobProgress.daemonOnline === false}
-                      Offline
-                    {:else}
-                      Unknown
-                    {/if}
-                  </span>
-                  {#if ingestJobProgress.updatedAt}
-                    <span class="muted small">Updated: {ingestJobProgress.updatedAt}</span>
-                  {/if}
-                </div>
-                {#if ingestJobProgress.error}
-                  <p class="error small">{ingestJobProgress.error}</p>
-                {/if}
-              </div>
-            {/if}
             <div class="table">
               <div class="table-row header cols-6">
                 <span class="ingest-select-cell">
@@ -5578,14 +5433,12 @@
             <details>
               <summary>How to use this search (quick guide)</summary>
               <p>
-                Search runs in two modes:
-                <strong>Text query</strong> (boolean) or <strong>JSON seed</strong> mode.
+                Search runs as a normal OpenAlex query.
                 The backend sends the request to the OpenAlex script, normalizes input,
                 then deduplicates results before returning.
               </p>
               <ul>
-                <li>Text mode is for normal boolean searches like <code>institutional AND economics</code>.</li>
-                <li>Seed mode is for exact starting points like OpenAlex IDs/DOI/title.</li>
+                <li>Use normal boolean searches like <code>institutional AND economics</code>.</li>
                 <li>Field selector controls which metadata is searched.</li>
                 <li>Depth/Max Related controls how far citation graph expansion should go.</li>
               </ul>
@@ -5593,46 +5446,19 @@
           </div>
           <form class="search-form" on:submit|preventDefault={runSearch}>
             <div class="search-primary-row">
-              <div class="search-field search-mode">
-                <label for="search-mode">Mode</label>
-                <select
-                  id="search-mode"
-                  bind:value={searchMode}
-                  data-testid="search-mode"
-                  title="Text mode runs a boolean OpenAlex query; Seed mode starts from a JSON list."
-                >
-                  <option value="query">Query</option>
-                  <option value="seed">Seed</option>
-                </select>
-              </div>
               <div class="search-field search-main-input">
-                {#if searchMode === 'query'}
-                  <div class="label-row">
-                    <label for="search-query">Text query</label>
-                    <span class="field-hint label-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</span>
-                  </div>
-                  <input
-                    id="search-query"
-                    type="text"
-                    placeholder="institutional economics AND governance"
-                    bind:value={searchQuery}
-                    data-testid="search-query"
-                    title='Use AND/OR/NOT. Missing operators are treated as implicit AND.'
-                  />
-                {:else}
-                  <div class="label-row">
-                    <label for="search-seed-json">Seed list (JSON)</label>
-                    <span class="field-hint label-hint">Supported: <code>\"W123...\"</code>, <code>&#123;&quot;doi&quot;:&quot;...&quot;&#125;</code></span>
-                  </div>
-                  <input
-                    id="search-seed-json"
-                    type="text"
-                    placeholder={JSON.stringify(["W2741809807"])}
-                    bind:value={searchSeedJson}
-                    data-testid="search-seed-json"
-                    title="JSON array of OpenAlex IDs, DOIs, or objects."
-                  />
-                {/if}
+                <div class="label-row">
+                  <label for="search-query">Text query</label>
+                  <span class="field-hint label-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</span>
+                </div>
+                <input
+                  id="search-query"
+                  type="text"
+                  placeholder="institutional economics AND governance"
+                  bind:value={searchQuery}
+                  data-testid="search-query"
+                  title='Use AND/OR/NOT. Missing operators are treated as implicit AND.'
+                />
               </div>
               <div class="search-field search-scope">
                 <label for="search-field">Search field</label>
@@ -5685,11 +5511,7 @@
               </button>
             </div>
             
-            {#if searchMode === 'query'}
-                 <p class="field-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</p>
-            {:else}
-                 <p class="field-hint">Supported: <code>\"W123...\"</code>, <code>&#123;&quot;doi&quot;:&quot;...&quot;&#125;</code></p>
-            {/if}
+            <p class="field-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</p>
           </form>
           <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
           <div class="table">

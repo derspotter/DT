@@ -391,6 +391,34 @@ export async function fetchSeedCandidates(sourceType, sourceKey) {
   return response.json()
 }
 
+export async function downloadSeedCandidateFile(sourceType, sourceKey, candidateKey) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates/${encodeURIComponent(String(candidateKey || ''))}/file`,
+    { method: 'GET' },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to download seed candidate file')
+  }
+
+  const blob = await response.blob()
+  const disposition = response.headers.get('content-disposition') || ''
+  let filename = ''
+  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
+  if (star && star[1]) {
+    filename = decodeURIComponent(star[1])
+  } else if (plain && plain[1]) {
+    filename = plain[1]
+  }
+  if (!filename) {
+    filename = 'seed-candidate.pdf'
+  }
+  return { blob, filename }
+}
+
 export async function promoteSeedCandidates(sourceType, sourceKey, {
   candidateKeys = [],
   includeDownstream = false,
@@ -533,24 +561,28 @@ export async function runKeywordSearch({
   fallbackToSample = true,
 }) {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query,
-        seedJson,
-        field,
-        author,
-        yearFrom,
-        yearTo,
-        includeDownstream,
-        includeUpstream,
-        relatedDepthDownstream,
-        relatedDepthUpstream,
-        maxRelated,
-        enqueue,
-      }),
-    })
+    const response = await fetchWithTimeout(
+      `${API_BASE}/api/keyword-search`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query,
+          seedJson,
+          field,
+          author,
+          yearFrom,
+          yearTo,
+          includeDownstream,
+          includeUpstream,
+          relatedDepthDownstream,
+          relatedDepthUpstream,
+          maxRelated,
+          enqueue,
+        }),
+      },
+      PIPELINE_TIMEOUT
+    )
     await throwIfUnauthorized(response)
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`)
