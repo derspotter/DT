@@ -150,7 +150,8 @@ def search_openalex(query: str,
                     mailto: str | None = None,
                     field: str | None = "default",
                     author: str | None = None) -> list[dict]:
-    openalex_query = build_openalex_query_text(query)
+    raw_query = (query or '').strip()
+    openalex_query = build_openalex_query_text(raw_query) if raw_query else ''
     rate_limiter = get_global_rate_limiter()
 
     params = {
@@ -173,9 +174,9 @@ def search_openalex(query: str,
         if field_key is None and field.strip().lower() not in ("default", "search"):
             raise ValueError(f"Unknown search field: {field}")
 
-    if field_key:
+    if field_key and openalex_query:
         params["filter"] = f"{field_key}:{openalex_query}"
-    else:
+    elif openalex_query:
         params["search"] = openalex_query
 
     filters = []
@@ -202,6 +203,8 @@ def search_openalex(query: str,
             params["filter"] = ",".join([params["filter"], *filters])
         else:
             params["filter"] = ",".join(filters)
+    if not openalex_query and "filter" not in params:
+        raise QuerySyntaxError("Search requires query text or at least one filter")
 
     # Use cursor-based pagination for robustness
     params["cursor"] = "*"

@@ -13,7 +13,7 @@ describe('POST /api/keyword-search', () => {
     delete process.env.RAG_FEEDER_STUB
   })
 
-  test('requires query or seedJson', async () => {
+  test('requires query, seedJson, author, or year filter', async () => {
     const res = await request(app).post('/api/keyword-search').send({})
     expect(res.status).toBe(400)
   })
@@ -26,6 +26,15 @@ describe('POST /api/keyword-search', () => {
     expect(res.body).toHaveProperty('results')
     expect(Array.isArray(res.body.results)).toBe(true)
     expect(res.body.results[0]).toHaveProperty('title')
+  })
+
+  test('accepts author-only search in stub', async () => {
+    const res = await request(app)
+      .post('/api/keyword-search')
+      .send({ author: 'Elinor Ostrom' })
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.results)).toBe(true)
+    expect(res.body.source).toBe('stub')
   })
 
   test('accepts separate downstream/upstream depth settings', async () => {

@@ -569,7 +569,8 @@ def main():
 
     with contextlib.redirect_stdout(io.StringIO()):
         db = DatabaseManager(db_path=db_path)
-        mode_label = 'seed' if args.seed_json else 'query'
+        is_query_mode = args.query is not None
+        mode_label = 'query' if is_query_mode else 'seed'
         filters = {
             'mode': mode_label,
             'max_results': args.max_results,
@@ -585,12 +586,12 @@ def main():
             'include_downstream': args.include_downstream,
             'include_upstream': args.include_upstream,
         }
-        run_query_label = args.query if args.query else '[seed-json]'
+        run_query_label = args.query if is_query_mode and args.query else (args.author or '[filtered-search]' if is_query_mode else '[seed-json]')
         run_id = db.create_search_run(query=run_query_label, filters=filters)
 
-        if args.query:
+        if is_query_mode:
             base_items = search_openalex(
-                query=args.query,
+                query=args.query or '',
                 max_results=args.max_results,
                 year_from=args.year_from,
                 year_to=args.year_to,

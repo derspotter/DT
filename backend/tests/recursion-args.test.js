@@ -160,6 +160,21 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     expect(args).toContain('--include-upstream')
   })
 
+  test('passes author-only keyword search as filtered query mode', async () => {
+    const res = await doKeywordSearch({
+      author: 'Elinor Ostrom',
+      includeDownstream: false,
+      includeUpstream: false,
+    })
+
+    expect(res.status).toBe(200)
+    const args = readArgFile(argFile)
+    expect(args).toContain('--query')
+    expect(args[args.indexOf('--query') + 1]).toBe('')
+    expect(args).toContain('--author')
+    expect(args).toContain('Elinor Ostrom')
+  })
+
   test('maps keyword search to downstream-disabled mode', async () => {
     const res = await doKeywordSearch({
       query: 'institutional economics',

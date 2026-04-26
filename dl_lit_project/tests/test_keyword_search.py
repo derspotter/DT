@@ -71,3 +71,30 @@ def test_search_openalex_field_filter(monkeypatch):
     assert "search" not in captured
     assert captured["filter"].startswith("title.search:foo bar")
     assert "publication_year:2020-2021" in captured["filter"]
+
+
+def test_search_openalex_author_only_filter(monkeypatch):
+    captured = {}
+
+    class DummyLimiter:
+        def wait_if_needed(self, *_args, **_kwargs):
+            return None
+
+    def fake_request(endpoint, params, rate_limiter, retries: int = 3):
+        if endpoint == "authors":
+            return {"results": [{"id": "https://openalex.org/A123", "display_name": "Elinor Ostrom"}]}
+        assert endpoint == "works"
+        captured.update(params)
+        return {"results": [], "meta": {}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake_request)
+    monkeypatch.setattr(keyword_search, "get_global_rate_limiter", lambda: DummyLimiter())
+
+    keyword_search.search_openalex(
+        "",
+        max_results=1,
+        author="Elinor Ostrom",
+    )
+
+    assert "search" not in captured
+    assert captured["filter"] == "authorships.author.id:A123"
