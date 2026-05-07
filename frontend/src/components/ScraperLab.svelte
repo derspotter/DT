@@ -3,6 +3,7 @@
   import {
     applyScraperArtifacts,
     createScraperRun,
+    downloadScraperMetadataDraft,
     fetchKantroposCorpora,
     fetchScraperRun,
     fetchScraperRuns,
@@ -163,17 +164,40 @@
     busy = true
     error = ''
     applyResult = null
-    status = 'Applying scraper artifacts to upstream corpus...'
+    status = 'Creating metadata.bib draft...'
     try {
       applyResult = await applyScraperArtifacts({
         targetId: selectedTargetId,
         artifactIds: selectedArtifactIds,
       })
-      status = `Applied ${applyResult.applied_count || 0}; skipped ${applyResult.skipped_count || 0}; errors ${applyResult.error_count || 0}.`
-      resetSelection()
+      status = `Drafted ${applyResult.applied_count || 0}; skipped ${applyResult.skipped_count || 0}; errors ${applyResult.error_count || 0}.`
+      selectedArtifactIds = []
       if (selectedRunId) await loadRun(selectedRunId, { quiet: true })
     } catch (err) {
-      error = err?.message || 'Failed to apply scraper artifacts.'
+      error = err?.message || 'Failed to create metadata.bib draft.'
+    } finally {
+      busy = false
+    }
+  }
+
+  async function downloadMetadataDraft() {
+    if (!applyResult?.event_id) return
+    busy = true
+    error = ''
+    status = 'Downloading generated metadata.bib...'
+    try {
+      const { blob, filename } = await downloadScraperMetadataDraft(applyResult.event_id)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename || 'metadata.bib'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+      status = 'Generated metadata.bib downloaded.'
+    } catch (err) {
+      error = err?.message || 'Failed to download generated metadata.bib.'
     } finally {
       busy = false
     }
@@ -201,7 +225,7 @@
       <p class="eyebrow">Scraper Lab</p>
       <h2>Collect EU source material without touching the literature corpus.</h2>
       <p>
-        EUR-Lex and Expert Groups runs stay quarantined as raw artifacts. Only selected downloaded files are copied into an upstream corpus.
+        EUR-Lex and Expert Groups runs stay quarantined as raw artifacts. Selected downloaded files create a reviewable metadata.bib draft.
       </p>
     </div>
     <div class="scraper-hero__stats">
@@ -278,11 +302,17 @@
           <small>Search words in the document title. Example: <code>artificial intelligence</code>.</small>
         </label>
       {:else}
-        <label>
-          <span>Expert group ID</span>
-          <input bind:value={expertGroupId} placeholder="E03745" />
-          <small>Enter the group id from the EU Expert Groups Register URL.</small>
-        </label>
+        <div class="field-help-panel">
+          <strong>Expert Groups search fields</strong>
+          <span>Use the numeric groupID from the EU Expert Groups Register URL.</span>
+        </div>
+        <div class="scraper-grid">
+          <label>
+            <span>Expert group ID</span>
+            <input bind:value={expertGroupId} placeholder="3745" inputmode="numeric" />
+            <small>Enter the groupID from the EU Expert Groups Register URL. E.g. For the Group "E03745" look at the url "https://ec.europa.eu/transparency/expert-groups-register/screen/expert-groups/consult?lang=fr&amp;groupID=3745" and use the groupID at the end -> 3745.</small>
+          </label>
+        </div>
       {/if}
 
       <div class="scraper-actions">
@@ -349,20 +379,25 @@
               {/each}
             </select>
           </label>
-          <span class="muted small">Files will be copied to <code>scraper/{selectedRun.source_type === 'expert_groups' ? 'expert_groups' : 'eurlex'}/</code>.</span>
         </div>
         <div class="apply-actions">
           <span class="selection-pill">{selectedCount} selected</span>
           <button class="secondary" type="button" on:click={selectAllDownloaded} disabled={downloadedArtifacts.length === 0 || busy}>Select ready</button>
           <button class="secondary" type="button" on:click={resetSelection} disabled={selectedCount === 0 || busy}>Clear</button>
           <button class="primary" type="button" on:click={applySelected} disabled={!selectedTargetId || selectedCount === 0 || busy}>
-            Apply to upstream corpus
+            Create metadata.bib draft
           </button>
         </div>
+        <span class="apply-target-help muted small">The upstream metadata.bib is read only; this creates a downloadable draft.</span>
       </div>
 
       {#if applyResult}
-        <p class="muted">Last apply: {applyResult.applied_count} applied, {applyResult.skipped_count} skipped, {applyResult.error_count} errors.</p>
+        <div class="scraper-draft-result">
+          <p class="muted">Last draft: {applyResult.applied_count} entries, {applyResult.skipped_count} skipped, {applyResult.error_count} errors.</p>
+          {#if applyResult.generated_bib_url}
+            <button class="secondary" type="button" on:click={downloadMetadataDraft} disabled={busy}>Download metadata.bib</button>
+          {/if}
+        </div>
       {/if}
 
       {#if artifacts.length === 0}
@@ -486,13 +521,27 @@
     font-size: 1.1rem;
   }
 
-  .scraper-card__header,
-  .scraper-apply-bar {
+  .scraper-card__header {
     align-items: flex-end;
     display: flex;
     flex-wrap: wrap;
     gap: 1rem;
     justify-content: space-between;
+  }
+
+  .scraper-card__header > div {
+    min-width: min(320px, 100%);
+  }
+
+  .scraper-card__header > button {
+    flex: 0 0 auto;
+  }
+
+  .scraper-apply-bar {
+    display: grid;
+    grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
+    gap: 8px 16px;
+    align-items: end;
   }
 
   .scraper-card--launcher {
@@ -542,6 +591,7 @@
 
   .scraper-grid {
     display: grid;
+    align-items: start;
     gap: 0.75rem;
     grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   }
@@ -552,6 +602,19 @@
     gap: 7px;
     color: var(--muted);
     font-size: 0.82rem;
+  }
+
+  .scraper-form input,
+  .apply-target select {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 12px;
+    border: 1px solid var(--stroke);
+    border-radius: 10px;
+    background: #fff;
+    color: var(--ink);
+    font-size: 0.9rem;
   }
 
   .scraper-form small {
@@ -628,19 +691,49 @@
     flex-wrap: wrap;
     gap: 10px;
     align-items: center;
+  }
+
+  .run-card__top {
     justify-content: space-between;
   }
 
   .apply-target {
-    min-width: min(360px, 100%);
-    flex: 1;
+    min-width: 0;
   }
 
-  .apply-target code {
-    padding: 2px 5px;
-    border-radius: 6px;
-    background: rgba(15, 139, 141, 0.09);
-    color: #17454b;
+  .apply-actions {
+    justify-content: flex-end;
+  }
+
+  .apply-actions button {
+    flex: 0 0 auto;
+  }
+
+  .apply-actions .selection-pill,
+  .apply-actions button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 40px;
+    line-height: 1;
+  }
+
+  .apply-target-help {
+    grid-column: 1 / -1;
+    margin-top: 0;
+  }
+
+  .scraper-draft-result {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 10px;
+  }
+
+  .scraper-draft-result p {
+    margin: 0;
   }
 
   .scraper-table-shell {
@@ -688,6 +781,14 @@
     .apply-actions,
     .scraper-actions {
       align-items: stretch;
+    }
+
+    .scraper-apply-bar {
+      grid-template-columns: 1fr;
+    }
+
+    .apply-actions,
+    .scraper-actions {
       flex-direction: column;
     }
 

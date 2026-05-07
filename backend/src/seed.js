@@ -349,17 +349,20 @@ function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } 
       return { downloaded_work_id: null, file_available: false, file_path: null }
     }
     let filePath = null
+    let originKey = null
     if (tableExists(db, 'works')) {
       try {
-        const record = db.prepare('SELECT file_path FROM works WHERE id = ? AND download_status = ?').get(Number(workId), 'downloaded')
+        const record = db.prepare('SELECT file_path, origin_key FROM works WHERE id = ? AND download_status = ?').get(Number(workId), 'downloaded')
         filePath = record?.file_path || null
+        originKey = record?.origin_key || null
       } catch {
         filePath = null
+        originKey = null
       }
     }
     let fileAvailable = Boolean(filePath)
     if (filePath && typeof resolveDownloadedFilePath === 'function') {
-      fileAvailable = Boolean(resolveDownloadedFilePath(filePath))
+      fileAvailable = Boolean(resolveDownloadedFilePath(filePath, { originKey, origin_key: originKey }))
     }
     return {
       downloaded_work_id: Number(workId),

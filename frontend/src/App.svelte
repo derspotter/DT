@@ -44,7 +44,7 @@
     startPipelineWorker,
     pausePipelineWorker,
     downloadCorpusExport,
-    downloadCorpusItemFile,
+    createCorpusItemDownloadUrl,
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
@@ -3385,15 +3385,14 @@
     const itemId = Number(item?.id);
     if (!Number.isFinite(itemId) || itemId <= 0) return;
     try {
-      const { blob, filename } = await downloadCorpusItemFile(itemId)
-      const url = URL.createObjectURL(blob)
+      corpusLoadStatus = 'Preparing download...'
+      const url = await createCorpusItemDownloadUrl(itemId)
       const link = document.createElement('a')
       link.href = url
-      link.download = filename
       document.body.appendChild(link)
       link.click()
       link.remove()
-      URL.revokeObjectURL(url)
+      corpusLoadStatus = 'Download started.'
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -3874,6 +3873,14 @@
           </p>
         </div>
         <div class="header-main__top">
+          <label class="header-corpus-picker">
+            <span class="eyebrow">Corpus</span>
+            <select value={currentCorpusId || ''} on:change={handleSelectCorpus}>
+              {#each corpora as corpus}
+                <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
+              {/each}
+            </select>
+          </label>
           <div class="header-user header-user--compact">
             <span class="eyebrow">Signed in</span>
             <strong>{authUser?.username}</strong>
@@ -3928,15 +3935,10 @@
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">
-              <h2 class="workspace-section-title">1. Seed intake</h2>
-              <p>Collect PDF and keyword-search seed sources, review candidates, and add selected works to the corpus pipeline.</p>
+              <h2 class="workspace-section-title">1. Search</h2>
+              <p>Collect PDF and keyword-search sources, review candidates, and add selected works to the corpus pipeline.</p>
             </div>
 
-            <div class="seed-corpus-toolbar__meta">
-              {#if seedActionStatus}
-                <p class="muted">{seedActionStatus}</p>
-              {/if}
-            </div>
           </div>
 
           <div class="seed-intake-grid">

@@ -15,6 +15,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
+from xml.etree import ElementTree
 
 import requests
 from bs4 import BeautifulSoup
@@ -48,6 +49,23 @@ def year_from_date(value: str | None) -> int | None:
         return None
     match = re.search(r"\b(19|20)\d{2}\b", str(value))
     return int(match.group(0)) if match else None
+
+
+def raise_for_eurlex_response(content: bytes, status_code: int) -> None:
+    fault_message = ""
+    try:
+        root = ElementTree.fromstring(content)
+        fault = root.find(".//{http://www.w3.org/2003/05/soap-envelope}Fault")
+        if fault is not None:
+            text = fault.find(".//{http://www.w3.org/2003/05/soap-envelope}Text")
+            fault_message = (text.text or "").strip() if text is not None else ""
+    except ElementTree.ParseError:
+        fault_message = ""
+
+    if fault_message:
+        raise RuntimeError(f"EUR-Lex SOAP fault: {fault_message}")
+    if int(status_code or 0) >= 400:
+        raise RuntimeError(f"EUR-Lex request failed with HTTP {status_code}")
 
 
 def ensure_scraper_schema(conn: sqlite3.Connection) -> None:
@@ -146,6 +164,7 @@ def scrape_eurlex(query: dict) -> list[dict]:
                 pageSize=100,
                 searchLanguage="en",
             )
+        raise_for_eurlex_response(response.content, response.status_code)
         root = etree.fromstring(response.content)
         rows = root.xpath("//*[local-name()='result']")
         if not rows:
@@ -297,10 +316,18 @@ def scrape_expert_groups(query: dict) -> list[dict]:
     return artifacts
 
 
+def validate_download_content(content: bytes, path: Path) -> None:
+    if not content:
+        raise RuntimeError("Downloaded artifact is empty")
+    if path.suffix.lower() == ".pdf" and not content.lstrip().startswith(b"%PDF-"):
+        raise RuntimeError("Downloaded artifact is not a valid PDF")
+
+
 def download_file(url: str, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     response = requests.get(url, timeout=60)
     response.raise_for_status()
+    validate_download_content(response.content, path)
     path.write_bytes(response.content)
 
 

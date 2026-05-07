@@ -1,4 +1,6 @@
 import json
+import sqlite3
+import time
 
 from dl_lit.db_manager import DatabaseManager
 
@@ -141,7 +143,7 @@ def test_create_pending_work_normalizes_editors_when_authors_missing(tmp_path):
     db.close_connection()
 
 
-def test_apply_enriched_metadata_ignores_non_schema_api_fields(tmp_path):
+def test_apply_enriched_metadata_serializes_openalex_runtime_fields(tmp_path):
     db = DatabaseManager(tmp_path / "test.db")
     row_id, err = db.create_pending_work({"title": "Schema Drift Work", "authors": ["Alice"], "year": 2024})
     assert row_id is not None and err is None
@@ -166,4 +168,97 @@ def test_apply_enriched_metadata_ignores_non_schema_api_fields(tmp_path):
     row = db.get_entry_by_id("works", int(row_id))
     assert row["metadata_status"] == "matched"
     assert row["doi"] == "10.1234/schema-drift"
+    assert row["open_access_url"] == "https://example.test/open.pdf"
+    assert json.loads(row["referenced_work_ids"]) == ["https://openalex.org/W1"]
+    assert row["cited_by_api_url"] == "https://api.openalex.org/works?filter=cites:W1"
+    db.close_connection()
+
+
+def test_raw_download_fallback_clears_enrichment_claim(tmp_path):
+    db = DatabaseManager(tmp_path / "test.db")
+    row_id, err = db.create_pending_work({"title": "Raw Download Work", "authors": ["EC"], "year": 2012})
+    assert row_id is not None and err is None
+
+    claimed = db.claim_enrich_batch(limit=1, corpus_id=None, claimed_by="worker-a", lease_seconds=60)
+    assert [row["id"] for row in claimed] == [row_id]
+
+    downloaded_id, message = db.mark_raw_work_downloaded(
+        int(row_id),
+        {
+            "title": "Raw Download Work",
+            "authors": ["EC"],
+            "year": 2012,
+            "downloaded_file": str(tmp_path / "raw.pdf"),
+        },
+        str(tmp_path / "raw.pdf"),
+        "checksum",
+        "OpenAlex OA URL",
+    )
+
+    assert downloaded_id == row_id
+    assert message is None
+    row = db.get_entry_by_id("works", int(row_id))
+    assert row["download_status"] == "downloaded"
+    assert row["metadata_status"] == "failed"
+    assert row["metadata_source"] == "raw_download_fallback"
+    assert row["metadata_claimed_by"] is None
+    assert row["metadata_claimed_at"] is None
+    assert row["metadata_lease_expires_at"] is None
+    assert "raw download fallback succeeded" in row["metadata_error"]
+
+    db.close_connection()
+
+
+def test_claim_enrich_batch_skips_downloaded_rows(tmp_path):
+    db = DatabaseManager(tmp_path / "test.db")
+    row_id, err = db.create_pending_work({"title": "Already Downloaded Work", "authors": ["EC"], "year": 2012})
+    assert row_id is not None and err is None
+    db._update_work_record(
+        int(row_id),
+        {
+            **(db.get_entry_by_id("works", int(row_id)) or {}),
+            "metadata_status": "in_progress",
+            "metadata_lease_expires_at": int(time.time()) - 10,
+            "download_status": "downloaded",
+        },
+    )
+    db.conn.commit()
+
+    claimed = db.claim_enrich_batch(limit=1, corpus_id=None, claimed_by="worker-a", lease_seconds=60)
+    assert claimed == []
+
+    db.close_connection()
+
+
+def test_database_manager_adds_runtime_columns_to_existing_works_table(tmp_path):
+    db_path = tmp_path / "old.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE works (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            openalex_id TEXT,
+            normalized_doi TEXT,
+            normalized_title TEXT,
+            normalized_authors TEXT,
+            year INTEGER,
+            metadata_status TEXT NOT NULL DEFAULT 'pending',
+            metadata_lease_expires_at INTEGER,
+            download_status TEXT NOT NULL DEFAULT 'not_requested',
+            download_lease_expires_at INTEGER,
+            origin_type TEXT,
+            origin_key TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = DatabaseManager(db_path)
+    columns = db._table_columns("works")
+
+    assert "open_access_url" in columns
+    assert "referenced_work_ids" in columns
+    assert "cited_by_api_url" in columns
     db.close_connection()

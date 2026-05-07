@@ -62,6 +62,16 @@ class DatabaseManager:
         cur.execute(f"PRAGMA table_info({table_name})")
         return {str(row[1]) for row in cur.fetchall()}
 
+    def _ensure_column(self, table_name: str, column_name: str, column_type: str) -> None:
+        if column_name not in self._table_columns(table_name):
+            self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+
+    def _ensure_works_schema_columns(self) -> None:
+        """Add canonical works columns introduced after the first schema version."""
+        self._ensure_column("works", "open_access_url", "TEXT")
+        self._ensure_column("works", "referenced_work_ids", "TEXT")
+        self._ensure_column("works", "cited_by_api_url", "TEXT")
+
     def close_connection(self):
         """Closes the database connection."""
         if hasattr(self, 'conn') and self.conn:
@@ -102,6 +112,7 @@ class DatabaseManager:
                 pages TEXT,
                 type TEXT,
                 url TEXT,
+                open_access_url TEXT,
                 isbn TEXT,
                 issn TEXT,
                 abstract TEXT,
@@ -134,6 +145,8 @@ class DatabaseManager:
                 run_id INTEGER,
                 source_work_id INTEGER,
                 relationship_type TEXT,
+                referenced_work_ids TEXT,
+                cited_by_api_url TEXT,
                 crossref_json TEXT,
                 openalex_json TEXT,
                 bibtex_entry_json TEXT,
@@ -142,6 +155,7 @@ class DatabaseManager:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._ensure_works_schema_columns()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS corpus_works (
                 corpus_id INTEGER NOT NULL,
@@ -572,6 +586,7 @@ class DatabaseManager:
             "pages": ref.get("pages"),
             "type": ref.get("type") or ref.get("entry_type"),
             "url": ref.get("url") or ref.get("url_source"),
+            "open_access_url": ref.get("open_access_url"),
             "isbn": ref.get("isbn"),
             "issn": ref.get("issn"),
             "abstract": ref.get("abstract"),
@@ -586,6 +601,8 @@ class DatabaseManager:
             "run_id": ref.get("run_id"),
             "source_work_id": ref.get("source_work_id"),
             "relationship_type": ref.get("relationship_type"),
+            "referenced_work_ids": self._clean_json_text(ref.get("referenced_work_ids")),
+            "cited_by_api_url": ref.get("cited_by_api_url"),
             "crossref_json": self._clean_json_text(ref.get("crossref_json")),
             "openalex_json": self._clean_json_text(ref.get("openalex_json")),
             "bibtex_entry_json": self._clean_json_text(ref.get("bibtex_entry_json")),
@@ -1621,6 +1638,7 @@ class DatabaseManager:
                 "doi": enrichment.get("doi") or base.get("doi"),
                 "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
                 "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id") or enrichment.get("id") or base.get("openalex_id")),
+                "open_access_url": enrichment.get("open_access_url") or base.get("open_access_url"),
                 "normalized_title": self._normalize_text(enrichment.get("title") or base.get("title")),
                 "normalized_authors": self._normalize_contributor_fields(authors if authors is not None else base.get("authors"), editors if editors is not None else base.get("editors")),
                 "metadata_status": "matched",
@@ -1628,6 +1646,8 @@ class DatabaseManager:
                 "metadata_error": None,
                 "metadata_updated_at": datetime.now().isoformat(),
                 "download_status": "not_requested" if str(base.get("download_status") or "not_requested") == "not_requested" else base.get("download_status"),
+                "referenced_work_ids": self._clean_json_text(enrichment.get("referenced_work_ids")) or base.get("referenced_work_ids"),
+                "cited_by_api_url": enrichment.get("cited_by_api_url") or base.get("cited_by_api_url"),
                 "crossref_json": self._clean_json_text(enrichment.get("crossref_json")) or base.get("crossref_json"),
                 "openalex_json": self._clean_json_text(enrichment.get("openalex_json") or enrichment),
                 "bibtex_entry_json": self._clean_json_text(enrichment.get("bibtex_entry_json")) or base.get("bibtex_entry_json"),
@@ -1748,6 +1768,7 @@ class DatabaseManager:
             cur.execute("BEGIN IMMEDIATE")
             where_clauses = [eligible_state_sql]
             query_params: list = list(params)
+            where_clauses.append("COALESCE(nm.download_status, 'not_requested') = 'not_requested'")
 
             if corpus_id is not None:
                 where_clauses.append(
@@ -2043,6 +2064,12 @@ class DatabaseManager:
                     "pages": download_result.get('pages') or original_entry.get('pages'),
                     "publisher": download_result.get('publisher') or original_entry.get('publisher'),
                     "metadata_source": 'raw_download_fallback',
+                    "metadata_status": 'failed',
+                    "metadata_error": 'Metadata fetch failed; raw download fallback succeeded',
+                    "metadata_updated_at": datetime.now().isoformat(),
+                    "metadata_claimed_by": None,
+                    "metadata_claimed_at": None,
+                    "metadata_lease_expires_at": None,
                     "bibtex_entry_json": metadata_blob,
                     "status_notes": 'Downloaded after metadata enrichment failed',
                     "file_checksum": checksum,
@@ -2077,6 +2104,12 @@ class DatabaseManager:
                 'pages': download_result.get('pages') or original_entry.get('pages'),
                 'publisher': download_result.get('publisher') or original_entry.get('publisher'),
                 'metadata_source': 'raw_download_fallback',
+                'metadata_status': 'failed',
+                'metadata_error': 'Metadata fetch failed; raw download fallback succeeded',
+                'metadata_updated_at': datetime.now().isoformat(),
+                'metadata_claimed_by': None,
+                'metadata_claimed_at': None,
+                'metadata_lease_expires_at': None,
                 'bibtex_entry_json': metadata_blob,
                 'status_notes': 'Downloaded after metadata enrichment failed',
                 'file_checksum': checksum,

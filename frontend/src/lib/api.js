@@ -301,6 +301,21 @@ export async function applyScraperArtifacts({ targetId, artifactIds }) {
   return response.json()
 }
 
+export async function downloadScraperMetadataDraft(eventId) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/scraper/apply-events/${encodeURIComponent(String(eventId || ''))}/metadata-bib`,
+    {},
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to download generated metadata.bib')
+  }
+  const blob = await response.blob()
+  return { blob, filename: 'metadata.bib' }
+}
+
 export async function uploadPdf(file) {
   const formData = new FormData()
   formData.append('file', file)
@@ -894,32 +909,40 @@ export async function downloadCorpusExport(format, { status = '', yearFrom = '',
   return { blob, filename }
 }
 
-export async function downloadCorpusItemFile(itemId) {
+export async function createCorpusItemDownloadUrl(itemId) {
   const response = await fetchWithTimeout(
-    `${API_BASE}/api/corpus/downloaded/${encodeURIComponent(String(itemId || ''))}/file`,
-    { method: 'GET' },
+    `${API_BASE}/api/corpus/downloaded/${encodeURIComponent(String(itemId || ''))}/download-ticket`,
+    { method: 'POST' },
     PIPELINE_TIMEOUT
   )
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
-    throw new Error(payload || 'Failed to download file')
+    throw new Error(payload || 'Failed to prepare file download')
   }
 
-  const blob = await response.blob()
-  const disposition = response.headers.get('content-disposition') || ''
-  let filename = ''
-  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
-  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
-  if (star && star[1]) {
-    filename = decodeURIComponent(star[1])
-  } else if (plain && plain[1]) {
-    filename = plain[1]
+  const payload = await response.json()
+  const url = String(payload?.url || '').trim()
+  if (!url) throw new Error('Download ticket response did not include a URL')
+  return API_BASE && url.startsWith('/') ? `${API_BASE}${url}` : url
+}
+
+export async function createUpstreamCorpusItemDownloadUrl(targetId, itemId) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/kantropos/corpora/${encodeURIComponent(String(targetId || ''))}/works/${encodeURIComponent(String(itemId || ''))}/download-ticket`,
+    { method: 'POST' },
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to prepare upstream file download')
   }
-  if (!filename) {
-    filename = `corpus-item-${String(itemId || 'file')}.pdf`
-  }
-  return { blob, filename }
+
+  const payload = await response.json()
+  const url = String(payload?.url || '').trim()
+  if (!url) throw new Error('Download ticket response did not include a URL')
+  return API_BASE && url.startsWith('/') ? `${API_BASE}${url}` : url
 }
 
 

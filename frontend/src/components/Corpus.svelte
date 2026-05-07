@@ -47,8 +47,9 @@
       const keywords = textFilter.toLowerCase().split(/\s+/).filter(Boolean);
       const titleStr = (item.title || '').toLowerCase();
       const yearStr = String(item.year || '');
+      const sourceStr = corpusItemSource(item).toLowerCase();
       
-      const allMatch = keywords.every(kw => titleStr.includes(kw) || yearStr.includes(kw));
+      const allMatch = keywords.every(kw => titleStr.includes(kw) || yearStr.includes(kw) || sourceStr.includes(kw));
       if (!allMatch) return false;
     }
     
@@ -98,6 +99,16 @@
     return formatAuthors(item)
   }
 
+  function corpusItemSource(item) {
+    const label = String(item?.source_label || '').trim()
+    if (label) return label
+    const raw = String(item?.source || '').trim()
+    if (!raw) return ''
+    if (raw.endsWith('/metadata.bib')) return 'Upstream metadata.bib'
+    if (raw.startsWith('search:')) return `Search #${raw.slice('search:'.length)}`
+    return raw
+  }
+
   function toggleCorpusItemSelection(item, bucket) {
     const key = corpusItemKey(item, bucket)
     if (!key) return
@@ -125,7 +136,7 @@
   <div class="table-toolbar corpus-toolbar">
     <div class="table-toolbar-left corpus-toolbar__filters">
       <label class="corpus-filter corpus-filter--wide">
-        <span class="muted small">Search Title and/or Year</span>
+        <span class="muted small">Search Title, Year, or Source</span>
         <input type="text" bind:value={textFilter} placeholder="Filter items..." />
       </label>
       <label class="corpus-filter corpus-filter--stage">
@@ -147,9 +158,10 @@
       class="table table-scroll corpus-table"
       on:scroll={handleCorpusColumnScroll}
     >
-      <div class="table-row header cols-corpus-workspace">
+      <div class="table-row header cols-corpus-main">
         <span>Title</span>
         <span>Year</span>
+        <span>Source</span>
         <span>Stage</span>
       </div>
       {#each filteredItems as item (item.id)}
@@ -157,7 +169,7 @@
         {@const itemKey = corpusItemKey(item, bucket)}
         {@const selected = itemKey !== '' && itemKey === activeCorpusKey}
         <div
-          class={`table-row cols-corpus-workspace clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
+          class={`table-row cols-corpus-main clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
           on:click={() => toggleCorpusItemSelection(item, bucket)}
           on:keydown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
@@ -176,6 +188,9 @@
             </span>
           </span>
           <span class="nowrap">{item.year || '-'}</span>
+          <span class="muted small line-clamp-2" title={corpusItemSource(item) || '-'}>
+            {corpusItemSource(item) || '-'}
+          </span>
           <span class="nowrap muted small corpus-stage-pill">{itemStageLabel(item, bucket)}</span>
         </div>
         {#if selected}
@@ -187,7 +202,7 @@
                     <button
                       class="inline-detail-chip inline-detail-chip--download"
                       type="button"
-                      on:click={() => handleDownloadedCorpusFile(item)}
+                      on:click|stopPropagation={() => handleDownloadedCorpusFile(item)}
                       title="Download the stored file"
                     >
                       Stage: {itemStageLabel(item, bucket)}
@@ -196,6 +211,7 @@
                     <span class="inline-detail-chip">Stage: {itemStageLabel(item, bucket)}</span>
                   {/if}
                   <span class="inline-detail-chip">Year: {item.year || '-'}</span>
+                  <span class="inline-detail-chip">Source: {corpusItemSource(item) || '-'}</span>
                   <span class="inline-detail-chip">Author: {corpusItemAuthors(item) || '-'}</span>
                   {#if item.doi}
                     <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI</a>

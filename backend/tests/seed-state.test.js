@@ -12,7 +12,9 @@ function createSeedDb() {
       doi TEXT,
       openalex_id TEXT,
       metadata_status TEXT,
-      download_status TEXT
+      download_status TEXT,
+      file_path TEXT,
+      origin_key TEXT
     );
     CREATE TABLE corpus_works (
       corpus_id INTEGER NOT NULL,
@@ -90,5 +92,38 @@ describe('seed candidate state resolution', () => {
 
     expect(candidate.in_corpus).toBe(true)
     expect(candidate.state).toBe('added')
+  })
+
+  test('checks downloaded elsewhere files relative to their metadata.bib origin', () => {
+    db = createSeedDb()
+    db.prepare(
+      `INSERT INTO works (id, title, authors, year, metadata_status, download_status, file_path, origin_key)
+       VALUES (201, 'Economic Anthropology', '["A. Author"]', '2021', 'matched', 'downloaded', '/source/example.pdf', '/upstream/corpus/metadata.bib')`
+    ).run()
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year)
+       VALUES (3001, 130, 'basare', 'Economic Anthropology.', '["A. Author"]', '2021')`
+    ).run()
+
+    const resolverCalls = []
+    const [candidate] = listSeedCandidates(db, 130, 'pdf', 'basare', {
+      resolveDownloadedFilePath: (filePath, context) => {
+        resolverCalls.push({ filePath, context })
+        return '/upstream/corpus/source/example.pdf'
+      },
+    })
+
+    expect(candidate.state).toBe('downloaded_elsewhere')
+    expect(candidate.file_available).toBe(true)
+    expect(candidate.downloaded_file_path).toBe('/source/example.pdf')
+    expect(resolverCalls).toEqual([
+      {
+        filePath: '/source/example.pdf',
+        context: {
+          originKey: '/upstream/corpus/metadata.bib',
+          origin_key: '/upstream/corpus/metadata.bib',
+        },
+      },
+    ])
   })
 })

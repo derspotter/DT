@@ -2,6 +2,7 @@ import argparse
 import json
 import sqlite3
 from collections import Counter
+from pathlib import Path
 
 
 STUB_ITEMS = [
@@ -60,6 +61,122 @@ def normalize_id(value):
         return 0
 
 
+def table_exists(conn, table_name):
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def load_pdf_source_labels(conn, corpus_id):
+    if not table_exists(conn, "ingest_source_metadata"):
+        return {}
+    rows = conn.execute(
+        """
+        SELECT corpus_id, ingest_source, title, source_pdf
+        FROM ingest_source_metadata
+        WHERE (? IS NULL OR corpus_id = ?)
+        """,
+        (corpus_id, corpus_id),
+    ).fetchall()
+    labels = {}
+    for row in rows:
+        key = str(row["ingest_source"] or "").strip()
+        if not key:
+            continue
+        label = row["title"] or (Path(str(row["source_pdf"])).stem if row["source_pdf"] else "") or key
+        labels[(row["corpus_id"], key)] = label
+        labels[(None, key)] = label
+    return labels
+
+
+def load_search_source_labels(conn):
+    if not table_exists(conn, "search_runs"):
+        return {}
+    rows = conn.execute("SELECT id, query FROM search_runs").fetchall()
+    return {
+        str(row["id"]): (row["query"] or f"Search #{row['id']}")
+        for row in rows
+    }
+
+
+def load_seed_provenance(conn, corpus_id, pdf_source_labels, search_source_labels):
+    if not table_exists(conn, "seed_candidates_in_corpus"):
+        return {}
+    rows = conn.execute(
+        """
+        SELECT work_id, source_type, source_key, marked_at
+        FROM seed_candidates_in_corpus
+        WHERE corpus_id = ?
+          AND work_id IS NOT NULL
+        ORDER BY marked_at DESC
+        """,
+        (corpus_id,),
+    ).fetchall()
+    provenance = {}
+    for row in rows:
+        work_id = normalize_id(row["work_id"])
+        if not work_id or work_id in provenance:
+            continue
+        source_type = str(row["source_type"] or "").strip().lower()
+        source_key = str(row["source_key"] or "").strip()
+        if source_type == "pdf":
+            label = pdf_source_labels.get((corpus_id, source_key)) or pdf_source_labels.get((None, source_key)) or source_key
+        elif source_type == "search":
+            label = search_source_labels.get(source_key) or f"Search #{source_key}"
+        else:
+            label = source_key
+        provenance[work_id] = {
+            "source_type": source_type,
+            "source_key": source_key,
+            "source_label": label,
+        }
+    return provenance
+
+
+def source_label_for_work(data, corpus_id, pdf_source_labels, search_source_labels, seed_provenance):
+    work_id = normalize_id(data.get("id"))
+    if work_id in seed_provenance:
+        return seed_provenance[work_id]
+
+    origin_key = str(data.get("origin_key") or "").strip()
+    origin_type = str(data.get("origin_type") or "").strip().lower()
+    run_id = data.get("run_id")
+
+    if origin_type == "bibtex_import" or origin_key.endswith("/metadata.bib"):
+        return {"source_type": "", "source_key": "", "source_label": ""}
+
+    if origin_key.startswith("search:"):
+        search_key = origin_key.split(":", 1)[1]
+        return {
+            "source_type": "search",
+            "source_key": search_key,
+            "source_label": search_source_labels.get(search_key) or f"Search #{search_key}",
+        }
+
+    if run_id is not None:
+        search_key = str(run_id)
+        return {
+            "source_type": "search",
+            "source_key": search_key,
+            "source_label": search_source_labels.get(search_key) or f"Search #{search_key}",
+        }
+
+    if origin_key:
+        label = pdf_source_labels.get((corpus_id, origin_key)) or pdf_source_labels.get((None, origin_key))
+        if label:
+            return {"source_type": "pdf", "source_key": origin_key, "source_label": label}
+        return {"source_type": origin_type or "source", "source_key": origin_key, "source_label": origin_key}
+
+    source_pdf = data.get("source_pdf")
+    if source_pdf:
+        return {"source_type": "pdf", "source_key": str(source_pdf), "source_label": Path(str(source_pdf)).stem}
+
+    source = data.get("metadata_source") or data.get("source") or ""
+    return {"source_type": "", "source_key": "", "source_label": source}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
@@ -90,6 +207,9 @@ def main():
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
+    pdf_source_labels = load_pdf_source_labels(conn, args.corpus_id)
+    search_source_labels = load_search_source_labels(conn)
+    seed_provenance = load_seed_provenance(conn, args.corpus_id, pdf_source_labels, search_source_labels)
 
     if args.corpus_id is not None:
         rows = conn.execute(
@@ -109,6 +229,7 @@ def main():
         data = dict(row)
         status = status_from_row(data)
         source = data.get("origin_key") or data.get("source_pdf") or data.get("metadata_source") or data.get("source")
+        source_info = source_label_for_work(data, args.corpus_id, pdf_source_labels, search_source_labels, seed_provenance)
         items.append(
             {
                 "id": data.get("id"),
@@ -117,6 +238,9 @@ def main():
                 "authors": data.get("authors"),
                 "year": data.get("year"),
                 "source": source,
+                "source_label": source_info["source_label"],
+                "source_type": source_info["source_type"],
+                "source_key": source_info["source_key"],
                 "status": status,
                 "metadata_status": data.get("metadata_status"),
                 "download_status": data.get("download_status"),

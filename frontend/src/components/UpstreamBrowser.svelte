@@ -1,5 +1,6 @@
 <script>
   import UpstreamCorpusMap from './UpstreamCorpusMap.svelte'
+  import { createUpstreamCorpusItemDownloadUrl } from '../lib/api'
 
   export let corpora = []
   export let currentCorpus = null
@@ -50,6 +51,8 @@
   let currentTextFilter = ''
   let activePendingKey = ''
   let activeCurrentKey = ''
+  let currentDownloadStatus = ''
+  let currentDownloadError = false
 
   function itemKey(prefix, item) {
     if (!item || item.id === null || item.id === undefined) return ''
@@ -105,6 +108,29 @@
     activeCurrentKey = activeCurrentKey === key ? '' : key
   }
 
+  function isCurrentItemDownloadable(item) {
+    return String(item?.download_status || '').toLowerCase() === 'downloaded' && Boolean(String(item?.file_path || '').trim())
+  }
+
+  async function downloadCurrentItem(item) {
+    if (!selectedTargetId || !isCurrentItemDownloadable(item)) return
+    currentDownloadStatus = 'Preparing download...'
+    currentDownloadError = false
+    try {
+      const url = await createUpstreamCorpusItemDownloadUrl(selectedTargetId, item.id)
+      const link = document.createElement('a')
+      link.href = url
+      link.rel = 'noopener'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      currentDownloadStatus = 'Download started.'
+    } catch (err) {
+      currentDownloadError = true
+      currentDownloadStatus = err?.message || 'Failed to download upstream file.'
+    }
+  }
+
   function assignedButtonLabel(entry) {
     if (!entry) return ''
     const base = String(entry.name || '').trim() || `Corpus ${entry.id}`
@@ -126,6 +152,10 @@
     const numericId = Number(currentCorpusId)
     return Number.isFinite(numericId) && numericId > 0 ? `Corpus ${numericId}` : 'No corpus selected'
   }
+
+  $: allAssignedPendingCount = Number.isFinite(Number(browse?.summary?.pending_items_count))
+    ? Number(browse.summary.pending_items_count)
+    : (browse?.assigned_corpora || []).reduce((total, entry) => total + Number(entry?.pending_count || 0), 0)
 
   $: filteredPendingItems = (browse?.pending_items || []).filter((item) => {
     if (selectedAssignedCorpusId !== null && selectedAssignedCorpusId !== undefined && selectedAssignedCorpusId !== '') {
@@ -170,23 +200,6 @@
         <h2 class="workspace-section-title">Management Console</h2>
         <p>Choose the active upstream target, configure corpus mapping, and manage sharing for the selected local corpus.</p>
       </div>
-      <div class="workspace-panel-actions upstream-browser__toolbar-controls">
-        <label class="upstream-browser__target-select">
-          <span class="muted small">Browse upstream corpus</span>
-          <select bind:value={selectedTargetId} on:change={(event) => selectTarget(event?.target?.value)} disabled={loading || targets.length === 0}>
-            {#if targets.length === 0}
-              <option value="">No upstream corpora</option>
-            {:else}
-              {#each targets as target}
-                <option value={target.id}>{target.name}</option>
-              {/each}
-            {/if}
-          </select>
-        </label>
-        <button class="secondary" type="button" on:click={refresh} disabled={loading || !selectedTargetId}>
-          {loading ? 'Refreshing...' : 'Refresh'}
-        </button>
-      </div>
     </div>
 
     <div class="upstream-management-grid">
@@ -196,14 +209,31 @@
           <p class="muted">Select an app corpus and map it to the upstream corpus it belongs to.</p>
         </div>
         <div class="upstream-management-form">
-          <label class="upstream-management-form__field">
-            <span class="muted small">App corpus</span>
-            <select value={currentCorpusId || ''} on:change={onSelectCorpusChange}>
-              {#each corpora as corpus}
-                <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
-              {/each}
-            </select>
-          </label>
+          <div class="upstream-management-form__app-corpus">
+            <label class="upstream-management-form__field">
+              <span class="muted small">App corpus</span>
+              <select value={currentCorpusId || ''} on:change={onSelectCorpusChange}>
+                {#each corpora as corpus}
+                  <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
+                {/each}
+              </select>
+            </label>
+
+            <div class="upstream-management-form__actions">
+              <button class="secondary" type="button" on:click={onCreateCorpus} disabled={creatingCorpus || deletingCorpus}>
+                {creatingCorpus ? 'Creating...' : 'New corpus'}
+              </button>
+              <button
+                class="danger"
+                type="button"
+                on:click={onDeleteCorpus}
+                disabled={deletingCorpus || creatingCorpus || !currentCorpusId || !canDeleteCurrentCorpus}
+                title={canDeleteCurrentCorpus ? 'Delete selected corpus' : 'Only owners can delete corpora'}
+              >
+                {deletingCorpus ? 'Deleting...' : 'Delete corpus'}
+              </button>
+            </div>
+          </div>
 
           <label class="upstream-management-form__field">
             <span class="muted small">Upstream target</span>
@@ -219,21 +249,6 @@
               {/each}
             </select>
           </label>
-
-          <div class="upstream-management-form__actions">
-            <button class="secondary" type="button" on:click={onCreateCorpus} disabled={creatingCorpus || deletingCorpus}>
-              {creatingCorpus ? 'Creating...' : 'New corpus'}
-            </button>
-            <button
-              class="danger"
-              type="button"
-              on:click={onDeleteCorpus}
-              disabled={deletingCorpus || creatingCorpus || !currentCorpusId || !canDeleteCurrentCorpus}
-              title={canDeleteCurrentCorpus ? 'Delete selected corpus' : 'Only owners can delete corpora'}
-            >
-              {deletingCorpus ? 'Deleting...' : 'Delete corpus'}
-            </button>
-          </div>
 
           {#if corpusActionStatus}
             <p class={`${corpusActionError ? 'error' : 'muted'} upstream-management-form__status`}>{corpusActionStatus}</p>
@@ -302,25 +317,6 @@
         </div>
       </div>
 
-      <div class="upstream-assignment-toolbar">
-        <button
-          type="button"
-          class:selected={selectedAssignedCorpusId === null || selectedAssignedCorpusId === ''}
-          on:click={() => toggleAssignedCorpus(null)}
-        >
-          All assigned corpora ({browse?.assigned_corpora?.length || 0})
-        </button>
-        {#each browse?.assigned_corpora || [] as corpus}
-          <button
-            type="button"
-            class:selected={Number(selectedAssignedCorpusId) === Number(corpus.id)}
-            on:click={() => toggleAssignedCorpus(corpus.id)}
-            title={corpus.owner_username ? `Owner: ${corpus.owner_username}` : ''}
-          >
-            {assignedButtonLabel(corpus)}
-          </button>
-        {/each}
-      </div>
     {/if}
   </div>
 
@@ -328,12 +324,57 @@
     <UpstreamCorpusMap {browse} {loading} />
   {/if}
 
-  <div class="upstream-columns seed-corpus-columns">
-    <div class="seed-corpus-column">
-      <div class="corpus-workspace-shell">
-      <div class="card corpus-panel upstream-panel">
-        <div class="workspace-panel-header">
-          <div class="workspace-panel-title">
+  <div class="corpus-workspace-shell upstream-workspace-shell">
+    <div class="card corpus-panel upstream-panel upstream-panel--combined">
+      <div class="workspace-panel-header upstream-browser__current-header">
+        <div class="workspace-panel-title">
+          <h3 class="workspace-section-title">Upstream Corpus</h3>
+          <p class="muted">Pending additions and imported baseline for the selected upstream corpus.</p>
+        </div>
+        <div class="workspace-panel-actions upstream-browser__toolbar-controls">
+          <label class="upstream-browser__target-select">
+            <span class="muted small">Upstream corpus</span>
+            <select bind:value={selectedTargetId} on:change={(event) => selectTarget(event?.target?.value)} disabled={loading || targets.length === 0}>
+              {#if targets.length === 0}
+                <option value="">No upstream corpora</option>
+              {:else}
+                {#each targets as target}
+                  <option value={target.id}>{target.name}</option>
+                {/each}
+              {/if}
+            </select>
+          </label>
+          <button class="secondary" type="button" on:click={refresh} disabled={loading || !selectedTargetId}>
+            {loading ? 'Refreshing...' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+
+      {#if browse?.target}
+        <div class="upstream-assignment-toolbar">
+          <button
+            type="button"
+            class:selected={selectedAssignedCorpusId === null || selectedAssignedCorpusId === ''}
+            on:click={() => toggleAssignedCorpus(null)}
+          >
+            All assigned corpora ({allAssignedPendingCount})
+          </button>
+          {#each browse?.assigned_corpora || [] as corpus}
+            <button
+              type="button"
+              class:selected={Number(selectedAssignedCorpusId) === Number(corpus.id)}
+              on:click={() => toggleAssignedCorpus(corpus.id)}
+              title={corpus.owner_username ? `Owner: ${corpus.owner_username}` : ''}
+            >
+              {assignedButtonLabel(corpus)}
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      <div class="upstream-comparison-grid">
+        <section class="upstream-comparison-section">
+          <div class="workspace-panel-title upstream-comparison-section__header">
             <h3 class="workspace-section-title">Pending Additions</h3>
             <p class="muted">
               {#if browse?.summary?.pending_is_provisional}
@@ -343,115 +384,12 @@
               {/if}
             </p>
           </div>
-        </div>
 
-        <div class="table-toolbar corpus-toolbar">
-          <div class="table-toolbar-left corpus-toolbar__filters">
-            <label class="corpus-filter corpus-filter--wide">
-              <span class="muted small">Search</span>
-              <input type="text" bind:value={pendingTextFilter} placeholder="Filter pending items..." />
-            </label>
-          </div>
-        </div>
-
-        <div class="corpus-table-unified">
-          <div class="table table-scroll corpus-table">
-            <div class="table-row header cols-corpus-workspace">
-              <span>Title</span>
-              <span>Year</span>
-              <span>Author</span>
-            </div>
-            {#each filteredPendingItems as item (item.id)}
-              {@const itemId = itemKey('pending', item)}
-              {@const selected = itemId !== '' && itemId === activePendingKey}
-              <div
-                class={`table-row cols-corpus-workspace clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
-                on:click={() => togglePendingItem(item)}
-                on:keydown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return
-                    e.preventDefault()
-                    togglePendingItem(item)
-                  }
-                }}
-                role="button"
-                tabindex="0"
-                aria-pressed={selected}
-              >
-                <span class="corpus-row-main">
-                  <span class="corpus-row-title line-clamp-2" title={item.title}>{item.title || 'Untitled'}</span>
-                </span>
-                <span class="nowrap">{item.year || '-'}</span>
-                <span class="muted small line-clamp-2" title={itemAuthors(item) || '-'}>{itemAuthors(item) || '-'}</span>
-              </div>
-              {#if selected}
-                <div class="table-row corpus-inline-detail-row">
-                  <div class="inline-detail-card">
-                    <div class="corpus-row-main">
-                      <div class="inline-detail-meta-row">
-                        {#if itemSource(item)}
-                          <span class="inline-detail-chip">Source: {itemSource(item)}</span>
-                        {/if}
-                        {#if item.doi}
-                          <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI: {item.doi}</a>
-                        {/if}
-                        {#if item.openalex_id}
-                          <a class="inline-detail-link" href={openAlexHref(item.openalex_id)} target="_blank" rel="noreferrer">OpenAlex: {itemOpenAlexLabel(item)}</a>
-                        {/if}
-                      </div>
-                      <div class="upstream-provenance-row">
-                        <span class="muted small">Source corpora</span>
-                        <div class="upstream-provenance-list">
-                          {#each item.source_corpora || [] as sourceCorpus}
-                            <span class="pill">{sourceCorpus.name}{sourceCorpus.owner_username ? ` · ${sourceCorpus.owner_username}` : ''}</span>
-                          {/each}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              {/if}
-            {/each}
-            {#if filteredPendingItems.length === 0}
-              <div class="table-row muted corpus-empty-state">
-                No pending additions match the current filters.
-              </div>
-            {/if}
-          </div>
-        </div>
-
-        <div class="corpus-lazy-status">
-          <span class="muted">Loaded {browse?.summary?.pending_items_loaded || filteredPendingItems.length} of {browse?.summary?.pending_items_count || 0} entries.</span>
-          {#if browse?.summary?.pending_items_has_more}
-            <button class="secondary" type="button" on:click={() => loadMorePending()} disabled={loading}>
-              {loading ? 'Loading…' : 'Load more'}
-            </button>
-          {/if}
-        </div>
-      </div>
-    </div>
-    </div>
-
-    <div class="seed-corpus-column seed-corpus-column--corpus">
-      <div class="corpus-workspace-shell">
-      <div class="card corpus-panel upstream-panel">
-        <div class="workspace-panel-header">
-          <div class="workspace-panel-title">
-            <h3 class="workspace-section-title">Current Upstream Corpus</h3>
-            <p class="muted">Imported upstream baseline currently available in DT.</p>
-          </div>
-        </div>
-
-        {#if !browse?.summary?.has_imported_current}
-          <div class="upstream-empty-state">
-            <p class="muted">This upstream corpus has not been imported into DT yet.</p>
-          </div>
-        {:else}
           <div class="table-toolbar corpus-toolbar">
             <div class="table-toolbar-left corpus-toolbar__filters">
               <label class="corpus-filter corpus-filter--wide">
                 <span class="muted small">Search</span>
-                <input type="text" bind:value={currentTextFilter} placeholder="Filter upstream items..." />
+                <input type="text" bind:value={pendingTextFilter} placeholder="Filter pending items..." />
               </label>
             </div>
           </div>
@@ -463,17 +401,17 @@
                 <span>Year</span>
                 <span>Author</span>
               </div>
-              {#each filteredCurrentItems as item (item.id)}
-                {@const itemId = itemKey('current', item)}
-                {@const selected = itemId !== '' && itemId === activeCurrentKey}
+              {#each filteredPendingItems as item (item.id)}
+                {@const itemId = itemKey('pending', item)}
+                {@const selected = itemId !== '' && itemId === activePendingKey}
                 <div
                   class={`table-row cols-corpus-workspace clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
-                  on:click={() => toggleCurrentItem(item)}
+                  on:click={() => togglePendingItem(item)}
                   on:keydown={(e) => {
                     if (e.key === 'Enter' || e.key === ' ') {
                       if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return
                       e.preventDefault()
-                      toggleCurrentItem(item)
+                      togglePendingItem(item)
                     }
                   }}
                   role="button"
@@ -501,30 +439,140 @@
                             <a class="inline-detail-link" href={openAlexHref(item.openalex_id)} target="_blank" rel="noreferrer">OpenAlex: {itemOpenAlexLabel(item)}</a>
                           {/if}
                         </div>
+                        <div class="upstream-provenance-row">
+                          <span class="muted small">Source corpora</span>
+                          <div class="upstream-provenance-list">
+                            {#each item.source_corpora || [] as sourceCorpus}
+                              <span class="pill">{sourceCorpus.name}{sourceCorpus.owner_username ? ` · ${sourceCorpus.owner_username}` : ''}</span>
+                            {/each}
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
                 {/if}
               {/each}
-              {#if filteredCurrentItems.length === 0}
+              {#if filteredPendingItems.length === 0}
                 <div class="table-row muted corpus-empty-state">
-                  No imported upstream items match the current filters.
+                  No pending additions match the current filters.
                 </div>
               {/if}
             </div>
           </div>
 
           <div class="corpus-lazy-status">
-            <span class="muted">Loaded {browse?.summary?.current_items_loaded || filteredCurrentItems.length} of {browse?.summary?.current_items_count || 0} entries.</span>
-            {#if browse?.summary?.current_items_has_more}
-              <button class="secondary" type="button" on:click={() => loadMoreCurrent()} disabled={loading}>
+            <span class="muted">Loaded {browse?.summary?.pending_items_loaded || filteredPendingItems.length} of {browse?.summary?.pending_items_count || 0} entries.</span>
+            {#if browse?.summary?.pending_items_has_more}
+              <button class="secondary" type="button" on:click={() => loadMorePending()} disabled={loading}>
                 {loading ? 'Loading…' : 'Load more'}
               </button>
             {/if}
           </div>
-        {/if}
+        </section>
+
+        <section class="upstream-comparison-section">
+          <div class="workspace-panel-title upstream-comparison-section__header">
+            <h3 class="workspace-section-title">Current Upstream Corpus</h3>
+            <p class="muted">Imported upstream baseline currently available in DT.</p>
+          </div>
+
+          {#if !browse?.summary?.has_imported_current}
+            <div class="upstream-empty-state">
+              <p class="muted">This upstream corpus has not been imported into DT yet.</p>
+            </div>
+          {:else}
+            <div class="table-toolbar corpus-toolbar">
+              <div class="table-toolbar-left corpus-toolbar__filters">
+                <label class="corpus-filter corpus-filter--wide">
+                  <span class="muted small">Search</span>
+                  <input type="text" bind:value={currentTextFilter} placeholder="Filter upstream items..." />
+                </label>
+              </div>
+            </div>
+
+            <div class="corpus-table-unified">
+              <div class="table table-scroll corpus-table">
+                <div class="table-row header cols-corpus-workspace cols-upstream-current">
+                  <span>Title</span>
+                  <span>Year</span>
+                  <span>Author</span>
+                  <span>File</span>
+                </div>
+                {#each filteredCurrentItems as item (item.id)}
+                  {@const itemId = itemKey('current', item)}
+                  {@const selected = itemId !== '' && itemId === activeCurrentKey}
+                  <div
+                    class={`table-row cols-corpus-workspace cols-upstream-current clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
+                    on:click={() => toggleCurrentItem(item)}
+                    on:keydown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return
+                        e.preventDefault()
+                        toggleCurrentItem(item)
+                      }
+                    }}
+                    role="button"
+                    tabindex="0"
+                    aria-pressed={selected}
+                  >
+                    <span class="corpus-row-main">
+                      <span class="corpus-row-title line-clamp-2" title={item.title}>{item.title || 'Untitled'}</span>
+                    </span>
+                    <span class="nowrap">{item.year || '-'}</span>
+                    <span class="muted small line-clamp-2" title={itemAuthors(item) || '-'}>{itemAuthors(item) || '-'}</span>
+                    <span class="upstream-current-download-cell">
+                      {#if isCurrentItemDownloadable(item)}
+                        <button class="secondary upstream-current-download-button" type="button" on:click|stopPropagation={() => downloadCurrentItem(item)}>
+                          Download
+                        </button>
+                      {:else}
+                        <span class="muted small">-</span>
+                      {/if}
+                    </span>
+                  </div>
+                  {#if selected}
+                    <div class="table-row corpus-inline-detail-row">
+                      <div class="inline-detail-card">
+                        <div class="corpus-row-main">
+                          <div class="inline-detail-meta-row">
+                            {#if itemSource(item)}
+                              <span class="inline-detail-chip">Source: {itemSource(item)}</span>
+                            {/if}
+                            {#if item.doi}
+                              <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI: {item.doi}</a>
+                            {/if}
+                            {#if item.openalex_id}
+                              <a class="inline-detail-link" href={openAlexHref(item.openalex_id)} target="_blank" rel="noreferrer">OpenAlex: {itemOpenAlexLabel(item)}</a>
+                            {/if}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  {/if}
+                {/each}
+                {#if filteredCurrentItems.length === 0}
+                  <div class="table-row muted corpus-empty-state">
+                    No imported upstream items match the current filters.
+                  </div>
+                {/if}
+              </div>
+            </div>
+
+            {#if currentDownloadStatus}
+              <p class={`${currentDownloadError ? 'error' : 'muted'} upstream-download-status`}>{currentDownloadStatus}</p>
+            {/if}
+
+            <div class="corpus-lazy-status">
+              <span class="muted">Loaded {browse?.summary?.current_items_loaded || filteredCurrentItems.length} of {browse?.summary?.current_items_count || 0} entries.</span>
+              {#if browse?.summary?.current_items_has_more}
+                <button class="secondary" type="button" on:click={() => loadMoreCurrent()} disabled={loading}>
+                  {loading ? 'Loading…' : 'Load more'}
+                </button>
+              {/if}
+            </div>
+          {/if}
+        </section>
       </div>
-    </div>
     </div>
   </div>
 </div>

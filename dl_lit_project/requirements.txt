@@ -16,3 +16,4 @@ google-cloud-aiplatform
 pydantic
 python-igraph
 numpy
+pytest

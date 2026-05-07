@@ -100,6 +100,7 @@ def ensure_schema(conn):
           pages TEXT,
           type TEXT,
           url TEXT,
+          open_access_url TEXT,
           isbn TEXT,
           issn TEXT,
           abstract TEXT,
@@ -132,6 +133,8 @@ def ensure_schema(conn):
           run_id INTEGER,
           source_work_id INTEGER,
           relationship_type TEXT,
+          referenced_work_ids TEXT,
+          cited_by_api_url TEXT,
           crossref_json TEXT,
           openalex_json TEXT,
           bibtex_entry_json TEXT,
@@ -141,6 +144,14 @@ def ensure_schema(conn):
         )
         """
     )
+    work_columns = {row[1] for row in cur.execute("PRAGMA table_info(works)").fetchall()}
+    for column_name, column_type in (
+        ("open_access_url", "TEXT"),
+        ("referenced_work_ids", "TEXT"),
+        ("cited_by_api_url", "TEXT"),
+    ):
+        if column_name not in work_columns:
+            cur.execute(f"ALTER TABLE works ADD COLUMN {column_name} {column_type}")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS corpus_works (

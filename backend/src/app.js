@@ -642,6 +642,7 @@ function ensureAuthSchema(db) {
       pages TEXT,
       type TEXT,
       url TEXT,
+      open_access_url TEXT,
       isbn TEXT,
       issn TEXT,
       abstract TEXT,
@@ -674,6 +675,8 @@ function ensureAuthSchema(db) {
       run_id INTEGER,
       source_work_id INTEGER,
       relationship_type TEXT,
+      referenced_work_ids TEXT,
+      cited_by_api_url TEXT,
       crossref_json TEXT,
       openalex_json TEXT,
       bibtex_entry_json TEXT,
@@ -774,6 +777,16 @@ function ensureAuthSchema(db) {
   }
   if (tableExists(db, 'pipeline_jobs')) {
     ensureColumn(db, 'pipeline_jobs', 'worker_id', 'TEXT');
+  }
+  if (tableExists(db, 'scraper_apply_events')) {
+    ensureColumn(db, 'scraper_apply_events', 'generated_bib_path', 'TEXT');
+    ensureColumn(db, 'scraper_apply_events', 'backup_bib_path', 'TEXT');
+    ensureColumn(db, 'scraper_apply_events', 'draft_dir', 'TEXT');
+  }
+  if (tableExists(db, 'works')) {
+    ensureColumn(db, 'works', 'open_access_url', 'TEXT');
+    ensureColumn(db, 'works', 'referenced_work_ids', 'TEXT');
+    ensureColumn(db, 'works', 'cited_by_api_url', 'TEXT');
   }
   ensureColumn(db, 'users', 'email', 'TEXT');
   ensureColumn(db, 'users', 'email_verified_at', 'TIMESTAMP');
@@ -991,6 +1004,20 @@ function buildScraperBibtexEntry(artifact, relativeFilePath) {
 
 function safeTimestampForFilename() {
   return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+function ensureInsideDirectory(baseDir, candidatePath) {
+  const resolvedBase = path.resolve(String(baseDir || ''));
+  const resolvedCandidate = path.resolve(String(candidatePath || ''));
+  return resolvedCandidate === resolvedBase || resolvedCandidate.startsWith(`${resolvedBase}${path.sep}`);
+}
+
+function appendBibtexEntries(existingBib, appendedEntries) {
+  const base = String(existingBib || '');
+  const entries = Array.isArray(appendedEntries) ? appendedEntries.filter(Boolean) : [];
+  if (entries.length === 0) return base;
+  const prefix = base && !base.endsWith('\n') ? '\n\n' : base ? '\n' : '';
+  return `${base}${prefix}${entries.join('\n\n')}\n`;
 }
 
 function mapScraperRunRow(row) {
@@ -1649,31 +1676,44 @@ function parseJsonFromOutput(output) {
   throw new Error(`No valid JSON output from python. Output was: ${output}`);
 }
 
-function resolveDownloadedFilePath(storedPath) {
+function resolveDownloadedFilePath(storedPath, context = {}) {
   const rawPath = String(storedPath || '').trim();
   if (!rawPath) return null;
 
   const candidates = [];
+  const addCandidate = (candidate) => {
+    const normalized = path.resolve(candidate);
+    if (!candidates.includes(normalized)) candidates.push(normalized);
+  };
   if (path.isAbsolute(rawPath)) {
-    candidates.push(path.resolve(rawPath));
+    addCandidate(rawPath);
     const containerPrefix = `${path.sep}usr${path.sep}src${path.sep}app${path.sep}`;
     if (rawPath.startsWith(containerPrefix)) {
-      candidates.push(path.resolve(REPO_ROOT, rawPath.slice(containerPrefix.length)));
+      addCandidate(path.resolve(REPO_ROOT, rawPath.slice(containerPrefix.length)));
     }
   } else {
     const libraryPath = path.resolve(PDF_LIBRARY_DIR, rawPath);
     const libraryRoot = path.resolve(PDF_LIBRARY_DIR);
     if (libraryPath === libraryRoot || libraryPath.startsWith(`${libraryRoot}${path.sep}`)) {
-      candidates.push(libraryPath);
+      addCandidate(libraryPath);
     }
-    candidates.push(path.resolve(rawPath));
+    addCandidate(rawPath);
+  }
+
+  const originKey = String(context?.originKey || context?.origin_key || '').trim();
+  if (originKey && path.basename(originKey) === 'metadata.bib') {
+    const originDir = path.dirname(originKey);
+    const relativeRaw = rawPath.replace(/^[/\\]+/, '');
+    const baseName = path.basename(rawPath);
+    if (relativeRaw) addCandidate(path.join(originDir, relativeRaw));
+    if (baseName && baseName !== relativeRaw) addCandidate(path.join(originDir, baseName));
   }
 
   return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || null;
 }
 
-function findDownloadedFilePath(storedPath) {
-  const resolved = resolveDownloadedFilePath(storedPath);
+function findDownloadedFilePath(storedPath, context = {}) {
+  const resolved = resolveDownloadedFilePath(storedPath, context);
   return resolved && fs.existsSync(resolved) ? resolved : null;
 }
 
@@ -2144,6 +2184,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
   const pipelineWorkers = new Map(); // corpusId -> state
+  const corpusDownloadTickets = new Map(); // token -> { userId, corpusId, itemId, expiresAt }
+  const upstreamDownloadTickets = new Map(); // token -> { userId, targetId, itemId, expiresAt }
   const authConfig = resolveAuthConfig();
 
   // Ensure temporary and output directories exist
@@ -2171,6 +2213,78 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
   const requireAuthMiddleware = requireAuth(authDb, authConfig);
+  const pruneCorpusDownloadTickets = () => {
+    const now = Date.now();
+    for (const [token, ticket] of corpusDownloadTickets.entries()) {
+      if (!ticket || Number(ticket.expiresAt || 0) <= now) {
+        corpusDownloadTickets.delete(token);
+      }
+    }
+  };
+  const requireCorpusDownloadAccess = (req, res, next) => {
+    const token = String(req.query?.ticket || '').trim();
+    if (!token) {
+      return requireAuthMiddleware(req, res, next);
+    }
+    pruneCorpusDownloadTickets();
+    const ticket = corpusDownloadTickets.get(token);
+    const itemId = coerceInt(req.params?.id, null);
+    if (!ticket || !Number.isFinite(itemId) || Number(ticket.itemId) !== Number(itemId)) {
+      return res.status(401).json({ error: 'Invalid or expired download ticket' });
+    }
+    if (isStubMode() && Number(ticket.userId) === 0) {
+      req.user = { id: 0, username: 'stub', last_corpus_id: null };
+      req.corpusId = ticket.corpusId || null;
+      return next();
+    }
+    const user = getUserById(authDb, ticket.userId);
+    if (!user) {
+      corpusDownloadTickets.delete(token);
+      return res.status(401).json({ error: 'Unknown user' });
+    }
+    req.user = user;
+    req.corpusId = ticket.corpusId || user.last_corpus_id || null;
+    return next();
+  };
+  const pruneUpstreamDownloadTickets = () => {
+    const now = Date.now();
+    for (const [token, ticket] of upstreamDownloadTickets.entries()) {
+      if (!ticket || Number(ticket.expiresAt || 0) <= now) {
+        upstreamDownloadTickets.delete(token);
+      }
+    }
+  };
+  const requireUpstreamDownloadAccess = (req, res, next) => {
+    const token = String(req.query?.ticket || '').trim();
+    if (!token) {
+      return res.status(401).json({ error: 'Missing download ticket' });
+    }
+    pruneUpstreamDownloadTickets();
+    const ticket = upstreamDownloadTickets.get(token);
+    const itemId = coerceInt(req.params?.workId, null);
+    const targetId = String(req.params?.id || '').trim();
+    if (
+      !ticket ||
+      !Number.isFinite(itemId) ||
+      Number(ticket.itemId) !== Number(itemId) ||
+      String(ticket.targetId || '') !== targetId
+    ) {
+      return res.status(401).json({ error: 'Invalid or expired download ticket' });
+    }
+    if (isStubMode() && Number(ticket.userId) === 0) {
+      req.user = { id: 0, username: 'stub', last_corpus_id: null };
+      req.upstreamTargetId = targetId;
+      return next();
+    }
+    const user = getUserById(authDb, ticket.userId);
+    if (!user) {
+      upstreamDownloadTickets.delete(token);
+      return res.status(401).json({ error: 'Unknown user' });
+    }
+    req.user = user;
+    req.upstreamTargetId = targetId;
+    return next();
+  };
   const hasWorkerAccess = (req) => {
     if (isStubMode()) return true;
     const role = getCorpusRoleForUser(authDb, req.user?.id, req.corpusId);
@@ -3268,6 +3382,87 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
+  app.post('/api/kantropos/corpora/:id/works/:workId/download-ticket', requireAuthMiddleware, (req, res) => {
+    try {
+      const targetId = String(req.params?.id || '').trim();
+      const itemId = coerceInt(req.params?.workId, null);
+      if (!targetId || !Number.isFinite(itemId) || itemId <= 0) {
+        return res.status(400).json({ error: 'Invalid upstream work download request' });
+      }
+      const target = getKantroposTargetById(targetId);
+      if (!target) {
+        return res.status(404).json({ error: 'Unknown Kantropos corpus target' });
+      }
+      const metadataBibPath = String(path.join(String(target.path || ''), 'metadata.bib'));
+      const row = authDb
+        .prepare(
+          `SELECT id
+             FROM works
+            WHERE id = ?
+              AND origin_type = 'bibtex_import'
+              AND origin_key = ?
+              AND download_status = 'downloaded'
+              AND COALESCE(file_path, '') <> ''
+            LIMIT 1`
+        )
+        .get(itemId, metadataBibPath);
+      if (!row) {
+        return res.status(404).json({ error: 'Downloaded upstream file not found' });
+      }
+      pruneUpstreamDownloadTickets();
+      const token = crypto.randomBytes(24).toString('base64url');
+      upstreamDownloadTickets.set(token, {
+        userId: req.user.id,
+        targetId,
+        itemId,
+        expiresAt: Date.now() + 60_000,
+      });
+      return res.json({
+        url: `/api/kantropos/corpora/${encodeURIComponent(targetId)}/works/${encodeURIComponent(String(itemId))}/file?ticket=${encodeURIComponent(token)}`,
+        expires_in_seconds: 60,
+      });
+    } catch (error) {
+      console.error('[/api/kantropos/corpora/:id/works/:workId/download-ticket] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to create upstream download ticket' });
+    }
+  });
+
+  app.get('/api/kantropos/corpora/:id/works/:workId/file', requireUpstreamDownloadAccess, (req, res) => {
+    try {
+      const targetId = String(req.params?.id || '').trim();
+      const itemId = coerceInt(req.params?.workId, null);
+      const target = getKantroposTargetById(targetId);
+      if (!target || !Number.isFinite(itemId) || itemId <= 0) {
+        return res.status(400).json({ error: 'Invalid upstream work download request' });
+      }
+      const metadataBibPath = String(path.join(String(target.path || ''), 'metadata.bib'));
+      const db = new Database(DB_PATH, { readonly: true });
+      const row = db
+        .prepare(
+          `SELECT id, title, file_path, origin_key
+             FROM works
+            WHERE id = ?
+              AND origin_type = 'bibtex_import'
+              AND origin_key = ?
+              AND download_status = 'downloaded'
+            LIMIT 1`
+        )
+        .get(itemId, metadataBibPath);
+      db.close();
+      if (!row) {
+        return res.status(404).json({ error: 'Downloaded upstream file not found' });
+      }
+      const filePath = resolveDownloadedFilePath(row.file_path, { originKey: row.origin_key });
+      if (!filePath || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Downloaded upstream file is missing on disk' });
+      }
+      return res.download(filePath, path.basename(filePath));
+    } catch (error) {
+      console.error('[/api/kantropos/corpora/:id/works/:workId/file] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to download upstream file' });
+    }
+  });
+
   app.post('/api/scraper/runs', requireAuthMiddleware, (req, res) => {
     try {
       const sourceType = String(req.body?.sourceType || req.body?.source_type || '').trim();
@@ -3369,12 +3564,20 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (!targetPath || targetPath !== configuredPath) {
         return res.status(400).json({ error: 'Invalid target path' });
       }
-      fs.mkdirSync(targetPath, { recursive: true });
+      if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
+        return res.status(400).json({ error: 'Configured target directory does not exist' });
+      }
       const metadataBibPath = path.join(targetPath, 'metadata.bib');
       const existingBib = fs.existsSync(metadataBibPath) ? fs.readFileSync(metadataBibPath, 'utf8') : '';
       const existingKeys = parseBibtexKeys(existingBib);
       const appendedEntries = [];
       const details = [];
+      const draftStamp = `${safeTimestampForFilename()}-${crypto.randomBytes(4).toString('hex')}`;
+      const draftBaseDir = path.join(BIB_OUTPUT_DIR, 'upstream-drafts');
+      const draftDir = path.join(draftBaseDir, `${target.id}-${draftStamp}`);
+      const draftFilesDir = path.join(draftDir, 'files');
+      const backupBibPath = path.join(draftDir, 'metadata.original.bib');
+      const generatedBibPath = path.join(draftDir, 'metadata.bib');
       let appliedCount = 0;
       let skippedCount = 0;
       let errorCount = 0;
@@ -3405,8 +3608,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         const sourcePath = path.resolve(String(artifact.local_artifact_path || ''));
         const destDir = path.join(targetPath, 'scraper', sourceDir);
         const destPath = path.join(destDir, fileName);
-        const sidecarPath = path.join(destDir, `${path.basename(fileName, path.extname(fileName))}.json`);
         const relFilePath = path.posix.join('scraper', sourceDir, fileName);
+        const destinationExists = fs.existsSync(destPath);
 
         if (!key) {
           errorCount += 1;
@@ -3423,36 +3626,44 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           details.push({ artifact_id: artifactId, status: 'skipped', reason: 'artifact_not_downloaded', bibtex_key: key });
           continue;
         }
-        if (!sourcePath || !fs.existsSync(sourcePath)) {
+        if ((!sourcePath || !fs.existsSync(sourcePath)) && !destinationExists) {
           errorCount += 1;
           details.push({ artifact_id: artifactId, status: 'error', reason: 'source_file_missing', bibtex_key: key });
           continue;
         }
-        if (fs.existsSync(destPath)) {
-          skippedCount += 1;
-          details.push({ artifact_id: artifactId, status: 'skipped', reason: 'destination_file_exists', bibtex_key: key });
+        if (sourcePath && fs.existsSync(sourcePath) && fs.statSync(sourcePath).size <= 0) {
+          errorCount += 1;
+          details.push({ artifact_id: artifactId, status: 'error', reason: 'source_file_empty', bibtex_key: key });
           continue;
         }
 
-        fs.mkdirSync(destDir, { recursive: true });
-        fs.copyFileSync(sourcePath, destPath);
-        fs.writeFileSync(sidecarPath, artifact.raw_metadata_json || '{}', 'utf8');
+        if (!destinationExists && sourcePath && fs.existsSync(sourcePath)) {
+          const stagedFilePath = path.join(draftFilesDir, 'scraper', sourceDir, fileName);
+          const stagedSidecarPath = path.join(draftFilesDir, 'scraper', sourceDir, `${path.basename(fileName, path.extname(fileName))}.json`);
+          fs.mkdirSync(path.dirname(stagedFilePath), { recursive: true });
+          fs.copyFileSync(sourcePath, stagedFilePath);
+          fs.writeFileSync(stagedSidecarPath, artifact.raw_metadata_json || '{}', 'utf8');
+        }
         const bibtexEntry = buildScraperBibtexEntry(artifact, relFilePath);
         appendedEntries.push(bibtexEntry);
         existingKeys.add(key);
         appliedCount += 1;
-        details.push({ artifact_id: artifactId, status: 'applied', bibtex_key: key, file: relFilePath });
+        details.push({
+          artifact_id: artifactId,
+          status: 'staged',
+          bibtex_key: key,
+          file: relFilePath,
+          destination_file_exists: destinationExists,
+        });
         authDb
           .prepare('UPDATE scraper_artifacts SET bibtex_entry = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
           .run(bibtexEntry, artifactId);
       }
 
       if (appendedEntries.length > 0) {
-        if (fs.existsSync(metadataBibPath)) {
-          fs.copyFileSync(metadataBibPath, `${metadataBibPath}.bak-${safeTimestampForFilename()}`);
-        }
-        const prefix = existingBib && !existingBib.endsWith('\n') ? '\n\n' : existingBib ? '\n' : '';
-        fs.appendFileSync(metadataBibPath, `${prefix}${appendedEntries.join('\n\n')}\n`, 'utf8');
+        fs.mkdirSync(draftDir, { recursive: true });
+        fs.writeFileSync(backupBibPath, existingBib, 'utf8');
+        fs.writeFileSync(generatedBibPath, appendBibtexEntries(existingBib, appendedEntries), 'utf8');
       }
 
       const eventId = Number(
@@ -3460,8 +3671,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           .prepare(
             `INSERT INTO scraper_apply_events (
                target_id, target_path, user_id, artifact_ids_json,
-               applied_count, skipped_count, error_count, details_json
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+               applied_count, skipped_count, error_count, details_json,
+               generated_bib_path, backup_bib_path, draft_dir
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           )
           .run(
             target.id,
@@ -3471,14 +3683,49 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             appliedCount,
             skippedCount,
             errorCount,
-            JSON.stringify(details)
+            JSON.stringify(details),
+            appendedEntries.length > 0 ? generatedBibPath : null,
+            appendedEntries.length > 0 ? backupBibPath : null,
+            appendedEntries.length > 0 ? draftDir : null
           )
           .lastInsertRowid
       );
-      return res.json({ event_id: eventId, applied_count: appliedCount, skipped_count: skippedCount, error_count: errorCount, details });
+      return res.json({
+        event_id: eventId,
+        mode: 'draft',
+        applied_count: appliedCount,
+        skipped_count: skippedCount,
+        error_count: errorCount,
+        details,
+        generated_bib_url: appendedEntries.length > 0 ? `/api/scraper/apply-events/${encodeURIComponent(String(eventId))}/metadata-bib` : '',
+      });
     } catch (error) {
       console.error('[/api/scraper/apply] Error:', error);
       return res.status(500).json({ error: error?.message || 'Failed to apply scraper artifacts' });
+    }
+  });
+
+  app.get('/api/scraper/apply-events/:id/metadata-bib', requireAuthMiddleware, (req, res) => {
+    try {
+      const eventId = Number(req.params.id);
+      if (!Number.isFinite(eventId) || eventId <= 0) {
+        return res.status(400).json({ error: 'Invalid apply event id' });
+      }
+      const row = authDb
+        .prepare('SELECT generated_bib_path FROM scraper_apply_events WHERE id = ?')
+        .get(eventId);
+      const generatedBibPath = String(row?.generated_bib_path || '').trim();
+      if (!generatedBibPath) {
+        return res.status(404).json({ error: 'Generated metadata.bib draft not found' });
+      }
+      if (!ensureInsideDirectory(BIB_OUTPUT_DIR, generatedBibPath) || !fs.existsSync(generatedBibPath)) {
+        return res.status(404).json({ error: 'Generated metadata.bib draft not found' });
+      }
+      res.setHeader('Content-Type', 'application/x-bibtex; charset=utf-8');
+      return res.download(generatedBibPath, 'metadata.bib');
+    } catch (error) {
+      console.error('[/api/scraper/apply-events/:id/metadata-bib] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to download generated metadata.bib' });
     }
   });
 
@@ -4238,7 +4485,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
       const db = new Database(DB_PATH, { readonly: true });
       const row = db.prepare(
-        `SELECT id, title, file_path
+        `SELECT id, title, file_path, origin_key
            FROM works
           WHERE id = ?
             AND download_status = 'downloaded'
@@ -4250,7 +4497,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(404).json({ error: 'Downloaded file not found' });
       }
 
-      const filePath = resolveDownloadedFilePath(row.file_path);
+      const filePath = resolveDownloadedFilePath(row.file_path, { originKey: row.origin_key });
       if (!filePath || !fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'Downloaded file is missing on disk' });
       }
@@ -4470,7 +4717,43 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/corpus/downloaded/:id/file', requireAuthMiddleware, async (req, res) => {
+  app.post('/api/corpus/downloaded/:id/download-ticket', requireAuthMiddleware, (req, res) => {
+    const itemId = coerceInt(req.params?.id, null);
+    if (!Number.isFinite(itemId) || itemId <= 0) {
+      return res.status(400).json({ error: 'Invalid downloaded item id' });
+    }
+    try {
+      const row = authDb.prepare(
+        `SELECT 1
+           FROM works w
+           JOIN corpus_works cw ON cw.work_id = w.id
+          WHERE cw.corpus_id = ?
+            AND w.id = ?
+            AND w.download_status = 'downloaded'
+          LIMIT 1`
+      ).get(req.corpusId, itemId);
+      if (!row) {
+        return res.status(404).json({ error: 'Downloaded file not found in this corpus' });
+      }
+      pruneCorpusDownloadTickets();
+      const token = crypto.randomBytes(24).toString('base64url');
+      corpusDownloadTickets.set(token, {
+        userId: req.user.id,
+        corpusId: req.corpusId,
+        itemId,
+        expiresAt: Date.now() + 60_000,
+      });
+      return res.json({
+        url: `/api/corpus/downloaded/${encodeURIComponent(String(itemId))}/file?ticket=${encodeURIComponent(token)}`,
+        expires_in_seconds: 60,
+      });
+    } catch (error) {
+      console.error('[/api/corpus/downloaded/:id/download-ticket] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to create download ticket' });
+    }
+  });
+
+  app.get('/api/corpus/downloaded/:id/file', requireCorpusDownloadAccess, async (req, res) => {
     const itemId = coerceInt(req.params?.id, null);
     if (!Number.isFinite(itemId) || itemId <= 0) {
       return res.status(400).json({ error: 'Invalid downloaded item id' });
@@ -4478,7 +4761,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     try {
       const db = new Database(DB_PATH, { readonly: true });
       const row = db.prepare(
-        `SELECT w.id, w.title, w.file_path
+        `SELECT w.id, w.title, w.file_path, w.origin_key
            FROM works w
            JOIN corpus_works cw ON cw.work_id = w.id
           WHERE cw.corpus_id = ?
@@ -4492,7 +4775,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(404).json({ error: 'Downloaded file not found in this corpus' });
       }
 
-      const filePath = resolveDownloadedFilePath(row.file_path);
+      const filePath = resolveDownloadedFilePath(row.file_path, { originKey: row.origin_key });
       if (!filePath || !fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'Downloaded file is missing on disk' });
       }

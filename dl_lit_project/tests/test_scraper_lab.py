@@ -1,6 +1,14 @@
 from pathlib import Path
 
-from dl_lit.scraper_lab import build_artifact_record, build_eurlex_expert_query, safe_filename
+import pytest
+
+from dl_lit.scraper_lab import (
+    build_artifact_record,
+    build_eurlex_expert_query,
+    raise_for_eurlex_response,
+    safe_filename,
+    validate_download_content,
+)
 
 
 def test_build_eurlex_query_escapes_text():
@@ -69,3 +77,38 @@ def test_expert_groups_artifact_record_keeps_minimal_metadata():
 def test_safe_filename_has_fallback():
     assert safe_filename(" /bad:name* ") == "bad_name"
     assert safe_filename("???", fallback="fallback") == "fallback"
+
+
+def test_download_validation_rejects_empty_artifacts():
+    with pytest.raises(RuntimeError, match="empty"):
+        validate_download_content(b"", Path("artifact.html"))
+
+
+def test_download_validation_rejects_non_pdf_bytes_for_pdf():
+    with pytest.raises(RuntimeError, match="valid PDF"):
+        validate_download_content(b"<html>not a pdf</html>", Path("artifact.pdf"))
+
+
+def test_download_validation_accepts_pdf_signature():
+    validate_download_content(b"%PDF-1.7\nbody", Path("artifact.pdf"))
+
+
+def test_eurlex_response_validation_surfaces_soap_fault():
+    content = b"""<?xml version='1.0' encoding='UTF-8'?>
+    <env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope">
+      <env:Body>
+        <env:Fault>
+          <env:Reason>
+            <env:Text xml:lang="en-US">Failed to assert identity with UsernameToken.</env:Text>
+          </env:Reason>
+        </env:Fault>
+      </env:Body>
+    </env:Envelope>"""
+
+    with pytest.raises(RuntimeError, match="Failed to assert identity"):
+        raise_for_eurlex_response(content, 500)
+
+
+def test_eurlex_response_validation_rejects_http_errors_without_fault():
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        raise_for_eurlex_response(b"service unavailable", 503)
