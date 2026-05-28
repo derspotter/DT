@@ -1,6 +1,11 @@
 <script>
   import { onDestroy, onMount, tick } from 'svelte'
-  import { fetchGraph3D } from '../lib/api'
+  import {
+    fetchGraph3DSnapshot,
+    fetchGraph3DSnapshotResources,
+    fetchGraph3DNodeDetail,
+    fetchGraph3DClusterDetail,
+  } from '../lib/api'
 
   export let autoLoad = true
 
@@ -18,12 +23,13 @@
   let pointer
   let animationFrame = 0
   let settleFrame = 0
+  let rotateFrame = 0
   let resizeObserver
   let handlePointerMove
   let handleClick
   let componentMounted = false
   let initialLoadStarted = false
-  let graphData = { nodes: [], edges: [], stats: {} }
+  let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
   let relationship = 'both'
@@ -31,9 +37,14 @@
   let scope = 'all'
   let maxNodes = 10000
   let colorMode = 'cluster'
+  let depthScale = 1.6
+  let autoRotate = false
   let selectedNode = null
   let hoveredNode = null
   let selectedCluster = null
+  let selectedNodeDetail = null
+  let selectedClusterDetail = null
+  let nodeDetailLoading = false
 
   const statusColors = {
     downloaded: 0x0f8b8d,
@@ -87,9 +98,21 @@
       return palette[Math.abs(Math.floor(year / 10)) % palette.length]
     }
     if (colorMode === 'area') return paletteColor(node.area || node.type || node.source || 'unknown')
+    if (colorMode === 'region') return paletteColor(node.region || node.countries?.[0] || 'unknown')
     if (colorMode === 'component') return palette[Math.abs(Number(node.component || 0)) % palette.length]
     if (node.cluster_kind === 'low_signal') return 0x64747a
     return palette[Math.abs(Number(node.cluster || 0)) % palette.length]
+  }
+
+  function positionValue(positions, nodes, index, axis) {
+    const base = index * 3 + axis
+    if (positions && base < positions.length) {
+      return Number(positions[base] || 0)
+    }
+    const node = nodes[index] || {}
+    if (axis === 0) return Number(node.x || 0)
+    if (axis === 1) return Number(node.y || 0)
+    return Number(node.z || 0)
   }
 
   function disposeObject(object) {
@@ -111,20 +134,21 @@
     disposeObject(points)
     disposeObject(edgeLines)
     disposeObject(clusterShells)
-    selectedNode = null
     hoveredNode = null
 
     const nodes = graphData.nodes || []
     const edges = graphData.edges || []
+    const sourcePositions = graphData.positions
+    const edgeTriplets = graphData.edgeTriplets
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]))
     const positions = new Float32Array(nodes.length * 3)
     const colors = new Float32Array(nodes.length * 3)
     const color = new THREE.Color()
 
     nodes.forEach((node, index) => {
-      positions[index * 3] = Number(node.x || 0)
-      positions[index * 3 + 1] = Number(node.y || 0)
-      positions[index * 3 + 2] = Number(node.z || 0)
+      positions[index * 3] = positionValue(sourcePositions, nodes, index, 0)
+      positions[index * 3 + 1] = positionValue(sourcePositions, nodes, index, 1) * depthScale
+      positions[index * 3 + 2] = positionValue(sourcePositions, nodes, index, 2)
       color.setHex(nodeColor(node))
       colors[index * 3] = color.r
       colors[index * 3 + 1] = color.g
@@ -164,31 +188,45 @@
         depthWrite: false,
       })
       const shell = new THREE.Mesh(geometry, material)
-      shell.position.set(Number(cluster.x || 0), Number(cluster.y || 0), Number(cluster.z || 0))
+      shell.position.set(Number(cluster.x || 0), Number(cluster.y || 0) * depthScale, Number(cluster.z || 0))
       clusterShells.add(shell)
     }
     scene.add(clusterShells)
 
-    const edgePositions = new Float32Array(edges.length * 2 * 3)
-    const edgeColors = new Float32Array(edges.length * 2 * 3)
+    const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
+    const edgeCount = binaryEdgeCount || edges.length
+    const edgePositions = new Float32Array(edgeCount * 2 * 3)
+    const edgeColors = new Float32Array(edgeCount * 2 * 3)
     let edgeOffset = 0
     let edgeColorOffset = 0
-    for (const edge of edges) {
-      const sourceIndex = nodeIndex.get(edge.s)
-      const targetIndex = nodeIndex.get(edge.t)
-      if (sourceIndex === undefined || targetIndex === undefined) continue
+    const appendEdge = (sourceIndex, targetIndex, relationshipCode = 0) => {
+      if (sourceIndex === undefined || targetIndex === undefined) return
+      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex >= nodes.length || targetIndex >= nodes.length) return
       edgePositions[edgeOffset++] = positions[sourceIndex * 3]
       edgePositions[edgeOffset++] = positions[sourceIndex * 3 + 1]
       edgePositions[edgeOffset++] = positions[sourceIndex * 3 + 2]
       edgePositions[edgeOffset++] = positions[targetIndex * 3]
       edgePositions[edgeOffset++] = positions[targetIndex * 3 + 1]
       edgePositions[edgeOffset++] = positions[targetIndex * 3 + 2]
-      const edgeHex = edge.r === 'cited_by' ? 0xf4a340 : 0x7c8b95
+      const edgeHex = relationshipCode === 1 ? 0xf4a340 : 0x7c8b95
       color.setHex(edgeHex)
       for (let i = 0; i < 2; i += 1) {
         edgeColors[edgeColorOffset++] = color.r
         edgeColors[edgeColorOffset++] = color.g
         edgeColors[edgeColorOffset++] = color.b
+      }
+    }
+    if (binaryEdgeCount) {
+      for (let i = 0; i < edgeTriplets.length; i += 3) {
+        appendEdge(edgeTriplets[i], edgeTriplets[i + 1], edgeTriplets[i + 2])
+      }
+    } else {
+      for (const edge of edges) {
+        appendEdge(
+          nodeIndex.get(edge.s || edge.source),
+          nodeIndex.get(edge.t || edge.target),
+          edge.r === 'cited_by' || edge.relationship_type === 'cited_by' ? 1 : 0
+        )
       }
     }
     const lineGeometry = new THREE.BufferGeometry()
@@ -219,7 +257,7 @@
       const bounds = framingClusters.reduce(
         (acc, cluster) => {
           const x = Number(cluster.x || 0)
-          const y = Number(cluster.y || 0)
+          const y = Number(cluster.y || 0) * depthScale
           const z = Number(cluster.z || 0)
           const padding = Math.max(90, Number(cluster.radius || 0) * 1.7)
           acc.minX = Math.min(acc.minX, x - padding)
@@ -254,7 +292,7 @@
     if (!camera || !controls || !cluster) return
     selectedCluster = Number(cluster.id)
     const x = Number(cluster.x || 0)
-    const y = Number(cluster.y || 0)
+    const y = Number(cluster.y || 0) * depthScale
     const z = Number(cluster.z || 0)
     const radius = Math.max(280, Math.min(2200, 180 + Math.sqrt(Number(cluster.size || 1)) * 34))
     const visualRadius = Math.max(radius, Number(cluster.radius || 0) * 3.2)
@@ -266,25 +304,111 @@
     controls.update()
     renderNow()
     renderForFrames(20)
+    void loadClusterDetail(cluster)
+  }
+
+  function setCameraPreset(preset) {
+    if (!camera || !controls) return
+    const center = controls.target || { x: 0, y: 0, z: 0 }
+    const radius = points?.geometry?.boundingSphere?.radius || 1800
+    if (preset === 'top') {
+      camera.position.set(center.x, center.y + radius * 2.2, center.z + 1)
+    } else if (preset === 'side') {
+      camera.position.set(center.x + radius * 2.1, center.y + radius * 0.2, center.z)
+    } else {
+      camera.position.set(center.x + radius * 1.1, center.y + radius * 0.75, center.z + radius * 1.55)
+    }
+    camera.lookAt(center.x, center.y, center.z)
+    controls.update()
+    renderNow()
+    renderForFrames(20)
+  }
+
+  function updateAutoRotate() {
+    if (!controls) return
+    controls.autoRotate = autoRotate
+    controls.autoRotateSpeed = 0.65
+    if (!autoRotate && rotateFrame) {
+      cancelAnimationFrame(rotateFrame)
+      rotateFrame = 0
+      return
+    }
+    if (autoRotate && !rotateFrame) {
+      const draw = () => {
+        if (!autoRotate || !controls) {
+          rotateFrame = 0
+          return
+        }
+        controls.update()
+        renderNow()
+        rotateFrame = requestAnimationFrame(draw)
+      }
+      rotateFrame = requestAnimationFrame(draw)
+    }
+  }
+
+  async function loadNodeDetail(node) {
+    const id = node?.work_id || node?.id
+    if (!id) return
+    nodeDetailLoading = true
+    selectedNodeDetail = null
+    try {
+      const detail = await fetchGraph3DNodeDetail(id)
+      if ((selectedNode?.work_id || selectedNode?.id) === id) {
+        selectedNodeDetail = detail
+      }
+    } catch {
+      selectedNodeDetail = null
+    } finally {
+      nodeDetailLoading = false
+    }
+  }
+
+  async function loadClusterDetail(cluster) {
+    const snapshotKey = graphData.manifest?.snapshot_key
+    if (!snapshotKey || cluster?.id === undefined || cluster?.id === null) {
+      selectedClusterDetail = cluster || null
+      return
+    }
+    selectedClusterDetail = cluster
+    try {
+      selectedClusterDetail = await fetchGraph3DClusterDetail(snapshotKey, cluster.id)
+    } catch {
+      selectedClusterDetail = cluster
+    }
   }
 
   async function load3DGraph() {
     graphLoading = true
-    graphStatus = 'Building 3D graph payload...'
+    graphStatus = 'Building 3D graph snapshot...'
     try {
-      const payload = await fetchGraph3D({
+      const manifest = await fetchGraph3DSnapshot({
         maxNodes,
         relationship,
         status: statusFilter,
         scope,
       })
-      graphData = payload || { nodes: [], edges: [], stats: {} }
+      const snapshot = await fetchGraph3DSnapshotResources(manifest)
+      const edgeCount = Number(snapshot.manifest?.buffers?.edges?.count || Math.floor((snapshot.edgeTriplets?.length || 0) / 3) || 0)
+      graphData = {
+        manifest,
+        nodes: snapshot.nodes || [],
+        edges: Array.isArray(snapshot.edgeTriplets) ? snapshot.edgeTriplets : [],
+        edgeTriplets: snapshot.edgeTriplets instanceof Uint32Array ? snapshot.edgeTriplets : null,
+        positions: snapshot.positions,
+        clusters: snapshot.clusters || manifest.clusters || [],
+        stats: {
+          ...(manifest.stats || {}),
+          node_count: Number(manifest.stats?.node_count || snapshot.nodes?.length || 0),
+          edge_count: Number(manifest.stats?.edge_count || edgeCount),
+        },
+      }
       const totalWorks = Number(graphData.stats?.total_work_count || graphData.nodes?.length || 0)
       const loadedNodes = Number(graphData.nodes?.length || 0)
       const limitedNote = graphData.stats?.is_limited && totalWorks > loadedNodes
         ? ` Showing the ${formatNumber(loadedNodes)} most connected works out of ${formatNumber(totalWorks)}.`
         : ''
-      graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.edges?.length || 0)} edges.${limitedNote}`
+      graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
       renderGraph()
     } catch (error) {
       graphStatus = error?.message || 'Failed to load 3D graph.'
@@ -346,7 +470,10 @@
     const hit = raycaster.intersectObject(points, false)[0]
     const nextNode = hit ? points.userData.nodes?.[hit.index] : null
     hoveredNode = nextNode
-    if (persist && nextNode) selectedNode = nextNode
+    if (persist && nextNode) {
+      selectedNode = nextNode
+      void loadNodeDetail(nextNode)
+    }
   }
 
   function formatNumber(value) {
@@ -386,6 +513,11 @@
 
     controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = false
+    controls.enableRotate = true
+    controls.enablePan = true
+    controls.enableZoom = true
+    controls.autoRotate = autoRotate
+    controls.autoRotateSpeed = 0.65
     controls.addEventListener('change', requestRender)
 
     raycaster = new THREE.Raycaster()
@@ -410,6 +542,7 @@
     componentMounted = false
     if (animationFrame) cancelAnimationFrame(animationFrame)
     if (settleFrame) cancelAnimationFrame(settleFrame)
+    if (rotateFrame) cancelAnimationFrame(rotateFrame)
     resizeObserver?.disconnect()
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
@@ -423,9 +556,11 @@
   })
 
   $: activeNode = selectedNode || hoveredNode
+  $: activeNodeDetail = selectedNode && selectedNodeDetail ? { ...selectedNode, ...selectedNodeDetail } : activeNode
   $: clusters = graphData.clusters || []
   $: topClusters = clusters.slice(0, 16)
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
+  $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
 </script>
 
 <div class="card graph-3d-panel" data-testid="graph-3d-panel">
@@ -437,6 +572,12 @@
       </p>
     </div>
     <div class="graph-3d-actions">
+      <button class="secondary" type="button" on:click={() => setCameraPreset('angle')} disabled={!graphData.nodes?.length}>Angle</button>
+      <button class="secondary" type="button" on:click={() => setCameraPreset('top')} disabled={!graphData.nodes?.length}>Top</button>
+      <button class="secondary" type="button" on:click={() => setCameraPreset('side')} disabled={!graphData.nodes?.length}>Side</button>
+      <button class:active={autoRotate} class="secondary" type="button" on:click={() => { autoRotate = !autoRotate; updateAutoRotate() }} disabled={!graphData.nodes?.length}>
+        {autoRotate ? 'Stop rotate' : 'Auto rotate'}
+      </button>
       <button class="secondary" type="button" on:click={resetCamera} disabled={!graphData.nodes?.length}>Reset camera</button>
       <button type="button" on:click={load3DGraph} disabled={graphLoading}>
         {graphLoading ? 'Loading 3D graph...' : 'Load 3D graph'}
@@ -478,10 +619,20 @@
       <select bind:value={colorMode} on:change={() => graphData.nodes?.length && renderGraph()}>
         <option value="cluster">Graph cluster</option>
         <option value="area">Science area</option>
+        <option value="region">Region</option>
         <option value="component">Connected component</option>
         <option value="status">Pipeline status</option>
         <option value="degree">Degree</option>
         <option value="year">Year decade</option>
+      </select>
+    </label>
+    <label>
+      <span class="muted small">Depth</span>
+      <select bind:value={depthScale} on:change={() => graphData.nodes?.length && renderGraph()}>
+        <option value={1}>1x</option>
+        <option value={1.6}>1.6x</option>
+        <option value={2.4}>2.4x</option>
+        <option value={3.2}>3.2x</option>
       </select>
     </label>
   </div>
@@ -544,30 +695,42 @@
         {/if}
       </div>
 
-      {#if selectedClusterData}
+      {#if selectedClusterPanel}
         <div class="graph-3d-cluster-detail">
           <span class="eyebrow">Cluster profile</span>
-          <strong>{selectedClusterData.label}</strong>
-          <span class="muted small">{formatNumber(selectedClusterData.size)} works / radius {Math.round(selectedClusterData.radius || 0)}</span>
-          <span class="muted small">Areas: {compactList(selectedClusterData.areas)}</span>
-          <span class="muted small">Regions: {compactList(selectedClusterData.regions)}</span>
-          <span class="muted small">Countries: {compactList(selectedClusterData.countries, 'unknown countries')}</span>
-          <span class="muted small">Types: {compactList(selectedClusterData.types)}</span>
-          {#if selectedClusterData.year_min || selectedClusterData.year_max}
-            <span class="muted small">Years: {selectedClusterData.year_min || '?'}-{selectedClusterData.year_max || '?'}</span>
+          <strong>{selectedClusterPanel.label}</strong>
+          <span class="muted small">{formatNumber(selectedClusterPanel.size)} works / radius {Math.round(selectedClusterPanel.radius || 0)}</span>
+          <span class="muted small">Areas: {compactList(selectedClusterPanel.areas)}</span>
+          <span class="muted small">Regions: {compactList(selectedClusterPanel.regions)}</span>
+          <span class="muted small">Countries: {compactList(selectedClusterPanel.countries, 'unknown countries')}</span>
+          <span class="muted small">Types: {compactList(selectedClusterPanel.types)}</span>
+          {#if selectedClusterPanel.year_min || selectedClusterPanel.year_max}
+            <span class="muted small">Years: {selectedClusterPanel.year_min || '?'}-{selectedClusterPanel.year_max || '?'}</span>
           {/if}
         </div>
       {/if}
 
       <div class="graph-3d-selected">
         <span class="eyebrow">Selected work</span>
-        {#if activeNode}
-          <strong>{activeNode.title}</strong>
-          <span class="muted small">{activeNode.year || 'Year ?'} / {activeNode.type || 'Type ?'} / {activeNode.status}</span>
-          <span class="muted small">Area: {activeNode.area || 'unknown'} / Region: {activeNode.region || 'unknown'}</span>
-          <span class="muted small">Degree: {formatNumber(activeNode.degree)} / Cluster: {activeNode.cluster} ({formatNumber(activeNode.cluster_size)} nodes)</span>
-          <span class="muted small">Component: {activeNode.component} ({formatNumber(activeNode.component_size)} nodes)</span>
-          <span class="muted small">Source: {activeNode.source || 'unknown'}</span>
+        {#if activeNodeDetail}
+          <strong>{activeNodeDetail.title}</strong>
+          <span class="muted small">{activeNodeDetail.year || 'Year ?'} / {activeNodeDetail.type || 'Type ?'} / {activeNodeDetail.status}</span>
+          <span class="muted small">Area: {activeNodeDetail.area || 'unknown'} / Region: {activeNodeDetail.region || 'unknown'}</span>
+          <span class="muted small">Degree: {formatNumber(activeNodeDetail.degree)} / Cluster: {activeNodeDetail.cluster} ({formatNumber(activeNodeDetail.cluster_size)} nodes)</span>
+          <span class="muted small">Component: {activeNodeDetail.component} ({formatNumber(activeNodeDetail.component_size)} nodes)</span>
+          <span class="muted small">Source: {activeNodeDetail.source || 'unknown'}</span>
+          {#if nodeDetailLoading}
+            <span class="muted small">Loading metadata...</span>
+          {/if}
+          {#if selectedNodeDetail?.authors}
+            <span class="muted small">Authors: {selectedNodeDetail.authors}</span>
+          {/if}
+          {#if selectedNodeDetail?.doi || selectedNodeDetail?.openalex_id}
+            <span class="muted small">Identifiers: {selectedNodeDetail.doi || selectedNodeDetail.openalex_id}</span>
+          {/if}
+          {#if selectedNodeDetail?.publisher || selectedNodeDetail?.keywords}
+            <span class="muted small">Metadata: {selectedNodeDetail.publisher || selectedNodeDetail.keywords}</span>
+          {/if}
         {:else}
           <strong>No node selected</strong>
           <span class="muted small">Hover or click a point in the 3D graph.</span>

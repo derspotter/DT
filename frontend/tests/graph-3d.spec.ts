@@ -103,6 +103,27 @@ const graph3dPayload = {
   },
 }
 
+const graph3dNodesMeta = graph3dPayload.nodes.map(({ x: _x, y: _y, z: _z, ...node }) => node)
+const graph3dPositions = new Float32Array(graph3dPayload.nodes.flatMap((node) => [node.x, node.y, node.z]))
+const graph3dEdgeTriplets = new Uint32Array([0, 1, 0])
+const graph3dSnapshotManifest = {
+  source: 'snapshot',
+  snapshot_key: 'playwrightsnapshot',
+  schema_version: 1,
+  stats: graph3dPayload.stats,
+  files: {
+    nodes: '/api/graph/3d/snapshot/playwrightsnapshot/nodes.bin',
+    edges: '/api/graph/3d/snapshot/playwrightsnapshot/edges.bin',
+    nodes_meta: '/api/graph/3d/snapshot/playwrightsnapshot/nodes_meta.json',
+    clusters: '/api/graph/3d/snapshot/playwrightsnapshot/clusters.json',
+  },
+  buffers: {
+    nodes: { count: 2, array: 'float32', stride: 3 },
+    edges: { count: 1, array: 'uint32', stride: 3 },
+  },
+  clusters: graph3dPayload.clusters,
+}
+
 async function mockApi(route: Route) {
   const url = new URL(route.request().url())
   const path = url.pathname
@@ -113,6 +134,26 @@ async function mockApi(route: Route) {
       user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
       corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
     }
+  } else if (path === '/api/graph/3d/snapshot') {
+    body = graph3dSnapshotManifest
+  } else if (path === '/api/graph/3d/snapshot/playwrightsnapshot/nodes.bin') {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/octet-stream',
+      body: Buffer.from(graph3dPositions.buffer),
+    })
+    return
+  } else if (path === '/api/graph/3d/snapshot/playwrightsnapshot/edges.bin') {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/octet-stream',
+      body: Buffer.from(graph3dEdgeTriplets.buffer),
+    })
+    return
+  } else if (path === '/api/graph/3d/snapshot/playwrightsnapshot/nodes_meta.json') {
+    body = graph3dNodesMeta
+  } else if (path === '/api/graph/3d/snapshot/playwrightsnapshot/clusters.json') {
+    body = graph3dPayload.clusters
   } else if (path === '/api/graph/3d') {
     body = graph3dPayload
   } else if (path === '/api/graph') {
@@ -145,8 +186,9 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
   await page.route('**/api/**', mockApi)
 
   const graphResponse = page.waitForResponse((res) => {
-    if (!res.url().includes('/api/graph/3d') || res.request().method() !== 'GET') return false
-    return new URL(res.url()).searchParams.get('scope') === 'all'
+    const url = new URL(res.url())
+    if (url.pathname !== '/api/graph/3d/snapshot' || res.request().method() !== 'GET') return false
+    return url.searchParams.get('scope') === 'all'
   })
   await page.goto('/#/graph')
   await page.getByTestId('tab-graph').click()
@@ -157,7 +199,7 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
 
   await graphResponse
 
-  await expect(panel.getByText('Loaded 2 nodes and 1 edges.')).toBeVisible()
+  await expect(panel.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
   await expect(panel.getByLabel('3D graph visualization')).toBeVisible()
   await expect(panel.getByText('Top clusters')).toBeVisible()
   await expect(panel.getByRole('button', { name: /seed/ })).toBeVisible()

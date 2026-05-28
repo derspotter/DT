@@ -102,15 +102,18 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
-const GRAPH_3D_CACHE_VERSION = 4;
+const GRAPH_3D_CACHE_VERSION = 5;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
+const GRAPH_3D_SNAPSHOT_DIR =
+  process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
-const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || 'python3';
+const LOCAL_VENV_PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
+const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || (fs.existsSync(LOCAL_VENV_PYTHON) ? LOCAL_VENV_PYTHON : 'python');
 const KANTROPOS_CORPORA_ROOT =
   process.env.RAG_FEEDER_KANTROPOS_CORPORA_ROOT || '/data/projects/kantropos/corpora';
 const PDF_LIBRARY_DIR =
@@ -293,6 +296,100 @@ function tableRowCount(db, tableName) {
   } catch {
     return 0;
   }
+}
+
+function listTableColumns(db, tableName) {
+  if (!tableExists(db, tableName)) return [];
+  return db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => String(row.name || ''));
+}
+
+function buildGraph3dRequest(req) {
+  const requestedMaxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
+  const maxNodes = Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
+  const relationship = req.query?.relationship || 'both';
+  const status = req.query?.status || 'all';
+  const scope = String(req.query?.scope || 'all').trim().toLowerCase();
+  const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
+  const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
+  const corpusId = scope === 'corpus' ? req.corpusId : null;
+  let dbModifiedMs = 0;
+  try {
+    dbModifiedMs = Math.floor(fs.statSync(DB_PATH).mtimeMs);
+  } catch {
+    dbModifiedMs = 0;
+  }
+  return { maxNodes, relationship, status, scope, yearFrom, yearTo, corpusId, dbModifiedMs };
+}
+
+function graph3dScriptArgs(options, extraArgs = []) {
+  const args = [
+    '--db-path',
+    DB_PATH,
+    '--max-nodes',
+    String(options.maxNodes),
+    '--relationship',
+    options.relationship,
+    '--status',
+    options.status,
+    ...extraArgs,
+  ];
+  if (options.yearFrom !== null) args.push('--year-from', String(options.yearFrom));
+  if (options.yearTo !== null) args.push('--year-to', String(options.yearTo));
+  return args;
+}
+
+function graph3dSnapshotKey(options) {
+  const keyPayload = JSON.stringify({
+    version: GRAPH_3D_CACHE_VERSION,
+    maxNodes: options.maxNodes,
+    relationship: options.relationship,
+    status: options.status,
+    scope: options.scope,
+    yearFrom: options.yearFrom,
+    yearTo: options.yearTo,
+    corpusId: options.corpusId,
+    dbModifiedMs: options.dbModifiedMs,
+  });
+  return crypto.createHash('sha256').update(keyPayload).digest('hex').slice(0, 20);
+}
+
+function graph3dSnapshotPath(key, fileName = '') {
+  return path.join(GRAPH_3D_SNAPSHOT_DIR, key, fileName);
+}
+
+function decorateGraph3dManifest(manifest, key) {
+  const base = `/api/graph/3d/snapshot/${encodeURIComponent(key)}`;
+  const files = manifest?.files || {};
+  return {
+    ...manifest,
+    source: manifest?.source || 'snapshot',
+    snapshot_key: key,
+    files: {
+      ...files,
+      nodes: `${base}/nodes.bin`,
+      edges: `${base}/edges.bin`,
+      nodes_meta: `${base}/nodes_meta.json`,
+      clusters: `${base}/clusters.json`,
+      manifest: `${base}/manifest.json`,
+    },
+  };
+}
+
+function stubGraph3dManifest() {
+  return {
+    source: 'stub',
+    snapshot_key: 'stub',
+    schema_version: 1,
+    stats: STUB_RESULTS.graph.stats,
+    files: {},
+    buffers: {
+      nodes: { count: STUB_RESULTS.graph.nodes.length, array: 'float32', stride: 3 },
+      edges: { count: STUB_RESULTS.graph.edges.length, array: 'uint32', stride: 3 },
+    },
+    nodes_meta: STUB_RESULTS.graph.nodes,
+    edges: STUB_RESULTS.graph.edges,
+    clusters: [],
+  };
 }
 
 function assertNoLegacyLibraryData(db) {
@@ -4404,41 +4501,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
     }
-    const requestedMaxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
-    const maxNodes = Math.max(1000, Math.min(50000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
-    const relationship = req.query?.relationship || 'both';
-    const status = req.query?.status || 'all';
-    const scope = String(req.query?.scope || 'all').trim().toLowerCase();
-    const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
-    const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
+    const options = buildGraph3dRequest(req);
     const dbPath = DB_PATH;
-
-    const args = [
-      '--db-path',
-      dbPath,
-      '--max-nodes',
-      String(maxNodes),
-      '--relationship',
-      relationship,
-      '--status',
-      status,
-    ];
-    if (yearFrom !== null) {
-      args.push('--year-from', String(yearFrom));
-    }
-    if (yearTo !== null) {
-      args.push('--year-to', String(yearTo));
-    }
-    const scopedCorpusId = scope === 'corpus' ? req.corpusId : null;
     const cacheKey = JSON.stringify({
       version: GRAPH_3D_CACHE_VERSION,
-      maxNodes,
-      relationship,
-      status,
-      scope,
-      yearFrom,
-      yearTo,
-      corpusId: scopedCorpusId,
+      maxNodes: options.maxNodes,
+      relationship: options.relationship,
+      status: options.status,
+      scope: options.scope,
+      yearFrom: options.yearFrom,
+      yearTo: options.yearTo,
+      corpusId: options.corpusId,
+      dbModifiedMs: options.dbModifiedMs,
     });
     const cached = graph3dCache.get(cacheKey);
     const cacheTtlMs = 15 * 60 * 1000;
@@ -4446,9 +4520,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json({ ...cached.payload, source: 'cache' });
     }
     try {
-      const payload = await runPythonJson(GRAPH_3D_EXPORT_SCRIPT, args, {
+      const payload = await runPythonJson(GRAPH_3D_EXPORT_SCRIPT, graph3dScriptArgs(options), {
         dbPath,
-        corpusId: scopedCorpusId,
+        corpusId: options.corpusId,
       });
       graph3dCache.set(cacheKey, { createdAt: Date.now(), payload });
       if (graph3dCache.size > 4) {
@@ -4460,6 +4534,136 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       console.error('[/api/graph/3d] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to build 3D graph' });
     }
+  });
+
+  app.get('/api/graph/3d/snapshot', requireAuthMiddleware, async (req, res) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json(stubGraph3dManifest());
+    }
+
+    const options = buildGraph3dRequest(req);
+    const key = graph3dSnapshotKey(options);
+    const snapshotDir = graph3dSnapshotPath(key);
+    const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
+    const refresh = req.query?.refresh === '1' || req.query?.refresh === 'true';
+
+    try {
+      if (!refresh && fs.existsSync(manifestPath)) {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+        return res.json({ ...decorateGraph3dManifest(manifest, key), source: 'snapshot-cache' });
+      }
+
+      fs.mkdirSync(snapshotDir, { recursive: true });
+      const payload = await runPythonJson(
+        GRAPH_3D_EXPORT_SCRIPT,
+        graph3dScriptArgs(options, ['--snapshot-dir', snapshotDir]),
+        { dbPath: DB_PATH, corpusId: options.corpusId }
+      );
+      const manifest = payload?.files ? payload : JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+      return res.json(decorateGraph3dManifest(manifest, key));
+    } catch (error) {
+      console.error('[/api/graph/3d/snapshot] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to build 3D graph snapshot' });
+    }
+  });
+
+  app.get('/api/graph/3d/node/:nodeId', requireAuthMiddleware, async (req, res) => {
+    const nodeId = String(req.params.nodeId || '').trim();
+    if (!nodeId) {
+      return res.status(400).json({ error: 'Missing node id' });
+    }
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      const node = STUB_RESULTS.graph.nodes.find((item) => String(item.id) === nodeId || String(item.work_id) === nodeId);
+      return node ? res.json({ ...node, source: 'stub' }) : res.status(404).json({ error: 'Node not found' });
+    }
+
+    try {
+      const db = new Database(DB_PATH, { readonly: true });
+      try {
+        const columns = new Set(listTableColumns(db, 'works'));
+        const wanted = [
+          'id',
+          'title',
+          'authors',
+          'year',
+          'doi',
+          'openalex_id',
+          'source',
+          'publisher',
+          'type',
+          'abstract',
+          'keywords',
+          'metadata_status',
+          'download_status',
+          'origin_key',
+          'source_pdf',
+          'source_work_id',
+          'relationship_type',
+          'file_path',
+        ].filter((column) => columns.has(column));
+        if (!wanted.length) {
+          return res.status(404).json({ error: 'Works table not found' });
+        }
+        const selectList = wanted.map((column) => `w.${column}`).join(', ');
+        const numericId = Number(nodeId);
+        const query = columns.has('openalex_id') && columns.has('doi')
+          ? `SELECT ${selectList} FROM works w WHERE w.id = ? OR w.openalex_id = ? OR w.doi = ? LIMIT 1`
+          : `SELECT ${selectList} FROM works w WHERE w.id = ? LIMIT 1`;
+        const params = columns.has('openalex_id') && columns.has('doi')
+          ? [Number.isFinite(numericId) ? numericId : -1, nodeId, nodeId]
+          : [Number.isFinite(numericId) ? numericId : -1];
+        const row = db.prepare(query).get(...params);
+        if (!row) {
+          return res.status(404).json({ error: 'Node not found' });
+        }
+        return res.json({
+          ...mapWorkRowToBrowserItem(row),
+          publisher: row.publisher || '',
+          abstract: row.abstract || '',
+          keywords: row.keywords || '',
+          source_pdf: row.source_pdf || '',
+        });
+      } finally {
+        db.close();
+      }
+    } catch (error) {
+      console.error('[/api/graph/3d/node/:nodeId] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to load node detail' });
+    }
+  });
+
+  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, async (req, res) => {
+    const key = String(req.params.snapshotKey || '').trim();
+    const clusterId = Number(req.params.clusterId);
+    if (!/^[a-f0-9]{20}$/.test(key) || !Number.isFinite(clusterId)) {
+      return res.status(400).json({ error: 'Invalid cluster request' });
+    }
+    try {
+      const clustersPath = graph3dSnapshotPath(key, 'clusters.json');
+      if (!fs.existsSync(clustersPath)) {
+        return res.status(404).json({ error: 'Cluster snapshot not found' });
+      }
+      const clusters = JSON.parse(fs.readFileSync(clustersPath, 'utf-8'));
+      const cluster = clusters.find((item) => Number(item.id) === clusterId);
+      return cluster ? res.json(cluster) : res.status(404).json({ error: 'Cluster not found' });
+    } catch (error) {
+      console.error('[/api/graph/3d/cluster/:snapshotKey/:clusterId] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to load cluster detail' });
+    }
+  });
+
+  app.get('/api/graph/3d/snapshot/:snapshotKey/:fileName', requireAuthMiddleware, async (req, res) => {
+    const key = String(req.params.snapshotKey || '').trim();
+    const fileName = String(req.params.fileName || '').trim();
+    const allowedFiles = new Set(['manifest.json', 'nodes.bin', 'edges.bin', 'nodes_meta.json', 'clusters.json']);
+    if (!/^[a-f0-9]{20}$/.test(key) || !allowedFiles.has(fileName)) {
+      return res.status(400).json({ error: 'Invalid snapshot file request' });
+    }
+    const filePath = graph3dSnapshotPath(key, fileName);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Snapshot file not found' });
+    }
+    return res.sendFile(filePath);
   });
 
   app.get('/api/ingest/latest', requireAuthMiddleware, async (req, res) => {

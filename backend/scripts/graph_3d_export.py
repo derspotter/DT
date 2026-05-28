@@ -1,9 +1,12 @@
 import argparse
+from array import array
 import json
 import math
+import os
 import re
 import sqlite3
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 
 GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
@@ -11,6 +14,7 @@ MAX_CLUSTER_SIZE = 18000
 MAX_CLUSTER_SUMMARIES = 80
 MIN_STANDALONE_CLUSTER_SIZE = 8
 DEFAULT_MAX_NODES = 10000
+SNAPSHOT_SCHEMA_VERSION = 1
 BASE_WORK_COLUMNS = [
     "id",
     "title",
@@ -586,6 +590,72 @@ def fetch_openalex_json_for_kept_rows(conn, node_by_id):
             item.pop("_openalex_json", None)
 
 
+def write_snapshot(payload, snapshot_dir):
+    os.makedirs(snapshot_dir, exist_ok=True)
+
+    nodes = payload.get("nodes") or []
+    edges = payload.get("edges") or []
+    node_index = {node.get("id"): index for index, node in enumerate(nodes)}
+
+    positions = array("f")
+    nodes_meta = []
+    for node in nodes:
+        positions.extend(
+            [
+                float(node.get("x") or 0.0),
+                float(node.get("y") or 0.0),
+                float(node.get("z") or 0.0),
+            ]
+        )
+        nodes_meta.append({key: value for key, value in node.items() if key not in {"x", "y", "z"}})
+
+    edge_triplets = array("I")
+    encoded_edge_count = 0
+    for edge in edges:
+        source_index = node_index.get(edge.get("s"))
+        target_index = node_index.get(edge.get("t"))
+        if source_index is None or target_index is None:
+            continue
+        edge_triplets.extend([source_index, target_index, 1 if edge.get("r") == "cited_by" else 0])
+        encoded_edge_count += 1
+
+    with open(os.path.join(snapshot_dir, "nodes.bin"), "wb") as handle:
+        positions.tofile(handle)
+    with open(os.path.join(snapshot_dir, "edges.bin"), "wb") as handle:
+        edge_triplets.tofile(handle)
+    with open(os.path.join(snapshot_dir, "nodes_meta.json"), "w", encoding="utf-8") as handle:
+        json.dump(nodes_meta, handle, ensure_ascii=False, separators=(",", ":"))
+    with open(os.path.join(snapshot_dir, "clusters.json"), "w", encoding="utf-8") as handle:
+        json.dump(payload.get("clusters") or [], handle, ensure_ascii=False, separators=(",", ":"))
+
+    manifest = {
+        "source": "snapshot",
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "stats": payload.get("stats") or {},
+        "files": {
+            "nodes": "nodes.bin",
+            "edges": "edges.bin",
+            "nodes_meta": "nodes_meta.json",
+            "clusters": "clusters.json",
+        },
+        "buffers": {
+            "nodes": {"count": len(nodes), "array": "float32", "stride": 3, "fields": ["x", "y", "z"]},
+            "edges": {
+                "count": encoded_edge_count,
+                "array": "uint32",
+                "stride": 3,
+                "fields": ["source_index", "target_index", "relationship_code"],
+                "relationship_codes": {"references": 0, "cited_by": 1},
+            },
+        },
+        "clusters": payload.get("clusters") or [],
+    }
+    with open(os.path.join(snapshot_dir, "manifest.json"), "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, separators=(",", ":"))
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
@@ -599,6 +669,7 @@ def main():
     parser.add_argument("--year-from", type=int, default=None)
     parser.add_argument("--year-to", type=int, default=None)
     parser.add_argument("--corpus-id", type=int, default=None)
+    parser.add_argument("--snapshot-dir", default=None)
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db_path)
@@ -803,6 +874,8 @@ def main():
         },
     }
     conn.close()
+    if args.snapshot_dir:
+        payload = write_snapshot(payload, args.snapshot_dir)
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 

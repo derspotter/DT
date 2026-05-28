@@ -31,4 +31,13 @@ describe('GET /api/graph (stub)', () => {
     expect(res.body).toHaveProperty('stats')
     expect(res.body).toHaveProperty('source', 'stub')
   })
+
+  test('returns 3D graph snapshot manifest', async () => {
+    const res = await request(app).get('/api/graph/3d/snapshot?max_nodes=1000&relationship=both')
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveProperty('source', 'stub')
+    expect(res.body).toHaveProperty('snapshot_key')
+    expect(res.body).toHaveProperty('buffers.nodes.count')
+    expect(res.body).toHaveProperty('nodes_meta')
+  })
 })

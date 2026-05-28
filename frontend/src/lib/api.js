@@ -970,3 +970,101 @@ export async function fetchGraph3D({
   }
   return response.json()
 }
+
+function graph3DParams({
+  maxNodes = 10000,
+  relationship = 'both',
+  status = 'all',
+  scope = 'all',
+  yearFrom = null,
+  yearTo = null,
+  refresh = false,
+} = {}) {
+  const params = new URLSearchParams()
+  params.set('max_nodes', String(maxNodes))
+  if (relationship) params.set('relationship', relationship)
+  if (status) params.set('status', status)
+  if (scope) params.set('scope', scope)
+  if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {
+    params.set('year_from', String(yearFrom))
+  }
+  if (yearTo !== null && yearTo !== undefined && yearTo !== '') {
+    params.set('year_to', String(yearTo))
+  }
+  if (refresh) params.set('refresh', '1')
+  return params
+}
+
+function apiUrl(pathOrUrl) {
+  const value = String(pathOrUrl || '')
+  if (/^https?:\/\//i.test(value)) return value
+  return `${API_BASE}${value.startsWith('/') ? value : `/${value}`}`
+}
+
+async function fetchGraph3DResource(pathOrUrl, type = 'json') {
+  const response = await fetchWithTimeout(apiUrl(pathOrUrl), {}, PIPELINE_TIMEOUT)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || `HTTP ${response.status}`)
+  }
+  return type === 'arrayBuffer' ? response.arrayBuffer() : response.json()
+}
+
+export async function fetchGraph3DSnapshot(options = {}) {
+  const params = graph3DParams(options)
+  const response = await fetchWithTimeout(`${API_BASE}/api/graph/3d/snapshot?${params.toString()}`, {}, PIPELINE_TIMEOUT)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || `HTTP ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchGraph3DSnapshotResources(manifest) {
+  const files = manifest?.files || {}
+  const inlineNodes = manifest?.nodes_meta || manifest?.nodes || null
+  const inlineEdges = manifest?.edge_triplets || manifest?.edges || null
+  const inlineClusters = manifest?.clusters || null
+  const [nodesBuffer, edgesBuffer, nodesMeta, clusters] = await Promise.all([
+    files.nodes ? fetchGraph3DResource(files.nodes, 'arrayBuffer') : null,
+    files.edges ? fetchGraph3DResource(files.edges, 'arrayBuffer') : null,
+    files.nodes_meta ? fetchGraph3DResource(files.nodes_meta, 'json') : inlineNodes,
+    files.clusters ? fetchGraph3DResource(files.clusters, 'json') : inlineClusters,
+  ])
+  const decodedInlineEdges = Array.isArray(inlineEdges) && typeof inlineEdges[0] === 'number'
+    ? new Uint32Array(inlineEdges)
+    : inlineEdges
+  return {
+    manifest,
+    positions: nodesBuffer ? new Float32Array(nodesBuffer) : null,
+    edgeTriplets: edgesBuffer ? new Uint32Array(edgesBuffer) : decodedInlineEdges,
+    nodes: nodesMeta || [],
+    clusters: clusters || [],
+  }
+}
+
+export async function fetchGraph3DNodeDetail(nodeId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/graph/3d/node/${encodeURIComponent(String(nodeId || ''))}`, {}, PIPELINE_TIMEOUT)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || `HTTP ${response.status}`)
+  }
+  return response.json()
+}
+
+export async function fetchGraph3DClusterDetail(snapshotKey, clusterId) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/graph/3d/cluster/${encodeURIComponent(String(snapshotKey || ''))}/${encodeURIComponent(String(clusterId || ''))}`,
+    {},
+    PIPELINE_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || `HTTP ${response.status}`)
+  }
+  return response.json()
+}

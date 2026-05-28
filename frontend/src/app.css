@@ -2268,6 +2268,11 @@ button.seed-download-tag:focus-visible {
   align-items: end;
 }
 
+.graph-3d-actions button.active {
+  border-color: rgba(244, 163, 64, 0.72);
+  background: rgba(244, 163, 64, 0.16);
+}
+
 .graph-3d-controls {
   justify-content: flex-start;
   padding: 12px;
