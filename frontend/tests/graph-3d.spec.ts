@@ -201,7 +201,7 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
 
   await expect(panel.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
   await expect(panel.getByLabel('3D graph visualization')).toBeVisible()
-  await expect(panel.getByText('Top clusters')).toBeVisible()
-  await expect(panel.getByRole('button', { name: /seed/ })).toBeVisible()
+  await expect(panel.getByText('Territories')).toBeVisible()
+  await expect(panel.getByText('Canon works')).toBeVisible()
   await expect(panel.getByText('No node selected')).toBeVisible()
 })

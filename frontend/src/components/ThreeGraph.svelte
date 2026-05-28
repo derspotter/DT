@@ -18,6 +18,8 @@
   let controls
   let points
   let edgeLines
+  let bridgeLines
+  let landmarkPoints
   let clusterShells
   let raycaster
   let pointer
@@ -29,6 +31,8 @@
   let handleClick
   let componentMounted = false
   let initialLoadStarted = false
+  let clusterLabelLayer
+  let clusterLabels = []
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
@@ -83,6 +87,14 @@
     return palette[stableHash(value) % palette.length]
   }
 
+  function colorCss(hex) {
+    return `#${Number(hex || 0).toString(16).padStart(6, '0')}`
+  }
+
+  function clusterColor(cluster) {
+    return cluster?.kind === 'low_signal' ? 0x52636a : paletteColor(cluster?.area || cluster?.label || cluster?.id)
+  }
+
   function nodeColor(node) {
     if (colorMode === 'status') return statusColors[node.status] || 0x6f7b84
     if (colorMode === 'degree') {
@@ -133,11 +145,15 @@
     if (!scene || !THREE) return
     disposeObject(points)
     disposeObject(edgeLines)
+    disposeObject(bridgeLines)
+    disposeObject(landmarkPoints)
     disposeObject(clusterShells)
+    clusterLabels = []
     hoveredNode = null
 
     const nodes = graphData.nodes || []
     const edges = graphData.edges || []
+    const clusterData = graphData.clusters || []
     const sourcePositions = graphData.positions
     const edgeTriplets = graphData.edgeTriplets
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]))
@@ -176,13 +192,14 @@
     scene.add(points)
 
     clusterShells = new THREE.Group()
-    for (const cluster of clusters.slice(0, 80)) {
+    const visibleClusters = clusterData.slice(0, 32)
+    for (const cluster of visibleClusters) {
       const radius = Math.max(48, Number(cluster.radius || Math.sqrt(Number(cluster.size || 1)) * 8))
       const geometry = new THREE.SphereGeometry(radius, 24, 12)
       const material = new THREE.MeshBasicMaterial({
-        color: cluster.kind === 'low_signal' ? 0x52636a : paletteColor(cluster.area || cluster.label || cluster.id),
+        color: clusterColor(cluster),
         transparent: true,
-        opacity: cluster.kind === 'low_signal' ? 0.1 : 0.3,
+        opacity: cluster.kind === 'low_signal' ? 0.08 : Math.min(0.2, 0.08 + Math.log1p(Number(cluster.size || 1)) * 0.018),
         wireframe: true,
         depthTest: false,
         depthWrite: false,
@@ -192,6 +209,22 @@
       clusterShells.add(shell)
     }
     scene.add(clusterShells)
+
+    clusterLabels = visibleClusters.slice(0, 8).map((cluster, index) => ({
+      id: cluster.id,
+      label: cluster.area && cluster.area !== 'unknown area' ? cluster.area : cluster.label,
+      detail: `${formatNumber(cluster.size)} works / ${cluster.region || 'unknown region'}`,
+      color: colorCss(clusterColor(cluster)),
+      vector: new THREE.Vector3(
+        Number(cluster.x || 0),
+        Number(cluster.y || 0) * depthScale + Math.max(62, Number(cluster.radius || 0) * 0.74),
+        Number(cluster.z || 0)
+      ),
+      x: -9999,
+      y: -9999,
+      opacity: index < 8 ? 1 : 0.74,
+      scale: Math.max(0.86, Math.min(1.12, 0.72 + Math.log1p(Number(cluster.size || 1)) * 0.062)),
+    }))
 
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
     const edgeCount = binaryEdgeCount || edges.length
@@ -237,10 +270,116 @@
       new THREE.LineBasicMaterial({
         vertexColors: true,
         transparent: true,
-        opacity: 0.26,
+        opacity: 0.12,
       })
     )
     scene.add(edgeLines)
+
+    const bridgeCandidates = []
+    const bridgePositions = []
+    const bridgeColors = []
+    const bridgeColor = new THREE.Color(0xffcf70)
+    const bridgeLimit = 700
+    const collectBridge = (sourceIndex, targetIndex) => {
+      if (sourceIndex === undefined || targetIndex === undefined) return
+      const source = nodes[sourceIndex]
+      const target = nodes[targetIndex]
+      if (!source || !target) return
+      const crossesCluster = Number(source.cluster) !== Number(target.cluster)
+      const crossesArea = (source.area || 'unknown area') !== (target.area || 'unknown area')
+      if (!crossesCluster && !crossesArea) return
+      const sourceDegree = Number(source.degree || 0)
+      const targetDegree = Number(target.degree || 0)
+      if (!crossesArea && sourceDegree + targetDegree < 24) return
+      bridgeCandidates.push({
+        sourceIndex,
+        targetIndex,
+        crossesArea,
+        score: sourceDegree + targetDegree + (crossesArea ? 42 : 0) + (crossesCluster ? 12 : 0),
+      })
+    }
+    const appendBridge = ({ sourceIndex, targetIndex, crossesArea }) => {
+      bridgePositions.push(
+        positions[sourceIndex * 3],
+        positions[sourceIndex * 3 + 1],
+        positions[sourceIndex * 3 + 2],
+        positions[targetIndex * 3],
+        positions[targetIndex * 3 + 1],
+        positions[targetIndex * 3 + 2]
+      )
+      const source = nodes[sourceIndex]
+      const target = nodes[targetIndex]
+      const hex = crossesArea ? paletteColor(`${source.area}->${target.area}`) : 0xffcf70
+      bridgeColor.setHex(hex)
+      for (let i = 0; i < 2; i += 1) {
+        bridgeColors.push(bridgeColor.r, bridgeColor.g, bridgeColor.b)
+      }
+    }
+    if (binaryEdgeCount) {
+      for (let i = 0; i < edgeTriplets.length; i += 3) {
+        collectBridge(edgeTriplets[i], edgeTriplets[i + 1])
+      }
+    } else {
+      for (const edge of edges) {
+        collectBridge(nodeIndex.get(edge.s || edge.source), nodeIndex.get(edge.t || edge.target))
+      }
+    }
+    bridgeCandidates
+      .sort((a, b) => b.score - a.score)
+      .slice(0, bridgeLimit)
+      .forEach(appendBridge)
+    if (bridgePositions.length) {
+      const bridgeGeometry = new THREE.BufferGeometry()
+      bridgeGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(bridgePositions), 3))
+      bridgeGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(bridgeColors), 3))
+      bridgeLines = new THREE.LineSegments(
+        bridgeGeometry,
+        new THREE.LineBasicMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.36,
+          depthTest: false,
+          depthWrite: false,
+        })
+      )
+      scene.add(bridgeLines)
+    }
+
+    const landmarkCandidates = nodes
+      .map((node, index) => ({ node, index, degree: Number(node.degree || 0) }))
+      .filter(({ degree }) => degree >= 8)
+      .sort((a, b) => b.degree - a.degree)
+      .slice(0, 140)
+    if (landmarkCandidates.length) {
+      const landmarkPositions = new Float32Array(landmarkCandidates.length * 3)
+      const landmarkColors = new Float32Array(landmarkCandidates.length * 3)
+      landmarkCandidates.forEach(({ node, index }, landmarkIndex) => {
+        landmarkPositions[landmarkIndex * 3] = positions[index * 3]
+        landmarkPositions[landmarkIndex * 3 + 1] = positions[index * 3 + 1]
+        landmarkPositions[landmarkIndex * 3 + 2] = positions[index * 3 + 2]
+        color.setHex(Number(node.degree || 0) > 100 ? 0xfff1a8 : 0xffcf70)
+        landmarkColors[landmarkIndex * 3] = color.r
+        landmarkColors[landmarkIndex * 3 + 1] = color.g
+        landmarkColors[landmarkIndex * 3 + 2] = color.b
+      })
+      const landmarkGeometry = new THREE.BufferGeometry()
+      landmarkGeometry.setAttribute('position', new THREE.BufferAttribute(landmarkPositions, 3))
+      landmarkGeometry.setAttribute('color', new THREE.BufferAttribute(landmarkColors, 3))
+      landmarkPoints = new THREE.Points(
+        landmarkGeometry,
+        new THREE.PointsMaterial({
+          size: 9,
+          sizeAttenuation: false,
+          vertexColors: true,
+          transparent: true,
+          opacity: 0.96,
+          blending: THREE.AdditiveBlending,
+          depthTest: false,
+          depthWrite: false,
+        })
+      )
+      scene.add(landmarkPoints)
+    }
 
     resetCamera()
     renderNow()
@@ -252,7 +391,7 @@
     if (!camera || !controls) return
     let center = points?.geometry?.boundingSphere?.center || { x: 0, y: 0, z: 0 }
     let radius = points?.geometry?.boundingSphere?.radius || 1600
-    const framingClusters = clusters.slice(0, 24)
+    const framingClusters = (graphData.clusters || clusters).slice(0, 24)
     if (framingClusters.length) {
       const bounds = framingClusters.reduce(
         (acc, cluster) => {
@@ -409,6 +548,7 @@
         ? ` Showing the ${formatNumber(loadedNodes)} most connected works out of ${formatNumber(totalWorks)}.`
         : ''
       graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
+      await tick()
       renderGraph()
     } catch (error) {
       graphStatus = error?.message || 'Failed to load 3D graph.'
@@ -428,6 +568,54 @@
   function renderNow() {
     if (!renderer || !scene || !camera) return
     renderer.render(scene, camera)
+    updateClusterLabelPositions()
+  }
+
+  function updateClusterLabelPositions() {
+    if (!camera || !renderer || !clusterLabels.length) return
+    const rect = renderer.domElement.getBoundingClientRect()
+    const placed = []
+    const labelOffsets = [
+      [0, 0],
+      [-180, 38],
+      [180, 38],
+      [-160, -42],
+      [160, -42],
+      [0, 76],
+    ]
+    clusterLabels = clusterLabels.map((label) => {
+      const projected = label.vector.clone().project(camera)
+      const baseX = ((projected.x + 1) / 2) * rect.width
+      const baseY = ((-projected.y + 1) / 2) * rect.height
+      const width = 184 * Number(label.scale || 1)
+      const height = 44 * Number(label.scale || 1)
+      let x = baseX
+      let y = baseY
+      let visible = false
+      if (projected.z > -1 && projected.z < 1) {
+        for (const [offsetX, offsetY] of labelOffsets) {
+          const candidateX = Math.min(rect.width - width / 2 - 12, Math.max(width / 2 + 12, baseX + offsetX))
+          const candidateY = Math.min(rect.height - height / 2 - 12, Math.max(48 + height / 2, baseY + offsetY))
+          const overlaps = placed.some((box) => (
+            Math.abs(box.x - candidateX) < (box.width + width) * 0.48
+            && Math.abs(box.y - candidateY) < (box.height + height) * 0.68
+          ))
+          if (!overlaps) {
+            x = candidateX
+            y = candidateY
+            visible = true
+            placed.push({ x, y, width, height })
+            break
+          }
+        }
+      }
+      return {
+        ...label,
+        x,
+        y,
+        visible,
+      }
+    })
   }
 
   function renderForFrames(count = 30) {
@@ -550,6 +738,8 @@
     controls?.dispose()
     disposeObject(points)
     disposeObject(edgeLines)
+    disposeObject(bridgeLines)
+    disposeObject(landmarkPoints)
     disposeObject(clusterShells)
     renderer?.dispose()
     renderer?.domElement?.remove()
@@ -558,7 +748,6 @@
   $: activeNode = selectedNode || hoveredNode
   $: activeNodeDetail = selectedNode && selectedNodeDetail ? { ...selectedNode, ...selectedNodeDetail } : activeNode
   $: clusters = graphData.clusters || []
-  $: topClusters = clusters.slice(0, 16)
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
   $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
 </script>
@@ -638,7 +827,28 @@
   </div>
 
   <div class="graph-3d-layout">
-    <div class="graph-3d-canvas" bind:this={container} aria-label="3D graph visualization" role="application"></div>
+    <div class="graph-3d-canvas" bind:this={container} aria-label="3D graph visualization" role="application">
+      <div class="graph-3d-map-key" aria-hidden="true">
+        <span><i class="territory"></i>Territories</span>
+        <span><i class="bridge"></i>Bridge links</span>
+        <span><i class="canon"></i>Canon works</span>
+      </div>
+      <div class="graph-3d-label-layer" bind:this={clusterLabelLayer}>
+        {#each clusterLabels as label (label.id)}
+          {#if label.visible}
+            <button
+              type="button"
+              class="graph-3d-cluster-label"
+              style={`--label-x:${label.x}px;--label-y:${label.y}px;--label-color:${label.color};--label-opacity:${label.opacity};--label-scale:${label.scale}`}
+              on:click={() => focusCluster(clusters.find((cluster) => Number(cluster.id) === Number(label.id)))}
+            >
+              <span>{label.label}</span>
+              <small>{label.detail}</small>
+            </button>
+          {/if}
+        {/each}
+      </div>
+    </div>
     <aside class="graph-3d-sidebar">
       <div class="graph-3d-summary">
         <div>
@@ -669,31 +879,6 @@
       <p class="muted small">
         Regions: {compactList(graphData.stats?.top_regions)} ({coverageLabel(graphData.stats?.region_coverage)})
       </p>
-
-      <div class="graph-3d-clusters">
-        <div>
-          <span class="eyebrow">Top clusters</span>
-          <p class="muted small">Jump to the largest communities.</p>
-        </div>
-        {#if topClusters.length}
-          <div class="graph-3d-cluster-list">
-            {#each topClusters as cluster}
-              <button
-                class:active={selectedCluster === Number(cluster.id)}
-                type="button"
-                on:click={() => focusCluster(cluster)}
-                title={cluster.top_titles?.join('\n')}
-              >
-                <span>{cluster.label}</span>
-                <small>{formatNumber(cluster.size)} works / {cluster.area || 'unknown area'} / {cluster.region || 'unknown region'}</small>
-                <small>{cluster.kind === 'low_signal' ? 'Low-link bucket' : 'Citation community'} / {cluster.decade}</small>
-              </button>
-            {/each}
-          </div>
-        {:else}
-          <p class="muted small">No cluster summaries loaded yet.</p>
-        {/if}
-      </div>
 
       {#if selectedClusterPanel}
         <div class="graph-3d-cluster-detail">
