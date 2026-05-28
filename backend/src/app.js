@@ -308,10 +308,10 @@ function buildGraph3dRequest(req) {
   const maxNodes = Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
   const relationship = req.query?.relationship || 'both';
   const status = 'downloaded';
-  const scope = 'corpus';
+  const scope = 'all';
   const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
   const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
-  const corpusId = req.corpusId || null;
+  const corpusId = null;
   let dbModifiedMs = 0;
   try {
     dbModifiedMs = Math.floor(fs.statSync(DB_PATH).mtimeMs);
@@ -4546,9 +4546,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
     }
     const options = buildGraph3dRequest(req);
-    if (!options.corpusId) {
-      return res.json(emptyGraph3dPayload('empty-corpus'));
-    }
     const dbPath = DB_PATH;
     const cacheKey = JSON.stringify({
       version: GRAPH_3D_CACHE_VERSION,
@@ -4589,9 +4586,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     const options = buildGraph3dRequest(req);
-    if (!options.corpusId) {
-      return res.json(emptyGraph3dManifest('empty-corpus'));
-    }
     const key = graph3dSnapshotKey(options);
     const snapshotDir = graph3dSnapshotPath(key);
     const manifestPath = graph3dSnapshotPath(key, 'manifest.json');

@@ -188,7 +188,7 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
   const graphResponse = page.waitForResponse((res) => {
     const url = new URL(res.url())
     if (url.pathname !== '/api/graph/3d/snapshot' || res.request().method() !== 'GET') return false
-    return url.searchParams.get('scope') === 'corpus'
+    return url.searchParams.get('scope') === 'all'
   })
   await page.goto('/#/graph')
   await page.getByTestId('tab-graph').click()

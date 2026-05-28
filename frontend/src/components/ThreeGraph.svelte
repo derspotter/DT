@@ -39,7 +39,7 @@
   let graphLoading = false
   let relationship = 'both'
   let statusFilter = 'downloaded'
-  let scope = 'corpus'
+  let scope = 'all'
   let maxNodes = 10000
   let colorMode = 'cluster'
   let depthScale = 1.6
@@ -771,7 +771,7 @@
     <div class="workspace-panel-title">
       <h2 class="workspace-section-title">3D Graph Explorer</h2>
       <p class="muted">
-        Fast WebGL overview of downloaded, metadata-ready works in the current corpus. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
+        Fast WebGL overview of downloaded, metadata-ready works across the database. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
       </p>
     </div>
     <div class="graph-3d-actions">
