@@ -38,8 +38,8 @@
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
   let relationship = 'both'
-  let statusFilter = 'all'
-  let scope = 'all'
+  let statusFilter = 'downloaded'
+  let scope = 'corpus'
   let maxNodes = 10000
   let colorMode = 'cluster'
   let depthScale = 1.6
@@ -771,7 +771,7 @@
     <div class="workspace-panel-title">
       <h2 class="workspace-section-title">3D Graph Explorer</h2>
       <p class="muted">
-        Fast WebGL overview of the most connected corpus works. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
+        Fast WebGL overview of downloaded, metadata-ready works in the current corpus. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
       </p>
     </div>
     <div class="graph-3d-actions">
@@ -790,27 +790,11 @@
 
   <div class="graph-3d-controls">
     <label>
-      <span class="muted small">Scope</span>
-      <select bind:value={scope} disabled={graphLoading}>
-        <option value="all">Full library</option>
-        <option value="corpus">Current corpus</option>
-      </select>
-    </label>
-    <label>
       <span class="muted small">Relationship</span>
       <select bind:value={relationship} disabled={graphLoading}>
         <option value="both">References + cited by</option>
         <option value="references">References only</option>
         <option value="cited_by">Cited by only</option>
-      </select>
-    </label>
-    <label>
-      <span class="muted small">Status</span>
-      <select bind:value={statusFilter} disabled={graphLoading}>
-        <option value="all">All</option>
-        <option value="downloaded">Downloaded</option>
-        <option value="matched">Matched</option>
-        <option value="raw">Raw</option>
       </select>
     </label>
     <label>

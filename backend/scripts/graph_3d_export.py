@@ -148,6 +148,14 @@ def status_allowed(filter_status, row):
     return filter_status == "all" or status == filter_status
 
 
+def has_downloaded_metadata(row):
+    if str(row.get("download_status") or "").strip().lower() != "downloaded":
+        return False
+    if str(row.get("metadata_status") or "").strip().lower() != "matched":
+        return False
+    return bool(str(row.get("title") or "").strip())
+
+
 def source_label(row):
     source_pdf = str(row.get("source_pdf") or "").strip()
     if source_pdf:
@@ -670,6 +678,7 @@ def main():
     parser.add_argument("--year-to", type=int, default=None)
     parser.add_argument("--corpus-id", type=int, default=None)
     parser.add_argument("--snapshot-dir", default=None)
+    parser.add_argument("--require-downloaded-metadata", action="store_true")
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db_path)
@@ -694,6 +703,8 @@ def main():
 
     rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
     rows = [row for row in rows if status_allowed(args.status, row)]
+    if args.require_downloaded_metadata:
+        rows = [row for row in rows if has_downloaded_metadata(row)]
 
     node_by_id = {}
     work_id_to_node_id = {}

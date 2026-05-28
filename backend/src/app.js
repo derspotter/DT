@@ -102,7 +102,7 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
-const GRAPH_3D_CACHE_VERSION = 5;
+const GRAPH_3D_CACHE_VERSION = 6;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
@@ -307,11 +307,11 @@ function buildGraph3dRequest(req) {
   const requestedMaxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
   const maxNodes = Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
   const relationship = req.query?.relationship || 'both';
-  const status = req.query?.status || 'all';
-  const scope = String(req.query?.scope || 'all').trim().toLowerCase();
+  const status = 'downloaded';
+  const scope = 'corpus';
   const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
   const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
-  const corpusId = scope === 'corpus' ? req.corpusId : null;
+  const corpusId = req.corpusId || null;
   let dbModifiedMs = 0;
   try {
     dbModifiedMs = Math.floor(fs.statSync(DB_PATH).mtimeMs);
@@ -331,6 +331,7 @@ function graph3dScriptArgs(options, extraArgs = []) {
     options.relationship,
     '--status',
     options.status,
+    '--require-downloaded-metadata',
     ...extraArgs,
   ];
   if (options.yearFrom !== null) args.push('--year-from', String(options.yearFrom));
@@ -388,6 +389,49 @@ function stubGraph3dManifest() {
     },
     nodes_meta: STUB_RESULTS.graph.nodes,
     edges: STUB_RESULTS.graph.edges,
+    clusters: [],
+  };
+}
+
+function emptyGraph3dPayload(source = 'api') {
+  return {
+    source,
+    nodes: [],
+    edges: [],
+    clusters: [],
+    stats: {
+      node_count: 0,
+      edge_count: 0,
+      component_count: 0,
+      cluster_count: 0,
+      relationship_counts: { references: 0, cited_by: 0 },
+      total_work_count: 0,
+      shown_node_count: 0,
+      max_nodes: 0,
+      is_limited: false,
+      area_coverage: { known: 0, total: 0 },
+      region_coverage: { known: 0, total: 0 },
+      top_areas: [],
+      top_regions: [],
+      top_countries: [],
+    },
+  };
+}
+
+function emptyGraph3dManifest(source = 'api') {
+  const payload = emptyGraph3dPayload(source);
+  return {
+    source,
+    snapshot_key: 'empty',
+    schema_version: 1,
+    stats: payload.stats,
+    files: {},
+    buffers: {
+      nodes: { count: 0, array: 'float32', stride: 3 },
+      edges: { count: 0, array: 'uint32', stride: 3 },
+    },
+    nodes_meta: [],
+    edges: [],
     clusters: [],
   };
 }
@@ -4502,6 +4546,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
     }
     const options = buildGraph3dRequest(req);
+    if (!options.corpusId) {
+      return res.json(emptyGraph3dPayload('empty-corpus'));
+    }
     const dbPath = DB_PATH;
     const cacheKey = JSON.stringify({
       version: GRAPH_3D_CACHE_VERSION,
@@ -4542,6 +4589,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     const options = buildGraph3dRequest(req);
+    if (!options.corpusId) {
+      return res.json(emptyGraph3dManifest('empty-corpus'));
+    }
     const key = graph3dSnapshotKey(options);
     const snapshotDir = graph3dSnapshotPath(key);
     const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
