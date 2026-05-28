@@ -102,7 +102,8 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
-const GRAPH_3D_CACHE_VERSION = 3;
+const GRAPH_3D_CACHE_VERSION = 4;
+const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
@@ -2645,6 +2646,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
+  for (const localOrigin of ['http://127.0.0.1:5175', 'http://localhost:5175']) {
+    if (!allowedOrigins.includes(localOrigin)) allowedOrigins.push(localOrigin);
+  }
   const corsOptions = {
     origin(origin, callback) {
       if (!origin || allowedOrigins.includes(origin)) {
@@ -4400,7 +4404,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
     }
-    const maxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, 120000);
+    const requestedMaxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
+    const maxNodes = Math.max(1000, Math.min(50000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
     const relationship = req.query?.relationship || 'both';
     const status = req.query?.status || 'all';
     const scope = String(req.query?.scope || 'all').trim().toLowerCase();

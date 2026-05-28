@@ -2314,8 +2314,7 @@ button.seed-download-tag:focus-visible {
 .graph-3d-canvas canvas {
   display: block;
   width: 100%;
-  height: calc(100% + 80px);
-  transform: translateY(-80px);
+  height: 100%;
 }
 
 .graph-3d-sidebar {

@@ -944,7 +944,7 @@ export async function fetchGraph({
 }
 
 export async function fetchGraph3D({
-  maxNodes = 120000,
+  maxNodes = 10000,
   relationship = 'both',
   status = 'all',
   scope = 'all',

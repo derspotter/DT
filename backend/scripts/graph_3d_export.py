@@ -10,6 +10,26 @@ GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
 MAX_CLUSTER_SIZE = 18000
 MAX_CLUSTER_SUMMARIES = 80
 MIN_STANDALONE_CLUSTER_SIZE = 8
+DEFAULT_MAX_NODES = 10000
+BASE_WORK_COLUMNS = [
+    "id",
+    "title",
+    "authors",
+    "year",
+    "doi",
+    "openalex_id",
+    "source",
+    "publisher",
+    "type",
+    "abstract",
+    "keywords",
+    "metadata_status",
+    "download_status",
+    "origin_key",
+    "source_pdf",
+    "source_work_id",
+    "relationship_type",
+]
 
 COUNTRY_REGIONS = {
     "US": "North America",
@@ -179,27 +199,33 @@ def openalex_payload(row):
 
 
 def science_area(row):
+    if "_science_area" in row:
+        return row["_science_area"]
     data = openalex_payload(row)
     primary_topic = data.get("primary_topic")
     if isinstance(primary_topic, dict):
         for key in ("display_name", "name"):
             if primary_topic.get(key):
-                return top_text(primary_topic.get(key))
+                row["_science_area"] = top_text(primary_topic.get(key))
+                return row["_science_area"]
         for parent_key in ("field", "subfield", "domain"):
             parent = primary_topic.get(parent_key)
             if isinstance(parent, dict) and parent.get("display_name"):
-                return top_text(parent.get("display_name"))
+                row["_science_area"] = top_text(parent.get("display_name"))
+                return row["_science_area"]
 
     topics = data.get("topics")
     if isinstance(topics, list):
         for topic in topics:
             if isinstance(topic, dict):
                 if topic.get("display_name"):
-                    return top_text(topic.get("display_name"))
+                    row["_science_area"] = top_text(topic.get("display_name"))
+                    return row["_science_area"]
                 for parent_key in ("field", "subfield", "domain"):
                     parent = topic.get(parent_key)
                     if isinstance(parent, dict) and parent.get("display_name"):
-                        return top_text(parent.get("display_name"))
+                        row["_science_area"] = top_text(parent.get("display_name"))
+                        return row["_science_area"]
 
     concepts = data.get("concepts")
     if isinstance(concepts, list):
@@ -208,37 +234,46 @@ def science_area(row):
             key=lambda concept: (-float(concept.get("score") or 0), int(concept.get("level") or 9), concept.get("display_name") or ""),
         )
         if ranked:
-            return top_text(ranked[0].get("display_name"))
+            row["_science_area"] = top_text(ranked[0].get("display_name"))
+            return row["_science_area"]
 
     keywords = data.get("keywords")
     if isinstance(keywords, list):
         for keyword in keywords:
             if isinstance(keyword, dict) and keyword.get("keyword"):
-                return top_text(keyword.get("keyword"))
+                row["_science_area"] = top_text(keyword.get("keyword"))
+                return row["_science_area"]
             if isinstance(keyword, str) and keyword.strip():
-                return top_text(keyword)
+                row["_science_area"] = top_text(keyword)
+                return row["_science_area"]
 
     raw_keywords = str(row.get("keywords") or "").strip()
     if raw_keywords:
         first = re.split(r"[,;|]", raw_keywords)[0]
         if first.strip():
-            return top_text(first)
+            row["_science_area"] = top_text(first)
+            return row["_science_area"]
 
     inferred = infer_area_from_text(row)
     if inferred:
-        return inferred
+        row["_science_area"] = inferred
+        return row["_science_area"]
 
     source = source_label(row)
     if not is_operational_source(source):
         cleaned = clean_cluster_label(source)
         cleaned = re.sub(r"[_-]?refs[_-]?(physical)?[_-]?p\d+", "", cleaned, flags=re.IGNORECASE)
-        return top_text(cleaned, "unknown area")
+        row["_science_area"] = top_text(cleaned, "unknown area")
+        return row["_science_area"]
 
     work_type = str(row.get("type") or "").strip()
-    return top_text(work_type, "unknown area")
+    row["_science_area"] = top_text(work_type, "unknown area")
+    return row["_science_area"]
 
 
 def work_countries(row):
+    if "_work_countries" in row:
+        return row["_work_countries"]
     data = openalex_payload(row)
     countries = []
     for authorship in data.get("authorships") or []:
@@ -254,15 +289,20 @@ def work_countries(row):
             country = str(institution.get("country_code") or "").strip().upper()
             if country and country not in countries:
                 countries.append(country)
-    return countries
+    row["_work_countries"] = countries
+    return row["_work_countries"]
 
 
 def work_region(row):
+    if "_work_region" in row:
+        return row["_work_region"]
     countries = work_countries(row)
     if not countries:
-        return infer_region_from_text(row) or "unknown region"
+        row["_work_region"] = infer_region_from_text(row) or "unknown region"
+        return row["_work_region"]
     region_counts = Counter(COUNTRY_REGIONS.get(country, "Other region") for country in countries)
-    return region_counts.most_common(1)[0][0]
+    row["_work_region"] = region_counts.most_common(1)[0][0]
+    return row["_work_region"]
 
 
 def cluster_seed_label(row):
@@ -451,7 +491,17 @@ def split_large_cluster(label, group, node_by_id, degree):
 
 
 def top_counter_items(counter, limit=5):
-    return [{"label": label, "count": int(count)} for label, count in counter.most_common(limit)]
+    ranked = sorted(counter.items(), key=lambda item: (str(item[0]).startswith("unknown "), -item[1], str(item[0])))
+    return [{"label": label, "count": int(count)} for label, count in ranked[:limit]]
+
+
+def dominant_meaningful(counter, unknown_label):
+    if not counter:
+        return unknown_label
+    for label, _count in counter.most_common():
+        if str(label or "").strip().lower() != unknown_label:
+            return label
+    return counter.most_common(1)[0][0]
 
 
 def cluster_visual_radius(size, label):
@@ -478,8 +528,8 @@ def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center):
             pass
     dominant_source = source_counts.most_common(1)[0][0] if source_counts else "unknown"
     dominant_decade = decade_counts.most_common(1)[0][0] if decade_counts else "unknown year"
-    dominant_area = area_counts.most_common(1)[0][0] if area_counts else "unknown area"
-    dominant_region = region_counts.most_common(1)[0][0] if region_counts else "unknown region"
+    dominant_area = dominant_meaningful(area_counts, "unknown area")
+    dominant_region = dominant_meaningful(region_counts, "unknown region")
     dominant_country = country_counts.most_common(1)[0][0] if country_counts else ""
     title = node_by_id[top_nodes[0]].get("title") if top_nodes else ""
     if str(label).startswith("low-signal:"):
@@ -520,10 +570,26 @@ def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center):
     }
 
 
+def fetch_openalex_json_for_kept_rows(conn, node_by_id):
+    rows_by_work_id = {int(row["id"]): row for row in node_by_id.values() if row.get("id") is not None}
+    work_ids = list(rows_by_work_id.keys())
+    if not work_ids:
+        return
+    for offset in range(0, len(work_ids), 900):
+        chunk = work_ids[offset : offset + 900]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(f"SELECT id, openalex_json FROM works WHERE id IN ({placeholders})", chunk):
+            item = rows_by_work_id.get(int(row["id"]))
+            if not item:
+                continue
+            item["openalex_json"] = row["openalex_json"]
+            item.pop("_openalex_json", None)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
-    parser.add_argument("--max-nodes", type=int, default=120000)
+    parser.add_argument("--max-nodes", type=int, default=DEFAULT_MAX_NODES)
     parser.add_argument("--relationship", choices=["references", "cited_by", "both"], default="both")
     parser.add_argument(
         "--status",
@@ -538,7 +604,8 @@ def main():
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
 
-    sql = "SELECT w.* FROM works w"
+    selected_columns = ", ".join(f"w.{column}" for column in BASE_WORK_COLUMNS)
+    sql = f"SELECT {selected_columns} FROM works w"
     params = []
     conditions = []
     if args.corpus_id is not None:
@@ -610,7 +677,12 @@ def main():
         keep = set(
             sorted(
                 node_by_id.keys(),
-                key=lambda node_id: (-degree[node_id], str(node_by_id[node_id].get("title") or ""), node_id),
+                key=lambda node_id: (
+                    -degree[node_id],
+                    0 if work_status(node_by_id[node_id]) == "downloaded" else 1,
+                    str(node_by_id[node_id].get("title") or ""),
+                    node_id,
+                ),
             )[: args.max_nodes]
         )
         node_by_id = {node_id: row for node_id, row in node_by_id.items() if node_id in keep}
@@ -626,6 +698,8 @@ def main():
             degree[edge["t"]] += 1
             relationship_counts[edge["r"]] += 1
             uf.union(edge["s"], edge["t"])
+
+    fetch_openalex_json_for_kept_rows(conn, node_by_id)
 
     groups = defaultdict(list)
     for node_id in node_by_id:
@@ -700,6 +774,12 @@ def main():
                 }
             )
 
+    area_counts = Counter(node.get("area") or "unknown area" for node in nodes)
+    region_counts = Counter(node.get("region") or "unknown region" for node in nodes)
+    country_counts = Counter(country for node in nodes for country in (node.get("countries") or []))
+    known_area_count = sum(count for label, count in area_counts.items() if label != "unknown area")
+    known_region_count = sum(count for label, count in region_counts.items() if label != "unknown region")
+
     payload = {
         "source": "api",
         "nodes": nodes,
@@ -712,6 +792,14 @@ def main():
             "cluster_count": len(clusters),
             "relationship_counts": relationship_counts,
             "total_work_count": len(rows),
+            "shown_node_count": len(nodes),
+            "max_nodes": args.max_nodes,
+            "is_limited": bool(args.max_nodes > 0 and len(rows) > len(nodes)),
+            "area_coverage": {"known": int(known_area_count), "total": len(nodes)},
+            "region_coverage": {"known": int(known_region_count), "total": len(nodes)},
+            "top_areas": top_counter_items(area_counts),
+            "top_regions": top_counter_items(region_counts),
+            "top_countries": top_counter_items(country_counts),
         },
     }
     conn.close()

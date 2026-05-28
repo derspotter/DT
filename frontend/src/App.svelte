@@ -3578,11 +3578,7 @@
     hydrateLogsFromTail()
     try {
       const envBase = String(import.meta.env.VITE_API_BASE || '').trim()
-      const devBackendBase =
-        window.location.port === '5175'
-          ? `${window.location.protocol}//${window.location.hostname}:4000`
-          : window.location.origin
-      const rawBase = envBase || devBackendBase
+      const rawBase = envBase || window.location.origin
       let wsUrl = 'ws://localhost:4000/api/ws'
       try {
         const u = new URL(rawBase, window.location.origin)

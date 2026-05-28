@@ -29,7 +29,7 @@
   let relationship = 'both'
   let statusFilter = 'all'
   let scope = 'all'
-  let maxNodes = 120000
+  let maxNodes = 10000
   let colorMode = 'cluster'
   let selectedNode = null
   let hoveredNode = null
@@ -138,7 +138,7 @@
     points = new THREE.Points(
       pointGeometry,
       new THREE.PointsMaterial({
-        size: 3,
+        size: 4,
         sizeAttenuation: false,
         vertexColors: true,
         transparent: true,
@@ -158,8 +158,9 @@
       const material = new THREE.MeshBasicMaterial({
         color: cluster.kind === 'low_signal' ? 0x52636a : paletteColor(cluster.area || cluster.label || cluster.id),
         transparent: true,
-        opacity: cluster.kind === 'low_signal' ? 0.055 : 0.15,
+        opacity: cluster.kind === 'low_signal' ? 0.1 : 0.3,
         wireframe: true,
+        depthTest: false,
         depthWrite: false,
       })
       const shell = new THREE.Mesh(geometry, material)
@@ -211,15 +212,41 @@
 
   function resetCamera() {
     if (!camera || !controls) return
-    const sphere = points?.geometry?.boundingSphere
-    const radius = sphere?.radius || 1600
-    const center = sphere?.center || { x: 0, y: 0, z: 0 }
-    const targetY = center.y - radius * 1.15
-    camera.position.set(center.x + radius * 0.35, targetY + radius * 0.1, center.z + radius * 2.4)
+    let center = points?.geometry?.boundingSphere?.center || { x: 0, y: 0, z: 0 }
+    let radius = points?.geometry?.boundingSphere?.radius || 1600
+    const framingClusters = clusters.slice(0, 24)
+    if (framingClusters.length) {
+      const bounds = framingClusters.reduce(
+        (acc, cluster) => {
+          const x = Number(cluster.x || 0)
+          const y = Number(cluster.y || 0)
+          const z = Number(cluster.z || 0)
+          const padding = Math.max(90, Number(cluster.radius || 0) * 1.7)
+          acc.minX = Math.min(acc.minX, x - padding)
+          acc.maxX = Math.max(acc.maxX, x + padding)
+          acc.minY = Math.min(acc.minY, y - padding)
+          acc.maxY = Math.max(acc.maxY, y + padding)
+          acc.minZ = Math.min(acc.minZ, z - padding)
+          acc.maxZ = Math.max(acc.maxZ, z + padding)
+          return acc
+        },
+        { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity, minZ: Infinity, maxZ: -Infinity }
+      )
+      center = {
+        x: (bounds.minX + bounds.maxX) / 2,
+        y: (bounds.minY + bounds.maxY) / 2,
+        z: (bounds.minZ + bounds.maxZ) / 2,
+      }
+      const spanX = bounds.maxX - bounds.minX
+      const spanY = bounds.maxY - bounds.minY
+      const spanZ = bounds.maxZ - bounds.minZ
+      radius = Math.max(520, Math.max(spanX, spanY, spanZ) * 0.62)
+    }
+    camera.position.set(center.x + radius * 1.05, center.y + radius * 0.72, center.z + radius * 1.55)
     camera.near = Math.max(0.1, radius / 4000)
     camera.far = Math.max(6000, radius * 8)
     camera.updateProjectionMatrix()
-    controls.target.set(center.x, targetY, center.z)
+    controls.target.set(center.x, center.y, center.z)
     controls.update()
   }
 
@@ -252,7 +279,12 @@
         scope,
       })
       graphData = payload || { nodes: [], edges: [], stats: {} }
-      graphStatus = `Loaded ${graphData.nodes?.length || 0} nodes and ${graphData.edges?.length || 0} edges.`
+      const totalWorks = Number(graphData.stats?.total_work_count || graphData.nodes?.length || 0)
+      const loadedNodes = Number(graphData.nodes?.length || 0)
+      const limitedNote = graphData.stats?.is_limited && totalWorks > loadedNodes
+        ? ` Showing the ${formatNumber(loadedNodes)} most connected works out of ${formatNumber(totalWorks)}.`
+        : ''
+      graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.edges?.length || 0)} edges.${limitedNote}`
       renderGraph()
     } catch (error) {
       graphStatus = error?.message || 'Failed to load 3D graph.'
@@ -326,6 +358,13 @@
     return items.slice(0, 3).map((item) => `${item.label} (${formatNumber(item.count)})`).join(', ')
   }
 
+  function coverageLabel(coverage) {
+    const known = Number(coverage?.known || 0)
+    const total = Number(coverage?.total || 0)
+    if (!total) return 'unknown coverage'
+    return `${formatNumber(known)} / ${formatNumber(total)} known`
+  }
+
   onMount(async () => {
     componentMounted = true
     await tick()
@@ -394,7 +433,7 @@
     <div class="workspace-panel-title">
       <h2 class="workspace-section-title">3D Graph Explorer</h2>
       <p class="muted">
-        Three.js/WebGL renderer for the existing corpus graph. Nodes are GPU points, edges are batched line segments, and layout is precomputed by the backend.
+        Fast WebGL overview of the most connected corpus works. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
       </p>
     </div>
     <div class="graph-3d-actions">
@@ -432,7 +471,7 @@
     </label>
     <label>
       <span class="muted small">Max nodes</span>
-      <input type="number" min="1000" max="120000" step="1000" bind:value={maxNodes} disabled={graphLoading} />
+      <input type="number" min="1000" max="50000" step="1000" bind:value={maxNodes} disabled={graphLoading} />
     </label>
     <label>
       <span class="muted small">Color by</span>
@@ -471,7 +510,13 @@
 
       <p class="muted small">{graphStatus}</p>
       <p class="muted small">
-        {formatNumber(graphData.stats?.component_count)} connected components. Clusters are citation communities; tiny fragments are bucketed by type and decade.
+        {formatNumber(graphData.stats?.component_count)} connected components. Clusters are citation communities; tiny fragments are bucketed by area, region, and decade.
+      </p>
+      <p class="muted small">
+        Areas: {compactList(graphData.stats?.top_areas)} ({coverageLabel(graphData.stats?.area_coverage)})
+      </p>
+      <p class="muted small">
+        Regions: {compactList(graphData.stats?.top_regions)} ({coverageLabel(graphData.stats?.region_coverage)})
       </p>
 
       <div class="graph-3d-clusters">
