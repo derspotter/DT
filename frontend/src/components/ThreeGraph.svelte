@@ -29,6 +29,7 @@
   let resizeObserver
   let handlePointerMove
   let handleClick
+  let handleContextMenu
   let componentMounted = false
   let initialLoadStarted = false
   let clusterLabelLayer
@@ -704,6 +705,16 @@
     controls.enableRotate = true
     controls.enablePan = true
     controls.enableZoom = true
+    controls.screenSpacePanning = true
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.DOLLY,
+      RIGHT: THREE.MOUSE.PAN,
+    }
+    controls.touches = {
+      ONE: THREE.TOUCH.ROTATE,
+      TWO: THREE.TOUCH.DOLLY_PAN,
+    }
     controls.autoRotate = autoRotate
     controls.autoRotateSpeed = 0.65
     controls.addEventListener('change', requestRender)
@@ -711,8 +722,10 @@
     raycaster = new THREE.Raycaster()
     handlePointerMove = (event) => pickNode(event, false)
     handleClick = (event) => pickNode(event, true)
+    handleContextMenu = (event) => event.preventDefault()
     renderer.domElement.addEventListener('pointermove', handlePointerMove)
     renderer.domElement.addEventListener('click', handleClick)
+    renderer.domElement.addEventListener('contextmenu', handleContextMenu)
 
     resizeObserver = new ResizeObserver(resize)
     resizeObserver.observe(container)
@@ -735,6 +748,7 @@
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
     if (handleClick) renderer?.domElement?.removeEventListener('click', handleClick)
+    if (handleContextMenu) renderer?.domElement?.removeEventListener('contextmenu', handleContextMenu)
     controls?.dispose()
     disposeObject(points)
     disposeObject(edgeLines)
