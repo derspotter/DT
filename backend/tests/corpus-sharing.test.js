@@ -238,4 +238,99 @@ describe('corpus sharing and multi-user isolation', () => {
     expect(res.status).toBe(200)
     expect(res.headers['content-disposition']).toContain('relative-download.pdf')
   })
+
+  test('kantropos browse exposes graph nodes and citation edges for upstream visualization', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusRes = await request(app)
+      .post('/api/corpora')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ name: 'Upstream graph source corpus' })
+    expect(corpusRes.status).toBe(201)
+    const corpusId = Number(corpusRes.body.id)
+
+    const assignmentRes = await request(app)
+      .put(`/api/corpora/${corpusId}/kantropos-assignment`)
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ targetId: 'target-a' })
+    expect(assignmentRes.status).toBe(200)
+
+    withDb((db) => {
+      const metadataBibPath = path.join(tmpDir, 'target-a', 'metadata.bib')
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS citation_edges (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_id TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          relationship_type TEXT NOT NULL,
+          source_table TEXT,
+          target_table TEXT,
+          source_row_id INTEGER,
+          target_row_id INTEGER,
+          run_id INTEGER,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(source_id, target_id, relationship_type)
+        )
+      `)
+      const current = db
+        .prepare(
+          `INSERT INTO works (
+             title, normalized_title, authors, year, type, openalex_id,
+             metadata_status, download_status, origin_type, origin_key
+           ) VALUES (?, ?, ?, ?, ?, ?, 'matched', 'downloaded', 'bibtex_import', ?)`
+        )
+        .run(
+          'Current upstream graph node',
+          'current upstream graph node',
+          'Current Author',
+          2024,
+          'journal-article',
+          'https://openalex.org/W100000001',
+          metadataBibPath
+        )
+      const pending = db
+        .prepare(
+          `INSERT INTO works (
+             title, normalized_title, authors, year, type, openalex_id,
+             metadata_status, download_status
+           ) VALUES (?, ?, ?, ?, ?, ?, 'matched', 'downloaded')`
+        )
+        .run(
+          'Pending local graph node',
+          'pending local graph node',
+          'Pending Author',
+          2025,
+          'book',
+          'https://openalex.org/W100000002'
+        )
+      const pendingWorkId = Number(pending.lastInsertRowid)
+      db.prepare('INSERT INTO corpus_works (corpus_id, work_id) VALUES (?, ?)').run(corpusId, pendingWorkId)
+      db
+        .prepare(
+          `INSERT INTO citation_edges (source_id, target_id, relationship_type, source_row_id, target_row_id)
+           VALUES (?, ?, 'references', ?, ?)`
+        )
+        .run('W100000002', 'W100000001', pendingWorkId, Number(current.lastInsertRowid))
+    })
+
+    const browseRes = await request(app)
+      .get('/api/kantropos/corpora/target-a/browse')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(browseRes.status).toBe(200)
+    expect(browseRes.body.graph.nodes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'W100000001', upstream_state: 'current' }),
+        expect.objectContaining({ id: 'W100000002', upstream_state: 'pending' }),
+      ])
+    )
+    expect(browseRes.body.graph.edges).toEqual([
+      expect.objectContaining({ source: 'W100000002', target: 'W100000001', relationship_type: 'references' }),
+    ])
+    expect(browseRes.body.graph.stats).toEqual(
+      expect.objectContaining({
+        node_count: expect.any(Number),
+        edge_count: 1,
+        relationship_counts: expect.objectContaining({ references: 1 }),
+      })
+    )
+  })
 })

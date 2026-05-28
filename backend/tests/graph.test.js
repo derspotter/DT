@@ -22,4 +22,13 @@ describe('GET /api/graph (stub)', () => {
     expect(res.body.stats).toHaveProperty('node_count')
     expect(res.body.stats).toHaveProperty('edge_count')
   })
+
+  test('returns 3D graph payload', async () => {
+    const res = await request(app).get('/api/graph/3d?max_nodes=1000&relationship=both')
+    expect(res.status).toBe(200)
+    expect(res.body).toHaveProperty('nodes')
+    expect(res.body).toHaveProperty('edges')
+    expect(res.body).toHaveProperty('stats')
+    expect(res.body).toHaveProperty('source', 'stub')
+  })
 })

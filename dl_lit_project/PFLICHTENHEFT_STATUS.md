@@ -22,10 +22,12 @@ Status: `completed`.
 
 ## M-03 Visualisierung
 
-Status: `deferred (nice-to-have for now)`.
+Status: `completed for current upstream/corpus scope`.
 
-- Graph API and UI exist in basic form.
-- Further visualization work intentionally deferred while ingestion/search/download are prioritized.
+- Current-corpus Graph tab visualizes references as nodes and citation relationships as edges.
+- Graph view supports relationship filters and color grouping by search path, component, status, decade, and work type.
+- The Graph tab also provides a Three.js/WebGL 3D explorer for large existing datasets, using backend-precomputed coordinates plus batched GPU points and line segments.
+- Korpus Management now includes an upstream corpus map that visualizes imported `metadata.bib` baseline items, pending downloaded local additions, available citation edges, source/path clustering, status/year clustering, node metrics, and selected-reference details.
 
 ## M-04 Frontend
 

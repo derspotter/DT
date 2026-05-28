@@ -101,6 +101,8 @@ const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py')
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
+const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
+const GRAPH_3D_CACHE_VERSION = 3;
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
@@ -851,13 +853,33 @@ function statusFromWorkRow(data) {
   return 'raw';
 }
 
+function normalizeGraphOpenAlexId(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const match = text.match(/(W\d+)/i);
+  return match ? match[1].toUpperCase() : null;
+}
+
+function normalizeGraphDoi(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  const match = text.match(/(10\.\d{4,9}\/[-._;()/:A-Z0-9]+)/i);
+  return (match ? match[1] : text).toUpperCase();
+}
+
+function graphNodeIdFromWorkRow(data) {
+  return normalizeGraphOpenAlexId(data?.openalex_id) || normalizeGraphDoi(data?.doi) || `work:${Number(data?.id)}`;
+}
+
 function mapWorkRowToBrowserItem(data, extra = {}) {
   return {
     id: Number(data?.id),
     work_id: Number(data?.id),
+    graph_node_id: graphNodeIdFromWorkRow(data),
     title: data?.title || '',
     authors: data?.authors || '',
     year: data?.year ?? null,
+    type: data?.type || '',
     source: data?.origin_key || data?.source_pdf || data?.metadata_source || data?.source || '',
     status: statusFromWorkRow(data),
     metadata_status: data?.metadata_status || '',
@@ -865,7 +887,108 @@ function mapWorkRowToBrowserItem(data, extra = {}) {
     doi: data?.doi || null,
     openalex_id: data?.openalex_id || null,
     file_path: data?.file_path || null,
+    source_work_id: data?.source_work_id ?? null,
+    relationship_type: data?.relationship_type || null,
     ...extra,
+  };
+}
+
+function buildKantroposGraphPayload(db, currentItems = [], pendingItems = []) {
+  const nodeById = new Map();
+  const workIdToNodeId = new Map();
+
+  const addNode = (item, upstreamState) => {
+    const nodeId = String(item?.graph_node_id || '').trim();
+    if (!nodeId) return;
+    const workId = Number(item?.work_id || item?.id);
+    if (Number.isFinite(workId) && workId > 0) {
+      workIdToNodeId.set(workId, nodeId);
+      workIdToNodeId.set(String(workId), nodeId);
+    }
+    const sourceCorpora = Array.isArray(item?.source_corpora) ? item.source_corpora : [];
+    const existing = nodeById.get(nodeId);
+    if (existing) {
+      existing.upstream_state = existing.upstream_state === upstreamState ? upstreamState : 'both';
+      existing.source_corpora = [
+        ...existing.source_corpora,
+        ...sourceCorpora.filter(
+          (sourceCorpus) => !existing.source_corpora.some((entry) => Number(entry.id) === Number(sourceCorpus.id))
+        ),
+      ];
+      existing.source_corpora_count = existing.source_corpora.length;
+      return;
+    }
+    nodeById.set(nodeId, {
+      id: nodeId,
+      work_id: Number.isFinite(workId) && workId > 0 ? workId : null,
+      title: item?.title || 'Untitled',
+      year: item?.year ?? null,
+      type: item?.type || '',
+      status: item?.status || '',
+      upstream_state: upstreamState,
+      source: item?.source || '',
+      doi: item?.doi || null,
+      openalex_id: item?.openalex_id || null,
+      source_corpora: sourceCorpora,
+      source_corpora_count: Number(item?.source_corpora_count || sourceCorpora.length || 0),
+      source_work_id: item?.source_work_id ?? null,
+      relationship_type: item?.relationship_type || null,
+    });
+  };
+
+  for (const item of currentItems || []) addNode(item, 'current');
+  for (const item of pendingItems || []) addNode(item, 'pending');
+
+  const allowedNodeIds = new Set(nodeById.keys());
+  const edges = [];
+  const edgeSet = new Set();
+  const addEdge = (source, target, relationshipType = 'references') => {
+    const sourceId = String(source || '').trim();
+    const targetId = String(target || '').trim();
+    if (!sourceId || !targetId || sourceId === targetId) return;
+    if (!allowedNodeIds.has(sourceId) || !allowedNodeIds.has(targetId)) return;
+    const relationship = String(relationshipType || 'references').trim() || 'references';
+    const key = `${sourceId}\u0000${targetId}\u0000${relationship}`;
+    if (edgeSet.has(key)) return;
+    edgeSet.add(key);
+    edges.push({ source: sourceId, target: targetId, relationship_type: relationship });
+  };
+
+  if (tableExists(db, 'citation_edges') && allowedNodeIds.size > 0) {
+    const rows = db.prepare('SELECT source_id, target_id, relationship_type FROM citation_edges').all();
+    for (const row of rows) {
+      addEdge(row.source_id, row.target_id, row.relationship_type);
+    }
+  }
+
+  for (const node of nodeById.values()) {
+    const targetId = node.id;
+    const sourceWorkId = node.source_work_id;
+    let sourceId = null;
+    if (sourceWorkId !== null && sourceWorkId !== undefined && sourceWorkId !== '') {
+      sourceId = workIdToNodeId.get(Number(sourceWorkId)) || workIdToNodeId.get(String(sourceWorkId));
+      sourceId = sourceId || normalizeGraphOpenAlexId(sourceWorkId) || normalizeGraphDoi(sourceWorkId);
+    }
+    addEdge(sourceId, targetId, node.relationship_type || 'references');
+  }
+
+  const relationshipCounts = edges.reduce(
+    (counts, edge) => {
+      const relationship = edge.relationship_type === 'cited_by' ? 'cited_by' : 'references';
+      counts[relationship] += 1;
+      return counts;
+    },
+    { references: 0, cited_by: 0 }
+  );
+
+  return {
+    nodes: [...nodeById.values()],
+    edges,
+    stats: {
+      node_count: nodeById.size,
+      edge_count: edges.length,
+      relationship_counts: relationshipCounts,
+    },
   };
 }
 
@@ -1058,6 +1181,7 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
     assigned_corpora: [...assignedById.values()],
     current_items: currentItems,
     pending_items: pendingItems,
+    graph: buildKantroposGraphPayload(db, currentItems, pendingItems),
   };
 }
 
@@ -1764,6 +1888,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
   const pipelineWorkers = new Map(); // corpusId -> state
+  const graph3dCache = new Map();
   const authConfig = resolveAuthConfig();
 
   // Ensure temporary and output directories exist
@@ -4235,6 +4360,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const maxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, 200);
     const relationship = req.query?.relationship || 'both';
     const status = req.query?.status || 'all';
+    const scope = String(req.query?.scope || 'all').trim().toLowerCase();
     const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
     const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
     const hideIsolates = req.query?.hide_isolates !== '0' && req.query?.hideIsolates !== '0';
@@ -4259,11 +4385,75 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       args.push('--year-to', String(yearTo));
     }
     try {
-      const payload = await runPythonJson(GRAPH_EXPORT_SCRIPT, args, { dbPath, corpusId: req.corpusId });
+      const payload = await runPythonJson(GRAPH_EXPORT_SCRIPT, args, {
+        dbPath,
+        corpusId: scope === 'corpus' ? req.corpusId : null,
+      });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/graph] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to build graph' });
+    }
+  });
+
+  app.get('/api/graph/3d', requireAuthMiddleware, async (req, res) => {
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
+    }
+    const maxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, 120000);
+    const relationship = req.query?.relationship || 'both';
+    const status = req.query?.status || 'all';
+    const scope = String(req.query?.scope || 'all').trim().toLowerCase();
+    const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
+    const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
+    const dbPath = DB_PATH;
+
+    const args = [
+      '--db-path',
+      dbPath,
+      '--max-nodes',
+      String(maxNodes),
+      '--relationship',
+      relationship,
+      '--status',
+      status,
+    ];
+    if (yearFrom !== null) {
+      args.push('--year-from', String(yearFrom));
+    }
+    if (yearTo !== null) {
+      args.push('--year-to', String(yearTo));
+    }
+    const scopedCorpusId = scope === 'corpus' ? req.corpusId : null;
+    const cacheKey = JSON.stringify({
+      version: GRAPH_3D_CACHE_VERSION,
+      maxNodes,
+      relationship,
+      status,
+      scope,
+      yearFrom,
+      yearTo,
+      corpusId: scopedCorpusId,
+    });
+    const cached = graph3dCache.get(cacheKey);
+    const cacheTtlMs = 15 * 60 * 1000;
+    if (cached && cached.createdAt + cacheTtlMs > Date.now()) {
+      return res.json({ ...cached.payload, source: 'cache' });
+    }
+    try {
+      const payload = await runPythonJson(GRAPH_3D_EXPORT_SCRIPT, args, {
+        dbPath,
+        corpusId: scopedCorpusId,
+      });
+      graph3dCache.set(cacheKey, { createdAt: Date.now(), payload });
+      if (graph3dCache.size > 4) {
+        const oldestKey = [...graph3dCache.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
+        if (oldestKey) graph3dCache.delete(oldestKey);
+      }
+      return res.json(payload);
+    } catch (error) {
+      console.error('[/api/graph/3d] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to build 3D graph' });
     }
   });
 

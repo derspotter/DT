@@ -360,6 +360,7 @@
   let graphStats = null
   let graphRelationship = 'both'
   let graphStatusFilter = 'all'
+  let graphScope = 'all'
   let graphYearFrom = ''
   let graphYearTo = ''
   let graphMaxNodes = 200
@@ -417,6 +418,7 @@
     assigned_corpora: [],
     current_items: [],
     pending_items: [],
+    graph: { nodes: [], edges: [], stats: {} },
   }
   let upstreamBrowseStatus = ''
   let upstreamBrowseLoading = false
@@ -456,6 +458,7 @@
       assigned_corpora: [],
       current_items: [],
       pending_items: [],
+      graph: { nodes: [], edges: [], stats: {} },
     }
     upstreamBrowseStatus = ''
     upstreamBrowseLoading = false
@@ -1864,6 +1867,7 @@
         assigned_corpora: assignedCorpora,
         current_items: (Array.isArray(payload?.current_items) ? payload.current_items : []).map((item) => normalizeUpstreamBrowseItem(item)),
         pending_items: (Array.isArray(payload?.pending_items) ? payload.pending_items : []).map((item) => normalizeUpstreamBrowseItem(item)),
+        graph: payload?.graph || { nodes: [], edges: [], stats: {} },
       }
       if (!quiet) {
         upstreamBrowseStatus = 'Loaded upstream corpus browser.'
@@ -3452,7 +3456,7 @@
     graphEdges = data.edges || []
     graphStats = data.stats || null
     graphSource = source
-    graphStatus = statusText || (source === 'api' ? 'Loaded from API.' : 'Sample graph loaded.')
+    graphStatus = statusText || (source === 'sample' ? 'Sample graph loaded.' : 'Loaded from API.')
     const degreeMap = buildDegreeMap(graphNodes, graphEdges)
     graphDegreeMap = degreeMap
     const { layoutEdges } = buildLayoutEdges(graphNodes, graphEdges, degreeMap)
@@ -3475,6 +3479,7 @@
         maxNodes: graphMaxNodes,
         relationship: graphRelationship,
         status: graphStatusFilter,
+        scope: graphScope,
         yearFrom: graphYearFrom ? Number(graphYearFrom) : null,
         yearTo: graphYearTo ? Number(graphYearTo) : null,
       }
@@ -5727,6 +5732,7 @@
         <Graph
           bind:graphRelationship={graphRelationship}
           bind:graphStatusFilter={graphStatusFilter}
+          bind:graphScope={graphScope}
           bind:graphYearFrom={graphYearFrom}
           bind:graphYearTo={graphYearTo}
           bind:graphMaxNodes={graphMaxNodes}

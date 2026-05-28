@@ -84,6 +84,7 @@ def ensure_graph_cache_table(conn):
 
 def build_cache_key(args):
     payload = {
+        "version": 2,
         "max_nodes": args.max_nodes,
         "relationship": args.relationship,
         "status": args.status,
@@ -347,7 +348,43 @@ def main():
 
     nodes.sort(key=lambda item: (-(degree.get(item["id"], 0)), item.get("title") or "", item["id"]))
     if args.max_nodes > 0 and len(nodes) > args.max_nodes:
-        keep = {node["id"] for node in nodes[: args.max_nodes]}
+        keep = set()
+        if edges:
+            adjacency = {}
+            for edge in edges:
+                adjacency.setdefault(edge["source"], set()).add(edge["target"])
+                adjacency.setdefault(edge["target"], set()).add(edge["source"])
+            seeds = sorted(
+                (node["id"] for node in nodes),
+                key=lambda node_id: (-(degree.get(node_id, 0)), str(node_by_key.get(node_id, {}).get("title") or ""), node_id),
+            )
+            for seed in seeds:
+                if len(keep) >= args.max_nodes:
+                    break
+                if seed in keep:
+                    continue
+                keep.add(seed)
+                queue = [seed]
+                visited = {seed}
+                while queue and len(keep) < args.max_nodes:
+                    current = queue.pop(0)
+                    neighbors = sorted(
+                        adjacency.get(current, []),
+                        key=lambda node_id: (-(degree.get(node_id, 0)), str(node_by_key.get(node_id, {}).get("title") or ""), node_id),
+                    )
+                    for neighbor in neighbors:
+                        if neighbor in visited:
+                            continue
+                        visited.add(neighbor)
+                        keep.add(neighbor)
+                        queue.append(neighbor)
+                        if len(keep) >= args.max_nodes:
+                            break
+        if len(keep) < args.max_nodes:
+            for node in nodes:
+                keep.add(node["id"])
+                if len(keep) >= args.max_nodes:
+                    break
         nodes = [node for node in nodes if node["id"] in keep]
         edges = [edge for edge in edges if edge["source"] in keep and edge["target"] in keep]
 

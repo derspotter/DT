@@ -1,4 +1,6 @@
 <script>
+  import UpstreamCorpusMap from './UpstreamCorpusMap.svelte'
+
   export let corpora = []
   export let currentCorpus = null
   export let currentCorpusId = null
@@ -321,6 +323,10 @@
       </div>
     {/if}
   </div>
+
+  {#if browse?.target}
+    <UpstreamCorpusMap {browse} {loading} />
+  {/if}
 
   <div class="upstream-columns seed-corpus-columns">
     <div class="seed-corpus-column">

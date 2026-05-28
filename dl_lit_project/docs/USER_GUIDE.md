@@ -227,6 +227,10 @@ Important:
 - the target assignment does not itself export files yet
 - it records which Kantropos corpus this local corpus is meant to feed
 
+The `Korpus Management` tab also includes an upstream corpus map. It shows imported `metadata.bib` baseline references, pending downloaded additions from assigned local corpora, and citation edges when OpenAlex/DOI graph data is available. Use the controls to switch between current/pending items and color the map by corpus state, source corpus/path, pipeline status, or year decade.
+
+The `Graph` tab has two views. The overview graph is for a smaller, inspectable 2D subset. The `3D Graph Explorer` loads a larger Three.js/WebGL graph from the existing database and is intended for navigating the full corpus network with GPU-rendered points and edges.
+
 ## Password Reset
 
 If you forget your password:

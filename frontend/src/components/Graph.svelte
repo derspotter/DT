@@ -1,8 +1,11 @@
 <script>
+  import ThreeGraph from './ThreeGraph.svelte'
+
   export let graphStatus;
   export let graphSource;
   export let graphRelationship;
   export let graphStatusFilter;
+  export let graphScope;
   export let graphYearFrom;
   export let graphYearTo;
   export let graphMaxNodes;
@@ -34,10 +37,22 @@
   export let graphDegreeMap;
 </script>
 
+<ThreeGraph />
+
 <div class="card" data-testid="graph-panel">
-  <h2>Graph overview</h2>
+  <h2>Legacy 2D sample</h2>
+  <p class="muted small">
+    Limited SVG sampler for quick inspection. Use the 3D Graph Explorer above for the full library graph.
+  </p>
   <p class="muted">{graphStatus} ({graphSource})</p>
   <div class="graph-controls">
+    <label>
+      <span>Scope</span>
+      <select bind:value={graphScope}>
+        <option value="all">Full library</option>
+        <option value="corpus">Current corpus</option>
+      </select>
+    </label>
     <label>
       <span>Relationship</span>
       <select bind:value={graphRelationship}>

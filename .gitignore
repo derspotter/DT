@@ -67,6 +67,7 @@ ocr/ocr_results/
 ocr/translated/
 
 # Local workspace artifacts
+Scraper_first_version/
 /.codex
 /.codex/
 /.tmp/

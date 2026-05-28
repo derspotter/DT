@@ -909,6 +909,7 @@ export async function fetchGraph({
   maxNodes = 200,
   relationship = 'both',
   status = 'all',
+  scope = 'all',
   yearFrom = null,
   yearTo = null,
   hideIsolates = true,
@@ -918,6 +919,7 @@ export async function fetchGraph({
     params.set('max_nodes', String(maxNodes))
     if (relationship) params.set('relationship', relationship)
     if (status) params.set('status', status)
+    if (scope) params.set('scope', scope)
     params.set('hide_isolates', hideIsolates ? '1' : '0')
     if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {
       params.set('year_from', String(yearFrom))
@@ -939,4 +941,32 @@ export async function fetchGraph({
     }
     return { data: sampleGraph, source: 'sample', error }
   }
+}
+
+export async function fetchGraph3D({
+  maxNodes = 120000,
+  relationship = 'both',
+  status = 'all',
+  scope = 'all',
+  yearFrom = null,
+  yearTo = null,
+} = {}) {
+  const params = new URLSearchParams()
+  params.set('max_nodes', String(maxNodes))
+  if (relationship) params.set('relationship', relationship)
+  if (status) params.set('status', status)
+  if (scope) params.set('scope', scope)
+  if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {
+    params.set('year_from', String(yearFrom))
+  }
+  if (yearTo !== null && yearTo !== undefined && yearTo !== '') {
+    params.set('year_to', String(yearTo))
+  }
+  const response = await fetchWithTimeout(`${API_BASE}/api/graph/3d?${params.toString()}`, {}, PIPELINE_TIMEOUT)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || `HTTP ${response.status}`)
+  }
+  return response.json()
 }
