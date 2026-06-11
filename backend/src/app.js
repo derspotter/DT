@@ -102,7 +102,7 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
-const GRAPH_3D_CACHE_VERSION = 6;
+const GRAPH_3D_CACHE_VERSION = 7;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
@@ -380,7 +380,8 @@ function stubGraph3dManifest() {
   return {
     source: 'stub',
     snapshot_key: 'stub',
-    schema_version: 1,
+    schema_version: 2,
+    layout: { algorithm: 'stub' },
     stats: STUB_RESULTS.graph.stats,
     files: {},
     buffers: {
@@ -423,7 +424,8 @@ function emptyGraph3dManifest(source = 'api') {
   return {
     source,
     snapshot_key: 'empty',
-    schema_version: 1,
+    schema_version: 2,
+    layout: { algorithm: 'empty' },
     stats: payload.stats,
     files: {},
     buffers: {

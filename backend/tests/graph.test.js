@@ -37,6 +37,8 @@ describe('GET /api/graph (stub)', () => {
     expect(res.status).toBe(200)
     expect(res.body).toHaveProperty('source', 'stub')
     expect(res.body).toHaveProperty('snapshot_key')
+    expect(res.body).toHaveProperty('schema_version', 2)
+    expect(res.body).toHaveProperty('layout.algorithm')
     expect(res.body).toHaveProperty('buffers.nodes.count')
     expect(res.body).toHaveProperty('nodes_meta')
   })

@@ -3,10 +3,21 @@ from array import array
 import json
 import math
 import os
+import random
 import re
 import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+
+try:
+    import igraph
+    import numpy as np
+
+    LAYOUT_AVAILABLE = True
+except ImportError:
+    igraph = None
+    np = None
+    LAYOUT_AVAILABLE = False
 
 
 GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
@@ -14,7 +25,10 @@ MAX_CLUSTER_SIZE = 18000
 MAX_CLUSTER_SUMMARIES = 80
 MIN_STANDALONE_CLUSTER_SIZE = 8
 DEFAULT_MAX_NODES = 10000
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
+LAYOUT_SEED = 42
+LAYOUT_TARGET_RADIUS = 2200.0
+LAYOUT_MIN_FORCE_COMPONENT = 5
 BASE_WORK_COLUMNS = [
     "id",
     "title",
@@ -412,6 +426,148 @@ class UnionFind:
         self.size[ra] += self.size[rb]
 
 
+def fibonacci_direction(index, total):
+    y = 1 - 2 * (index + 0.5) / max(1, total)
+    ring = math.sqrt(max(0.0, 1 - y * y))
+    theta = index * GOLDEN_ANGLE
+    return (math.cos(theta) * ring, y, math.sin(theta) * ring)
+
+
+def layout_component(size, local_edges):
+    if size <= 1:
+        return [(0.0, 0.0, 0.0)]
+    if size < LAYOUT_MIN_FORCE_COMPONENT or not local_edges:
+        radius = 14.0 + math.pow(size, 0.5) * 6.0
+        return [
+            tuple(value * radius * (0.4 + 0.6 * (index + 1) / size) for value in fibonacci_direction(index, size))
+            for index in range(size)
+        ]
+    graph = igraph.Graph(size, local_edges)
+    niter = int(min(200, 90 + math.sqrt(size) * 1.5))
+    layout = graph.layout_fruchterman_reingold(dim=3, niter=niter)
+    return [tuple(coord) for coord in layout]
+
+
+def normalize_component(coords, size):
+    points = np.asarray(coords, dtype=np.float64)
+    points -= points.mean(axis=0)
+    if size > 1:
+        spread = float(np.percentile(np.linalg.norm(points, axis=1), 90))
+        target = math.pow(size, 0.4) * 40.0
+        if spread > 1e-9:
+            points *= target / spread
+    return points
+
+
+def compute_force_layout(components, edges, clusters):
+    """3D force-directed layout of the citation graph.
+
+    Components with at least LAYOUT_MIN_FORCE_COMPONENT nodes get a real
+    Fruchterman-Reingold 3D layout and are packed on golden-angle shells around
+    the giant component. The remaining "dust" (isolated or near-isolated works,
+    typically the vast majority) is grouped by cluster label into compact balls
+    on outer shells, mirroring the territory grouping of the legacy layout.
+
+    Returns {node_id: (x, y, z)} or None when igraph/numpy are unavailable.
+    """
+    if not LAYOUT_AVAILABLE:
+        return None
+    igraph.set_random_number_generator(random.Random(LAYOUT_SEED))
+
+    force_components = [group for group in components if len(group) >= LAYOUT_MIN_FORCE_COMPONENT]
+    dust_nodes = set()
+    for group in components:
+        if len(group) < LAYOUT_MIN_FORCE_COMPONENT:
+            dust_nodes.update(group)
+
+    component_of = {}
+    local_index = {}
+    for component_id, group in enumerate(force_components):
+        for position, node_id in enumerate(group):
+            component_of[node_id] = component_id
+            local_index[node_id] = position
+
+    component_edges = defaultdict(set)
+    for edge in edges:
+        source, target = edge["s"], edge["t"]
+        if source == target or source not in component_of or target not in component_of:
+            continue
+        pair = (local_index[source], local_index[target])
+        component_edges[component_of[source]].add((min(pair), max(pair)))
+
+    layouts = []
+    for component_id, group in enumerate(force_components):
+        coords = layout_component(len(group), sorted(component_edges.get(component_id, ())))
+        layouts.append(normalize_component(coords, len(group)))
+
+    radii = [
+        float(np.linalg.norm(points, axis=1).max()) if len(points) > 1 else 8.0
+        for points in layouts
+    ]
+
+    dust_groups = []
+    for _label, group in clusters:
+        members = [node_id for node_id in group if node_id in dust_nodes]
+        if members:
+            dust_groups.append(members)
+
+    satellites = [
+        ("component", component_id, radii[component_id], len(force_components[component_id]))
+        for component_id in range(1, len(force_components))
+    ]
+    for group_index, members in enumerate(dust_groups):
+        ball_radius = 14.0 + math.pow(len(members), 0.5) * 6.0
+        satellites.append(("dust", group_index, ball_radius, len(members)))
+    satellites.sort(key=lambda item: -item[3])
+
+    positions = {}
+    if force_components:
+        for position, node_id in enumerate(force_components[0]):
+            point = layouts[0][position]
+            positions[node_id] = (float(point[0]), float(point[1]), float(point[2]))
+
+    giant_radius = radii[0] if radii else 0.0
+    satellite_count = max(1, len(satellites))
+    for index, (kind, ref, radius, _size) in enumerate(satellites):
+        direction = np.asarray(fibonacci_direction(index, satellite_count))
+        distance = giant_radius + radius + 140.0 + 60.0 * math.pow(index + 1, 0.55)
+        offset = direction * distance
+        if kind == "component":
+            placed = layouts[ref] + offset
+            for position, node_id in enumerate(force_components[ref]):
+                point = placed[position]
+                positions[node_id] = (float(point[0]), float(point[1]), float(point[2]))
+        else:
+            members = dust_groups[ref]
+            for position, node_id in enumerate(members):
+                spread = fibonacci_direction(position, len(members))
+                reach = radius * (0.35 + 0.65 * (position + 1) / len(members))
+                positions[node_id] = (
+                    float(offset[0] + spread[0] * reach),
+                    float(offset[1] + spread[1] * reach),
+                    float(offset[2] + spread[2] * reach),
+                )
+
+    max_radius = max((math.sqrt(x * x + y * y + z * z) for x, y, z in positions.values()), default=0.0)
+    if max_radius > 1e-9:
+        scale = min(LAYOUT_TARGET_RADIUS / max_radius, 8.0)
+        positions = {
+            node_id: (x * scale, y * scale, z * scale)
+            for node_id, (x, y, z) in positions.items()
+        }
+    return positions
+
+
+def cluster_geometry_from_positions(group, positions):
+    points = np.asarray([positions[node_id] for node_id in group], dtype=np.float64)
+    center = points.mean(axis=0)
+    if len(group) > 1:
+        radius = float(np.percentile(np.linalg.norm(points - center, axis=1), 88))
+    else:
+        radius = 24.0
+    return (float(center[0]), float(center[1]), float(center[2])), max(24.0, radius)
+
+
 def cluster_center(index, size, total_clusters, label):
     seed = stable_hash(label)
     rank = index + 1
@@ -523,7 +679,7 @@ def cluster_visual_radius(size, label):
     return radius
 
 
-def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center):
+def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center, radius=None):
     top_nodes = sorted(group, key=lambda node_id: (-degree[node_id], str(node_by_id[node_id].get("title") or ""), node_id))[:5]
     source_counts = Counter(source_label(node_by_id[node_id]) for node_id in group)
     decade_counts = Counter(year_decade(node_by_id[node_id]) for node_id in group)
@@ -570,7 +726,7 @@ def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center):
         "decade": dominant_decade,
         "year_min": min(years) if years else None,
         "year_max": max(years) if years else None,
-        "radius": round(cluster_visual_radius(len(group), label), 3),
+        "radius": round(radius if radius is not None else cluster_visual_radius(len(group), label), 3),
         "x": round(center[0], 3),
         "y": round(center[1], 3),
         "z": round(center[2], 3),
@@ -640,6 +796,7 @@ def write_snapshot(payload, snapshot_dir):
         "source": "snapshot",
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "layout": payload.get("layout") or {"algorithm": "synthetic-spiral"},
         "stats": payload.get("stats") or {},
         "files": {
             "nodes": "nodes.bin",
@@ -813,6 +970,29 @@ def main():
     cluster_parts = []
     for label, group in retained_raw_clusters:
         cluster_parts.extend(split_large_cluster(label, group, node_by_id, degree))
+
+    # Clusters from label propagation can span multiple connected components
+    # (seed labels are shared across components). The layout places components
+    # in distant scene regions, so such clusters would get meaningless centers
+    # and near-scene-sized radii. Split them: one part per force-laid
+    # component, with all dust members (tiny components) kept together.
+    component_split_parts = []
+    for label, group in cluster_parts:
+        by_part = defaultdict(list)
+        for node_id in group:
+            if component_sizes[node_id] >= LAYOUT_MIN_FORCE_COMPONENT:
+                by_part[component_index[node_id]].append(node_id)
+            else:
+                by_part["dust"].append(node_id)
+        if len(by_part) == 1:
+            component_split_parts.append((label, group))
+            continue
+        ordered = sorted(by_part.values(), key=len, reverse=True)
+        component_split_parts.append((label, ordered[0]))
+        for extra_index, part in enumerate(ordered[1:], start=2):
+            component_split_parts.append((f"{label}:c{extra_index}", part))
+    cluster_parts = component_split_parts
+
     clusters = sorted(cluster_parts, key=lambda item: (-len(item[1]), item[0]))
     cluster_index = {}
     cluster_sizes = {}
@@ -821,22 +1001,37 @@ def main():
             cluster_index[node_id] = index
             cluster_sizes[node_id] = len(group)
 
+    layout_positions = compute_force_layout(components, edges, clusters)
+    layout_info = {
+        "algorithm": "igraph-fr3d" if layout_positions else "synthetic-spiral",
+        "seed": LAYOUT_SEED,
+    }
+
     total_clusters = len(clusters)
     cluster_summaries = []
     nodes = []
     for index, (label, group) in enumerate(clusters):
-        center = cluster_center(index, len(group), total_clusters, label)
+        if layout_positions:
+            center, radius = cluster_geometry_from_positions(group, layout_positions)
+        else:
+            center = cluster_center(index, len(group), total_clusters, label)
+            radius = None
         if len(cluster_summaries) < MAX_CLUSTER_SUMMARIES:
-            cluster_summaries.append(build_cluster_summary(index, label, group, node_by_id, degree, center))
+            cluster_summaries.append(build_cluster_summary(index, label, group, node_by_id, degree, center, radius))
         group.sort(key=lambda node_id: (-degree[node_id], str(node_by_id[node_id].get("title") or ""), node_id))
         for local_index, node_id in enumerate(group):
             row = node_by_id[node_id]
-            lx, ly, lz = local_position(local_index, len(group), degree[node_id], len(group), label)
+            if layout_positions:
+                px, py, pz = layout_positions[node_id]
+            else:
+                lx, ly, lz = local_position(local_index, len(group), degree[node_id], len(group), label)
+                px, py, pz = center[0] + lx, center[1] + ly, center[2] + lz
             nodes.append(
                 {
                     "id": node_id,
                     "work_id": row.get("id"),
                     "title": row.get("title") or "Untitled",
+                    "authors": re.sub(r"\s+", " ", str(row.get("authors") or "")).strip()[:120],
                     "year": row.get("year"),
                     "type": row.get("type") or "",
                     "status": work_status(row),
@@ -850,9 +1045,9 @@ def main():
                     "cluster": int(cluster_index[node_id]),
                     "cluster_size": int(cluster_sizes[node_id]),
                     "cluster_kind": "low_signal" if str(label).startswith("low-signal:") else "community",
-                    "x": round(center[0] + lx, 3),
-                    "y": round(center[1] + ly, 3),
-                    "z": round(center[2] + lz, 3),
+                    "x": round(px, 3),
+                    "y": round(py, 3),
+                    "z": round(pz, 3),
                 }
             )
 
@@ -864,6 +1059,7 @@ def main():
 
     payload = {
         "source": "api",
+        "layout": layout_info,
         "nodes": nodes,
         "edges": edges,
         "clusters": cluster_summaries,
