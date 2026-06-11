@@ -106,8 +106,56 @@
     return `#${Number(hex || 0).toString(16).padStart(6, '0')}`
   }
 
+  const UNKNOWN_FIELD_COLOR = 0x52636a
+  let fieldColorMap = new Map()
+
+  function isUnknownField(kind) {
+    return kind === 'unknown_field' || kind === 'low_signal'
+  }
+
+  function hslToHex(h, s, l) {
+    const a = s * Math.min(l, 1 - l)
+    const channel = (n) => {
+      const k = (n + h / 30) % 12
+      const value = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))
+      return Math.round(255 * value)
+    }
+    return (channel(0) << 16) | (channel(8) << 8) | channel(4)
+  }
+
+  // Assign every distinct academic field its own colour. A 12-entry palette
+  // collides across the ~26 OpenAlex fields, so derive evenly separated hues
+  // instead. The golden-angle stride keeps neighbouring territories (packed by
+  // size) far apart on the colour wheel; a small lightness wobble separates
+  // hues that land close together.
+  function buildFieldColorMap(clusters, nodes) {
+    const order = []
+    const seen = new Set()
+    const consider = (field, kind) => {
+      if (!field || isUnknownField(kind) || seen.has(field)) return
+      seen.add(field)
+      order.push(field)
+    }
+    for (const cluster of clusters || []) consider(cluster.field || cluster.label, cluster.kind)
+    for (const node of nodes || []) consider(node.field, node.cluster_kind)
+    const map = new Map()
+    order.forEach((field, index) => {
+      const hue = (index * 137.508) % 360
+      const lightness = 0.54 + ((index % 3) - 1) * 0.07
+      map.set(field, hslToHex(hue, 0.64, lightness))
+    })
+    fieldColorMap = map
+  }
+
+  function fieldColor(field) {
+    if (field && fieldColorMap.has(field)) return fieldColorMap.get(field)
+    return paletteColor(field || 'unknown')
+  }
+
   function clusterColor(cluster) {
-    return cluster?.kind === 'low_signal' ? 0x52636a : paletteColor(cluster?.area || cluster?.label || cluster?.id)
+    return isUnknownField(cluster?.kind)
+      ? UNKNOWN_FIELD_COLOR
+      : fieldColor(cluster?.field || cluster?.area || cluster?.label)
   }
 
   function nodeColor(node) {
@@ -124,11 +172,15 @@
       if (!year) return 0x64748b
       return palette[Math.abs(Math.floor(year / 10)) % palette.length]
     }
-    if (colorMode === 'area') return paletteColor(node.area || node.type || node.source || 'unknown')
+    if (colorMode === 'field' || colorMode === 'area') {
+      if (isUnknownField(node.cluster_kind)) return UNKNOWN_FIELD_COLOR
+      return fieldColor(node.field || node.area || node.type || node.source || 'unknown')
+    }
     if (colorMode === 'region') return paletteColor(node.region || node.countries?.[0] || 'unknown')
     if (colorMode === 'component') return palette[Math.abs(Number(node.component || 0)) % palette.length]
-    if (node.cluster_kind === 'low_signal') return 0x64747a
-    return palette[Math.abs(Number(node.cluster || 0)) % palette.length]
+    // Default 'cluster' mode: colour by field so points match their territory shell.
+    if (isUnknownField(node.cluster_kind)) return UNKNOWN_FIELD_COLOR
+    return fieldColor(node.field || node.area || node.cluster || 'unknown')
   }
 
   function positionValue(positions, nodes, index, axis) {
@@ -174,6 +226,7 @@
     const clusterData = graphData.clusters || []
     const sourcePositions = graphData.positions
     const edgeTriplets = graphData.edgeTriplets
+    buildFieldColorMap(clusterData, nodes)
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]))
     const positions = new Float32Array(nodes.length * 3)
     const colors = new Float32Array(nodes.length * 3)
@@ -212,7 +265,7 @@
       const material = new THREE.MeshBasicMaterial({
         color: clusterColor(cluster),
         transparent: true,
-        opacity: cluster.kind === 'low_signal' ? 0.08 : Math.min(0.2, 0.08 + Math.log1p(Number(cluster.size || 1)) * 0.018),
+        opacity: isUnknownField(cluster.kind) ? 0.08 : Math.min(0.2, 0.08 + Math.log1p(Number(cluster.size || 1)) * 0.018),
         wireframe: true,
         depthTest: false,
         depthWrite: false,
@@ -225,7 +278,7 @@
 
     clusterLabels = visibleClusters.map((cluster, index) => ({
       id: cluster.id,
-      label: cluster.area && cluster.area !== 'unknown area' ? cluster.area : cluster.label,
+      label: cluster.field || cluster.label,
       detail: `${formatNumber(cluster.size)} works / ${cluster.region || 'unknown region'}`,
       color: colorCss(clusterColor(cluster)),
       radius: Math.max(24, Number(cluster.radius || 0)),
@@ -977,7 +1030,7 @@
     <div class="workspace-panel-title">
       <h2 class="workspace-section-title">3D Graph Explorer</h2>
       <p class="muted">
-        Fast WebGL overview of downloaded, metadata-ready works across the database. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
+        Fast WebGL overview of downloaded, metadata-ready works across the database. Works are grouped into academic-field territories (OpenAlex fields), with citation structure laid out inside each field.
       </p>
     </div>
     <div class="graph-3d-actions">
@@ -1010,8 +1063,7 @@
     <label>
       <span class="muted small">Color by</span>
       <select bind:value={colorMode} on:change={() => graphData.nodes?.length && renderGraph()}>
-        <option value="cluster">Graph cluster</option>
-        <option value="area">Science area</option>
+        <option value="cluster">Academic field</option>
         <option value="region">Region</option>
         <option value="component">Connected component</option>
         <option value="status">Pipeline status</option>
@@ -1111,7 +1163,7 @@
         </p>
       {/if}
       <p class="muted small">
-        {formatNumber(graphData.stats?.component_count)} connected components. Clusters are citation communities; tiny fragments are bucketed by area, region, and decade.
+        {formatNumber(graphData.stats?.component_count)} connected components. Territories are OpenAlex academic fields; large fields are split by subfield. Works OpenAlex could not classify sit in a grey "Unknown field" territory.
       </p>
       <p class="muted small">
         Areas: {compactList(graphData.stats?.top_areas)} ({coverageLabel(graphData.stats?.area_coverage)})
@@ -1140,7 +1192,7 @@
         {#if activeNodeDetail}
           <strong>{activeNodeDetail.title}</strong>
           <span class="muted small">{activeNodeDetail.year || 'Year ?'} / {activeNodeDetail.type || 'Type ?'} / {activeNodeDetail.status}</span>
-          <span class="muted small">Area: {activeNodeDetail.area || 'unknown'} / Region: {activeNodeDetail.region || 'unknown'}</span>
+          <span class="muted small">Field: {activeNodeDetail.field || activeNodeDetail.area || 'unknown'} / Region: {activeNodeDetail.region || 'unknown'}</span>
           <span class="muted small">Degree: {formatNumber(activeNodeDetail.degree)} / Cluster: {activeNodeDetail.cluster} ({formatNumber(activeNodeDetail.cluster_size)} nodes)</span>
           <span class="muted small">Component: {activeNodeDetail.component} ({formatNumber(activeNodeDetail.component_size)} nodes)</span>
           <span class="muted small">Source: {activeNodeDetail.source || 'unknown'}</span>

@@ -23,7 +23,6 @@ except ImportError:
 GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
 MAX_CLUSTER_SIZE = 18000
 MAX_CLUSTER_SUMMARIES = 80
-MIN_STANDALONE_CLUSTER_SIZE = 8
 DEFAULT_MAX_NODES = 10000
 SNAPSHOT_SCHEMA_VERSION = 2
 LAYOUT_SEED = 42
@@ -47,7 +46,20 @@ BASE_WORK_COLUMNS = [
     "source_pdf",
     "source_work_id",
     "relationship_type",
+    "primary_field",
+    "primary_subfield",
+    "primary_domain",
+    "primary_topic",
 ]
+
+# OpenAlex topic columns may be absent on databases that predate the
+# backfill; main() drops any that PRAGMA reports as missing.
+OPTIONAL_WORK_COLUMNS = {
+    "primary_field",
+    "primary_subfield",
+    "primary_domain",
+    "primary_topic",
+}
 
 COUNTRY_REGIONS = {
     "US": "North America",
@@ -203,10 +215,6 @@ def top_text(value, fallback="unknown"):
     return value if value else fallback
 
 
-def label_part(value, limit):
-    return top_text(value).replace(":", " - ")[:limit]
-
-
 def year_decade(row):
     year = row.get("year")
     try:
@@ -222,6 +230,30 @@ def openalex_payload(row):
         parsed = parse_json_field(row.get("openalex_json"))
         row["_openalex_json"] = parsed
     return parsed if isinstance(parsed, dict) else {}
+
+
+UNKNOWN_FIELD = "Unknown field"
+
+
+def work_field(row):
+    """Academic field used for clustering.
+
+    Prefers the OpenAlex `primary_field` backfilled into the works table; falls
+    back to the inferred science area (then a placeholder) for works OpenAlex
+    could not classify.
+    """
+    if "_work_field" in row:
+        return row["_work_field"]
+    field = top_text(row.get("primary_field"), "")
+    if not field:
+        area = science_area(row)
+        field = area if area and not area.lower().startswith("unknown") else UNKNOWN_FIELD
+    row["_work_field"] = field
+    return field
+
+
+def work_domain(row):
+    return top_text(row.get("primary_domain"), "")
 
 
 def science_area(row):
@@ -329,23 +361,6 @@ def work_region(row):
     region_counts = Counter(COUNTRY_REGIONS.get(country, "Other region") for country in countries)
     row["_work_region"] = region_counts.most_common(1)[0][0]
     return row["_work_region"]
-
-
-def cluster_seed_label(row):
-    decade = year_decade(row)
-    area = science_area(row)
-    region = work_region(row)
-    source = source_label(row)
-    if source != "unknown":
-        return f"source:{label_part(source, 120)}:{label_part(area, 80)}:{label_part(region, 40)}:{decade}"
-    return f"topic:{label_part(area, 100)}:{label_part(region, 40)}:{decade}"
-
-
-def low_signal_cluster_label(row):
-    decade = year_decade(row)
-    area = science_area(row)
-    region = work_region(row)
-    return f"low-signal:{label_part(area, 100)}:{label_part(region, 40)}:{decade}"
 
 
 def clean_cluster_label(value):
@@ -459,94 +474,65 @@ def normalize_component(coords, size):
     return points
 
 
-def compute_force_layout(components, edges, clusters):
-    """3D force-directed layout of the citation graph.
+def compute_field_layout(clusters, edges):
+    """3D layout that groups works into academic-field territories.
 
-    Components with at least LAYOUT_MIN_FORCE_COMPONENT nodes get a real
-    Fruchterman-Reingold 3D layout and are packed on golden-angle shells around
-    the giant component. The remaining "dust" (isolated or near-isolated works,
-    typically the vast majority) is grouped by cluster label into compact balls
-    on outer shells, mirroring the territory grouping of the legacy layout.
+    Each field cluster is laid out on its own — Fruchterman-Reingold 3D over its
+    internal citation edges when it has enough of them, otherwise a compact
+    Fibonacci ball — then packed onto golden-angle shells with the largest field
+    at the origin. Cross-field citations are not used for positioning (they are
+    rendered as bridge links), so spatial grouping reflects fields.
 
     Returns {node_id: (x, y, z)} or None when igraph/numpy are unavailable.
     """
-    if not LAYOUT_AVAILABLE:
+    if not LAYOUT_AVAILABLE or not clusters:
         return None
     igraph.set_random_number_generator(random.Random(LAYOUT_SEED))
 
-    force_components = [group for group in components if len(group) >= LAYOUT_MIN_FORCE_COMPONENT]
-    dust_nodes = set()
-    for group in components:
-        if len(group) < LAYOUT_MIN_FORCE_COMPONENT:
-            dust_nodes.update(group)
-
-    component_of = {}
+    cluster_of = {}
     local_index = {}
-    for component_id, group in enumerate(force_components):
+    for cluster_id, (_label, group) in enumerate(clusters):
         for position, node_id in enumerate(group):
-            component_of[node_id] = component_id
+            cluster_of[node_id] = cluster_id
             local_index[node_id] = position
 
-    component_edges = defaultdict(set)
+    cluster_edges = defaultdict(set)
     for edge in edges:
         source, target = edge["s"], edge["t"]
-        if source == target or source not in component_of or target not in component_of:
+        if source == target:
             continue
+        cluster_source = cluster_of.get(source)
+        if cluster_source is None or cluster_source != cluster_of.get(target):
+            continue  # cross-field edges do not drive positioning
         pair = (local_index[source], local_index[target])
-        component_edges[component_of[source]].add((min(pair), max(pair)))
+        cluster_edges[cluster_source].add((min(pair), max(pair)))
 
     layouts = []
-    for component_id, group in enumerate(force_components):
-        coords = layout_component(len(group), sorted(component_edges.get(component_id, ())))
-        layouts.append(normalize_component(coords, len(group)))
+    radii = []
+    for cluster_id, (_label, group) in enumerate(clusters):
+        points = normalize_component(
+            layout_component(len(group), sorted(cluster_edges.get(cluster_id, ()))),
+            len(group),
+        )
+        layouts.append(points)
+        radii.append(float(np.linalg.norm(points, axis=1).max()) if len(points) > 1 else 8.0)
 
-    radii = [
-        float(np.linalg.norm(points, axis=1).max()) if len(points) > 1 else 8.0
-        for points in layouts
-    ]
-
-    dust_groups = []
-    for _label, group in clusters:
-        members = [node_id for node_id in group if node_id in dust_nodes]
-        if members:
-            dust_groups.append(members)
-
-    satellites = [
-        ("component", component_id, radii[component_id], len(force_components[component_id]))
-        for component_id in range(1, len(force_components))
-    ]
-    for group_index, members in enumerate(dust_groups):
-        ball_radius = 14.0 + math.pow(len(members), 0.5) * 6.0
-        satellites.append(("dust", group_index, ball_radius, len(members)))
-    satellites.sort(key=lambda item: -item[3])
-
+    # Largest field at the origin, the rest on golden-angle shells around it.
+    order = sorted(range(len(clusters)), key=lambda cluster_id: -len(clusters[cluster_id][1]))
+    giant_radius = radii[order[0]]
+    satellite_count = max(1, len(order) - 1)
     positions = {}
-    if force_components:
-        for position, node_id in enumerate(force_components[0]):
-            point = layouts[0][position]
-            positions[node_id] = (float(point[0]), float(point[1]), float(point[2]))
-
-    giant_radius = radii[0] if radii else 0.0
-    satellite_count = max(1, len(satellites))
-    for index, (kind, ref, radius, _size) in enumerate(satellites):
-        direction = np.asarray(fibonacci_direction(index, satellite_count))
-        distance = giant_radius + radius + 140.0 + 60.0 * math.pow(index + 1, 0.55)
-        offset = direction * distance
-        if kind == "component":
-            placed = layouts[ref] + offset
-            for position, node_id in enumerate(force_components[ref]):
-                point = placed[position]
-                positions[node_id] = (float(point[0]), float(point[1]), float(point[2]))
+    for rank, cluster_id in enumerate(order):
+        if rank == 0:
+            offset = np.zeros(3)
         else:
-            members = dust_groups[ref]
-            for position, node_id in enumerate(members):
-                spread = fibonacci_direction(position, len(members))
-                reach = radius * (0.35 + 0.65 * (position + 1) / len(members))
-                positions[node_id] = (
-                    float(offset[0] + spread[0] * reach),
-                    float(offset[1] + spread[1] * reach),
-                    float(offset[2] + spread[2] * reach),
-                )
+            direction = np.asarray(fibonacci_direction(rank - 1, satellite_count))
+            distance = giant_radius + radii[cluster_id] + 160.0 + 70.0 * math.pow(rank, 0.55)
+            offset = direction * distance
+        placed = layouts[cluster_id] + offset
+        for position, node_id in enumerate(clusters[cluster_id][1]):
+            point = placed[position]
+            positions[node_id] = (float(point[0]), float(point[1]), float(point[2]))
 
     max_radius = max((math.sqrt(x * x + y * y + z * z) for x, y, z in positions.values()), default=0.0)
     if max_radius > 1e-9:
@@ -556,6 +542,27 @@ def compute_force_layout(components, edges, clusters):
             for node_id, (x, y, z) in positions.items()
         }
     return positions
+
+
+def split_field_cluster(field, members, node_by_id, degree):
+    """Keep a field as one cluster, splitting only oversized fields.
+
+    Large fields are first broken out by OpenAlex subfield, then chunked by size
+    if a subfield is still too large, so territories stay legible.
+    """
+    if len(members) <= MAX_CLUSTER_SIZE:
+        return [(field, members)]
+    by_subfield = defaultdict(list)
+    for node_id in members:
+        subfield = top_text(node_by_id[node_id].get("primary_subfield"), "")
+        by_subfield[subfield].append(node_id)
+    if len(by_subfield) <= 1:
+        return split_large_cluster(field, members, node_by_id, degree)
+    parts = []
+    for subfield, sub_members in by_subfield.items():
+        label = field if not subfield else f"{field} - {subfield}"
+        parts.extend(split_large_cluster(label, sub_members, node_by_id, degree))
+    return parts
 
 
 def cluster_geometry_from_positions(group, positions):
@@ -610,44 +617,6 @@ def local_position(index, count, degree, cluster_size, label):
     )
 
 
-def build_adjacency(edges, allowed):
-    adjacency = {node_id: set() for node_id in allowed}
-    for edge in edges:
-        source = edge["s"]
-        target = edge["t"]
-        if source in adjacency and target in adjacency:
-            adjacency[source].add(target)
-            adjacency[target].add(source)
-    return adjacency
-
-
-def propagate_cluster_labels(node_by_id, adjacency, degree, iterations=8):
-    labels = {node_id: cluster_seed_label(row) for node_id, row in node_by_id.items()}
-    ordered_nodes = sorted(
-        node_by_id.keys(),
-        key=lambda node_id: (-degree[node_id], str(node_by_id[node_id].get("title") or ""), node_id),
-    )
-    for _ in range(iterations):
-        changed = 0
-        next_labels = labels.copy()
-        for node_id in ordered_nodes:
-            neighbours = adjacency.get(node_id) or ()
-            if not neighbours:
-                continue
-            scores = defaultdict(float)
-            scores[labels[node_id]] += 0.35
-            for neighbour_id in neighbours:
-                scores[labels[neighbour_id]] += 1.0 + min(2.5, math.log1p(degree[neighbour_id]) * 0.3)
-            best_label = min(scores.items(), key=lambda item: (-item[1], item[0]))[0]
-            if best_label != labels[node_id]:
-                next_labels[node_id] = best_label
-                changed += 1
-        labels = next_labels
-        if changed == 0:
-            break
-    return labels
-
-
 def split_large_cluster(label, group, node_by_id, degree):
     if len(group) <= MAX_CLUSTER_SIZE:
         return [(label, group)]
@@ -679,11 +648,15 @@ def cluster_visual_radius(size, label):
     return radius
 
 
-def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center, radius=None):
+def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center, radius=None, kind="field"):
     top_nodes = sorted(group, key=lambda node_id: (-degree[node_id], str(node_by_id[node_id].get("title") or ""), node_id))[:5]
-    source_counts = Counter(source_label(node_by_id[node_id]) for node_id in group)
     decade_counts = Counter(year_decade(node_by_id[node_id]) for node_id in group)
-    area_counts = Counter(science_area(node_by_id[node_id]) for node_id in group)
+    # Within a field territory the sub-structure of interest is the subfield;
+    # fall back to the inferred science area for works without OpenAlex data.
+    subfield_counts = Counter(
+        top_text(node_by_id[node_id].get("primary_subfield"), "") or science_area(node_by_id[node_id])
+        for node_id in group
+    )
     region_counts = Counter(work_region(node_by_id[node_id]) for node_id in group)
     country_counts = Counter(country for node_id in group for country in work_countries(node_by_id[node_id]))
     type_counts = Counter(top_text(node_by_id[node_id].get("type"), "unknown type") for node_id in group)
@@ -694,33 +667,22 @@ def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center, 
             years.append(year)
         except (TypeError, ValueError):
             pass
-    dominant_source = source_counts.most_common(1)[0][0] if source_counts else "unknown"
+    field = label.split(" - ", 1)[0]
     dominant_decade = decade_counts.most_common(1)[0][0] if decade_counts else "unknown year"
-    dominant_area = dominant_meaningful(area_counts, "unknown area")
     dominant_region = dominant_meaningful(region_counts, "unknown region")
     dominant_country = country_counts.most_common(1)[0][0] if country_counts else ""
-    title = node_by_id[top_nodes[0]].get("title") if top_nodes else ""
-    if str(label).startswith("low-signal:"):
-        parts = str(label)[len("low-signal:") :].split(":")
-        area = parts[0] if parts else dominant_area
-        region = parts[1] if len(parts) > 1 else dominant_region
-        decade = parts[2] if len(parts) > 2 else dominant_decade
-        part = f" {parts[3]}" if len(parts) > 3 else ""
-        display_label = f"Low-link {clean_cluster_label(area)}, {region}, {decade}{part}"
-    elif dominant_source and dominant_source != "unknown" and clean_cluster_label(dominant_source) != clean_cluster_label(dominant_area):
-        display_label = f"{clean_cluster_label(dominant_area)} / {clean_cluster_label(dominant_source)}"
-    elif title:
-        display_label = f"{clean_cluster_label(dominant_area)} / {clean_cluster_label(title)}"
-    else:
-        display_label = clean_cluster_label(label)
+    dominant_domain = dominant_meaningful(
+        Counter(work_domain(node_by_id[node_id]) for node_id in group), ""
+    )
     return {
         "id": int(cluster_id),
-        "label": display_label,
-        "kind": "low_signal" if str(label).startswith("low-signal:") else "community",
+        "label": clean_cluster_label(label),
+        "kind": kind,
+        "field": field,
+        "domain": dominant_domain or None,
         "size": int(len(group)),
         "degree": int(sum(degree[node_id] for node_id in group)),
-        "source": dominant_source,
-        "area": dominant_area,
+        "area": field,
         "region": dominant_region,
         "country": dominant_country,
         "decade": dominant_decade,
@@ -730,7 +692,7 @@ def build_cluster_summary(cluster_id, label, group, node_by_id, degree, center, 
         "x": round(center[0], 3),
         "y": round(center[1], 3),
         "z": round(center[2], 3),
-        "areas": top_counter_items(area_counts),
+        "areas": top_counter_items(subfield_counts),
         "regions": top_counter_items(region_counts),
         "countries": top_counter_items(country_counts),
         "types": top_counter_items(type_counts),
@@ -841,7 +803,13 @@ def main():
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
 
-    selected_columns = ", ".join(f"w.{column}" for column in BASE_WORK_COLUMNS)
+    available_columns = {row[1] for row in conn.execute("PRAGMA table_info(works)")}
+    query_columns = [
+        column
+        for column in BASE_WORK_COLUMNS
+        if column not in OPTIONAL_WORK_COLUMNS or column in available_columns
+    ]
+    selected_columns = ", ".join(f"w.{column}" for column in query_columns)
     sql = f"SELECT {selected_columns} FROM works w"
     params = []
     conditions = []
@@ -951,47 +919,16 @@ def main():
             component_index[node_id] = index
             component_sizes[node_id] = len(group)
 
-    adjacency = build_adjacency(edges, allowed)
-    cluster_labels = propagate_cluster_labels(node_by_id, adjacency, degree)
-    raw_clusters = defaultdict(list)
-    for node_id, label in cluster_labels.items():
-        raw_clusters[label].append(node_id)
-
-    merged_low_signal_clusters = defaultdict(list)
-    retained_raw_clusters = []
-    for label, group in raw_clusters.items():
-        if len(group) < MIN_STANDALONE_CLUSTER_SIZE:
-            for node_id in group:
-                merged_low_signal_clusters[low_signal_cluster_label(node_by_id[node_id])].append(node_id)
-        else:
-            retained_raw_clusters.append((label, group))
-    retained_raw_clusters.extend(merged_low_signal_clusters.items())
+    # Cluster by academic field (OpenAlex primary_field, backfilled into the
+    # works table). The graph then forms field territories rather than citation
+    # communities; oversized fields are split by subfield to stay legible.
+    field_groups = defaultdict(list)
+    for node_id, row in node_by_id.items():
+        field_groups[work_field(row)].append(node_id)
 
     cluster_parts = []
-    for label, group in retained_raw_clusters:
-        cluster_parts.extend(split_large_cluster(label, group, node_by_id, degree))
-
-    # Clusters from label propagation can span multiple connected components
-    # (seed labels are shared across components). The layout places components
-    # in distant scene regions, so such clusters would get meaningless centers
-    # and near-scene-sized radii. Split them: one part per force-laid
-    # component, with all dust members (tiny components) kept together.
-    component_split_parts = []
-    for label, group in cluster_parts:
-        by_part = defaultdict(list)
-        for node_id in group:
-            if component_sizes[node_id] >= LAYOUT_MIN_FORCE_COMPONENT:
-                by_part[component_index[node_id]].append(node_id)
-            else:
-                by_part["dust"].append(node_id)
-        if len(by_part) == 1:
-            component_split_parts.append((label, group))
-            continue
-        ordered = sorted(by_part.values(), key=len, reverse=True)
-        component_split_parts.append((label, ordered[0]))
-        for extra_index, part in enumerate(ordered[1:], start=2):
-            component_split_parts.append((f"{label}:c{extra_index}", part))
-    cluster_parts = component_split_parts
+    for field, members in field_groups.items():
+        cluster_parts.extend(split_field_cluster(field, members, node_by_id, degree))
 
     clusters = sorted(cluster_parts, key=lambda item: (-len(item[1]), item[0]))
     cluster_index = {}
@@ -1001,9 +938,9 @@ def main():
             cluster_index[node_id] = index
             cluster_sizes[node_id] = len(group)
 
-    layout_positions = compute_force_layout(components, edges, clusters)
+    layout_positions = compute_field_layout(clusters, edges)
     layout_info = {
-        "algorithm": "igraph-fr3d" if layout_positions else "synthetic-spiral",
+        "algorithm": "igraph-fr3d-field" if layout_positions else "synthetic-spiral",
         "seed": LAYOUT_SEED,
     }
 
@@ -1011,13 +948,17 @@ def main():
     cluster_summaries = []
     nodes = []
     for index, (label, group) in enumerate(clusters):
+        field_root = label.split(" - ", 1)[0]
+        cluster_kind = "unknown_field" if field_root == UNKNOWN_FIELD else "field"
         if layout_positions:
             center, radius = cluster_geometry_from_positions(group, layout_positions)
         else:
             center = cluster_center(index, len(group), total_clusters, label)
             radius = None
         if len(cluster_summaries) < MAX_CLUSTER_SUMMARIES:
-            cluster_summaries.append(build_cluster_summary(index, label, group, node_by_id, degree, center, radius))
+            cluster_summaries.append(
+                build_cluster_summary(index, label, group, node_by_id, degree, center, radius, kind=cluster_kind)
+            )
         group.sort(key=lambda node_id: (-degree[node_id], str(node_by_id[node_id].get("title") or ""), node_id))
         for local_index, node_id in enumerate(group):
             row = node_by_id[node_id]
@@ -1036,6 +977,7 @@ def main():
                     "type": row.get("type") or "",
                     "status": work_status(row),
                     "source": source_label(row),
+                    "field": work_field(row),
                     "area": science_area(row),
                     "region": work_region(row),
                     "countries": work_countries(row)[:4],
@@ -1044,7 +986,7 @@ def main():
                     "component_size": int(component_sizes[node_id]),
                     "cluster": int(cluster_index[node_id]),
                     "cluster_size": int(cluster_sizes[node_id]),
-                    "cluster_kind": "low_signal" if str(label).startswith("low-signal:") else "community",
+                    "cluster_kind": cluster_kind,
                     "x": round(px, 3),
                     "y": round(py, 3),
                     "z": round(pz, 3),
