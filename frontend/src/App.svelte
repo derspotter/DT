@@ -88,6 +88,7 @@
   let authStatus = 'loading'
   let authError = ''
   let authUser = null
+  let navigationRevision = 0
   $: isAdmin = Boolean(authUser?.is_admin || authUser?.username === 'admin')
   $: diagnosticsEnabled = isAdmin
   $: tabGroups = isAdmin ? [...userTabGroups, ...adminTabGroups] : userTabGroups
@@ -1432,6 +1433,7 @@
     authStatus = 'loading'
     authError = ''
     const startupTab = !preserveAuthFlow ? readTabFromHash({ includeUnavailable: true }) : null
+    const startupNavigationRevision = navigationRevision
     try {
       const payload = await fetchMe()
       authUser = payload.user
@@ -1445,7 +1447,7 @@
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
-      if (!preserveAuthFlow) {
+      if (!preserveAuthFlow && navigationRevision === startupNavigationRevision) {
         const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
         setActiveTab(latestTab, { replace: true })
       }
@@ -1476,10 +1478,13 @@
       authStatus = 'authenticated'
       authFlow = 'login'
       authFlowToken = ''
+      const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
-      setActiveTab('workspace', { replace: true })
+      if (navigationRevision === authNavigationRevision) {
+        setActiveTab('workspace', { replace: true })
+      }
     } catch (error) {
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
@@ -1530,10 +1535,13 @@
       authStatus = 'authenticated'
       authFlow = 'login'
       authFlowToken = ''
+      const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
-      setActiveTab('workspace', { replace: true })
+      if (navigationRevision === authNavigationRevision) {
+        setActiveTab('workspace', { replace: true })
+      }
     } catch (error) {
       authError = error.message || 'Failed to accept invite'
     }
@@ -1568,10 +1576,13 @@
       authStatus = 'authenticated'
       authFlow = 'login'
       authFlowToken = ''
+      const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       await refreshAll()
       connectLogs()
-      setActiveTab('workspace', { replace: true })
+      if (navigationRevision === authNavigationRevision) {
+        setActiveTab('workspace', { replace: true })
+      }
     } catch (error) {
       authError = error.message || 'Failed to reset password'
     }
@@ -4351,6 +4362,7 @@
   function setActiveTab(tabId, { replace = false } = {}) {
     const normalized = normalizeTab(tabId)
     const safeTab = tabIds.has(normalized) ? normalized : 'workspace'
+    navigationRevision += 1
     activeTab = safeTab
     updateHash(safeTab, replace)
     if (safeTab === 'workspace' && pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
@@ -4381,6 +4393,7 @@
     reducedMotionMediaQuery?.addEventListener?.('change', onReducedMotionChange)
 
     const onHashChange = () => {
+      navigationRevision += 1
       const authHash = parseAuthFlowFromHash()
       if (authHash.flow !== 'login') {
         applyAuthFlowFromHash()
