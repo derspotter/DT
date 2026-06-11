@@ -256,6 +256,29 @@ def work_domain(row):
     return top_text(row.get("primary_domain"), "")
 
 
+GROUP_BY_CHOICES = ["field", "source_path", "type", "region", "year", "component"]
+
+
+def group_label(row, group_by, component_index, node_id):
+    """The territory label a node belongs to for the requested grouping."""
+    if group_by == "source_path":
+        return source_label(row)
+    if group_by == "type":
+        return top_text(row.get("type"), "unknown type")
+    if group_by == "region":
+        return work_region(row)
+    if group_by == "year":
+        return year_decade(row)
+    if group_by == "component":
+        return f"Component {component_index[node_id] + 1}"
+    return work_field(row)
+
+
+def is_unknown_group_label(label):
+    text = str(label or "").strip().lower()
+    return label == UNKNOWN_FIELD or text in {"", "unknown"} or text.startswith("unknown ")
+
+
 def science_area(row):
     if "_science_area" in row:
         return row["_science_area"]
@@ -796,6 +819,7 @@ def main():
     parser.add_argument("--year-from", type=int, default=None)
     parser.add_argument("--year-to", type=int, default=None)
     parser.add_argument("--corpus-id", type=int, default=None)
+    parser.add_argument("--group-by", choices=GROUP_BY_CHOICES, default="field")
     parser.add_argument("--snapshot-dir", default=None)
     parser.add_argument("--require-downloaded-metadata", action="store_true")
     args = parser.parse_args()
@@ -919,16 +943,20 @@ def main():
             component_index[node_id] = index
             component_sizes[node_id] = len(group)
 
-    # Cluster by academic field (OpenAlex primary_field, backfilled into the
-    # works table). The graph then forms field territories rather than citation
-    # communities; oversized fields are split by subfield to stay legible.
-    field_groups = defaultdict(list)
+    # Cluster by the requested dimension (academic field by default). The graph
+    # forms territories of that dimension rather than citation communities;
+    # oversized field territories are split by subfield to stay legible.
+    group_by = args.group_by
+    grouped = defaultdict(list)
     for node_id, row in node_by_id.items():
-        field_groups[work_field(row)].append(node_id)
+        grouped[group_label(row, group_by, component_index, node_id)].append(node_id)
 
     cluster_parts = []
-    for field, members in field_groups.items():
-        cluster_parts.extend(split_field_cluster(field, members, node_by_id, degree))
+    for label, members in grouped.items():
+        if group_by == "field":
+            cluster_parts.extend(split_field_cluster(label, members, node_by_id, degree))
+        else:
+            cluster_parts.extend(split_large_cluster(label, members, node_by_id, degree))
 
     clusters = sorted(cluster_parts, key=lambda item: (-len(item[1]), item[0]))
     cluster_index = {}
@@ -940,7 +968,8 @@ def main():
 
     layout_positions = compute_field_layout(clusters, edges)
     layout_info = {
-        "algorithm": "igraph-fr3d-field" if layout_positions else "synthetic-spiral",
+        "algorithm": f"igraph-fr3d-{group_by}" if layout_positions else "synthetic-spiral",
+        "group_by": group_by,
         "seed": LAYOUT_SEED,
     }
 
@@ -948,8 +977,8 @@ def main():
     cluster_summaries = []
     nodes = []
     for index, (label, group) in enumerate(clusters):
-        field_root = label.split(" - ", 1)[0]
-        cluster_kind = "unknown_field" if field_root == UNKNOWN_FIELD else "field"
+        group_root = label.split(" - ", 1)[0]
+        cluster_kind = "unknown_field" if is_unknown_group_label(group_root) else "field"
         if layout_positions:
             center, radius = cluster_geometry_from_positions(group, layout_positions)
         else:

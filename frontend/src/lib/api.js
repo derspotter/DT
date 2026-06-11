@@ -978,6 +978,7 @@ function graph3DParams({
   scope = 'all',
   yearFrom = null,
   yearTo = null,
+  groupBy = 'field',
   refresh = false,
 } = {}) {
   const params = new URLSearchParams()
@@ -991,6 +992,7 @@ function graph3DParams({
   if (yearTo !== null && yearTo !== undefined && yearTo !== '') {
     params.set('year_to', String(yearTo))
   }
+  if (groupBy) params.set('group_by', groupBy)
   if (refresh) params.set('refresh', '1')
   return params
 }

@@ -44,6 +44,7 @@
   let scope = 'all'
   let maxNodes = 10000
   let colorMode = 'cluster'
+  let loadedGroupBy = 'field'
   let depthScale = 1.6
   let autoRotate = false
   let selectedNode = null
@@ -65,15 +66,6 @@
   const nodeDetailCache = new Map()
   const clusterDetailCache = new Map()
 
-  const statusColors = {
-    downloaded: 0x0f8b8d,
-    matched: 0x3b82f6,
-    queued_download: 0xf4a340,
-    failed_download: 0xb91c1c,
-    failed_enrichment: 0xb91c1c,
-    enriching: 0x8b5cf6,
-    raw: 0x6f7b84,
-  }
   const palette = [
     0x0f8b8d,
     0xf4a340,
@@ -107,7 +99,7 @@
   }
 
   const UNKNOWN_FIELD_COLOR = 0x52636a
-  let fieldColorMap = new Map()
+  let clusterColorById = new Map()
 
   function isUnknownField(kind) {
     return kind === 'unknown_field' || kind === 'low_signal'
@@ -123,43 +115,33 @@
     return (channel(0) << 16) | (channel(8) << 8) | channel(4)
   }
 
-  // Assign every distinct academic field its own colour. A 12-entry palette
-  // collides across the ~26 OpenAlex fields, so derive evenly separated hues
-  // instead. The golden-angle stride keeps neighbouring territories (packed by
-  // size) far apart on the colour wheel; a small lightness wobble separates
-  // hues that land close together.
-  function buildFieldColorMap(clusters, nodes) {
-    const order = []
-    const seen = new Set()
-    const consider = (field, kind) => {
-      if (!field || isUnknownField(kind) || seen.has(field)) return
-      seen.add(field)
-      order.push(field)
-    }
-    for (const cluster of clusters || []) consider(cluster.field || cluster.label, cluster.kind)
-    for (const node of nodes || []) consider(node.field, node.cluster_kind)
+  // Give every territory (cluster) its own colour. A 12-entry palette collides
+  // across the ~26+ groups a dimension can produce, so derive evenly separated
+  // hues instead. The golden-angle stride keeps neighbouring territories (packed
+  // by size) far apart on the colour wheel; a small lightness wobble separates
+  // hues that land close together. "Unknown" territories are grey.
+  function buildClusterColors(clusters) {
     const map = new Map()
-    order.forEach((field, index) => {
+    let index = 0
+    for (const cluster of clusters || []) {
+      if (isUnknownField(cluster.kind)) {
+        map.set(cluster.id, UNKNOWN_FIELD_COLOR)
+        continue
+      }
       const hue = (index * 137.508) % 360
       const lightness = 0.54 + ((index % 3) - 1) * 0.07
-      map.set(field, hslToHex(hue, 0.64, lightness))
-    })
-    fieldColorMap = map
-  }
-
-  function fieldColor(field) {
-    if (field && fieldColorMap.has(field)) return fieldColorMap.get(field)
-    return paletteColor(field || 'unknown')
+      map.set(cluster.id, hslToHex(hue, 0.64, lightness))
+      index += 1
+    }
+    clusterColorById = map
   }
 
   function clusterColor(cluster) {
-    return isUnknownField(cluster?.kind)
-      ? UNKNOWN_FIELD_COLOR
-      : fieldColor(cluster?.field || cluster?.area || cluster?.label)
+    if (isUnknownField(cluster?.kind)) return UNKNOWN_FIELD_COLOR
+    return clusterColorById.get(cluster?.id) ?? paletteColor(cluster?.field || cluster?.label || cluster?.id)
   }
 
   function nodeColor(node) {
-    if (colorMode === 'status') return statusColors[node.status] || 0x6f7b84
     if (colorMode === 'degree') {
       const degree = Number(node.degree || 0)
       if (degree > 100) return 0xfff1a8
@@ -167,20 +149,10 @@
       if (degree > 10) return 0x3b82f6
       return 0x0f8b8d
     }
-    if (colorMode === 'year') {
-      const year = Number(node.year || 0)
-      if (!year) return 0x64748b
-      return palette[Math.abs(Math.floor(year / 10)) % palette.length]
-    }
-    if (colorMode === 'field' || colorMode === 'area') {
-      if (isUnknownField(node.cluster_kind)) return UNKNOWN_FIELD_COLOR
-      return fieldColor(node.field || node.area || node.type || node.source || 'unknown')
-    }
-    if (colorMode === 'region') return paletteColor(node.region || node.countries?.[0] || 'unknown')
-    if (colorMode === 'component') return palette[Math.abs(Number(node.component || 0)) % palette.length]
-    // Default 'cluster' mode: colour by field so points match their territory shell.
+    // Every other mode arranges the graph into territories of that dimension, so
+    // colour each point by its territory to match its shell and label.
     if (isUnknownField(node.cluster_kind)) return UNKNOWN_FIELD_COLOR
-    return fieldColor(node.field || node.area || node.cluster || 'unknown')
+    return clusterColorById.get(node.cluster) ?? paletteColor(node.field || node.cluster || 'unknown')
   }
 
   function positionValue(positions, nodes, index, axis) {
@@ -226,7 +198,7 @@
     const clusterData = graphData.clusters || []
     const sourcePositions = graphData.positions
     const edgeTriplets = graphData.edgeTriplets
-    buildFieldColorMap(clusterData, nodes)
+    buildClusterColors(clusterData)
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]))
     const positions = new Float32Array(nodes.length * 3)
     const colors = new Float32Array(nodes.length * 3)
@@ -740,6 +712,25 @@
     recomputeAlphas()
   }
 
+  // Map a "Group by" selection to the server-side layout dimension. 'degree' is
+  // a colour-only overlay (no re-arrangement), so it has no grouping dimension.
+  function groupByForMode(mode) {
+    if (mode === 'degree') return null
+    return mode === 'cluster' ? 'field' : mode
+  }
+
+  function onGroupModeChange() {
+    if (!graphData.nodes?.length) return
+    const target = groupByForMode(colorMode)
+    // A new grouping dimension re-arranges the graph (server re-layout); same
+    // dimension or the degree overlay just recolours the current arrangement.
+    if (target && target !== loadedGroupBy) {
+      void load3DGraph()
+    } else {
+      renderGraph()
+    }
+  }
+
   async function load3DGraph() {
     graphLoading = true
     graphStatus = 'Building 3D graph snapshot...'
@@ -749,13 +740,16 @@
     selectedCluster = null
     selectedClusterDetail = null
     searchResults = []
+    const groupBy = groupByForMode(colorMode) || loadedGroupBy || 'field'
     try {
       const manifest = await fetchGraph3DSnapshot({
         maxNodes,
         relationship,
         status: statusFilter,
         scope,
+        groupBy,
       })
+      loadedGroupBy = groupBy
       const snapshot = await fetchGraph3DSnapshotResources(manifest)
       const edgeCount = Number(snapshot.manifest?.buffers?.edges?.count || Math.floor((snapshot.edgeTriplets?.length || 0) / 3) || 0)
       graphData = {
@@ -1030,7 +1024,7 @@
     <div class="workspace-panel-title">
       <h2 class="workspace-section-title">3D Graph Explorer</h2>
       <p class="muted">
-        Fast WebGL overview of downloaded, metadata-ready works across the database. Works are grouped into academic-field territories (OpenAlex fields), with citation structure laid out inside each field.
+        Fast WebGL overview of downloaded, metadata-ready works across the database. Choose a "Group by" dimension to re-arrange works into territories (academic field by default), with citation structure laid out inside each territory.
       </p>
     </div>
     <div class="graph-3d-actions">
@@ -1061,14 +1055,15 @@
       <input type="number" min="1000" max="50000" step="1000" bind:value={maxNodes} disabled={graphLoading} />
     </label>
     <label>
-      <span class="muted small">Color by</span>
-      <select bind:value={colorMode} on:change={() => graphData.nodes?.length && renderGraph()}>
+      <span class="muted small">Group by</span>
+      <select bind:value={colorMode} on:change={onGroupModeChange} disabled={graphLoading}>
         <option value="cluster">Academic field</option>
+        <option value="source_path">Search path</option>
+        <option value="type">Work type</option>
         <option value="region">Region</option>
-        <option value="component">Connected component</option>
-        <option value="status">Pipeline status</option>
-        <option value="degree">Degree</option>
         <option value="year">Year decade</option>
+        <option value="component">Connected component</option>
+        <option value="degree">Degree (colour only)</option>
       </select>
     </label>
     <label>
@@ -1163,7 +1158,7 @@
         </p>
       {/if}
       <p class="muted small">
-        {formatNumber(graphData.stats?.component_count)} connected components. Territories are OpenAlex academic fields; large fields are split by subfield. Works OpenAlex could not classify sit in a grey "Unknown field" territory.
+        {formatNumber(graphData.stats?.component_count)} connected components. Territories follow the selected "Group by" dimension; oversized academic fields are split by subfield, and works with no value for the dimension sit in a grey "Unknown" territory.
       </p>
       <p class="muted small">
         Areas: {compactList(graphData.stats?.top_areas)} ({coverageLabel(graphData.stats?.area_coverage)})

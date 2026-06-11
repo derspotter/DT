@@ -104,6 +104,7 @@ const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
 const GRAPH_3D_CACHE_VERSION = 7;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
+const GRAPH_3D_GROUP_BY = new Set(['field', 'source_path', 'type', 'region', 'year', 'component']);
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
@@ -312,13 +313,15 @@ function buildGraph3dRequest(req) {
   const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
   const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
   const corpusId = null;
+  const requestedGroupBy = String(req.query?.group_by || req.query?.groupBy || 'field');
+  const groupBy = GRAPH_3D_GROUP_BY.has(requestedGroupBy) ? requestedGroupBy : 'field';
   let dbModifiedMs = 0;
   try {
     dbModifiedMs = Math.floor(fs.statSync(DB_PATH).mtimeMs);
   } catch {
     dbModifiedMs = 0;
   }
-  return { maxNodes, relationship, status, scope, yearFrom, yearTo, corpusId, dbModifiedMs };
+  return { maxNodes, relationship, status, scope, yearFrom, yearTo, corpusId, groupBy, dbModifiedMs };
 }
 
 function graph3dScriptArgs(options, extraArgs = []) {
@@ -331,6 +334,8 @@ function graph3dScriptArgs(options, extraArgs = []) {
     options.relationship,
     '--status',
     options.status,
+    '--group-by',
+    options.groupBy || 'field',
     '--require-downloaded-metadata',
     ...extraArgs,
   ];
@@ -349,6 +354,7 @@ function graph3dSnapshotKey(options) {
     yearFrom: options.yearFrom,
     yearTo: options.yearTo,
     corpusId: options.corpusId,
+    groupBy: options.groupBy,
     dbModifiedMs: options.dbModifiedMs,
   });
   return crypto.createHash('sha256').update(keyPayload).digest('hex').slice(0, 20);

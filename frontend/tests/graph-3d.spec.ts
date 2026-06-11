@@ -234,6 +234,19 @@ async function openLoadedGraphPanel(page) {
   return panel
 }
 
+test('changing the grouping re-requests the snapshot with group_by', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  const regrouped = page.waitForRequest((req) => {
+    const url = new URL(req.url())
+    return url.pathname === '/api/graph/3d/snapshot' && url.searchParams.get('group_by') === 'type'
+  })
+  await panel.getByText('Group by').locator('..').locator('select').selectOption('type')
+  await regrouped
+  await expect(panel.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
+})
+
 test('search finds a work and selects it', async ({ page }) => {
   await page.route('**/api/**', mockApi)
   const panel = await openLoadedGraphPanel(page)
