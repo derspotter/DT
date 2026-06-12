@@ -47,6 +47,7 @@
   let loadedGroupBy = 'field'
   let depthScale = 1.6
   let autoRotate = false
+  let cameraPreset = 'angle'
   let selectedNode = null
   let hoveredNode = null
   let selectedCluster = null
@@ -585,6 +586,7 @@
 
   function setCameraPreset(preset) {
     if (!camera || !controls) return
+    cameraPreset = preset
     const center = controls.target.clone()
     const radius = points?.geometry?.boundingSphere?.radius || 1800
     let position
@@ -1028,15 +1030,17 @@
       </p>
     </div>
     <div class="graph-3d-actions">
-      <button class="secondary" type="button" on:click={() => setCameraPreset('angle')} disabled={!graphData.nodes?.length}>Angle</button>
-      <button class="secondary" type="button" on:click={() => setCameraPreset('top')} disabled={!graphData.nodes?.length}>Top</button>
-      <button class="secondary" type="button" on:click={() => setCameraPreset('side')} disabled={!graphData.nodes?.length}>Side</button>
-      <button class:active={autoRotate} class="secondary" type="button" on:click={() => { autoRotate = !autoRotate; updateAutoRotate() }} disabled={!graphData.nodes?.length}>
-        {autoRotate ? 'Stop rotate' : 'Auto rotate'}
+      <div class="graph-3d-segment" role="group" aria-label="Camera angle">
+        <button class="graph-3d-btn" class:active={cameraPreset === 'angle'} type="button" on:click={() => setCameraPreset('angle')} disabled={!graphData.nodes?.length}>Angle</button>
+        <button class="graph-3d-btn" class:active={cameraPreset === 'top'} type="button" on:click={() => setCameraPreset('top')} disabled={!graphData.nodes?.length}>Top</button>
+        <button class="graph-3d-btn" class:active={cameraPreset === 'side'} type="button" on:click={() => setCameraPreset('side')} disabled={!graphData.nodes?.length}>Side</button>
+      </div>
+      <button class="graph-3d-btn" class:active={autoRotate} type="button" on:click={() => { autoRotate = !autoRotate; updateAutoRotate() }} disabled={!graphData.nodes?.length}>
+        {autoRotate ? '⏸ Rotating' : '↻ Auto rotate'}
       </button>
-      <button class="secondary" type="button" on:click={resetCamera} disabled={!graphData.nodes?.length}>Reset camera</button>
-      <button type="button" on:click={load3DGraph} disabled={graphLoading}>
-        {graphLoading ? 'Loading 3D graph...' : 'Load 3D graph'}
+      <button class="graph-3d-btn" type="button" on:click={resetCamera} disabled={!graphData.nodes?.length}>Reset</button>
+      <button class="graph-3d-btn graph-3d-btn-primary" type="button" on:click={load3DGraph} disabled={graphLoading}>
+        {graphLoading ? 'Loading…' : 'Load 3D graph'}
       </button>
     </div>
   </div>
