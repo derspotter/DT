@@ -186,7 +186,7 @@ test('graph tab is available to non-admin users', async ({ page }) => {
   await expect(page.getByTestId('tab-graph')).toBeVisible()
   await page.getByTestId('tab-graph').click()
   await expect(page.getByTestId('graph-3d-panel')).toBeVisible()
-  await expect(page.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
+  await expect(page.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
 })
 
 test('loads the Three.js 3D graph panel from the graph API', async ({ page }) => {
@@ -207,9 +207,11 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
   await expect(panel).toBeVisible()
   await expect(panel.getByRole('heading', { name: '3D Graph Explorer' })).toBeVisible()
 
-  await graphResponse
+  // The initial load defaults to 25,000 works — guard against a silent revert.
+  const initialSnapshot = await graphResponse
+  expect(new URL(initialSnapshot.url()).searchParams.get('max_nodes')).toBe('25000')
 
-  await expect(panel.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
   await expect(panel.getByLabel('3D graph visualization')).toBeVisible()
   const mapKey = panel.locator('.graph-3d-map-key')
   await expect(mapKey.getByText('Territories')).toBeVisible()
@@ -229,7 +231,7 @@ async function openLoadedGraphPanel(page) {
   const panel = page.getByTestId('graph-3d-panel')
   await expect(panel).toBeVisible()
   await loaded
-  await expect(panel.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
   return panel
 }
 
@@ -243,7 +245,7 @@ test('changing the grouping re-requests the snapshot with group_by', async ({ pa
   })
   await panel.getByText('Group by').locator('..').locator('select').selectOption('type')
   await regrouped
-  await expect(panel.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
 })
 
 test('search finds a work and selects it', async ({ page }) => {

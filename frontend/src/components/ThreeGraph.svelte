@@ -7,6 +7,7 @@
     fetchGraph3DClusterDetail,
   } from '../lib/api'
   import { createNodeMaterial, createEdgeMaterial } from '../lib/graphMaterials'
+  import { chooseEdgeSegments } from '../lib/graphGeometry'
 
   export let autoLoad = true
 
@@ -37,6 +38,7 @@
   let initialLoadStarted = false
   let clusterLabelLayer
   let clusterLabels = []
+  let clusterLegend = []
   let hubLabels = []
   let tooltip = { visible: false, x: 0, y: 0, node: null }
   let halo = { visible: false, x: 0, y: 0 }
@@ -58,7 +60,7 @@
   let loadedGroupBy = 'field'
   let depthScale = 1.6
   let autoRotate = false
-  let cameraPreset = 'angle'
+  let cameraPreset = null
   let selectedNode = null
   let hoveredNode = null
   let selectedCluster = null
@@ -75,6 +77,7 @@
   let searchQuery = ''
   let searchResults = []
   let searchTimer = 0
+  let yearFilterTimer = 0
   let fadeStart = 0
   const nodeDetailCache = new Map()
   const clusterDetailCache = new Map()
@@ -290,6 +293,16 @@
       scale: Math.max(0.86, Math.min(1.12, 0.72 + Math.log1p(Number(cluster.size || 1)) * 0.062)),
     }))
 
+    // Stable legend source: clusterLabels is rewritten every rendered frame by
+    // the overlay positioner, so the legend reads from this instead to avoid
+    // re-rendering 60×/s during auto-rotate.
+    clusterLegend = visibleClusters.map((cluster) => ({
+      id: cluster.id,
+      label: cluster.field || cluster.label,
+      color: colorCss(clusterColor(cluster)),
+      size: Number(cluster.size || 1),
+    }))
+
     // Always-on labels for the most-cited works ("hubs") so the map reads as a
     // citation landscape before any interaction. Highest-degree nodes only; the
     // overlay placer caps how many show by zoom and avoids cluster labels.
@@ -317,7 +330,29 @@
     // territories converge onto a common trunk instead of forming a hairball.
     // Cheaper segment counts kick in as the edge population grows so the vertex
     // buffer stays bounded on huge ("All works") graphs.
+    // Centroid per cluster for bundling. The snapshot only exports summaries
+    // (with x/y/z) for the top-N clusters, so derive every cluster's centroid
+    // from its node positions first, then override with the exported centroid
+    // when present. Otherwise nodes in un-summarised clusters would all fall
+    // back to the graph centre and over-bundle there.
+    const clusterSums = new Map()
+    for (let i = 0; i < nodes.length; i += 1) {
+      const key = Number(nodes[i].cluster)
+      if (Number.isNaN(key)) continue
+      let acc = clusterSums.get(key)
+      if (!acc) {
+        acc = { x: 0, y: 0, z: 0, n: 0 }
+        clusterSums.set(key, acc)
+      }
+      acc.x += positions[i * 3]
+      acc.y += positions[i * 3 + 1]
+      acc.z += positions[i * 3 + 2]
+      acc.n += 1
+    }
     const clusterCentroids = new Map()
+    for (const [key, acc] of clusterSums) {
+      clusterCentroids.set(key, { x: acc.x / acc.n, y: acc.y / acc.n, z: acc.z / acc.n })
+    }
     for (const cluster of clusterData) {
       clusterCentroids.set(Number(cluster.id), {
         x: Number(cluster.x || 0),
@@ -332,7 +367,7 @@
 
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
     const edgeCount = binaryEdgeCount || edges.length
-    const edgeSegments = edgeCount > 500000 ? 4 : edgeCount > 200000 ? 6 : 8
+    const edgeSegments = chooseEdgeSegments(edgeCount)
     edgeVertexStride = edgeSegments * 2
     const edgePositions = new Float32Array(edgeCount * edgeVertexStride * 3)
     const edgeColors = new Float32Array(edgeCount * edgeVertexStride * 3)
@@ -540,16 +575,22 @@
     if (!nodeAlphaAttr) return
     const highlightSet = highlightIndex === null ? null : highlightNeighborhood(highlightIndex)
     const pathActive = pathNodeSet !== null && pathNodeSet.size > 0
+    // The year filter always drives the visible count, and path / highlight /
+    // isolation compose on top of it rather than short-circuiting each other.
     let visible = 0
     for (let i = 0; i < nodes.length; i += 1) {
+      const yearOk = passesYearFilter(nodes[i])
+      if (yearOk) visible += 1
       let alpha = 0
       if (pathActive) {
+        // An explicitly chosen path always shows, even outside the year range.
         alpha = pathNodeSet.has(i) ? 1 : 0.05
-      } else if (passesYearFilter(nodes[i])) {
-        visible += 1
+      } else if (yearOk) {
         const inIsolated = isolatedCluster === null || Number(nodes[i].cluster) === isolatedCluster
         if (highlightSet) {
-          alpha = highlightSet.has(i) ? 1 : 0.06
+          // Highlight composes with isolation: a neighbour outside the isolated
+          // territory stays dim.
+          alpha = highlightSet.has(i) && inIsolated ? 1 : 0.06
         } else {
           alpha = inIsolated ? 1 : 0.07
         }
@@ -561,9 +602,11 @@
 
     if (edgeLines && edgeEndpoints) {
       const edgeAlphaAttr = edgeLines.geometry.getAttribute('alpha')
+      const edgeAlphaArray = edgeAlphaAttr.array
       const totalEdges = edgeEndpoints.length / 2
       const lodActive = totalEdges > 60000
       const baseAlpha = lodActive ? 0.06 : 0.12
+      const isolating = isolatedCluster !== null
       for (let edge = 0; edge < totalEdges; edge += 1) {
         const source = edgeEndpoints[edge * 2]
         const target = edgeEndpoints[edge * 2 + 1]
@@ -571,13 +614,15 @@
         const targetAlpha = nodeAlphaAttr.array[target]
         let alpha = 0
         if (sourceAlpha > 0 && targetAlpha > 0) {
+          const dimmedEndpoint = sourceAlpha < 0.5 || targetAlpha < 0.5
           if (pathActive) {
             // The bright amber overlay line carries the path; dim the base graph.
             alpha = 0.02
+          } else if (isolating && dimmedEndpoint) {
+            // Isolation wins over highlight for edges leaving the territory.
+            alpha = 0.015
           } else if (highlightIndex !== null) {
             alpha = source === highlightIndex || target === highlightIndex ? 0.85 : 0.02
-          } else if (isolatedCluster !== null && (sourceAlpha < 0.5 || targetAlpha < 0.5)) {
-            alpha = 0.015
           } else if (
             lodActive
             && Number(nodes[source]?.degree || 0) <= 1
@@ -588,11 +633,9 @@
             alpha = baseAlpha
           }
         }
-        // Each edge owns `edgeVertexStride` curve vertices; set them all.
+        // Each edge owns `edgeVertexStride` consecutive curve vertices.
         const base = edge * edgeVertexStride
-        for (let v = 0; v < edgeVertexStride; v += 1) {
-          edgeAlphaAttr.array[base + v] = alpha
-        }
+        edgeAlphaArray.fill(alpha, base, base + edgeVertexStride)
       }
       edgeAlphaAttr.needsUpdate = true
     }
@@ -716,6 +759,9 @@
 
   function resetCamera() {
     if (!camera || !controls) return
+    // Reset/re-render frames the whole graph, which is none of the presets, so
+    // clear the segmented-control highlight to keep it in sync with the camera.
+    cameraPreset = null
     let center = points?.geometry?.boundingSphere?.center || { x: 0, y: 0, z: 0 }
     let radius = points?.geometry?.boundingSphere?.radius || 1600
     const framingClusters = (graphData.clusters || clusters).slice(0, 24)
@@ -941,7 +987,13 @@
   }
 
   function onYearFilterChange() {
-    recomputeAlphas()
+    // Debounced: recomputeAlphas walks every edge, so coalesce keystrokes
+    // instead of running a full pass on each digit typed.
+    if (yearFilterTimer) clearTimeout(yearFilterTimer)
+    yearFilterTimer = setTimeout(() => {
+      yearFilterTimer = 0
+      recomputeAlphas()
+    }, 200)
   }
 
   // Map a "Group by" selection to the server-side layout dimension. 'degree' is
@@ -1062,6 +1114,8 @@
       const baseY = ((-projected.y + 1) / 2) * rect.height
       const width = 184 * Number(label.scale || 1)
       const height = 44 * Number(label.scale || 1)
+      const halfW = width / 2
+      const halfH = height / 2
       let x = baseX
       let y = baseY
       let visible = false
@@ -1076,6 +1130,13 @@
         for (const offsetY of labelOffsets) {
           const candidateX = baseX
           const candidateY = baseY + offsetY
+          // The label is rendered centred (translate -50%,-50%) inside an
+          // overflow-hidden canvas, so require the whole box on-screen — skip
+          // offsets that would clip it rather than show a half-cut label.
+          const inBounds =
+            candidateX - halfW >= 0 && candidateX + halfW <= rect.width &&
+            candidateY - halfH >= 0 && candidateY + halfH <= rect.height
+          if (!inBounds) continue
           const overlaps = placed.some((box) => (
             Math.abs(box.x - candidateX) < (box.width + width) * 0.5
             && Math.abs(box.y - candidateY) < (box.height + height) * 0.6
@@ -1315,6 +1376,7 @@
     if (rotateFrame) cancelAnimationFrame(rotateFrame)
     if (flyFrame) cancelAnimationFrame(flyFrame)
     if (searchTimer) clearTimeout(searchTimer)
+    if (yearFilterTimer) clearTimeout(yearFilterTimer)
     resizeObserver?.disconnect()
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
@@ -1337,7 +1399,7 @@
   $: clusters = graphData.clusters || []
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
   $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
-  $: legendItems = clusterLabels.slice(0, 12)
+  $: legendItems = clusterLegend.slice(0, 12)
 </script>
 
 <div class="card graph-3d-panel" data-testid="graph-3d-panel">
@@ -1350,9 +1412,9 @@
     </div>
     <div class="graph-3d-actions">
       <div class="graph-3d-segment" role="group" aria-label="Camera angle">
-        <button class="graph-3d-btn" class:active={cameraPreset === 'angle'} type="button" on:click={() => setCameraPreset('angle')} disabled={!graphData.nodes?.length}>Angle</button>
-        <button class="graph-3d-btn" class:active={cameraPreset === 'top'} type="button" on:click={() => setCameraPreset('top')} disabled={!graphData.nodes?.length}>Top</button>
-        <button class="graph-3d-btn" class:active={cameraPreset === 'side'} type="button" on:click={() => setCameraPreset('side')} disabled={!graphData.nodes?.length}>Side</button>
+        <button class="graph-3d-btn" class:active={cameraPreset === 'angle'} aria-pressed={cameraPreset === 'angle'} type="button" on:click={() => setCameraPreset('angle')} disabled={!graphData.nodes?.length}>Angle</button>
+        <button class="graph-3d-btn" class:active={cameraPreset === 'top'} aria-pressed={cameraPreset === 'top'} type="button" on:click={() => setCameraPreset('top')} disabled={!graphData.nodes?.length}>Top</button>
+        <button class="graph-3d-btn" class:active={cameraPreset === 'side'} aria-pressed={cameraPreset === 'side'} type="button" on:click={() => setCameraPreset('side')} disabled={!graphData.nodes?.length}>Side</button>
       </div>
       <button class="graph-3d-btn" class:active={autoRotate} type="button" on:click={() => { autoRotate = !autoRotate; updateAutoRotate() }} disabled={!graphData.nodes?.length}>
         {autoRotate ? '⏸ Rotating' : '↻ Auto rotate'}
