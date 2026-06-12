@@ -63,8 +63,8 @@ artifacts/
 dl_lit_project/artifacts/
 
 # OCR output directories
-ocr/ocr_results/
-ocr/translated/
+experiments/ocr/ocr_results/
+experiments/ocr/translated/
 
 # Local workspace artifacts
 Scraper_first_version/
@@ -74,3 +74,11 @@ Scraper_first_version/
 /logs/
 /Abrechnung_ohne_Visualisierung_Entwurf.md
 /Rechnung_MS1.qmd
+
+# Build & test artifacts
+*.pyc
+.pytest_cache/
+node_modules/
+/frontend/dist/
+**/test-results/
+**/playwright-report/

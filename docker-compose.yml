@@ -57,7 +57,6 @@ services:
     volumes:
       - ./backend/src:/usr/src/app/src
       - ./backend/scripts:/usr/src/app/scripts
-      - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_uploads:/usr/src/app/uploads
       - rag_feeder_logs:/usr/src/app/logs
@@ -96,7 +95,6 @@ services:
     volumes:
       - ./backend/src:/usr/src/app/src
       - ./backend/scripts:/usr/src/app/scripts
-      - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_logs:/usr/src/app/logs
     restart: unless-stopped
@@ -129,7 +127,6 @@ services:
     volumes:
       - ./backend/src:/usr/src/app/src
       - ./backend/scripts:/usr/src/app/scripts
-      - ./dl_lit:/usr/src/app/dl_lit
       - ./dl_lit_project:/usr/src/app/dl_lit_project
       - rag_feeder_logs:/usr/src/app/logs
     restart: unless-stopped
