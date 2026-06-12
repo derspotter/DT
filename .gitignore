@@ -83,8 +83,12 @@ Scraper_first_version/
 /.codex/
 /.tmp/
 /logs/
-/Abrechnung_ohne_Visualisierung_Entwurf.md
-/Rechnung_MS1.qmd
+
+# Invoices / billing docs (contain personal data: IBAN, Steuernummer) — keep out of the repo
+Rechnung_*.qmd
+Rechnung_*.pdf
+Abrechnung_*.md
+AN_RE-*.pdf
 
 # Build & test artifacts
 *.pyc
