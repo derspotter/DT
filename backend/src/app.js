@@ -7,6 +7,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
@@ -311,8 +312,11 @@ function listTableColumns(db, tableName) {
 }
 
 function buildGraph3dRequest(req) {
-  const requestedMaxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
-  const maxNodes = Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
+  const requestedMaxNodes = coerceInt(req.query?.max_nodes ?? req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
+  // 0 means "no cap" (show the whole corpus); otherwise clamp to a sane range.
+  const maxNodes = requestedMaxNodes === 0
+    ? 0
+    : Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
   const relationship = req.query?.relationship || 'both';
   const status = 'downloaded';
   const scope = 'all';
@@ -388,6 +392,15 @@ function buildGraph3dSnapshot(options, key) {
         graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
         { dbPath: DB_PATH, corpusId: options.corpusId }
       );
+      // Pre-gzip the large JSON payloads so big snapshots (whole-corpus views)
+      // download at ~1/3 the size; the file endpoint serves these when the
+      // client accepts gzip.
+      for (const fileName of ['nodes_meta.json', 'clusters.json']) {
+        const filePath = path.join(buildDir, fileName);
+        if (fs.existsSync(filePath)) {
+          fs.writeFileSync(`${filePath}.gz`, zlib.gzipSync(fs.readFileSync(filePath)));
+        }
+      }
       const backupDir = `${finalDir}.old-${Date.now()}`;
       if (fs.existsSync(finalDir)) fs.renameSync(finalDir, backupDir);
       fs.renameSync(buildDir, finalDir);
@@ -4767,6 +4780,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const filePath = graph3dSnapshotPath(key, fileName);
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'Snapshot file not found' });
+    }
+    const gzPath = `${filePath}.gz`;
+    const acceptsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+    if (fileName.endsWith('.json') && acceptsGzip && fs.existsSync(gzPath)) {
+      res.set('Content-Encoding', 'gzip');
+      res.set('Content-Type', 'application/json; charset=utf-8');
+      res.set('Vary', 'Accept-Encoding');
+      return res.send(fs.readFileSync(gzPath));
     }
     return res.sendFile(filePath);
   });

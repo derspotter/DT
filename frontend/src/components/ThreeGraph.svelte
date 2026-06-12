@@ -1051,8 +1051,13 @@
       </select>
     </label>
     <label>
-      <span class="muted small">Max nodes</span>
-      <input type="number" min="1000" max="50000" step="1000" bind:value={maxNodes} disabled={graphLoading} />
+      <span class="muted small">Works shown</span>
+      <select bind:value={maxNodes} disabled={graphLoading}>
+        <option value={10000}>Top 10,000 (fastest)</option>
+        <option value={25000}>Top 25,000</option>
+        <option value={50000}>Top 50,000</option>
+        <option value={0}>All works</option>
+      </select>
     </label>
     <label>
       <span class="muted small">Group by</span>
