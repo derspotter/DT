@@ -165,6 +165,30 @@ async function mockApi(route: Route) {
   })
 }
 
+test('graph tab is available to non-admin users', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await page.route('**/api/**', mockApi)
+  // Override auth to a non-admin researcher (registered last, so it wins).
+  await page.route('**/api/auth/me', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        user: { id: 2, username: 'researcher', last_corpus_id: 1, is_admin: false },
+        corpora: [{ id: 1, name: 'Local research corpus', role: 'editor', owner_username: 'admin' }],
+      }),
+    })
+  )
+
+  await page.goto('/#/graph')
+  await expect(page.getByTestId('tab-graph')).toBeVisible()
+  await page.getByTestId('tab-graph').click()
+  await expect(page.getByTestId('graph-3d-panel')).toBeVisible()
+  await expect(page.getByText('Loaded 2 nodes and 1 edges from snapshot.')).toBeVisible()
+})
+
 test('loads the Three.js 3D graph panel from the graph API', async ({ page }) => {
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
