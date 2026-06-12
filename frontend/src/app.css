@@ -2682,6 +2682,95 @@ button.seed-download-tag:focus-visible {
   white-space: nowrap;
 }
 
+/* Citation path-finder */
+.graph-3d-path-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.graph-3d-path-actions button {
+  flex: 1 1 auto;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(236, 247, 246, 0.2);
+  background: rgba(236, 247, 246, 0.06);
+  color: rgba(236, 247, 246, 0.92);
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.graph-3d-path-actions button:hover {
+  background: rgba(236, 247, 246, 0.12);
+}
+
+.graph-3d-path-actions button.active {
+  border-color: rgba(255, 209, 102, 0.7);
+  background: rgba(255, 209, 102, 0.18);
+  color: #ffe9b8;
+}
+
+.graph-3d-path {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid rgba(255, 209, 102, 0.3);
+  border-radius: 14px;
+  background: rgba(255, 209, 102, 0.06);
+}
+
+.graph-3d-path .muted.small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-3d-path-steps {
+  margin: 2px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.graph-3d-path-steps li {
+  display: grid;
+  gap: 0;
+}
+
+.graph-3d-path-steps li span {
+  font-size: 0.76rem;
+  line-height: 1.25;
+  color: #ecf7f6;
+}
+
+.graph-3d-path-steps li small {
+  font-size: 0.66rem;
+  color: rgba(236, 247, 246, 0.55);
+}
+
+.graph-3d-path-clear {
+  justify-self: start;
+  margin-top: 4px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(236, 247, 246, 0.22);
+  background: rgba(236, 247, 246, 0.06);
+  color: rgba(236, 247, 246, 0.88);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.graph-3d-path-clear:hover {
+  background: rgba(236, 247, 246, 0.14);
+}
+
 .graph-3d-clusters {
   display: grid;
   gap: 10px;
