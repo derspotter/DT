@@ -525,7 +525,9 @@
     fadeStart = performance.now()
     resetCamera()
     renderNow()
-    renderForFrames(45)
+    // The fade only needs to cover ~400ms; 24 frames is plenty and avoids
+    // re-drawing the (now larger) curved-edge buffer dozens of extra times.
+    renderForFrames(24)
     requestRender()
   }
 
@@ -605,7 +607,10 @@
       const edgeAlphaArray = edgeAlphaAttr.array
       const totalEdges = edgeEndpoints.length / 2
       const lodActive = totalEdges > 60000
-      const baseAlpha = lodActive ? 0.06 : 0.12
+      // Edges blend additively, so a bundle of N overlapping edges saturates
+      // once N×baseAlpha ≈ 1. Keep it low so only genuine trunks glow and the
+      // dense core doesn't wash out to white.
+      const baseAlpha = lodActive ? 0.035 : 0.09
       const isolating = isolatedCluster !== null
       for (let edge = 0; edge < totalEdges; edge += 1) {
         const source = edgeEndpoints[edge * 2]

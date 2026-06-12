@@ -4,12 +4,14 @@
 // a regression once when it silently collapsed to 2, so it is worth pinning.
 
 // Sampled segments per bundled edge. Fewer as the edge population grows so the
-// vertex buffer stays bounded on the whole-corpus view, but never so few that a
-// cubic Bézier degenerates into a visible straight kink.
+// vertex buffer (built synchronously and uploaded to the GPU on every load)
+// stays small enough to paint quickly, but never so few that a cubic Bézier
+// degenerates into a visible straight kink. 3 chords already read as a curve;
+// 2 (a single mid-point kink) does not — that was the regression we guard.
 export function chooseEdgeSegments(edgeCount) {
-  if (edgeCount > 500000) return 4
-  if (edgeCount > 200000) return 6
-  return 8
+  if (edgeCount > 400000) return 3
+  if (edgeCount > 120000) return 4
+  return 6
 }
 
 // Control points for one bundled edge: pull each endpoint toward its own
