@@ -61,6 +61,7 @@
         { id: 'workspace', label: 'Workspace' },
         { id: 'upstream', label: 'Korpus Management' },
         { id: 'scraper', label: 'Scraper Lab' },
+        { id: 'graph', label: 'Graph' },
       ]
     }
   ]
@@ -75,7 +76,6 @@
       title: 'Diagnostics',
       tabs: [
         { id: 'downloads', label: 'Downloads' },
-        { id: 'graph', label: 'Graph' },
         { id: 'dashboard', label: 'Pipeline Status' },
         { id: 'logs', label: 'Logs' },
       ]

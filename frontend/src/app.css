@@ -4575,3 +4575,65 @@ button.seed-download-tag:focus-visible {
     min-width: 0;
   }
 }
+
+/* ---- Mobile: compact nav strip + denser controls ---- */
+@media (max-width: 780px) {
+  .app-shell {
+    padding: 12px clamp(12px, 3vw, 18px) 16px;
+    gap: 12px;
+  }
+
+  /* Flatten the side-nav into a compact, wrapping pill row at the top so the
+     content (incl. the graph) is reachable without scrolling past the menu. */
+  .layout {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .side-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 10px;
+    position: static;
+    top: auto;
+  }
+
+  .nav-group {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .nav-group-title {
+    display: none;
+  }
+
+  .side-nav button {
+    padding: 8px 12px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  /* 3D graph controls: pack two per row instead of one to reclaim ~half the
+     vertical space before the canvas; search spans the full width. */
+  .graph-3d-controls {
+    gap: 8px;
+  }
+
+  .graph-3d-controls label {
+    min-width: 0;
+    flex: 1 1 130px;
+  }
+
+  .graph-3d-search {
+    flex-basis: 100%;
+    min-width: 0;
+  }
+
+  .graph-3d-actions {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+}
