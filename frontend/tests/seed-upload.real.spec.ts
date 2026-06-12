@@ -1,4 +1,4 @@
-import { test, expect, type APIRequestContext, type Page } from '@playwright/test'
+import { test, expect, type Page } from '@playwright/test'
 
 // Real authenticated round-trip for the BibTeX seed upload against the live
 // backend + DB. Uploads a uniquely-marked probe entry; the surrounding shell

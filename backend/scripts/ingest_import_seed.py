@@ -98,6 +98,10 @@ def main():
     errors = []
     try:
         for raw in entries:
+            if not isinstance(raw, dict):
+                skipped += 1
+                errors.append(f"Skipped non-object entry: {type(raw).__name__}")
+                continue
             entry = dict(raw)
             if args.source_label and not entry.get("source"):
                 entry["source"] = args.source_label
@@ -109,7 +113,7 @@ def main():
                 continue
             if row_id:
                 added += 1
-                if args.corpus_id:
+                if args.corpus_id is not None:
                     db.add_corpus_item(args.corpus_id, "works", int(row_id))
                     linked += 1
             else:

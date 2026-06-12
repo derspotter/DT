@@ -46,18 +46,18 @@ Status: `completed`.
 
 ## M-04 Frontend
 
-Status: `completed` (one literal-wording nuance on seed upload — see note).
+Status: `completed`.
 
 - Svelte/Vite frontend in production use for ingest/search/corpus/download/logs/graph.
 - DB-backed ingest selection/queueing and download controls implemented.
 - Corpus graph display and pipeline/progress indicators present.
+- **Seed upload accepts PDF, BibTeX, and JSON.** PDFs go through bibliography
+  extraction; `.bib`/`.json` seed files are imported straight into the current
+  corpus via `POST /api/ingest/import-seed`
+  (`backend/scripts/ingest_import_seed.py`). The keyword search also accepts a
+  JSON seed.
 - Final export interface implemented: JSON, BibTeX, PDFs ZIP, and Bundle ZIP downloads from current corpus, with status/year/source filters.
 - URL-based tab routing + auth/corpus selection are integrated.
-- **Seed upload note:** the spec lists "PDF, BibTeX, JSON". The web upload
-  accepts **PDF** files; **JSON** seeds are supported via the keyword-search
-  JSON-seed input; **BibTeX/JSON file import** is currently available through
-  the CLI (`import-bib`, `add-pending-works`). A browser-side BibTeX/JSON file
-  upload is not yet wired into the corpus-aware ingest pipeline.
 
 ## M-05 Dockerisierung
 
