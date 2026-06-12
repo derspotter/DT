@@ -103,7 +103,10 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
 const GRAPH_3D_CACHE_VERSION = 9;
-const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
+// Keep in sync with the frontend "Works shown" default (ThreeGraph.svelte).
+// The startup pre-warm builds this snapshot, so a mismatch means the user's
+// first load is a cold ~15s layout build instead of an instant cache hit.
+const GRAPH_3D_DEFAULT_MAX_NODES = 25000;
 const GRAPH_3D_GROUP_BY = new Set(['field', 'source_path', 'type', 'region', 'year', 'component']);
 // A built snapshot is served immediately; if it is older than this it is also
 // rebuilt in the background (stale-while-revalidate) so opens stay instant.
