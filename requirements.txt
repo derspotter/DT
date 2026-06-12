@@ -10,3 +10,5 @@ rapidfuzz
 python-slugify
 pdfminer.six
 openai
+python-igraph
+numpy

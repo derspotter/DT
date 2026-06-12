@@ -6,6 +6,7 @@
     fetchGraph3DNodeDetail,
     fetchGraph3DClusterDetail,
   } from '../lib/api'
+  import { createNodeMaterial, createEdgeMaterial } from '../lib/graphMaterials'
 
   export let autoLoad = true
 
@@ -19,17 +20,18 @@
   let points
   let edgeLines
   let bridgeLines
-  let landmarkPoints
   let clusterShells
   let raycaster
   let pointer
   let animationFrame = 0
   let settleFrame = 0
   let rotateFrame = 0
+  let flyFrame = 0
   let resizeObserver
   let handlePointerMove
   let handleClick
   let handleContextMenu
+  let handleKeydown
   let componentMounted = false
   let initialLoadStarted = false
   let clusterLabelLayer
@@ -41,7 +43,8 @@
   let statusFilter = 'downloaded'
   let scope = 'all'
   let maxNodes = 10000
-  let colorMode = 'cluster'
+  let groupMode = 'cluster'
+  let loadedGroupBy = 'field'
   let depthScale = 1.6
   let autoRotate = false
   let selectedNode = null
@@ -50,16 +53,19 @@
   let selectedNodeDetail = null
   let selectedClusterDetail = null
   let nodeDetailLoading = false
+  let highlightIndex = null
+  let adjacency = null
+  let edgeEndpoints = null
+  let yearFrom = null
+  let yearTo = null
+  let visibleNodeCount = 0
+  let searchQuery = ''
+  let searchResults = []
+  let searchTimer = 0
+  let fadeStart = 0
+  const nodeDetailCache = new Map()
+  const clusterDetailCache = new Map()
 
-  const statusColors = {
-    downloaded: 0x0f8b8d,
-    matched: 0x3b82f6,
-    queued_download: 0xf4a340,
-    failed_download: 0xb91c1c,
-    failed_enrichment: 0xb91c1c,
-    enriching: 0x8b5cf6,
-    raw: 0x6f7b84,
-  }
   const palette = [
     0x0f8b8d,
     0xf4a340,
@@ -92,29 +98,61 @@
     return `#${Number(hex || 0).toString(16).padStart(6, '0')}`
   }
 
+  const UNKNOWN_FIELD_COLOR = 0x52636a
+  let clusterColorById = new Map()
+
+  function isUnknownField(kind) {
+    return kind === 'unknown_field' || kind === 'low_signal'
+  }
+
+  function hslToHex(h, s, l) {
+    const a = s * Math.min(l, 1 - l)
+    const channel = (n) => {
+      const k = (n + h / 30) % 12
+      const value = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))
+      return Math.round(255 * value)
+    }
+    return (channel(0) << 16) | (channel(8) << 8) | channel(4)
+  }
+
+  // Give every territory (cluster) its own colour. A 12-entry palette collides
+  // across the ~26+ groups a dimension can produce, so derive evenly separated
+  // hues instead. The golden-angle stride keeps neighbouring territories (packed
+  // by size) far apart on the colour wheel; a small lightness wobble separates
+  // hues that land close together. "Unknown" territories are grey.
+  function buildClusterColors(clusters) {
+    const map = new Map()
+    let index = 0
+    for (const cluster of clusters || []) {
+      if (isUnknownField(cluster.kind)) {
+        map.set(cluster.id, UNKNOWN_FIELD_COLOR)
+        continue
+      }
+      const hue = (index * 137.508) % 360
+      const lightness = 0.54 + ((index % 3) - 1) * 0.07
+      map.set(cluster.id, hslToHex(hue, 0.64, lightness))
+      index += 1
+    }
+    clusterColorById = map
+  }
+
   function clusterColor(cluster) {
-    return cluster?.kind === 'low_signal' ? 0x52636a : paletteColor(cluster?.area || cluster?.label || cluster?.id)
+    if (isUnknownField(cluster?.kind)) return UNKNOWN_FIELD_COLOR
+    return clusterColorById.get(cluster?.id) ?? paletteColor(cluster?.field || cluster?.label || cluster?.id)
   }
 
   function nodeColor(node) {
-    if (colorMode === 'status') return statusColors[node.status] || 0x6f7b84
-    if (colorMode === 'degree') {
+    if (groupMode === 'degree') {
       const degree = Number(node.degree || 0)
       if (degree > 100) return 0xfff1a8
       if (degree > 30) return 0xf4a340
       if (degree > 10) return 0x3b82f6
       return 0x0f8b8d
     }
-    if (colorMode === 'year') {
-      const year = Number(node.year || 0)
-      if (!year) return 0x64748b
-      return palette[Math.abs(Math.floor(year / 10)) % palette.length]
-    }
-    if (colorMode === 'area') return paletteColor(node.area || node.type || node.source || 'unknown')
-    if (colorMode === 'region') return paletteColor(node.region || node.countries?.[0] || 'unknown')
-    if (colorMode === 'component') return palette[Math.abs(Number(node.component || 0)) % palette.length]
-    if (node.cluster_kind === 'low_signal') return 0x64747a
-    return palette[Math.abs(Number(node.cluster || 0)) % palette.length]
+    // Every other mode arranges the graph into territories of that dimension, so
+    // colour each point by its territory to match its shell and label.
+    if (isUnknownField(node.cluster_kind)) return UNKNOWN_FIELD_COLOR
+    return clusterColorById.get(node.cluster) ?? paletteColor(node.field || node.cluster || 'unknown')
   }
 
   function positionValue(positions, nodes, index, axis) {
@@ -142,12 +180,15 @@
     scene?.remove(object)
   }
 
+  function nodeSize(degree) {
+    return Math.min(14, Math.max(3, 3 + 2.4 * Math.log2(1 + Math.max(0, Number(degree || 0)))))
+  }
+
   function renderGraph() {
     if (!scene || !THREE) return
     disposeObject(points)
     disposeObject(edgeLines)
     disposeObject(bridgeLines)
-    disposeObject(landmarkPoints)
     disposeObject(clusterShells)
     clusterLabels = []
     hoveredNode = null
@@ -157,38 +198,34 @@
     const clusterData = graphData.clusters || []
     const sourcePositions = graphData.positions
     const edgeTriplets = graphData.edgeTriplets
+    buildClusterColors(clusterData)
     const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]))
     const positions = new Float32Array(nodes.length * 3)
     const colors = new Float32Array(nodes.length * 3)
+    const sizes = new Float32Array(nodes.length)
+    const nodeAlphas = new Float32Array(nodes.length).fill(1)
     const color = new THREE.Color()
 
     nodes.forEach((node, index) => {
       positions[index * 3] = positionValue(sourcePositions, nodes, index, 0)
       positions[index * 3 + 1] = positionValue(sourcePositions, nodes, index, 1) * depthScale
       positions[index * 3 + 2] = positionValue(sourcePositions, nodes, index, 2)
+      const degree = Number(node.degree || 0)
       color.setHex(nodeColor(node))
+      if (degree > 100) color.lerp(new THREE.Color(0xfff1a8), 0.4)
       colors[index * 3] = color.r
       colors[index * 3 + 1] = color.g
       colors[index * 3 + 2] = color.b
+      sizes[index] = nodeSize(degree)
     })
 
     const pointGeometry = new THREE.BufferGeometry()
     pointGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
     pointGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    pointGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1))
+    pointGeometry.setAttribute('alpha', new THREE.BufferAttribute(nodeAlphas, 1))
     pointGeometry.computeBoundingSphere()
-    points = new THREE.Points(
-      pointGeometry,
-      new THREE.PointsMaterial({
-        size: 4,
-        sizeAttenuation: false,
-        vertexColors: true,
-        transparent: true,
-        opacity: 1,
-        blending: THREE.AdditiveBlending,
-        depthTest: false,
-        depthWrite: false,
-      })
-    )
+    points = new THREE.Points(pointGeometry, createNodeMaterial(THREE, renderer?.getPixelRatio?.() || 1))
     points.userData.nodes = nodes
     scene.add(points)
 
@@ -200,7 +237,7 @@
       const material = new THREE.MeshBasicMaterial({
         color: clusterColor(cluster),
         transparent: true,
-        opacity: cluster.kind === 'low_signal' ? 0.08 : Math.min(0.2, 0.08 + Math.log1p(Number(cluster.size || 1)) * 0.018),
+        opacity: isUnknownField(cluster.kind) ? 0.08 : Math.min(0.2, 0.08 + Math.log1p(Number(cluster.size || 1)) * 0.018),
         wireframe: true,
         depthTest: false,
         depthWrite: false,
@@ -211,11 +248,13 @@
     }
     scene.add(clusterShells)
 
-    clusterLabels = visibleClusters.slice(0, 8).map((cluster, index) => ({
+    clusterLabels = visibleClusters.map((cluster, index) => ({
       id: cluster.id,
-      label: cluster.area && cluster.area !== 'unknown area' ? cluster.area : cluster.label,
+      label: cluster.field || cluster.label,
       detail: `${formatNumber(cluster.size)} works / ${cluster.region || 'unknown region'}`,
       color: colorCss(clusterColor(cluster)),
+      radius: Math.max(24, Number(cluster.radius || 0)),
+      size: Number(cluster.size || 1),
       vector: new THREE.Vector3(
         Number(cluster.x || 0),
         Number(cluster.y || 0) * depthScale + Math.max(62, Number(cluster.radius || 0) * 0.74),
@@ -223,7 +262,7 @@
       ),
       x: -9999,
       y: -9999,
-      opacity: index < 8 ? 1 : 0.74,
+      opacity: index < 8 ? 1 : 0.85,
       scale: Math.max(0.86, Math.min(1.12, 0.72 + Math.log1p(Number(cluster.size || 1)) * 0.062)),
     }))
 
@@ -231,8 +270,10 @@
     const edgeCount = binaryEdgeCount || edges.length
     const edgePositions = new Float32Array(edgeCount * 2 * 3)
     const edgeColors = new Float32Array(edgeCount * 2 * 3)
+    const endpointPairs = new Uint32Array(edgeCount * 2)
     let edgeOffset = 0
     let edgeColorOffset = 0
+    let appendedEdges = 0
     const appendEdge = (sourceIndex, targetIndex, relationshipCode = 0) => {
       if (sourceIndex === undefined || targetIndex === undefined) return
       if (sourceIndex < 0 || targetIndex < 0 || sourceIndex >= nodes.length || targetIndex >= nodes.length) return
@@ -242,6 +283,9 @@
       edgePositions[edgeOffset++] = positions[targetIndex * 3]
       edgePositions[edgeOffset++] = positions[targetIndex * 3 + 1]
       edgePositions[edgeOffset++] = positions[targetIndex * 3 + 2]
+      endpointPairs[appendedEdges * 2] = sourceIndex
+      endpointPairs[appendedEdges * 2 + 1] = targetIndex
+      appendedEdges += 1
       const edgeHex = relationshipCode === 1 ? 0xf4a340 : 0x7c8b95
       color.setHex(edgeHex)
       for (let i = 0; i < 2; i += 1) {
@@ -263,17 +307,13 @@
         )
       }
     }
+    edgeEndpoints = endpointPairs.slice(0, appendedEdges * 2)
+    adjacency = buildAdjacency(edgeEndpoints, nodes.length)
     const lineGeometry = new THREE.BufferGeometry()
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions.slice(0, edgeOffset), 3))
     lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors.slice(0, edgeColorOffset), 3))
-    edgeLines = new THREE.LineSegments(
-      lineGeometry,
-      new THREE.LineBasicMaterial({
-        vertexColors: true,
-        transparent: true,
-        opacity: 0.12,
-      })
-    )
+    lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(appendedEdges * 2), 1))
+    edgeLines = new THREE.LineSegments(lineGeometry, createEdgeMaterial(THREE))
     scene.add(edgeLines)
 
     const bridgeCandidates = []
@@ -346,46 +386,104 @@
       scene.add(bridgeLines)
     }
 
-    const landmarkCandidates = nodes
-      .map((node, index) => ({ node, index, degree: Number(node.degree || 0) }))
-      .filter(({ degree }) => degree >= 8)
-      .sort((a, b) => b.degree - a.degree)
-      .slice(0, 140)
-    if (landmarkCandidates.length) {
-      const landmarkPositions = new Float32Array(landmarkCandidates.length * 3)
-      const landmarkColors = new Float32Array(landmarkCandidates.length * 3)
-      landmarkCandidates.forEach(({ node, index }, landmarkIndex) => {
-        landmarkPositions[landmarkIndex * 3] = positions[index * 3]
-        landmarkPositions[landmarkIndex * 3 + 1] = positions[index * 3 + 1]
-        landmarkPositions[landmarkIndex * 3 + 2] = positions[index * 3 + 2]
-        color.setHex(Number(node.degree || 0) > 100 ? 0xfff1a8 : 0xffcf70)
-        landmarkColors[landmarkIndex * 3] = color.r
-        landmarkColors[landmarkIndex * 3 + 1] = color.g
-        landmarkColors[landmarkIndex * 3 + 2] = color.b
-      })
-      const landmarkGeometry = new THREE.BufferGeometry()
-      landmarkGeometry.setAttribute('position', new THREE.BufferAttribute(landmarkPositions, 3))
-      landmarkGeometry.setAttribute('color', new THREE.BufferAttribute(landmarkColors, 3))
-      landmarkPoints = new THREE.Points(
-        landmarkGeometry,
-        new THREE.PointsMaterial({
-          size: 9,
-          sizeAttenuation: false,
-          vertexColors: true,
-          transparent: true,
-          opacity: 0.96,
-          blending: THREE.AdditiveBlending,
-          depthTest: false,
-          depthWrite: false,
-        })
-      )
-      scene.add(landmarkPoints)
-    }
-
+    recomputeAlphas()
+    fadeStart = performance.now()
     resetCamera()
     renderNow()
     renderForFrames(45)
     requestRender()
+  }
+
+  function buildAdjacency(endpoints, nodeCount) {
+    const counts = new Uint32Array(nodeCount)
+    for (let i = 0; i < endpoints.length; i += 2) {
+      counts[endpoints[i]] += 1
+      counts[endpoints[i + 1]] += 1
+    }
+    const offsets = new Uint32Array(nodeCount + 1)
+    for (let i = 0; i < nodeCount; i += 1) {
+      offsets[i + 1] = offsets[i] + counts[i]
+    }
+    const neighbors = new Uint32Array(offsets[nodeCount])
+    const cursor = offsets.slice(0, nodeCount)
+    for (let i = 0; i < endpoints.length; i += 2) {
+      const source = endpoints[i]
+      const target = endpoints[i + 1]
+      neighbors[cursor[source]++] = target
+      neighbors[cursor[target]++] = source
+    }
+    return { offsets, neighbors }
+  }
+
+  function passesYearFilter(node) {
+    const year = Number(node.year || 0)
+    if (!year) return true
+    if (yearFrom && year < Number(yearFrom)) return false
+    if (yearTo && year > Number(yearTo)) return false
+    return true
+  }
+
+  function highlightNeighborhood(index) {
+    const set = new Set([index])
+    if (adjacency) {
+      for (let i = adjacency.offsets[index]; i < adjacency.offsets[index + 1]; i += 1) {
+        set.add(adjacency.neighbors[i])
+      }
+    }
+    return set
+  }
+
+  function recomputeAlphas() {
+    if (!points) return
+    const nodes = graphData.nodes || []
+    const nodeAlphaAttr = points.geometry.getAttribute('alpha')
+    if (!nodeAlphaAttr) return
+    const highlightSet = highlightIndex === null ? null : highlightNeighborhood(highlightIndex)
+    let visible = 0
+    for (let i = 0; i < nodes.length; i += 1) {
+      let alpha = 0
+      if (passesYearFilter(nodes[i])) {
+        visible += 1
+        alpha = highlightSet ? (highlightSet.has(i) ? 1 : 0.06) : 1
+      }
+      nodeAlphaAttr.array[i] = alpha
+    }
+    nodeAlphaAttr.needsUpdate = true
+    visibleNodeCount = visible
+
+    if (edgeLines && edgeEndpoints) {
+      const edgeAlphaAttr = edgeLines.geometry.getAttribute('alpha')
+      const totalEdges = edgeEndpoints.length / 2
+      const lodActive = totalEdges > 60000
+      const baseAlpha = lodActive ? 0.06 : 0.12
+      for (let edge = 0; edge < totalEdges; edge += 1) {
+        const source = edgeEndpoints[edge * 2]
+        const target = edgeEndpoints[edge * 2 + 1]
+        let alpha = 0
+        if (nodeAlphaAttr.array[source] > 0 && nodeAlphaAttr.array[target] > 0) {
+          if (highlightIndex !== null) {
+            alpha = source === highlightIndex || target === highlightIndex ? 0.85 : 0.02
+          } else if (
+            lodActive
+            && Number(nodes[source]?.degree || 0) <= 1
+            && Number(nodes[target]?.degree || 0) <= 1
+          ) {
+            alpha = 0
+          } else {
+            alpha = baseAlpha
+          }
+        }
+        edgeAlphaAttr.array[edge * 2] = alpha
+        edgeAlphaAttr.array[edge * 2 + 1] = alpha
+      }
+      edgeAlphaAttr.needsUpdate = true
+    }
+    requestRender()
+  }
+
+  function applyHighlight(index) {
+    highlightIndex = index
+    recomputeAlphas()
   }
 
   function resetCamera() {
@@ -428,6 +526,30 @@
     controls.update()
   }
 
+  function flyTo({ target, position, duration = 700 }) {
+    if (!camera || !controls) return
+    if (flyFrame) {
+      cancelAnimationFrame(flyFrame)
+      flyFrame = 0
+    }
+    const startPosition = camera.position.clone()
+    const startTarget = controls.target.clone()
+    const endPosition = position.clone()
+    const endTarget = target.clone()
+    const startedAt = performance.now()
+    const ease = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2)
+    const step = () => {
+      const progress = Math.min(1, (performance.now() - startedAt) / duration)
+      const eased = ease(progress)
+      camera.position.lerpVectors(startPosition, endPosition, eased)
+      controls.target.lerpVectors(startTarget, endTarget, eased)
+      controls.update()
+      renderNow()
+      flyFrame = progress < 1 ? requestAnimationFrame(step) : 0
+    }
+    flyFrame = requestAnimationFrame(step)
+  }
+
   function focusCluster(cluster) {
     if (!camera || !controls || !cluster) return
     selectedCluster = Number(cluster.id)
@@ -436,32 +558,44 @@
     const z = Number(cluster.z || 0)
     const radius = Math.max(280, Math.min(2200, 180 + Math.sqrt(Number(cluster.size || 1)) * 34))
     const visualRadius = Math.max(radius, Number(cluster.radius || 0) * 3.2)
-    camera.position.set(x + visualRadius * 0.95, y + visualRadius * 0.35, z + visualRadius * 1.55)
     camera.near = Math.max(0.1, visualRadius / 2000)
     camera.far = Math.max(6000, visualRadius * 12)
     camera.updateProjectionMatrix()
-    controls.target.set(x, y, z)
-    controls.update()
-    renderNow()
-    renderForFrames(20)
+    flyTo({
+      target: new THREE.Vector3(x, y, z),
+      position: new THREE.Vector3(x + visualRadius * 0.95, y + visualRadius * 0.35, z + visualRadius * 1.55),
+    })
     void loadClusterDetail(cluster)
+  }
+
+  function focusNode(index) {
+    if (!camera || !controls || !points) return
+    const positionAttr = points.geometry.getAttribute('position')
+    if (!positionAttr || index === null || index === undefined || index * 3 >= positionAttr.array.length) return
+    const target = new THREE.Vector3(
+      positionAttr.array[index * 3],
+      positionAttr.array[index * 3 + 1],
+      positionAttr.array[index * 3 + 2]
+    )
+    const direction = camera.position.clone().sub(controls.target)
+    if (direction.lengthSq() < 1) direction.set(1, 0.6, 1.4)
+    direction.normalize().multiplyScalar(220)
+    flyTo({ target, position: target.clone().add(direction) })
   }
 
   function setCameraPreset(preset) {
     if (!camera || !controls) return
-    const center = controls.target || { x: 0, y: 0, z: 0 }
+    const center = controls.target.clone()
     const radius = points?.geometry?.boundingSphere?.radius || 1800
+    let position
     if (preset === 'top') {
-      camera.position.set(center.x, center.y + radius * 2.2, center.z + 1)
+      position = new THREE.Vector3(center.x, center.y + radius * 2.2, center.z + 1)
     } else if (preset === 'side') {
-      camera.position.set(center.x + radius * 2.1, center.y + radius * 0.2, center.z)
+      position = new THREE.Vector3(center.x + radius * 2.1, center.y + radius * 0.2, center.z)
     } else {
-      camera.position.set(center.x + radius * 1.1, center.y + radius * 0.75, center.z + radius * 1.55)
+      position = new THREE.Vector3(center.x + radius * 1.1, center.y + radius * 0.75, center.z + radius * 1.55)
     }
-    camera.lookAt(center.x, center.y, center.z)
-    controls.update()
-    renderNow()
-    renderForFrames(20)
+    flyTo({ target: center, position })
   }
 
   function updateAutoRotate() {
@@ -490,10 +624,16 @@
   async function loadNodeDetail(node) {
     const id = node?.work_id || node?.id
     if (!id) return
+    if (nodeDetailCache.has(id)) {
+      selectedNodeDetail = nodeDetailCache.get(id)
+      nodeDetailLoading = false
+      return
+    }
     nodeDetailLoading = true
     selectedNodeDetail = null
     try {
       const detail = await fetchGraph3DNodeDetail(id)
+      nodeDetailCache.set(id, detail)
       if ((selectedNode?.work_id || selectedNode?.id) === id) {
         selectedNodeDetail = detail
       }
@@ -510,24 +650,106 @@
       selectedClusterDetail = cluster || null
       return
     }
+    const cacheKey = `${snapshotKey}:${cluster.id}`
+    if (clusterDetailCache.has(cacheKey)) {
+      selectedClusterDetail = clusterDetailCache.get(cacheKey)
+      return
+    }
     selectedClusterDetail = cluster
     try {
       selectedClusterDetail = await fetchGraph3DClusterDetail(snapshotKey, cluster.id)
+      clusterDetailCache.set(cacheKey, selectedClusterDetail)
     } catch {
       selectedClusterDetail = cluster
+    }
+  }
+
+  function runSearch() {
+    const query = searchQuery.trim().toLowerCase()
+    if (query.length < 2) {
+      searchResults = []
+      return
+    }
+    const nodes = graphData.nodes || []
+    const results = []
+    for (let index = 0; index < nodes.length && results.length < 12; index += 1) {
+      const node = nodes[index]
+      const haystack = `${node.title || ''} ${node.authors || ''} ${node.year || ''}`.toLowerCase()
+      if (haystack.includes(query)) {
+        results.push({ index, title: node.title || 'Untitled', year: node.year, authors: node.authors || '' })
+      }
+    }
+    searchResults = results
+  }
+
+  function onSearchInput() {
+    if (searchTimer) clearTimeout(searchTimer)
+    searchTimer = setTimeout(() => {
+      searchTimer = 0
+      runSearch()
+    }, 200)
+  }
+
+  function selectSearchResult(result) {
+    const node = (graphData.nodes || [])[result.index]
+    if (!node) return
+    searchResults = []
+    searchQuery = result.title
+    selectedNode = node
+    applyHighlight(result.index)
+    focusNode(result.index)
+    void loadNodeDetail(node)
+  }
+
+  function clearSelection() {
+    selectedNode = null
+    selectedNodeDetail = null
+    hoveredNode = null
+    if (highlightIndex !== null) applyHighlight(null)
+  }
+
+  function onYearFilterChange() {
+    recomputeAlphas()
+  }
+
+  // Map a "Group by" selection to the server-side layout dimension. 'degree' is
+  // a colour-only overlay (no re-arrangement), so it has no grouping dimension.
+  function groupByForMode(mode) {
+    if (mode === 'degree') return null
+    return mode === 'cluster' ? 'field' : mode
+  }
+
+  function onGroupModeChange() {
+    if (!graphData.nodes?.length) return
+    const target = groupByForMode(groupMode)
+    // A new grouping dimension re-arranges the graph (server re-layout); same
+    // dimension or the degree overlay just recolours the current arrangement.
+    if (target && target !== loadedGroupBy) {
+      void load3DGraph()
+    } else {
+      renderGraph()
     }
   }
 
   async function load3DGraph() {
     graphLoading = true
     graphStatus = 'Building 3D graph snapshot...'
+    highlightIndex = null
+    selectedNode = null
+    selectedNodeDetail = null
+    selectedCluster = null
+    selectedClusterDetail = null
+    searchResults = []
+    const groupBy = groupByForMode(groupMode) || loadedGroupBy || 'field'
     try {
       const manifest = await fetchGraph3DSnapshot({
         maxNodes,
         relationship,
         status: statusFilter,
         scope,
+        groupBy,
       })
+      loadedGroupBy = groupBy
       const snapshot = await fetchGraph3DSnapshotResources(manifest)
       const edgeCount = Number(snapshot.manifest?.buffers?.edges?.count || Math.floor((snapshot.edgeTriplets?.length || 0) / 3) || 0)
       graphData = {
@@ -568,6 +790,12 @@
 
   function renderNow() {
     if (!renderer || !scene || !camera) return
+    if (fadeStart) {
+      const fade = Math.min(1, (performance.now() - fadeStart) / 400)
+      if (points?.material?.uniforms?.uFade) points.material.uniforms.uFade.value = fade
+      if (edgeLines?.material?.uniforms?.uFade) edgeLines.material.uniforms.uFade.value = fade
+      if (fade >= 1) fadeStart = 0
+    }
     renderer.render(scene, camera)
     updateClusterLabelPositions()
   }
@@ -584,7 +812,18 @@
       [160, -42],
       [0, 76],
     ]
-    clusterLabels = clusterLabels.map((label) => {
+    const cameraDistance = controls ? camera.position.distanceTo(controls.target) : 2600
+    const maxLabels = cameraDistance < 1200 ? 20 : cameraDistance < 2600 ? 14 : 8
+    const ranked = clusterLabels
+      .map((label, index) => ({
+        label,
+        index,
+        score: (label.radius * Math.log1p(label.size)) / Math.max(1, camera.position.distanceTo(label.vector)),
+      }))
+      .sort((a, b) => b.score - a.score)
+    const updates = new Array(clusterLabels.length)
+    let visibleCount = 0
+    for (const { label, index } of ranked) {
       const projected = label.vector.clone().project(camera)
       const baseX = ((projected.x + 1) / 2) * rect.width
       const baseY = ((-projected.y + 1) / 2) * rect.height
@@ -593,7 +832,7 @@
       let x = baseX
       let y = baseY
       let visible = false
-      if (projected.z > -1 && projected.z < 1) {
+      if (visibleCount < maxLabels && projected.z > -1 && projected.z < 1) {
         for (const [offsetX, offsetY] of labelOffsets) {
           const candidateX = Math.min(rect.width - width / 2 - 12, Math.max(width / 2 + 12, baseX + offsetX))
           const candidateY = Math.min(rect.height - height / 2 - 12, Math.max(48 + height / 2, baseY + offsetY))
@@ -605,18 +844,15 @@
             x = candidateX
             y = candidateY
             visible = true
+            visibleCount += 1
             placed.push({ x, y, width, height })
             break
           }
         }
       }
-      return {
-        ...label,
-        x,
-        y,
-        visible,
-      }
-    })
+      updates[index] = { ...label, x, y, visible }
+    }
+    clusterLabels = updates
   }
 
   function renderForFrames(count = 30) {
@@ -655,13 +891,21 @@
     if (!raycaster || !points || !camera) return
     pointerFromEvent(event)
     raycaster.setFromCamera(pointer, camera)
-    raycaster.params.Points.threshold = 10
-    const hit = raycaster.intersectObject(points, false)[0]
+    const cameraDistance = controls ? camera.position.distanceTo(controls.target) : 2000
+    raycaster.params.Points.threshold = Math.min(24, Math.max(2, cameraDistance * 0.005))
+    const alphaArray = points.geometry.getAttribute('alpha')?.array
+    const hit = raycaster
+      .intersectObject(points, false)
+      .find((candidate) => !alphaArray || alphaArray[candidate.index] > 0.05)
     const nextNode = hit ? points.userData.nodes?.[hit.index] : null
     hoveredNode = nextNode
-    if (persist && nextNode) {
+    if (!persist) return
+    if (nextNode) {
       selectedNode = nextNode
+      applyHighlight(hit.index)
       void loadNodeDetail(nextNode)
+    } else {
+      clearSelection()
     }
   }
 
@@ -723,9 +967,16 @@
     handlePointerMove = (event) => pickNode(event, false)
     handleClick = (event) => pickNode(event, true)
     handleContextMenu = (event) => event.preventDefault()
+    handleKeydown = (event) => {
+      if (event.key === 'Escape') {
+        searchResults = []
+        clearSelection()
+      }
+    }
     renderer.domElement.addEventListener('pointermove', handlePointerMove)
     renderer.domElement.addEventListener('click', handleClick)
     renderer.domElement.addEventListener('contextmenu', handleContextMenu)
+    window.addEventListener('keydown', handleKeydown)
 
     resizeObserver = new ResizeObserver(resize)
     resizeObserver.observe(container)
@@ -744,16 +995,18 @@
     if (animationFrame) cancelAnimationFrame(animationFrame)
     if (settleFrame) cancelAnimationFrame(settleFrame)
     if (rotateFrame) cancelAnimationFrame(rotateFrame)
+    if (flyFrame) cancelAnimationFrame(flyFrame)
+    if (searchTimer) clearTimeout(searchTimer)
     resizeObserver?.disconnect()
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
     if (handleClick) renderer?.domElement?.removeEventListener('click', handleClick)
     if (handleContextMenu) renderer?.domElement?.removeEventListener('contextmenu', handleContextMenu)
+    if (handleKeydown) window.removeEventListener('keydown', handleKeydown)
     controls?.dispose()
     disposeObject(points)
     disposeObject(edgeLines)
     disposeObject(bridgeLines)
-    disposeObject(landmarkPoints)
     disposeObject(clusterShells)
     renderer?.dispose()
     renderer?.domElement?.remove()
@@ -771,7 +1024,7 @@
     <div class="workspace-panel-title">
       <h2 class="workspace-section-title">3D Graph Explorer</h2>
       <p class="muted">
-        Fast WebGL overview of downloaded, metadata-ready works across the database. Cluster summaries include inferred science areas and geographic regions when the metadata supports it.
+        Fast WebGL overview of downloaded, metadata-ready works across the database. Choose a "Group by" dimension to re-arrange works into territories (academic field by default), with citation structure laid out inside each territory.
       </p>
     </div>
     <div class="graph-3d-actions">
@@ -798,19 +1051,24 @@
       </select>
     </label>
     <label>
-      <span class="muted small">Max nodes</span>
-      <input type="number" min="1000" max="50000" step="1000" bind:value={maxNodes} disabled={graphLoading} />
+      <span class="muted small">Works shown</span>
+      <select bind:value={maxNodes} disabled={graphLoading}>
+        <option value={10000}>Top 10,000 (fastest)</option>
+        <option value={25000}>Top 25,000</option>
+        <option value={50000}>Top 50,000</option>
+        <option value={0}>All works</option>
+      </select>
     </label>
     <label>
-      <span class="muted small">Color by</span>
-      <select bind:value={colorMode} on:change={() => graphData.nodes?.length && renderGraph()}>
-        <option value="cluster">Graph cluster</option>
-        <option value="area">Science area</option>
+      <span class="muted small">Group by</span>
+      <select bind:value={groupMode} on:change={onGroupModeChange} disabled={graphLoading}>
+        <option value="cluster">Academic field</option>
+        <option value="source_path">Search path</option>
+        <option value="type">Work type</option>
         <option value="region">Region</option>
-        <option value="component">Connected component</option>
-        <option value="status">Pipeline status</option>
-        <option value="degree">Degree</option>
         <option value="year">Year decade</option>
+        <option value="component">Connected component</option>
+        <option value="degree">Degree (colour only)</option>
       </select>
     </label>
     <label>
@@ -822,6 +1080,37 @@
         <option value={3.2}>3.2x</option>
       </select>
     </label>
+    <label>
+      <span class="muted small">Year from</span>
+      <input type="number" data-testid="graph-3d-year-from" placeholder="any" bind:value={yearFrom} on:input={onYearFilterChange} disabled={!graphData.nodes?.length} />
+    </label>
+    <label>
+      <span class="muted small">Year to</span>
+      <input type="number" data-testid="graph-3d-year-to" placeholder="any" bind:value={yearTo} on:input={onYearFilterChange} disabled={!graphData.nodes?.length} />
+    </label>
+    <label class="graph-3d-search">
+      <span class="muted small">Search</span>
+      <input
+        type="search"
+        data-testid="graph-3d-search"
+        placeholder="Title, author, year"
+        bind:value={searchQuery}
+        on:input={onSearchInput}
+        disabled={!graphData.nodes?.length}
+      />
+      {#if searchResults.length}
+        <ul class="graph-3d-search-results" data-testid="graph-3d-search-results">
+          {#each searchResults as result (result.index)}
+            <li>
+              <button type="button" on:click={() => selectSearchResult(result)}>
+                <span>{result.title}</span>
+                <small>{result.authors ? `${result.authors} / ` : ''}{result.year || 'year ?'}</small>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </label>
   </div>
 
   <div class="graph-3d-layout">
@@ -829,7 +1118,7 @@
       <div class="graph-3d-map-key" aria-hidden="true">
         <span><i class="territory"></i>Territories</span>
         <span><i class="bridge"></i>Bridge links</span>
-        <span><i class="canon"></i>Canon works</span>
+        <span><i class="canon"></i>Hubs (size = citations)</span>
       </div>
       <div class="graph-3d-label-layer" bind:this={clusterLabelLayer}>
         {#each clusterLabels as label (label.id)}
@@ -868,8 +1157,13 @@
       </div>
 
       <p class="muted small">{graphStatus}</p>
+      {#if (yearFrom || yearTo) && graphData.nodes?.length}
+        <p class="muted small" data-testid="graph-3d-filter-status">
+          Showing {formatNumber(visibleNodeCount)} of {formatNumber(graphData.nodes.length)} nodes after year filter.
+        </p>
+      {/if}
       <p class="muted small">
-        {formatNumber(graphData.stats?.component_count)} connected components. Clusters are citation communities; tiny fragments are bucketed by area, region, and decade.
+        {formatNumber(graphData.stats?.component_count)} connected components. Territories follow the selected "Group by" dimension; oversized academic fields are split by subfield, and works with no value for the dimension sit in a grey "Unknown" territory.
       </p>
       <p class="muted small">
         Areas: {compactList(graphData.stats?.top_areas)} ({coverageLabel(graphData.stats?.area_coverage)})
@@ -898,7 +1192,7 @@
         {#if activeNodeDetail}
           <strong>{activeNodeDetail.title}</strong>
           <span class="muted small">{activeNodeDetail.year || 'Year ?'} / {activeNodeDetail.type || 'Type ?'} / {activeNodeDetail.status}</span>
-          <span class="muted small">Area: {activeNodeDetail.area || 'unknown'} / Region: {activeNodeDetail.region || 'unknown'}</span>
+          <span class="muted small">Field: {activeNodeDetail.field || activeNodeDetail.area || 'unknown'} / Region: {activeNodeDetail.region || 'unknown'}</span>
           <span class="muted small">Degree: {formatNumber(activeNodeDetail.degree)} / Cluster: {activeNodeDetail.cluster} ({formatNumber(activeNodeDetail.cluster_size)} nodes)</span>
           <span class="muted small">Component: {activeNodeDetail.component} ({formatNumber(activeNodeDetail.component_size)} nodes)</span>
           <span class="muted small">Source: {activeNodeDetail.source || 'unknown'}</span>

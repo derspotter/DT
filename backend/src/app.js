@@ -7,6 +7,7 @@ import os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
@@ -100,10 +101,16 @@ const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
-const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
-const GRAPH_3D_CACHE_VERSION = 6;
+const GRAPH_3D_CACHE_VERSION = 9;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
+const GRAPH_3D_GROUP_BY = new Set(['field', 'source_path', 'type', 'region', 'year', 'component']);
+// A built snapshot is served immediately; if it is older than this it is also
+// rebuilt in the background (stale-while-revalidate) so opens stay instant.
+const GRAPH_3D_SNAPSHOT_TTL_MS = 15 * 60 * 1000;
+// Shared in-flight builds keyed by snapshot key, so concurrent requests await
+// one build instead of spawning duplicates.
+const graph3dBuilds = new Map();
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
@@ -304,21 +311,26 @@ function listTableColumns(db, tableName) {
 }
 
 function buildGraph3dRequest(req) {
-  const requestedMaxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
-  const maxNodes = Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
+  const requestedMaxNodes = coerceInt(req.query?.max_nodes ?? req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
+  // 0 means "no cap" (show the whole corpus); otherwise clamp to a sane range.
+  const maxNodes = requestedMaxNodes === 0
+    ? 0
+    : Math.max(1000, Math.min(100000, requestedMaxNodes || GRAPH_3D_DEFAULT_MAX_NODES));
   const relationship = req.query?.relationship || 'both';
   const status = 'downloaded';
   const scope = 'all';
   const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
   const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
   const corpusId = null;
+  const requestedGroupBy = String(req.query?.group_by || req.query?.groupBy || 'field');
+  const groupBy = GRAPH_3D_GROUP_BY.has(requestedGroupBy) ? requestedGroupBy : 'field';
   let dbModifiedMs = 0;
   try {
     dbModifiedMs = Math.floor(fs.statSync(DB_PATH).mtimeMs);
   } catch {
     dbModifiedMs = 0;
   }
-  return { maxNodes, relationship, status, scope, yearFrom, yearTo, corpusId, dbModifiedMs };
+  return { maxNodes, relationship, status, scope, yearFrom, yearTo, corpusId, groupBy, dbModifiedMs };
 }
 
 function graph3dScriptArgs(options, extraArgs = []) {
@@ -331,6 +343,8 @@ function graph3dScriptArgs(options, extraArgs = []) {
     options.relationship,
     '--status',
     options.status,
+    '--group-by',
+    options.groupBy || 'field',
     '--require-downloaded-metadata',
     ...extraArgs,
   ];
@@ -340,6 +354,10 @@ function graph3dScriptArgs(options, extraArgs = []) {
 }
 
 function graph3dSnapshotKey(options) {
+  // Intentionally excludes the DB modification time: the enrich/download workers
+  // touch the DB constantly, so keying on mtime made nearly every open a cold
+  // ~30s rebuild. A param set now maps to one stable cache dir, refreshed in the
+  // background when stale (see GRAPH_3D_SNAPSHOT_TTL_MS).
   const keyPayload = JSON.stringify({
     version: GRAPH_3D_CACHE_VERSION,
     maxNodes: options.maxNodes,
@@ -349,13 +367,73 @@ function graph3dSnapshotKey(options) {
     yearFrom: options.yearFrom,
     yearTo: options.yearTo,
     corpusId: options.corpusId,
-    dbModifiedMs: options.dbModifiedMs,
+    groupBy: options.groupBy,
   });
   return crypto.createHash('sha256').update(keyPayload).digest('hex').slice(0, 20);
 }
 
 function graph3dSnapshotPath(key, fileName = '') {
   return path.join(GRAPH_3D_SNAPSHOT_DIR, key, fileName);
+}
+
+// Build a snapshot into a temp dir, then swap it into place, so readers never
+// see a half-written snapshot. Concurrent callers for the same key share one
+// build. Returns the manifest object.
+function buildGraph3dSnapshot(options, key) {
+  if (graph3dBuilds.has(key)) return graph3dBuilds.get(key);
+  const finalDir = graph3dSnapshotPath(key);
+  const buildDir = `${finalDir}.build-${Date.now()}`;
+  const promise = (async () => {
+    try {
+      fs.mkdirSync(buildDir, { recursive: true });
+      await runPythonJson(
+        GRAPH_3D_EXPORT_SCRIPT,
+        graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
+        { dbPath: DB_PATH, corpusId: options.corpusId }
+      );
+      // Pre-gzip the large JSON payloads so big snapshots (whole-corpus views)
+      // download at ~1/3 the size; the file endpoint serves these when the
+      // client accepts gzip.
+      for (const fileName of ['nodes_meta.json', 'clusters.json']) {
+        const filePath = path.join(buildDir, fileName);
+        if (fs.existsSync(filePath)) {
+          fs.writeFileSync(`${filePath}.gz`, zlib.gzipSync(fs.readFileSync(filePath)));
+        }
+      }
+      const backupDir = `${finalDir}.old-${Date.now()}`;
+      const hadExisting = fs.existsSync(finalDir);
+      if (hadExisting) fs.renameSync(finalDir, backupDir);
+      try {
+        fs.renameSync(buildDir, finalDir);
+      } catch (swapError) {
+        // Restore the previous snapshot so the cache dir is never left missing
+        // (which would cause cold rebuilds and transient 404s).
+        if (hadExisting && !fs.existsSync(finalDir)) fs.renameSync(backupDir, finalDir);
+        throw swapError;
+      }
+      if (fs.existsSync(backupDir)) fs.rmSync(backupDir, { recursive: true, force: true });
+      return JSON.parse(fs.readFileSync(graph3dSnapshotPath(key, 'manifest.json'), 'utf-8'));
+    } finally {
+      if (fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
+    }
+  })().finally(() => graph3dBuilds.delete(key));
+  graph3dBuilds.set(key, promise);
+  return promise;
+}
+
+// Build the default 3D snapshot if it is missing, so the first Graph-tab open
+// is served from cache instead of waiting ~30s for a cold build.
+async function warmGraph3dSnapshot() {
+  if (isStubMode()) return;
+  try {
+    const options = buildGraph3dRequest({ query: {} });
+    const key = graph3dSnapshotKey(options);
+    if (fs.existsSync(graph3dSnapshotPath(key, 'manifest.json'))) return;
+    await buildGraph3dSnapshot(options, key);
+    console.log('[graph3d] default snapshot pre-warmed');
+  } catch (error) {
+    console.warn('[graph3d] pre-warm failed:', error.message);
+  }
 }
 
 function decorateGraph3dManifest(manifest, key) {
@@ -380,7 +458,8 @@ function stubGraph3dManifest() {
   return {
     source: 'stub',
     snapshot_key: 'stub',
-    schema_version: 1,
+    schema_version: 2,
+    layout: { algorithm: 'stub' },
     stats: STUB_RESULTS.graph.stats,
     files: {},
     buffers: {
@@ -423,7 +502,8 @@ function emptyGraph3dManifest(source = 'api') {
   return {
     source,
     snapshot_key: 'empty',
-    schema_version: 1,
+    schema_version: 2,
+    layout: { algorithm: 'empty' },
     stats: payload.stats,
     files: {},
     buffers: {
@@ -4498,49 +4578,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.status(500).json({ error: error.message || 'Failed to export corpus data' });
     }
   });
-  app.get('/api/graph', requireAuthMiddleware, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
-    }
-    const maxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, 200);
-    const relationship = req.query?.relationship || 'both';
-    const status = req.query?.status || 'all';
-    const scope = String(req.query?.scope || 'all').trim().toLowerCase();
-    const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
-    const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
-    const hideIsolates = req.query?.hide_isolates !== '0' && req.query?.hideIsolates !== '0';
-    const dbPath = DB_PATH;
-
-    const args = [
-      '--db-path',
-      dbPath,
-      '--max-nodes',
-      String(maxNodes),
-      '--relationship',
-      relationship,
-      '--status',
-      status,
-      '--hide-isolates',
-      hideIsolates ? '1' : '0',
-    ];
-    if (yearFrom !== null) {
-      args.push('--year-from', String(yearFrom));
-    }
-    if (yearTo !== null) {
-      args.push('--year-to', String(yearTo));
-    }
-    try {
-      const payload = await runPythonJson(GRAPH_EXPORT_SCRIPT, args, {
-        dbPath,
-        corpusId: scope === 'corpus' ? req.corpusId : null,
-      });
-      return res.json(payload);
-    } catch (error) {
-      console.error('[/api/graph] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to build graph' });
-    }
-  });
-
   app.get('/api/graph/3d', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
@@ -4587,23 +4624,24 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     const options = buildGraph3dRequest(req);
     const key = graph3dSnapshotKey(options);
-    const snapshotDir = graph3dSnapshotPath(key);
     const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
     const refresh = req.query?.refresh === '1' || req.query?.refresh === 'true';
 
     try {
       if (!refresh && fs.existsSync(manifestPath)) {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+        // Serve cache immediately; if stale, rebuild in the background so the
+        // next open is fresh without making this one wait.
+        const ageMs = Date.now() - fs.statSync(manifestPath).mtimeMs;
+        if (ageMs > GRAPH_3D_SNAPSHOT_TTL_MS) {
+          buildGraph3dSnapshot(options, key).catch((err) =>
+            console.warn('[graph3d] background rebuild failed:', err.message)
+          );
+        }
         return res.json({ ...decorateGraph3dManifest(manifest, key), source: 'snapshot-cache' });
       }
 
-      fs.mkdirSync(snapshotDir, { recursive: true });
-      const payload = await runPythonJson(
-        GRAPH_3D_EXPORT_SCRIPT,
-        graph3dScriptArgs(options, ['--snapshot-dir', snapshotDir]),
-        { dbPath: DB_PATH, corpusId: options.corpusId }
-      );
-      const manifest = payload?.files ? payload : JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+      const manifest = await buildGraph3dSnapshot(options, key);
       return res.json(decorateGraph3dManifest(manifest, key));
     } catch (error) {
       console.error('[/api/graph/3d/snapshot] Error:', error);
@@ -4706,6 +4744,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const filePath = graph3dSnapshotPath(key, fileName);
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'Snapshot file not found' });
+    }
+    const gzPath = `${filePath}.gz`;
+    const acceptsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+    if (fileName.endsWith('.json') && acceptsGzip && fs.existsSync(gzPath)) {
+      res.set('Content-Encoding', 'gzip');
+      res.set('Content-Type', 'application/json; charset=utf-8');
+      res.set('Vary', 'Accept-Encoding');
+      return res.send(fs.readFileSync(gzPath));
     }
     return res.sendFile(filePath);
   });
@@ -5193,6 +5239,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   if (process.env.NODE_ENV !== 'test') {
     console.log('[pipeline-worker] DB-driven enrich/download workers expected; no pipeline_jobs scheduler started.');
   }
+
+  app.warmGraph3dSnapshot = warmGraph3dSnapshot;
 
   return app;
 }
