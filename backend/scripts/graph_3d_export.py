@@ -27,10 +27,10 @@ DEFAULT_MAX_NODES = 10000
 SNAPSHOT_SCHEMA_VERSION = 2
 LAYOUT_SEED = 42
 LAYOUT_TARGET_RADIUS = 2200.0
-# Connected cores at/above this size use DrL (near-linear) instead of
-# Fruchterman-Reingold (quadratic). Below it, FR with a size-scaled iteration
-# count is both faster and produces a tighter layout.
-LAYOUT_DRL_CORE_THRESHOLD = 10000
+# DrL is only worth it for enormous cores: benchmarked in 3D it is markedly
+# slower than iteration-capped Fruchterman-Reingold up to ~20k nodes (375s vs
+# 108s), so this threshold is set high and FR handles realistic core sizes.
+LAYOUT_DRL_CORE_THRESHOLD = 40000
 BASE_WORK_COLUMNS = [
     "id",
     "title",
@@ -475,9 +475,10 @@ def fibonacci_direction(index, total):
 
 
 def _core_niter(size):
-    # More iterations for small cores (cheap), fewer for large ones to keep the
-    # quadratic FR cost bounded.
-    return int(max(70, min(200, 9000 / math.sqrt(max(1, size)))))
+    # FR cost is O(size^2 * niter); scale iterations down inversely with size so
+    # large dense cores stay affordable. Small cores get a fully settled layout,
+    # large ones a coarser but visually adequate one (they are hairballs anyway).
+    return int(min(200, max(40, 400000 / max(1, size))))
 
 
 def layout_cluster(size, local_edges):
