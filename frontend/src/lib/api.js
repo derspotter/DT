@@ -321,6 +321,24 @@ export async function uploadPdf(file) {
   return payload
 }
 
+export async function importSeed(filename, kind) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/ingest/import-seed`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename, kind }),
+    },
+    UPLOAD_TIMEOUT
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const message = await response.text()
+    throw new Error(message || 'Import failed')
+  }
+  return response.json()
+}
+
 export async function extractBibliography(filename) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/extract-bibliography/${encodeURIComponent(filename)}`,

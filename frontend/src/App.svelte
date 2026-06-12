@@ -17,6 +17,7 @@
     saveCorpusKantroposAssignment,
     setAuthToken,
     uploadPdf,
+    importSeed,
     extractBibliography,
     fetchBibliographyEntries,
     fetchIngestStats,
@@ -2260,15 +2261,36 @@
     }
   }
 
+  function seedKindForName(name) {
+    const ext = String(name || '').toLowerCase().split('.').pop()
+    if (ext === 'bib') return 'bib'
+    if (ext === 'json') return 'json'
+    return null
+  }
+
   async function uploadItem(item) {
     updateUpload(item.id, { status: 'uploading', message: '' })
     try {
       const payload = await uploadPdf(item.file)
-      updateUpload(item.id, {
-        status: 'uploaded',
-        backendFilename: payload.filename,
-        message: 'Uploaded',
-      })
+      const seedKind = seedKindForName(item.name)
+      if (seedKind) {
+        // BibTeX/JSON seeds are imported straight into the corpus (no PDF
+        // bibliography extraction step applies).
+        updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
+        const result = await importSeed(payload.filename, seedKind)
+        const linked = Number(result.corpus_linked || 0)
+        updateUpload(item.id, {
+          status: 'imported',
+          backendFilename: payload.filename,
+          message: `Imported ${result.added || 0} works (${result.skipped || 0} skipped${linked ? `, ${linked} added to corpus` : ''}).`,
+        })
+      } else {
+        updateUpload(item.id, {
+          status: 'uploaded',
+          backendFilename: payload.filename,
+          message: 'Uploaded',
+        })
+      }
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) {
@@ -3927,8 +3949,8 @@
               </div>
               <div class="uploader">
                 <label class="upload-drop">
-                  <input type="file" multiple accept=".pdf" on:change={handleFiles} />
-                  <span>Drop PDFs or click to upload.</span>
+                  <input type="file" multiple accept=".pdf,.bib,.json" on:change={handleFiles} />
+                  <span>Drop PDF, BibTeX, or JSON files, or click to upload.</span>
                 </label>
               </div>
               {#if uploads.length > 0}
@@ -3937,17 +3959,19 @@
 	                    <div class="upload-item">
 	                      <div>
 	                        <strong>{item.name}</strong>
-	                        <span>{item.size ? formatBytes(item.size) : item.backendFilename}</span>
+	                        <span>{item.message || (item.size ? formatBytes(item.size) : item.backendFilename)}</span>
 	                      </div>
 	                      <div class="upload-actions">
 	                        <span class={`status ${item.status}`}>{item.status}</span>
-                        <button
-                          type="button"
-                          on:click={() => extractForItem(item)}
-                          disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
-                        >
-                          Extract
-                        </button>
+                        {#if !seedKindForName(item.name)}
+                          <button
+                            type="button"
+                            on:click={() => extractForItem(item)}
+                            disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
+                          >
+                            Extract
+                          </button>
+                        {/if}
 	                      </div>
 	                    </div>
 	                  {/each}
@@ -4459,11 +4483,11 @@
       {#if activeTab === 'ingest'}
         <div class="card" data-testid="ingest-panel">
           <h2>Seed document</h2>
-          <p>Upload PDFs, extract bibliographies, and select entries for further processing.</p>
+          <p>Upload PDFs (extract bibliographies) or BibTeX/JSON files (imported straight into the corpus), and select entries for further processing.</p>
           <div class="uploader">
             <label class="upload-drop">
-              <input type="file" multiple accept=".pdf" on:change={handleFiles} />
-              <span>Drop PDFs or click to add files (uploads start automatically)</span>
+              <input type="file" multiple accept=".pdf,.bib,.json" on:change={handleFiles} />
+              <span>Drop PDF, BibTeX, or JSON files to add (uploads start automatically)</span>
             </label>
           </div>
           <div class="upload-list">
@@ -4474,17 +4498,19 @@
                 <div class="upload-item">
                   <div>
                     <strong>{item.name}</strong>
-                    <span>{formatBytes(item.size)}</span>
+                    <span>{item.message || formatBytes(item.size)}</span>
                   </div>
                   <div class="upload-actions">
                     <span class={`status ${item.status}`}>{item.status}</span>
-                    <button
-                      type="button"
-                      on:click={() => extractForItem(item)}
-                      disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
-                    >
-                      Extract
-                    </button>
+                    {#if !seedKindForName(item.name)}
+                      <button
+                        type="button"
+                        on:click={() => extractForItem(item)}
+                        disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
+                      >
+                        Extract
+                      </button>
+                    {/if}
                   </div>
                 </div>
               {/each}
