@@ -102,9 +102,15 @@ const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
-const GRAPH_3D_CACHE_VERSION = 7;
+const GRAPH_3D_CACHE_VERSION = 8;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
 const GRAPH_3D_GROUP_BY = new Set(['field', 'source_path', 'type', 'region', 'year', 'component']);
+// A built snapshot is served immediately; if it is older than this it is also
+// rebuilt in the background (stale-while-revalidate) so opens stay instant.
+const GRAPH_3D_SNAPSHOT_TTL_MS = 15 * 60 * 1000;
+// Shared in-flight builds keyed by snapshot key, so concurrent requests await
+// one build instead of spawning duplicates.
+const graph3dBuilds = new Map();
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
@@ -345,6 +351,10 @@ function graph3dScriptArgs(options, extraArgs = []) {
 }
 
 function graph3dSnapshotKey(options) {
+  // Intentionally excludes the DB modification time: the enrich/download workers
+  // touch the DB constantly, so keying on mtime made nearly every open a cold
+  // ~30s rebuild. A param set now maps to one stable cache dir, refreshed in the
+  // background when stale (see GRAPH_3D_SNAPSHOT_TTL_MS).
   const keyPayload = JSON.stringify({
     version: GRAPH_3D_CACHE_VERSION,
     maxNodes: options.maxNodes,
@@ -355,13 +365,55 @@ function graph3dSnapshotKey(options) {
     yearTo: options.yearTo,
     corpusId: options.corpusId,
     groupBy: options.groupBy,
-    dbModifiedMs: options.dbModifiedMs,
   });
   return crypto.createHash('sha256').update(keyPayload).digest('hex').slice(0, 20);
 }
 
 function graph3dSnapshotPath(key, fileName = '') {
   return path.join(GRAPH_3D_SNAPSHOT_DIR, key, fileName);
+}
+
+// Build a snapshot into a temp dir, then swap it into place, so readers never
+// see a half-written snapshot. Concurrent callers for the same key share one
+// build. Returns the manifest object.
+function buildGraph3dSnapshot(options, key) {
+  if (graph3dBuilds.has(key)) return graph3dBuilds.get(key);
+  const finalDir = graph3dSnapshotPath(key);
+  const buildDir = `${finalDir}.build-${Date.now()}`;
+  const promise = (async () => {
+    try {
+      fs.mkdirSync(buildDir, { recursive: true });
+      await runPythonJson(
+        GRAPH_3D_EXPORT_SCRIPT,
+        graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
+        { dbPath: DB_PATH, corpusId: options.corpusId }
+      );
+      const backupDir = `${finalDir}.old-${Date.now()}`;
+      if (fs.existsSync(finalDir)) fs.renameSync(finalDir, backupDir);
+      fs.renameSync(buildDir, finalDir);
+      if (fs.existsSync(backupDir)) fs.rmSync(backupDir, { recursive: true, force: true });
+      return JSON.parse(fs.readFileSync(graph3dSnapshotPath(key, 'manifest.json'), 'utf-8'));
+    } finally {
+      if (fs.existsSync(buildDir)) fs.rmSync(buildDir, { recursive: true, force: true });
+    }
+  })().finally(() => graph3dBuilds.delete(key));
+  graph3dBuilds.set(key, promise);
+  return promise;
+}
+
+// Build the default 3D snapshot if it is missing, so the first Graph-tab open
+// is served from cache instead of waiting ~30s for a cold build.
+async function warmGraph3dSnapshot() {
+  if (isStubMode()) return;
+  try {
+    const options = buildGraph3dRequest({ query: {} });
+    const key = graph3dSnapshotKey(options);
+    if (fs.existsSync(graph3dSnapshotPath(key, 'manifest.json'))) return;
+    await buildGraph3dSnapshot(options, key);
+    console.log('[graph3d] default snapshot pre-warmed');
+  } catch (error) {
+    console.warn('[graph3d] pre-warm failed:', error.message);
+  }
 }
 
 function decorateGraph3dManifest(manifest, key) {
@@ -4595,23 +4647,24 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     const options = buildGraph3dRequest(req);
     const key = graph3dSnapshotKey(options);
-    const snapshotDir = graph3dSnapshotPath(key);
     const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
     const refresh = req.query?.refresh === '1' || req.query?.refresh === 'true';
 
     try {
       if (!refresh && fs.existsSync(manifestPath)) {
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+        // Serve cache immediately; if stale, rebuild in the background so the
+        // next open is fresh without making this one wait.
+        const ageMs = Date.now() - fs.statSync(manifestPath).mtimeMs;
+        if (ageMs > GRAPH_3D_SNAPSHOT_TTL_MS) {
+          buildGraph3dSnapshot(options, key).catch((err) =>
+            console.warn('[graph3d] background rebuild failed:', err.message)
+          );
+        }
         return res.json({ ...decorateGraph3dManifest(manifest, key), source: 'snapshot-cache' });
       }
 
-      fs.mkdirSync(snapshotDir, { recursive: true });
-      const payload = await runPythonJson(
-        GRAPH_3D_EXPORT_SCRIPT,
-        graph3dScriptArgs(options, ['--snapshot-dir', snapshotDir]),
-        { dbPath: DB_PATH, corpusId: options.corpusId }
-      );
-      const manifest = payload?.files ? payload : JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+      const manifest = await buildGraph3dSnapshot(options, key);
       return res.json(decorateGraph3dManifest(manifest, key));
     } catch (error) {
       console.error('[/api/graph/3d/snapshot] Error:', error);
@@ -5201,6 +5254,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   if (process.env.NODE_ENV !== 'test') {
     console.log('[pipeline-worker] DB-driven enrich/download workers expected; no pipeline_jobs scheduler started.');
   }
+
+  app.warmGraph3dSnapshot = warmGraph3dSnapshot;
 
   return app;
 }

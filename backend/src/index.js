@@ -105,6 +105,11 @@ function broadcastEvent(payload) {
 const app = createApp({ broadcast, broadcastEvent });
 const server = app.listen(port, () => {
   console.log(`HTTP server listening on port ${port}`);
+  // Pre-build the default 3D graph snapshot so the first Graph-tab open is
+  // instant instead of waiting for a cold ~30s build.
+  setTimeout(() => {
+    app.warmGraph3dSnapshot?.().catch(() => {});
+  }, 3000);
 });
 
 const wss = new WebSocketServer({ server, path: '/api/ws' });
