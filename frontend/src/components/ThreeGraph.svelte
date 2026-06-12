@@ -53,7 +53,7 @@
   let relationship = 'both'
   let statusFilter = 'downloaded'
   let scope = 'all'
-  let maxNodes = 10000
+  let maxNodes = 25000
   let groupMode = 'cluster'
   let loadedGroupBy = 'field'
   let depthScale = 1.6
