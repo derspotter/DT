@@ -1,7 +1,6 @@
 import {
   sampleSearchResults,
   sampleDownloads,
-  sampleGraph,
 } from './sample-data'
 
 const DEFAULT_TIMEOUT = 8_000
@@ -903,44 +902,6 @@ export async function downloadCorpusItemFile(itemId) {
     filename = `corpus-item-${String(itemId || 'file')}.pdf`
   }
   return { blob, filename }
-}
-
-export async function fetchGraph({
-  maxNodes = 200,
-  relationship = 'both',
-  status = 'all',
-  scope = 'all',
-  yearFrom = null,
-  yearTo = null,
-  hideIsolates = true,
-} = {}) {
-  try {
-    const params = new URLSearchParams()
-    params.set('max_nodes', String(maxNodes))
-    if (relationship) params.set('relationship', relationship)
-    if (status) params.set('status', status)
-    if (scope) params.set('scope', scope)
-    params.set('hide_isolates', hideIsolates ? '1' : '0')
-    if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {
-      params.set('year_from', String(yearFrom))
-    }
-    if (yearTo !== null && yearTo !== undefined && yearTo !== '') {
-      params.set('year_to', String(yearTo))
-    }
-    const response = await fetchWithTimeout(`${API_BASE}/api/graph?${params.toString()}`)
-    await throwIfUnauthorized(response)
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-    const payload = await response.json()
-    const data = payload.nodes ? payload : payload.data || payload
-    return { data, source: payload.source || 'api' }
-  } catch (error) {
-    if (error?.status === 401) {
-      throw error
-    }
-    return { data: sampleGraph, source: 'sample', error }
-  }
 }
 
 export async function fetchGraph3D({

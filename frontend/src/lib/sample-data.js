@@ -70,34 +70,6 @@ export const sampleDownloads = [
   },
 ]
 
-export const sampleGraph = {
-  nodes: [
-    {
-      id: 'W1',
-      title: 'The New Institutional Economics',
-      year: 2002,
-      type: 'book-chapter',
-      status: 'matched',
-      source_path: 'seed_pdf',
-    },
-    { id: 'W2', title: 'The Nature of the Firm', year: 1937, type: 'journal-article', status: 'downloaded', source_path: 'seed_pdf' },
-    { id: 'W3', title: 'The Problem of Social Cost', year: 1960, type: 'journal-article', status: 'matched', source_path: 'keyword_search' },
-    { id: 'W4', title: 'Markets and Hierarchies', year: 1975, type: 'book', status: 'queued_download', source_path: 'keyword_search' },
-    { id: 'W5', title: 'Transaction Cost Economics', year: 1985, type: 'journal-article', status: 'queued_download', source_path: 'seed_pdf' },
-  ],
-  edges: [
-    { source: 'W1', target: 'W2', relationship_type: 'references' },
-    { source: 'W1', target: 'W3', relationship_type: 'references' },
-    { source: 'W4', target: 'W2', relationship_type: 'references' },
-    { source: 'W5', target: 'W4', relationship_type: 'references' },
-  ],
-  stats: {
-    node_count: 5,
-    edge_count: 4,
-    relationship_counts: { references: 4, cited_by: 0 },
-  },
-}
-
 export const sampleActivity = [
   {
     id: 'RUN-001',

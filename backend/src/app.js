@@ -101,7 +101,6 @@ const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
-const GRAPH_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_export.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
 const GRAPH_3D_CACHE_VERSION = 9;
 const GRAPH_3D_DEFAULT_MAX_NODES = 10000;
@@ -4571,49 +4570,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.status(500).json({ error: error.message || 'Failed to export corpus data' });
     }
   });
-  app.get('/api/graph', requireAuthMiddleware, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
-    }
-    const maxNodes = coerceInt(req.query?.max_nodes || req.query?.maxNodes, 200);
-    const relationship = req.query?.relationship || 'both';
-    const status = req.query?.status || 'all';
-    const scope = String(req.query?.scope || 'all').trim().toLowerCase();
-    const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
-    const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
-    const hideIsolates = req.query?.hide_isolates !== '0' && req.query?.hideIsolates !== '0';
-    const dbPath = DB_PATH;
-
-    const args = [
-      '--db-path',
-      dbPath,
-      '--max-nodes',
-      String(maxNodes),
-      '--relationship',
-      relationship,
-      '--status',
-      status,
-      '--hide-isolates',
-      hideIsolates ? '1' : '0',
-    ];
-    if (yearFrom !== null) {
-      args.push('--year-from', String(yearFrom));
-    }
-    if (yearTo !== null) {
-      args.push('--year-to', String(yearTo));
-    }
-    try {
-      const payload = await runPythonJson(GRAPH_EXPORT_SCRIPT, args, {
-        dbPath,
-        corpusId: scope === 'corpus' ? req.corpusId : null,
-      });
-      return res.json(payload);
-    } catch (error) {
-      console.error('[/api/graph] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to build graph' });
-    }
-  });
-
   app.get('/api/graph/3d', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ ...STUB_RESULTS.graph, source: 'stub' });

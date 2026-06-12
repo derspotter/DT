@@ -1,28 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
 
-const graph2dPayload = {
-  nodes: [
-    {
-      id: 'W1',
-      title: 'Graph seed work',
-      year: 2024,
-      type: 'journal-article',
-      status: 'downloaded',
-      source_path: 'seed',
-    },
-    {
-      id: 'W2',
-      title: 'Referenced work',
-      year: 2023,
-      type: 'book',
-      status: 'matched',
-      source_path: 'seed',
-    },
-  ],
-  edges: [{ source: 'W1', target: 'W2', relationship_type: 'references' }],
-  stats: { node_count: 2, edge_count: 1, relationship_counts: { references: 1, cited_by: 0 } },
-}
-
 const graph3dPayload = {
   nodes: [
     {
@@ -167,8 +144,6 @@ async function mockApi(route: Route) {
     }
   } else if (path === '/api/graph/3d') {
     body = graph3dPayload
-  } else if (path === '/api/graph') {
-    body = graph2dPayload
   } else if (path === '/api/recursion-config') {
     body = { keyword: { includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0, maxRelated: 30 } }
   } else if (path === '/api/seed/sources') {
