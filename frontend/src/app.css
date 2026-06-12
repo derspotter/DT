@@ -2103,26 +2103,108 @@ button.seed-download-tag:focus-visible {
   align-items: start;
 }
 
-.graph-3d-actions,
-.graph-3d-controls {
+.graph-3d-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
-  align-items: end;
+  align-items: center;
 }
 
-.graph-3d-actions button.active {
-  border-color: rgba(244, 163, 64, 0.72);
-  background: rgba(244, 163, 64, 0.16);
+/* Ghost/glass buttons that sit on the dark panel */
+.graph-3d-btn {
+  appearance: none;
+  min-height: 36px;
+  padding: 7px 14px;
+  border-radius: 9px;
+  border: 1px solid rgba(236, 247, 246, 0.18);
+  background: rgba(236, 247, 246, 0.06);
+  color: rgba(236, 247, 246, 0.92);
+  font-weight: 600;
+  font-size: 0.86rem;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.graph-3d-btn:hover:not(:disabled) {
+  background: rgba(236, 247, 246, 0.12);
+  border-color: rgba(236, 247, 246, 0.32);
+}
+
+.graph-3d-btn:focus-visible {
+  outline: none;
+  border-color: rgba(15, 139, 141, 0.9);
+  box-shadow: 0 0 0 3px rgba(15, 139, 141, 0.35);
+}
+
+.graph-3d-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.graph-3d-btn.active {
+  border-color: rgba(244, 163, 64, 0.7);
+  background: rgba(244, 163, 64, 0.18);
+  color: #ffe6c2;
+  box-shadow: inset 0 0 0 1px rgba(244, 163, 64, 0.35);
+}
+
+/* Solid teal call-to-action for the load button */
+.graph-3d-btn-primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #13a0a2, #0f8b8d);
+  color: #fff;
+  box-shadow: 0 6px 16px rgba(8, 60, 61, 0.45);
+}
+
+.graph-3d-btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #16b2b4, #11999b);
+  border-color: transparent;
+}
+
+/* Segmented control: presets join into one pill */
+.graph-3d-segment {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  border-radius: 11px;
+  border: 1px solid rgba(236, 247, 246, 0.16);
+  background: rgba(7, 19, 22, 0.45);
+}
+
+.graph-3d-segment .graph-3d-btn {
+  min-height: 30px;
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  color: rgba(236, 247, 246, 0.7);
+}
+
+.graph-3d-segment .graph-3d-btn:hover:not(:disabled) {
+  background: rgba(236, 247, 246, 0.08);
+  color: rgba(236, 247, 246, 0.95);
+}
+
+.graph-3d-segment .graph-3d-btn.active {
+  background: rgba(15, 139, 141, 0.32);
+  color: #eafffe;
+  box-shadow: inset 0 0 0 1px rgba(72, 209, 204, 0.4);
 }
 
 .graph-3d-controls {
+  display: flex;
   justify-content: flex-start;
-  padding: 12px;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: end;
+  padding: 14px;
   border: 1px solid rgba(236, 247, 246, 0.14);
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .graph-3d-controls label {
@@ -2131,14 +2213,61 @@ button.seed-download-tag:focus-visible {
   min-width: 150px;
 }
 
+.graph-3d-controls .muted.small {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: rgba(236, 247, 246, 0.55);
+}
+
 .graph-3d-controls select,
 .graph-3d-controls input {
   min-height: 40px;
   border-radius: 10px;
-  border: 1px solid rgba(236, 247, 246, 0.18);
-  background: rgba(255, 255, 255, 0.92);
-  color: #17262d;
-  padding: 8px 10px;
+  border: 1px solid rgba(236, 247, 246, 0.2);
+  background: rgba(7, 19, 22, 0.55);
+  color: #ecf7f6;
+  padding: 9px 12px;
+  font-size: 0.88rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.graph-3d-controls select {
+  appearance: none;
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%23ecf7f6' fill-opacity='0.7' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  cursor: pointer;
+}
+
+.graph-3d-controls select option {
+  background: #0d2329;
+  color: #ecf7f6;
+}
+
+.graph-3d-controls input::placeholder {
+  color: rgba(236, 247, 246, 0.4);
+}
+
+.graph-3d-controls select:hover:not(:disabled),
+.graph-3d-controls input:hover:not(:disabled) {
+  border-color: rgba(236, 247, 246, 0.34);
+}
+
+.graph-3d-controls select:focus-visible,
+.graph-3d-controls input:focus-visible {
+  outline: none;
+  border-color: rgba(15, 139, 141, 0.9);
+  box-shadow: 0 0 0 3px rgba(15, 139, 141, 0.3);
+  background: rgba(7, 19, 22, 0.72);
+}
+
+.graph-3d-controls select:disabled,
+.graph-3d-controls input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .graph-3d-search {
