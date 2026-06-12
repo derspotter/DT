@@ -768,8 +768,13 @@ function ensureAuthSchema(db) {
 function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
   const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(authConfig.adminUsername);
   let adminId = admin?.id;
+  // The bootstrap admin's password is sourced from RAG_ADMIN_PASSWORD. Keep the
+  // stored hash in sync with the env on every startup so the documented
+  // credentials always work (after the env changes, or after the DB is rebuilt).
+  // NOTE: this makes the env authoritative for the bootstrap admin — a password
+  // set for it via the UI is reset to RAG_ADMIN_PASSWORD on the next restart.
+  const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
   if (!adminId) {
-    const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
     const result = db
       .prepare('INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)')
       .run(authConfig.adminUsername, hash);
@@ -778,6 +783,8 @@ function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
     } else {
       adminId = result.lastInsertRowid;
     }
+  } else {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, adminId);
   }
 
   let corpus = db
