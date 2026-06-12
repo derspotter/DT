@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # Dummy values so createApp() can boot under test; stub-mode tests set
+      # RAG_FEEDER_STUB themselves.
+      RAG_FEEDER_JWT_SECRET: ci-test-secret
+      RAG_ADMIN_USER: ci-admin
+      RAG_ADMIN_PASSWORD: ci-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  frontend:
+    name: Frontend build + mocked e2e
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npx vite build
+      - run: npx playwright install --with-deps chromium
+      # Mock-only specs (no live backend needed). Live/real specs are opt-in via
+      # their own env flags and are intentionally excluded here.
+      - run: npx playwright test tests/graph-3d.spec.ts tests/seed-upload.spec.ts
