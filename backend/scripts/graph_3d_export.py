@@ -27,7 +27,10 @@ DEFAULT_MAX_NODES = 10000
 SNAPSHOT_SCHEMA_VERSION = 2
 LAYOUT_SEED = 42
 LAYOUT_TARGET_RADIUS = 2200.0
-LAYOUT_MIN_FORCE_COMPONENT = 5
+# Connected cores at/above this size use DrL (near-linear) instead of
+# Fruchterman-Reingold (quadratic). Below it, FR with a size-scaled iteration
+# count is both faster and produces a tighter layout.
+LAYOUT_DRL_CORE_THRESHOLD = 10000
 BASE_WORK_COLUMNS = [
     "id",
     "title",
@@ -471,19 +474,54 @@ def fibonacci_direction(index, total):
     return (math.cos(theta) * ring, y, math.sin(theta) * ring)
 
 
-def layout_component(size, local_edges):
+def _core_niter(size):
+    # More iterations for small cores (cheap), fewer for large ones to keep the
+    # quadratic FR cost bounded.
+    return int(max(70, min(200, 9000 / math.sqrt(max(1, size)))))
+
+
+def layout_cluster(size, local_edges):
+    """Position one field's works.
+
+    Only the connected core (works with an internal citation edge) gets a force
+    layout: in this corpus ~80% of works in large fields are isolated, and
+    running Fruchterman-Reingold over them just adds O(n^2) cost with no edges to
+    shape them. Isolated works are scattered on a Fibonacci shell around the
+    core. Cores at/above LAYOUT_DRL_CORE_THRESHOLD use DrL (near-linear) rather
+    than FR (quadratic).
+    """
     if size <= 1:
         return [(0.0, 0.0, 0.0)]
-    if size < LAYOUT_MIN_FORCE_COMPONENT or not local_edges:
-        radius = 14.0 + math.pow(size, 0.5) * 6.0
-        return [
-            tuple(value * radius * (0.4 + 0.6 * (index + 1) / size) for value in fibonacci_direction(index, size))
-            for index in range(size)
-        ]
-    graph = igraph.Graph(size, local_edges)
-    niter = int(min(200, 90 + math.sqrt(size) * 1.5))
-    layout = graph.layout_fruchterman_reingold(dim=3, niter=niter)
-    return [tuple(coord) for coord in layout]
+    touched = set()
+    for source, target in local_edges:
+        touched.add(source)
+        touched.add(target)
+
+    coords = [None] * size
+    core_radius = 0.0
+    if len(touched) >= 2:
+        core = sorted(touched)
+        remap = {local_idx: position for position, local_idx in enumerate(core)}
+        core_edges = [(remap[source], remap[target]) for source, target in local_edges]
+        graph = igraph.Graph(len(core), core_edges)
+        if len(core) >= LAYOUT_DRL_CORE_THRESHOLD:
+            raw = graph.layout_drl(dim=3)
+        else:
+            raw = graph.layout_fruchterman_reingold(dim=3, niter=_core_niter(len(core)))
+        points = np.asarray([tuple(coord) for coord in raw], dtype=np.float64)
+        points -= points.mean(axis=0)
+        for position, local_idx in enumerate(core):
+            coords[local_idx] = (float(points[position][0]), float(points[position][1]), float(points[position][2]))
+        core_radius = float(np.linalg.norm(points, axis=1).max()) if len(core) > 1 else 8.0
+
+    isolated = [index for index in range(size) if coords[index] is None]
+    if isolated:
+        shell = max(core_radius * 1.15, 14.0 + math.pow(len(isolated), 0.5) * 6.0)
+        for offset, local_idx in enumerate(isolated):
+            direction = fibonacci_direction(offset, len(isolated))
+            reach = shell * (0.55 + 0.45 * (offset + 1) / len(isolated))
+            coords[local_idx] = (direction[0] * reach, direction[1] * reach, direction[2] * reach)
+    return coords
 
 
 def normalize_component(coords, size):
@@ -500,11 +538,11 @@ def normalize_component(coords, size):
 def compute_field_layout(clusters, edges):
     """3D layout that groups works into academic-field territories.
 
-    Each field cluster is laid out on its own — Fruchterman-Reingold 3D over its
-    internal citation edges when it has enough of them, otherwise a compact
-    Fibonacci ball — then packed onto golden-angle shells with the largest field
-    at the origin. Cross-field citations are not used for positioning (they are
-    rendered as bridge links), so spatial grouping reflects fields.
+    Each field cluster is laid out on its own (see layout_cluster: force layout
+    for its connected core, scatter for the isolated remainder), then packed onto
+    golden-angle shells with the largest field at the origin. Cross-field
+    citations are not used for positioning (they are rendered as bridge links),
+    so spatial grouping reflects fields.
 
     Returns {node_id: (x, y, z)} or None when igraph/numpy are unavailable.
     """
@@ -534,7 +572,7 @@ def compute_field_layout(clusters, edges):
     radii = []
     for cluster_id, (_label, group) in enumerate(clusters):
         points = normalize_component(
-            layout_component(len(group), sorted(cluster_edges.get(cluster_id, ()))),
+            layout_cluster(len(group), sorted(cluster_edges.get(cluster_id, ()))),
             len(group),
         )
         layouts.append(points)
