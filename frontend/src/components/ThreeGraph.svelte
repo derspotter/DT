@@ -63,6 +63,7 @@
   let highlightIndex = null
   let adjacency = null
   let edgeEndpoints = null
+  let edgeVertexStride = 2
   let yearFrom = null
   let yearTo = null
   let visibleNodeCount = 0
@@ -300,10 +301,30 @@
         visible: false,
       }))
 
+    // Hierarchical edge bundling: route every edge through its endpoints'
+    // cluster centroids with a cubic Bézier, so edges that share the same two
+    // territories converge onto a common trunk instead of forming a hairball.
+    // Cheaper segment counts kick in as the edge population grows so the vertex
+    // buffer stays bounded on huge ("All works") graphs.
+    const clusterCentroids = new Map()
+    for (const cluster of clusterData) {
+      clusterCentroids.set(Number(cluster.id), {
+        x: Number(cluster.x || 0),
+        y: Number(cluster.y || 0) * depthScale,
+        z: Number(cluster.z || 0),
+      })
+    }
+    const graphCenter = pointGeometry.boundingSphere?.center
+      ? { x: pointGeometry.boundingSphere.center.x, y: pointGeometry.boundingSphere.center.y, z: pointGeometry.boundingSphere.center.z }
+      : { x: 0, y: 0, z: 0 }
+    const BUNDLE_STRENGTH = 0.78
+
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
     const edgeCount = binaryEdgeCount || edges.length
-    const edgePositions = new Float32Array(edgeCount * 2 * 3)
-    const edgeColors = new Float32Array(edgeCount * 2 * 3)
+    const edgeSegments = edgeCount > 250000 ? 2 : edgeCount > 90000 ? 4 : 7
+    edgeVertexStride = edgeSegments * 2
+    const edgePositions = new Float32Array(edgeCount * edgeVertexStride * 3)
+    const edgeColors = new Float32Array(edgeCount * edgeVertexStride * 3)
     const endpointPairs = new Uint32Array(edgeCount * 2)
     let edgeOffset = 0
     let edgeColorOffset = 0
@@ -311,18 +332,52 @@
     const appendEdge = (sourceIndex, targetIndex, relationshipCode = 0) => {
       if (sourceIndex === undefined || targetIndex === undefined) return
       if (sourceIndex < 0 || targetIndex < 0 || sourceIndex >= nodes.length || targetIndex >= nodes.length) return
-      edgePositions[edgeOffset++] = positions[sourceIndex * 3]
-      edgePositions[edgeOffset++] = positions[sourceIndex * 3 + 1]
-      edgePositions[edgeOffset++] = positions[sourceIndex * 3 + 2]
-      edgePositions[edgeOffset++] = positions[targetIndex * 3]
-      edgePositions[edgeOffset++] = positions[targetIndex * 3 + 1]
-      edgePositions[edgeOffset++] = positions[targetIndex * 3 + 2]
+      const sx = positions[sourceIndex * 3]
+      const sy = positions[sourceIndex * 3 + 1]
+      const sz = positions[sourceIndex * 3 + 2]
+      const tx = positions[targetIndex * 3]
+      const ty = positions[targetIndex * 3 + 1]
+      const tz = positions[targetIndex * 3 + 2]
+      // Control points: pull each endpoint toward its own cluster centroid (or
+      // the graph centre when the cluster is unknown), so same-cluster edges bow
+      // through that centroid and cross-cluster edges follow the centroid trunk.
+      const ca = clusterCentroids.get(Number(nodes[sourceIndex].cluster)) || graphCenter
+      const cb = clusterCentroids.get(Number(nodes[targetIndex].cluster)) || graphCenter
+      const c1x = sx + (ca.x - sx) * BUNDLE_STRENGTH
+      const c1y = sy + (ca.y - sy) * BUNDLE_STRENGTH
+      const c1z = sz + (ca.z - sz) * BUNDLE_STRENGTH
+      const c2x = tx + (cb.x - tx) * BUNDLE_STRENGTH
+      const c2y = ty + (cb.y - ty) * BUNDLE_STRENGTH
+      const c2z = tz + (cb.z - tz) * BUNDLE_STRENGTH
+      let px = sx
+      let py = sy
+      let pz = sz
+      for (let seg = 1; seg <= edgeSegments; seg += 1) {
+        const u = seg / edgeSegments
+        const mt = 1 - u
+        const a = mt * mt * mt
+        const b = 3 * mt * mt * u
+        const c = 3 * mt * u * u
+        const d = u * u * u
+        const qx = a * sx + b * c1x + c * c2x + d * tx
+        const qy = a * sy + b * c1y + c * c2y + d * ty
+        const qz = a * sz + b * c1z + c * c2z + d * tz
+        edgePositions[edgeOffset++] = px
+        edgePositions[edgeOffset++] = py
+        edgePositions[edgeOffset++] = pz
+        edgePositions[edgeOffset++] = qx
+        edgePositions[edgeOffset++] = qy
+        edgePositions[edgeOffset++] = qz
+        px = qx
+        py = qy
+        pz = qz
+      }
       endpointPairs[appendedEdges * 2] = sourceIndex
       endpointPairs[appendedEdges * 2 + 1] = targetIndex
       appendedEdges += 1
       const edgeHex = relationshipCode === 1 ? 0xf4a340 : 0x7c8b95
       color.setHex(edgeHex)
-      for (let i = 0; i < 2; i += 1) {
+      for (let i = 0; i < edgeVertexStride; i += 1) {
         edgeColors[edgeColorOffset++] = color.r
         edgeColors[edgeColorOffset++] = color.g
         edgeColors[edgeColorOffset++] = color.b
@@ -346,7 +401,7 @@
     const lineGeometry = new THREE.BufferGeometry()
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions.slice(0, edgeOffset), 3))
     lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors.slice(0, edgeColorOffset), 3))
-    lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(appendedEdges * 2), 1))
+    lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(appendedEdges * edgeVertexStride), 1))
     edgeLines = new THREE.LineSegments(lineGeometry, createEdgeMaterial(THREE))
     scene.add(edgeLines)
 
@@ -516,8 +571,11 @@
             alpha = baseAlpha
           }
         }
-        edgeAlphaAttr.array[edge * 2] = alpha
-        edgeAlphaAttr.array[edge * 2 + 1] = alpha
+        // Each edge owns `edgeVertexStride` curve vertices; set them all.
+        const base = edge * edgeVertexStride
+        for (let v = 0; v < edgeVertexStride; v += 1) {
+          edgeAlphaAttr.array[base + v] = alpha
+        }
       }
       edgeAlphaAttr.needsUpdate = true
     }
