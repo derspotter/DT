@@ -332,7 +332,7 @@
 
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
     const edgeCount = binaryEdgeCount || edges.length
-    const edgeSegments = edgeCount > 250000 ? 2 : edgeCount > 90000 ? 4 : 7
+    const edgeSegments = edgeCount > 500000 ? 4 : edgeCount > 200000 ? 6 : 8
     edgeVertexStride = edgeSegments * 2
     const edgePositions = new Float32Array(edgeCount * edgeVertexStride * 3)
     const edgeColors = new Float32Array(edgeCount * edgeVertexStride * 3)

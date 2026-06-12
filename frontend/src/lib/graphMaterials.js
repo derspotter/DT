@@ -67,5 +67,9 @@ export function createEdgeMaterial(THREE) {
     vertexColors: true,
     transparent: true,
     depthWrite: false,
+    depthTest: false,
+    // Additive so edges bundled along a shared trunk accumulate brightness and
+    // the trunk visibly glows, instead of many faint lines cancelling into haze.
+    blending: THREE.AdditiveBlending,
   })
 }
