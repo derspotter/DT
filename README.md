@@ -4,11 +4,12 @@ Monorepo for PDF ingestion, bibliography extraction, metadata enrichment, and do
 
 ## Repository Layout
 
-- `frontend/`: Svelte + Vite app
-- `backend/`: Node.js API and orchestration routes
+- `frontend/`: Svelte + Vite app (incl. the 3D graph explorer, `src/components/ThreeGraph.svelte`)
+- `backend/`: Node.js API and orchestration routes; `backend/scripts/` holds the Python entrypoints (graph export, OpenAlex/citation backfills, seed import) that import the `dl_lit` package
 - `backend/scripts/daemon/worker.py`: queue consumer daemon
-- `dl_lit_project/`: canonical Python pipeline package (`dl_lit`)
-- `dl_lit/`: legacy scripts (not canonical runtime)
+- `dl_lit_project/`: canonical Python pipeline package (`dl_lit`) + docs (`README.md`, `docs/`)
+- `experiments/`: scratch / experimental scripts (not part of the runtime)
+- `docs/archive/`: historical planning notes
 
 ## Current Runtime Architecture
 
@@ -40,7 +41,7 @@ Status lives directly on `works`:
 
 - `rag_feeder_frontend` on `http://localhost:5175`
 - `rag_feeder_backend` on `http://localhost:4000`
-- `rag_feeder_worker` (no HTTP port)
+- `rag_feeder_enrich_worker` and `rag_feeder_download_worker` (no HTTP port)
 
 ## Quick Start
 
@@ -80,8 +81,31 @@ Do not patch tracked compose files on the server. Keep the live host and Caddy l
 
 `/api/pipeline/worker/start` and `/api/pipeline/worker/pause` currently update in-memory API state; continuous interval scheduling is transitional in current implementation.
 
+## Development & Testing
+
+Local setup:
+
+- `cp .env.example .env` and fill in keys (`GOOGLE_API_KEY` required; `OPENALEX_API_KEY`, `RAG_ADMIN_USER`/`RAG_ADMIN_PASSWORD`, `RAG_FEEDER_JWT_SECRET` as needed). The bootstrap admin password is re-synced from `RAG_ADMIN_PASSWORD` on every backend start.
+- `docker compose up -d` runs the full stack; backend (`backend/src`) and Python scripts (`backend/scripts`) are bind-mounted and hot-reload via nodemon.
+
+Run the tests:
+
+- Backend (Jest, stub mode — no DB needed): `cd backend && npm ci && npm test`
+- Frontend build + mocked e2e: `cd frontend && npm ci && npx vite build && npx playwright install chromium && npx playwright test tests/graph-3d.spec.ts tests/seed-upload.spec.ts`
+- Python lint: `python -m ruff check backend/scripts`
+- Live/authenticated e2e specs are opt-in via env flags (`RUN_SEED_UPLOAD_REAL=1`, `RUN_REAL_PDF_PERF=1`) and need a running backend + `RAG_ADMIN_*`.
+
+CI (`.github/workflows/ci.yml`) runs the backend suite and the frontend build + mocked e2e on every PR.
+
+One-off maintenance scripts (`backend/scripts/`, write to the live DB, re-runnable):
+
+- `backfill_openalex_topics.py` — OpenAlex topic/field/domain columns (powers the 3D graph's field clustering)
+- `backfill_citation_edges.py` — in-corpus citation edges from `referenced_works`
+- `ingest_import_seed.py` — used by the `.bib`/`.json` web upload
+
 ## Read More
 
 - Backend details: `backend/README.md`
 - Frontend details: `frontend/README.md`
 - Python pipeline details: `dl_lit_project/README.md`
+- Architecture & web-app notes: `dl_lit_project/CLAUDE.md`

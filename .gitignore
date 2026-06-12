@@ -63,8 +63,8 @@ artifacts/
 dl_lit_project/artifacts/
 
 # OCR output directories
-ocr/ocr_results/
-ocr/translated/
+experiments/ocr/ocr_results/
+experiments/ocr/translated/
 
 # Local workspace artifacts
 Scraper_first_version/
