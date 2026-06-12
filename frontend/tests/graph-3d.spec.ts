@@ -272,6 +272,25 @@ test('year filter reports visible node count', async ({ page }) => {
   await expect(panel.getByTestId('graph-3d-filter-status')).toBeHidden()
 })
 
+test('legend isolates a territory and clears it', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  const legend = panel.getByTestId('graph-3d-legend')
+  await expect(legend).toBeVisible()
+  const item = panel.getByTestId('graph-3d-legend-item').first()
+  await expect(item).toHaveAttribute('aria-pressed', 'false')
+
+  await item.click()
+  await expect(item).toHaveAttribute('aria-pressed', 'true')
+  const clear = panel.getByTestId('graph-3d-legend-clear')
+  await expect(clear).toBeVisible()
+
+  await clear.click()
+  await expect(item).toHaveAttribute('aria-pressed', 'false')
+  await expect(clear).toBeHidden()
+})
+
 test('node detail responses are cached per work', async ({ page }) => {
   let nodeDetailRequests = 0
   await page.route('**/api/**', async (route) => {
