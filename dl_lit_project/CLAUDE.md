@@ -6,6 +6,32 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is `dl_lit`, an automated PDF literature pipeline for academic research. The system extracts bibliographies from PDFs, enriches metadata via APIs (OpenAlex, Crossref), downloads referenced papers, and manages everything in a SQLite database with a canonical `works` workflow.
 
+The CLI documented below is the original interface; the same `dl_lit` package
+and `works`/`corpus_works` schema also power a web application (see below).
+
+## Web application & runtime
+
+A web app wraps the pipeline (repo root, outside `dl_lit_project/`):
+
+- **Backend** — Node/Express (`backend/src/app.js`) exposing `/api/*`, with
+  Python work delegated to scripts in `backend/scripts/` (which import this
+  `dl_lit` package). **Frontend** — Svelte/Vite (`frontend/`). **Deployment** —
+  `docker-compose.yml` runs `rag_feeder_{frontend,backend,enrich_worker,download_worker}`
+  against the shared `dl_lit_project/data/literature.db`. The bootstrap admin is
+  sourced from `RAG_ADMIN_USER`/`RAG_ADMIN_PASSWORD` (re-synced on each startup).
+- **3D graph explorer** — `backend/scripts/graph_3d_export.py` builds cached
+  snapshots (igraph force-directed layout) grouped into academic-field
+  territories; served via `/api/graph/3d/snapshot*` and rendered in
+  `frontend/src/components/ThreeGraph.svelte`.
+- **Backfills / import** (`backend/scripts/`): `backfill_openalex_topics.py`
+  (OpenAlex topic/field/domain columns), `backfill_citation_edges.py`
+  (in-corpus `citation_edges` from `referenced_works`), `ingest_import_seed.py`
+  (web upload of `.bib`/`.json` seeds into a corpus). These populate the live DB
+  and are re-runnable on a fresh database.
+
+CI (`.github/workflows/ci.yml`) runs the backend Jest suite and a frontend
+build + mocked Playwright specs on every PR.
+
 ## Environment Setup
 
 **CRITICAL**: All commands must be run from within the activated Python virtual environment:

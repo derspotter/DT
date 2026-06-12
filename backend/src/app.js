@@ -424,8 +424,34 @@ function buildGraph3dSnapshot(options, key) {
 
 // Build the default 3D snapshot if it is missing, so the first Graph-tab open
 // is served from cache instead of waiting ~30s for a cold build.
+// Remove snapshot directories not refreshed within maxAgeMs. Cache keys change
+// when params or the cache version change, so orphans from old keys/versions
+// (and any leftover .build-/.old- temp dirs) age out and get cleaned up here.
+function pruneGraph3dSnapshots(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+  try {
+    if (!fs.existsSync(GRAPH_3D_SNAPSHOT_DIR)) return;
+    const now = Date.now();
+    for (const entry of fs.readdirSync(GRAPH_3D_SNAPSHOT_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(GRAPH_3D_SNAPSHOT_DIR, entry.name);
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(path.join(dir, 'manifest.json')).mtimeMs;
+      } catch {
+        try { mtimeMs = fs.statSync(dir).mtimeMs; } catch { mtimeMs = 0; }
+      }
+      if (mtimeMs && now - mtimeMs > maxAgeMs) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  } catch (error) {
+    console.warn('[graph3d] snapshot prune failed:', error.message);
+  }
+}
+
 async function warmGraph3dSnapshot() {
   if (isStubMode()) return;
+  pruneGraph3dSnapshots();
   try {
     const options = buildGraph3dRequest({ query: {} });
     const key = graph3dSnapshotKey(options);
@@ -2118,7 +2144,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const downloadWorkers = new Map(); // corpusId -> state
   const pipelineWorkers = new Map(); // corpusId -> state
-  const graph3dCache = new Map();
   const authConfig = resolveAuthConfig();
 
   // Ensure temporary and output directories exist
@@ -4586,45 +4611,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.status(500).json({ error: error.message || 'Failed to export corpus data' });
     }
   });
-  app.get('/api/graph/3d', requireAuthMiddleware, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ ...STUB_RESULTS.graph, source: 'stub' });
-    }
-    const options = buildGraph3dRequest(req);
-    const dbPath = DB_PATH;
-    const cacheKey = JSON.stringify({
-      version: GRAPH_3D_CACHE_VERSION,
-      maxNodes: options.maxNodes,
-      relationship: options.relationship,
-      status: options.status,
-      scope: options.scope,
-      yearFrom: options.yearFrom,
-      yearTo: options.yearTo,
-      corpusId: options.corpusId,
-      dbModifiedMs: options.dbModifiedMs,
-    });
-    const cached = graph3dCache.get(cacheKey);
-    const cacheTtlMs = 15 * 60 * 1000;
-    if (cached && cached.createdAt + cacheTtlMs > Date.now()) {
-      return res.json({ ...cached.payload, source: 'cache' });
-    }
-    try {
-      const payload = await runPythonJson(GRAPH_3D_EXPORT_SCRIPT, graph3dScriptArgs(options), {
-        dbPath,
-        corpusId: options.corpusId,
-      });
-      graph3dCache.set(cacheKey, { createdAt: Date.now(), payload });
-      if (graph3dCache.size > 4) {
-        const oldestKey = [...graph3dCache.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
-        if (oldestKey) graph3dCache.delete(oldestKey);
-      }
-      return res.json(payload);
-    } catch (error) {
-      console.error('[/api/graph/3d] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to build 3D graph' });
-    }
-  });
-
   app.get('/api/graph/3d/snapshot', requireAuthMiddleware, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json(stubGraph3dManifest());
