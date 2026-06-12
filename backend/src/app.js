@@ -115,6 +115,7 @@ const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
+const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_seed.py');
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
@@ -767,8 +768,13 @@ function ensureAuthSchema(db) {
 function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
   const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(authConfig.adminUsername);
   let adminId = admin?.id;
+  // The bootstrap admin's password is sourced from RAG_ADMIN_PASSWORD. Keep the
+  // stored hash in sync with the env on every startup so the documented
+  // credentials always work (after the env changes, or after the DB is rebuilt).
+  // NOTE: this makes the env authoritative for the bootstrap admin — a password
+  // set for it via the UI is reset to RAG_ADMIN_PASSWORD on the next restart.
+  const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
   if (!adminId) {
-    const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
     const result = db
       .prepare('INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)')
       .run(authConfig.adminUsername, hash);
@@ -777,6 +783,8 @@ function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
     } else {
       adminId = result.lastInsertRowid;
     }
+  } else {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, adminId);
   }
 
   let corpus = db
@@ -4771,6 +4779,30 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       console.error('[/api/ingest/latest] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest entries' });
+    }
+  });
+
+  app.post('/api/ingest/import-seed', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+    const filename = String(req.body?.filename || '').trim();
+    const kind = String(req.body?.kind || '').trim();
+    if (!filename || !['bib', 'json'].includes(kind)) {
+      return res.status(400).json({ error: 'filename and kind (bib|json) are required' });
+    }
+    if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+      return res.status(400).json({ error: 'Invalid filename' });
+    }
+    const filePath = path.join(UPLOADS_DIR, filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Uploaded file not found. Please re-upload.' });
+    }
+    const args = ['--db-path', DB_PATH, '--file', filePath, '--kind', kind, '--source-label', filename];
+    if (req.corpusId) args.push('--corpus-id', String(req.corpusId));
+    try {
+      const result = await runPythonJson(INGEST_IMPORT_SEED_SCRIPT, args, { dbPath: DB_PATH, corpusId: req.corpusId });
+      return res.json(result);
+    } catch (error) {
+      console.error('[/api/ingest/import-seed] Error:', error);
+      return res.status(500).json({ error: error.message || 'Failed to import seed file' });
     }
   });
 
