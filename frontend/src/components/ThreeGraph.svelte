@@ -29,6 +29,7 @@
   let flyFrame = 0
   let resizeObserver
   let handlePointerMove
+  let handlePointerLeave
   let handleClick
   let handleContextMenu
   let handleKeydown
@@ -36,6 +37,11 @@
   let initialLoadStarted = false
   let clusterLabelLayer
   let clusterLabels = []
+  let hubLabels = []
+  let tooltip = { visible: false, x: 0, y: 0, node: null }
+  let halo = { visible: false, x: 0, y: 0 }
+  let selectedIndex = null
+  let isolatedCluster = null
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
@@ -185,6 +191,11 @@
     return Math.min(14, Math.max(3, 3 + 2.4 * Math.log2(1 + Math.max(0, Number(degree || 0)))))
   }
 
+  function truncate(text, max) {
+    const value = String(text || '').trim()
+    return value.length > max ? `${value.slice(0, max - 1)}…` : value
+  }
+
   function renderGraph() {
     if (!scene || !THREE) return
     disposeObject(points)
@@ -266,6 +277,28 @@
       opacity: index < 8 ? 1 : 0.85,
       scale: Math.max(0.86, Math.min(1.12, 0.72 + Math.log1p(Number(cluster.size || 1)) * 0.062)),
     }))
+
+    // Always-on labels for the most-cited works ("hubs") so the map reads as a
+    // citation landscape before any interaction. Highest-degree nodes only; the
+    // overlay placer caps how many show by zoom and avoids cluster labels.
+    hubLabels = nodes
+      .map((node, index) => ({ node, index, degree: Number(node.degree || 0) }))
+      .filter((entry) => entry.degree > 0)
+      .sort((a, b) => b.degree - a.degree)
+      .slice(0, 16)
+      .map(({ node, index }) => ({
+        index,
+        label: truncate(node.title || node.label || 'Untitled', 32),
+        degree: Number(node.degree || 0),
+        vector: new THREE.Vector3(
+          positions[index * 3],
+          positions[index * 3 + 1],
+          positions[index * 3 + 2]
+        ),
+        x: -9999,
+        y: -9999,
+        visible: false,
+      }))
 
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
     const edgeCount = binaryEdgeCount || edges.length
@@ -445,7 +478,12 @@
       let alpha = 0
       if (passesYearFilter(nodes[i])) {
         visible += 1
-        alpha = highlightSet ? (highlightSet.has(i) ? 1 : 0.06) : 1
+        const inIsolated = isolatedCluster === null || Number(nodes[i].cluster) === isolatedCluster
+        if (highlightSet) {
+          alpha = highlightSet.has(i) ? 1 : 0.06
+        } else {
+          alpha = inIsolated ? 1 : 0.07
+        }
       }
       nodeAlphaAttr.array[i] = alpha
     }
@@ -460,10 +498,14 @@
       for (let edge = 0; edge < totalEdges; edge += 1) {
         const source = edgeEndpoints[edge * 2]
         const target = edgeEndpoints[edge * 2 + 1]
+        const sourceAlpha = nodeAlphaAttr.array[source]
+        const targetAlpha = nodeAlphaAttr.array[target]
         let alpha = 0
-        if (nodeAlphaAttr.array[source] > 0 && nodeAlphaAttr.array[target] > 0) {
+        if (sourceAlpha > 0 && targetAlpha > 0) {
           if (highlightIndex !== null) {
             alpha = source === highlightIndex || target === highlightIndex ? 0.85 : 0.02
+          } else if (isolatedCluster !== null && (sourceAlpha < 0.5 || targetAlpha < 0.5)) {
+            alpha = 0.015
           } else if (
             lodActive
             && Number(nodes[source]?.degree || 0) <= 1
@@ -484,6 +526,13 @@
 
   function applyHighlight(index) {
     highlightIndex = index
+    recomputeAlphas()
+  }
+
+  // Click a legend swatch to isolate that territory (dim everything else);
+  // click the active one again to clear.
+  function toggleIsolate(clusterId) {
+    isolatedCluster = isolatedCluster === clusterId ? null : Number(clusterId)
     recomputeAlphas()
   }
 
@@ -706,7 +755,9 @@
   function clearSelection() {
     selectedNode = null
     selectedNodeDetail = null
+    selectedIndex = null
     hoveredNode = null
+    halo = { ...halo, visible: false }
     if (highlightIndex !== null) applyHighlight(null)
   }
 
@@ -739,6 +790,10 @@
     highlightIndex = null
     selectedNode = null
     selectedNodeDetail = null
+    selectedIndex = null
+    isolatedCluster = null
+    halo = { ...halo, visible: false }
+    tooltip = { ...tooltip, visible: false }
     selectedCluster = null
     selectedClusterDetail = null
     searchResults = []
@@ -859,6 +914,69 @@
       updates[index] = { ...label, x, y, visible }
     }
     clusterLabels = updates
+
+    // Hub labels are placed into the same occupancy map so they never collide
+    // with territory labels. Fewer show when zoomed out, and a hub whose node is
+    // filtered/dimmed out is skipped.
+    if (hubLabels.length) {
+      const nodeAlphaAttr = points?.geometry?.getAttribute('alpha')?.array
+      const hubMax = cameraDistance < 1200 ? 12 : cameraDistance < 2600 ? 7 : 3
+      const hubOffsets = [-16, -34, 14, -52]
+      let hubVisible = 0
+      const hubUpdates = new Array(hubLabels.length)
+      for (let h = 0; h < hubLabels.length; h += 1) {
+        const hub = hubLabels[h]
+        const dimmed = nodeAlphaAttr ? nodeAlphaAttr[hub.index] < 0.5 : false
+        const projected = hub.vector.clone().project(camera)
+        const baseX = ((projected.x + 1) / 2) * rect.width
+        const baseY = ((-projected.y + 1) / 2) * rect.height
+        const width = 150
+        const height = 22
+        let x = baseX
+        let y = baseY
+        let visible = false
+        const onScreen =
+          projected.z > -1 && projected.z < 1 &&
+          baseX >= 0 && baseX <= rect.width && baseY >= 0 && baseY <= rect.height
+        if (!dimmed && hubVisible < hubMax && onScreen) {
+          for (const offsetY of hubOffsets) {
+            const candidateY = baseY + offsetY
+            const overlaps = placed.some((box) => (
+              Math.abs(box.x - baseX) < (box.width + width) * 0.5
+              && Math.abs(box.y - candidateY) < (box.height + height) * 0.6
+            ))
+            if (!overlaps) {
+              x = baseX
+              y = candidateY
+              visible = true
+              hubVisible += 1
+              placed.push({ x, y, width, height })
+              break
+            }
+          }
+        }
+        hubUpdates[h] = { ...hub, x, y, visible }
+      }
+      hubLabels = hubUpdates
+    }
+
+    // Selection halo follows the picked node in screen space.
+    if (selectedIndex !== null && points) {
+      const posAttr = points.geometry.getAttribute('position')
+      const v = new THREE.Vector3(
+        posAttr.getX(selectedIndex),
+        posAttr.getY(selectedIndex),
+        posAttr.getZ(selectedIndex)
+      ).project(camera)
+      const onScreen = v.z > -1 && v.z < 1
+      halo = {
+        visible: onScreen,
+        x: ((v.x + 1) / 2) * rect.width,
+        y: ((-v.y + 1) / 2) * rect.height,
+      }
+    } else if (halo.visible) {
+      halo = { ...halo, visible: false }
+    }
   }
 
   function renderForFrames(count = 30) {
@@ -905,9 +1023,18 @@
       .find((candidate) => !alphaArray || alphaArray[candidate.index] > 0.05)
     const nextNode = hit ? points.userData.nodes?.[hit.index] : null
     hoveredNode = nextNode
+    if (renderer) renderer.domElement.style.cursor = nextNode ? 'pointer' : ''
+    if (nextNode && !persist) {
+      const rect = renderer.domElement.getBoundingClientRect()
+      tooltip = { visible: true, x: event.clientX - rect.left, y: event.clientY - rect.top, node: nextNode }
+    } else if (!nextNode) {
+      tooltip = { ...tooltip, visible: false }
+    }
     if (!persist) return
     if (nextNode) {
       selectedNode = nextNode
+      selectedIndex = hit.index
+      tooltip = { ...tooltip, visible: false }
       applyHighlight(hit.index)
       void loadNodeDetail(nextNode)
     } else {
@@ -971,6 +1098,11 @@
 
     raycaster = new THREE.Raycaster()
     handlePointerMove = (event) => pickNode(event, false)
+    handlePointerLeave = () => {
+      hoveredNode = null
+      tooltip = { ...tooltip, visible: false }
+      if (renderer) renderer.domElement.style.cursor = ''
+    }
     handleClick = (event) => pickNode(event, true)
     handleContextMenu = (event) => event.preventDefault()
     handleKeydown = (event) => {
@@ -980,6 +1112,7 @@
       }
     }
     renderer.domElement.addEventListener('pointermove', handlePointerMove)
+    renderer.domElement.addEventListener('pointerleave', handlePointerLeave)
     renderer.domElement.addEventListener('click', handleClick)
     renderer.domElement.addEventListener('contextmenu', handleContextMenu)
     window.addEventListener('keydown', handleKeydown)
@@ -1006,6 +1139,7 @@
     resizeObserver?.disconnect()
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
+    if (handlePointerLeave) renderer?.domElement?.removeEventListener('pointerleave', handlePointerLeave)
     if (handleClick) renderer?.domElement?.removeEventListener('click', handleClick)
     if (handleContextMenu) renderer?.domElement?.removeEventListener('contextmenu', handleContextMenu)
     if (handleKeydown) window.removeEventListener('keydown', handleKeydown)
@@ -1023,6 +1157,7 @@
   $: clusters = graphData.clusters || []
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
   $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
+  $: legendItems = clusterLabels.slice(0, 12)
 </script>
 
 <div class="card graph-3d-panel" data-testid="graph-3d-panel">
@@ -1142,7 +1277,48 @@
             </button>
           {/if}
         {/each}
+        {#each hubLabels as hub (hub.index)}
+          {#if hub.visible}
+            <span class="graph-3d-hub-label" style={`--label-x:${hub.x}px;--label-y:${hub.y}px`}>
+              {hub.label}
+            </span>
+          {/if}
+        {/each}
+        {#if halo.visible}
+          <span class="graph-3d-halo" style={`--label-x:${halo.x}px;--label-y:${halo.y}px`} aria-hidden="true"></span>
+        {/if}
       </div>
+      {#if tooltip.visible && tooltip.node}
+        <div class="graph-3d-tooltip" style={`--label-x:${tooltip.x}px;--label-y:${tooltip.y}px`} aria-hidden="true">
+          <strong>{truncate(tooltip.node.title || tooltip.node.label || 'Untitled', 90)}</strong>
+          <span>{tooltip.node.authors ? `${truncate(tooltip.node.authors, 60)} · ` : ''}{tooltip.node.year || 'year ?'}</span>
+          <span>{formatNumber(tooltip.node.degree)} citations · {tooltip.node.field || tooltip.node.area || 'unknown field'}</span>
+        </div>
+      {/if}
+      {#if legendItems.length}
+        <div class="graph-3d-legend" data-testid="graph-3d-legend">
+          <span class="graph-3d-legend-title">Territories</span>
+          {#each legendItems as item (item.id)}
+            <button
+              type="button"
+              class="graph-3d-legend-item"
+              class:active={isolatedCluster === Number(item.id)}
+              class:dimmed={isolatedCluster !== null && isolatedCluster !== Number(item.id)}
+              data-testid="graph-3d-legend-item"
+              aria-pressed={isolatedCluster === Number(item.id)}
+              on:click={() => toggleIsolate(Number(item.id))}
+            >
+              <i style={`background:${item.color}`}></i>
+              <span>{item.label}</span>
+            </button>
+          {/each}
+          {#if isolatedCluster !== null}
+            <button type="button" class="graph-3d-legend-clear" data-testid="graph-3d-legend-clear" on:click={() => toggleIsolate(isolatedCluster)}>
+              Clear isolation
+            </button>
+          {/if}
+        </div>
+      {/if}
     </div>
     <aside class="graph-3d-sidebar">
       <div class="graph-3d-summary">

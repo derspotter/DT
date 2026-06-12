@@ -2474,6 +2474,167 @@ button.seed-download-tag:focus-visible {
   border-color: var(--label-color);
 }
 
+/* Always-on labels for the most-cited works */
+.graph-3d-hub-label {
+  position: absolute;
+  left: var(--label-x);
+  top: var(--label-y);
+  transform: translate(-50%, -50%);
+  max-width: 180px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(236, 247, 246, 0.16);
+  background: rgba(7, 19, 22, 0.72);
+  color: rgba(236, 247, 246, 0.92);
+  font-size: 0.66rem;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+/* Pulsing ring around the selected node */
+.graph-3d-halo {
+  position: absolute;
+  left: var(--label-x);
+  top: var(--label-y);
+  width: 34px;
+  height: 34px;
+  margin: -17px 0 0 -17px;
+  border-radius: 50%;
+  border: 2px solid rgba(244, 163, 64, 0.95);
+  box-shadow: 0 0 14px rgba(244, 163, 64, 0.6);
+  pointer-events: none;
+  animation: graph-3d-halo-pulse 1.5s ease-out infinite;
+}
+
+@keyframes graph-3d-halo-pulse {
+  0% { transform: scale(0.7); opacity: 1; }
+  70% { transform: scale(1.25); opacity: 0.35; }
+  100% { transform: scale(1.45); opacity: 0; }
+}
+
+/* Hover tooltip */
+.graph-3d-tooltip {
+  position: absolute;
+  left: var(--label-x);
+  top: var(--label-y);
+  transform: translate(14px, -50%);
+  z-index: 6;
+  display: grid;
+  gap: 2px;
+  max-width: 280px;
+  padding: 8px 11px;
+  border: 1px solid rgba(236, 247, 246, 0.2);
+  border-radius: 9px;
+  background: rgba(7, 19, 22, 0.94);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+}
+
+.graph-3d-tooltip strong {
+  font-size: 0.82rem;
+  line-height: 1.25;
+  color: #f4f9f8;
+}
+
+.graph-3d-tooltip span {
+  font-size: 0.72rem;
+  color: rgba(236, 247, 246, 0.74);
+}
+
+/* Interactive legend: click a territory to isolate it */
+.graph-3d-legend {
+  position: absolute;
+  z-index: 5;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 220px;
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  padding: 9px 10px;
+  border: 1px solid rgba(236, 247, 246, 0.14);
+  border-radius: 11px;
+  background: rgba(7, 19, 22, 0.62);
+  backdrop-filter: blur(4px);
+}
+
+.graph-3d-legend-title {
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: rgba(236, 247, 246, 0.55);
+  margin-bottom: 2px;
+}
+
+.graph-3d-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 3px 5px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(236, 247, 246, 0.86);
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, opacity 0.12s ease, border-color 0.12s ease;
+}
+
+.graph-3d-legend-item i {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  box-shadow: 0 0 6px rgba(0, 0, 0, 0.4);
+}
+
+.graph-3d-legend-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.graph-3d-legend-item:hover {
+  background: rgba(236, 247, 246, 0.1);
+}
+
+.graph-3d-legend-item.active {
+  border-color: rgba(244, 163, 64, 0.6);
+  background: rgba(244, 163, 64, 0.16);
+  color: #ffe6c2;
+}
+
+.graph-3d-legend-item.dimmed {
+  opacity: 0.42;
+}
+
+.graph-3d-legend-clear {
+  margin-top: 4px;
+  padding: 4px 8px;
+  border: 1px solid rgba(236, 247, 246, 0.2);
+  border-radius: 6px;
+  background: rgba(236, 247, 246, 0.06);
+  color: rgba(236, 247, 246, 0.85);
+  font-size: 0.68rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.graph-3d-legend-clear:hover {
+  background: rgba(236, 247, 246, 0.14);
+}
+
 .graph-3d-sidebar {
   display: grid;
   gap: 12px;
