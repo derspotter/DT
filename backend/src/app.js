@@ -401,8 +401,16 @@ function buildGraph3dSnapshot(options, key) {
         }
       }
       const backupDir = `${finalDir}.old-${Date.now()}`;
-      if (fs.existsSync(finalDir)) fs.renameSync(finalDir, backupDir);
-      fs.renameSync(buildDir, finalDir);
+      const hadExisting = fs.existsSync(finalDir);
+      if (hadExisting) fs.renameSync(finalDir, backupDir);
+      try {
+        fs.renameSync(buildDir, finalDir);
+      } catch (swapError) {
+        // Restore the previous snapshot so the cache dir is never left missing
+        // (which would cause cold rebuilds and transient 404s).
+        if (hadExisting && !fs.existsSync(finalDir)) fs.renameSync(backupDir, finalDir);
+        throw swapError;
+      }
       if (fs.existsSync(backupDir)) fs.rmSync(backupDir, { recursive: true, force: true });
       return JSON.parse(fs.readFileSync(graph3dSnapshotPath(key, 'manifest.json'), 'utf-8'));
     } finally {

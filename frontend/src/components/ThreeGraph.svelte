@@ -43,7 +43,7 @@
   let statusFilter = 'downloaded'
   let scope = 'all'
   let maxNodes = 10000
-  let colorMode = 'cluster'
+  let groupMode = 'cluster'
   let loadedGroupBy = 'field'
   let depthScale = 1.6
   let autoRotate = false
@@ -142,7 +142,7 @@
   }
 
   function nodeColor(node) {
-    if (colorMode === 'degree') {
+    if (groupMode === 'degree') {
       const degree = Number(node.degree || 0)
       if (degree > 100) return 0xfff1a8
       if (degree > 30) return 0xf4a340
@@ -721,7 +721,7 @@
 
   function onGroupModeChange() {
     if (!graphData.nodes?.length) return
-    const target = groupByForMode(colorMode)
+    const target = groupByForMode(groupMode)
     // A new grouping dimension re-arranges the graph (server re-layout); same
     // dimension or the degree overlay just recolours the current arrangement.
     if (target && target !== loadedGroupBy) {
@@ -740,7 +740,7 @@
     selectedCluster = null
     selectedClusterDetail = null
     searchResults = []
-    const groupBy = groupByForMode(colorMode) || loadedGroupBy || 'field'
+    const groupBy = groupByForMode(groupMode) || loadedGroupBy || 'field'
     try {
       const manifest = await fetchGraph3DSnapshot({
         maxNodes,
@@ -1061,7 +1061,7 @@
     </label>
     <label>
       <span class="muted small">Group by</span>
-      <select bind:value={colorMode} on:change={onGroupModeChange} disabled={graphLoading}>
+      <select bind:value={groupMode} on:change={onGroupModeChange} disabled={graphLoading}>
         <option value="cluster">Academic field</option>
         <option value="source_path">Search path</option>
         <option value="type">Work type</option>
