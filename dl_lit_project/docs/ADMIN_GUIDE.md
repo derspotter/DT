@@ -121,6 +121,10 @@ Example target:
 
 Use this assignment consistently so the later export step is unambiguous.
 
+For the operational procedure that turns pending additions into an updated upstream RAG corpus, see:
+
+- `dl_lit_project/docs/KANTROPOS_UPSTREAM_UPDATE.md`
+
 ## Mail Configuration
 
 Invites and password reset depend on SMTP.

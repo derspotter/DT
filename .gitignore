@@ -1,5 +1,14 @@
 .env
+.env.local
+.env.*.local
 /docker-compose.override.yml
+
+# Local dependency and virtualenv folders
+node_modules/
+.venv/
+venv/
+env/
+ENV/
 
 # Ignore generated directories from dl_lit scripts
 /dl_lit/temp_pages/*
@@ -61,6 +70,8 @@ dl_lit_project/extracted_refs_tmp/
 artifacts/
 .artifacts/
 dl_lit_project/artifacts/
+dl_lit_project/data/upstream_update_drafts/
+dl_lit_project/data/wzb_rag_drafts/
 
 # OCR output directories
 experiments/ocr/ocr_results/
