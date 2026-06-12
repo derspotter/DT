@@ -804,14 +804,11 @@
     if (!camera || !renderer || !clusterLabels.length) return
     const rect = renderer.domElement.getBoundingClientRect()
     const placed = []
-    const labelOffsets = [
-      [0, 0],
-      [-180, 38],
-      [180, 38],
-      [-160, -42],
-      [160, -42],
-      [0, 76],
-    ]
+    // Vertical-only nudges so a label always stays horizontally on its cluster.
+    // If no nudge is collision-free, the label is hidden rather than relocated
+    // far from its cluster (the old horizontal offsets could fling it ~180px
+    // away, which read as detached labels when zoomed out).
+    const labelOffsets = [0, -26, 28, -52, 54]
     const cameraDistance = controls ? camera.position.distanceTo(controls.target) : 2600
     const maxLabels = cameraDistance < 1200 ? 20 : cameraDistance < 2600 ? 14 : 8
     const ranked = clusterLabels
@@ -832,13 +829,20 @@
       let x = baseX
       let y = baseY
       let visible = false
-      if (visibleCount < maxLabels && projected.z > -1 && projected.z < 1) {
-        for (const [offsetX, offsetY] of labelOffsets) {
-          const candidateX = Math.min(rect.width - width / 2 - 12, Math.max(width / 2 + 12, baseX + offsetX))
-          const candidateY = Math.min(rect.height - height / 2 - 12, Math.max(48 + height / 2, baseY + offsetY))
+      // The cluster anchor must be in front of the camera and on-screen. Hide
+      // off-screen labels instead of clamping them to an edge (which detached
+      // them from their cluster).
+      const onScreen =
+        projected.z > -1 && projected.z < 1 &&
+        baseX >= 0 && baseX <= rect.width &&
+        baseY >= 0 && baseY <= rect.height
+      if (visibleCount < maxLabels && onScreen) {
+        for (const offsetY of labelOffsets) {
+          const candidateX = baseX
+          const candidateY = baseY + offsetY
           const overlaps = placed.some((box) => (
-            Math.abs(box.x - candidateX) < (box.width + width) * 0.48
-            && Math.abs(box.y - candidateY) < (box.height + height) * 0.68
+            Math.abs(box.x - candidateX) < (box.width + width) * 0.5
+            && Math.abs(box.y - candidateY) < (box.height + height) * 0.6
           ))
           if (!overlaps) {
             x = candidateX
