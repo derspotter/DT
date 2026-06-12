@@ -42,6 +42,11 @@
   let halo = { visible: false, x: 0, y: 0 }
   let selectedIndex = null
   let isolatedCluster = null
+  let pathStart = null
+  let pathEnd = null
+  let pathInfo = null
+  let pathNodeSet = null
+  let pathLine = null
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
@@ -203,6 +208,12 @@
     disposeObject(edgeLines)
     disposeObject(bridgeLines)
     disposeObject(clusterShells)
+    // Node indices and positions change on re-render, so any path is stale.
+    disposePathLine()
+    pathStart = null
+    pathEnd = null
+    pathInfo = null
+    pathNodeSet = null
     clusterLabels = []
     hoveredNode = null
 
@@ -528,10 +539,13 @@
     const nodeAlphaAttr = points.geometry.getAttribute('alpha')
     if (!nodeAlphaAttr) return
     const highlightSet = highlightIndex === null ? null : highlightNeighborhood(highlightIndex)
+    const pathActive = pathNodeSet !== null && pathNodeSet.size > 0
     let visible = 0
     for (let i = 0; i < nodes.length; i += 1) {
       let alpha = 0
-      if (passesYearFilter(nodes[i])) {
+      if (pathActive) {
+        alpha = pathNodeSet.has(i) ? 1 : 0.05
+      } else if (passesYearFilter(nodes[i])) {
         visible += 1
         const inIsolated = isolatedCluster === null || Number(nodes[i].cluster) === isolatedCluster
         if (highlightSet) {
@@ -557,7 +571,10 @@
         const targetAlpha = nodeAlphaAttr.array[target]
         let alpha = 0
         if (sourceAlpha > 0 && targetAlpha > 0) {
-          if (highlightIndex !== null) {
+          if (pathActive) {
+            // The bright amber overlay line carries the path; dim the base graph.
+            alpha = 0.02
+          } else if (highlightIndex !== null) {
             alpha = source === highlightIndex || target === highlightIndex ? 0.85 : 0.02
           } else if (isolatedCluster !== null && (sourceAlpha < 0.5 || targetAlpha < 0.5)) {
             alpha = 0.015
@@ -591,6 +608,109 @@
   // click the active one again to clear.
   function toggleIsolate(clusterId) {
     isolatedCluster = isolatedCluster === clusterId ? null : Number(clusterId)
+    recomputeAlphas()
+  }
+
+  // Breadth-first shortest path over the undirected citation adjacency.
+  function bfsPath(startIndex, endIndex) {
+    if (!adjacency) return null
+    const count = (graphData.nodes || []).length
+    if (startIndex === endIndex) return [startIndex]
+    const prev = new Int32Array(count).fill(-1)
+    const visited = new Uint8Array(count)
+    const queue = [startIndex]
+    visited[startIndex] = 1
+    let head = 0
+    while (head < queue.length) {
+      const current = queue[head++]
+      for (let i = adjacency.offsets[current]; i < adjacency.offsets[current + 1]; i += 1) {
+        const next = adjacency.neighbors[i]
+        if (!visited[next]) {
+          visited[next] = 1
+          prev[next] = current
+          if (next === endIndex) {
+            const path = []
+            for (let c = endIndex; c !== -1; c = prev[c]) path.push(c)
+            return path.reverse()
+          }
+          queue.push(next)
+        }
+      }
+    }
+    return null
+  }
+
+  function disposePathLine() {
+    if (!pathLine) return
+    pathLine.geometry?.dispose?.()
+    pathLine.material?.dispose?.()
+    scene?.remove(pathLine)
+    pathLine = null
+  }
+
+  function buildPathLine(indices) {
+    disposePathLine()
+    if (!indices || indices.length < 2 || !points || !THREE) return
+    const posAttr = points.geometry.getAttribute('position')
+    const linePoints = indices.map((idx) => new THREE.Vector3(
+      posAttr.getX(idx), posAttr.getY(idx), posAttr.getZ(idx)
+    ))
+    const geometry = new THREE.BufferGeometry().setFromPoints(linePoints)
+    pathLine = new THREE.Line(geometry, new THREE.LineBasicMaterial({
+      color: 0xffd166,
+      transparent: true,
+      opacity: 0.96,
+      depthTest: false,
+      depthWrite: false,
+    }))
+    pathLine.renderOrder = 6
+    scene.add(pathLine)
+  }
+
+  function computePath() {
+    if (pathStart === null || pathEnd === null) return
+    const nodes = graphData.nodes || []
+    const indices = bfsPath(pathStart, pathEnd)
+    if (!indices) {
+      pathInfo = { found: false, steps: [], hops: 0 }
+      pathNodeSet = null
+      disposePathLine()
+      recomputeAlphas()
+      return
+    }
+    pathNodeSet = new Set(indices)
+    pathInfo = {
+      found: true,
+      hops: indices.length - 1,
+      steps: indices.map((idx) => ({
+        title: truncate(nodes[idx]?.title || nodes[idx]?.label || 'Untitled', 60),
+        year: nodes[idx]?.year || null,
+      })),
+    }
+    buildPathLine(indices)
+    recomputeAlphas()
+  }
+
+  function setPathPoint(which) {
+    if (selectedIndex === null) return
+    if (which === 'start') pathStart = pathStart === selectedIndex ? null : selectedIndex
+    else pathEnd = pathEnd === selectedIndex ? null : selectedIndex
+    if (pathStart !== null && pathEnd !== null) {
+      computePath()
+    } else {
+      pathInfo = null
+      pathNodeSet = null
+      disposePathLine()
+      recomputeAlphas()
+    }
+  }
+
+  function clearPath() {
+    pathStart = null
+    pathEnd = null
+    pathInfo = null
+    pathNodeSet = null
+    disposePathLine()
     recomputeAlphas()
   }
 
@@ -805,6 +925,7 @@
     searchResults = []
     searchQuery = result.title
     selectedNode = node
+    selectedIndex = result.index
     applyHighlight(result.index)
     focusNode(result.index)
     void loadNodeDetail(node)
@@ -1206,6 +1327,7 @@
     disposeObject(edgeLines)
     disposeObject(bridgeLines)
     disposeObject(clusterShells)
+    disposePathLine()
     renderer?.dispose()
     renderer?.domElement?.remove()
   })
@@ -1450,11 +1572,40 @@
           {#if selectedNodeDetail?.publisher || selectedNodeDetail?.keywords}
             <span class="muted small">Metadata: {selectedNodeDetail.publisher || selectedNodeDetail.keywords}</span>
           {/if}
+          {#if selectedIndex !== null}
+            <div class="graph-3d-path-actions" data-testid="graph-3d-path-actions">
+              <button type="button" class:active={pathStart === selectedIndex} on:click={() => setPathPoint('start')}>
+                {pathStart === selectedIndex ? '✓ Path start' : 'Set as path start'}
+              </button>
+              <button type="button" class:active={pathEnd === selectedIndex} on:click={() => setPathPoint('end')}>
+                {pathEnd === selectedIndex ? '✓ Path end' : 'Set as path end'}
+              </button>
+            </div>
+          {/if}
         {:else}
           <strong>No node selected</strong>
           <span class="muted small">Hover or click a point in the 3D graph.</span>
         {/if}
       </div>
+
+      {#if pathStart !== null || pathEnd !== null || pathInfo}
+        <div class="graph-3d-path" data-testid="graph-3d-path">
+          <span class="eyebrow">Citation path</span>
+          <span class="muted small">From: {pathStart !== null ? truncate(graphData.nodes[pathStart]?.title || 'Untitled', 48) : 'pick a work and "Set as path start"'}</span>
+          <span class="muted small">To: {pathEnd !== null ? truncate(graphData.nodes[pathEnd]?.title || 'Untitled', 48) : 'pick a work and "Set as path end"'}</span>
+          {#if pathInfo && pathInfo.found}
+            <span class="muted small" data-testid="graph-3d-path-status">{pathInfo.hops} {pathInfo.hops === 1 ? 'hop' : 'hops'} along the citation graph.</span>
+            <ol class="graph-3d-path-steps">
+              {#each pathInfo.steps as step, i (i)}
+                <li><span>{step.title}</span><small>{step.year || ''}</small></li>
+              {/each}
+            </ol>
+          {:else if pathInfo && !pathInfo.found}
+            <span class="muted small" data-testid="graph-3d-path-status">No citation path connects these two works.</span>
+          {/if}
+          <button type="button" class="graph-3d-path-clear" data-testid="graph-3d-path-clear" on:click={clearPath}>Clear path</button>
+        </div>
+      {/if}
     </aside>
   </div>
 </div>

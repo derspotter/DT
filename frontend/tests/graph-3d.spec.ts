@@ -291,6 +291,31 @@ test('legend isolates a territory and clears it', async ({ page }) => {
   await expect(clear).toBeHidden()
 })
 
+test('path-finder connects two works via search selection', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  const search = panel.getByTestId('graph-3d-search')
+  const results = panel.getByTestId('graph-3d-search-results')
+
+  // Pick the first work and mark it as the path start.
+  await search.fill('Graph seed')
+  await results.getByRole('button', { name: /Graph seed work/ }).click()
+  await panel.getByTestId('graph-3d-path-actions').getByRole('button', { name: /path start/i }).click()
+
+  // Pick the second work and mark it as the path end.
+  await search.fill('Referenced')
+  await results.getByRole('button', { name: /Referenced work/ }).click()
+  await panel.getByTestId('graph-3d-path-actions').getByRole('button', { name: /path end/i }).click()
+
+  await expect(panel.getByTestId('graph-3d-path-status')).toHaveText(
+    '1 hop along the citation graph.'
+  )
+
+  await panel.getByTestId('graph-3d-path-clear').click()
+  await expect(panel.getByTestId('graph-3d-path')).toBeHidden()
+})
+
 test('node detail responses are cached per work', async ({ page }) => {
   let nodeDetailRequests = 0
   await page.route('**/api/**', async (route) => {
