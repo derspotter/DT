@@ -110,7 +110,7 @@ const GRAPH_3D_DEFAULT_MAX_NODES = 25000;
 const GRAPH_3D_GROUP_BY = new Set(['field', 'source_path', 'type', 'region', 'year', 'component']);
 // A built snapshot is served immediately; if it is older than this it is also
 // rebuilt in the background (stale-while-revalidate) so opens stay instant.
-const GRAPH_3D_SNAPSHOT_TTL_MS = 15 * 60 * 1000;
+const GRAPH_3D_SNAPSHOT_TTL_MS = 60 * 60 * 1000;
 // Shared in-flight builds keyed by snapshot key, so concurrent requests await
 // one build instead of spawning duplicates.
 const graph3dBuilds = new Map();
@@ -395,10 +395,10 @@ function buildGraph3dSnapshot(options, key) {
         graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
         { dbPath: DB_PATH, corpusId: options.corpusId }
       );
-      // Pre-gzip the large JSON payloads so big snapshots (whole-corpus views)
-      // download at ~1/3 the size; the file endpoint serves these when the
-      // client accepts gzip.
-      for (const fileName of ['nodes_meta.json', 'clusters.json']) {
+      // Pre-gzip the large payloads so snapshots download far smaller; the file
+      // endpoint serves these when the client accepts gzip. edges.bin in
+      // particular is mostly small node indices and compresses ~4x.
+      for (const fileName of ['nodes_meta.json', 'clusters.json', 'nodes.bin', 'edges.bin']) {
         const filePath = path.join(buildDir, fileName);
         if (fs.existsSync(filePath)) {
           fs.writeFileSync(`${filePath}.gz`, zlib.gzipSync(fs.readFileSync(filePath)));
@@ -5032,9 +5032,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     res.set('Cache-Control', 'private, max-age=600');
     const gzPath = `${filePath}.gz`;
     const acceptsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
-    if (fileName.endsWith('.json') && acceptsGzip && fs.existsSync(gzPath)) {
+    if (acceptsGzip && fs.existsSync(gzPath)) {
+      // Serve the pre-gzipped copy (json or binary); the browser transparently
+      // decodes it, so the frontend still receives the raw bytes.
       res.set('Content-Encoding', 'gzip');
-      res.set('Content-Type', 'application/json; charset=utf-8');
+      res.set('Content-Type', fileName.endsWith('.json')
+        ? 'application/json; charset=utf-8'
+        : 'application/octet-stream');
       res.set('Vary', 'Accept-Encoding');
       return res.send(fs.readFileSync(gzPath));
     }
