@@ -2720,6 +2720,38 @@ button.seed-download-tag:focus-visible {
   white-space: nowrap;
 }
 
+/* Clickable links to open the selected work (DOI / OpenAlex / PDF) */
+.graph-3d-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.graph-3d-links a {
+  padding: 3px 9px;
+  border-radius: 7px;
+  border: 1px solid rgba(72, 209, 204, 0.45);
+  background: rgba(15, 139, 141, 0.16);
+  color: #9beae6;
+  font-size: 0.74rem;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.graph-3d-links a:hover {
+  background: rgba(15, 139, 141, 0.3);
+  border-color: rgba(72, 209, 204, 0.8);
+  color: #eafffe;
+}
+
+.graph-3d-links a:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(15, 139, 141, 0.35);
+}
+
 /* Citation path-finder */
 .graph-3d-path-actions {
   display: flex;
