@@ -1414,7 +1414,7 @@
         authFlowToken = ''
       }
       await loadRecursionConfig()
-      await refreshAll()
+      await refreshAll(startupTab || activeTab)
       connectLogs()
       if (!preserveAuthFlow && navigationRevision === startupNavigationRevision) {
         const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
@@ -1587,8 +1587,15 @@
     resetFrontendState()
   }
 
-  async function refreshAll() {
+  async function refreshAll(targetTab = activeTab) {
     restoreStoredUploads()
+    // Only the workspace/dashboard/downloads tabs render this pipeline + corpus
+    // data. For other landing tabs (notably the graph, which loads its own
+    // snapshot) these are several synchronous DB queries that can stall the
+    // backend while the workers hold the SQLite lock — so skip them and let
+    // setActiveTab()/refreshForActiveTab() load exactly what the tab needs.
+    const needsWorkspaceData = targetTab === 'workspace' || targetTab === 'dashboard' || targetTab === 'downloads'
+    if (!needsWorkspaceData) return
     const tasks = [
       loadSeedSources(),
       loadIngestStats(),
