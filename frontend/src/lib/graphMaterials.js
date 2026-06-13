@@ -56,6 +56,9 @@ export function createEdgeMaterial(THREE) {
   return new THREE.ShaderMaterial({
     uniforms: {
       uFade: { value: 1 },
+      // Faded toward 0 as the camera moves in close, so the edge convergence at
+      // a cluster's centre stops veiling its nodes when you zoom in to inspect.
+      uViewDim: { value: 1 },
     },
     vertexShader: `
       attribute float alpha;
@@ -69,10 +72,11 @@ export function createEdgeMaterial(THREE) {
     `,
     fragmentShader: `
       uniform float uFade;
+      uniform float uViewDim;
       varying vec3 vColor;
       varying float vAlpha;
       void main() {
-        gl_FragColor = vec4(vColor, vAlpha * uFade);
+        gl_FragColor = vec4(vColor, vAlpha * uFade * uViewDim);
       }
     `,
     vertexColors: true,
