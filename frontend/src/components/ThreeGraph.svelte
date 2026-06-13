@@ -6,7 +6,7 @@
     fetchGraph3DNodeDetail,
     fetchGraph3DClusterDetail,
   } from '../lib/api'
-  import { createNodeMaterial, createNodeQuadMaterial, createEdgeMaterial } from '../lib/graphMaterials'
+  import { createNodeQuadMaterial, createEdgeMaterial } from '../lib/graphMaterials'
   import { chooseEdgeSegments } from '../lib/graphGeometry'
 
   export let autoLoad = true
@@ -257,7 +257,8 @@
     pointGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
     pointGeometry.setAttribute('alpha', new THREE.BufferAttribute(nodeAlphas, 1))
     pointGeometry.computeBoundingSphere()
-    points = new THREE.Points(pointGeometry, createNodeMaterial(THREE, renderer?.getPixelRatio?.() || 1))
+    // Plain material — this object is never rendered, only raycast for picking.
+    points = new THREE.Points(pointGeometry, new THREE.PointsMaterial())
     points.userData.nodes = nodes
     points.frustumCulled = false
 
@@ -316,7 +317,7 @@
       let contain = 0
       if (samples && samples.length) {
         samples.sort((a, b) => a - b)
-        contain = samples[Math.floor(samples.length * 0.92)] || 0
+        contain = samples[Math.min(samples.length - 1, Math.floor((samples.length - 1) * 0.92))] || 0
       }
       const radius = Math.max(exported, contain * 1.05)
       shellRadiusById.set(Number(cluster.id), radius)
@@ -455,7 +456,7 @@
       validCount += 1
     }
     if (binaryEdgeCount) {
-      for (let i = 0; i < edgeTriplets.length; i += 3) pushEdge(edgeTriplets[i], edgeTriplets[i + 1], edgeTriplets[i + 2])
+      for (let i = 0; i + 2 < edgeTriplets.length; i += 3) pushEdge(edgeTriplets[i], edgeTriplets[i + 1], edgeTriplets[i + 2])
     } else {
       for (const edge of edges) {
         pushEdge(
@@ -881,6 +882,8 @@
     selectedNodeDetail = null
     selectedIndex = null
     hoveredNode = null
+    tooltip = { ...tooltip, visible: false }
+    if (renderer) renderer.domElement.style.cursor = ''
     halo = { ...halo, visible: false }
     highlightIndex = null
     isolatedCluster = null
@@ -1223,8 +1226,10 @@
     // cluster's centre stops veiling its nodes; full strength in the overview.
     if (edgeLines?.material?.uniforms?.uViewDim && controls) {
       const dist = camera.position.distanceTo(controls.target)
-      const dim = Math.min(1, Math.max(0.12, (dist - 350) / (1500 - 350)))
-      edgeLines.material.uniforms.uViewDim.value = dim
+      // Smooth ramp 0.12 (at/below 350) → 1.0 (at/above 1500): compute t in
+      // [0,1] first, then lerp, so it doesn't sit pinned at the floor.
+      const t = Math.min(1, Math.max(0, (dist - 350) / (1500 - 350)))
+      edgeLines.material.uniforms.uViewDim.value = 0.12 + t * 0.88
     }
     renderer.render(scene, camera)
     updateClusterLabelPositions()
@@ -1416,6 +1421,8 @@
         && node.scrollHeight > node.clientHeight + 2
       if (scrollable) return
       event.preventDefault()
+      // Re-dispatch a faithful copy: preserve modifier keys (trackpad pinch is
+      // ctrl+wheel, shift+wheel pans, etc.) and let it bubble like a real wheel.
       renderer.domElement.dispatchEvent(new WheelEvent('wheel', {
         deltaX: event.deltaX,
         deltaY: event.deltaY,
@@ -1423,7 +1430,13 @@
         deltaMode: event.deltaMode,
         clientX: event.clientX,
         clientY: event.clientY,
-        bubbles: false,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        ctrlKey: event.ctrlKey,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        metaKey: event.metaKey,
+        bubbles: true,
         cancelable: true,
       }))
     }
