@@ -318,23 +318,35 @@ test('path-finder connects two works via search selection', async ({ page }) => 
   await expect(panel.getByTestId('graph-3d-path')).toBeHidden()
 })
 
-test('selecting a work shows a reset control that restores all nodes', async ({ page }) => {
+test('isolating a territory shows a reset control that restores all nodes', async ({ page }) => {
   await page.route('**/api/**', mockApi)
   const panel = await openLoadedGraphPanel(page)
 
   // No filtering yet → no reset control.
   await expect(panel.getByTestId('graph-3d-showall')).toBeHidden()
 
-  // Selecting a work dims the rest; the reset control appears.
-  await panel.getByTestId('graph-3d-search').fill('Referenced')
-  const results = panel.getByTestId('graph-3d-search-results')
-  await expect(results).toBeVisible()
-  await results.getByRole('button', { name: /Referenced work/ }).click()
+  // Isolating a territory dims the rest; the reset control appears.
+  await panel.getByTestId('graph-3d-legend-item').first().click()
   const showAll = panel.getByTestId('graph-3d-showall')
   await expect(showAll).toBeVisible()
 
   await showAll.click()
   await expect(showAll).toBeHidden()
+})
+
+test('selecting a work does not dim the rest (no reset control)', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  await panel.getByTestId('graph-3d-search').fill('Referenced')
+  const results = panel.getByTestId('graph-3d-search-results')
+  await expect(results).toBeVisible()
+  await results.getByRole('button', { name: /Referenced work/ }).click()
+
+  // The work is selected (shown in the sidebar) but nothing is dimmed, so the
+  // "Show all nodes" reset control must not appear.
+  await expect(panel.locator('.graph-3d-selected strong')).toHaveText('Referenced work')
+  await expect(panel.getByTestId('graph-3d-showall')).toBeHidden()
 })
 
 test('rotating with a left-drag does not change the selection', async ({ page }) => {
@@ -346,7 +358,6 @@ test('rotating with a left-drag does not change the selection', async ({ page })
   const results = panel.getByTestId('graph-3d-search-results')
   await expect(results).toBeVisible()
   await results.getByRole('button', { name: /Referenced work/ }).click()
-  await expect(panel.getByTestId('graph-3d-showall')).toBeVisible()
   await expect(panel.locator('.graph-3d-selected strong')).toHaveText('Referenced work')
 
   // A left-drag on the canvas (rotate) ends in a click; it must NOT re-select.
@@ -361,7 +372,6 @@ test('rotating with a left-drag does not change the selection', async ({ page })
 
   // Selection unchanged: the originally selected work is still shown.
   await expect(panel.locator('.graph-3d-selected strong')).toHaveText('Referenced work')
-  await expect(panel.getByTestId('graph-3d-showall')).toBeVisible()
 })
 
 test('wheeling over a canvas overlay still reaches the canvas to zoom', async ({ page }) => {

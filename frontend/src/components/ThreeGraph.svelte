@@ -1110,7 +1110,6 @@
     searchQuery = result.title
     selectedNode = node
     selectedIndex = result.index
-    applyHighlight(result.index)
     focusNode(result.index)
     void loadNodeDetail(node)
   }
@@ -1121,7 +1120,7 @@
     selectedIndex = null
     hoveredNode = null
     halo = { ...halo, visible: false }
-    if (highlightIndex !== null) applyHighlight(null)
+    requestRender()
   }
 
   function onYearFilterChange() {
@@ -1465,11 +1464,13 @@
     }
     if (!persist) return
     if (nextNode) {
+      // Selection just spotlights the node (halo + sidebar detail); it no
+      // longer dims the rest of the graph.
       selectedNode = nextNode
       selectedIndex = hit.index
       tooltip = { ...tooltip, visible: false }
-      applyHighlight(hit.index)
       void loadNodeDetail(nextNode)
+      requestRender()
     } else {
       clearSelection()
     }
@@ -1616,7 +1617,9 @@
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
   $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
   $: legendItems = clusterLegend.slice(0, 12)
-  $: viewFiltered = Boolean(selectedNode) || isolatedCluster !== null || Boolean(pathInfo)
+  // The "Show all nodes" reset is only for states that actually dim the graph
+  // (territory isolation, a citation path) — a plain selection no longer does.
+  $: viewFiltered = isolatedCluster !== null || Boolean(pathInfo)
 </script>
 
 <div class="card graph-3d-panel" data-testid="graph-3d-panel">
