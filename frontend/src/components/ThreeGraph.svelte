@@ -1535,6 +1535,10 @@
       ONE: THREE.TOUCH.ROTATE,
       TWO: THREE.TOUCH.DOLLY_PAN,
     }
+    // Faster than the default 1.0: the default view sits ~3600 units out and a
+    // cluster is only a few hundred across, so at 1.0 the proportional dolly
+    // took ~20 scrolls to get in and felt like it stopped making progress.
+    controls.zoomSpeed = 2.5
     controls.autoRotate = autoRotate
     controls.autoRotateSpeed = 0.65
     controls.addEventListener('change', requestRender)
