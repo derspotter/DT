@@ -255,6 +255,10 @@
     points = new THREE.Points(pointGeometry, createNodeMaterial(THREE, renderer?.getPixelRatio?.() || 1))
     points.userData.nodes = nodes
     points.renderOrder = 3 // draw nodes on top of edges/shells so they're never veiled by edge haze
+    // Never cull the whole cloud: its bounding sphere is centred on the graph,
+    // so when you zoom/orbit into an off-centre cluster the centre can leave the
+    // frustum and THREE would cull every node at once (nodes blinking out).
+    points.frustumCulled = false
     scene.add(points)
 
     // Measure how far each cluster's nodes actually spread from its exported
@@ -529,6 +533,7 @@
     lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors.slice(0, edgeColorOffset), 3))
     lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(appendedEdges * edgeVertexStride), 1))
     edgeLines = new THREE.LineSegments(lineGeometry, createEdgeMaterial(THREE))
+    edgeLines.frustumCulled = false
     scene.add(edgeLines)
 
     const bridgeCandidates = []
@@ -598,6 +603,7 @@
           depthWrite: false,
         })
       )
+      bridgeLines.frustumCulled = false
       scene.add(bridgeLines)
     }
 
@@ -1317,7 +1323,11 @@
     const draw = () => {
       renderNow()
       remaining -= 1
-      if (remaining > 0) {
+      // Keep rendering until the min frame count AND any in-progress fade are
+      // done. A fixed count alone left uFade < 1 on high-refresh displays
+      // (24 frames < the 400ms fade), leaving nodes/edges stuck semi-transparent
+      // until the next interaction.
+      if (remaining > 0 || fadeStart) {
         settleFrame = requestAnimationFrame(draw)
       } else {
         settleFrame = 0
