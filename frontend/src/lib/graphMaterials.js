@@ -9,18 +9,27 @@ export function createNodeMaterial(THREE, pixelRatio = 1) {
     uniforms: {
       uPixelRatio: { value: pixelRatio },
       uFade: { value: 1 },
+      // View distance at which a node renders at its base pixel size. Closer
+      // than this it grows, farther it shrinks — so zooming into a cluster
+      // makes nodes bigger instead of staying fixed dots that fly out of view.
+      uRefDist: { value: 3200 },
     },
     vertexShader: `
       attribute float size;
       attribute float alpha;
       uniform float uPixelRatio;
+      uniform float uRefDist;
       varying vec3 vColor;
       varying float vAlpha;
       void main() {
         vColor = color;
         vAlpha = alpha;
-        gl_PointSize = size * uPixelRatio;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        // Perspective size attenuation, clamped so distant nodes stay visible
+        // (>=2px) and close ones don't balloon off-screen (<=48px).
+        float atten = uRefDist / max(60.0, -mvPosition.z);
+        gl_PointSize = clamp(size * atten, 2.0, 48.0) * uPixelRatio;
+        gl_Position = projectionMatrix * mvPosition;
       }
     `,
     fragmentShader: `
