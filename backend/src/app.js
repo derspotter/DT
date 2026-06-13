@@ -393,7 +393,7 @@ function buildGraph3dSnapshot(options, key) {
       await runPythonJson(
         GRAPH_3D_EXPORT_SCRIPT,
         graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
-        { dbPath: DB_PATH, corpusId: options.corpusId }
+        { dbPath: DB_PATH, corpusId: options.corpusId, lowPriority: true }
       );
       // Pre-gzip the large payloads so snapshots download far smaller; the file
       // endpoint serves these when the client accepts gzip. edges.bin in
@@ -1883,12 +1883,12 @@ function applyUploadedDocsExpansionArgs(args, expansion) {
   args.push('--max-related', String(expansion.maxRelated));
 }
 
-function runPythonJson(scriptPath, args, { dbPath, corpusId } = {}) {
-  const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId });
+function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {}) {
+  const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority });
   return done;
 }
 
-function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine } = {}) {
+function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine, lowPriority } = {}) {
   const env = {
     ...process.env,
     PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
@@ -1902,6 +1902,12 @@ function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onS
   }
 
   const child = spawn(PYTHON_EXEC, [scriptPath, ...finalArgs], { env });
+  if (lowPriority && child.pid) {
+    // Background jobs (e.g. the ~60s graph layout rebuild) shouldn't starve the
+    // API: drop their CPU priority so interactive requests stay fast while they
+    // run. Best-effort — ignore if the platform/permissions disallow it.
+    try { os.setPriority(child.pid, 15); } catch { /* noop */ }
+  }
   let stdout = '';
   let stderr = '';
   let stdoutBuf = '';
