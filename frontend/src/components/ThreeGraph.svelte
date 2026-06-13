@@ -32,9 +32,11 @@
   let resizeObserver
   let handlePointerMove
   let handlePointerLeave
+  let handlePointerDown
   let handleClick
   let handleContextMenu
   let handleKeydown
+  let pointerDownPos = null
   let componentMounted = false
   let initialLoadStarted = false
   let clusterLabelLayer
@@ -1504,6 +1506,11 @@
     controls.enableRotate = true
     controls.enablePan = true
     controls.enableZoom = true
+    // Zoom toward the cursor, not the fixed orbit target — otherwise scrolling
+    // only ever approaches the graph centre (with proportional, diminishing
+    // steps) and you can never reach an off-centre cluster.
+    controls.zoomToCursor = true
+    controls.minDistance = 1
     controls.screenSpacePanning = true
     controls.mouseButtons = {
       LEFT: THREE.MOUSE.ROTATE,
@@ -1525,7 +1532,18 @@
       tooltip = { ...tooltip, visible: false }
       if (renderer) renderer.domElement.style.cursor = ''
     }
-    handleClick = (event) => pickNode(event, true)
+    // Distinguish a click (select) from a left-drag (rotate): a drag also fires
+    // a `click` at the end, which otherwise selected whatever was under the
+    // cursor. Only select if the pointer barely moved between down and up.
+    handlePointerDown = (event) => { pointerDownPos = { x: event.clientX, y: event.clientY } }
+    handleClick = (event) => {
+      if (pointerDownPos) {
+        const moved = Math.hypot(event.clientX - pointerDownPos.x, event.clientY - pointerDownPos.y)
+        pointerDownPos = null
+        if (moved > 6) return // it was a drag/rotate, not a click
+      }
+      pickNode(event, true)
+    }
     handleContextMenu = (event) => event.preventDefault()
     handleKeydown = (event) => {
       if (event.key === 'Escape') {
@@ -1535,6 +1553,7 @@
     }
     renderer.domElement.addEventListener('pointermove', handlePointerMove)
     renderer.domElement.addEventListener('pointerleave', handlePointerLeave)
+    renderer.domElement.addEventListener('pointerdown', handlePointerDown)
     renderer.domElement.addEventListener('click', handleClick)
     renderer.domElement.addEventListener('contextmenu', handleContextMenu)
     window.addEventListener('keydown', handleKeydown)
@@ -1563,6 +1582,7 @@
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
     if (handlePointerLeave) renderer?.domElement?.removeEventListener('pointerleave', handlePointerLeave)
+    if (handlePointerDown) renderer?.domElement?.removeEventListener('pointerdown', handlePointerDown)
     if (handleClick) renderer?.domElement?.removeEventListener('click', handleClick)
     if (handleContextMenu) renderer?.domElement?.removeEventListener('contextmenu', handleContextMenu)
     if (handleKeydown) window.removeEventListener('keydown', handleKeydown)
