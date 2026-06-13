@@ -327,12 +327,41 @@ test('selecting a work shows a reset control that restores all nodes', async ({ 
 
   // Selecting a work dims the rest; the reset control appears.
   await panel.getByTestId('graph-3d-search').fill('Referenced')
-  await panel.getByTestId('graph-3d-search-results').getByRole('button', { name: /Referenced work/ }).click()
+  const results = panel.getByTestId('graph-3d-search-results')
+  await expect(results).toBeVisible()
+  await results.getByRole('button', { name: /Referenced work/ }).click()
   const showAll = panel.getByTestId('graph-3d-showall')
   await expect(showAll).toBeVisible()
 
   await showAll.click()
   await expect(showAll).toBeHidden()
+})
+
+test('rotating with a left-drag does not change the selection', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  // Select a work first (deterministic, via search).
+  await panel.getByTestId('graph-3d-search').fill('Referenced')
+  const results = panel.getByTestId('graph-3d-search-results')
+  await expect(results).toBeVisible()
+  await results.getByRole('button', { name: /Referenced work/ }).click()
+  await expect(panel.getByTestId('graph-3d-showall')).toBeVisible()
+  await expect(panel.locator('.graph-3d-selected strong')).toHaveText('Referenced work')
+
+  // A left-drag on the canvas (rotate) ends in a click; it must NOT re-select.
+  const canvas = panel.locator('.graph-3d-canvas')
+  const box = await canvas.boundingBox()
+  const cx = box!.x + box!.width / 2
+  const cy = box!.y + box!.height / 2
+  await page.mouse.move(cx - 80, cy)
+  await page.mouse.down()
+  await page.mouse.move(cx + 80, cy + 40, { steps: 8 })
+  await page.mouse.up()
+
+  // Selection unchanged: the originally selected work is still shown.
+  await expect(panel.locator('.graph-3d-selected strong')).toHaveText('Referenced work')
+  await expect(panel.getByTestId('graph-3d-showall')).toBeVisible()
 })
 
 test('wheeling over a canvas overlay still reaches the canvas to zoom', async ({ page }) => {

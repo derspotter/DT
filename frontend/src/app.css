@@ -2405,6 +2405,12 @@ button.seed-download-tag:focus-visible {
   border-color: rgba(244, 163, 64, 0.85);
 }
 
+.graph-3d-showall:focus-visible {
+  outline: none;
+  border-color: rgba(244, 163, 64, 0.95);
+  box-shadow: 0 0 0 3px rgba(244, 163, 64, 0.4);
+}
+
 .graph-3d-map-key span {
   display: inline-flex;
   align-items: center;
