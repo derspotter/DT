@@ -5025,6 +5025,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'Snapshot file not found' });
     }
+    // Snapshot files are keyed by a content hash (params + cache version) and
+    // the layout is seeded/reproducible, so a background rebuild barely moves
+    // positions. Let the browser cache them so reopening the graph in a session
+    // doesn't re-download several MB of nodes/edges every time.
+    res.set('Cache-Control', 'private, max-age=600');
     const gzPath = `${filePath}.gz`;
     const acceptsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
     if (fileName.endsWith('.json') && acceptsGzip && fs.existsSync(gzPath)) {

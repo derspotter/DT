@@ -67,9 +67,8 @@ export function createEdgeMaterial(THREE) {
     vertexColors: true,
     transparent: true,
     depthWrite: false,
-    // Additive so edges bundled along a shared trunk accumulate brightness and
-    // the trunk visibly glows, instead of many faint lines cancelling into haze.
-    // depthTest is left on (default) to preserve front/back depth cues.
-    blending: THREE.AdditiveBlending,
+    // Normal (not additive) blending: additive made bundled trunks stack up to
+    // a saturated white smear that lost all colour. With a curated, lower edge
+    // count the curved trunks read clearly as coloured strands instead.
   })
 }
