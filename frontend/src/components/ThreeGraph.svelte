@@ -6,7 +6,7 @@
     fetchGraph3DNodeDetail,
     fetchGraph3DClusterDetail,
   } from '../lib/api'
-  import { createNodeMaterial, createEdgeMaterial } from '../lib/graphMaterials'
+  import { createNodeMaterial, createNodeQuadMaterial, createEdgeMaterial } from '../lib/graphMaterials'
   import { chooseEdgeSegments } from '../lib/graphGeometry'
 
   export let autoLoad = true
@@ -19,6 +19,7 @@
   let camera
   let controls
   let points
+  let nodeQuads
   let edgeLines
   let bridgeLines
   let clusterShells
@@ -208,6 +209,7 @@
   function renderGraph() {
     if (!scene || !THREE) return
     disposeObject(points)
+    disposeObject(nodeQuads)
     disposeObject(edgeLines)
     disposeObject(bridgeLines)
     disposeObject(clusterShells)
@@ -246,20 +248,39 @@
       sizes[index] = nodeSize(degree)
     })
 
+    // `points` is NOT added to the scene — it exists only as the raycast target
+    // for hover/click picking. Nodes are rendered as instanced quads below to
+    // avoid GL_POINTS driver bugs (intermittent dropping during camera motion).
     const pointGeometry = new THREE.BufferGeometry()
     pointGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-    pointGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    pointGeometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1))
     pointGeometry.setAttribute('alpha', new THREE.BufferAttribute(nodeAlphas, 1))
     pointGeometry.computeBoundingSphere()
     points = new THREE.Points(pointGeometry, createNodeMaterial(THREE, renderer?.getPixelRatio?.() || 1))
     points.userData.nodes = nodes
-    points.renderOrder = 3 // draw nodes on top of edges/shells so they're never veiled by edge haze
-    // Never cull the whole cloud: its bounding sphere is centred on the graph,
-    // so when you zoom/orbit into an off-centre cluster the centre can leave the
-    // frustum and THREE would cull every node at once (nodes blinking out).
     points.frustumCulled = false
-    scene.add(points)
+
+    // Visible nodes: one instanced camera-facing quad per node, sharing the same
+    // position/colour/size/alpha buffers as the pick geometry.
+    const quadGeometry = new THREE.InstancedBufferGeometry()
+    const baseQuad = new THREE.PlaneGeometry(1, 1)
+    quadGeometry.index = baseQuad.index
+    quadGeometry.setAttribute('position', baseQuad.attributes.position)
+    quadGeometry.setAttribute('aPosition', new THREE.InstancedBufferAttribute(positions, 3))
+    quadGeometry.setAttribute('aColor', new THREE.InstancedBufferAttribute(colors, 3))
+    quadGeometry.setAttribute('aSize', new THREE.InstancedBufferAttribute(sizes, 1))
+    quadGeometry.setAttribute('aAlpha', new THREE.InstancedBufferAttribute(nodeAlphas, 1))
+    quadGeometry.instanceCount = nodes.length
+    quadGeometry.boundingSphere = pointGeometry.boundingSphere
+    const dbSize = renderer?.getDrawingBufferSize
+      ? renderer.getDrawingBufferSize(new THREE.Vector2())
+      : { x: 1, y: 1 }
+    nodeQuads = new THREE.Mesh(
+      quadGeometry,
+      createNodeQuadMaterial(THREE, renderer?.getPixelRatio?.() || 1, dbSize.x, dbSize.y)
+    )
+    nodeQuads.renderOrder = 3 // draw nodes on top of edges/shells
+    nodeQuads.frustumCulled = false
+    scene.add(nodeQuads)
 
     // Measure how far each cluster's nodes actually spread from its exported
     // centre. The exported radius understates the force-layout spread, so the
@@ -686,6 +707,9 @@
       nodeAlphaAttr.array[i] = alpha
     }
     nodeAlphaAttr.needsUpdate = true
+    // The quad instances share this alpha buffer; flag the rendered attribute.
+    const quadAlpha = nodeQuads?.geometry?.getAttribute('aAlpha')
+    if (quadAlpha) quadAlpha.needsUpdate = true
     visibleNodeCount = visible
 
     if (edgeLines && edgeEndpoints) {
@@ -1171,7 +1195,7 @@
     if (!renderer || !scene || !camera) return
     if (fadeStart) {
       const fade = Math.min(1, (performance.now() - fadeStart) / 400)
-      if (points?.material?.uniforms?.uFade) points.material.uniforms.uFade.value = fade
+      if (nodeQuads?.material?.uniforms?.uFade) nodeQuads.material.uniforms.uFade.value = fade
       if (edgeLines?.material?.uniforms?.uFade) edgeLines.material.uniforms.uFade.value = fade
       if (fade >= 1) fadeStart = 0
     }
@@ -1343,6 +1367,10 @@
     camera.aspect = width / height
     camera.updateProjectionMatrix()
     renderer.setSize(width, height, false)
+    // Node quads are sized in screen pixels, so they need the drawing-buffer size.
+    if (nodeQuads?.material?.uniforms?.uViewport) {
+      renderer.getDrawingBufferSize(nodeQuads.material.uniforms.uViewport.value)
+    }
     requestRender()
   }
 
@@ -1522,6 +1550,7 @@
     if (handleKeydown) window.removeEventListener('keydown', handleKeydown)
     controls?.dispose()
     disposeObject(points)
+    disposeObject(nodeQuads)
     disposeObject(edgeLines)
     disposeObject(bridgeLines)
     disposeObject(clusterShells)

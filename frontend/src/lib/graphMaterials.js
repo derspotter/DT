@@ -52,6 +52,63 @@ export function createNodeMaterial(THREE, pixelRatio = 1) {
   })
 }
 
+// Node renderer. GL_POINTS sprites are dropped intermittently by some GPU
+// drivers (notably Linux/Mesa and macOS/ANGLE) during camera motion or when
+// scaled up. Instead render each node as an instanced camera-facing quad sized
+// in screen pixels — identical look (an anti-aliased disc that grows as you
+// zoom in) without the point-sprite driver bugs.
+export function createNodeQuadMaterial(THREE, pixelRatio = 1, width = 1, height = 1) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      uPixelRatio: { value: pixelRatio },
+      uFade: { value: 1 },
+      uRefDist: { value: 3200 },
+      uViewport: { value: new THREE.Vector2(width, height) },
+    },
+    vertexShader: `
+      attribute vec3 aPosition;
+      attribute vec3 aColor;
+      attribute float aSize;
+      attribute float aAlpha;
+      uniform float uPixelRatio;
+      uniform float uRefDist;
+      uniform vec2 uViewport;
+      varying vec2 vCorner;
+      varying vec3 vColor;
+      varying float vAlpha;
+      void main() {
+        vColor = aColor;
+        vAlpha = aAlpha;
+        vCorner = position.xy; // base quad corner in [-0.5, 0.5]
+        vec4 mvPosition = modelViewMatrix * vec4(aPosition, 1.0);
+        float depth = max(60.0, -mvPosition.z);
+        // Same sizing as the old points: grows toward the camera, clamped so it
+        // never shrinks to nothing or balloons off-screen.
+        float px = clamp(aSize * (uRefDist / depth), 2.0, 30.0) * uPixelRatio;
+        vec4 clip = projectionMatrix * mvPosition;
+        // Offset the quad corner by px screen pixels, converted into clip space.
+        clip.xy += (position.xy * px / (uViewport * 0.5)) * clip.w;
+        gl_Position = clip;
+      }
+    `,
+    fragmentShader: `
+      uniform float uFade;
+      varying vec2 vCorner;
+      varying vec3 vColor;
+      varying float vAlpha;
+      void main() {
+        float d = length(vCorner);
+        float edge = smoothstep(0.5, 0.42, d);
+        if (edge <= 0.0) discard;
+        gl_FragColor = vec4(vColor, vAlpha * uFade * edge);
+      }
+    `,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+  })
+}
+
 export function createEdgeMaterial(THREE) {
   return new THREE.ShaderMaterial({
     uniforms: {
