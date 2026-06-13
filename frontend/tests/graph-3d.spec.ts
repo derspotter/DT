@@ -318,6 +318,26 @@ test('path-finder connects two works via search selection', async ({ page }) => 
   await expect(panel.getByTestId('graph-3d-path')).toBeHidden()
 })
 
+test('wheeling over a canvas overlay still reaches the canvas to zoom', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  await page.evaluate(() => {
+    const canvas = document.querySelector('.graph-3d-canvas canvas') as HTMLElement
+    ;(window as unknown as { __wheels: number }).__wheels = 0
+    canvas?.addEventListener('wheel', () => { (window as unknown as { __wheels: number }).__wheels += 1 })
+  })
+
+  // The interactive legend sits on top of the canvas; a wheel over it must be
+  // forwarded so the graph still zooms instead of the gesture being swallowed.
+  await panel.getByTestId('graph-3d-legend').hover()
+  await page.mouse.wheel(0, -120)
+
+  await expect
+    .poll(() => page.evaluate(() => (window as unknown as { __wheels: number }).__wheels))
+    .toBeGreaterThan(0)
+})
+
 test('node detail responses are cached per work', async ({ page }) => {
   let nodeDetailRequests = 0
   await page.route('**/api/**', async (route) => {

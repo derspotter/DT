@@ -1293,6 +1293,36 @@
     pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
   }
 
+  // HTML overlays on the canvas (cluster labels, legend) need pointer-events to
+  // be clickable, which also makes them swallow wheel events so the graph won't
+  // zoom while the cursor is over them. Forward the wheel to the canvas so
+  // OrbitControls still zooms — unless the element itself can actually scroll.
+  function forwardWheel(node) {
+    const handler = (event) => {
+      if (!renderer) return
+      // Only let the element keep the wheel if it's a real scroll container
+      // that actually has overflow (e.g. a long legend); plain text labels
+      // whose content is a hair taller than the box must still forward to zoom.
+      const overflowY = getComputedStyle(node).overflowY
+      const scrollable = (overflowY === 'auto' || overflowY === 'scroll')
+        && node.scrollHeight > node.clientHeight + 2
+      if (scrollable) return
+      event.preventDefault()
+      renderer.domElement.dispatchEvent(new WheelEvent('wheel', {
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        deltaZ: event.deltaZ,
+        deltaMode: event.deltaMode,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        bubbles: false,
+        cancelable: true,
+      }))
+    }
+    node.addEventListener('wheel', handler, { passive: false })
+    return { destroy() { node.removeEventListener('wheel', handler) } }
+  }
+
   function pickNode(event, persist = false) {
     if (!raycaster || !points || !camera) return
     pointerFromEvent(event)
@@ -1553,6 +1583,7 @@
             <button
               type="button"
               class="graph-3d-cluster-label"
+              use:forwardWheel
               style={`--label-x:${label.x}px;--label-y:${label.y}px;--label-color:${label.color};--label-opacity:${label.opacity};--label-scale:${label.scale}`}
               on:click={() => focusCluster(clusters.find((cluster) => Number(cluster.id) === Number(label.id)))}
             >
@@ -1580,7 +1611,7 @@
         </div>
       {/if}
       {#if legendItems.length}
-        <div class="graph-3d-legend" data-testid="graph-3d-legend">
+        <div class="graph-3d-legend" data-testid="graph-3d-legend" use:forwardWheel>
           <span class="graph-3d-legend-title">Territories</span>
           {#each legendItems as item (item.id)}
             <button
