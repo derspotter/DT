@@ -365,19 +365,66 @@
       : { x: 0, y: 0, z: 0 }
     const BUNDLE_STRENGTH = 0.78
 
+    // Collect every valid edge once. Adjacency (search / neighbourhood
+    // highlight / path-finder) is built from the FULL set so connectivity is
+    // complete, but only a curated subset becomes curve geometry: drawing all
+    // ~437k edges is slow and bundles them into an indistinct mass. Rendering
+    // the highest-degree edges keeps the major trunks while thinning the rest.
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
-    const edgeCount = binaryEdgeCount || edges.length
-    const edgeSegments = chooseEdgeSegments(edgeCount)
+    const rawCount = binaryEdgeCount || edges.length
+    const srcArr = new Uint32Array(rawCount)
+    const tgtArr = new Uint32Array(rawCount)
+    const relArr = new Uint8Array(rawCount)
+    let validCount = 0
+    const pushEdge = (s, t, r) => {
+      if (s === undefined || t === undefined) return
+      if (s < 0 || t < 0 || s >= nodes.length || t >= nodes.length) return
+      srcArr[validCount] = s
+      tgtArr[validCount] = t
+      relArr[validCount] = r
+      validCount += 1
+    }
+    if (binaryEdgeCount) {
+      for (let i = 0; i < edgeTriplets.length; i += 3) pushEdge(edgeTriplets[i], edgeTriplets[i + 1], edgeTriplets[i + 2])
+    } else {
+      for (const edge of edges) {
+        pushEdge(
+          nodeIndex.get(edge.s || edge.source),
+          nodeIndex.get(edge.t || edge.target),
+          edge.r === 'cited_by' || edge.relationship_type === 'cited_by' ? 1 : 0
+        )
+      }
+    }
+
+    const fullEndpoints = new Uint32Array(validCount * 2)
+    for (let e = 0; e < validCount; e += 1) {
+      fullEndpoints[e * 2] = srcArr[e]
+      fullEndpoints[e * 2 + 1] = tgtArr[e]
+    }
+    adjacency = buildAdjacency(fullEndpoints, nodes.length)
+
+    const RENDER_EDGE_BUDGET = 90000
+    let renderOrder = null
+    if (validCount > RENDER_EDGE_BUDGET) {
+      const score = new Float64Array(validCount)
+      for (let e = 0; e < validCount; e += 1) {
+        score[e] = Number(nodes[srcArr[e]].degree || 0) + Number(nodes[tgtArr[e]].degree || 0)
+      }
+      renderOrder = Array.from({ length: validCount }, (_, i) => i)
+        .sort((a, b) => score[b] - score[a])
+        .slice(0, RENDER_EDGE_BUDGET)
+    }
+    const renderCount = renderOrder ? renderOrder.length : validCount
+
+    const edgeSegments = chooseEdgeSegments(renderCount)
     edgeVertexStride = edgeSegments * 2
-    const edgePositions = new Float32Array(edgeCount * edgeVertexStride * 3)
-    const edgeColors = new Float32Array(edgeCount * edgeVertexStride * 3)
-    const endpointPairs = new Uint32Array(edgeCount * 2)
+    const edgePositions = new Float32Array(renderCount * edgeVertexStride * 3)
+    const edgeColors = new Float32Array(renderCount * edgeVertexStride * 3)
+    const endpointPairs = new Uint32Array(renderCount * 2)
     let edgeOffset = 0
     let edgeColorOffset = 0
     let appendedEdges = 0
     const appendEdge = (sourceIndex, targetIndex, relationshipCode = 0) => {
-      if (sourceIndex === undefined || targetIndex === undefined) return
-      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex >= nodes.length || targetIndex >= nodes.length) return
       const sx = positions[sourceIndex * 3]
       const sy = positions[sourceIndex * 3 + 1]
       const sz = positions[sourceIndex * 3 + 2]
@@ -429,21 +476,11 @@
         edgeColors[edgeColorOffset++] = color.b
       }
     }
-    if (binaryEdgeCount) {
-      for (let i = 0; i < edgeTriplets.length; i += 3) {
-        appendEdge(edgeTriplets[i], edgeTriplets[i + 1], edgeTriplets[i + 2])
-      }
-    } else {
-      for (const edge of edges) {
-        appendEdge(
-          nodeIndex.get(edge.s || edge.source),
-          nodeIndex.get(edge.t || edge.target),
-          edge.r === 'cited_by' || edge.relationship_type === 'cited_by' ? 1 : 0
-        )
-      }
+    for (let k = 0; k < renderCount; k += 1) {
+      const e = renderOrder ? renderOrder[k] : k
+      appendEdge(srcArr[e], tgtArr[e], relArr[e])
     }
     edgeEndpoints = endpointPairs.slice(0, appendedEdges * 2)
-    adjacency = buildAdjacency(edgeEndpoints, nodes.length)
     const lineGeometry = new THREE.BufferGeometry()
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions.slice(0, edgeOffset), 3))
     lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors.slice(0, edgeColorOffset), 3))
@@ -607,10 +644,10 @@
       const edgeAlphaArray = edgeAlphaAttr.array
       const totalEdges = edgeEndpoints.length / 2
       const lodActive = totalEdges > 60000
-      // Edges blend additively, so a bundle of N overlapping edges saturates
-      // once N×baseAlpha ≈ 1. Keep it low so only genuine trunks glow and the
-      // dense core doesn't wash out to white.
-      const baseAlpha = lodActive ? 0.035 : 0.09
+      // Normal blending now, so this is a straightforward per-edge opacity:
+      // higher when fewer edges are drawn, lower when the curated set is large
+      // so dense trunks layer up without crushing to a solid mass.
+      const baseAlpha = lodActive ? 0.16 : 0.24
       const isolating = isolatedCluster !== null
       for (let edge = 0; edge < totalEdges; edge += 1) {
         const source = edgeEndpoints[edge * 2]
