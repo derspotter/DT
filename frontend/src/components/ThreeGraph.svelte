@@ -254,6 +254,7 @@
     pointGeometry.computeBoundingSphere()
     points = new THREE.Points(pointGeometry, createNodeMaterial(THREE, renderer?.getPixelRatio?.() || 1))
     points.userData.nodes = nodes
+    points.renderOrder = 3 // draw nodes on top of edges/shells so they're never veiled by edge haze
     scene.add(points)
 
     // Measure how far each cluster's nodes actually spread from its exported
@@ -1167,6 +1168,13 @@
       if (points?.material?.uniforms?.uFade) points.material.uniforms.uFade.value = fade
       if (edgeLines?.material?.uniforms?.uFade) edgeLines.material.uniforms.uFade.value = fade
       if (fade >= 1) fadeStart = 0
+    }
+    // Fade edges out as the camera moves in close so the bundle convergence at a
+    // cluster's centre stops veiling its nodes; full strength in the overview.
+    if (edgeLines?.material?.uniforms?.uViewDim && controls) {
+      const dist = camera.position.distanceTo(controls.target)
+      const dim = Math.min(1, Math.max(0.12, (dist - 350) / (1500 - 350)))
+      edgeLines.material.uniforms.uViewDim.value = dim
     }
     renderer.render(scene, camera)
     updateClusterLabelPositions()
