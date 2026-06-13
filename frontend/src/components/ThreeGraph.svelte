@@ -32,11 +32,12 @@
   let resizeObserver
   let handlePointerMove
   let handlePointerLeave
-  let handlePointerDown
-  let handleClick
+  let handleDownCapture
+  let handleMoveCapture
+  let handleUpCapture
   let handleContextMenu
   let handleKeydown
-  let pointerDownPos = null
+  let pendingDown = null
   let componentMounted = false
   let initialLoadStarted = false
   let clusterLabelLayer
@@ -1450,9 +1451,19 @@
     const cameraDistance = controls ? camera.position.distanceTo(controls.target) : 2000
     raycaster.params.Points.threshold = Math.min(24, Math.max(2, cameraDistance * 0.005))
     const alphaArray = points.geometry.getAttribute('alpha')?.array
-    const hit = raycaster
-      .intersectObject(points, false)
-      .find((candidate) => !alphaArray || alphaArray[candidate.index] > 0.05)
+    // Pick the node nearest the cursor (smallest perpendicular distance to the
+    // ray), not the first one along the ray — so a click selects the dot under
+    // the pointer rather than a nearby one that happens to be closer to camera.
+    let hit = null
+    let bestDist = Infinity
+    for (const candidate of raycaster.intersectObject(points, false)) {
+      if (alphaArray && !(alphaArray[candidate.index] > 0.05)) continue
+      const d = candidate.distanceToRay ?? candidate.distance ?? 0
+      if (d < bestDist) {
+        bestDist = d
+        hit = candidate
+      }
+    }
     const nextNode = hit ? points.userData.nodes?.[hit.index] : null
     hoveredNode = nextNode
     if (renderer) renderer.domElement.style.cursor = nextNode ? 'pointer' : ''
@@ -1569,17 +1580,42 @@
       tooltip = { ...tooltip, visible: false }
       if (renderer) renderer.domElement.style.cursor = ''
     }
-    // Distinguish a click (select) from a left-drag (rotate): a drag also fires
-    // a `click` at the end, which otherwise selected whatever was under the
-    // cursor. Only select if the pointer barely moved between down and up.
-    handlePointerDown = (event) => { pointerDownPos = { x: event.clientX, y: event.clientY } }
-    handleClick = (event) => {
-      if (pointerDownPos) {
-        const moved = Math.hypot(event.clientX - pointerDownPos.x, event.clientY - pointerDownPos.y)
-        pointerDownPos = null
-        if (moved > 6) return // it was a drag/rotate, not a click
+    // Left-button dead-zone so a click selects without the camera rotating.
+    // OrbitControls rotates on ANY movement once it sees the pointerdown, so we
+    // hold the left pointerdown back (capture phase) and only hand it to
+    // OrbitControls once the pointer crosses a small threshold — i.e. it's a
+    // real drag. Below the threshold it's a click: select on pointerup.
+    const DRAG_DEADZONE = 5
+    handleDownCapture = (event) => {
+      if (event.button !== 0 || event.__fromGraph) return
+      pendingDown = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+      event.stopImmediatePropagation() // withhold from OrbitControls for now
+    }
+    handleMoveCapture = (event) => {
+      if (!pendingDown || event.pointerId !== pendingDown.pointerId) return
+      const moved = Math.hypot(event.clientX - pendingDown.x, event.clientY - pendingDown.y)
+      if (moved > DRAG_DEADZONE) {
+        // Promote to a rotate: hand OrbitControls a fresh pointerdown.
+        const synth = new PointerEvent('pointerdown', {
+          pointerId: pendingDown.pointerId,
+          clientX: pendingDown.x,
+          clientY: pendingDown.y,
+          button: 0,
+          buttons: 1,
+          bubbles: true,
+          cancelable: true,
+        })
+        synth.__fromGraph = true
+        pendingDown = null
+        renderer.domElement.dispatchEvent(synth)
       }
-      pickNode(event, true)
+    }
+    handleUpCapture = (event) => {
+      if (pendingDown && event.pointerId === pendingDown.pointerId) {
+        pendingDown = null
+        // never crossed the dead-zone → a click selects (a cancel just clears)
+        if (event.type === 'pointerup') pickNode(event, true)
+      }
     }
     handleContextMenu = (event) => event.preventDefault()
     handleKeydown = (event) => {
@@ -1590,8 +1626,10 @@
     }
     renderer.domElement.addEventListener('pointermove', handlePointerMove)
     renderer.domElement.addEventListener('pointerleave', handlePointerLeave)
-    renderer.domElement.addEventListener('pointerdown', handlePointerDown)
-    renderer.domElement.addEventListener('click', handleClick)
+    renderer.domElement.addEventListener('pointerdown', handleDownCapture, { capture: true })
+    renderer.domElement.addEventListener('pointermove', handleMoveCapture, { capture: true })
+    renderer.domElement.addEventListener('pointerup', handleUpCapture, { capture: true })
+    renderer.domElement.addEventListener('pointercancel', handleUpCapture, { capture: true })
     renderer.domElement.addEventListener('contextmenu', handleContextMenu)
     window.addEventListener('keydown', handleKeydown)
 
@@ -1619,8 +1657,12 @@
     controls?.removeEventListener('change', requestRender)
     if (handlePointerMove) renderer?.domElement?.removeEventListener('pointermove', handlePointerMove)
     if (handlePointerLeave) renderer?.domElement?.removeEventListener('pointerleave', handlePointerLeave)
-    if (handlePointerDown) renderer?.domElement?.removeEventListener('pointerdown', handlePointerDown)
-    if (handleClick) renderer?.domElement?.removeEventListener('click', handleClick)
+    if (handleDownCapture) renderer?.domElement?.removeEventListener('pointerdown', handleDownCapture, { capture: true })
+    if (handleMoveCapture) renderer?.domElement?.removeEventListener('pointermove', handleMoveCapture, { capture: true })
+    if (handleUpCapture) {
+      renderer?.domElement?.removeEventListener('pointerup', handleUpCapture, { capture: true })
+      renderer?.domElement?.removeEventListener('pointercancel', handleUpCapture, { capture: true })
+    }
     if (handleContextMenu) renderer?.domElement?.removeEventListener('contextmenu', handleContextMenu)
     if (handleKeydown) window.removeEventListener('keydown', handleKeydown)
     controls?.dispose()
