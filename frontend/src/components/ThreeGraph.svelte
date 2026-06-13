@@ -1480,6 +1480,25 @@
     return new Intl.NumberFormat().format(Number(value || 0))
   }
 
+  // Resolve a clickable URL for the selected work, so a researcher can open the
+  // actual paper. Each accepts the raw stored value (id or full URL).
+  function doiHref(doi) {
+    const s = String(doi || '').trim()
+    if (!s) return null
+    if (/^https?:\/\//i.test(s)) return s
+    return `https://doi.org/${s.replace(/^doi:/i, '')}`
+  }
+  function openAlexHref(id) {
+    const s = String(id || '').trim()
+    if (!s) return null
+    if (/^https?:\/\//i.test(s)) return s
+    return `https://openalex.org/${s}`
+  }
+  function externalHref(url) {
+    const s = String(url || '').trim()
+    return /^https?:\/\//i.test(s) ? s : null
+  }
+
   function compactList(items, fallback = 'unknown') {
     if (!Array.isArray(items) || !items.length) return fallback
     return items.slice(0, 3).map((item) => `${item.label} (${formatNumber(item.count)})`).join(', ')
@@ -1860,6 +1879,20 @@
           {/if}
           {#if selectedNodeDetail?.doi || selectedNodeDetail?.openalex_id}
             <span class="muted small">Identifiers: {selectedNodeDetail.doi || selectedNodeDetail.openalex_id}</span>
+          {/if}
+          {#if selectedNodeDetail && (doiHref(selectedNodeDetail.doi) || openAlexHref(selectedNodeDetail.openalex_id) || externalHref(selectedNodeDetail.source_pdf))}
+            <div class="graph-3d-links" data-testid="graph-3d-links">
+              <span class="muted small">Open:</span>
+              {#if doiHref(selectedNodeDetail.doi)}
+                <a href={doiHref(selectedNodeDetail.doi)} target="_blank" rel="noopener noreferrer">DOI ↗</a>
+              {/if}
+              {#if openAlexHref(selectedNodeDetail.openalex_id)}
+                <a href={openAlexHref(selectedNodeDetail.openalex_id)} target="_blank" rel="noopener noreferrer">OpenAlex ↗</a>
+              {/if}
+              {#if externalHref(selectedNodeDetail.source_pdf)}
+                <a href={externalHref(selectedNodeDetail.source_pdf)} target="_blank" rel="noopener noreferrer">PDF ↗</a>
+              {/if}
+            </div>
           {/if}
           {#if selectedNodeDetail?.publisher || selectedNodeDetail?.keywords}
             <span class="muted small">Metadata: {selectedNodeDetail.publisher || selectedNodeDetail.keywords}</span>

@@ -416,3 +416,20 @@ test('node detail responses are cached per work', async ({ page }) => {
 
   expect(nodeDetailRequests).toBe(1)
 })
+
+test('selected work exposes a clickable link to open the paper', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  await panel.getByTestId('graph-3d-search').fill('Referenced')
+  const results = panel.getByTestId('graph-3d-search-results')
+  await expect(results).toBeVisible()
+  await results.getByRole('button', { name: /Referenced work/ }).click()
+
+  const links = panel.getByTestId('graph-3d-links')
+  await expect(links).toBeVisible()
+  await expect(links.getByRole('link', { name: /DOI/ })).toHaveAttribute(
+    'href',
+    'https://doi.org/10.1000/example'
+  )
+})
