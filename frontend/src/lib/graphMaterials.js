@@ -28,7 +28,7 @@ export function createNodeMaterial(THREE, pixelRatio = 1) {
         // Perspective size attenuation, clamped so distant nodes stay visible
         // (>=2px) and close ones don't balloon off-screen (<=48px).
         float atten = uRefDist / max(60.0, -mvPosition.z);
-        gl_PointSize = clamp(size * atten, 2.0, 48.0) * uPixelRatio;
+        gl_PointSize = clamp(size * atten, 2.0, 30.0) * uPixelRatio;
         gl_Position = projectionMatrix * mvPosition;
       }
     `,
@@ -37,14 +37,16 @@ export function createNodeMaterial(THREE, pixelRatio = 1) {
       varying vec3 vColor;
       varying float vAlpha;
       void main() {
-        vec2 offset = gl_PointCoord - vec2(0.5);
-        if (dot(offset, offset) > 0.25) discard;
-        gl_FragColor = vec4(vColor, vAlpha * uFade);
+        // Anti-aliased solid disc. Normal (not additive) blending so zoomed-in
+        // nodes read as crisp distinct dots instead of piling into a blur.
+        float d = length(gl_PointCoord - vec2(0.5));
+        float edge = smoothstep(0.5, 0.42, d);
+        if (edge <= 0.0) discard;
+        gl_FragColor = vec4(vColor, vAlpha * uFade * edge);
       }
     `,
     vertexColors: true,
     transparent: true,
-    blending: THREE.AdditiveBlending,
     depthTest: false,
     depthWrite: false,
   })

@@ -256,10 +256,49 @@
     points.userData.nodes = nodes
     scene.add(points)
 
+    // Measure how far each cluster's nodes actually spread from its exported
+    // centre. The exported radius understates the force-layout spread, so the
+    // shell sphere was smaller than its own nodes — leaving them visibly
+    // outside the cluster when zoomed in. Size the shell to contain ~92% of
+    // its nodes instead.
+    const clusterCenterById = new Map()
+    for (const cluster of clusterData) {
+      clusterCenterById.set(Number(cluster.id), {
+        x: Number(cluster.x || 0),
+        y: Number(cluster.y || 0) * depthScale,
+        z: Number(cluster.z || 0),
+      })
+    }
+    const clusterRadiusSamples = new Map()
+    for (let i = 0; i < nodes.length; i += 1) {
+      const id = Number(nodes[i].cluster)
+      const c = clusterCenterById.get(id)
+      if (!c) continue
+      const dx = positions[i * 3] - c.x
+      const dy = positions[i * 3 + 1] - c.y
+      const dz = positions[i * 3 + 2] - c.z
+      let arr = clusterRadiusSamples.get(id)
+      if (!arr) { arr = []; clusterRadiusSamples.set(id, arr) }
+      arr.push(Math.sqrt(dx * dx + dy * dy + dz * dz))
+    }
+    const shellRadiusById = new Map()
+    const shellRadiusFor = (cluster) => {
+      const exported = Math.max(48, Number(cluster.radius || Math.sqrt(Number(cluster.size || 1)) * 8))
+      const samples = clusterRadiusSamples.get(Number(cluster.id))
+      let contain = 0
+      if (samples && samples.length) {
+        samples.sort((a, b) => a - b)
+        contain = samples[Math.floor(samples.length * 0.92)] || 0
+      }
+      const radius = Math.max(exported, contain * 1.05)
+      shellRadiusById.set(Number(cluster.id), radius)
+      return radius
+    }
+
     clusterShells = new THREE.Group()
     const visibleClusters = clusterData.slice(0, 32)
     for (const cluster of visibleClusters) {
-      const radius = Math.max(48, Number(cluster.radius || Math.sqrt(Number(cluster.size || 1)) * 8))
+      const radius = shellRadiusFor(cluster)
       const geometry = new THREE.SphereGeometry(radius, 24, 12)
       const material = new THREE.MeshBasicMaterial({
         color: clusterColor(cluster),
@@ -275,23 +314,26 @@
     }
     scene.add(clusterShells)
 
-    clusterLabels = visibleClusters.map((cluster, index) => ({
+    clusterLabels = visibleClusters.map((cluster, index) => {
+      const shellRadius = shellRadiusById.get(Number(cluster.id)) || Math.max(24, Number(cluster.radius || 0))
+      return {
       id: cluster.id,
       label: cluster.field || cluster.label,
       detail: `${formatNumber(cluster.size)} works / ${cluster.region || 'unknown region'}`,
       color: colorCss(clusterColor(cluster)),
-      radius: Math.max(24, Number(cluster.radius || 0)),
+      radius: Math.max(24, shellRadius),
       size: Number(cluster.size || 1),
       vector: new THREE.Vector3(
         Number(cluster.x || 0),
-        Number(cluster.y || 0) * depthScale + Math.max(62, Number(cluster.radius || 0) * 0.74),
+        Number(cluster.y || 0) * depthScale + Math.max(62, shellRadius * 0.74),
         Number(cluster.z || 0)
       ),
       x: -9999,
       y: -9999,
       opacity: index < 8 ? 1 : 0.85,
       scale: Math.max(0.86, Math.min(1.12, 0.72 + Math.log1p(Number(cluster.size || 1)) * 0.062)),
-    }))
+      }
+    })
 
     // Stable legend source: clusterLabels is rewritten every rendered frame by
     // the overlay positioner, so the legend reads from this instead to avoid
