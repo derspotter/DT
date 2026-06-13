@@ -99,9 +99,14 @@ export function createNodeQuadMaterial(THREE, pixelRatio = 1, width = 1, height 
       varying float vAlpha;
       void main() {
         float d = length(vCorner);
-        float edge = smoothstep(0.5, 0.42, d);
-        if (edge <= 0.0) discard;
-        gl_FragColor = vec4(vColor, vAlpha * uFade * edge);
+        // Outer anti-aliased edge of the disc.
+        float alphaMask = smoothstep(0.5, 0.46, d);
+        if (alphaMask <= 0.0) discard;
+        // Dark outline ring near the rim so overlapping/adjacent nodes (even of
+        // the same colour) stay visually separable; bright fill in the centre.
+        float fill = smoothstep(0.44, 0.38, d);
+        vec3 col = mix(vColor * 0.22, vColor, fill);
+        gl_FragColor = vec4(col, vAlpha * uFade * alphaMask);
       }
     `,
     transparent: true,

@@ -872,6 +872,24 @@
     recomputeAlphas()
   }
 
+  // Single reset for every "dim the rest" state: a selected node's neighbourhood
+  // highlight, a territory isolation, or a citation path.
+  function showAllNodes() {
+    selectedNode = null
+    selectedNodeDetail = null
+    selectedIndex = null
+    hoveredNode = null
+    halo = { ...halo, visible: false }
+    highlightIndex = null
+    isolatedCluster = null
+    pathStart = null
+    pathEnd = null
+    pathInfo = null
+    pathNodeSet = null
+    disposePathLine()
+    recomputeAlphas()
+  }
+
   function resetCamera() {
     if (!camera || !controls) return
     // Reset/re-render frames the whole graph, which is none of the presets, so
@@ -1565,6 +1583,7 @@
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
   $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
   $: legendItems = clusterLegend.slice(0, 12)
+  $: viewFiltered = Boolean(selectedNode) || isolatedCluster !== null || Boolean(pathInfo)
 </script>
 
 <div class="card graph-3d-panel" data-testid="graph-3d-panel">
@@ -1670,6 +1689,11 @@
         <span><i class="bridge"></i>Bridge links</span>
         <span><i class="canon"></i>Hubs (size = citations)</span>
       </div>
+      {#if viewFiltered}
+        <button type="button" class="graph-3d-showall" data-testid="graph-3d-showall" on:click={showAllNodes}>
+          ✕ Show all nodes
+        </button>
+      {/if}
       <div class="graph-3d-label-layer" bind:this={clusterLabelLayer}>
         {#each clusterLabels as label (label.id)}
           {#if label.visible}

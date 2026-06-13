@@ -318,6 +318,23 @@ test('path-finder connects two works via search selection', async ({ page }) => 
   await expect(panel.getByTestId('graph-3d-path')).toBeHidden()
 })
 
+test('selecting a work shows a reset control that restores all nodes', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  const panel = await openLoadedGraphPanel(page)
+
+  // No filtering yet → no reset control.
+  await expect(panel.getByTestId('graph-3d-showall')).toBeHidden()
+
+  // Selecting a work dims the rest; the reset control appears.
+  await panel.getByTestId('graph-3d-search').fill('Referenced')
+  await panel.getByTestId('graph-3d-search-results').getByRole('button', { name: /Referenced work/ }).click()
+  const showAll = panel.getByTestId('graph-3d-showall')
+  await expect(showAll).toBeVisible()
+
+  await showAll.click()
+  await expect(showAll).toBeHidden()
+})
+
 test('wheeling over a canvas overlay still reaches the canvas to zoom', async ({ page }) => {
   await page.route('**/api/**', mockApi)
   const panel = await openLoadedGraphPanel(page)

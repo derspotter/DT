@@ -2381,6 +2381,30 @@ button.seed-download-tag:focus-visible {
   pointer-events: none;
 }
 
+/* Reset control shown whenever the view is filtered down (selection / isolation
+   / path), so dimming the rest of the graph is always one click to undo. */
+.graph-3d-showall {
+  position: absolute;
+  z-index: 5;
+  top: 12px;
+  right: 12px;
+  padding: 7px 13px;
+  border-radius: 9px;
+  border: 1px solid rgba(244, 163, 64, 0.55);
+  background: rgba(20, 36, 44, 0.92);
+  color: #ffe6c2;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 6px 16px rgba(4, 14, 17, 0.5);
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.graph-3d-showall:hover {
+  background: rgba(244, 163, 64, 0.2);
+  border-color: rgba(244, 163, 64, 0.85);
+}
+
 .graph-3d-map-key span {
   display: inline-flex;
   align-items: center;
