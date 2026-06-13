@@ -82,9 +82,10 @@ export function createNodeQuadMaterial(THREE, pixelRatio = 1, width = 1, height 
         vCorner = position.xy; // base quad corner in [-0.5, 0.5]
         vec4 mvPosition = modelViewMatrix * vec4(aPosition, 1.0);
         float depth = max(60.0, -mvPosition.z);
-        // Same sizing as the old points: grows toward the camera, clamped so it
-        // never shrinks to nothing or balloons off-screen.
-        float px = clamp(aSize * (uRefDist / depth), 2.0, 30.0) * uPixelRatio;
+        // Grows toward the camera, clamped so it never shrinks to nothing nor
+        // grows so large that dense clusters tile into a solid mass (which made
+        // individual nodes impossible to pick out).
+        float px = clamp(aSize * (uRefDist / depth), 2.0, 8.0) * uPixelRatio;
         vec4 clip = projectionMatrix * mvPosition;
         // Offset the quad corner by px screen pixels, converted into clip space.
         clip.xy += (position.xy * px / (uViewport * 0.5)) * clip.w;
