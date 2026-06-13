@@ -1445,7 +1445,11 @@
     scene.background = new THREE.Color(0x0b1f24)
     scene.fog = new THREE.Fog(0x0b1f24, 2400, 9000)
     camera = new THREE.PerspectiveCamera(58, 1, 0.1, 12000)
-    renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' })
+    // preserveDrawingBuffer keeps the last rendered frame in the buffer. The
+    // graph renders on demand (only on interaction); without this the browser
+    // can composite a cleared buffer between renders, blanking the canvas
+    // intermittently — the "nodes vanish sometimes" report.
+    renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', preserveDrawingBuffer: true })
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5))
     container.appendChild(renderer.domElement)
 
