@@ -54,12 +54,9 @@
   let pathNodeSet = null
   let pathLine = null
   let selectionEdges = null
-  // Directed edge arrays (source/target/relationship) kept so a selected node's
-  // adjacent edges can be coloured by citation direction.
-  let dirSrc = null
-  let dirTgt = null
-  let dirRel = null
-  let dirCount = 0
+  // Per-node directed adjacency (CSR: neighbour + outgoing flag) so a selected
+  // node's adjacent edges can be coloured by citation direction in O(degree).
+  let directedAdj = null
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
@@ -450,11 +447,10 @@
       : { x: 0, y: 0, z: 0 }
     const BUNDLE_STRENGTH = 0.78
 
-    // Collect every valid edge once. Adjacency (search / neighbourhood
-    // highlight / path-finder) is built from the FULL set so connectivity is
-    // complete, but only a curated subset becomes curve geometry: drawing all
-    // ~437k edges is slow and bundles them into an indistinct mass. Rendering
-    // the highest-degree edges keeps the major trunks while thinning the rest.
+    // Collect every valid edge once. The adjacency (search / neighbourhood
+    // highlight / path-finder) and the rendered curve geometry both cover the
+    // FULL edge set — every edge is drawn (opacity scales down with count so it
+    // stays a legible web rather than a solid mass).
     const binaryEdgeCount = edgeTriplets?.length ? Math.floor(edgeTriplets.length / 3) : 0
     const rawCount = binaryEdgeCount || edges.length
     const srcArr = new Uint32Array(rawCount)
@@ -487,11 +483,8 @@
       fullEndpoints[e * 2 + 1] = tgtArr[e]
     }
     adjacency = buildAdjacency(fullEndpoints, nodes.length)
-    // Keep the directed edges for per-node direction colouring on selection.
-    dirSrc = srcArr
-    dirTgt = tgtArr
-    dirRel = relArr
-    dirCount = validCount
+    // Directed adjacency for per-node citation direction on selection.
+    directedAdj = buildDirectedAdjacency(srcArr, tgtArr, relArr, validCount, nodes.length)
 
     // Render every edge (no curation). Each is a directional colour gradient
     // (dim at the citing end → bright at the cited end), so you can see which
@@ -507,6 +500,9 @@
     let edgeOffset = 0
     let edgeColorOffset = 0
     let appendedEdges = 0
+    const gradR = EDGE_BRIGHT_R - EDGE_DIM_R
+    const gradG = EDGE_BRIGHT_G - EDGE_DIM_G
+    const gradB = EDGE_BRIGHT_B - EDGE_DIM_B
     const appendEdge = (sourceIndex, targetIndex, relationshipCode = 0) => {
       const sx = positions[sourceIndex * 3]
       const sy = positions[sourceIndex * 3 + 1]
@@ -525,17 +521,11 @@
       const c2x = tx + (cb.x - tx) * BUNDLE_STRENGTH
       const c2y = ty + (cb.y - ty) * BUNDLE_STRENGTH
       const c2z = tz + (cb.z - tz) * BUNDLE_STRENGTH
-      // Direction: colour flows from the citing end (dim) to the cited end
-      // (bright). source references target (rel 0) -> bright at target (t=1);
-      // source cited_by target (rel 1) -> target cites source -> bright at the
-      // source (t=0). `brightAtT1` is 1 when t=1 (target) is the cited end.
-      const brightAtT1 = relationshipCode === 1 ? 0 : 1
-      const writeColor = (t) => {
-        const f = brightAtT1 ? t : 1 - t // 0 at citing end, 1 at cited end
-        edgeColors[edgeColorOffset++] = EDGE_DIM_R + (EDGE_BRIGHT_R - EDGE_DIM_R) * f
-        edgeColors[edgeColorOffset++] = EDGE_DIM_G + (EDGE_BRIGHT_G - EDGE_DIM_G) * f
-        edgeColors[edgeColorOffset++] = EDGE_DIM_B + (EDGE_BRIGHT_B - EDGE_DIM_B) * f
-      }
+      // Direction: colour runs from the citing end (amber) to the cited end
+      // (cyan) via t in [0,1] along source->target. references (rel 0): source
+      // cites target, so cited (cyan) is at t=1. cited_by (rel 1): target cites
+      // source, so cited is at t=0 — invert t.
+      const forward = relationshipCode !== 1
       let px = sx
       let py = sy
       let pz = sz
@@ -556,8 +546,14 @@
         edgePositions[edgeOffset++] = qx
         edgePositions[edgeOffset++] = qy
         edgePositions[edgeOffset++] = qz
-        writeColor(pt)
-        writeColor(u)
+        const f0 = forward ? pt : 1 - pt
+        const f1 = forward ? u : 1 - u
+        edgeColors[edgeColorOffset++] = EDGE_DIM_R + gradR * f0
+        edgeColors[edgeColorOffset++] = EDGE_DIM_G + gradG * f0
+        edgeColors[edgeColorOffset++] = EDGE_DIM_B + gradB * f0
+        edgeColors[edgeColorOffset++] = EDGE_DIM_R + gradR * f1
+        edgeColors[edgeColorOffset++] = EDGE_DIM_G + gradG * f1
+        edgeColors[edgeColorOffset++] = EDGE_DIM_B + gradB * f1
         px = qx
         py = qy
         pz = qz
@@ -680,6 +676,26 @@
       neighbors[cursor[target]++] = source
     }
     return { offsets, neighbors }
+  }
+
+  // CSR adjacency that also records direction: for each node, its neighbours and
+  // whether the connecting citation is outgoing (this node cites the neighbour).
+  // references (rel 0): src cites tgt. cited_by (rel 1): tgt cites src.
+  function buildDirectedAdjacency(src, tgt, rel, count, nodeCount) {
+    const counts = new Uint32Array(nodeCount)
+    for (let e = 0; e < count; e += 1) { counts[src[e]] += 1; counts[tgt[e]] += 1 }
+    const offsets = new Uint32Array(nodeCount + 1)
+    for (let i = 0; i < nodeCount; i += 1) offsets[i + 1] = offsets[i] + counts[i]
+    const neighbors = new Uint32Array(offsets[nodeCount])
+    const outgoing = new Uint8Array(offsets[nodeCount])
+    const cursor = offsets.slice(0, nodeCount)
+    for (let e = 0; e < count; e += 1) {
+      const citing = rel[e] === 1 ? tgt[e] : src[e]
+      const cited = rel[e] === 1 ? src[e] : tgt[e]
+      let p = cursor[citing]++; neighbors[p] = cited; outgoing[p] = 1
+      p = cursor[cited]++; neighbors[p] = citing; outgoing[p] = 0
+    }
+    return { offsets, neighbors, outgoing }
   }
 
   function passesYearFilter(node) {
@@ -849,36 +865,39 @@
     selectionEdges = null
   }
 
-  // Highlight every edge adjacent to the selected node, coloured by direction:
-  // amber = "this work cites X" (outgoing), cyan = "X cites this work"
-  // (incoming). Drawn from the FULL directed edge list so it shows all
-  // connections, not just the rendered subset, and doesn't dim anything else.
+  // Highlight a selected node's adjacent edges, coloured by direction:
+  // amber (the gradient's citing colour) = "this work cites X" (outgoing),
+  // cyan (the cited colour) = "X cites this work" (incoming). Uses the directed
+  // adjacency (O(degree)) and shows all connections without dimming anything.
   function buildSelectionEdges(index) {
     disposeSelectionEdges()
-    if (index === null || index === undefined || !dirSrc || !points || !THREE) return
+    if (index === null || index === undefined || !directedAdj || !points || !THREE) return
     const posAttr = points.geometry.getAttribute('position')
+    if (!posAttr || index < 0 || index >= posAttr.count) return
+    const start = directedAdj.offsets[index]
+    const end = directedAdj.offsets[index + 1]
+    if (end <= start) return
     const nx = posAttr.getX(index)
     const ny = posAttr.getY(index)
     const nz = posAttr.getZ(index)
-    const OUT = [0.98, 0.66, 0.20] // this work cites -> (amber)
-    const IN = [0.30, 0.80, 1.0]   // cited by this work <- (cyan)
-    const pos = []
-    const col = []
-    for (let e = 0; e < dirCount; e += 1) {
-      const s = dirSrc[e]
-      const t = dirTgt[e]
-      if (s !== index && t !== index) continue
-      const other = s === index ? t : s
-      // references (rel 0): s cites t. cited_by (rel 1): t cites s.
-      const citing = dirRel[e] === 1 ? t : s
-      const c = citing === index ? OUT : IN
-      pos.push(nx, ny, nz, posAttr.getX(other), posAttr.getY(other), posAttr.getZ(other))
-      col.push(c[0], c[1], c[2], c[0], c[1], c[2])
+    const OUT = [EDGE_DIM_R, EDGE_DIM_G, EDGE_DIM_B]        // outgoing (cites) — amber
+    const IN = [EDGE_BRIGHT_R, EDGE_BRIGHT_G, EDGE_BRIGHT_B] // incoming (cited by) — cyan
+    const n = end - start
+    const pos = new Float32Array(n * 2 * 3)
+    const col = new Float32Array(n * 2 * 3)
+    let po = 0
+    let co = 0
+    for (let i = start; i < end; i += 1) {
+      const other = directedAdj.neighbors[i]
+      const c = directedAdj.outgoing[i] ? OUT : IN
+      pos[po++] = nx; pos[po++] = ny; pos[po++] = nz
+      pos[po++] = posAttr.getX(other); pos[po++] = posAttr.getY(other); pos[po++] = posAttr.getZ(other)
+      col[co++] = c[0]; col[co++] = c[1]; col[co++] = c[2]
+      col[co++] = c[0]; col[co++] = c[1]; col[co++] = c[2]
     }
-    if (!pos.length) return
     const geometry = new THREE.BufferGeometry()
-    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3))
-    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3))
+    geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+    geometry.setAttribute('color', new THREE.BufferAttribute(col, 3))
     selectionEdges = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
       vertexColors: true,
       transparent: true,
