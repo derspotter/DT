@@ -2453,14 +2453,14 @@ button.seed-download-tag:focus-visible {
   width: 16px;
   height: 3px;
   border-radius: 3px;
-  background: #faa833;
+  background: #f59e45; /* matches EDGE_DIM (citing/amber) */
 }
 
 .graph-3d-map-key .cited {
   width: 16px;
   height: 3px;
   border-radius: 3px;
-  background: #4ccbff;
+  background: #4dccff; /* matches EDGE_BRIGHT (cited/cyan) */
 }
 
 .graph-3d-label-layer {
