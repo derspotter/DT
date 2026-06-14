@@ -88,11 +88,12 @@ def main():
     log(f"corpus works with openalex_id: {len(corpus)}")
 
     # Existing edges keyed exactly like the table's UNIQUE constraint —
-    # directed (source, target, relationship). Citations are directional (the
-    # graph colours edges by direction), so an undirected key would wrongly drop
-    # a reciprocal A->B / B->A pair or an opposite-relationship edge on the same
-    # pair. This in-memory set just avoids redundant work within the run; the
-    # INSERT OR IGNORE below is the durable guard.
+    # directed (source_id, target_id, relationship_type). Citations are
+    # directional (the graph colours edges by direction), so an undirected key
+    # would wrongly drop a reciprocal A->B / B->A pair or an opposite-
+    # relationship_type edge on the same pair. This in-memory set just avoids
+    # redundant work within the run; the INSERT OR IGNORE below is the durable
+    # guard.
     existing_edges = set()
     for row in conn.execute(
         "SELECT source_id, target_id, relationship_type FROM citation_edges"
@@ -162,8 +163,11 @@ def main():
         if new_rows:
             # OR IGNORE so the directed UNIQUE(source_id, target_id,
             # relationship_type) constraint is the source of truth even across
-            # runs/races; rowcount then reflects rows actually inserted.
-            cursor = conn.executemany(
+            # runs/races. Count real insertions via total_changes — rowcount is
+            # unreliable for executemany with OR IGNORE (can be 0 or -1 even when
+            # rows were inserted), which would otherwise over-count the summary.
+            before = conn.total_changes
+            conn.executemany(
                 """
                 INSERT OR IGNORE INTO citation_edges
                   (source_id, target_id, relationship_type, source_table, target_table,
@@ -172,7 +176,7 @@ def main():
                 """,
                 new_rows,
             )
-            added += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else len(new_rows)
+            added += conn.total_changes - before
         if seen_work_ids:
             conn.executemany(
                 "UPDATE works SET refs_fetched = 1 WHERE id = ?",
