@@ -2442,45 +2442,44 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   function readWorkerBacklogSummary(corpusId) {
     const scopedCorpusId = corpusId ?? null;
-    const countScoped = (whereSql = '', params = []) => {
-      if (!tableExists(authDb, 'works')) return 0;
-      const normalizedWhere = String(whereSql || '').trim();
-      try {
-        if (scopedCorpusId === null) {
-          const row = authDb
-            .prepare(
-              `SELECT COUNT(*) AS count
-               FROM works
-               ${normalizedWhere ? `WHERE ${normalizedWhere}` : ''}`
-            )
-            .get(...params);
-          return Number(row?.count || 0);
-        }
-        const row = authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM works t
-             JOIN corpus_works cw ON cw.work_id = t.id
-             WHERE cw.corpus_id = ?${normalizedWhere ? ` AND ${normalizedWhere}` : ''}`
-          )
-          .get(scopedCorpusId, ...params);
-        return Number(row?.count || 0);
-      } catch (error) {
-        return 0;
-      }
-    };
-
-    return {
+    const empty = {
       corpus_id: scopedCorpusId,
-      raw_pending: countScoped("COALESCE(metadata_status, 'pending') = 'pending'"),
-      enriching: countScoped("COALESCE(metadata_status, 'pending') = 'in_progress'"),
-      matched: countScoped("metadata_status = 'matched' AND COALESCE(download_status, 'not_requested') = 'not_requested'"),
-      queued_download: countScoped("COALESCE(download_status, 'not_requested') = 'queued'"),
-      downloading: countScoped("COALESCE(download_status, 'not_requested') = 'in_progress'"),
-      downloaded: countScoped("download_status = 'downloaded'"),
-      failed_enrichment: countScoped("metadata_status = 'failed'"),
-      failed_download: countScoped("download_status = 'failed'"),
+      raw_pending: 0, enriching: 0, matched: 0, queued_download: 0,
+      downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0,
     };
+    if (!tableExists(authDb, 'works')) return empty;
+    // Single pass with conditional aggregation. The previous version ran 8
+    // separate COUNT(*) queries, each scanning the (corpus's) works — slow on a
+    // 100k-row table and contended when the workers hold the DB lock.
+    const sums = `
+      SUM(CASE WHEN COALESCE(t.metadata_status, 'pending') = 'pending' THEN 1 ELSE 0 END) AS raw_pending,
+      SUM(CASE WHEN COALESCE(t.metadata_status, 'pending') = 'in_progress' THEN 1 ELSE 0 END) AS enriching,
+      SUM(CASE WHEN t.metadata_status = 'matched' AND COALESCE(t.download_status, 'not_requested') = 'not_requested' THEN 1 ELSE 0 END) AS matched,
+      SUM(CASE WHEN COALESCE(t.download_status, 'not_requested') = 'queued' THEN 1 ELSE 0 END) AS queued_download,
+      SUM(CASE WHEN COALESCE(t.download_status, 'not_requested') = 'in_progress' THEN 1 ELSE 0 END) AS downloading,
+      SUM(CASE WHEN t.download_status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
+      SUM(CASE WHEN t.metadata_status = 'failed' THEN 1 ELSE 0 END) AS failed_enrichment,
+      SUM(CASE WHEN t.download_status = 'failed' THEN 1 ELSE 0 END) AS failed_download`;
+    try {
+      const row = scopedCorpusId === null
+        ? authDb.prepare(`SELECT ${sums} FROM works t`).get()
+        : authDb.prepare(
+            `SELECT ${sums} FROM works t JOIN corpus_works cw ON cw.work_id = t.id WHERE cw.corpus_id = ?`
+          ).get(scopedCorpusId);
+      return {
+        corpus_id: scopedCorpusId,
+        raw_pending: Number(row?.raw_pending || 0),
+        enriching: Number(row?.enriching || 0),
+        matched: Number(row?.matched || 0),
+        queued_download: Number(row?.queued_download || 0),
+        downloading: Number(row?.downloading || 0),
+        downloaded: Number(row?.downloaded || 0),
+        failed_enrichment: Number(row?.failed_enrichment || 0),
+        failed_download: Number(row?.failed_download || 0),
+      };
+    } catch (error) {
+      return empty;
+    }
   }
 
   function tickDownloadWorker(corpusId) {
