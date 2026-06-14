@@ -120,6 +120,10 @@
   }
 
   const UNKNOWN_FIELD_COLOR = 0x52636a
+  // Directional edge gradient: dim slate at the citing end → bright cyan at the
+  // cited end, so an edge's colour shows which way the citation points.
+  const EDGE_DIM_R = 0.20, EDGE_DIM_G = 0.27, EDGE_DIM_B = 0.30
+  const EDGE_BRIGHT_R = 0.62, EDGE_BRIGHT_G = 0.86, EDGE_BRIGHT_B = 0.89
   let clusterColorById = new Map()
 
   function isUnknownField(kind) {
@@ -477,18 +481,11 @@
     }
     adjacency = buildAdjacency(fullEndpoints, nodes.length)
 
-    const RENDER_EDGE_BUDGET = 90000
-    let renderOrder = null
-    if (validCount > RENDER_EDGE_BUDGET) {
-      const score = new Float64Array(validCount)
-      for (let e = 0; e < validCount; e += 1) {
-        score[e] = Number(nodes[srcArr[e]].degree || 0) + Number(nodes[tgtArr[e]].degree || 0)
-      }
-      renderOrder = Array.from({ length: validCount }, (_, i) => i)
-        .sort((a, b) => score[b] - score[a])
-        .slice(0, RENDER_EDGE_BUDGET)
-    }
-    const renderCount = renderOrder ? renderOrder.length : validCount
+    // Render every edge (no curation). Each is a directional colour gradient
+    // (dim at the citing end → bright at the cited end), so you can see which
+    // way a citation points.
+    const renderOrder = null
+    const renderCount = validCount
 
     const edgeSegments = chooseEdgeSegments(renderCount)
     edgeVertexStride = edgeSegments * 2
@@ -516,9 +513,21 @@
       const c2x = tx + (cb.x - tx) * BUNDLE_STRENGTH
       const c2y = ty + (cb.y - ty) * BUNDLE_STRENGTH
       const c2z = tz + (cb.z - tz) * BUNDLE_STRENGTH
+      // Direction: colour flows from the citing end (dim) to the cited end
+      // (bright). source references target (rel 0) -> bright at target (t=1);
+      // source cited_by target (rel 1) -> target cites source -> bright at the
+      // source (t=0). `brightAtT1` is 1 when t=1 (target) is the cited end.
+      const brightAtT1 = relationshipCode === 1 ? 0 : 1
+      const writeColor = (t) => {
+        const f = brightAtT1 ? t : 1 - t // 0 at citing end, 1 at cited end
+        edgeColors[edgeColorOffset++] = EDGE_DIM_R + (EDGE_BRIGHT_R - EDGE_DIM_R) * f
+        edgeColors[edgeColorOffset++] = EDGE_DIM_G + (EDGE_BRIGHT_G - EDGE_DIM_G) * f
+        edgeColors[edgeColorOffset++] = EDGE_DIM_B + (EDGE_BRIGHT_B - EDGE_DIM_B) * f
+      }
       let px = sx
       let py = sy
       let pz = sz
+      let pt = 0
       for (let seg = 1; seg <= edgeSegments; seg += 1) {
         const u = seg / edgeSegments
         const mt = 1 - u
@@ -535,20 +544,16 @@
         edgePositions[edgeOffset++] = qx
         edgePositions[edgeOffset++] = qy
         edgePositions[edgeOffset++] = qz
+        writeColor(pt)
+        writeColor(u)
         px = qx
         py = qy
         pz = qz
+        pt = u
       }
       endpointPairs[appendedEdges * 2] = sourceIndex
       endpointPairs[appendedEdges * 2 + 1] = targetIndex
       appendedEdges += 1
-      const edgeHex = relationshipCode === 1 ? 0xf4a340 : 0x7c8b95
-      color.setHex(edgeHex)
-      for (let i = 0; i < edgeVertexStride; i += 1) {
-        edgeColors[edgeColorOffset++] = color.r
-        edgeColors[edgeColorOffset++] = color.g
-        edgeColors[edgeColorOffset++] = color.b
-      }
     }
     for (let k = 0; k < renderCount; k += 1) {
       const e = renderOrder ? renderOrder[k] : k
@@ -722,11 +727,10 @@
       const edgeAlphaAttr = edgeLines.geometry.getAttribute('alpha')
       const edgeAlphaArray = edgeAlphaAttr.array
       const totalEdges = edgeEndpoints.length / 2
-      const lodActive = totalEdges > 60000
-      // Normal blending now, so this is a straightforward per-edge opacity:
-      // higher when fewer edges are drawn, lower when the curated set is large
-      // so dense trunks layer up without crushing to a solid mass.
-      const baseAlpha = lodActive ? 0.16 : 0.24
+      // Per-edge opacity, scaled down as the edge count grows so that drawing
+      // the full set reads as a faint directional web rather than a solid mass
+      // (normal blending, so dense areas still layer up).
+      const baseAlpha = totalEdges > 200000 ? 0.05 : totalEdges > 60000 ? 0.12 : 0.24
       const isolating = isolatedCluster !== null
       for (let edge = 0; edge < totalEdges; edge += 1) {
         const source = edgeEndpoints[edge * 2]
@@ -744,12 +748,6 @@
             alpha = 0.015
           } else if (highlightIndex !== null) {
             alpha = source === highlightIndex || target === highlightIndex ? 0.85 : 0.02
-          } else if (
-            lodActive
-            && Number(nodes[source]?.degree || 0) <= 1
-            && Number(nodes[target]?.degree || 0) <= 1
-          ) {
-            alpha = 0
           } else {
             alpha = baseAlpha
           }
