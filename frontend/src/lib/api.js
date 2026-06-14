@@ -949,18 +949,16 @@ export async function createUpstreamCorpusItemDownloadUrl(targetId, itemId) {
 function graph3DParams({
   maxNodes = 10000,
   relationship = 'both',
-  status = 'all',
-  scope = 'all',
   yearFrom = null,
   yearTo = null,
   groupBy = 'field',
   refresh = false,
 } = {}) {
+  // status/scope are fixed server-side (downloaded works, whole corpus); the
+  // backend ignores them, so they are not sent.
   const params = new URLSearchParams()
   params.set('max_nodes', String(maxNodes))
   if (relationship) params.set('relationship', relationship)
-  if (status) params.set('status', status)
-  if (scope) params.set('scope', scope)
   if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {
     params.set('year_from', String(yearFrom))
   }

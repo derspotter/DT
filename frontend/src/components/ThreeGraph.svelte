@@ -62,8 +62,6 @@
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
   let relationship = 'both'
-  let statusFilter = 'downloaded'
-  let scope = 'all'
   let maxNodes = 25000
   let groupMode = 'cluster'
   let loadedGroupBy = 'field'
@@ -1233,8 +1231,6 @@
       const manifest = await fetchGraph3DSnapshot({
         maxNodes,
         relationship,
-        status: statusFilter,
-        scope,
         groupBy,
       })
       loadedGroupBy = groupBy

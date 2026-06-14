@@ -55,10 +55,6 @@ def ensure_refs_fetched_column(conn):
         log("Added column: refs_fetched")
 
 
-def undirected(source, target):
-    return (source, target) if source <= target else (target, source)
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
@@ -91,11 +87,18 @@ def main():
             corpus[token] = row["id"]
     log(f"corpus works with openalex_id: {len(corpus)}")
 
-    # Existing edges (undirected) so we never insert a duplicate link.
-    existing_pairs = set()
-    for row in conn.execute("SELECT source_id, target_id FROM citation_edges"):
-        existing_pairs.add(undirected(row["source_id"], row["target_id"]))
-    log(f"existing edges: {len(existing_pairs)}")
+    # Existing edges keyed exactly like the table's UNIQUE constraint —
+    # directed (source, target, relationship). Citations are directional (the
+    # graph colours edges by direction), so an undirected key would wrongly drop
+    # a reciprocal A->B / B->A pair or an opposite-relationship edge on the same
+    # pair. This in-memory set just avoids redundant work within the run; the
+    # INSERT OR IGNORE below is the durable guard.
+    existing_edges = set()
+    for row in conn.execute(
+        "SELECT source_id, target_id, relationship_type FROM citation_edges"
+    ):
+        existing_edges.add((row["source_id"], row["target_id"], row["relationship_type"]))
+    log(f"existing edges: {len(existing_edges)}")
 
     limit_clause = f" LIMIT {int(args.limit)}" if args.limit else ""
     todo = []
@@ -148,25 +151,28 @@ def main():
                 target_token = normalize_openalex_id(reference)
                 if not target_token or target_token == source_token or target_token not in corpus:
                     continue
-                pair = undirected(source_token, target_token)
-                if pair in existing_pairs:
+                edge = (source_token, target_token, "references")
+                if edge in existing_edges:
                     continue
-                existing_pairs.add(pair)
+                existing_edges.add(edge)
                 new_rows.append(
                     (source_token, target_token, "references", "works", "works",
                      source_work_id, corpus[target_token], RUN_ID)
                 )
         if new_rows:
-            conn.executemany(
+            # OR IGNORE so the directed UNIQUE(source_id, target_id,
+            # relationship_type) constraint is the source of truth even across
+            # runs/races; rowcount then reflects rows actually inserted.
+            cursor = conn.executemany(
                 """
-                INSERT INTO citation_edges
+                INSERT OR IGNORE INTO citation_edges
                   (source_id, target_id, relationship_type, source_table, target_table,
                    source_row_id, target_row_id, run_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 """,
                 new_rows,
             )
-            added += len(new_rows)
+            added += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else len(new_rows)
         if seen_work_ids:
             conn.executemany(
                 "UPDATE works SET refs_fetched = 1 WHERE id = ?",
