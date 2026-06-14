@@ -485,7 +485,6 @@
     // Render every edge (no curation). Each is a directional colour gradient
     // (dim at the citing end → bright at the cited end), so you can see which
     // way a citation points.
-    const renderOrder = null
     const renderCount = validCount
 
     const edgeSegments = chooseEdgeSegments(renderCount)
@@ -559,14 +558,17 @@
       endpointPairs[appendedEdges * 2 + 1] = targetIndex
       appendedEdges += 1
     }
-    for (let k = 0; k < renderCount; k += 1) {
-      const e = renderOrder ? renderOrder[k] : k
+    for (let e = 0; e < renderCount; e += 1) {
       appendEdge(srcArr[e], tgtArr[e], relArr[e])
     }
-    edgeEndpoints = endpointPairs.slice(0, appendedEdges * 2)
+    // appendEdge never skips, so every buffer is filled exactly to capacity
+    // (edgeOffset === edgePositions.length, appendedEdges === renderCount).
+    // Hand them to the geometry as-is rather than allocating a second
+    // full-size copy via slice() (~60MB of needless churn at ~437k edges).
+    edgeEndpoints = endpointPairs
     const lineGeometry = new THREE.BufferGeometry()
-    lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions.slice(0, edgeOffset), 3))
-    lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors.slice(0, edgeColorOffset), 3))
+    lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions, 3))
+    lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors, 3))
     lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(appendedEdges * edgeVertexStride), 1))
     edgeLines = new THREE.LineSegments(lineGeometry, createEdgeMaterial(THREE))
     edgeLines.frustumCulled = false
