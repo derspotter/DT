@@ -2448,6 +2448,21 @@ button.seed-download-tag:focus-visible {
   box-shadow: 0 0 10px rgba(255, 241, 168, 0.7);
 }
 
+/* Edge-direction key (matches the on-select adjacent-edge colours). */
+.graph-3d-map-key .cites {
+  width: 16px;
+  height: 3px;
+  border-radius: 3px;
+  background: #faa833;
+}
+
+.graph-3d-map-key .cited {
+  width: 16px;
+  height: 3px;
+  border-radius: 3px;
+  background: #4ccbff;
+}
+
 .graph-3d-label-layer {
   position: absolute;
   inset: 0;

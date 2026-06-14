@@ -1857,6 +1857,8 @@
         <span><i class="territory"></i>Territories</span>
         <span><i class="bridge"></i>Bridge links</span>
         <span><i class="canon"></i>Hubs (size = citations)</span>
+        <span><i class="cites"></i>Cites →</span>
+        <span><i class="cited"></i>← Cited by</span>
       </div>
       {#if viewFiltered}
         <button type="button" class="graph-3d-showall" data-testid="graph-3d-showall" on:click={showAllNodes}>
