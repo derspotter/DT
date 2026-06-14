@@ -198,7 +198,9 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
   const graphResponse = page.waitForResponse((res) => {
     const url = new URL(res.url())
     if (url.pathname !== '/api/graph/3d/snapshot' || res.request().method() !== 'GET') return false
-    return url.searchParams.get('scope') === 'all'
+    // The initial load defaults to 25,000 works (status/scope are fixed
+    // server-side and no longer sent as params).
+    return url.searchParams.get('max_nodes') === '25000'
   })
   await page.goto('/#/graph')
   await page.getByTestId('tab-graph').click()
