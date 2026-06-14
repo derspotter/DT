@@ -54,6 +54,12 @@
   let pathNodeSet = null
   let pathLine = null
   let selectionEdges = null
+  // Directed edge arrays (source/target/relationship) kept so a selected node's
+  // adjacent edges can be coloured by citation direction.
+  let dirSrc = null
+  let dirTgt = null
+  let dirRel = null
+  let dirCount = 0
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
@@ -120,10 +126,11 @@
   }
 
   const UNKNOWN_FIELD_COLOR = 0x52636a
-  // Directional edge gradient: dim slate at the citing end → bright cyan at the
-  // cited end, so an edge's colour shows which way the citation points.
-  const EDGE_DIM_R = 0.20, EDGE_DIM_G = 0.27, EDGE_DIM_B = 0.30
-  const EDGE_BRIGHT_R = 0.62, EDGE_BRIGHT_G = 0.86, EDGE_BRIGHT_B = 0.89
+  // Directional edge gradient: amber at the citing end → cyan at the cited end,
+  // so an edge's colour shows which way the citation points (amber "cites" →
+  // cyan "cited"). Same convention as the on-select adjacent-edge colours.
+  const EDGE_DIM_R = 0.96, EDGE_DIM_G = 0.62, EDGE_DIM_B = 0.27   // citing (amber)
+  const EDGE_BRIGHT_R = 0.30, EDGE_BRIGHT_G = 0.80, EDGE_BRIGHT_B = 1.0 // cited (cyan)
   let clusterColorById = new Map()
 
   function isUnknownField(kind) {
@@ -480,6 +487,11 @@
       fullEndpoints[e * 2 + 1] = tgtArr[e]
     }
     adjacency = buildAdjacency(fullEndpoints, nodes.length)
+    // Keep the directed edges for per-node direction colouring on selection.
+    dirSrc = srcArr
+    dirTgt = tgtArr
+    dirRel = relArr
+    dirCount = validCount
 
     // Render every edge (no curation). Each is a directional colour gradient
     // (dim at the citing end → bright at the cited end), so you can see which
@@ -837,33 +849,40 @@
     selectionEdges = null
   }
 
-  // Highlight every edge adjacent to the selected node as a bright overlay,
-  // drawn from the FULL adjacency (so it shows connections even when the edge
-  // isn't part of the curated rendered subset). Doesn't dim anything else.
+  // Highlight every edge adjacent to the selected node, coloured by direction:
+  // amber = "this work cites X" (outgoing), cyan = "X cites this work"
+  // (incoming). Drawn from the FULL directed edge list so it shows all
+  // connections, not just the rendered subset, and doesn't dim anything else.
   function buildSelectionEdges(index) {
     disposeSelectionEdges()
-    if (index === null || index === undefined || !adjacency || !points || !THREE) return
+    if (index === null || index === undefined || !dirSrc || !points || !THREE) return
     const posAttr = points.geometry.getAttribute('position')
-    const start = adjacency.offsets[index]
-    const end = adjacency.offsets[index + 1]
-    const count = end - start
-    if (count <= 0) return
     const nx = posAttr.getX(index)
     const ny = posAttr.getY(index)
     const nz = posAttr.getZ(index)
-    const pts = new Float32Array(count * 2 * 3)
-    let o = 0
-    for (let i = start; i < end; i += 1) {
-      const nb = adjacency.neighbors[i]
-      pts[o++] = nx; pts[o++] = ny; pts[o++] = nz
-      pts[o++] = posAttr.getX(nb); pts[o++] = posAttr.getY(nb); pts[o++] = posAttr.getZ(nb)
+    const OUT = [0.98, 0.66, 0.20] // this work cites -> (amber)
+    const IN = [0.30, 0.80, 1.0]   // cited by this work <- (cyan)
+    const pos = []
+    const col = []
+    for (let e = 0; e < dirCount; e += 1) {
+      const s = dirSrc[e]
+      const t = dirTgt[e]
+      if (s !== index && t !== index) continue
+      const other = s === index ? t : s
+      // references (rel 0): s cites t. cited_by (rel 1): t cites s.
+      const citing = dirRel[e] === 1 ? t : s
+      const c = citing === index ? OUT : IN
+      pos.push(nx, ny, nz, posAttr.getX(other), posAttr.getY(other), posAttr.getZ(other))
+      col.push(c[0], c[1], c[2], c[0], c[1], c[2])
     }
+    if (!pos.length) return
     const geometry = new THREE.BufferGeometry()
-    geometry.setAttribute('position', new THREE.BufferAttribute(pts, 3))
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3))
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(col), 3))
     selectionEdges = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
-      color: 0x7fe9e3,
+      vertexColors: true,
       transparent: true,
-      opacity: 0.85,
+      opacity: 0.92,
       depthTest: false,
       depthWrite: false,
     }))
