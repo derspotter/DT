@@ -53,6 +53,7 @@
   let pathInfo = null
   let pathNodeSet = null
   let pathLine = null
+  let selectionEdges = null
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
   let graphLoading = false
@@ -218,6 +219,7 @@
     disposeObject(clusterShells)
     // Node indices and positions change on re-render, so any path is stale.
     disposePathLine()
+    disposeSelectionEdges()
     pathStart = null
     pathEnd = null
     pathInfo = null
@@ -829,6 +831,50 @@
     scene.add(pathLine)
   }
 
+  function disposeSelectionEdges() {
+    if (!selectionEdges) return
+    selectionEdges.geometry?.dispose?.()
+    selectionEdges.material?.dispose?.()
+    scene?.remove(selectionEdges)
+    selectionEdges = null
+  }
+
+  // Highlight every edge adjacent to the selected node as a bright overlay,
+  // drawn from the FULL adjacency (so it shows connections even when the edge
+  // isn't part of the curated rendered subset). Doesn't dim anything else.
+  function buildSelectionEdges(index) {
+    disposeSelectionEdges()
+    if (index === null || index === undefined || !adjacency || !points || !THREE) return
+    const posAttr = points.geometry.getAttribute('position')
+    const start = adjacency.offsets[index]
+    const end = adjacency.offsets[index + 1]
+    const count = end - start
+    if (count <= 0) return
+    const nx = posAttr.getX(index)
+    const ny = posAttr.getY(index)
+    const nz = posAttr.getZ(index)
+    const pts = new Float32Array(count * 2 * 3)
+    let o = 0
+    for (let i = start; i < end; i += 1) {
+      const nb = adjacency.neighbors[i]
+      pts[o++] = nx; pts[o++] = ny; pts[o++] = nz
+      pts[o++] = posAttr.getX(nb); pts[o++] = posAttr.getY(nb); pts[o++] = posAttr.getZ(nb)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.BufferAttribute(pts, 3))
+    selectionEdges = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
+      color: 0x7fe9e3,
+      transparent: true,
+      opacity: 0.85,
+      depthTest: false,
+      depthWrite: false,
+    }))
+    selectionEdges.renderOrder = 5
+    selectionEdges.frustumCulled = false
+    scene.add(selectionEdges)
+    requestRender()
+  }
+
   function computePath() {
     if (pathStart === null || pathEnd === null) return
     const nodes = graphData.nodes || []
@@ -893,6 +939,7 @@
     pathInfo = null
     pathNodeSet = null
     disposePathLine()
+    disposeSelectionEdges()
     recomputeAlphas()
   }
 
@@ -1111,6 +1158,7 @@
     searchQuery = result.title
     selectedNode = node
     selectedIndex = result.index
+    buildSelectionEdges(result.index)
     focusNode(result.index)
     void loadNodeDetail(node)
   }
@@ -1121,6 +1169,7 @@
     selectedIndex = null
     hoveredNode = null
     halo = { ...halo, visible: false }
+    disposeSelectionEdges()
     requestRender()
   }
 
@@ -1480,6 +1529,7 @@
       selectedNode = nextNode
       selectedIndex = hit.index
       tooltip = { ...tooltip, visible: false }
+      buildSelectionEdges(hit.index)
       void loadNodeDetail(nextNode)
       requestRender()
     } else {
@@ -1672,6 +1722,7 @@
     disposeObject(bridgeLines)
     disposeObject(clusterShells)
     disposePathLine()
+    disposeSelectionEdges()
     renderer?.dispose()
     renderer?.domElement?.remove()
   })
