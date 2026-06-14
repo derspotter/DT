@@ -472,16 +472,21 @@ function decorateGraph3dManifest(manifest, key) {
   // Cache-bust the resource URLs per build. The snapshot key is stable across
   // rebuilds (it excludes DB mtime), and the files carry max-age=600, so a
   // background rebuild could otherwise leave a browser pairing this fresh
-  // manifest with a cached old nodes.bin/edges.bin. The manifest file's mtime
-  // changes on every atomic swap, so tagging the URLs with it makes the browser
-  // refetch the bytes exactly when (and only when) a rebuild has landed.
+  // manifest with a cached old nodes.bin/edges.bin. Take the version from the
+  // manifest's own generated_at — written atomically with the rest of the
+  // manifest and bumped on every rebuild — so the version always matches the
+  // manifest being decorated (no separate stat() that could race a swap).
   let version = '';
-  try {
-    version = String(Math.floor(fs.statSync(graph3dSnapshotPath(key, 'manifest.json')).mtimeMs));
-  } catch {
-    version = '';
+  if (manifest?.generated_at) {
+    version = String(manifest.generated_at);
+  } else {
+    try {
+      version = String(Math.floor(fs.statSync(graph3dSnapshotPath(key, 'manifest.json')).mtimeMs));
+    } catch {
+      version = '';
+    }
   }
-  const v = version ? `?v=${version}` : '';
+  const v = version ? `?v=${encodeURIComponent(version)}` : '';
   return {
     ...manifest,
     source: manifest?.source || 'snapshot',
@@ -5067,6 +5072,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         if (!res.headersSent) res.status(500).end();
         else res.destroy(err);
       });
+      // If the client aborts mid-download, stop reading the file rather than
+      // draining it to EOF (frees the fd and disk I/O on flaky connections).
+      res.on('close', () => stream.destroy());
       return stream.pipe(res);
     }
     return res.sendFile(filePath);

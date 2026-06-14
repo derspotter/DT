@@ -517,7 +517,7 @@
     // Build the curved-edge buffers off the main thread (falls back to a
     // synchronous build if the worker is unavailable). Inputs are cloned, not
     // transferred, so positions/adjacency stay intact on this thread.
-    const { edgePositions, edgeColors, endpointPairs } = await buildEdgeBuffersAsync({
+    const built = await buildEdgeBuffersAsync({
       src: srcArr,
       tgt: tgtArr,
       rel: relArr,
@@ -529,10 +529,11 @@
       dim: [EDGE_DIM_R, EDGE_DIM_G, EDGE_DIM_B],
       grad: [EDGE_BRIGHT_R - EDGE_DIM_R, EDGE_BRIGHT_G - EDGE_DIM_G, EDGE_BRIGHT_B - EDGE_DIM_B],
     })
-    // A newer renderGraph() may have started (and rebuilt the scene) while this
-    // build was off-thread — discard this now-stale result rather than attaching
-    // it on top of the newer geometry.
-    if (generation !== renderGeneration) return
+    // Bail if the build was aborted (teardown → null) or a newer renderGraph()
+    // has started and rebuilt the scene while this build was off-thread — don't
+    // attach now-stale geometry on top of the newer render.
+    if (!built || generation !== renderGeneration) return
+    const { edgePositions, edgeColors, endpointPairs } = built
     edgeEndpoints = endpointPairs
     const lineGeometry = new THREE.BufferGeometry()
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions, 3))
@@ -652,17 +653,17 @@
       edgeWorker = new Worker(new URL('../lib/graphEdges.worker.js', import.meta.url), { type: 'module' })
       edgeWorker.onmessage = (event) => {
         const { id, result } = event.data || {}
-        const resolve = edgeWorkerPending.get(id)
-        if (resolve) {
+        const entry = edgeWorkerPending.get(id)
+        if (entry) {
           edgeWorkerPending.delete(id)
-          resolve(result)
+          entry.resolve(result)
         }
       }
       edgeWorker.onerror = () => {
-        // Reject every in-flight build so each caller can fall back; drop the
-        // worker so subsequent renders go straight to the synchronous path.
+        // Worker failed — fall every in-flight build back to a synchronous build
+        // (we kept the inputs), and drop the worker so later renders skip it.
         edgeWorkerFailed = true
-        for (const [, resolve] of edgeWorkerPending) resolve(null)
+        for (const [, entry] of edgeWorkerPending) entry.resolve(buildEdgeBuffers(entry.params))
         edgeWorkerPending.clear()
         edgeWorker?.terminate?.()
         edgeWorker = null
@@ -681,10 +682,13 @@
     const worker = ensureEdgeWorker()
     if (!worker) return Promise.resolve(buildEdgeBuffers(params))
     const id = edgeWorkerNextId++
+    // Keep params with the resolver so onerror can fall back synchronously and
+    // teardown can resolve a build as aborted (null) — both without leaving the
+    // awaiting renderGraph()/load3DGraph() hanging.
     return new Promise((resolve) => {
-      edgeWorkerPending.set(id, resolve)
+      edgeWorkerPending.set(id, { resolve, params })
       worker.postMessage({ id, params })
-    }).then((result) => result || buildEdgeBuffers(params))
+    })
   }
 
   function passesYearFilter(node) {
@@ -1153,10 +1157,13 @@
     }
     selectedClusterDetail = cluster
     try {
-      selectedClusterDetail = await fetchGraph3DClusterDetail(snapshotKey, cluster.id)
-      clusterDetailCache.set(cacheKey, selectedClusterDetail)
+      const detail = await fetchGraph3DClusterDetail(snapshotKey, cluster.id)
+      clusterDetailCache.set(cacheKey, detail)
+      // Guard against a slower earlier request overwriting a newer selection:
+      // only apply if this cluster is still the selected one (cf. loadNodeDetail).
+      if (Number(cluster.id) === selectedCluster) selectedClusterDetail = detail
     } catch {
-      selectedClusterDetail = cluster
+      if (Number(cluster.id) === selectedCluster) selectedClusterDetail = cluster
     }
   }
 
@@ -1788,9 +1795,14 @@
     disposeObject(clusterShells)
     disposePathLine()
     disposeSelectionEdges()
+    // Resolve any in-flight builds as aborted (null) before terminating, so an
+    // awaiting renderGraph()/load3DGraph() unblocks instead of hanging; the
+    // generation bump makes the post-await guard discard them either way.
+    renderGeneration += 1
+    for (const [, entry] of edgeWorkerPending) entry.resolve(null)
+    edgeWorkerPending.clear()
     edgeWorker?.terminate?.()
     edgeWorker = null
-    edgeWorkerPending.clear()
     renderer?.dispose()
     renderer?.domElement?.remove()
   })
