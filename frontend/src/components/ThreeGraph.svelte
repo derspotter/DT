@@ -8,6 +8,7 @@
   } from '../lib/api'
   import { createNodeQuadMaterial, createEdgeMaterial } from '../lib/graphMaterials'
   import { chooseEdgeSegments } from '../lib/graphGeometry'
+  import { buildEdgeBuffers } from '../lib/graphEdges'
 
   export let autoLoad = true
 
@@ -87,6 +88,17 @@
   let fadeStart = 0
   const nodeDetailCache = new Map()
   const clusterDetailCache = new Map()
+  // Worker that builds the curved-edge buffers off the main thread (the per-edge
+  // Bézier sampling is the heaviest part of a render at the 400k–650k edge
+  // scale). Lazily created; null means "build synchronously on this thread".
+  let edgeWorker = null
+  let edgeWorkerFailed = false
+  let edgeWorkerNextId = 1
+  const edgeWorkerPending = new Map()
+  // Bumped on every renderGraph() so an in-flight async edge build that has been
+  // superseded by a newer render can discard its result instead of attaching
+  // stale geometry.
+  let renderGeneration = 0
 
   const palette = [
     0x0f8b8d,
@@ -216,8 +228,9 @@
     return value.length > max ? `${value.slice(0, max - 1)}…` : value
   }
 
-  function renderGraph() {
+  async function renderGraph() {
     if (!scene || !THREE) return
+    const generation = ++renderGeneration
     disposeObject(points)
     disposeObject(nodeQuads)
     disposeObject(edgeLines)
@@ -487,87 +500,40 @@
 
     const edgeSegments = chooseEdgeSegments(renderCount)
     edgeVertexStride = edgeSegments * 2
-    const edgePositions = new Float32Array(renderCount * edgeVertexStride * 3)
-    const edgeColors = new Float32Array(renderCount * edgeVertexStride * 3)
-    const endpointPairs = new Uint32Array(renderCount * 2)
-    let edgeOffset = 0
-    let edgeColorOffset = 0
-    let appendedEdges = 0
-    const gradR = EDGE_BRIGHT_R - EDGE_DIM_R
-    const gradG = EDGE_BRIGHT_G - EDGE_DIM_G
-    const gradB = EDGE_BRIGHT_B - EDGE_DIM_B
-    const appendEdge = (sourceIndex, targetIndex, relationshipCode = 0) => {
-      const sx = positions[sourceIndex * 3]
-      const sy = positions[sourceIndex * 3 + 1]
-      const sz = positions[sourceIndex * 3 + 2]
-      const tx = positions[targetIndex * 3]
-      const ty = positions[targetIndex * 3 + 1]
-      const tz = positions[targetIndex * 3 + 2]
-      // Control points: pull each endpoint toward its own cluster centroid (or
-      // the graph centre when the cluster is unknown), so same-cluster edges bow
-      // through that centroid and cross-cluster edges follow the centroid trunk.
-      const ca = clusterCentroids.get(Number(nodes[sourceIndex].cluster)) || graphCenter
-      const cb = clusterCentroids.get(Number(nodes[targetIndex].cluster)) || graphCenter
-      const c1x = sx + (ca.x - sx) * BUNDLE_STRENGTH
-      const c1y = sy + (ca.y - sy) * BUNDLE_STRENGTH
-      const c1z = sz + (ca.z - sz) * BUNDLE_STRENGTH
-      const c2x = tx + (cb.x - tx) * BUNDLE_STRENGTH
-      const c2y = ty + (cb.y - ty) * BUNDLE_STRENGTH
-      const c2z = tz + (cb.z - tz) * BUNDLE_STRENGTH
-      // Direction: colour runs from the citing end (amber) to the cited end
-      // (cyan) via t in [0,1] along source->target. references (rel 0): source
-      // cites target, so cited (cyan) is at t=1. cited_by (rel 1): target cites
-      // source, so cited is at t=0 — invert t.
-      const forward = relationshipCode !== 1
-      let px = sx
-      let py = sy
-      let pz = sz
-      let pt = 0
-      for (let seg = 1; seg <= edgeSegments; seg += 1) {
-        const u = seg / edgeSegments
-        const mt = 1 - u
-        const a = mt * mt * mt
-        const b = 3 * mt * mt * u
-        const c = 3 * mt * u * u
-        const d = u * u * u
-        const qx = a * sx + b * c1x + c * c2x + d * tx
-        const qy = a * sy + b * c1y + c * c2y + d * ty
-        const qz = a * sz + b * c1z + c * c2z + d * tz
-        edgePositions[edgeOffset++] = px
-        edgePositions[edgeOffset++] = py
-        edgePositions[edgeOffset++] = pz
-        edgePositions[edgeOffset++] = qx
-        edgePositions[edgeOffset++] = qy
-        edgePositions[edgeOffset++] = qz
-        const f0 = forward ? pt : 1 - pt
-        const f1 = forward ? u : 1 - u
-        edgeColors[edgeColorOffset++] = EDGE_DIM_R + gradR * f0
-        edgeColors[edgeColorOffset++] = EDGE_DIM_G + gradG * f0
-        edgeColors[edgeColorOffset++] = EDGE_DIM_B + gradB * f0
-        edgeColors[edgeColorOffset++] = EDGE_DIM_R + gradR * f1
-        edgeColors[edgeColorOffset++] = EDGE_DIM_G + gradG * f1
-        edgeColors[edgeColorOffset++] = EDGE_DIM_B + gradB * f1
-        px = qx
-        py = qy
-        pz = qz
-        pt = u
-      }
-      endpointPairs[appendedEdges * 2] = sourceIndex
-      endpointPairs[appendedEdges * 2 + 1] = targetIndex
-      appendedEdges += 1
+    // Resolve each node's bundling centroid (its cluster centroid, graph centre
+    // as fallback) into a flat array up front, so the worker's hot loop is pure
+    // typed-array arithmetic with no Map/object access.
+    const nodeCentroid = new Float32Array(nodes.length * 3)
+    for (let i = 0; i < nodes.length; i += 1) {
+      const ctr = clusterCentroids.get(Number(nodes[i].cluster)) || graphCenter
+      nodeCentroid[i * 3] = ctr.x
+      nodeCentroid[i * 3 + 1] = ctr.y
+      nodeCentroid[i * 3 + 2] = ctr.z
     }
-    for (let e = 0; e < renderCount; e += 1) {
-      appendEdge(srcArr[e], tgtArr[e], relArr[e])
-    }
-    // appendEdge never skips, so every buffer is filled exactly to capacity
-    // (edgeOffset === edgePositions.length, appendedEdges === renderCount).
-    // Hand them to the geometry as-is rather than allocating a second
-    // full-size copy via slice() (~60MB of needless churn at ~437k edges).
+    // Build the curved-edge buffers off the main thread (falls back to a
+    // synchronous build if the worker is unavailable). Inputs are cloned, not
+    // transferred, so positions/adjacency stay intact on this thread.
+    const { edgePositions, edgeColors, endpointPairs } = await buildEdgeBuffersAsync({
+      src: srcArr,
+      tgt: tgtArr,
+      rel: relArr,
+      count: renderCount,
+      positions,
+      nodeCentroid,
+      edgeSegments,
+      bundleStrength: BUNDLE_STRENGTH,
+      dim: [EDGE_DIM_R, EDGE_DIM_G, EDGE_DIM_B],
+      grad: [EDGE_BRIGHT_R - EDGE_DIM_R, EDGE_BRIGHT_G - EDGE_DIM_G, EDGE_BRIGHT_B - EDGE_DIM_B],
+    })
+    // A newer renderGraph() may have started (and rebuilt the scene) while this
+    // build was off-thread — discard this now-stale result rather than attaching
+    // it on top of the newer geometry.
+    if (generation !== renderGeneration) return
     edgeEndpoints = endpointPairs
     const lineGeometry = new THREE.BufferGeometry()
     lineGeometry.setAttribute('position', new THREE.BufferAttribute(edgePositions, 3))
     lineGeometry.setAttribute('color', new THREE.BufferAttribute(edgeColors, 3))
-    lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(appendedEdges * edgeVertexStride), 1))
+    lineGeometry.setAttribute('alpha', new THREE.BufferAttribute(new Float32Array(renderCount * edgeVertexStride), 1))
     edgeLines = new THREE.LineSegments(lineGeometry, createEdgeMaterial(THREE))
     edgeLines.frustumCulled = false
     scene.add(edgeLines)
@@ -671,6 +637,50 @@
       p = cursor[cited]++; neighbors[p] = citing; outgoing[p] = 0
     }
     return { offsets, neighbors, outgoing }
+  }
+
+  // Lazily spin up the edge-build worker. Returns null (and latches the failure)
+  // if Workers are unavailable or the module fails to load, so callers fall back
+  // to building synchronously on the main thread.
+  function ensureEdgeWorker() {
+    if (edgeWorker || edgeWorkerFailed) return edgeWorker
+    try {
+      edgeWorker = new Worker(new URL('../lib/graphEdges.worker.js', import.meta.url), { type: 'module' })
+      edgeWorker.onmessage = (event) => {
+        const { id, result } = event.data || {}
+        const resolve = edgeWorkerPending.get(id)
+        if (resolve) {
+          edgeWorkerPending.delete(id)
+          resolve(result)
+        }
+      }
+      edgeWorker.onerror = () => {
+        // Reject every in-flight build so each caller can fall back; drop the
+        // worker so subsequent renders go straight to the synchronous path.
+        edgeWorkerFailed = true
+        for (const [, resolve] of edgeWorkerPending) resolve(null)
+        edgeWorkerPending.clear()
+        edgeWorker?.terminate?.()
+        edgeWorker = null
+      }
+    } catch {
+      edgeWorkerFailed = true
+      edgeWorker = null
+    }
+    return edgeWorker
+  }
+
+  // Build the curved-edge buffers, off the main thread when possible. Inputs are
+  // cloned (not transferred) so a worker failure can fall back to the same
+  // arrays synchronously; the worker transfers the result buffers back.
+  function buildEdgeBuffersAsync(params) {
+    const worker = ensureEdgeWorker()
+    if (!worker) return Promise.resolve(buildEdgeBuffers(params))
+    const id = edgeWorkerNextId++
+    return new Promise((resolve) => {
+      edgeWorkerPending.set(id, resolve)
+      worker.postMessage({ id, params })
+    }).then((result) => result || buildEdgeBuffers(params))
   }
 
   function passesYearFilter(node) {
@@ -1256,7 +1266,7 @@
         : ''
       graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
       await tick()
-      renderGraph()
+      await renderGraph()
     } catch (error) {
       graphStatus = error?.message || 'Failed to load 3D graph.'
     } finally {
@@ -1732,6 +1742,9 @@
     disposeObject(clusterShells)
     disposePathLine()
     disposeSelectionEdges()
+    edgeWorker?.terminate?.()
+    edgeWorker = null
+    edgeWorkerPending.clear()
     renderer?.dispose()
     renderer?.domElement?.remove()
   })
