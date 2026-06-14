@@ -361,6 +361,10 @@
       })
       const shell = new THREE.Mesh(geometry, material)
       shell.position.set(Number(cluster.x || 0), Number(cluster.y || 0) * depthScale, Number(cluster.z || 0))
+      // Carry the cluster + its radius so a ray hit can resolve back to the
+      // territory (picking the most specific shell when several overlap).
+      shell.userData.cluster = cluster
+      shell.userData.radius = radius
       clusterShells.add(shell)
     }
     scene.add(clusterShells)
@@ -1189,6 +1193,8 @@
     selectedNodeDetail = null
     selectedIndex = null
     hoveredNode = null
+    selectedCluster = null
+    selectedClusterDetail = null
     halo = { ...halo, visible: false }
     disposeSelectionEdges()
     requestRender()
@@ -1512,6 +1518,25 @@
     return { destroy() { node.removeEventListener('wheel', handler) } }
   }
 
+  // Pick the territory under the cursor: the most specific (smallest) cluster
+  // shell the ray crosses. Used as a fallback when no node is hit, so clicking a
+  // territory's volume selects it like clicking its label.
+  function pickCluster() {
+    if (!raycaster || !clusterShells?.children?.length) return null
+    let best = null
+    let bestRadius = Infinity
+    for (const intersection of raycaster.intersectObjects(clusterShells.children, false)) {
+      const cluster = intersection.object?.userData?.cluster
+      if (!cluster) continue
+      const radius = Number(intersection.object.userData.radius) || Infinity
+      if (radius < bestRadius) {
+        bestRadius = radius
+        best = cluster
+      }
+    }
+    return best
+  }
+
   function pickNode(event, persist = false) {
     if (!raycaster || !points || !camera) return
     pointerFromEvent(event)
@@ -1552,7 +1577,16 @@
       void loadNodeDetail(nextNode)
       requestRender()
     } else {
-      clearSelection()
+      // No node under the cursor — if the click landed inside a territory,
+      // select that cluster (focus + detail panel, same as clicking its label);
+      // otherwise it's an empty-space click that clears the selection.
+      const cluster = pickCluster()
+      if (cluster) {
+        clearSelection()
+        focusCluster(cluster)
+      } else {
+        clearSelection()
+      }
     }
   }
 
