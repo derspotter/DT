@@ -54,8 +54,9 @@
   let pathNodeSet = null
   let pathLine = null
   let selectionEdges = null
-  // Per-node directed adjacency (CSR: neighbour + outgoing flag) so a selected
-  // node's adjacent edges can be coloured by citation direction in O(degree).
+  // Per-node directed adjacency (CSR: offsets + neighbours + an outgoing flag).
+  // Serves every O(degree) lookup: neighbourhood highlight, BFS pathfinding, and
+  // colouring a selected node's edges by citation direction.
   let directedAdj = null
   let graphData = { nodes: [], edges: [], edgeTriplets: null, positions: null, clusters: [], stats: {} }
   let graphStatus = '3D graph not loaded.'
@@ -76,7 +77,6 @@
   let selectedClusterDetail = null
   let nodeDetailLoading = false
   let highlightIndex = null
-  let adjacency = null
   let edgeEndpoints = null
   let edgeVertexStride = 2
   let yearFrom = null
@@ -477,13 +477,9 @@
       }
     }
 
-    const fullEndpoints = new Uint32Array(validCount * 2)
-    for (let e = 0; e < validCount; e += 1) {
-      fullEndpoints[e * 2] = srcArr[e]
-      fullEndpoints[e * 2 + 1] = tgtArr[e]
-    }
-    adjacency = buildAdjacency(fullEndpoints, nodes.length)
-    // Directed adjacency for per-node citation direction on selection.
+    // One CSR adjacency, built directed. Drives highlight, BFS, and the
+    // direction-coloured selection edges (the outgoing flag is ignored where
+    // only neighbour membership matters).
     directedAdj = buildDirectedAdjacency(srcArr, tgtArr, relArr, validCount, nodes.length)
 
     // Render every edge (no curation). Each is a directional colour gradient
@@ -657,27 +653,6 @@
     requestRender()
   }
 
-  function buildAdjacency(endpoints, nodeCount) {
-    const counts = new Uint32Array(nodeCount)
-    for (let i = 0; i < endpoints.length; i += 2) {
-      counts[endpoints[i]] += 1
-      counts[endpoints[i + 1]] += 1
-    }
-    const offsets = new Uint32Array(nodeCount + 1)
-    for (let i = 0; i < nodeCount; i += 1) {
-      offsets[i + 1] = offsets[i] + counts[i]
-    }
-    const neighbors = new Uint32Array(offsets[nodeCount])
-    const cursor = offsets.slice(0, nodeCount)
-    for (let i = 0; i < endpoints.length; i += 2) {
-      const source = endpoints[i]
-      const target = endpoints[i + 1]
-      neighbors[cursor[source]++] = target
-      neighbors[cursor[target]++] = source
-    }
-    return { offsets, neighbors }
-  }
-
   // CSR adjacency that also records direction: for each node, its neighbours and
   // whether the connecting citation is outgoing (this node cites the neighbour).
   // references (rel 0): src cites tgt. cited_by (rel 1): tgt cites src.
@@ -708,9 +683,9 @@
 
   function highlightNeighborhood(index) {
     const set = new Set([index])
-    if (adjacency) {
-      for (let i = adjacency.offsets[index]; i < adjacency.offsets[index + 1]; i += 1) {
-        set.add(adjacency.neighbors[i])
+    if (directedAdj) {
+      for (let i = directedAdj.offsets[index]; i < directedAdj.offsets[index + 1]; i += 1) {
+        set.add(directedAdj.neighbors[i])
       }
     }
     return set
@@ -803,7 +778,7 @@
 
   // Breadth-first shortest path over the undirected citation adjacency.
   function bfsPath(startIndex, endIndex) {
-    if (!adjacency) return null
+    if (!directedAdj) return null
     const count = (graphData.nodes || []).length
     if (startIndex === endIndex) return [startIndex]
     const prev = new Int32Array(count).fill(-1)
@@ -813,8 +788,8 @@
     let head = 0
     while (head < queue.length) {
       const current = queue[head++]
-      for (let i = adjacency.offsets[current]; i < adjacency.offsets[current + 1]; i += 1) {
-        const next = adjacency.neighbors[i]
+      for (let i = directedAdj.offsets[current]; i < directedAdj.offsets[current + 1]; i += 1) {
+        const next = directedAdj.neighbors[i]
         if (!visited[next]) {
           visited[next] = 1
           prev[next] = current
