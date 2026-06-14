@@ -1035,9 +1035,20 @@
     flyFrame = requestAnimationFrame(step)
   }
 
+  // Select a territory: mark it and open its detail panel, without moving the
+  // camera. This is the in-place selection used when clicking the territory in
+  // the 3D view (mirrors how clicking a node spotlights it without flying).
+  function selectCluster(cluster) {
+    if (!cluster) return
+    selectedCluster = Number(cluster.id)
+    void loadClusterDetail(cluster)
+  }
+
+  // Select a territory AND fly the camera to frame it. Used by the floating
+  // cluster label, which is an explicit "take me there" navigation control.
   function focusCluster(cluster) {
     if (!camera || !controls || !cluster) return
-    selectedCluster = Number(cluster.id)
+    selectCluster(cluster)
     const x = Number(cluster.x || 0)
     const y = Number(cluster.y || 0) * depthScale
     const z = Number(cluster.z || 0)
@@ -1050,7 +1061,6 @@
       target: new THREE.Vector3(x, y, z),
       position: new THREE.Vector3(x + visualRadius * 0.95, y + visualRadius * 0.35, z + visualRadius * 1.55),
     })
-    void loadClusterDetail(cluster)
   }
 
   function focusNode(index) {
@@ -1582,8 +1592,10 @@
       // otherwise it's an empty-space click that clears the selection.
       const cluster = pickCluster()
       if (cluster) {
+        // Select in place (panel only) — clicking a thing in the scene to
+        // inspect it shouldn't yank the camera. The label still flies.
         clearSelection()
-        focusCluster(cluster)
+        selectCluster(cluster)
       } else {
         clearSelection()
       }
