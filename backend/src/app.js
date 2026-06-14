@@ -5039,13 +5039,22 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const acceptsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
     if (acceptsGzip && fs.existsSync(gzPath)) {
       // Serve the pre-gzipped copy (json or binary); the browser transparently
-      // decodes it, so the frontend still receives the raw bytes.
+      // decodes it, so the frontend still receives the raw bytes. Stream it
+      // rather than readFileSync-ing the whole (multi-MB) file into memory on
+      // the event loop for every fetch.
       res.set('Content-Encoding', 'gzip');
       res.set('Content-Type', fileName.endsWith('.json')
         ? 'application/json; charset=utf-8'
         : 'application/octet-stream');
       res.set('Vary', 'Accept-Encoding');
-      return res.send(fs.readFileSync(gzPath));
+      res.set('Content-Length', String(fs.statSync(gzPath).size));
+      const stream = fs.createReadStream(gzPath);
+      stream.on('error', (err) => {
+        console.error('[/api/graph/3d/snapshot] stream error:', err.message);
+        if (!res.headersSent) res.status(500).end();
+        else res.destroy(err);
+      });
+      return stream.pipe(res);
     }
     return res.sendFile(filePath);
   });
