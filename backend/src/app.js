@@ -469,17 +469,30 @@ async function warmGraph3dSnapshot() {
 function decorateGraph3dManifest(manifest, key) {
   const base = `/api/graph/3d/snapshot/${encodeURIComponent(key)}`;
   const files = manifest?.files || {};
+  // Cache-bust the resource URLs per build. The snapshot key is stable across
+  // rebuilds (it excludes DB mtime), and the files carry max-age=600, so a
+  // background rebuild could otherwise leave a browser pairing this fresh
+  // manifest with a cached old nodes.bin/edges.bin. The manifest file's mtime
+  // changes on every atomic swap, so tagging the URLs with it makes the browser
+  // refetch the bytes exactly when (and only when) a rebuild has landed.
+  let version = '';
+  try {
+    version = String(Math.floor(fs.statSync(graph3dSnapshotPath(key, 'manifest.json')).mtimeMs));
+  } catch {
+    version = '';
+  }
+  const v = version ? `?v=${version}` : '';
   return {
     ...manifest,
     source: manifest?.source || 'snapshot',
     snapshot_key: key,
     files: {
       ...files,
-      nodes: `${base}/nodes.bin`,
-      edges: `${base}/edges.bin`,
-      nodes_meta: `${base}/nodes_meta.json`,
-      clusters: `${base}/clusters.json`,
-      manifest: `${base}/manifest.json`,
+      nodes: `${base}/nodes.bin${v}`,
+      edges: `${base}/edges.bin${v}`,
+      nodes_meta: `${base}/nodes_meta.json${v}`,
+      clusters: `${base}/clusters.json${v}`,
+      manifest: `${base}/manifest.json${v}`,
     },
   };
 }
