@@ -14,13 +14,28 @@
 # Requires the gh CLI, authenticated.
 set -euo pipefail
 
+# Fail fast if gh can't talk to the API — otherwise a "(none)" result could just
+# mean "not logged in", silently hiding the very feedback this script exists to
+# surface.
+if ! gh auth status >/dev/null 2>&1; then
+  echo "error: gh CLI is not authenticated — run 'gh auth login'" >&2
+  exit 1
+fi
+
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
 
-# Inline review comments left by Copilot on a PR: "path:line: body".
+# Inline review comments left by Copilot on a PR: "path:line: body". Real API
+# errors (rate limit, permissions, bad repo) are surfaced on stderr; a failure
+# warns and returns empty so an --all sweep keeps going rather than aborting.
 copilot_comments() {
-  gh api "repos/$repo/pulls/$1/comments" --paginate \
-    --jq '.[] | select(.user.login | test("copilot"; "i"))
-          | "  • \(.path):\(.line // .original_line // 0): \(.body | gsub("\n"; " "))"' 2>/dev/null || true
+  local body
+  if ! body=$(gh api "repos/$repo/pulls/$1/comments" --paginate \
+      --jq '.[] | select(.user.login | test("copilot"; "i"))
+            | "  • \(.path):\(.line // .original_line // 0): \(.body | gsub("\n"; " "))"'); then
+    echo "warning: failed to fetch comments for PR #$1" >&2
+    return 0
+  fi
+  printf '%s' "$body"
 }
 
 copilot_reviewed() {
