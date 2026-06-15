@@ -39,6 +39,7 @@
   let handleContextMenu
   let handleKeydown
   let pendingDown = null
+  let tapCandidate = null
   let componentMounted = false
   let initialLoadStarted = false
   let clusterLabelLayer
@@ -1619,7 +1620,9 @@
     const s = String(doi || '').trim()
     if (!s) return null
     if (/^https?:\/\//i.test(s)) return s
-    return `https://doi.org/${s.replace(/^doi:/i, '')}`
+    // Strip an optional "doi:" prefix *and* any whitespace after it, so a stored
+    // "doi: 10.1000/x" doesn't yield "https://doi.org/ 10.1000/x".
+    return `https://doi.org/${s.replace(/^doi:\s*/i, '')}`
   }
   function openAlexHref(id) {
     const s = String(id || '').trim()
@@ -1707,13 +1710,31 @@
     // hold the left pointerdown back (capture phase) and only hand it to
     // OrbitControls once the pointer crosses a small threshold — i.e. it's a
     // real drag. Below the threshold it's a click: select on pointerup.
+    //
+    // This withholding applies to the MOUSE only. Withholding touch pointerdowns
+    // broke OrbitControls' multi-touch gestures (two-finger dolly/pan never saw
+    // the second pointer), so touch passes straight through to OrbitControls and
+    // we only track a tap candidate to keep tap-to-select working.
     const DRAG_DEADZONE = 5
     handleDownCapture = (event) => {
-      if (event.button !== 0 || event.__fromGraph) return
+      if (event.__fromGraph) return
+      if (event.pointerType !== 'mouse') {
+        // Touch/pen: don't withhold — let OrbitControls handle rotate/pinch
+        // natively; remember the start so a stationary tap still selects.
+        tapCandidate = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+        return
+      }
+      if (event.button !== 0) return
       pendingDown = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
       event.stopImmediatePropagation() // withhold from OrbitControls for now
     }
     handleMoveCapture = (event) => {
+      // A touch that moves past the dead-zone is a drag/gesture, not a tap.
+      if (tapCandidate && event.pointerId === tapCandidate.pointerId) {
+        if (Math.hypot(event.clientX - tapCandidate.x, event.clientY - tapCandidate.y) > DRAG_DEADZONE) {
+          tapCandidate = null
+        }
+      }
       if (!pendingDown || event.pointerId !== pendingDown.pointerId) return
       const moved = Math.hypot(event.clientX - pendingDown.x, event.clientY - pendingDown.y)
       if (moved > DRAG_DEADZONE) {
@@ -1737,6 +1758,13 @@
         pendingDown = null
         // never crossed the dead-zone → a click selects (a cancel just clears)
         if (event.type === 'pointerup') pickNode(event, true)
+      }
+      if (tapCandidate && event.pointerId === tapCandidate.pointerId) {
+        const wasTap = event.type === 'pointerup'
+        tapCandidate = null
+        // Stationary touch tap → select (additive to OrbitControls, which does
+        // nothing on a tap with no movement).
+        if (wasTap) pickNode(event, true)
       }
     }
     handleContextMenu = (event) => event.preventDefault()

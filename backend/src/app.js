@@ -5054,7 +5054,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // doesn't re-download several MB of nodes/edges every time.
     res.set('Cache-Control', 'private, max-age=600');
     const gzPath = `${filePath}.gz`;
-    const acceptsGzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] || ''));
+    // Accept gzip unless the client explicitly refused it with q=0.
+    const acceptEncoding = String(req.headers['accept-encoding'] || '');
+    const acceptsGzip = /\bgzip\b/.test(acceptEncoding)
+      && !/\bgzip\s*;\s*q=0(\.0+)?(\s|,|$)/i.test(acceptEncoding);
     if (acceptsGzip && fs.existsSync(gzPath)) {
       // Serve the pre-gzipped copy (json or binary); the browser transparently
       // decodes it, so the frontend still receives the raw bytes. Stream it

@@ -1371,9 +1371,13 @@
     lastTabRefreshAt = now
     pipelineRefreshInFlight = true
     try {
-      const tasks = [
-        loadIngestStats({ quiet: true }),
-      ]
+      // The graph tab renders none of the pipeline/ingest counts, so skip the
+      // ingest-stats query there (completes #35's "don't load workspace data on
+      // the graph tab" — refreshAll already skips it; this is the per-tab path).
+      const tasks = []
+      if (tabId !== 'graph') {
+        tasks.push(loadIngestStats({ quiet: true }))
+      }
       if (diagnosticsEnabled) {
         tasks.push(
           loadPipelineWorkerStatus({ quiet: true }),
