@@ -1693,8 +1693,11 @@
       if (event.__fromGraph) return
       if (event.pointerType !== 'mouse') {
         // Touch/pen: don't withhold — let OrbitControls handle rotate/pinch
-        // natively; remember the start so a stationary tap still selects.
-        tapCandidate = { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
+        // natively; remember the start so a stationary tap still selects. A
+        // second concurrent touch means a multi-touch gesture, not a tap, so
+        // cancel the pending tap instead of letting the new finger overwrite it
+        // (which could otherwise select a node on a two-finger gesture).
+        tapCandidate = tapCandidate ? null : { pointerId: event.pointerId, x: event.clientX, y: event.clientY }
         return
       }
       if (event.button !== 0) return
