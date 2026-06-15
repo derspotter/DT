@@ -76,7 +76,6 @@
   let selectedNodeDetail = null
   let selectedClusterDetail = null
   let nodeDetailLoading = false
-  let highlightIndex = null
   let edgeEndpoints = null
   let edgeVertexStride = 2
   let yearFrom = null
@@ -700,25 +699,14 @@
     return true
   }
 
-  function highlightNeighborhood(index) {
-    const set = new Set([index])
-    if (directedAdj) {
-      for (let i = directedAdj.offsets[index]; i < directedAdj.offsets[index + 1]; i += 1) {
-        set.add(directedAdj.neighbors[i])
-      }
-    }
-    return set
-  }
-
   function recomputeAlphas() {
     if (!points) return
     const nodes = graphData.nodes || []
     const nodeAlphaAttr = points.geometry.getAttribute('alpha')
     if (!nodeAlphaAttr) return
-    const highlightSet = highlightIndex === null ? null : highlightNeighborhood(highlightIndex)
     const pathActive = pathNodeSet !== null && pathNodeSet.size > 0
-    // The year filter always drives the visible count, and path / highlight /
-    // isolation compose on top of it rather than short-circuiting each other.
+    // The year filter always drives the visible count, and path / isolation
+    // compose on top of it rather than short-circuiting each other.
     let visible = 0
     for (let i = 0; i < nodes.length; i += 1) {
       const yearOk = passesYearFilter(nodes[i])
@@ -729,13 +717,7 @@
         alpha = pathNodeSet.has(i) ? 1 : 0.05
       } else if (yearOk) {
         const inIsolated = isolatedCluster === null || Number(nodes[i].cluster) === isolatedCluster
-        if (highlightSet) {
-          // Highlight composes with isolation: a neighbour outside the isolated
-          // territory stays dim.
-          alpha = highlightSet.has(i) && inIsolated ? 1 : 0.06
-        } else {
-          alpha = inIsolated ? 1 : 0.07
-        }
+        alpha = inIsolated ? 1 : 0.07
       }
       nodeAlphaAttr.array[i] = alpha
     }
@@ -766,10 +748,8 @@
             // The bright amber overlay line carries the path; dim the base graph.
             alpha = 0.02
           } else if (isolating && dimmedEndpoint) {
-            // Isolation wins over highlight for edges leaving the territory.
+            // Edges leaving an isolated territory stay dim.
             alpha = 0.015
-          } else if (highlightIndex !== null) {
-            alpha = source === highlightIndex || target === highlightIndex ? 0.85 : 0.02
           } else {
             alpha = baseAlpha
           }
@@ -781,11 +761,6 @@
       edgeAlphaAttr.needsUpdate = true
     }
     requestRender()
-  }
-
-  function applyHighlight(index) {
-    highlightIndex = index
-    recomputeAlphas()
   }
 
   // Click a legend swatch to isolate that territory (dim everything else);
@@ -962,7 +937,6 @@
     tooltip = { ...tooltip, visible: false }
     if (renderer) renderer.domElement.style.cursor = ''
     halo = { ...halo, visible: false }
-    highlightIndex = null
     isolatedCluster = null
     pathStart = null
     pathEnd = null
@@ -1250,7 +1224,6 @@
   async function load3DGraph() {
     graphLoading = true
     graphStatus = 'Building 3D graph snapshot...'
-    highlightIndex = null
     selectedNode = null
     selectedNodeDetail = null
     selectedIndex = null
