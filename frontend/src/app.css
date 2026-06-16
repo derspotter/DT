@@ -3333,16 +3333,6 @@ button.seed-download-tag:focus-visible {
     grid-template-columns: 1fr;
   }
 
-  .layout {
-    grid-template-columns: 1fr;
-  }
-
-  .side-nav {
-    flex-direction: row;
-    flex-wrap: wrap;
-    position: static;
-  }
-
   .graph-layout {
     grid-template-columns: 1fr;
   }
@@ -5047,39 +5037,6 @@ button.seed-download-tag:focus-visible {
     gap: 12px;
   }
 
-  /* Flatten the side-nav into a compact, wrapping pill row at the top so the
-     content (incl. the graph) is reachable without scrolling past the menu. */
-  .layout {
-    grid-template-columns: 1fr;
-    gap: 14px;
-  }
-
-  .side-nav {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 8px;
-    padding: 8px 10px;
-    position: static;
-    top: auto;
-  }
-
-  .nav-group {
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .nav-group-title {
-    display: none;
-  }
-
-  .side-nav button {
-    padding: 8px 12px;
-    font-size: 0.85rem;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-
   /* 3D graph controls: pack two per row instead of one to reclaim ~half the
      vertical space before the canvas; search spans the full width. */
   .graph-3d-controls {
@@ -5116,7 +5073,25 @@ button.seed-download-tag:focus-visible {
    ========================================================================== */
 
 @media (max-width: 1024px) {
-  /* tablet tier — populated by later tasks */
+  /* Side-nav: desktop sidebar collapses to a wrapping pill row. Single source
+     of truth (was duplicated across the old 980px + 780px blocks). */
+  .layout { grid-template-columns: 1fr; gap: 14px; }
+  .side-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+    position: static;
+    top: auto;
+  }
+  .nav-group { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+  .nav-group-title { display: none; }
+  .side-nav button {
+    padding: 12px 16px;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    min-height: 44px;
+  }
 }
 
 @media (max-width: 640px) {
