@@ -97,3 +97,6 @@ node_modules/
 /frontend/dist/
 **/test-results/
 **/playwright-report/
+
+# Local responsive screenshot matrix (baseline/after) — evidence, not source
+artifacts/responsive/

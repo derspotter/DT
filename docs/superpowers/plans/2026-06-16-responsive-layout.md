@@ -278,36 +278,30 @@ git commit -m "style: horizontal-scroll data tables on small screens (keep colum
 
 ---
 
-## Task 5: Pipeline `.corpus-columns` → 1-up on tablet/phone
+## Task 5: Remove dead `.corpus-columns` / `.corpus-column` CSS
 
-`.corpus-columns` (`app.css:3385`) is `repeat(3, 1fr)` and never collapses — the worst phone offender.
+**REVISED after baseline screenshots:** the spec assumed `.corpus-columns` (`app.css:3385`, `repeat(3,1fr)`) was a live phone offender. It is **not used in the current markup** — the live corpus workspace uses `seed-corpus-columns` (already single-column). The `.corpus-columns` / `.corpus-column*` rules are dead CSS. So this task becomes a safe deletion rather than a responsive fix.
 
 **Files:** Modify `frontend/src/app.css`.
 
-- [ ] **Step 1: Stack the pipeline columns in the tablet tier**
+- [ ] **Step 1: Confirm the classes are unused**
 
-In `@media (max-width: 1024px)` add:
+Run: `grep -rn 'corpus-columns\|corpus-column' frontend/src --include=*.svelte`
+Expected: only `seed-corpus-columns` / `seed-corpus-column` appear (those stay). If a bare `corpus-columns`/`corpus-column` class IS found in markup, STOP and treat it as the original responsive task instead (add `.corpus-columns { grid-template-columns: 1fr; }` to the tablet tier).
 
-```css
-  .corpus-columns { grid-template-columns: 1fr; }
-```
+- [ ] **Step 2: Delete the dead rules**
 
-(Each of Raw / Metadata / Downloaded now spans full width; the tables inside keep their own column grid and scroll via Task 4 if needed.)
+Remove the `.corpus-columns { … }`, `.corpus-column { … }`, `.corpus-column h3 { … }`, `.corpus-column h3 .count { … }` blocks (app.css ~3385-3419). Keep `.corpus-table` and everything `seed-corpus-*`.
 
-- [ ] **Step 2: Re-screenshot the corpus pipeline at 390 / 768 / 1024 + desktop 1366**
+- [ ] **Step 3: Build + spot-check the corpus view at 390 / 768 / 1366**
 
-Confirm: one column per stage stacked vertically on tablet/phone, each readable; desktop still 3-up.
-
-- [ ] **Step 3: e2e regression**
-
-Run: `npx playwright test navigation`
-Expected: PASS.
+Run: `cd frontend && npm run build` (expected: clean). Re-screenshot workspace + dashboard; confirm no change (the rules were unused).
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add frontend/src/app.css
-git commit -m "style: stack pipeline columns 1-up on tablet/phone"
+git commit -m "style: remove dead .corpus-columns CSS (unused in markup)"
 ```
 
 ---
