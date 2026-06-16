@@ -4402,16 +4402,6 @@ button.seed-download-tag:focus-visible {
     width: 100%;
   }
 
-  .seed-expansion-row--panel {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .seed-expansion-pill {
-    justify-content: flex-start;
-    flex-wrap: wrap;
-    white-space: normal;
-  }
 }
 
 .seed-source {
@@ -4965,6 +4955,11 @@ button.seed-download-tag:focus-visible {
   .app-shell.workspace-mode .header-panel { padding: 16px 18px; }
   .app-shell.workspace-mode .app-header h1 { font-size: 1.52rem; line-height: 1.08; }
   .header-main__top { grid-template-columns: 1fr; }
+
+  /* Seed-source expansion: stack the pill row so it doesn't overflow in the
+     981–1024 tablet band (previously only handled at <=780px). */
+  .seed-expansion-row--panel { flex-direction: column; align-items: stretch; }
+  .seed-expansion-pill { justify-content: flex-start; flex-wrap: wrap; white-space: normal; }
 }
 
 @media (max-width: 640px) {
