@@ -3283,56 +3283,6 @@ button.seed-download-tag:focus-visible {
 }
 
 @media (max-width: 980px) {
-  .app-header {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .header-panel {
-    min-width: 0;
-    width: 100%;
-    margin-left: 0;
-    border-left: none;
-    border-top: 1px solid rgba(201, 191, 180, 0.72);
-  }
-
-  .header-corpus {
-    grid-template-columns: 1fr;
-  }
-
-  .header-invite {
-    grid-template-columns: 1fr;
-  }
-
-  .header-corpus-actions {
-    justify-content: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .header-user {
-    grid-template-columns: 1fr;
-    justify-items: start;
-    text-align: left;
-  }
-
-  .header-user strong {
-    max-width: 100%;
-  }
-
-  .logout-button {
-    grid-column: 1;
-    grid-row: auto;
-    justify-self: start;
-  }
-
-  .header-pipeline__actions {
-    flex-wrap: wrap;
-  }
-
-  .header-pipeline__stats {
-    grid-template-columns: 1fr;
-  }
-
   .graph-layout {
     grid-template-columns: 1fr;
   }
@@ -4654,16 +4604,6 @@ button.seed-download-tag:focus-visible {
     gap: 16px;
   }
 
-  .app-shell.workspace-mode .header-main,
-  .app-shell.workspace-mode .header-panel {
-    padding: 16px 18px;
-  }
-
-  .app-shell.workspace-mode .app-header h1 {
-    font-size: 1.52rem;
-    line-height: 1.08;
-  }
-
   .app-shell.workspace-mode .content,
   .seed-corpus-workspace {
     overflow: visible;
@@ -4687,10 +4627,6 @@ button.seed-download-tag:focus-visible {
 
   .upstream-map__details {
     grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .header-main__top {
-    grid-template-columns: 1fr;
   }
 
   .upstream-management-form,
@@ -4771,11 +4707,6 @@ button.seed-download-tag:focus-visible {
 }
 
 @media (max-width: 760px) {
-  .app-shell {
-    padding: 12px;
-    gap: 12px;
-  }
-
   .tab-hero {
     grid-template-columns: 1fr;
     padding: 20px;
@@ -4783,27 +4714,6 @@ button.seed-download-tag:focus-visible {
 
   .tab-hero__stats {
     grid-template-columns: 1fr;
-  }
-
-  .app-shell.workspace-mode .header-main,
-  .app-shell.workspace-mode .header-panel {
-    padding: 14px;
-  }
-
-  .app-shell.workspace-mode .app-header h1 {
-    font-size: 1.34rem;
-  }
-
-  .header-panel {
-    gap: 12px;
-  }
-
-  .header-corpus-actions {
-    width: 100%;
-  }
-
-  .header-corpus-actions button {
-    flex: 1 1 0;
   }
 
   .seed-corpus-toolbar {
@@ -4856,10 +4766,6 @@ button.seed-download-tag:focus-visible {
 }
 
 @media (max-width: 560px) {
-  .header-corpus select {
-    font-size: 0.86rem;
-  }
-
   .seed-corpus-toolbar .seed-intake-card,
   .seed-sources-panel,
   .corpus-workspace-shell > .card {
@@ -5013,30 +4919,8 @@ button.seed-download-tag:focus-visible {
   line-height: 1.25;
 }
 
-@media (max-width: 1100px) {
-  .app-shell .header-main.header-main--workspace {
-    grid-template-columns: 1fr;
-    align-items: start;
-  }
-
-  .app-shell .header-main.header-main--workspace .header-main__top {
-    justify-content: flex-start;
-    text-align: left;
-  }
-
-  .header-corpus-picker {
-    width: min(360px, 100%);
-    min-width: 0;
-  }
-}
-
 /* ---- Mobile: compact nav strip + denser controls ---- */
 @media (max-width: 780px) {
-  .app-shell {
-    padding: 12px clamp(12px, 3vw, 18px) 16px;
-    gap: 12px;
-  }
-
   /* 3D graph controls: pack two per row instead of one to reclaim ~half the
      vertical space before the canvas; search spans the full width. */
   .graph-3d-controls {
@@ -5092,8 +4976,41 @@ button.seed-download-tag:focus-visible {
     white-space: nowrap;
     min-height: 44px;
   }
+
+  /* Header / app-shell: stack the two-column header (was 980px + 1100px). */
+  .app-header { flex-direction: column; align-items: stretch; }
+  .header-panel {
+    min-width: 0;
+    width: 100%;
+    margin-left: 0;
+    border-left: none;
+    border-top: 1px solid rgba(201, 191, 180, 0.72);
+  }
+  .header-corpus { grid-template-columns: 1fr; }
+  .header-invite { grid-template-columns: 1fr; }
+  .header-corpus-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .header-user { grid-template-columns: 1fr; justify-items: start; text-align: left; }
+  .header-user strong { max-width: 100%; }
+  .logout-button { grid-column: 1; grid-row: auto; justify-self: start; }
+  .header-pipeline__actions { flex-wrap: wrap; }
+  .header-pipeline__stats { grid-template-columns: 1fr; }
+  .app-shell .header-main.header-main--workspace { grid-template-columns: 1fr; align-items: start; }
+  .app-shell .header-main.header-main--workspace .header-main__top { justify-content: flex-start; text-align: left; }
+  .header-corpus-picker { width: min(360px, 100%); min-width: 0; }
+  .app-shell.workspace-mode .header-main,
+  .app-shell.workspace-mode .header-panel { padding: 16px 18px; }
+  .app-shell.workspace-mode .app-header h1 { font-size: 1.52rem; line-height: 1.08; }
+  .header-main__top { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 640px) {
-  /* phone tier — populated by later tasks */
+  /* Header / app-shell density (was 760px / 780px / 560px). */
+  .app-shell { padding: 12px clamp(12px, 3vw, 18px) 16px; gap: 12px; }
+  .app-shell.workspace-mode .header-main,
+  .app-shell.workspace-mode .header-panel { padding: 14px; }
+  .app-shell.workspace-mode .app-header h1 { font-size: 1.34rem; }
+  .header-panel { gap: 12px; }
+  .header-corpus-actions { width: 100%; }
+  .header-corpus-actions button { flex: 1 1 0; }
+  .header-corpus select { font-size: 0.86rem; }
 }
