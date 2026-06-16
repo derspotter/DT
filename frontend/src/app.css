@@ -5013,4 +5013,17 @@ button.seed-download-tag:focus-visible {
   .header-corpus-actions { width: 100%; }
   .header-corpus-actions button { flex: 1 1 0; }
   .header-corpus select { font-size: 0.86rem; }
+
+  /* Dense data tables: keep columns and scroll sideways (the .table wrapper is
+     already overflow-x:auto) instead of squishing the minmax(0,…) tracks to
+     unreadable widths. min-widths ≈ a readable sum of each variant's tracks. */
+  .table-row.cols-search { min-width: 680px; }
+  .table-row.cols-corpus { min-width: 600px; }
+  .table-row.cols-runs { min-width: 600px; }
+  .table-row.cols-5 { min-width: 620px; }
+  .table-row.cols-6 { min-width: 700px; }
+  .table-row.cols-7 { min-width: 740px; }
+  .table-row.cols-corpus-workspace { min-width: 560px; }
+  .table-row.cols-corpus-main { min-width: 620px; }
+  .table-row.cols-upstream-current { min-width: 640px; }
 }
