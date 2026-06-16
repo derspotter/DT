@@ -5101,3 +5101,24 @@ button.seed-download-tag:focus-visible {
     gap: 8px;
   }
 }
+
+/* ==========================================================================
+   RESPONSIVE  —  single source of truth for adaptive layout
+   Tiers (CSS pixels; width=device-width means high-DPI phones report ~390,
+   tablets ~768 portrait / ~1024 landscape):
+     Desktop  > 1024px   default rules above; never edited here
+     Tablet   <= 1024px  first block below
+     Phone    <= 640px   second block below (assumes the tablet block applied)
+   Auxiliary (justified): short-desktop max-height rule; narrow-phone <=400.
+   Rules are migrated here from the old scattered @media blocks; the old
+   blocks are deleted as their rules move. Phone rules assume the tablet
+   block already applied (cascade), so only add phone-specific overrides.
+   ========================================================================== */
+
+@media (max-width: 1024px) {
+  /* tablet tier — populated by later tasks */
+}
+
+@media (max-width: 640px) {
+  /* phone tier — populated by later tasks */
+}
