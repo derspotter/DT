@@ -4118,16 +4118,22 @@ button.seed-download-tag:focus-visible {
   background: #fffaf2;
 }
 
-/* Keep all Keyword Search controls visually on a single line. */
+/* Query-first: the query input owns the full top row; Field / Author / From /
+   To / actions share the second row. The .seed-search-row is display:contents
+   so its children become direct grid items of the form. */
 .seed-corpus-toolbar .seed-intake-card--search .seed-search-form {
   display: grid;
-  grid-template-columns: minmax(100px, 2fr) 110px minmax(100px, 1fr) 70px 70px max-content;
-  gap: 8px;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1.4fr) 88px 88px max-content;
+  gap: 10px 12px;
   align-items: end;
 }
 
 .seed-corpus-toolbar .seed-intake-card--search .seed-search-row {
   display: contents;
+}
+
+.seed-corpus-toolbar .seed-intake-card--search .seed-search-main {
+  grid-column: 1 / -1;
 }
 
 .seed-corpus-toolbar .seed-intake-card--search label {
@@ -4270,26 +4276,17 @@ button.seed-download-tag:focus-visible {
   min-width: 0;
 }
 
-@container keyword-search (max-width: 620px) {
+/* Narrow card: stack every control on its own full-width line. */
+@container keyword-search (max-width: 520px) {
   .seed-corpus-toolbar .seed-intake-card--search .seed-search-form {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row,
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row:first-of-type,
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row:last-of-type {
-    display: grid;
     grid-template-columns: 1fr;
     gap: 10px;
-    align-items: stretch;
   }
 
   .seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
-    flex-wrap: wrap;
-    justify-content: flex-start;
-    min-height: 0;
+    justify-self: stretch;
+    justify-content: flex-end;
+    width: auto;
   }
 }
 
@@ -4674,20 +4671,6 @@ button.seed-download-tag:focus-visible {
     padding: 12px;
   }
 
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row:first-of-type,
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row {
-    grid-template-columns: 1fr;
-  }
-
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row:last-of-type {
-    grid-template-columns: 1fr;
-  }
-
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
-    flex-wrap: wrap;
-    justify-content: flex-start;
-  }
-
   .seed-source__summary {
     flex-direction: column;
   }
@@ -4914,21 +4897,46 @@ button.seed-download-tag:focus-visible {
   /* Side-nav: desktop sidebar collapses to a wrapping pill row. Single source
      of truth (was duplicated across the old 980px + 780px blocks). */
   .layout { grid-template-columns: 1fr; gap: 14px; }
+  /* Segmented control: a single bordered bar with the tabs as equal segments
+     divided by hairlines, active segment filled. (Was a scatter of bare-text
+     items with only the active one styled.) */
   .side-nav {
     flex-direction: row;
     flex-wrap: wrap;
-    gap: 8px;
-    padding: 10px 12px;
+    gap: 0;
+    padding: 0;
     position: static;
     top: auto;
+    border: 1px solid var(--stroke);
+    border-radius: 12px;
+    overflow: hidden;
   }
-  .nav-group { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+  .nav-group { display: contents; }
   .nav-group-title { display: none; }
   .side-nav button {
-    padding: 12px 16px;
+    flex: 1 1 auto;
+    min-height: 44px;
+    padding: 12px 14px;
     font-size: 0.9rem;
     white-space: nowrap;
-    min-height: 44px;
+    text-align: center;
+    border: 0;
+    border-right: 1px solid var(--stroke);
+    border-radius: 0;
+  }
+  /* No trailing divider after the final segment. */
+  .side-nav .nav-group:last-child button:last-child { border-right: 0; }
+  /* overflow:hidden on the bar would clip the default focus ring, so draw
+     focus inside the segment to keep keyboard focus visible. */
+  .side-nav button:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 2px rgba(15, 139, 141, 0.55);
+  }
+  .side-nav button.active {
+    background: rgba(15, 139, 141, 0.14);
+    color: #0c5f60;
+    border-color: var(--stroke);
+    box-shadow: none;
   }
 
   /* Header / app-shell: stack the two-column header (was 980px + 1100px). */
