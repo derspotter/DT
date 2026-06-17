@@ -4286,6 +4286,7 @@ button.seed-download-tag:focus-visible {
   .seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
     justify-self: stretch;
     justify-content: flex-end;
+    width: auto;
   }
 }
 
@@ -4670,20 +4671,6 @@ button.seed-download-tag:focus-visible {
     padding: 12px;
   }
 
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row:first-of-type,
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row {
-    grid-template-columns: 1fr;
-  }
-
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-row:last-of-type {
-    grid-template-columns: 1fr;
-  }
-
-  .seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
-    flex-wrap: wrap;
-    justify-content: flex-start;
-  }
-
   .seed-source__summary {
     flex-direction: column;
   }
@@ -4936,6 +4923,14 @@ button.seed-download-tag:focus-visible {
     border: 0;
     border-right: 1px solid var(--stroke);
     border-radius: 0;
+  }
+  /* No trailing divider after the final segment. */
+  .side-nav .nav-group:last-child button:last-child { border-right: 0; }
+  /* overflow:hidden on the bar would clip the default focus ring, so draw
+     focus inside the segment to keep keyboard focus visible. */
+  .side-nav button:focus-visible {
+    outline: none;
+    box-shadow: inset 0 0 0 2px rgba(15, 139, 141, 0.55);
   }
   .side-nav button.active {
     background: rgba(15, 139, 141, 0.14);
