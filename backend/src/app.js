@@ -3981,7 +3981,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     },
     filename: function (req, file, cb) {
       const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-      cb(null, uniqueSuffix + '-' + file.originalname);
+      // Strip any directory components from the client-supplied name so a crafted
+      // multipart filename (e.g. "../../etc/x") cannot escape uploadDir. Normalize
+      // backslashes first so Windows-style separators are handled on POSIX too.
+      const safeOriginalName = path.basename(String(file.originalname || '').replace(/\\/g, '/')) || 'upload';
+      cb(null, uniqueSuffix + '-' + safeOriginalName);
     }
   });
 
@@ -4034,9 +4038,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   // --- NEW ENDPOINT: Extract Bibliography ---
   app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const { filename } = req.params;
+    // Reject path-traversal in the filename param (Express decodes %2F/%2E%2E into
+    // the param) so inputPdfPath cannot escape UPLOADS_DIR. Mirrors the guard in
+    // /api/ingest/import-seed.
+    if (!filename || filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+      return res.status(400).json({ error: 'Invalid filename' });
+    }
     const corpusId = req.corpusId;
     const corpusTag = String(corpusId || 'none');
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
+    if (!ensureInsideDirectory(UPLOADS_DIR, inputPdfPath)) {
+      return res.status(400).json({ error: 'Invalid filename' });
+    }
     const baseName = path.basename(filename, path.extname(filename)); // stable ingest_source
     const existingPagesDir = path.join(BIB_OUTPUT_DIR, baseName);
 
