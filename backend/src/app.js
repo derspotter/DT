@@ -4038,14 +4038,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   // --- NEW ENDPOINT: Extract Bibliography ---
   app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const { filename } = req.params;
-    // Reject path-traversal in the filename param (Express decodes %2F/%2E%2E into
-    // the param) so inputPdfPath cannot escape UPLOADS_DIR. Mirrors the guard in
-    // /api/ingest/import-seed.
-    if (!filename || filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
-      return res.status(400).json({ error: 'Invalid filename' });
-    }
+    // Reject path separators (Express decodes %2F into the param) and confirm the
+    // resolved path stays inside UPLOADS_DIR. ensureInsideDirectory is the real
+    // traversal guard (it catches a bare ".."), so we don't reject every ".."
+    // substring — that would 400 legitimate names like "paper..v2.pdf".
     const corpusId = req.corpusId;
     const corpusTag = String(corpusId || 'none');
+    if (!filename || filename.includes('/') || filename.includes('\\')) {
+      return res.status(400).json({ error: 'Invalid filename' });
+    }
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
     if (!ensureInsideDirectory(UPLOADS_DIR, inputPdfPath)) {
       return res.status(400).json({ error: 'Invalid filename' });
@@ -4410,6 +4411,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
                 // 1) cheap default page model (RAG_FEEDER_API_EXTRACT_MODEL)
                 let produced = await runPageMode('APIscraper (page mode)');
+                let producedMode = 'page';
 
                 // 2) cheap INLINE on a 0-yield — the mode switch recovers flaky
                 //    page-mode misses without paying for the pro model.
@@ -4418,6 +4420,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                     process.env.RAG_FEEDER_API_INLINE_CHEAP_MODEL || 'gemini-3-flash-preview';
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Page mode produced 0 references; retrying with cheap inline (${cheapInline}).`);
                   produced = await runInlineMode(`APIscraper inline (${cheapInline})`, cheapInline);
+                  producedMode = 'inline';
                 }
 
                 // 3) last resort: inline with the pro model (RAG_FEEDER_API_INLINE_MODEL)
@@ -4426,16 +4429,17 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                     process.env.RAG_FEEDER_API_INLINE_MODEL || 'gemini-3.1-pro-preview';
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Still 0 references; final fallback to inline (${proInline}).`);
                   produced = await runInlineMode(`APIscraper inline (${proInline})`, proInline);
+                  producedMode = 'inline';
                 }
 
                 if (produced <= 0) {
-                  sendExtractionSignal({ status: 'failed', mode: 'inline', reason: 'zero_after_escalation' });
+                  sendExtractionSignal({ status: 'failed', mode: producedMode, reason: 'zero_after_escalation' });
                   return;
                 }
 
-                console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename} (${produced} reference(s)). Output in ${BIB_OUTPUT_DIR}.`);
+                console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename} (${produced} reference(s) via ${producedMode}). Output in ${BIB_OUTPUT_DIR}.`);
                 send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename} (${produced} reference(s)).`);
-                sendExtractionSignal({ status: 'success', mode: 'page' });
+                sendExtractionSignal({ status: 'success', mode: producedMode });
               } catch (error) {
                 console.error(`[/api/extract-bibliography] Unexpected post-processing error for ${filename}:`, error);
                 sendExtractionSignal({ status: 'failed', reason: 'post_process_error' });
