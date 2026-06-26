@@ -736,6 +736,9 @@
       // (normal blending, so dense areas still layer up).
       const baseAlpha = totalEdges > 200000 ? 0.05 : totalEdges > 60000 ? 0.12 : 0.24
       const isolating = isolatedCluster !== null
+      // A node selection hides the whole base web — the bright `selectionEdges`
+      // overlay carries that node's own connections, so the view shows only them.
+      const selecting = selectedIndex !== null && !pathActive
       for (let edge = 0; edge < totalEdges; edge += 1) {
         const source = edgeEndpoints[edge * 2]
         const target = edgeEndpoints[edge * 2 + 1]
@@ -747,6 +750,9 @@
           if (pathActive) {
             // The bright amber overlay line carries the path; dim the base graph.
             alpha = 0.02
+          } else if (selecting) {
+            // Hide every base edge; the selection overlay shows the node's own.
+            alpha = 0
           } else if (isolating && dimmedEndpoint) {
             // Edges leaving an isolated territory stay dim.
             alpha = 0.015
@@ -1176,6 +1182,7 @@
     selectedNode = node
     selectedIndex = result.index
     buildSelectionEdges(result.index)
+    recomputeAlphas()
     focusNode(result.index)
     void loadNodeDetail(node)
   }
@@ -1189,6 +1196,7 @@
     selectedClusterDetail = null
     halo = { ...halo, visible: false }
     disposeSelectionEdges()
+    recomputeAlphas()
     requestRender()
   }
 
@@ -1565,6 +1573,7 @@
       selectedIndex = hit.index
       tooltip = { ...tooltip, visible: false }
       buildSelectionEdges(hit.index)
+      recomputeAlphas()
       void loadNodeDetail(nextNode)
       requestRender()
     } else {
