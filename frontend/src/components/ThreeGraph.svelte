@@ -739,30 +739,33 @@
       // A node selection hides the whole base web — the bright `selectionEdges`
       // overlay carries that node's own connections, so the view shows only them.
       const selecting = selectedIndex !== null && !pathActive
-      for (let edge = 0; edge < totalEdges; edge += 1) {
-        const source = edgeEndpoints[edge * 2]
-        const target = edgeEndpoints[edge * 2 + 1]
-        const sourceAlpha = nodeAlphaAttr.array[source]
-        const targetAlpha = nodeAlphaAttr.array[target]
-        let alpha = 0
-        if (sourceAlpha > 0 && targetAlpha > 0) {
-          const dimmedEndpoint = sourceAlpha < 0.5 || targetAlpha < 0.5
-          if (pathActive) {
-            // The bright amber overlay line carries the path; dim the base graph.
-            alpha = 0.02
-          } else if (selecting) {
-            // Hide every base edge; the selection overlay shows the node's own.
-            alpha = 0
-          } else if (isolating && dimmedEndpoint) {
-            // Edges leaving an isolated territory stay dim.
-            alpha = 0.015
-          } else {
-            alpha = baseAlpha
+      if (selecting) {
+        // Every base edge is hidden in selection mode, so skip the per-edge walk
+        // (cheap on large graphs) and blank the whole alpha buffer at once.
+        edgeAlphaArray.fill(0)
+      } else {
+        for (let edge = 0; edge < totalEdges; edge += 1) {
+          const source = edgeEndpoints[edge * 2]
+          const target = edgeEndpoints[edge * 2 + 1]
+          const sourceAlpha = nodeAlphaAttr.array[source]
+          const targetAlpha = nodeAlphaAttr.array[target]
+          let alpha = 0
+          if (sourceAlpha > 0 && targetAlpha > 0) {
+            const dimmedEndpoint = sourceAlpha < 0.5 || targetAlpha < 0.5
+            if (pathActive) {
+              // The bright amber overlay line carries the path; dim the base graph.
+              alpha = 0.02
+            } else if (isolating && dimmedEndpoint) {
+              // Edges leaving an isolated territory stay dim.
+              alpha = 0.015
+            } else {
+              alpha = baseAlpha
+            }
           }
+          // Each edge owns `edgeVertexStride` consecutive curve vertices.
+          const base = edge * edgeVertexStride
+          edgeAlphaArray.fill(alpha, base, base + edgeVertexStride)
         }
-        // Each edge owns `edgeVertexStride` consecutive curve vertices.
-        const base = edge * edgeVertexStride
-        edgeAlphaArray.fill(alpha, base, base + edgeVertexStride)
       }
       edgeAlphaAttr.needsUpdate = true
     }
