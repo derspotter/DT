@@ -4150,6 +4150,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             uploadedFileName = null,
             modelOverride = null,
             inlineModelOverride = null,
+            extractModelOverride = null,
             label = 'APIscraper',
           }) => {
             return new Promise((resolve) => {
@@ -4169,6 +4170,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                   ...process.env,
                   ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
                   ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
+                  ...(extractModelOverride ? { RAG_FEEDER_API_EXTRACT_MODEL: extractModelOverride } : {}),
                   PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
                   RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
                   RAG_FEEDER_DB_PATH: DB_PATH,
@@ -4362,18 +4364,78 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                   return;
                 }
 
-                const ok = await runApiScraper({
-                  inputDir: jsonSubDir,
-                  extractMode: 'page',
-                  label: 'APIscraper (page mode)',
-                });
-                if (ok) {
-                  console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename}. Output in ${BIB_OUTPUT_DIR}.`);
-                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename}.`);
-                  sendExtractionSignal({ status: 'success', mode: 'page' });
-                } else {
-                  sendExtractionSignal({ status: 'failed', mode: 'page' });
+                // Measure references this run actually produced, so a page run
+                // that "succeeds" (exit 0) but yields nothing escalates to a
+                // stronger model instead of silently reporting success. Cheap by
+                // default; escalate only when the cheap model returns nothing.
+                const countIngestEntries = () => {
+                  try {
+                    if (!tableExists(authDb, 'ingest_entries')) return 0;
+                    return Number(
+                      authDb
+                        .prepare('SELECT COUNT(*) AS c FROM ingest_entries WHERE ingest_source = ?')
+                        .get(baseName)?.c || 0
+                    );
+                  } catch {
+                    return 0;
+                  }
+                };
+                const beforeCount = countIngestEntries();
+                const runPageMode = async (pageLabel, extractModelOverride = null) => {
+                  await runApiScraper({
+                    inputDir: jsonSubDir,
+                    extractMode: 'page',
+                    extractModelOverride,
+                    label: pageLabel,
+                  });
+                  return countIngestEntries() - beforeCount;
+                };
+                // Inline mode re-reads the whole PDF with a citation-extraction
+                // prompt. Switching MODE (not just bumping the model on the same
+                // flaky page parse) is what recovers a page-mode miss, so a cheap
+                // model in inline mode usually suffices; pro is only a last resort.
+                const runInlineMode = async (inlineLabel, inlineModel) => {
+                  if (!inputExists) return -1; // cannot inline without the source PDF
+                  const chunkPages = inputPageCount && inputPageCount > 12 ? 10 : 0;
+                  await runApiScraper({
+                    inputPdf: inputPdfPath,
+                    extractMode: 'inline',
+                    chunkPages,
+                    uploadedFileName: chunkPages > 0 ? null : sharedUploadedFileName,
+                    inlineModelOverride: inlineModel,
+                    label: inlineLabel,
+                  });
+                  return countIngestEntries() - beforeCount;
+                };
+
+                // 1) cheap default page model (RAG_FEEDER_API_EXTRACT_MODEL)
+                let produced = await runPageMode('APIscraper (page mode)');
+
+                // 2) cheap INLINE on a 0-yield — the mode switch recovers flaky
+                //    page-mode misses without paying for the pro model.
+                if (produced <= 0) {
+                  const cheapInline =
+                    process.env.RAG_FEEDER_API_INLINE_CHEAP_MODEL || 'gemini-3-flash-preview';
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Page mode produced 0 references; retrying with cheap inline (${cheapInline}).`);
+                  produced = await runInlineMode(`APIscraper inline (${cheapInline})`, cheapInline);
                 }
+
+                // 3) last resort: inline with the pro model (RAG_FEEDER_API_INLINE_MODEL)
+                if (produced <= 0) {
+                  const proInline =
+                    process.env.RAG_FEEDER_API_INLINE_MODEL || 'gemini-3.1-pro-preview';
+                  send(`[/api/extract-bibliography][corpus=${corpusTag}] Still 0 references; final fallback to inline (${proInline}).`);
+                  produced = await runInlineMode(`APIscraper inline (${proInline})`, proInline);
+                }
+
+                if (produced <= 0) {
+                  sendExtractionSignal({ status: 'failed', mode: 'inline', reason: 'zero_after_escalation' });
+                  return;
+                }
+
+                console.log(`[/api/extract-bibliography] Bibliography extraction complete for ${filename} (${produced} reference(s)). Output in ${BIB_OUTPUT_DIR}.`);
+                send(`[/api/extract-bibliography][corpus=${corpusTag}] Bibliography extraction complete for ${filename} (${produced} reference(s)).`);
+                sendExtractionSignal({ status: 'success', mode: 'page' });
               } catch (error) {
                 console.error(`[/api/extract-bibliography] Unexpected post-processing error for ${filename}:`, error);
                 sendExtractionSignal({ status: 'failed', reason: 'post_process_error' });
