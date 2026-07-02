@@ -85,6 +85,7 @@
 
   let activeTab = 'workspace'
   let apiStatus = 'unknown'
+  $: backendStatusLabel = apiStatus === 'online' ? 'healthy' : apiStatus === 'offline' ? 'not responding' : 'checking'
   let authStatus = 'loading'
   let authError = ''
   let authUser = null
@@ -3890,7 +3891,7 @@
         <div class="header-main__copy">
           <p class="eyebrow">Korpus Builder</p>
           <p class="subtitle">
-            Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote. API status: {apiStatus}.
+            Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote. Backend: {backendStatusLabel}.
           </p>
         </div>
         <div class="header-stats">
