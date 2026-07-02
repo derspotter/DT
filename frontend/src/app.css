@@ -264,7 +264,7 @@ select {
 
 .header-corpus select {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   min-width: 0;
@@ -313,7 +313,7 @@ select {
 
 .header-invite input {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   width: 100%;
@@ -370,7 +370,7 @@ select {
 
 .header-corpus select {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   min-width: 0;
@@ -419,7 +419,7 @@ select {
 
 .header-invite input {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   width: 100%;
@@ -459,7 +459,7 @@ select {
 }
 
 .header-pipeline__title strong.running {
-  color: #0a5557;
+  color: var(--accent);
   background: rgba(var(--accent-rgb), 0.18);
   border-color: rgba(var(--accent-rgb), 0.35);
 }
@@ -473,7 +473,7 @@ select {
 .pipeline-kpi {
   background: #ffffff;
   border: 1px solid var(--stroke);
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   padding: 7px 9px;
   display: grid;
   gap: 2px;
@@ -570,7 +570,7 @@ select {
 
 .login-form input {
   padding: 12px 14px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
 }
 
@@ -651,7 +651,7 @@ select {
 
 .side-nav button {
   padding: 12px 14px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid transparent;
   background: transparent;
   color: var(--ink);
@@ -948,7 +948,7 @@ select {
   color: white;
   border: none;
   padding: 10px 16px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   font-weight: 600;
   cursor: pointer;
 }
@@ -958,7 +958,7 @@ select {
   color: #3b2f1d;
   border: none;
   padding: 10px 16px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   font-weight: 600;
   cursor: pointer;
 }
@@ -1532,7 +1532,7 @@ select {
 .export-card__filters input,
 .export-card__filters select {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: #fff;
   color: var(--ink);
@@ -1592,7 +1592,7 @@ select {
 
 button.danger {
   padding: 10px 16px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: none;
   background: #b42318;
   color: white;
@@ -1609,7 +1609,7 @@ button.danger:disabled {
   display: grid;
   gap: 12px;
   padding: 9px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   background: #f9f7f4;
   border: 1px solid transparent;
   align-items: center;
@@ -1960,7 +1960,7 @@ button.seed-download-tag:focus-visible {
 .downloads-toolbar .toolbar-input,
 .downloads-toolbar .toolbar-select {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: #fff;
   color: var(--ink);
@@ -2145,16 +2145,17 @@ button.seed-download-tag:focus-visible {
   box-shadow: inset 0 0 0 1px rgba(244, 163, 64, 0.35);
 }
 
-/* Solid teal call-to-action for the load button */
+/* Solid accent call-to-action for the load button */
 .graph-3d-btn-primary {
   border-color: transparent;
   background: var(--accent);
   color: #fff;
-  box-shadow: 0 6px 16px rgba(8, 60, 61, 0.45);
+  box-shadow: 0 6px 16px rgba(var(--accent-rgb), 0.45);
 }
 
 .graph-3d-btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, #16b2b4, #11999b);
+  background: var(--accent);
+  filter: brightness(1.18);
   border-color: transparent;
 }
 
@@ -2185,7 +2186,7 @@ button.seed-download-tag:focus-visible {
 .graph-3d-segment .graph-3d-btn.active {
   background: rgba(var(--accent-rgb), 0.32);
   color: #fbf1ea;
-  box-shadow: inset 0 0 0 1px rgba(72, 209, 204, 0.4);
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-2-rgb), 0.55);
 }
 
 /* Restore the keyboard focus ring the segment reset (box-shadow: none) drops. */
@@ -2223,7 +2224,7 @@ button.seed-download-tag:focus-visible {
 .graph-3d-controls select,
 .graph-3d-controls input {
   min-height: 40px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid rgba(236, 247, 246, 0.2);
   background: rgba(7, 19, 22, 0.55);
   color: #f7efe9;
@@ -2287,7 +2288,7 @@ button.seed-download-tag:focus-visible {
   padding: 4px;
   list-style: none;
   border: 1px solid rgba(236, 247, 246, 0.2);
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   background: #122b31;
   box-shadow: 0 14px 30px rgba(4, 14, 17, 0.55);
   max-height: 320px;
@@ -2740,9 +2741,9 @@ button.seed-download-tag:focus-visible {
 .graph-3d-links a {
   padding: 3px 9px;
   border-radius: 7px;
-  border: 1px solid rgba(72, 209, 204, 0.45);
+  border: 1px solid rgba(var(--accent-2-rgb), 0.5);
   background: rgba(var(--accent-rgb), 0.16);
-  color: #9beae6;
+  color: rgba(var(--accent-2-rgb), 0.95);
   font-size: 0.74rem;
   font-weight: 600;
   text-decoration: none;
@@ -2751,7 +2752,7 @@ button.seed-download-tag:focus-visible {
 
 .graph-3d-links a:hover {
   background: rgba(var(--accent-rgb), 0.3);
-  border-color: rgba(72, 209, 204, 0.8);
+  border-color: rgba(var(--accent-2-rgb), 0.85);
   color: #fbf1ea;
 }
 
@@ -2966,7 +2967,7 @@ button.seed-download-tag:focus-visible {
 .corpus-share select {
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.85rem;
@@ -3264,7 +3265,7 @@ button.seed-download-tag:focus-visible {
 .corpus-filter input,
 .corpus-filter select {
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3360,7 +3361,7 @@ button.seed-download-tag:focus-visible {
 .corpus-select-row {
   width: 100%;
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   text-align: left;
   font: inherit;
   color: inherit;
@@ -3442,7 +3443,7 @@ button.seed-download-tag:focus-visible {
   display: grid;
   gap: 1px;
   border: 1px solid rgba(188, 183, 174, 0.5);
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   padding: 6px 10px;
   background: #fff;
 }
@@ -3549,7 +3550,7 @@ button.seed-download-tag:focus-visible {
 .upstream-browser__target-select select {
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3617,7 +3618,7 @@ button.seed-download-tag:focus-visible {
 .upstream-management-form__field select {
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3661,7 +3662,7 @@ button.seed-download-tag:focus-visible {
 .admin-invite-form input {
   min-height: 42px;
   padding: 10px 12px;
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3758,7 +3759,7 @@ button.seed-download-tag:focus-visible {
   min-height: 40px;
   padding: 8px 12px;
   border: 1px solid var(--stroke);
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   background: white;
   color: var(--ink);
   font-size: 0.88rem;
@@ -4119,7 +4120,7 @@ button.seed-download-tag:focus-visible {
   gap: 10px;
   padding: 7px 9px;
   border: 1px solid var(--stroke);
-  border-radius: 5px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.72);
   color: var(--text);
   text-align: left;
