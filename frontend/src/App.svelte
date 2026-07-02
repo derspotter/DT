@@ -2492,8 +2492,8 @@
         }
       case 'downloaded_elsewhere':
         return candidate?.file_available === true
-          ? { label: 'PDF reusable (other corpus)', className: 'downloaded' }
-          : { label: 'Stale record (other corpus)', className: 'pending' }
+          ? { label: 'PDF reusable', className: 'downloaded', hint: 'Downloaded by another corpus and the file is present — promoting reuses it' }
+          : { label: 'Stale record', className: 'pending', hint: 'Another corpus recorded a download but the file is gone — promoting downloads it fresh' }
       case 'queued_download':
         return { label: 'Download queued', className: 'queued' }
       case 'enriched':
@@ -4334,7 +4334,7 @@
 	                                    {:else}
 	                                      <span
 	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag`}
-	                                        title={candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : ''}
+	                                        title={seedCandidateTag(candidate).hint || (candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : '')}
 	                                      >
 	                                        {seedCandidateTag(candidate).label}
 	                                      </span>

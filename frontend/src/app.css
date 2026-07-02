@@ -1911,7 +1911,11 @@ button.danger:disabled {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: 0.64rem;
-  min-width: max-content;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   padding-inline: 10px;
 }
 
