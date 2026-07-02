@@ -2904,7 +2904,7 @@
         author: searchAuthor,
         yearFrom,
         yearTo,
-        maxResults: Number(searchMaxResults) || 0,
+        maxResults: Math.max(0, Math.trunc(Number(searchMaxResults) || 0)),
         sort: searchSort,
         includeDownstream: false,
         includeUpstream: false,
@@ -4095,7 +4095,7 @@
                   </label>
                   <label>
                     <span>Max results</span>
-                    <input type="number" min="1" placeholder="No cap" bind:value={searchMaxResults} />
+                    <input type="number" min="1" step="1" placeholder="No cap" bind:value={searchMaxResults} />
                   </label>
                   <label>
                     <span>Sort</span>

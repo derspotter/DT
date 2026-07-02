@@ -221,6 +221,26 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     expect(args).not.toContain('--sort')
   })
 
+  test('rejects an unknown sort value', async () => {
+    const res = await doKeywordSearch({
+      query: 'institutional economics',
+      sort: 'banana',
+    })
+
+    expect(res.status).toBe(400)
+  })
+
+  test('truncates a fractional max results value', async () => {
+    const res = await doKeywordSearch({
+      query: 'institutional economics',
+      maxResults: 25.5,
+    })
+
+    expect(res.status).toBe(200)
+    const args = readArgFile(argFile)
+    expect(args[args.indexOf('--max-results') + 1]).toBe('25')
+  })
+
   test('upload process queues DB-driven background jobs', async () => {
     seedPendingWork()
     const res = await doIngestProcess({

@@ -99,6 +99,8 @@ const FRONTEND_URL = process.env.RAG_FEEDER_FRONTEND_URL || 'https://genkia.de';
 const SMTP_FROM = process.env.RAG_FEEDER_SMTP_FROM || process.env.SMTP_FROM || 'noreply@example.com';
 const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
+// Must match SORT_OPTIONS in dl_lit/keyword_search.py
+const KEYWORD_SEARCH_SORTS = new Set(['relevance', 'cited_by_count', 'newest', 'oldest']);
 const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
@@ -4489,8 +4491,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     const field = req.body?.field || 'default';
     // 0 = uncapped; the user opts into a cap via maxResults
-    const maxResults = coerceInt(req.body?.maxResults, 0);
+    const maxResults = Math.max(0, Math.trunc(coerceInt(req.body?.maxResults, 0) ?? 0));
     const sort = typeof req.body?.sort === 'string' ? req.body.sort.trim() : '';
+    if (sort && !KEYWORD_SEARCH_SORTS.has(sort)) {
+      return res.status(400).json({ error: `Unknown sort option: ${sort}` });
+    }
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
     const dbPath = DB_PATH;
