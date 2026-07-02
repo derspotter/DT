@@ -168,3 +168,12 @@ def test_search_openalex_relevance_sort_requires_search_text(monkeypatch):
 def test_search_openalex_rejects_unknown_sort():
     with pytest.raises(ValueError):
         keyword_search.search_openalex("foo", sort="banana")
+
+
+def test_effective_max_results():
+    assert keyword_search.effective_max_results(0) is None
+    assert keyword_search.effective_max_results(-5) is None
+    assert keyword_search.effective_max_results(None) is None
+    assert keyword_search.effective_max_results("") is None
+    assert keyword_search.effective_max_results(25) == 25
+    assert keyword_search.effective_max_results("200") == 200

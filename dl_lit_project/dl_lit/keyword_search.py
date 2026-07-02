@@ -143,6 +143,15 @@ def resolve_openalex_author_ids(author: str, mailto: str | None = None, max_resu
     return ids
 
 
+def effective_max_results(value) -> int | None:
+    """Translate a user-facing cap into a search_openalex cap: <=0/empty means uncapped."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 SORT_OPTIONS = {
     "relevance": "relevance_score:desc",
     "cited_by_count": "cited_by_count:desc",

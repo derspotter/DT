@@ -22,7 +22,7 @@ from dl_lit.OpenAlexScraper import (
     fetch_referenced_work_details,
 )
 from dl_lit.db_manager import DatabaseManager
-from dl_lit.keyword_search import dedupe_results, search_openalex
+from dl_lit.keyword_search import SORT_OPTIONS, dedupe_results, effective_max_results, search_openalex
 from dl_lit.utils import (
     OpenAlexRateLimitExceeded,
     get_global_rate_limiter,
@@ -510,7 +510,9 @@ def main():
     mode.add_argument('--query')
     mode.add_argument('--seed-json', default=None)
     parser.add_argument('--db-path', required=True)
-    parser.add_argument('--max-results', type=int, default=200)
+    parser.add_argument('--max-results', type=int, default=0,
+                        help='Cap on base search results; 0 or negative means no cap.')
+    parser.add_argument('--sort', default=None, choices=sorted(SORT_OPTIONS.keys()))
     parser.add_argument('--author', default=None)
     parser.add_argument('--year-from', type=int, default=None)
     parser.add_argument('--year-to', type=int, default=None)
@@ -574,6 +576,7 @@ def main():
         filters = {
             'mode': mode_label,
             'max_results': args.max_results,
+            'sort': args.sort,
             'year_from': args.year_from,
             'year_to': args.year_to,
             'author': args.author,
@@ -592,12 +595,13 @@ def main():
         if is_query_mode:
             base_items = search_openalex(
                 query=args.query or '',
-                max_results=args.max_results,
+                max_results=effective_max_results(args.max_results),
                 year_from=args.year_from,
                 year_to=args.year_to,
                 author=args.author,
                 field=args.field,
                 mailto=args.mailto,
+                sort=args.sort,
             )
         else:
             seeds = _parse_seed_json(args.seed_json)
