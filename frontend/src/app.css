@@ -145,7 +145,7 @@ select {
 .header-panel {
   padding: 24px;
   background: linear-gradient(180deg, #fcfbf9 0%, #f8f4ef 100%);
-  border-left: 1px solid rgba(201, 191, 180, 0.72);
+  border-left: 1px solid var(--stroke);
   flex: 0 0 auto;
   min-width: min(680px, 58%);
   display: grid;
@@ -164,7 +164,7 @@ select {
   align-items: center;
   gap: 4px 10px;
   padding-bottom: 12px;
-  border-bottom: 1px solid rgba(201, 191, 180, 0.72);
+  border-bottom: 1px solid var(--stroke);
 }
 
 .header-panel--compact .header-user {
@@ -174,9 +174,9 @@ select {
 
 .header-user--compact {
   padding: 10px 12px;
-  border: 1px solid rgba(201, 191, 180, 0.72);
+  border: 1px solid var(--stroke);
   border-radius: var(--radius-md);
-  background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
+  background: var(--surface);
 }
 
 .header-user--compact .eyebrow {
@@ -191,7 +191,7 @@ select {
 .header-user strong {
   font-size: 1rem;
   letter-spacing: 0.01em;
-  color: #20313d;
+  color: var(--ink);
   white-space: nowrap;
   text-overflow: ellipsis;
 }
@@ -294,7 +294,7 @@ select {
 }
 
 .header-invite {
-  border-top: 1px solid rgba(201, 191, 180, 0.72);
+  border-top: 1px solid var(--stroke);
   padding-top: 12px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto;
@@ -400,7 +400,7 @@ select {
 }
 
 .header-invite {
-  border-top: 1px solid rgba(201, 191, 180, 0.72);
+  border-top: 1px solid var(--stroke);
   padding-top: 12px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto;
@@ -972,13 +972,17 @@ select {
 }
 
 .secondary {
-  background: var(--accent-2);
-  color: #3b2f1d;
-  border: none;
-  padding: 10px 16px;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--stroke);
+  padding: 9px 15px;
   border-radius: var(--radius-md);
   font-weight: 600;
   cursor: pointer;
+}
+
+.secondary:hover:not(:disabled) {
+  background: var(--bg-alt);
 }
 
 .upload-list {
@@ -2963,8 +2967,8 @@ button.seed-download-tag:focus-visible {
   width: 100%;
   margin-left: 0;
   padding: 10px 12px;
-  background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(244, 239, 231, 0.92));
-  border: 1px solid rgba(201, 191, 180, 0.72);
+  background: var(--surface);
+  border: 1px solid var(--stroke);
   border-radius: var(--radius-md);
 }
 
@@ -3256,9 +3260,9 @@ button.seed-download-tag:focus-visible {
   gap: 12px;
   margin-bottom: 12px;
   padding: 14px;
-  border: 1px solid rgba(201, 191, 180, 0.72);
+  border: 1px solid var(--stroke);
   border-radius: var(--radius-md);
-  background: linear-gradient(180deg, rgba(252, 250, 247, 0.95), rgba(247, 243, 237, 0.88));
+  background: var(--surface);
 }
 
 .corpus-toolbar__filters {
@@ -3586,7 +3590,7 @@ button.seed-download-tag:focus-visible {
   padding: 14px;
   border: 1px solid rgba(201, 191, 180, 0.78);
   border-radius: var(--radius-md);
-  background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
+  background: var(--surface);
 }
 
 .upstream-management-card--mapping {
@@ -4355,7 +4359,7 @@ button.seed-download-tag:focus-visible {
   padding: 14px;
   border: 1px solid rgba(201, 191, 180, 0.78);
   border-radius: var(--radius-md);
-  background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
+  background: var(--surface);
   margin-bottom: 14px;
 }
 
@@ -4839,11 +4843,13 @@ button.seed-download-tag:focus-visible {
 
 .app-shell .header-main.header-main--workspace .header-main__top {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px 14px;
-  text-align: right;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 8px;
+  justify-self: end;
+  width: min(360px, 100%);
+  text-align: left;
 }
 
 .app-shell .header-main.header-main--workspace > .eyebrow,
@@ -4860,9 +4866,9 @@ button.seed-download-tag:focus-visible {
   gap: 4px;
   min-width: min(280px, 36vw);
   padding: 10px 12px;
-  border: 1px solid rgba(201, 191, 180, 0.72);
+  border: 1px solid var(--stroke);
   border-radius: var(--radius-md);
-  background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
+  background: var(--surface);
   text-align: left;
 }
 
@@ -4990,7 +4996,7 @@ button.seed-download-tag:focus-visible {
     width: 100%;
     margin-left: 0;
     border-left: none;
-    border-top: 1px solid rgba(201, 191, 180, 0.72);
+    border-top: 1px solid var(--stroke);
   }
   .header-corpus { grid-template-columns: 1fr; }
   .header-invite { grid-template-columns: 1fr; }
