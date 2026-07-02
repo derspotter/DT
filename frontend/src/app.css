@@ -723,6 +723,10 @@ select {
   font-size: 1.05rem;
 }
 
+.header-stats strong.status-bad {
+  color: #b42318;
+}
+
 .keyword-search-note {
   font-weight: 400;
   margin-left: 10px;

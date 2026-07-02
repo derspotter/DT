@@ -3891,13 +3891,14 @@
         <div class="header-main__copy">
           <p class="eyebrow">Korpus Builder</p>
           <p class="subtitle">
-            Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote. Backend: {backendStatusLabel}.
+            Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote.
           </p>
         </div>
         <div class="header-stats">
           <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
           <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
           <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+          <span title="Whether the app's backend server answered the most recent request">backend <strong class:status-bad={apiStatus === 'offline'}>{backendStatusLabel}</strong></span>
         </div>
         <div class="header-main__top">
           <label class="header-corpus-picker">
