@@ -1,20 +1,20 @@
 :root {
   color-scheme: light;
-  font-family: 'Space Grotesk', system-ui, sans-serif;
-  --bg: #f6f3ec;
-  --bg-alt: #eee8dc;
-  --ink: #23201b;
-  --muted: #665f55;
-  --accent: #7d3138;
-  --accent-rgb: 125, 49, 56;
-  --accent-2: #c08f36;
-  --accent-2-rgb: 192, 143, 54;
-  --surface: #fffdf8;
-  --stroke: #d8d1c2;
-  --shadow: 0 1px 2px rgba(40, 34, 26, 0.07);
-  --shadow-strong: 0 2px 8px rgba(40, 34, 26, 0.12);
-  --radius-lg: 6px;
-  --radius-md: 4px;
+  font-family: system-ui, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  --bg: #f3f3f0;
+  --bg-alt: #eaeae6;
+  --ink: #1c1c1c;
+  --muted: #5a5a55;
+  --accent: #33502f;
+  --accent-rgb: 51, 80, 47;
+  --accent-2: #6b6b3a;
+  --accent-2-rgb: 148, 148, 96;
+  --surface: #ffffff;
+  --stroke: #c9c9c2;
+  --shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+  --shadow-strong: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --radius-lg: 3px;
+  --radius-md: 2px;
 }
 
 * {
@@ -125,17 +125,16 @@ select {
 
 .eyebrow {
   text-transform: uppercase;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.06em;
   font-size: 0.7rem;
   margin: 0 0 10px;
-  color: var(--accent);
+  color: var(--muted);
 }
 
 .app-header h1 {
   margin: 0 0 10px;
   font-size: 2rem;
-  font-family: 'Instrument Serif', serif;
-  line-height: 1;
+  line-height: 1.2;
 }
 
 .subtitle {
@@ -712,10 +711,9 @@ select {
   gap: 18px;
   padding: 24px;
   border: 1px solid var(--stroke);
-  border-top: 3px solid var(--accent);
   border-radius: var(--radius-lg);
   background: var(--surface);
-  box-shadow: var(--shadow);
+  box-shadow: none;
 }
 
 .tab-hero--workspace {
@@ -738,9 +736,9 @@ select {
 .tab-hero h2 {
   max-width: 760px;
   margin: 0;
-  font-family: 'Instrument Serif', serif;
-  font-size: clamp(2rem, 4vw, 3.4rem);
-  line-height: 0.96;
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.35;
   color: var(--ink);
 }
 
@@ -764,18 +762,13 @@ select {
   align-items: baseline;
   justify-content: flex-start;
   gap: 8px;
-  padding: 8px 2px 8px 12px;
+  padding: 6px 2px 6px 10px;
   border: none;
-  border-left: 3px solid rgba(var(--accent-rgb), 0.55);
+  border-left: 2px solid var(--stroke);
   border-radius: 0;
   background: none;
   color: var(--muted);
   font-size: 0.84rem;
-}
-
-.tab-hero__stats strong {
-  font-family: 'Instrument Serif', serif;
-  font-size: 1.35rem;
 }
 
 .tab-hero__stats strong {
@@ -2018,7 +2011,7 @@ button.seed-download-tag:focus-visible {
   border-radius: var(--radius-md);
   height: 280px;
   overflow-y: auto;
-  font-family: 'Space Grotesk', sans-serif;
+  font-family: system-ui, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
   font-size: 0.85rem;
 }
 
