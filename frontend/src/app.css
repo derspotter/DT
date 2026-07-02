@@ -703,6 +703,29 @@ select {
   max-width: 100%;
 }
 
+.workspace-stats-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 22px;
+  padding: 10px 14px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.workspace-stats-bar span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.workspace-stats-bar strong {
+  color: var(--ink);
+  font-size: 1.05rem;
+}
+
 .tab-hero {
   position: relative;
   overflow: hidden;

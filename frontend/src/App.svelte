@@ -3892,12 +3892,12 @@
           <p class="eyebrow">Korpus Builder</p>
           <h1>Corpus orchestration workspace</h1>
           <p class="subtitle">
-            Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
+            Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote. API status: {apiStatus}.
           </p>
         </div>
         <div class="header-main__top">
           <label class="header-corpus-picker">
-            <span class="eyebrow">Corpus</span>
+            <span class="eyebrow">Corpus Workspace</span>
             <select value={currentCorpusId || ''} on:change={handleSelectCorpus}>
               {#each corpora as corpus}
                 <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
@@ -3940,20 +3940,11 @@
 
     <section class="content">
       {#if activeTab === 'workspace'}
-        <section class="tab-hero tab-hero--workspace">
-          <div class="tab-hero__copy">
-            <p class="eyebrow">Workspace</p>
-            <h2>You are building a corpus — not just browsing one.</h2>
-            <p>
-              Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote.
-            </p>
-          </div>
-          <div class="tab-hero__stats">
-            <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
-            <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
-            <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
-          </div>
-        </section>
+        <div class="workspace-stats-bar">
+          <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
+          <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
+          <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+        </div>
         <div class="seed-corpus-workspace">
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
