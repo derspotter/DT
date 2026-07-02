@@ -481,10 +481,10 @@
   .scraper-hero h2 {
     max-width: 760px;
     margin: 0;
-    font-family: 'Instrument Serif', serif;
-    font-size: clamp(2rem, 4vw, 3.4rem);
-    line-height: 0.96;
-    color: #18313a;
+    font-size: 1.25rem;
+    font-weight: 600;
+    line-height: 1.35;
+    color: var(--ink);
   }
 
   .scraper-hero p:not(.eyebrow) {

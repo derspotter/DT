@@ -8,7 +8,7 @@
   --accent: #33502f;
   --accent-rgb: 51, 80, 47;
   --accent-2: #6b6b3a;
-  --accent-2-rgb: 148, 148, 96;
+  --accent-2-rgb: 107, 107, 58;
   --surface: #ffffff;
   --stroke: #c9c9c2;
   --shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
@@ -2736,7 +2736,7 @@ button.seed-download-tag:focus-visible {
   border-radius: 7px;
   border: 1px solid rgba(var(--accent-2-rgb), 0.5);
   background: rgba(var(--accent-rgb), 0.16);
-  color: rgba(var(--accent-2-rgb), 0.95);
+  color: rgba(236, 247, 246, 0.85);
   font-size: 0.74rem;
   font-weight: 600;
   text-decoration: none;
