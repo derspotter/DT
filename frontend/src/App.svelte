@@ -3889,7 +3889,7 @@
     <header class="app-header">
       <div class="header-main header-main--workspace">
         <div class="header-main__copy">
-          <p class="eyebrow">Korpus Builder</p>
+          <h1 class="eyebrow">Korpus Builder</h1>
           <p class="subtitle">
             Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote.
           </p>
@@ -4293,6 +4293,7 @@
                                 {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
                                 {@const candidateKey = String(candidate?.candidate_key || '')}
                                 {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
+                                {@const candidateTag = seedCandidateTag(candidate)}
                                 <div
                                   class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
                                   on:click={(e) => {
@@ -4326,19 +4327,19 @@
                                     {/if}
                                     {#if canDownloadSeedCandidate(candidate)}
 	                                      <button
-	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag seed-download-tag`}
+	                                        class={`tag ${candidateTag.className} ingest-state-tag seed-download-tag`}
 	                                        type="button"
 	                                        title={`Download available file from work ${candidate.downloaded_work_id}`}
 	                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
 	                                      >
-	                                        {seedCandidateTag(candidate).label}
+	                                        {candidateTag.label}
 	                                      </button>
 	                                    {:else}
 	                                      <span
-	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag`}
-	                                        title={seedCandidateTag(candidate).hint || (candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : '')}
+	                                        class={`tag ${candidateTag.className} ingest-state-tag`}
+	                                        title={candidateTag.hint || (candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : '')}
 	                                      >
-	                                        {seedCandidateTag(candidate).label}
+	                                        {candidateTag.label}
 	                                      </span>
 	                                    {/if}
                                   </span>

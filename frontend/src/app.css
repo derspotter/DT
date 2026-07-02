@@ -137,6 +137,15 @@ select {
   line-height: 1.2;
 }
 
+/* The page h1 doubles as the eyebrow label; keep the eyebrow's look. */
+.app-header h1.eyebrow,
+.app-shell .app-header h1.eyebrow {
+  font-size: 0.7rem;
+  font-weight: 400;
+  line-height: inherit;
+  margin: 0 0 10px;
+}
+
 .subtitle {
   margin: 0;
   color: var(--muted);
