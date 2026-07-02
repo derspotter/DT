@@ -34,7 +34,6 @@ except Exception as exc:  # pragma: no cover
     raise RuntimeError("pikepdf is required for PDF page extraction") from exc
 
 try:
-    from google import genai
     from google.genai import types
 except Exception as exc:  # pragma: no cover
     raise RuntimeError("google-genai is required (pip install google-genai)") from exc
@@ -49,6 +48,8 @@ try:
     from dl_lit.utils import get_global_rate_limiter
 except Exception:  # pragma: no cover
     get_global_rate_limiter = None
+
+from dl_lit.llm_provider import get_client
 
 
 MODEL_NAME = os.getenv("RAG_FEEDER_GEMINI_MODEL", "gemini-3-flash-preview")
@@ -83,13 +84,7 @@ GET_BIB_RETRY_BACKOFF_SECONDS = _env_float("RAG_FEEDER_GET_BIB_RETRY_BACKOFF_SEC
 
 
 load_dotenv()
-api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-api_client = None
-if api_key:
-    try:
-        api_client = genai.Client(api_key=api_key)
-    except Exception:
-        api_client = None
+api_client = get_client()
 
 
 SECTION_JSON_RE = re.compile(r"```json\s*([\s\S]*?)\s*```", re.IGNORECASE)
