@@ -73,7 +73,7 @@
     if (item.status === 'matched') return 'Matched';
     if (DOWNLOADED_STATUSES.has(item.status)) return 'Downloaded';
     if (!item.status || RAW_STATUSES.has(item.status)) {
-      return 'Raw';
+      return 'Seed';
     }
     return bucketLabel(bucket);
   }
@@ -143,11 +143,17 @@
         <span class="muted small">Pipeline Stage</span>
         <select bind:value={stageFilter}>
           <option value="all">All stages ({corpusTotal || corpusItems.length})</option>
-          <option value="raw">Raw / Seeds ({rawTotal || 0})</option>
-          <option value="metadata">Metadata / Enriching ({metadataTotal || 0})</option>
-          <option value="failed_enrichment">Failed enrichments ({failedEnrichmentTotal || 0})</option>
-          <option value="failed_download">Failed downloads ({failedDownloadTotal || 0})</option>
-          <option value="downloaded">Downloaded ({downloadedTotal || 0})</option>
+          <optgroup label="Seed stage">
+            <option value="raw">Seed / raw ({rawTotal || 0})</option>
+          </optgroup>
+          <optgroup label="Promoted">
+            <option value="metadata">Fetching bibliographic metadata ({metadataTotal || 0})</option>
+            <option value="failed_enrichment">Failed enrichments ({failedEnrichmentTotal || 0})</option>
+          </optgroup>
+          <optgroup label="Downloaded">
+            <option value="downloaded">Downloaded ({downloadedTotal || 0})</option>
+            <option value="failed_download">Failed downloads ({failedDownloadTotal || 0})</option>
+          </optgroup>
         </select>
       </label>
     </div>
@@ -183,8 +189,11 @@
           tabindex="0"
         >
           <span class="corpus-row-main">
-            <span class="corpus-row-title line-clamp-2" title={item.title}>
-              {item.title || 'Untitled'}
+            <span class="corpus-title-line">
+              <span class={`disclosure-chevron ${selected ? 'open' : ''}`} aria-hidden="true">▸</span>
+              <span class="corpus-row-title line-clamp-2" title={item.title}>
+                {item.title || 'Untitled'}
+              </span>
             </span>
           </span>
           <span class="nowrap">{item.year || '-'}</span>
