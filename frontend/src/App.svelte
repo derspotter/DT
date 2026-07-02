@@ -2622,7 +2622,7 @@
       const payload = await fetchSeedSources(100)
       seedSources = payload.sources || []
       const validSourceIds = new Set(seedSources.map((source) => seedSourceId(source)))
-      if (!quiet && expandedSeedSourceId && !validSourceIds.has(expandedSeedSourceId)) {
+      if (expandedSeedSourceId && !validSourceIds.has(expandedSeedSourceId)) {
         expandedSeedSourceId = ''
       }
       seedSelections = Object.fromEntries(
