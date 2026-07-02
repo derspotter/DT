@@ -143,16 +143,40 @@ def resolve_openalex_author_ids(author: str, mailto: str | None = None, max_resu
     return ids
 
 
+def effective_max_results(value) -> int | None:
+    """Translate a user-facing cap into a search_openalex cap: <=0/empty means uncapped."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+SORT_OPTIONS = {
+    "relevance": "relevance_score:desc",
+    "cited_by_count": "cited_by_count:desc",
+    "newest": "publication_date:desc",
+    "oldest": "publication_date:asc",
+}
+
+
 def search_openalex(query: str,
-                    max_results: int = 200,
+                    max_results: int | None = 200,
                     year_from: int | None = None,
                     year_to: int | None = None,
                     mailto: str | None = None,
                     field: str | None = "default",
-                    author: str | None = None) -> list[dict]:
+                    author: str | None = None,
+                    sort: str | None = None) -> list[dict]:
     raw_query = (query or '').strip()
     openalex_query = build_openalex_query_text(raw_query) if raw_query else ''
     rate_limiter = get_global_rate_limiter()
+
+    sort_value = None
+    if sort:
+        sort_value = SORT_OPTIONS.get(str(sort).strip().lower())
+        if sort_value is None:
+            raise ValueError(f"Unknown sort option: {sort}")
 
     params = {
         "per-page": 200,
@@ -206,6 +230,10 @@ def search_openalex(query: str,
     if not openalex_query and "filter" not in params:
         raise QuerySyntaxError("Search requires query text or at least one filter")
 
+    # relevance_score sorting is only valid when a search term is present
+    if sort_value and not (sort_value.startswith("relevance") and not openalex_query):
+        params["sort"] = sort_value
+
     # Use cursor-based pagination for robustness
     params["cursor"] = "*"
     results: list[dict] = []
@@ -219,7 +247,7 @@ def search_openalex(query: str,
                 continue
             seen_ids.add(item_id)
             results.append(item)
-            if len(results) >= max_results:
+            if max_results is not None and len(results) >= max_results:
                 return results
         next_cursor = data.get("meta", {}).get("next_cursor")
         if not next_cursor:
