@@ -98,3 +98,73 @@ def test_search_openalex_author_only_filter(monkeypatch):
 
     assert "search" not in captured
     assert captured["filter"] == "authorships.author.id:A123"
+
+
+def test_search_openalex_uncapped_pages_until_cursor_exhausted(monkeypatch):
+    class DummyLimiter:
+        def wait_if_needed(self, *_args, **_kwargs):
+            return None
+
+    pages = [
+        {"results": [{"id": f"W{i}"} for i in range(200)], "meta": {"next_cursor": "c2"}},
+        {"results": [{"id": f"W{200 + i}"} for i in range(50)], "meta": {"next_cursor": None}},
+    ]
+    calls = []
+
+    def fake_request(endpoint, params, rate_limiter, retries: int = 3):
+        assert endpoint == "works"
+        calls.append(dict(params))
+        return pages[len(calls) - 1]
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake_request)
+    monkeypatch.setattr(keyword_search, "get_global_rate_limiter", lambda: DummyLimiter())
+
+    results = keyword_search.search_openalex("foo", max_results=None)
+
+    assert len(results) == 250
+    assert len(calls) == 2
+
+
+def test_search_openalex_sort_param(monkeypatch):
+    captured = {}
+
+    class DummyLimiter:
+        def wait_if_needed(self, *_args, **_kwargs):
+            return None
+
+    def fake_request(endpoint, params, rate_limiter, retries: int = 3):
+        captured.update(params)
+        return {"results": [], "meta": {}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake_request)
+    monkeypatch.setattr(keyword_search, "get_global_rate_limiter", lambda: DummyLimiter())
+
+    keyword_search.search_openalex("foo", max_results=1, sort="cited_by_count")
+
+    assert captured["sort"] == "cited_by_count:desc"
+
+
+def test_search_openalex_relevance_sort_requires_search_text(monkeypatch):
+    captured = {}
+
+    class DummyLimiter:
+        def wait_if_needed(self, *_args, **_kwargs):
+            return None
+
+    def fake_request(endpoint, params, rate_limiter, retries: int = 3):
+        if endpoint == "authors":
+            return {"results": [{"id": "https://openalex.org/A123", "display_name": "Elinor Ostrom"}]}
+        captured.update(params)
+        return {"results": [], "meta": {}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake_request)
+    monkeypatch.setattr(keyword_search, "get_global_rate_limiter", lambda: DummyLimiter())
+
+    keyword_search.search_openalex("", max_results=1, author="Elinor Ostrom", sort="relevance")
+
+    assert "sort" not in captured
+
+
+def test_search_openalex_rejects_unknown_sort():
+    with pytest.raises(ValueError):
+        keyword_search.search_openalex("foo", sort="banana")
