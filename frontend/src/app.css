@@ -3160,6 +3160,25 @@ button.seed-download-tag:focus-visible {
   min-width: 0;
 }
 
+.corpus-title-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.disclosure-chevron {
+  display: inline-block;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+  font-size: 0.8em;
+  opacity: 0.6;
+}
+
+.disclosure-chevron.open {
+  transform: rotate(90deg);
+}
+
 .corpus-row-title {
   min-width: 0;
   overflow-wrap: anywhere;

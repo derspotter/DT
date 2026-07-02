@@ -144,6 +144,8 @@
   $: pipelineRawCount = Number(ingestStats.raw_pending || 0)
   $: pipelineMetadataCount = Number(ingestStats.matched || 0)
   $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
+  $: itemsFoundCount = seedSources.reduce((total, source) => total + (Number(source?.candidate_count) || 0), 0)
+  $: itemsPromotedCount = Number(corpusTotal) || corpusItems.length
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
@@ -3941,9 +3943,9 @@
             </p>
           </div>
           <div class="tab-hero__stats">
-            <span><strong>{seedSources.length}</strong> seeds</span>
-            <span><strong>{pipelineMetadataCount}</strong> bibliographic metadata</span>
-            <span><strong>{pipelineDownloadedCount}</strong> downloaded</span>
+            <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
+            <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
+            <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
           </div>
         </section>
         <div class="seed-corpus-workspace">
@@ -4105,7 +4107,7 @@
         <div class="card seed-sources-panel" data-testid="seed-panel">
           <div class="workspace-panel-header">
             <div class="workspace-panel-title">
-              <h3 class="workspace-section-title">2. Seed</h3>
+              <h3 class="workspace-section-title">2. Seed <span class="muted small">({seedSources.length})</span></h3>
               <p class="muted">Every seed document and search run lands here as a seed. Expand one to review its items and promote the keepers to the corpus.</p>
             </div>
             <div class="workspace-panel-actions">
@@ -4248,7 +4250,7 @@
 	                          {/if}
 	                        {/if}
                       </div>
-                      <span class="muted small">{isExpanded ? 'Hide' : 'Show'}</span>
+                      <span class={`disclosure-chevron ${isExpanded ? 'open' : ''}`} aria-hidden="true">▸</span>
                     </div>
                   </div>
 
