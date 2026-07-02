@@ -211,6 +211,8 @@
   let searchAuthor = ''
   let yearFrom = ''
   let yearTo = ''
+  let searchMaxResults = ''
+  let searchSort = 'relevance'
   let includeDownstream = false
   let includeUpstream = false
   let relatedDepthDownstream = 0
@@ -2902,6 +2904,8 @@
         author: searchAuthor,
         yearFrom,
         yearTo,
+        maxResults: Number(searchMaxResults) || 0,
+        sort: searchSort,
         includeDownstream: false,
         includeUpstream: false,
         relatedDepthDownstream: 0,
@@ -2918,7 +2922,7 @@
         await loadSeedSources()
         await focusSeedSource('search', runId)
       }
-      searchStatus = `Search complete. Added ${data.length} candidate(s) to Seed.${suffix}`
+      searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -3092,6 +3096,8 @@
     searchAuthor = ''
     yearFrom = ''
     yearTo = ''
+    searchMaxResults = ''
+    searchSort = 'relevance'
     searchStatus = ''
     searchSource = ''
     searchSelection = []
@@ -4086,6 +4092,19 @@
                   <label>
                     <span>To</span>
                     <input type="number" placeholder="Year" bind:value={yearTo} />
+                  </label>
+                  <label>
+                    <span>Max results</span>
+                    <input type="number" min="1" placeholder="No cap" bind:value={searchMaxResults} />
+                  </label>
+                  <label>
+                    <span>Sort</span>
+                    <select bind:value={searchSort}>
+                      <option value="relevance">Relevance (OpenAlex default)</option>
+                      <option value="cited_by_count">Most cited</option>
+                      <option value="newest">Newest</option>
+                      <option value="oldest">Oldest</option>
+                    </select>
                   </label>
                   <div class="seed-search-actions">
                     <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
