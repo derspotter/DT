@@ -2133,7 +2133,7 @@ function getPdfPageCountSync(pdfPath) {
   }
 }
 
-function geminiUploadPdfSync(pdfPath) {
+function llmUploadPdfSync(pdfPath) {
   const code = [
     'import json',
     'import os',
@@ -2185,7 +2185,7 @@ function geminiUploadPdfSync(pdfPath) {
   return parsed.name;
 }
 
-function geminiDeleteUploadedSync(uploadedFileName) {
+function llmDeleteUploadedSync(uploadedFileName) {
   if (!uploadedFileName) return;
   const code = [
     'import sys',
@@ -2203,7 +2203,7 @@ function geminiDeleteUploadedSync(uploadedFileName) {
   });
   if (result.status !== 0) {
     console.warn(
-      `[/api/extract-bibliography] Failed to delete uploaded Gemini file ${uploadedFileName}: ${result.stderr || result.stdout}`
+      `[/api/extract-bibliography] Failed to delete uploaded LLM file ${uploadedFileName}: ${result.stderr || result.stdout}`
     );
   }
 }
@@ -4122,7 +4122,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           if (!sharedUploadedFileName) return;
           const toDelete = sharedUploadedFileName;
           sharedUploadedFileName = null;
-          geminiDeleteUploadedSync(toDelete);
+          llmDeleteUploadedSync(toDelete);
         };
 
         try {
@@ -4137,7 +4137,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           // get_bib_pages and inline fallback to avoid a second upload.
           if (inputExists && inputPageCount && inputPageCount <= 50) {
             try {
-              sharedUploadedFileName = geminiUploadPdfSync(inputPdfPath);
+              sharedUploadedFileName = llmUploadPdfSync(inputPdfPath);
               console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
               send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
             } catch (uploadErr) {

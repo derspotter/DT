@@ -104,6 +104,9 @@ class _OpenAIModels:
             name = getattr(item, "name", None)
             if isinstance(name, str) and name.startswith(LOCAL_HANDLE_PREFIX):
                 handle = item if isinstance(item, LocalFileHandle) else LocalFileHandle(name=name)
+                # OpenAI's documented PDF-input content part for chat completions
+                # (platform.openai.com/docs/guides/pdf-files). Compatible servers
+                # without PDF support reject it with a 4xx, surfaced verbatim below.
                 encoded = base64.b64encode(handle.path.read_bytes()).decode("ascii")
                 parts.append({
                     "type": "file",
