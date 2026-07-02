@@ -24,7 +24,6 @@ from threading import Lock
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from google import genai
 from google.genai import types
 
 try:
@@ -36,6 +35,7 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dl_lit.db_manager import DatabaseManager
+from dl_lit.llm_provider import get_client
 from dl_lit.utils import get_global_rate_limiter
 try:
     from pydantic import BaseModel, ValidationError
@@ -234,27 +234,15 @@ if BaseModel:
 
 # --- Helper Functions ---
 
-def load_api_key():
-    """Loads the appropriate API key based on the chosen model."""
-    load_dotenv() # Load .env for local execution
-    key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
-    if not key:
-        print("[ERROR] GEMINI_API_KEY (or GOOGLE_API_KEY) not found.", flush=True)
-    return key
-
 def configure_api_client():
-    """Configures the API client/model."""
+    """Configures the LLM client for the selected provider."""
     global api_client
-    api_key = load_api_key()
-    if not api_key:
-        return False
-
     try:
-        api_client = genai.Client(api_key=api_key)
-        print("[INFO] Successfully configured Google client.", flush=True)
+        api_client = get_client(required=True)
+        print("[INFO] Successfully configured LLM client.", flush=True)
         return True
     except Exception as e:
-        print(f"[ERROR] Failed to configure API client: {e}", flush=True)
+        print(f"[ERROR] Failed to configure LLM client: {e}", flush=True)
         api_client = None
         return False
 

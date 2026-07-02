@@ -58,8 +58,7 @@ try:
 except Exception:  # pragma: no cover
     aiplatform = None
 
-from google import genai
-# Removed incompatible google.genai.types imports
+from dl_lit.llm_provider import get_client
 
 
 class BibliographyEnhancer:
@@ -93,8 +92,7 @@ class BibliographyEnhancer:
         # Set model ID
         self.MODEL_ID = "gemini-2.5-flash"
 
-        api_key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
-        self.client = genai.Client(api_key=api_key) if api_key else None
+        self.client = get_client()
         # Google Search for grounding (disabled for compatibility)
         # self.google_search_tool = Tool(google_search=GoogleSearch())
         self.proxies = self._resolve_vpn_proxies(proxies)

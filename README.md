@@ -48,6 +48,25 @@ Status lives directly on `works`:
 1. Set `.env` values (at least `GOOGLE_API_KEY`, optional `OPENALEX_API_KEY`).
 2. Start stack:
    - `docker compose up -d`
+
+### LLM provider
+
+Bibliography extraction uses Google Gemini by default. To use an
+OpenAI-compatible endpoint instead (OpenAI itself, or self-hosted servers such
+as vLLM/Ollama that implement `/chat/completions` with Bearer auth), set in
+`.env`:
+
+- `RAG_FEEDER_LLM_PROVIDER=openai`
+- `OPENAI_API_KEY=<key>` (any non-empty value for local servers without auth)
+- `RAG_FEEDER_OPENAI_MODEL=<model id>` (must accept PDF file inputs, i.e. a vision-capable model)
+- `RAG_FEEDER_OPENAI_BASE_URL` (optional; default `https://api.openai.com/v1`)
+
+In OpenAI mode PDFs are sent inline as base64 with each request (OpenAI's PDF
+file-input content part) instead of via the Gemini Files API, so the endpoint
+and model must support PDF inputs. Endpoints with non-standard URL or auth
+shapes (e.g. Azure OpenAI's `api-key` header and deployment URLs) need an
+OpenAI-compatible gateway in front. Misconfiguration (missing key or model)
+fails fast with a clear error instead of silently falling back to Gemini.
 3. Open:
    - `http://localhost:5175`
 

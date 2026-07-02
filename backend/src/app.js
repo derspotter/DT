@@ -2133,7 +2133,7 @@ function getPdfPageCountSync(pdfPath) {
   }
 }
 
-function geminiUploadPdfSync(pdfPath) {
+function llmUploadPdfSync(pdfPath) {
   const code = [
     'import json',
     'import os',
@@ -2141,12 +2141,15 @@ function geminiUploadPdfSync(pdfPath) {
     'import sys',
     'import tempfile',
     'import unicodedata',
-    'from google import genai',
-    'key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")',
-    'assert key, "Missing GEMINI_API_KEY/GOOGLE_API_KEY"',
-    'client = genai.Client(api_key=key)',
+    'from dl_lit.llm_provider import OpenAICompatClient, get_client',
+    'client = get_client(required=True)',
     'pdf_path = sys.argv[1]',
     'base = os.path.basename(pdf_path)',
+    'if isinstance(client, OpenAICompatClient):',
+    '    # Local handles must reference a persistent path; no remote upload happens.',
+    '    f = client.files.upload(file=pdf_path, config={"mime_type":"application/pdf","display_name":base})',
+    '    print(json.dumps({"name": f.name}))',
+    '    sys.exit(0)',
     'norm = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")',
     'safe = "".join((c if (c.isalnum() or c in "._-") else "_") for c in norm).strip("._") or "upload"',
     'if not safe.lower().endswith(".pdf"):',
@@ -2182,14 +2185,12 @@ function geminiUploadPdfSync(pdfPath) {
   return parsed.name;
 }
 
-function geminiDeleteUploadedSync(uploadedFileName) {
+function llmDeleteUploadedSync(uploadedFileName) {
   if (!uploadedFileName) return;
   const code = [
-    'import os, sys',
-    'from google import genai',
-    'key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")',
-    'assert key, "Missing GEMINI_API_KEY/GOOGLE_API_KEY"',
-    'client = genai.Client(api_key=key)',
+    'import sys',
+    'from dl_lit.llm_provider import get_client',
+    'client = get_client(required=True)',
     'client.files.delete(name=sys.argv[1])',
     'print("ok")',
   ].join('; ');
@@ -2202,7 +2203,7 @@ function geminiDeleteUploadedSync(uploadedFileName) {
   });
   if (result.status !== 0) {
     console.warn(
-      `[/api/extract-bibliography] Failed to delete uploaded Gemini file ${uploadedFileName}: ${result.stderr || result.stdout}`
+      `[/api/extract-bibliography] Failed to delete uploaded LLM file ${uploadedFileName}: ${result.stderr || result.stdout}`
     );
   }
 }
@@ -4121,7 +4122,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           if (!sharedUploadedFileName) return;
           const toDelete = sharedUploadedFileName;
           sharedUploadedFileName = null;
-          geminiDeleteUploadedSync(toDelete);
+          llmDeleteUploadedSync(toDelete);
         };
 
         try {
@@ -4136,7 +4137,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           // get_bib_pages and inline fallback to avoid a second upload.
           if (inputExists && inputPageCount && inputPageCount <= 50) {
             try {
-              sharedUploadedFileName = geminiUploadPdfSync(inputPdfPath);
+              sharedUploadedFileName = llmUploadPdfSync(inputPdfPath);
               console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
               send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
             } catch (uploadErr) {
