@@ -1304,6 +1304,10 @@
         if (activeTab !== 'corpus') {
           tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
         }
+        // The Seed panel has no manual refresh; keep its state counts current on worker ticks.
+        if (activeTab === 'workspace') {
+          tasks.push(loadSeedSources({ quiet: true }))
+        }
         if (diagnosticsEnabled) {
           tasks.push(
             loadPipelineWorkerStatus({ quiet: true }),
@@ -1384,7 +1388,7 @@
           loadDownloadWorkerStatus({ quiet: true }),
         )
       }
-      if (tabId === 'workspace' && seedSources.length === 0) {
+      if (tabId === 'workspace') {
         tasks.push(loadSeedSources({ quiet: true }))
       }
       if (tabId === 'dashboard' || tabId === 'workspace') {
@@ -2613,7 +2617,7 @@
   }
 
   async function loadSeedSources({ quiet = false } = {}) {
-    if (!quiet) seedSourcesStatus = 'Loading seed sources...'
+    if (!quiet) seedSourcesStatus = 'Loading seeds...'
     try {
       const payload = await fetchSeedSources(100)
       seedSources = payload.sources || []
@@ -2626,8 +2630,8 @@
       )
       if (!quiet) {
         seedSourcesStatus = seedSources.length > 0
-          ? `Loaded ${seedSources.length} seed source${seedSources.length === 1 ? '' : 's'}.`
-          : 'No seed sources yet.'
+          ? `Loaded ${seedSources.length} seed${seedSources.length === 1 ? '' : 's'}.`
+          : 'No seeds yet.'
       }
       if (expandedSeedSourceId) {
         const expandedSource = seedSources.find((source) => seedSourceId(source) === expandedSeedSourceId)
@@ -2641,7 +2645,7 @@
         setAuthToken('')
         return
       }
-      if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seed sources.'
+      if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
   }
 
@@ -3931,14 +3935,14 @@
         <section class="tab-hero tab-hero--workspace">
           <div class="tab-hero__copy">
             <p class="eyebrow">Workspace</p>
-            <h2>Search, review, and build the working literature corpus.</h2>
+            <h2>You are building a corpus — not just browsing one.</h2>
             <p>
-              Start with search results or bibliography uploads, promote the useful candidates, and track the pipeline from metadata to downloaded files.
+              Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote.
             </p>
           </div>
           <div class="tab-hero__stats">
-            <span><strong>{seedSources.length}</strong> seed sources</span>
-            <span><strong>{pipelineMetadataCount}</strong> metadata</span>
+            <span><strong>{seedSources.length}</strong> seeds</span>
+            <span><strong>{pipelineMetadataCount}</strong> bibliographic metadata</span>
             <span><strong>{pipelineDownloadedCount}</strong> downloaded</span>
           </div>
         </section>
@@ -3946,8 +3950,8 @@
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">
-              <h2 class="workspace-section-title">1. Search</h2>
-              <p>Collect PDF and keyword-search sources, review candidates, and add selected works to the corpus pipeline.</p>
+              <h2 class="workspace-section-title">1. Find items</h2>
+              <p>Two ways in: extract the bibliography of an uploaded seed document (Document items), or run a keyword search on OpenAlex (Search items). Review everything in Seed below.</p>
             </div>
 
           </div>
@@ -3955,7 +3959,7 @@
           <div class="seed-intake-grid">
             <div class="seed-intake-card seed-intake-card--upload">
               <div class="split">
-                <h3>Document Search</h3>
+                <h3>Seed document</h3>
                 {#if extractionProgress.active}
                   <span class="tag queued">extracting</span>
                 {/if}
@@ -3975,7 +3979,9 @@
 	                        <span>{item.message || (item.size ? formatBytes(item.size) : item.backendFilename)}</span>
 	                      </div>
 	                      <div class="upload-actions">
-	                        <span class={`status ${item.status}`}>{item.status}</span>
+	                        {#if item.status && item.status !== 'uploaded'}
+	                          <span class={`status ${item.status}`}>{item.status}</span>
+	                        {/if}
                         {#if !seedKindForName(item.name)}
                           <button
                             type="button"
@@ -3993,18 +3999,17 @@
 	              {#if recentDocumentRuns.length > 0}
 	                <div class="document-run-list">
 	                  <div class="document-run-list__header">
-	                    <span class="muted small">Extracted PDFs</span>
-	                    <button class="link" type="button" on:click={loadIngestRuns}>Refresh</button>
+	                    <span class="muted small">Extracted seed documents</span>
 	                  </div>
 	                  {#each recentDocumentRuns as run}
 	                    <button
 	                      class="document-run"
 	                      type="button"
-	                      title={formatSeedDocumentDetails({
+	                      title={`Bibliographic metadata extracted from this PDF. ${formatSeedDocumentDetails({
 	                        authors: run.seed_authors,
 	                        source: run.seed_source,
 	                        publisher: run.seed_publisher,
-	                      }) || (run.source_pdf || '')}
+	                      }) || (run.source_pdf || '')}`.trim()}
 	                      on:click={() => focusSeedSource('pdf', run.ingest_source)}
 	                    >
 	                      <span class="truncate-line">
@@ -4045,7 +4050,7 @@
             </div>
 
             <div class="seed-intake-card seed-intake-card--search">
-              <h3>Keyword Search</h3>
+              <h3>Keyword search (OpenAlex)</h3>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
                   <label class="seed-search-main">
@@ -4089,6 +4094,7 @@
                 </div>
               </form>
               <p class="muted">{searchStatus}</p>
+              <p class="muted small">Queries run against the OpenAlex scholarly index.</p>
             </div>
           </div>
 
@@ -4100,10 +4106,9 @@
           <div class="workspace-panel-header">
             <div class="workspace-panel-title">
               <h3 class="workspace-section-title">2. Seed</h3>
-              <p class="muted">PDF extractions and search runs appear here as the same kind of expandable source.</p>
+              <p class="muted">Every seed document and search run lands here as a seed. Expand one to review its items and promote the keepers to the corpus.</p>
             </div>
             <div class="workspace-panel-actions">
-              <button class="secondary" type="button" on:click={() => loadSeedSources()} disabled={seedActionBusy}>Refresh</button>
               {#if seedSourcesStatus}
                 <span class="muted">{seedSourcesStatus}</span>
               {/if}
@@ -4113,7 +4118,7 @@
           <div class="seed-expansion-row seed-expansion-row--panel">
             <div class="seed-expansion-meta">
               <span class="muted small seed-expansion-label">Promotion settings</span>
-              <span class="muted small">Applies to the selected Seed candidates when you promote them.</span>
+              <span class="muted small">Applies to the selected Seed items when you promote them.</span>
             </div>
             <div class="seed-expansion-pill" class:opacity-50={!includeDownstream}>
               <label class="expansion-toggle">
@@ -4139,7 +4144,7 @@
           </div>
 
           {#if seedSources.length === 0}
-            <p class="muted">No seed sources yet. Upload a PDF or run a search to start staging candidates.</p>
+            <p class="muted">No seeds yet. Upload a seed document or run a keyword search to start collecting items.</p>
           {:else}
             <div class="seed-source-list">
               {#each seedSources as source (seedSourceId(source))}
@@ -4170,21 +4175,21 @@
                           <label
                             class="seed-source__select"
                             title={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)
-                              ? 'Clear all candidates in this source'
-                              : 'Select all candidates in this source'}
+                              ? 'Clear all items in this seed'
+                              : 'Select all items in this seed'}
                           >
                             <input
                               type="checkbox"
                               checked={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)}
                               disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
-                              aria-label="Select all candidates in this source"
+                              aria-label="Select all items in this seed"
                               on:click|stopPropagation
                               on:keydown|stopPropagation
                               on:change|stopPropagation={(e) => setAllSeedCandidatesSelected(source, e.currentTarget.checked)}
                             />
                           </label>
                         {/key}
-                        <span class={`tag ${source.source_type === 'pdf' ? 'pending' : 'queued'}`}>{source.source_type === 'pdf' ? 'PDF' : 'Search'}</span>
+                        <span class={`tag ${source.source_type === 'pdf' ? 'pending' : 'queued'}`}>{source.source_type === 'pdf' ? 'Document items' : 'Search items'}</span>
                         <strong>{source.label}</strong>
                       </div>
                       {#if source.subtitle}
@@ -4198,8 +4203,8 @@
                             class="seed-source__action seed-source__action--promote"
                             type="button"
                             disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
-                            title={estimatedSelectableSeedCount(source) === 0 ? 'No promotable candidates remain in this source' : 'Promote all promotable candidates from this source'}
-                            aria-label="Promote all promotable candidates"
+                            title={estimatedSelectableSeedCount(source) === 0 ? 'No promotable items remain in this seed' : 'Promote all promotable items from this seed'}
+                            aria-label="Promote all promotable items"
                             on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
                           >
                             →
@@ -4208,8 +4213,8 @@
                             class="seed-source__action seed-source__action--remove"
                             type="button"
                             disabled={seedActionBusy}
-                            title="Remove this source from Seed"
-                            aria-label="Remove source"
+                            title="Remove this seed and its items"
+                            aria-label="Remove seed"
                             on:click|stopPropagation={() => handleRemoveSeedSource(source)}
                           >
                             ×
@@ -4217,7 +4222,7 @@
                         </div>
                       {/key}
                       <div class="pill-row">
-                        <span class="pill">{source.candidate_count} candidates</span>
+                        <span class="pill">{source.candidate_count} items</span>
                         {#if source.state_counts.pending}
                           <span class="pill">Pending: {source.state_counts.pending}</span>
                         {/if}
@@ -4231,7 +4236,7 @@
                           <span class="pill">Raw: {source.state_counts.staged_raw}</span>
                         {/if}
                         {#if source.state_counts.enriched}
-                          <span class="pill">Metadata: {source.state_counts.enriched}</span>
+                          <span class="pill" title="Items whose bibliographic metadata has been retrieved">Bibliographic metadata: {source.state_counts.enriched}</span>
                         {/if}
                         {#if source.state_counts.downloaded}
                           <span class="pill">Downloaded: {source.state_counts.downloaded}</span>
@@ -4273,9 +4278,9 @@
                         {/key}
 
                         {#if seedCandidatesLoading[sourceId]}
-                          <p class="muted">Loading candidates...</p>
+                          <p class="muted">Loading items...</p>
                         {:else if sourceCandidates.length === 0}
-                          <p class="muted">No active candidates remain in this seed source.</p>
+                          <p class="muted">No active items remain in this seed.</p>
                         {:else}
                           {#key `${sourceId}:selection:${selectionVersion}`}
                             <div class="table table-scroll seed-candidate-table">
