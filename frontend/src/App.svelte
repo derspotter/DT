@@ -4092,7 +4092,7 @@
                   <label>
                     <span>Sort</span>
                     <select bind:value={searchSort}>
-                      <option value="relevance">Relevance (OpenAlex default)</option>
+                      <option value="relevance">Relevance (default)</option>
                       <option value="cited_by_count">Most cited</option>
                       <option value="newest">Newest</option>
                       <option value="oldest">Oldest</option>
