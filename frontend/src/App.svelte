@@ -3890,10 +3890,14 @@
       <div class="header-main header-main--workspace">
         <div class="header-main__copy">
           <p class="eyebrow">Korpus Builder</p>
-          <h1>Corpus orchestration workspace</h1>
           <p class="subtitle">
             Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote. API status: {apiStatus}.
           </p>
+        </div>
+        <div class="header-stats">
+          <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
+          <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
+          <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
         </div>
         <div class="header-main__top">
           <label class="header-corpus-picker">
@@ -3940,11 +3944,6 @@
 
     <section class="content">
       {#if activeTab === 'workspace'}
-        <div class="workspace-stats-bar">
-          <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
-          <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
-          <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
-        </div>
         <div class="seed-corpus-workspace">
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
@@ -4049,7 +4048,7 @@
             </div>
 
             <div class="seed-intake-card seed-intake-card--search">
-              <h3>Keyword search (OpenAlex)</h3>
+              <h3>Keyword search <span class="muted small keyword-search-note">Queries run against the OpenAlex scholarly index.</span></h3>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
                   <label class="seed-search-main">
@@ -4106,7 +4105,6 @@
                 </div>
               </form>
               <p class="muted">{searchStatus}</p>
-              <p class="muted small">Queries run against the OpenAlex scholarly index.</p>
             </div>
           </div>
 
