@@ -2487,30 +2487,29 @@
     switch (seedCandidateState(candidate)) {
       case 'downloaded':
         return {
-          label: candidate?.file_available === false ? 'Missing file' : 'Downloaded',
+          label: candidate?.file_available === false ? 'File missing' : 'PDF downloaded',
           className: candidate?.file_available === false ? 'failed' : 'downloaded',
         }
       case 'downloaded_elsewhere':
-        return {
-          label: candidate?.file_available === true ? 'Available' : 'Missing file',
-          className: candidate?.file_available === true ? 'downloaded' : 'failed',
-        }
+        return candidate?.file_available === true
+          ? { label: 'PDF reusable (other corpus)', className: 'downloaded' }
+          : { label: 'Stale record (other corpus)', className: 'pending' }
       case 'queued_download':
-        return { label: 'Queued DL', className: 'queued' }
+        return { label: 'Download queued', className: 'queued' }
       case 'enriched':
-        return { label: 'Metadata', className: 'completed' }
+        return { label: 'Metadata ready', className: 'completed' }
       case 'queued_enrichment':
-        return { label: 'Queued', className: 'queued' }
+        return { label: 'Fetching metadata', className: 'queued' }
       case 'staged_raw':
-        return { label: 'Raw', className: 'pending' }
+        return { label: 'Awaiting metadata', className: 'pending' }
       case 'added':
-        return { label: 'Added', className: 'completed' }
+        return { label: 'In corpus', className: 'completed' }
       case 'failed_enrichment':
-        return { label: 'Enrich Fail', className: 'failed' }
+        return { label: 'Metadata failed', className: 'failed' }
       case 'failed_download':
-        return { label: 'Download Fail', className: 'failed' }
+        return { label: 'Download failed', className: 'failed' }
       default:
-        return { label: 'Pending', className: 'pending' }
+        return { label: 'To review', className: 'pending' }
     }
   }
 
@@ -4232,31 +4231,16 @@
                         </div>
                       {/key}
                       <div class="pill-row">
-                        <span class="pill">{source.candidate_count} items</span>
-                        {#if source.state_counts.pending}
-                          <span class="pill">Pending: {source.state_counts.pending}</span>
-                        {/if}
-                        {#if source.state_counts.added}
-                          <span class="pill">Added: {source.state_counts.added}</span>
+                        <span class="pill" title="Total items found in this seed">{source.candidate_count} items</span>
+                        {#if source.candidate_count - (source.state_counts.in_corpus || 0) > 0}
+                          <span class="pill" title="Not yet promoted or dismissed — your decision pending">To review: {source.candidate_count - (source.state_counts.in_corpus || 0)}</span>
                         {/if}
                         {#if source.state_counts.in_corpus}
-                          <span class="pill">In Corpus: {source.state_counts.in_corpus}</span>
+                          <span class="pill" title="Already a member of this corpus — expand for each item's stage">In corpus: {source.state_counts.in_corpus}</span>
                         {/if}
-                        {#if source.state_counts.staged_raw}
-                          <span class="pill">Raw: {source.state_counts.staged_raw}</span>
+                        {#if source.state_counts.downloaded_elsewhere_available}
+                          <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF reusable: {source.state_counts.downloaded_elsewhere_available}</span>
                         {/if}
-                        {#if source.state_counts.enriched}
-                          <span class="pill" title="Items whose bibliographic metadata has been retrieved">Bibliographic metadata: {source.state_counts.enriched}</span>
-                        {/if}
-                        {#if source.state_counts.downloaded}
-                          <span class="pill">Downloaded: {source.state_counts.downloaded}</span>
-                        {/if}
-	                        {#if source.state_counts.downloaded_elsewhere}
-	                          <span class="pill">Available: {source.state_counts.downloaded_elsewhere_available || 0}</span>
-	                          {#if source.state_counts.downloaded_elsewhere_missing}
-	                            <span class="pill">Missing file: {source.state_counts.downloaded_elsewhere_missing}</span>
-	                          {/if}
-	                        {/if}
                       </div>
                       <span class={`disclosure-chevron ${isExpanded ? 'open' : ''}`} aria-hidden="true">▸</span>
                     </div>
