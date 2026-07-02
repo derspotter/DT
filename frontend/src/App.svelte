@@ -85,6 +85,7 @@
 
   let activeTab = 'workspace'
   let apiStatus = 'unknown'
+  $: backendStatusLabel = apiStatus === 'online' ? 'healthy' : apiStatus === 'offline' ? 'not responding' : 'checking'
   let authStatus = 'loading'
   let authError = ''
   let authUser = null
@@ -2487,30 +2488,29 @@
     switch (seedCandidateState(candidate)) {
       case 'downloaded':
         return {
-          label: candidate?.file_available === false ? 'Missing file' : 'Downloaded',
+          label: candidate?.file_available === false ? 'File missing' : 'PDF downloaded',
           className: candidate?.file_available === false ? 'failed' : 'downloaded',
         }
       case 'downloaded_elsewhere':
-        return {
-          label: candidate?.file_available === true ? 'Available' : 'Missing file',
-          className: candidate?.file_available === true ? 'downloaded' : 'failed',
-        }
+        return candidate?.file_available === true
+          ? { label: 'PDF reusable', className: 'downloaded', hint: 'Downloaded by another corpus and the file is present — promoting reuses it' }
+          : { label: 'Stale record', className: 'pending', hint: 'Another corpus recorded a download but the file is gone — promoting downloads it fresh' }
       case 'queued_download':
-        return { label: 'Queued DL', className: 'queued' }
+        return { label: 'Download queued', className: 'queued' }
       case 'enriched':
-        return { label: 'Metadata', className: 'completed' }
+        return { label: 'Metadata ready', className: 'completed' }
       case 'queued_enrichment':
-        return { label: 'Queued', className: 'queued' }
+        return { label: 'Fetching metadata', className: 'queued' }
       case 'staged_raw':
-        return { label: 'Raw', className: 'pending' }
+        return { label: 'Awaiting metadata', className: 'pending' }
       case 'added':
-        return { label: 'Added', className: 'completed' }
+        return { label: 'In corpus', className: 'completed' }
       case 'failed_enrichment':
-        return { label: 'Enrich Fail', className: 'failed' }
+        return { label: 'Metadata failed', className: 'failed' }
       case 'failed_download':
-        return { label: 'Download Fail', className: 'failed' }
+        return { label: 'Download failed', className: 'failed' }
       default:
-        return { label: 'Pending', className: 'pending' }
+        return { label: 'To review', className: 'pending' }
     }
   }
 
@@ -3889,15 +3889,20 @@
     <header class="app-header">
       <div class="header-main header-main--workspace">
         <div class="header-main__copy">
-          <p class="eyebrow">Korpus Builder</p>
-          <h1>Corpus orchestration workspace</h1>
+          <h1 class="eyebrow">Korpus Builder</h1>
           <p class="subtitle">
-            Build, enrich, and monitor literature pipelines end-to-end. API status: {apiStatus}.
+            Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote.
           </p>
+        </div>
+        <div class="header-stats">
+          <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
+          <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
+          <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+          <span title="Whether the app's backend server answered the most recent request">backend <strong class:status-bad={apiStatus === 'offline'}>{backendStatusLabel}</strong></span>
         </div>
         <div class="header-main__top">
           <label class="header-corpus-picker">
-            <span class="eyebrow">Corpus</span>
+            <span class="eyebrow">Corpus Workspace</span>
             <select value={currentCorpusId || ''} on:change={handleSelectCorpus}>
               {#each corpora as corpus}
                 <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
@@ -3940,20 +3945,6 @@
 
     <section class="content">
       {#if activeTab === 'workspace'}
-        <section class="tab-hero tab-hero--workspace">
-          <div class="tab-hero__copy">
-            <p class="eyebrow">Workspace</p>
-            <h2>You are building a corpus — not just browsing one.</h2>
-            <p>
-              Feed it seed documents and OpenAlex searches, decide which found items belong, and the pipeline fetches bibliographic metadata and PDFs for everything you promote.
-            </p>
-          </div>
-          <div class="tab-hero__stats">
-            <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
-            <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
-            <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
-          </div>
-        </section>
         <div class="seed-corpus-workspace">
         <div class="card seed-corpus-toolbar">
           <div class="seed-corpus-toolbar__header">
@@ -4058,7 +4049,7 @@
             </div>
 
             <div class="seed-intake-card seed-intake-card--search">
-              <h3>Keyword search (OpenAlex)</h3>
+              <h3>Keyword search <span class="muted small keyword-search-note">Queries run against the OpenAlex scholarly index.</span></h3>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
                   <label class="seed-search-main">
@@ -4102,7 +4093,7 @@
                   <label>
                     <span>Sort</span>
                     <select bind:value={searchSort}>
-                      <option value="relevance">Relevance (OpenAlex default)</option>
+                      <option value="relevance">Relevance (default)</option>
                       <option value="cited_by_count">Most cited</option>
                       <option value="newest">Newest</option>
                       <option value="oldest">Oldest</option>
@@ -4115,7 +4106,6 @@
                 </div>
               </form>
               <p class="muted">{searchStatus}</p>
-              <p class="muted small">Queries run against the OpenAlex scholarly index.</p>
             </div>
           </div>
 
@@ -4243,31 +4233,16 @@
                         </div>
                       {/key}
                       <div class="pill-row">
-                        <span class="pill">{source.candidate_count} items</span>
-                        {#if source.state_counts.pending}
-                          <span class="pill">Pending: {source.state_counts.pending}</span>
-                        {/if}
-                        {#if source.state_counts.added}
-                          <span class="pill">Added: {source.state_counts.added}</span>
+                        <span class="pill" title="Total items found in this seed">{source.candidate_count} items</span>
+                        {#if source.candidate_count - (source.state_counts.in_corpus || 0) > 0}
+                          <span class="pill" title="Not yet promoted or dismissed — your decision pending">To review: {source.candidate_count - (source.state_counts.in_corpus || 0)}</span>
                         {/if}
                         {#if source.state_counts.in_corpus}
-                          <span class="pill">In Corpus: {source.state_counts.in_corpus}</span>
+                          <span class="pill" title="Already a member of this corpus — expand for each item's stage">In corpus: {source.state_counts.in_corpus}</span>
                         {/if}
-                        {#if source.state_counts.staged_raw}
-                          <span class="pill">Raw: {source.state_counts.staged_raw}</span>
+                        {#if source.state_counts.downloaded_elsewhere_available}
+                          <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF reusable: {source.state_counts.downloaded_elsewhere_available}</span>
                         {/if}
-                        {#if source.state_counts.enriched}
-                          <span class="pill" title="Items whose bibliographic metadata has been retrieved">Bibliographic metadata: {source.state_counts.enriched}</span>
-                        {/if}
-                        {#if source.state_counts.downloaded}
-                          <span class="pill">Downloaded: {source.state_counts.downloaded}</span>
-                        {/if}
-	                        {#if source.state_counts.downloaded_elsewhere}
-	                          <span class="pill">Available: {source.state_counts.downloaded_elsewhere_available || 0}</span>
-	                          {#if source.state_counts.downloaded_elsewhere_missing}
-	                            <span class="pill">Missing file: {source.state_counts.downloaded_elsewhere_missing}</span>
-	                          {/if}
-	                        {/if}
                       </div>
                       <span class={`disclosure-chevron ${isExpanded ? 'open' : ''}`} aria-hidden="true">▸</span>
                     </div>
@@ -4318,6 +4293,7 @@
                                 {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
                                 {@const candidateKey = String(candidate?.candidate_key || '')}
                                 {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
+                                {@const candidateTag = seedCandidateTag(candidate)}
                                 <div
                                   class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
                                   on:click={(e) => {
@@ -4351,19 +4327,19 @@
                                     {/if}
                                     {#if canDownloadSeedCandidate(candidate)}
 	                                      <button
-	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag seed-download-tag`}
+	                                        class={`tag ${candidateTag.className} ingest-state-tag seed-download-tag`}
 	                                        type="button"
 	                                        title={`Download available file from work ${candidate.downloaded_work_id}`}
 	                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
 	                                      >
-	                                        {seedCandidateTag(candidate).label}
+	                                        {candidateTag.label}
 	                                      </button>
 	                                    {:else}
 	                                      <span
-	                                        class={`tag ${seedCandidateTag(candidate).className} ingest-state-tag`}
-	                                        title={candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : ''}
+	                                        class={`tag ${candidateTag.className} ingest-state-tag`}
+	                                        title={candidateTag.hint || (candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : '')}
 	                                      >
-	                                        {seedCandidateTag(candidate).label}
+	                                        {candidateTag.label}
 	                                      </span>
 	                                    {/if}
                                   </span>
