@@ -1,18 +1,20 @@
 :root {
   color-scheme: light;
   font-family: 'Space Grotesk', system-ui, sans-serif;
-  --bg: #f5f2ee;
-  --bg-alt: #ece6df;
-  --ink: #1f2933;
-  --muted: #5b6670;
-  --accent: #0f8b8d;
-  --accent-2: #f4b860;
-  --surface: #ffffff;
-  --stroke: #d9d3cb;
-  --shadow: 0 14px 34px rgba(35, 35, 35, 0.08);
-  --shadow-strong: 0 24px 60px rgba(35, 35, 35, 0.12);
-  --radius-lg: 18px;
-  --radius-md: 12px;
+  --bg: #f6f3ec;
+  --bg-alt: #eee8dc;
+  --ink: #23201b;
+  --muted: #665f55;
+  --accent: #7d3138;
+  --accent-rgb: 125, 49, 56;
+  --accent-2: #c08f36;
+  --accent-2-rgb: 192, 143, 54;
+  --surface: #fffdf8;
+  --stroke: #d8d1c2;
+  --shadow: 0 1px 2px rgba(40, 34, 26, 0.07);
+  --shadow-strong: 0 2px 8px rgba(40, 34, 26, 0.12);
+  --radius-lg: 6px;
+  --radius-md: 4px;
 }
 
 * {
@@ -22,9 +24,7 @@
 body {
   margin: 0;
   min-height: 100vh;
-  background: radial-gradient(circle at top left, #fff4dc 0%, transparent 45%),
-    radial-gradient(circle at 20% 20%, #e6f0ef 0%, transparent 55%),
-    linear-gradient(120deg, var(--bg), var(--bg-alt));
+  background: var(--bg);
   color: var(--ink);
 }
 
@@ -176,7 +176,7 @@ select {
 .header-user--compact {
   padding: 10px 12px;
   border: 1px solid rgba(201, 191, 180, 0.72);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
 }
 
@@ -264,7 +264,7 @@ select {
 
 .header-corpus select {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   min-width: 0;
@@ -313,7 +313,7 @@ select {
 
 .header-invite input {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   width: 100%;
@@ -370,7 +370,7 @@ select {
 
 .header-corpus select {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   min-width: 0;
@@ -419,7 +419,7 @@ select {
 
 .header-invite input {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   width: 100%;
@@ -452,16 +452,16 @@ select {
 .header-pipeline__title strong {
   font-size: 0.92rem;
   color: #5a3a22;
-  background: rgba(244, 184, 96, 0.22);
-  border: 1px solid rgba(244, 184, 96, 0.45);
+  background: rgba(var(--accent-2-rgb), 0.22);
+  border: 1px solid rgba(var(--accent-2-rgb), 0.45);
   border-radius: 999px;
   padding: 2px 10px;
 }
 
 .header-pipeline__title strong.running {
-  color: #0a5557;
-  background: rgba(15, 139, 141, 0.18);
-  border-color: rgba(15, 139, 141, 0.35);
+  color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.35);
 }
 
 .header-pipeline__stats {
@@ -473,7 +473,7 @@ select {
 .pipeline-kpi {
   background: #ffffff;
   border: 1px solid var(--stroke);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 7px 9px;
   display: grid;
   gap: 2px;
@@ -496,7 +496,7 @@ select {
 .header-log-stream {
   grid-column: 1 / -1;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.8);
   padding: 10px 12px;
   display: grid;
@@ -570,7 +570,7 @@ select {
 
 .login-form input {
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
 }
 
@@ -651,7 +651,7 @@ select {
 
 .side-nav button {
   padding: 12px 14px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid transparent;
   background: transparent;
   color: var(--ink);
@@ -667,10 +667,10 @@ select {
 }
 
 .side-nav button.active {
-  background: rgba(15, 139, 141, 0.12);
-  color: #0c5f60;
-  border-color: rgba(15, 139, 141, 0.4);
-  box-shadow: 0 10px 22px rgba(15, 139, 141, 0.12);
+  background: rgba(var(--accent-rgb), 0.12);
+  color: #5f262c;
+  border-color: rgba(var(--accent-rgb), 0.4);
+  box-shadow: 0 10px 22px rgba(var(--accent-rgb), 0.12);
 }
 
 .content {
@@ -711,36 +711,23 @@ select {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 18px;
   padding: 24px;
-  border: 1px solid rgba(15, 139, 141, 0.22);
-  border-radius: 24px;
-  background:
-    radial-gradient(circle at 92% 10%, rgba(244, 184, 96, 0.32), transparent 32%),
-    linear-gradient(135deg, rgba(255, 255, 255, 0.94), rgba(231, 244, 242, 0.92));
+  border: 1px solid var(--stroke);
+  border-top: 3px solid var(--accent);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
   box-shadow: var(--shadow);
 }
 
 .tab-hero--workspace {
-  background:
-    radial-gradient(circle at 92% 10%, rgba(15, 139, 141, 0.2), transparent 34%),
-    radial-gradient(circle at 12% 95%, rgba(244, 184, 96, 0.26), transparent 30%),
-    linear-gradient(135deg, rgba(255, 255, 255, 0.95), rgba(244, 239, 231, 0.94));
+  background: var(--surface);
 }
 
 .tab-hero--upstream {
-  background:
-    radial-gradient(circle at 88% 14%, rgba(244, 184, 96, 0.34), transparent 32%),
-    radial-gradient(circle at 8% 105%, rgba(15, 139, 141, 0.18), transparent 34%),
-    linear-gradient(135deg, rgba(255, 255, 255, 0.95), rgba(230, 240, 239, 0.94));
+  background: var(--surface);
 }
 
 .tab-hero::before {
-  content: '';
-  position: absolute;
-  inset: auto -40px -78px auto;
-  width: 220px;
-  height: 220px;
-  border-radius: 999px;
-  border: 36px solid rgba(15, 139, 141, 0.12);
+  content: none;
 }
 
 .tab-hero__copy {
@@ -754,7 +741,7 @@ select {
   font-family: 'Instrument Serif', serif;
   font-size: clamp(2rem, 4vw, 3.4rem);
   line-height: 0.96;
-  color: #18313a;
+  color: var(--ink);
 }
 
 .tab-hero p:not(.eyebrow) {
@@ -775,14 +762,20 @@ select {
 .tab-hero__stats span {
   display: inline-flex;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-  border: 1px solid rgba(15, 139, 141, 0.2);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.78);
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 8px 2px 8px 12px;
+  border: none;
+  border-left: 3px solid rgba(var(--accent-rgb), 0.55);
+  border-radius: 0;
+  background: none;
   color: var(--muted);
   font-size: 0.84rem;
+}
+
+.tab-hero__stats strong {
+  font-family: 'Instrument Serif', serif;
+  font-size: 1.35rem;
 }
 
 .tab-hero__stats strong {
@@ -829,7 +822,7 @@ select {
 }
 
 .card.highlight {
-  border: 1px solid rgba(15, 139, 141, 0.4);
+  border: 1px solid rgba(var(--accent-rgb), 0.4);
   background: linear-gradient(135deg, #ffffff 0%, #eef7f6 100%);
 }
 
@@ -857,7 +850,7 @@ select {
 
 .pipeline-stage {
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fff;
   padding: 9px 10px;
   min-width: 0;
@@ -955,17 +948,17 @@ select {
   color: white;
   border: none;
   padding: 10px 16px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   font-weight: 600;
   cursor: pointer;
 }
 
 .secondary {
-  background: #f4b860;
+  background: var(--accent-2);
   color: #3b2f1d;
   border: none;
   padding: 10px 16px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   font-weight: 600;
   cursor: pointer;
 }
@@ -983,7 +976,7 @@ select {
   align-items: center;
   gap: 16px;
   padding: 12px 14px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: #fbfaf8;
 }
@@ -1056,7 +1049,7 @@ select {
 .extract-progress-bar {
   height: 100%;
   width: 0%;
-  background: linear-gradient(90deg, #0f8b8d 0%, #56b6b8 100%);
+  background: var(--accent);
   transition: width 0.25s ease;
 }
 
@@ -1069,7 +1062,7 @@ select {
 .ingest-start-prompt {
   margin: 6px 0 10px;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fbfaf8;
   padding: 12px;
   display: flex;
@@ -1092,7 +1085,7 @@ select {
 .ingest-job-progress {
   margin: 6px 0 12px;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fff;
   padding: 12px;
   display: grid;
@@ -1196,7 +1189,7 @@ select {
   padding: 12px 16px;
   background: #fdfdfc;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   flex-wrap: wrap;
   margin-top: 4px;
 }
@@ -1539,7 +1532,7 @@ select {
 .export-card__filters input,
 .export-card__filters select {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: #fff;
   color: var(--ink);
@@ -1599,7 +1592,7 @@ select {
 
 button.danger {
   padding: 10px 16px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: none;
   background: #b42318;
   color: white;
@@ -1616,7 +1609,7 @@ button.danger:disabled {
   display: grid;
   gap: 12px;
   padding: 9px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: #f9f7f4;
   border: 1px solid transparent;
   align-items: center;
@@ -1824,13 +1817,13 @@ button.danger:disabled {
 
 .table-row.selected,
 .table-row:not(.header):nth-child(even).selected {
-  background: rgba(15, 139, 141, 0.08);
-  border: 1px solid rgba(15, 139, 141, 0.22);
+  background: rgba(var(--accent-rgb), 0.08);
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
 }
 
 .table-row:not(.header).selected:hover {
-  background: rgba(15, 139, 141, 0.12);
-  border-color: rgba(15, 139, 141, 0.35);
+  background: rgba(var(--accent-rgb), 0.12);
+  border-color: rgba(var(--accent-rgb), 0.35);
 }
 
 .table-row input[type="checkbox"] {
@@ -1849,7 +1842,7 @@ button.danger:disabled {
   background: transparent;
   border: none;
   padding: 0;
-  color: #0c5f60;
+  color: #5f262c;
   font-weight: 650;
   cursor: pointer;
   text-align: left;
@@ -1967,7 +1960,7 @@ button.seed-download-tag:focus-visible {
 .downloads-toolbar .toolbar-input,
 .downloads-toolbar .toolbar-select {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: #fff;
   color: var(--ink);
@@ -2008,7 +2001,7 @@ button.seed-download-tag:focus-visible {
   display: grid;
   gap: 6px;
   padding: 16px 14px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   border: 1px dashed var(--stroke);
   background: rgba(255, 255, 255, 0.6);
   text-align: center;
@@ -2022,7 +2015,7 @@ button.seed-download-tag:focus-visible {
   background: #0d1b1e;
   color: #d6f5f3;
   padding: 16px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   height: 280px;
   overflow-y: auto;
   font-family: 'Space Grotesk', sans-serif;
@@ -2066,7 +2059,7 @@ button.seed-download-tag:focus-visible {
 
 .log-filter-current input[type="checkbox"] {
   margin: 0;
-  accent-color: #0f8b8d;
+  accent-color: var(--accent);
 }
 
 .log-line {
@@ -2078,7 +2071,7 @@ button.seed-download-tag:focus-visible {
 .graph-wrap {
   overflow-x: auto;
   background: #f9f7f4;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   padding: 12px;
   border: 1px solid var(--stroke);
 }
@@ -2089,10 +2082,10 @@ button.seed-download-tag:focus-visible {
   gap: 14px;
   overflow: hidden;
   background:
-    radial-gradient(circle at 12% 8%, rgba(15, 139, 141, 0.18), transparent 26%),
+    radial-gradient(circle at 12% 8%, rgba(var(--accent-rgb), 0.18), transparent 26%),
     radial-gradient(circle at 88% 0%, rgba(244, 163, 64, 0.16), transparent 28%),
     linear-gradient(135deg, rgba(6, 19, 22, 0.96), rgba(20, 36, 44, 0.94));
-  color: #ecf7f6;
+  color: #f7efe9;
 }
 
 .graph-3d-panel .muted {
@@ -2136,8 +2129,8 @@ button.seed-download-tag:focus-visible {
 
 .graph-3d-btn:focus-visible {
   outline: none;
-  border-color: rgba(15, 139, 141, 0.9);
-  box-shadow: 0 0 0 3px rgba(15, 139, 141, 0.35);
+  border-color: rgba(var(--accent-rgb), 0.9);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.35);
 }
 
 .graph-3d-btn:disabled {
@@ -2152,16 +2145,17 @@ button.seed-download-tag:focus-visible {
   box-shadow: inset 0 0 0 1px rgba(244, 163, 64, 0.35);
 }
 
-/* Solid teal call-to-action for the load button */
+/* Solid accent call-to-action for the load button */
 .graph-3d-btn-primary {
   border-color: transparent;
-  background: linear-gradient(135deg, #13a0a2, #0f8b8d);
+  background: var(--accent);
   color: #fff;
-  box-shadow: 0 6px 16px rgba(8, 60, 61, 0.45);
+  box-shadow: 0 6px 16px rgba(var(--accent-rgb), 0.45);
 }
 
 .graph-3d-btn-primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, #16b2b4, #11999b);
+  background: var(--accent);
+  filter: brightness(1.18);
   border-color: transparent;
 }
 
@@ -2190,15 +2184,15 @@ button.seed-download-tag:focus-visible {
 }
 
 .graph-3d-segment .graph-3d-btn.active {
-  background: rgba(15, 139, 141, 0.32);
-  color: #eafffe;
-  box-shadow: inset 0 0 0 1px rgba(72, 209, 204, 0.4);
+  background: rgba(var(--accent-rgb), 0.32);
+  color: #fbf1ea;
+  box-shadow: inset 0 0 0 1px rgba(var(--accent-2-rgb), 0.55);
 }
 
 /* Restore the keyboard focus ring the segment reset (box-shadow: none) drops. */
 .graph-3d-segment .graph-3d-btn:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px rgba(15, 139, 141, 0.55);
+  box-shadow: 0 0 0 2px rgba(var(--accent-rgb), 0.55);
 }
 
 .graph-3d-controls {
@@ -2209,7 +2203,7 @@ button.seed-download-tag:focus-visible {
   align-items: end;
   padding: 14px;
   border: 1px solid rgba(236, 247, 246, 0.14);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.05);
 }
 
@@ -2230,10 +2224,10 @@ button.seed-download-tag:focus-visible {
 .graph-3d-controls select,
 .graph-3d-controls input {
   min-height: 40px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid rgba(236, 247, 246, 0.2);
   background: rgba(7, 19, 22, 0.55);
-  color: #ecf7f6;
+  color: #f7efe9;
   padding: 9px 12px;
   font-size: 0.88rem;
   transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
@@ -2250,7 +2244,7 @@ button.seed-download-tag:focus-visible {
 
 .graph-3d-controls select option {
   background: #0d2329;
-  color: #ecf7f6;
+  color: #f7efe9;
 }
 
 .graph-3d-controls input::placeholder {
@@ -2265,8 +2259,8 @@ button.seed-download-tag:focus-visible {
 .graph-3d-controls select:focus-visible,
 .graph-3d-controls input:focus-visible {
   outline: none;
-  border-color: rgba(15, 139, 141, 0.9);
-  box-shadow: 0 0 0 3px rgba(15, 139, 141, 0.3);
+  border-color: rgba(var(--accent-rgb), 0.9);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.3);
   /* background-color only — the `background` shorthand would drop the custom
      <select> chevron (a background-image) on focus. */
   background-color: rgba(7, 19, 22, 0.72);
@@ -2294,7 +2288,7 @@ button.seed-download-tag:focus-visible {
   padding: 4px;
   list-style: none;
   border: 1px solid rgba(236, 247, 246, 0.2);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: #122b31;
   box-shadow: 0 14px 30px rgba(4, 14, 17, 0.55);
   max-height: 320px;
@@ -2314,7 +2308,7 @@ button.seed-download-tag:focus-visible {
   border: none;
   border-radius: 8px;
   background: transparent;
-  color: #ecf7f6;
+  color: #f7efe9;
   cursor: pointer;
 }
 
@@ -2352,7 +2346,7 @@ button.seed-download-tag:focus-visible {
   position: relative;
   min-height: 520px;
   border: 1px solid rgba(236, 247, 246, 0.16);
-  border-radius: 18px;
+  border-radius: var(--radius-lg);
   overflow: hidden;
   background:
     linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
@@ -2432,8 +2426,8 @@ button.seed-download-tag:focus-visible {
 }
 
 .graph-3d-map-key .territory {
-  border: 1px solid #0f8b8d;
-  background: rgba(15, 139, 141, 0.28);
+  border: 1px solid var(--accent);
+  background: rgba(var(--accent-rgb), 0.28);
 }
 
 .graph-3d-map-key .bridge {
@@ -2485,7 +2479,7 @@ button.seed-download-tag:focus-visible {
   background:
     linear-gradient(90deg, color-mix(in srgb, var(--label-color) 24%, transparent), rgba(7, 19, 22, 0.86)),
     rgba(7, 19, 22, 0.86);
-  color: #ecf7f6;
+  color: #f7efe9;
   text-align: left;
   opacity: var(--label-opacity);
   pointer-events: auto;
@@ -2706,7 +2700,7 @@ button.seed-download-tag:focus-visible {
 .graph-3d-cluster-detail {
   padding: 12px;
   border: 1px solid rgba(236, 247, 246, 0.14);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.08);
 }
 
@@ -2747,9 +2741,9 @@ button.seed-download-tag:focus-visible {
 .graph-3d-links a {
   padding: 3px 9px;
   border-radius: 7px;
-  border: 1px solid rgba(72, 209, 204, 0.45);
-  background: rgba(15, 139, 141, 0.16);
-  color: #9beae6;
+  border: 1px solid rgba(var(--accent-2-rgb), 0.5);
+  background: rgba(var(--accent-rgb), 0.16);
+  color: rgba(var(--accent-2-rgb), 0.95);
   font-size: 0.74rem;
   font-weight: 600;
   text-decoration: none;
@@ -2757,14 +2751,14 @@ button.seed-download-tag:focus-visible {
 }
 
 .graph-3d-links a:hover {
-  background: rgba(15, 139, 141, 0.3);
-  border-color: rgba(72, 209, 204, 0.8);
-  color: #eafffe;
+  background: rgba(var(--accent-rgb), 0.3);
+  border-color: rgba(var(--accent-2-rgb), 0.85);
+  color: #fbf1ea;
 }
 
 .graph-3d-links a:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px rgba(15, 139, 141, 0.35);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.35);
 }
 
 /* Citation path-finder */
@@ -2804,7 +2798,7 @@ button.seed-download-tag:focus-visible {
   gap: 6px;
   padding: 12px;
   border: 1px solid rgba(255, 209, 102, 0.3);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: rgba(255, 209, 102, 0.06);
 }
 
@@ -2831,7 +2825,7 @@ button.seed-download-tag:focus-visible {
 .graph-3d-path-steps li span {
   font-size: 0.76rem;
   line-height: 1.25;
-  color: #ecf7f6;
+  color: #f7efe9;
 }
 
 .graph-3d-path-steps li small {
@@ -2879,9 +2873,9 @@ button.seed-download-tag:focus-visible {
   width: 100%;
   padding: 9px 10px;
   border: 1px solid rgba(236, 247, 246, 0.14);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: rgba(7, 19, 22, 0.74);
-  color: #ecf7f6;
+  color: #f7efe9;
   text-align: left;
   cursor: pointer;
 }
@@ -2953,7 +2947,7 @@ button.seed-download-tag:focus-visible {
   padding: 10px 12px;
   background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(244, 239, 231, 0.92));
   border: 1px solid rgba(201, 191, 180, 0.72);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
 }
 
 .corpus-share > div {
@@ -2973,7 +2967,7 @@ button.seed-download-tag:focus-visible {
 .corpus-share select {
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.85rem;
@@ -3015,7 +3009,7 @@ button.seed-download-tag:focus-visible {
   padding: 10px 12px;
   margin-bottom: 12px;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fcfaf7;
 }
 
@@ -3082,9 +3076,9 @@ button.seed-download-tag:focus-visible {
   min-height: 28px;
   padding: 0 10px;
   border-radius: 999px;
-  border: 1px solid rgba(15, 139, 141, 0.22);
-  background: rgba(15, 139, 141, 0.08);
-  color: #0c5f60;
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
+  background: rgba(var(--accent-rgb), 0.08);
+  color: #5f262c;
   font-size: 0.78rem;
   font-weight: 650;
 }
@@ -3231,9 +3225,9 @@ button.seed-download-tag:focus-visible {
   min-height: 28px;
   padding: 0 10px;
   border-radius: 999px;
-  border: 1px solid rgba(15, 139, 141, 0.22);
-  background: rgba(15, 139, 141, 0.08);
-  color: #0c5f60;
+  border: 1px solid rgba(var(--accent-rgb), 0.22);
+  background: rgba(var(--accent-rgb), 0.08);
+  color: #5f262c;
   font-size: 0.78rem;
   font-weight: 650;
 }
@@ -3245,7 +3239,7 @@ button.seed-download-tag:focus-visible {
   margin-bottom: 12px;
   padding: 14px;
   border: 1px solid rgba(201, 191, 180, 0.72);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(252, 250, 247, 0.95), rgba(247, 243, 237, 0.88));
 }
 
@@ -3271,7 +3265,7 @@ button.seed-download-tag:focus-visible {
 .corpus-filter input,
 .corpus-filter select {
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3297,7 +3291,7 @@ button.seed-download-tag:focus-visible {
   margin: 6px 0;
   padding: 20px;
   border: 1px dashed rgba(201, 191, 180, 0.88);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(250, 247, 242, 0.96), rgba(245, 240, 233, 0.88));
 }
 
@@ -3338,7 +3332,7 @@ button.seed-download-tag:focus-visible {
 }
 
 .table-row.selected {
-  background: rgba(15, 139, 141, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 .corpus-table {
@@ -3367,7 +3361,7 @@ button.seed-download-tag:focus-visible {
 .corpus-select-row {
   width: 100%;
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   text-align: left;
   font: inherit;
   color: inherit;
@@ -3377,7 +3371,7 @@ button.seed-download-tag:focus-visible {
 }
 
 .corpus-select-row:focus-visible {
-  outline: 2px solid rgba(15, 139, 141, 0.45);
+  outline: 2px solid rgba(var(--accent-rgb), 0.45);
   outline-offset: 1px;
 }
 
@@ -3405,13 +3399,13 @@ button.seed-download-tag:focus-visible {
 
 @keyframes corpusPromotionFlash {
   0% {
-    background: rgba(15, 139, 141, 0.26);
-    border-color: rgba(15, 139, 141, 0.42);
+    background: rgba(var(--accent-rgb), 0.26);
+    border-color: rgba(var(--accent-rgb), 0.42);
   }
 
   100% {
-    background: rgba(15, 139, 141, 0.08);
-    border-color: rgba(15, 139, 141, 0.16);
+    background: rgba(var(--accent-rgb), 0.08);
+    border-color: rgba(var(--accent-rgb), 0.16);
   }
 }
 
@@ -3430,7 +3424,7 @@ button.seed-download-tag:focus-visible {
   margin-bottom: 20px;
   padding: 10px;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fcfaf7;
 }
 
@@ -3449,7 +3443,7 @@ button.seed-download-tag:focus-visible {
   display: grid;
   gap: 1px;
   border: 1px solid rgba(188, 183, 174, 0.5);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   padding: 6px 10px;
   background: #fff;
 }
@@ -3472,7 +3466,7 @@ button.seed-download-tag:focus-visible {
 }
 
 .corpus-details-grid a {
-  color: #0c5f60;
+  color: #5f262c;
   text-decoration: none;
 }
 
@@ -3556,7 +3550,7 @@ button.seed-download-tag:focus-visible {
 .upstream-browser__target-select select {
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3573,7 +3567,7 @@ button.seed-download-tag:focus-visible {
   gap: 12px;
   padding: 14px;
   border: 1px solid rgba(201, 191, 180, 0.78);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
 }
 
@@ -3624,7 +3618,7 @@ button.seed-download-tag:focus-visible {
 .upstream-management-form__field select {
   min-height: 40px;
   padding: 8px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3668,7 +3662,7 @@ button.seed-download-tag:focus-visible {
 .admin-invite-form input {
   min-height: 42px;
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   border: 1px solid var(--stroke);
   background: white;
   font-size: 0.9rem;
@@ -3700,7 +3694,7 @@ button.seed-download-tag:focus-visible {
 .upstream-target-list button.selected,
 .upstream-assignment-toolbar button.selected {
   background: var(--accent-2);
-  border-color: rgba(15, 139, 141, 0.4);
+  border-color: rgba(var(--accent-rgb), 0.4);
   color: #372b1d;
   font-weight: 600;
 }
@@ -3716,7 +3710,7 @@ button.seed-download-tag:focus-visible {
   gap: 4px;
   padding: 12px 14px;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fcfaf7;
 }
 
@@ -3738,7 +3732,7 @@ button.seed-download-tag:focus-visible {
   padding: 18px;
   overflow: hidden;
   background:
-    radial-gradient(circle at 18% 18%, rgba(15, 139, 141, 0.16), transparent 28%),
+    radial-gradient(circle at 18% 18%, rgba(var(--accent-rgb), 0.16), transparent 28%),
     radial-gradient(circle at 86% 12%, rgba(244, 163, 64, 0.18), transparent 30%),
     linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(246, 241, 234, 0.94));
 }
@@ -3765,7 +3759,7 @@ button.seed-download-tag:focus-visible {
   min-height: 40px;
   padding: 8px 12px;
   border: 1px solid var(--stroke);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: white;
   color: var(--ink);
   font-size: 0.88rem;
@@ -3781,12 +3775,12 @@ button.seed-download-tag:focus-visible {
 .upstream-map__canvas {
   position: relative;
   min-height: 380px;
-  border: 1px solid rgba(15, 139, 141, 0.18);
-  border-radius: 20px;
+  border: 1px solid rgba(var(--accent-rgb), 0.18);
+  border-radius: var(--radius-lg);
   overflow: hidden;
   background:
-    linear-gradient(rgba(15, 139, 141, 0.055) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(15, 139, 141, 0.055) 1px, transparent 1px),
+    linear-gradient(rgba(var(--accent-rgb), 0.055) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(var(--accent-rgb), 0.055) 1px, transparent 1px),
     radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.98), rgba(246, 241, 234, 0.84));
   background-size: 34px 34px, 34px 34px, auto;
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
@@ -3801,7 +3795,7 @@ button.seed-download-tag:focus-visible {
 
 .upstream-map__halo circle {
   fill: none;
-  stroke: rgba(15, 139, 141, 0.11);
+  stroke: rgba(var(--accent-rgb), 0.11);
   stroke-width: 1.5;
   stroke-dasharray: 7 10;
 }
@@ -3861,7 +3855,7 @@ button.seed-download-tag:focus-visible {
 .upstream-map__legend {
   padding: 12px;
   border: 1px solid rgba(201, 191, 180, 0.78);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.86);
   box-shadow: 0 16px 36px rgba(29, 53, 64, 0.08);
 }
@@ -3926,7 +3920,7 @@ button.seed-download-tag:focus-visible {
   gap: 6px;
   text-align: center;
   border: 1px dashed rgba(201, 191, 180, 0.95);
-  border-radius: 16px;
+  border-radius: var(--radius-lg);
   background: rgba(255, 255, 255, 0.72);
 }
 
@@ -4003,7 +3997,7 @@ button.seed-download-tag:focus-visible {
   min-height: 160px;
   padding: 16px;
   border: 1px dashed var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fcfaf7;
 }
 
@@ -4126,7 +4120,7 @@ button.seed-download-tag:focus-visible {
   gap: 10px;
   padding: 7px 9px;
   border: 1px solid var(--stroke);
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.72);
   color: var(--text);
   text-align: left;
@@ -4206,7 +4200,7 @@ button.seed-download-tag:focus-visible {
 
 .seed-corpus-column.is-active > .seed-sources-panel,
 .seed-corpus-column.is-active .corpus-workspace-shell > .card {
-  border-color: rgba(15, 139, 141, 0.28);
+  border-color: rgba(var(--accent-rgb), 0.28);
   box-shadow: 0 18px 40px rgba(31, 41, 51, 0.08);
 }
 
@@ -4255,7 +4249,7 @@ button.seed-download-tag:focus-visible {
   gap: 12px;
   padding: 14px;
   border: 1px solid var(--stroke);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: #fcfaf7;
 }
 
@@ -4340,7 +4334,7 @@ button.seed-download-tag:focus-visible {
   gap: 12px;
   padding: 14px;
   border: 1px solid rgba(201, 191, 180, 0.78);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
   margin-bottom: 14px;
 }
@@ -4370,7 +4364,7 @@ button.seed-download-tag:focus-visible {
   flex-wrap: nowrap;
   padding: 10px 12px;
   border: 1px solid rgba(201, 191, 180, 0.78);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.84);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
   white-space: nowrap;
@@ -4399,7 +4393,7 @@ button.seed-download-tag:focus-visible {
   margin: 0;
   padding: 18px 20px;
   border: 1px dashed rgba(201, 191, 180, 0.88);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(250, 247, 242, 0.96), rgba(245, 240, 233, 0.88));
 }
 
@@ -4422,7 +4416,7 @@ button.seed-download-tag:focus-visible {
 
 .seed-source {
   border: 1px solid var(--stroke);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: #fff;
   overflow: hidden;
   flex: 0 0 auto;
@@ -4725,7 +4719,7 @@ button.seed-download-tag:focus-visible {
   .seed-corpus-toolbar .seed-intake-card,
   .seed-sources-panel,
   .corpus-workspace-shell > .card {
-    border-radius: 14px;
+    border-radius: var(--radius-md);
   }
 
   .seed-corpus-toolbar .seed-intake-card--upload .upload-drop {
@@ -4836,7 +4830,7 @@ button.seed-download-tag:focus-visible {
   min-width: min(280px, 36vw);
   padding: 10px 12px;
   border: 1px solid rgba(201, 191, 180, 0.72);
-  border-radius: 14px;
+  border-radius: var(--radius-md);
   background: linear-gradient(180deg, rgba(252, 250, 247, 0.96), rgba(246, 241, 234, 0.92));
   text-align: left;
 }
@@ -4927,7 +4921,7 @@ button.seed-download-tag:focus-visible {
     position: static;
     top: auto;
     border: 1px solid var(--stroke);
-    border-radius: 12px;
+    border-radius: var(--radius-md);
     overflow: hidden;
   }
   .nav-group { display: contents; }
@@ -4949,11 +4943,11 @@ button.seed-download-tag:focus-visible {
      focus inside the segment to keep keyboard focus visible. */
   .side-nav button:focus-visible {
     outline: none;
-    box-shadow: inset 0 0 0 2px rgba(15, 139, 141, 0.55);
+    box-shadow: inset 0 0 0 2px rgba(var(--accent-rgb), 0.55);
   }
   .side-nav button.active {
-    background: rgba(15, 139, 141, 0.14);
-    color: #0c5f60;
+    background: rgba(var(--accent-rgb), 0.14);
+    color: #5f262c;
     border-color: var(--stroke);
     box-shadow: none;
   }
