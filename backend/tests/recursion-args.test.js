@@ -188,6 +188,39 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     expect(args).not.toContain('--include-upstream')
   })
 
+  test('defaults keyword search to uncapped results and no sort', async () => {
+    const res = await doKeywordSearch({ query: 'institutional economics' })
+
+    expect(res.status).toBe(200)
+    const args = readArgFile(argFile)
+    expect(args[args.indexOf('--max-results') + 1]).toBe('0')
+    expect(args).not.toContain('--sort')
+  })
+
+  test('passes user cap and sort for keyword search', async () => {
+    const res = await doKeywordSearch({
+      query: 'institutional economics',
+      maxResults: 25,
+      sort: 'newest',
+    })
+
+    expect(res.status).toBe(200)
+    const args = readArgFile(argFile)
+    expect(args[args.indexOf('--max-results') + 1]).toBe('25')
+    expect(args[args.indexOf('--sort') + 1]).toBe('newest')
+  })
+
+  test('ignores a non-sort sort value', async () => {
+    const res = await doKeywordSearch({
+      query: 'institutional economics',
+      sort: '   ',
+    })
+
+    expect(res.status).toBe(200)
+    const args = readArgFile(argFile)
+    expect(args).not.toContain('--sort')
+  })
+
   test('upload process queues DB-driven background jobs', async () => {
     seedPendingWork()
     const res = await doIngestProcess({

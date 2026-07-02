@@ -4488,12 +4488,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
 
     const field = req.body?.field || 'default';
-    const maxResults = coerceInt(req.body?.maxResults, 200);
+    // 0 = uncapped; the user opts into a cap via maxResults
+    const maxResults = coerceInt(req.body?.maxResults, 0);
+    const sort = typeof req.body?.sort === 'string' ? req.body.sort.trim() : '';
     const mailto = req.body?.mailto || '';
     const enqueue = Boolean(req.body?.enqueue);
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
+    if (sort) args.push('--sort', sort);
     const expansion = buildKeywordSearchExpansion({
       relatedDepth: coerceInt(req.body?.relatedDepth, null),
       relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
