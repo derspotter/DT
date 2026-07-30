@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { ensureSeedSchema, listSeedCandidates } from '../src/seed.js'
+import { ensureSeedSchema, listSeedCandidates, listSeedSources } from '../src/seed.js'
 
 function createSeedDb() {
   const db = new Database(':memory:')
@@ -191,5 +191,96 @@ describe('seed candidate venue fallback', () => {
     const [candidate] = listSeedCandidates(db, 130, 'search', '7')
 
     expect(candidate.source).toBe('Journal of Labour Studies')
+  })
+})
+
+describe('seed candidate text filter', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  function seedTwoEntries() {
+    db = createSeedDb()
+    // listSeedSources joins the seed-document metadata table; the shared
+    // createSeedDb helper only sets up what listSeedCandidates needs.
+    db.exec(`
+      CREATE TABLE ingest_source_metadata (
+        corpus_id INTEGER NOT NULL,
+        ingest_source TEXT NOT NULL,
+        title TEXT,
+        authors TEXT,
+        year TEXT,
+        doi TEXT,
+        source TEXT,
+        publisher TEXT,
+        source_pdf TEXT
+      );
+    `)
+    // ensureSeedSchema creates search_run_corpora, so listSeedSources takes the
+    // search branch and needs these two present even when empty.
+    db.exec(`
+      CREATE TABLE search_runs (
+        id INTEGER PRIMARY KEY,
+        query TEXT,
+        filters_json TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE search_results (
+        id INTEGER PRIMARY KEY,
+        search_run_id INTEGER NOT NULL,
+        title TEXT,
+        doi TEXT,
+        openalex_id TEXT,
+        year TEXT,
+        raw_json TEXT
+      );
+    `)
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
+       VALUES (1, 130, 'basare', 'Bazaar Economies', '["Anna Author"]', '2001', 'Journal of Labour Studies')`
+    ).run()
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
+       VALUES (2, 130, 'basare', 'Shuttle Trade', '["Bert Writer"]', '2015', 'Economic Review')`
+    ).run()
+  }
+
+  test('returns every candidate when no query is given', () => {
+    seedTwoEntries()
+    expect(listSeedCandidates(db, 130, 'pdf', 'basare')).toHaveLength(2)
+  })
+
+  test('matches on title case-insensitively', () => {
+    seedTwoEntries()
+    const results = listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'BAZAAR' })
+    expect(results.map((row) => row.title)).toEqual(['Bazaar Economies'])
+  })
+
+  test('matches on author', () => {
+    seedTwoEntries()
+    const results = listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'bert' })
+    expect(results.map((row) => row.title)).toEqual(['Shuttle Trade'])
+  })
+
+  test('matches on publication', () => {
+    seedTwoEntries()
+    const results = listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'economic review' })
+    expect(results.map((row) => row.title)).toEqual(['Shuttle Trade'])
+  })
+
+  test('hides seeds whose candidates all fail to match', () => {
+    seedTwoEntries()
+    const sources = listSeedSources(db, 130, { q: 'nothing matches this' })
+    expect(sources).toHaveLength(0)
+  })
+
+  test('keeps a seed that still has one matching candidate', () => {
+    seedTwoEntries()
+    const sources = listSeedSources(db, 130, { q: 'bazaar' })
+    expect(sources).toHaveLength(1)
+    expect(sources[0].candidate_count).toBe(1)
   })
 })

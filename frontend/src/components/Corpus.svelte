@@ -21,7 +21,13 @@
   export let loadCorpus;
   export let handleCorpusColumnScroll;
 
-  let textFilter = '';
+  // The text filter is server-side (spec line 6): the corpus is paged, so a
+  // client-side filter would only ever search the page already loaded.
+  export let corpusFilterQuery = '';
+  export let handleCorpusFilterInput = () => {};
+  export let toggleCorpusSort = () => {};
+  export let corpusSortIndicator = () => '';
+  export let corpusSort = '';
   let stageFilter = 'all';
   let activeCorpusKey = '';
   const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending']);
@@ -43,16 +49,6 @@
       if (!DOWNLOADED_STATUSES.has(item.status)) return false;
     }
 
-    if (textFilter.trim() !== '') {
-      const keywords = textFilter.toLowerCase().split(/\s+/).filter(Boolean);
-      const titleStr = (item.title || '').toLowerCase();
-      const yearStr = String(item.year || '');
-      const sourceStr = corpusItemSource(item).toLowerCase();
-      
-      const allMatch = keywords.every(kw => titleStr.includes(kw) || yearStr.includes(kw) || sourceStr.includes(kw));
-      if (!allMatch) return false;
-    }
-    
     return true;
   });
 
@@ -137,7 +133,13 @@
     <div class="table-toolbar-left corpus-toolbar__filters">
       <label class="corpus-filter corpus-filter--wide">
         <span class="muted small">Search Title, Year, or Source</span>
-        <input type="text" bind:value={textFilter} placeholder="Filter items..." />
+        <input
+          type="search"
+          value={corpusFilterQuery}
+          on:input={handleCorpusFilterInput}
+          placeholder="Filter by title, author or publication"
+          aria-label="Filter corpus items by title, author or publication"
+        />
       </label>
       <label class="corpus-filter corpus-filter--stage">
         <span class="muted small">Pipeline Stage</span>
@@ -165,9 +167,9 @@
       on:scroll={handleCorpusColumnScroll}
     >
       <div class="table-row header cols-corpus-main">
-        <span>Title</span>
-        <span>Year</span>
-        <span>Source</span>
+        <span><button class="table-sort" type="button" on:click={() => toggleCorpusSort('title')}>Title{corpusSortIndicator('title', corpusSort)}</button></span>
+        <span><button class="table-sort" type="button" on:click={() => toggleCorpusSort('year')}>Year{corpusSortIndicator('year', corpusSort)}</button></span>
+        <span><button class="table-sort" type="button" on:click={() => toggleCorpusSort('source')}>Source{corpusSortIndicator('source', corpusSort)}</button></span>
         <span>Stage</span>
       </div>
       {#each filteredItems as item (item.id)}

@@ -4543,7 +4543,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.get('/api/seed/sources', requireAuthMiddleware, (req, res) => {
     try {
       const limit = Math.max(1, Math.min(500, coerceInt(req.query?.limit, 100) || 100));
-      const sources = listSeedSources(authDb, req.corpusId, { limit, resolveDownloadedFilePath: findDownloadedFilePath });
+      const q = String(req.query?.q || '').trim();
+      const sources = listSeedSources(authDb, req.corpusId, { limit, resolveDownloadedFilePath: findDownloadedFilePath, q });
       return res.json({ source: 'db', sources, total: sources.length });
     } catch (error) {
       console.error('[/api/seed/sources] Error:', error);
@@ -4561,6 +4562,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver: null,
         resolveDownloadedFilePath: findDownloadedFilePath,
+        q: String(req.query?.q || '').trim(),
       });
       const sourceSummary = listSeedSources(authDb, req.corpusId, { limit: 500, resolveDownloadedFilePath: findDownloadedFilePath }).find(
         (source) => source.source_type === sourceType && String(source.source_key) === sourceKey
@@ -4819,9 +4821,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     const limit = coerceInt(req.query?.limit, 200);
     const offset = coerceInt(req.query?.offset, 0);
+    const query = String(req.query?.q || '').trim();
+    const sort = String(req.query?.sort || '').trim();
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
+    if (query) args.push('--q', query);
+    if (sort) args.push('--sort', sort);
     try {
       const payload = await runPythonJson(CORPUS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);

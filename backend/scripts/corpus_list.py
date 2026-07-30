@@ -177,12 +177,63 @@ def source_label_for_work(data, corpus_id, pdf_source_labels, search_source_labe
     return {"source_type": "", "source_key": "", "source_label": source}
 
 
+def _searchable_text(item):
+    """Fields the corpus text filter matches on: title, author, publication."""
+    parts = [
+        item.get("title"),
+        item.get("authors"),
+        item.get("source"),
+        item.get("source_label"),
+    ]
+    return " ".join(str(part) for part in parts if part).lower()
+
+
+def apply_query_filter(items, query):
+    needle = str(query or "").strip().lower()
+    if not needle:
+        return items
+    return [item for item in items if needle in _searchable_text(item)]
+
+
+# Sorting happens here rather than in SQL because the rows are already
+# materialised in Python above; paging slices this same list.
+SORT_KEYS = {
+    "title": lambda item: str(item.get("title") or "").lower(),
+    "year": lambda item: normalize_year(item.get("year")),
+    "source": lambda item: str(item.get("source") or "").lower(),
+    "seed": lambda item: str(item.get("source_label") or "").lower(),
+    "metadata": lambda item: str(item.get("metadata_status") or "").lower(),
+    "download": lambda item: str(item.get("download_status") or "").lower(),
+}
+
+
+def apply_sort(items, sort):
+    raw = str(sort or "").strip().lower()
+    column, _, direction = raw.partition(":")
+    key = SORT_KEYS.get(column)
+    if key is None:
+        # Default ordering, unchanged: newest first, then newest id.
+        items.sort(key=lambda x: (normalize_year(x.get("year")), normalize_id(x.get("id"))), reverse=True)
+        return
+    reverse = direction != "asc"
+    # Stable secondary ordering by id keeps paging deterministic when the sort
+    # column ties (very common for year and status columns).
+    items.sort(key=lambda x: normalize_id(x.get("id")), reverse=True)
+    items.sort(key=key, reverse=reverse)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--corpus-id", type=int, default=None)
+    parser.add_argument("--q", default=None, help="Case-insensitive substring filter over title, authors and source")
+    parser.add_argument(
+        "--sort",
+        default=None,
+        help="Sort as <column>:<asc|desc>. Columns: title, year, source, seed, metadata, download",
+    )
     args = parser.parse_args()
 
     if "RAG_FEEDER_STUB" in __import__("os").environ:
@@ -252,6 +303,8 @@ def main():
 
     conn.close()
 
+    items = apply_query_filter(items, args.q)
+
     status_counts = Counter(item.get("status") for item in items)
     stage_totals = {
         "raw": sum(status_counts.get(status, 0) for status in ("raw", "extract_references_from_pdf", "pending")),
@@ -261,7 +314,7 @@ def main():
         "failed_download": status_counts.get("failed_download", 0),
     }
 
-    items.sort(key=lambda x: (normalize_year(x.get("year")), normalize_id(x.get("id"))), reverse=True)
+    apply_sort(items, args.sort)
     total = len(items)
     start = max(args.offset, 0)
     end = start + max(args.limit, 0)

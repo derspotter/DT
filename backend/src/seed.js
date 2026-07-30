@@ -599,7 +599,26 @@ export function upsertSearchRunCorpus(db, { searchRunId, corpusId }) {
   return true
 }
 
-export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null } = {}) {
+// The seed/corpus text filter matches title, author and publication (venue),
+// case-insensitively. Kept here so listSeedCandidates and listSeedSources agree
+// on what "matching" means — a seed is hidden exactly when none of its items match.
+export function matchesSeedQuery(candidate, needle) {
+  if (!needle) return true
+  const authors = Array.isArray(candidate?.authors) ? candidate.authors.join(' ') : candidate?.authors || ''
+  const haystack = [
+    candidate?.title,
+    authors,
+    candidate?.source,
+    candidate?.publisher,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return haystack.includes(needle)
+}
+
+export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null, q = '' } = {}) {
+  const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   if (!sourceRef || !['pdf', 'search'].includes(sourceKind)) return []
@@ -620,7 +639,8 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
         const candidate = normalizePdfCandidate(row, sourceRef, resolverBundle)
         return applyExplicitCorpusMembership(candidate, inCorpusMarked)
       })
-      .filter((candidate) => !dismissed.has(candidate.candidate_key)))
+      .filter((candidate) => !dismissed.has(candidate.candidate_key))
+      .filter((candidate) => matchesSeedQuery(candidate, needle)))
   }
 
   const runId = Number(sourceRef)
@@ -638,7 +658,8 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
       const candidate = normalizeSearchCandidate(row, resolverBundle)
       return applyExplicitCorpusMembership(candidate, inCorpusMarked)
     })
-    .filter((candidate) => !dismissed.has(candidate.candidate_key)))
+    .filter((candidate) => !dismissed.has(candidate.candidate_key))
+    .filter((candidate) => matchesSeedQuery(candidate, needle)))
 }
 
 function summarizeStates(candidates) {
@@ -676,7 +697,7 @@ function summarizeStates(candidates) {
   return stateCounts
 }
 
-export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFilePath = null } = {}) {
+export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFilePath = null, q = '' } = {}) {
   const resolver = createStateResolver(db, corpusId, { resolveDownloadedFilePath })
   const pdfSources = db.prepare(
     `SELECT ie.ingest_source AS source_key,
@@ -732,7 +753,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
       source: row.seed_source,
       publisher: row.seed_publisher,
     }
-    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver })
+    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
     sources.push({
       id: buildSourceId('pdf', sourceKey),
@@ -751,7 +772,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
   searchSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
     if (!sourceKey) return
-    const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver })
+    const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
     sources.push({
       id: buildSourceId('search', sourceKey),

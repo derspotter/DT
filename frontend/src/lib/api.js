@@ -401,8 +401,11 @@ export async function fetchIngestRuns(limit = 20) {
   return response.json()
 }
 
-export async function fetchSeedSources(limit = 100) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/seed/sources?limit=${encodeURIComponent(String(limit))}`)
+export async function fetchSeedSources(limit = 100, { q = '' } = {}) {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  if (q) params.set('q', q)
+  const response = await fetchWithTimeout(`${API_BASE}/api/seed/sources?${params.toString()}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
@@ -411,9 +414,10 @@ export async function fetchSeedSources(limit = 100) {
   return response.json()
 }
 
-export async function fetchSeedCandidates(sourceType, sourceKey) {
+export async function fetchSeedCandidates(sourceType, sourceKey, { q = '' } = {}) {
+  const suffix = q ? `?q=${encodeURIComponent(q)}` : ''
   const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates`
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates${suffix}`
   )
   await throwIfUnauthorized(response)
   if (!response.ok) {
@@ -653,10 +657,12 @@ export async function fetchRecursionConfig() {
   return response.json()
 }
 
-export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
+export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' } = {}) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   params.set('offset', String(offset))
+  if (q) params.set('q', q)
+  if (sort) params.set('sort', sort)
   const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {

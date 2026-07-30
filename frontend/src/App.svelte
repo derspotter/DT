@@ -255,6 +255,14 @@
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
+  // Text filter (spec line 6). Applied server-side for both sections: the
+  // corpus is paged, and seeds are collapsed, so client-side filtering would
+  // only ever see what happens to be loaded.
+  let seedFilterQuery = ''
+  let corpusFilterQuery = ''
+  let seedFilterDebounce = null
+  let corpusFilterDebounce = null
+  let corpusSort = ''
   let corpusLoading = false
   let corpusLoadingMore = false
   let corpusLoadRequestSeq = 0
@@ -2554,6 +2562,39 @@
   // driven by the Promotion Settings need to appear in the key itself.
   $: downstreamPromotesAll = includeDownstream && relatedDepthDownstream >= 1
 
+  // Debounced so typing does not fire a request per keystroke. Both reset to
+  // offset 0 implicitly: loadSeedSources reloads from scratch and loadCorpus
+  // without `append` starts at offset 0.
+  function handleSeedFilterInput(event) {
+    seedFilterQuery = String(event?.target?.value || '')
+    clearTimeout(seedFilterDebounce)
+    seedFilterDebounce = setTimeout(() => {
+      seedCandidatesBySource = {}
+      loadSeedSources({ quiet: true })
+    }, 300)
+  }
+
+  function handleCorpusFilterInput(event) {
+    corpusFilterQuery = String(event?.target?.value || '')
+    clearTimeout(corpusFilterDebounce)
+    corpusFilterDebounce = setTimeout(() => {
+      loadCorpus({ quiet: true })
+    }, 300)
+  }
+
+  function toggleCorpusSort(column) {
+    const [currentColumn, currentDirection] = String(corpusSort || '').split(':')
+    const direction = currentColumn === column && currentDirection === 'asc' ? 'desc' : 'asc'
+    corpusSort = `${column}:${direction}`
+    loadCorpus({ quiet: true })
+  }
+
+  function corpusSortIndicator(column, sort = corpusSort) {
+    const [currentColumn, currentDirection] = String(sort || '').split(':')
+    if (currentColumn !== column) return ''
+    return currentDirection === 'asc' ? ' ▲' : ' ▼'
+  }
+
   function getSeedCandidatesForSource(source) {
     return seedCandidatesBySource[seedSourceId(source)] || []
   }
@@ -2707,7 +2748,7 @@
   async function loadSeedSources({ quiet = false } = {}) {
     if (!quiet) seedSourcesStatus = 'Loading seeds...'
     try {
-      const payload = await fetchSeedSources(100)
+      const payload = await fetchSeedSources(100, { q: seedFilterQuery })
       seedSources = payload.sources || []
       const validSourceIds = new Set(seedSources.map((source) => seedSourceId(source)))
       if (expandedSeedSourceId && !validSourceIds.has(expandedSeedSourceId)) {
@@ -2746,7 +2787,7 @@
       seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: true }
     }
     try {
-      const payload = await fetchSeedCandidates(source.source_type, source.source_key)
+      const payload = await fetchSeedCandidates(source.source_type, source.source_key, { q: seedFilterQuery })
       const nextCandidates = payload.candidates || []
       seedCandidatesBySource = {
         ...seedCandidatesBySource,
@@ -3230,7 +3271,12 @@
           : quiet && preserveSelection
             ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
             : CORPUS_PAGE_SIZE
-      const { data, total, source, stageTotals } = await fetchCorpus({ limit: requestedLimit, offset })
+      const { data, total, source, stageTotals } = await fetchCorpus({
+        limit: requestedLimit,
+        offset,
+        q: corpusFilterQuery,
+        sort: corpusSort,
+      })
       const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       const currentCorpusNumeric = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
       if (requestSeq !== corpusLoadRequestSeq || requestCorpusId !== currentCorpusNumeric) {
@@ -4224,6 +4270,20 @@
             </div>
           </div>
 
+          <div class="table-filter">
+            <input
+              type="search"
+              class="table-filter__input"
+              placeholder="Filter by title, author or publication"
+              aria-label="Filter seed items by title, author or publication"
+              value={seedFilterQuery}
+              on:input={handleSeedFilterInput}
+            />
+            {#if seedFilterQuery}
+              <span class="muted small">Seeds without a match are hidden.</span>
+            {/if}
+          </div>
+
           <div class="seed-expansion-row seed-expansion-row--panel">
             <div class="seed-expansion-meta">
               <span class="muted small seed-expansion-label">Promotion settings</span>
@@ -4511,6 +4571,11 @@
                 {failedDownloadTotal}
                 {bucketLabel}
                 {formatAuthors}
+                {corpusFilterQuery}
+                {handleCorpusFilterInput}
+                {toggleCorpusSort}
+                {corpusSortIndicator}
+                {corpusSort}
                 {doiHref}
                 {openAlexHref}
                 {handleDownloadedCorpusFile}

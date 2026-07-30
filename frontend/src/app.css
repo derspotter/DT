@@ -1966,6 +1966,22 @@ button.seed-download-tag:focus-visible {
   min-width: 0;
 }
 
+.table-filter {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.table-filter__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border, #d4d4d8);
+  border-radius: 6px;
+  font: inherit;
+}
+
 .table-sort {
   border: 0;
   background: none;
