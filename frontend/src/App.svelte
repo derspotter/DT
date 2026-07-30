@@ -35,6 +35,8 @@
     fetchCorpus,
     removeCorpusWork,
     fetchSeedSourceDocument,
+    fetchAppSettings,
+    saveAppSettings,
     fetchDownloadQueue,
     fetchDownloadWorkerStatus,
     startDownloadWorker,
@@ -260,6 +262,10 @@
   // Text filter (spec line 6). Applied server-side for both sections: the
   // corpus is paged, and seeds are collapsed, so client-side filtering would
   // only ever see what happens to be loaded.
+  let appSettings = null
+  let appSettingsDraft = {}
+  let appSettingsStatus = ''
+  let appSettingsError = false
   let seedFilterQuery = ''
   let corpusFilterQuery = ''
   let seedFilterDebounce = null
@@ -385,6 +391,8 @@
   // The graph opens scoped to the workspace corpus; "All corpora" in its own
   // dropdown restores the previous global view (spec line 22).
   $: graphCorpusId = Number.isFinite(Number(currentCorpusId)) && currentCorpusId ? String(currentCorpusId) : 'all'
+  // Load settings the first time an admin opens the Admin tab.
+  $: if (activeTab === 'admin' && isAdmin && appSettings === null) loadAppSettings()
   $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
   $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && (isAdmin || currentCorpus?.role === 'owner' || currentCorpus?.role === 'editor'))
   let shareUsername = ''
@@ -3599,6 +3607,59 @@
     }
   }
 
+  async function loadAppSettings() {
+    if (!isAdmin) return
+    try {
+      const payload = await fetchAppSettings()
+      appSettings = payload?.settings || null
+      // Secrets are never returned, so their draft fields start blank and a
+      // blank field means "leave unchanged" on save.
+      appSettingsDraft = {
+        openalex_api_key: '',
+        openai_api_key: '',
+        gemini_api_key: '',
+        openalex_rps: appSettings?.openalex_rps?.value || '',
+        llm_provider: appSettings?.llm_provider?.value || '',
+        openai_base_url: appSettings?.openai_base_url?.value || '',
+        extract_model: appSettings?.extract_model?.value || '',
+        openai_model: appSettings?.openai_model?.value || '',
+        gemini_model: appSettings?.gemini_model?.value || '',
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      appSettingsStatus = error?.message || 'Failed to load settings.'
+      appSettingsError = true
+    }
+  }
+
+  async function handleSaveAppSettings() {
+    const payload = { ...appSettingsDraft }
+    // A blank secret means "keep what is stored", so omit it entirely rather
+    // than sending '' — which the API treats as "clear this override".
+    for (const key of ['openalex_api_key', 'openai_api_key', 'gemini_api_key']) {
+      if (!String(payload[key] || '').trim()) delete payload[key]
+    }
+    try {
+      appSettingsError = false
+      appSettingsStatus = 'Saving...'
+      await saveAppSettings(payload)
+      appSettingsStatus = 'Settings saved. New values apply to the next pipeline run.'
+      await loadAppSettings()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      appSettingsStatus = error?.message || 'Failed to save settings.'
+      appSettingsError = true
+    }
+  }
+
   async function handleDownloadSeedDocument(ingestSource) {
     const sourceKey = String(ingestSource || '').trim()
     if (!sourceKey) return
@@ -4711,6 +4772,11 @@
           {inviteStatus}
           {inviteError}
           {handleCreateInvitation}
+          {appSettings}
+          {appSettingsStatus}
+          {appSettingsError}
+          bind:appSettingsDraft={appSettingsDraft}
+          {handleSaveAppSettings}
         />
       {/if}
 

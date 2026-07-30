@@ -1989,6 +1989,27 @@ button.seed-download-tag:focus-visible {
   color: #b91c1c;
 }
 
+.admin-settings-form {
+  display: grid;
+  gap: 12px;
+  max-width: 520px;
+}
+
+.admin-settings-form label {
+  display: grid;
+  gap: 4px;
+}
+
+.admin-settings-form__group {
+  margin: 12px 0 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.admin-settings-form__toggle {
+  justify-self: start;
+}
+
 .table-filter {
   display: flex;
   align-items: center;

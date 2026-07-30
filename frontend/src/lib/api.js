@@ -693,6 +693,30 @@ export async function fetchSeedSourceDocument(sourceKey) {
   return { blob: await response.blob(), filename }
 }
 
+export async function fetchAppSettings() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load settings')
+  }
+  return response.json()
+}
+
+export async function saveAppSettings(settings) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ settings }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to save settings')
+  }
+  return response.json()
+}
+
 export async function removeCorpusWork(workId) {
   const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/${encodeURIComponent(String(workId))}`, {
     method: 'DELETE',

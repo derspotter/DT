@@ -390,6 +390,77 @@ describe('corpus sharing and multi-user isolation', () => {
     expect(res.status).toBe(404)
   })
 
+  test('admin settings never echo secrets back and persist non-secrets', async () => {
+    const admin = await login(adminUsername, adminPassword)
+
+    const saveRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { openalex_api_key: 'super-secret', openalex_rps: '12', llm_provider: 'openai' } })
+    expect(saveRes.status).toBe(200)
+
+    const getRes = await request(app)
+      .get('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(getRes.status).toBe(200)
+    // The secret is reported as set but its value is never returned.
+    expect(getRes.body.settings.openalex_api_key).toEqual(expect.objectContaining({ is_set: true }))
+    expect(JSON.stringify(getRes.body)).not.toContain('super-secret')
+    expect(getRes.body.settings.openalex_rps.value).toBe('12')
+    expect(getRes.body.settings.llm_provider.value).toBe('openai')
+  })
+
+  test('clearing a setting removes the override', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { extract_model: 'some-model' } })
+
+    await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { extract_model: '' } })
+
+    const getRes = await request(app)
+      .get('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(getRes.body.settings.extract_model.value).toBe('')
+  })
+
+  test('rejects unknown settings keys and a non-positive rps', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const unknownRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { not_a_setting: 'x' } })
+    expect(unknownRes.status).toBe(400)
+
+    const rpsRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { openalex_rps: '0' } })
+    expect(rpsRes.status).toBe(400)
+  })
+
+  test('non-admins cannot read or write settings', async () => {
+    const username = 'settings-outsider'
+    const password = 'settings-outsider-password'
+    createActiveUser(username, password)
+    const outsider = await login(username, password)
+
+    const getRes = await request(app)
+      .get('/api/admin/settings')
+      .set('Authorization', `Bearer ${outsider.token}`)
+    expect(getRes.status).toBe(403)
+
+    const putRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${outsider.token}`)
+      .send({ settings: { llm_provider: 'gemini' } })
+    expect(putRes.status).toBe(403)
+  })
+
   test('rejects an invalid work id', async () => {
     const admin = await login(adminUsername, adminPassword)
     const res = await request(app)

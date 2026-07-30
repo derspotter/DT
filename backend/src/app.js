@@ -722,6 +722,14 @@ function ensureAuthSchema(db) {
       added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, work_id)
     );
+    -- Instance-wide external API / LLM configuration (spec lines 13 & 14).
+    -- Values override the corresponding environment variables when set.
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_by_user_id INTEGER,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS ingest_source_metadata (
       corpus_id INTEGER NOT NULL DEFAULT 0,
       ingest_source TEXT NOT NULL,
@@ -1939,6 +1947,53 @@ function applyUploadedDocsExpansionArgs(args, expansion) {
   args.push('--max-related', String(expansion.maxRelated));
 }
 
+// Each setting maps 1:1 onto the environment variable the Python scripts
+// already read, so this is a UI over the existing env plumbing rather than a
+// new configuration mechanism. `secret: true` values are never returned to the
+// client — the API reports only whether they are set.
+let appSettingsDb = null;
+
+const APP_SETTING_DEFS = [
+  { key: 'openalex_api_key', env: 'OPENALEX_API_KEY', secret: true },
+  { key: 'openalex_rps', env: 'RAG_FEEDER_OPENALEX_RPS', secret: false },
+  { key: 'llm_provider', env: 'RAG_FEEDER_LLM_PROVIDER', secret: false },
+  { key: 'openai_base_url', env: 'RAG_FEEDER_OPENAI_BASE_URL', secret: false },
+  { key: 'openai_api_key', env: 'OPENAI_API_KEY', secret: true },
+  { key: 'gemini_api_key', env: 'GEMINI_API_KEY', secret: true },
+  { key: 'extract_model', env: 'RAG_FEEDER_API_EXTRACT_MODEL', secret: false },
+  { key: 'openai_model', env: 'RAG_FEEDER_OPENAI_MODEL', secret: false },
+  { key: 'gemini_model', env: 'RAG_FEEDER_GEMINI_MODEL', secret: false },
+];
+
+const APP_SETTING_BY_KEY = new Map(APP_SETTING_DEFS.map((def) => [def.key, def]));
+
+function readAppSettings(db) {
+  if (!tableExists(db, 'app_settings')) return {};
+  const rows = db.prepare('SELECT key, value FROM app_settings').all();
+  const out = {};
+  for (const row of rows) {
+    const value = String(row.value ?? '').trim();
+    if (value) out[String(row.key)] = value;
+  }
+  return out;
+}
+
+function appSettingsEnv() {
+  if (!appSettingsDb) return {};
+  let stored = {};
+  try {
+    stored = readAppSettings(appSettingsDb);
+  } catch {
+    return {};
+  }
+  const env = {};
+  for (const def of APP_SETTING_DEFS) {
+    const value = stored[def.key];
+    if (value) env[def.env] = value;
+  }
+  return env;
+}
+
 function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {}) {
   const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority });
   return done;
@@ -1947,6 +2002,9 @@ function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {})
 function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine, lowPriority } = {}) {
   const env = {
     ...process.env,
+    // Admin-managed settings win over the process environment, so changing a
+    // key or model in the UI takes effect on the next script run (spec 13/14).
+    ...appSettingsEnv(),
     PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
     RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
@@ -2260,6 +2318,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   const authDb = new Database(DB_PATH, { timeout: 3_000 });
+  // spawnPythonJson is module-level but needs the settings table; hand it this
+  // connection rather than reopening the DB on every spawn.
+  appSettingsDb = authDb;
   // Test suites spin up multiple app instances in parallel; these settings
   // reduce transient SQLITE_BUSY / "database is locked" bootstrapping failures.
   try {
@@ -3206,6 +3267,76 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       token: issueAuthToken(user, authConfig),
       user: authUserPayload(user, lastCorpusId, authConfig),
     });
+  });
+
+  const requireAdminMiddleware = (req, res, next) => {
+    if (!isAdminUser(req.user, authConfig)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    return next();
+  };
+
+  app.get('/api/admin/settings', requireAuthMiddleware, requireAdminMiddleware, (req, res) => {
+    try {
+      const stored = readAppSettings(authDb);
+      const settings = {};
+      for (const def of APP_SETTING_DEFS) {
+        if (def.secret) {
+          // Never echo a secret back — the UI shows "set"/"not set" and can
+          // only replace it.
+          settings[def.key] = { is_set: Boolean(stored[def.key]), env_fallback: Boolean(process.env[def.env]) };
+        } else {
+          settings[def.key] = { value: stored[def.key] || '', env_fallback: process.env[def.env] || '' };
+        }
+      }
+      return res.json({ settings });
+    } catch (error) {
+      console.error('[/api/admin/settings GET] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load settings' });
+    }
+  });
+
+  app.put('/api/admin/settings', requireAuthMiddleware, requireAdminMiddleware, (req, res) => {
+    const updates = req.body?.settings;
+    if (!updates || typeof updates !== 'object') {
+      return res.status(400).json({ error: 'Missing settings object' });
+    }
+    const unknown = Object.keys(updates).filter((key) => !APP_SETTING_BY_KEY.has(key));
+    if (unknown.length > 0) {
+      return res.status(400).json({ error: `Unknown setting(s): ${unknown.join(', ')}` });
+    }
+    const rps = updates.openalex_rps;
+    if (rps !== undefined && String(rps).trim() !== '') {
+      const parsed = Number(rps);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: 'openalex_rps must be a positive number' });
+      }
+    }
+    try {
+      const upsert = authDb.prepare(
+        `INSERT INTO app_settings (key, value, updated_by_user_id, updated_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_by_user_id = excluded.updated_by_user_id,
+           updated_at = CURRENT_TIMESTAMP`
+      );
+      const remove = authDb.prepare('DELETE FROM app_settings WHERE key = ?');
+      const apply = authDb.transaction((entries) => {
+        for (const [key, raw] of entries) {
+          const value = String(raw ?? '').trim();
+          // An empty value clears the override and falls back to the
+          // environment, rather than storing an empty string.
+          if (value) upsert.run(key, value, req.user.id);
+          else remove.run(key);
+        }
+      });
+      apply(Object.entries(updates));
+      return res.json({ saved: true });
+    } catch (error) {
+      console.error('[/api/admin/settings PUT] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to save settings' });
+    }
   });
 
   app.post('/api/auth/register', (req, res) => {
