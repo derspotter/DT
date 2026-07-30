@@ -226,6 +226,11 @@
   let relatedDepthDownstream = 0
   let relatedDepthUpstream = 0
   let maxRelated = 30
+  // Spec line 12: how related papers are ranked before the max-related cap.
+  let relatedSort = 'most_cited'
+  // Spec lines 10 & 11: new_seed reviews the expansion in section 2 first;
+  // download_all is the historical behaviour. Default is review-first.
+  let promotionMode = 'new_seed'
   let keywordRecursionConfig = {
     includeDownstream: false,
     includeUpstream: false,
@@ -2574,6 +2579,7 @@
   // The seed tables render inside {#key ...} blocks, so selectability changes
   // driven by the Promotion Settings need to appear in the key itself.
   $: downstreamPromotesAll = includeDownstream && relatedDepthDownstream >= 1
+  $: expansionEnabled = (includeDownstream && relatedDepthDownstream >= 1) || (includeUpstream && relatedDepthUpstream >= 1)
 
   // Debounced so typing does not fire a request per keystroke. Both reset to
   // offset 0 implicitly: loadSeedSources reloads from scratch and loadCorpus
@@ -2912,6 +2918,8 @@
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        relatedSort,
+        promotionMode,
         enqueueDownload: true,
         downloadBatchSize: Math.max(25, candidateKeys.length),
         workers: 6,
@@ -2979,6 +2987,8 @@
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        relatedSort,
+        promotionMode,
         enqueueDownload: true,
         downloadBatchSize: Math.max(25, candidateCount),
         workers: 6,
@@ -4433,6 +4443,24 @@
             <div class="seed-expansion-pill">
               <span class="muted small">Max Related / Paper</span>
               <input type="number" min="1" max="100" bind:value={maxRelated} class="short-input" />
+            </div>
+            <div class="seed-expansion-pill" class:opacity-50={!expansionEnabled}>
+              <span class="muted small" title="Which related papers survive the Max Related cap">Related papers</span>
+              <select bind:value={relatedSort} disabled={!expansionEnabled}>
+                <option value="most_cited">Most cited</option>
+                <option value="newest">Newest</option>
+              </select>
+            </div>
+            <div class="seed-expansion-divider"></div>
+            <div class="seed-expansion-pill" class:opacity-50={!expansionEnabled}>
+              <span
+                class="muted small"
+                title="New seed: related works land in Seed for review. Download everything: they go straight into the corpus."
+              >Expansion</span>
+              <select bind:value={promotionMode} disabled={!expansionEnabled}>
+                <option value="new_seed">Make new seed (review first)</option>
+                <option value="download_all">Download everything</option>
+              </select>
             </div>
           </div>
 

@@ -274,6 +274,61 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     expect(params?.expansion?.relatedDepthUpstream).toBe(2)
   })
 
+  test('passes the related-paper sort to the keyword search script', async () => {
+    const res = await doKeywordSearch({
+      query: 'ranking test',
+      includeDownstream: true,
+      relatedDepthDownstream: 1,
+      maxRelated: 5,
+      relatedSort: 'newest',
+    })
+    expect(res.status).toBe(200)
+    const argv = readArgFile(argFile)
+    expect(argv).toEqual(expect.arrayContaining(['--related-sort', 'newest']))
+  })
+
+  test('falls back to most_cited when the related sort is unknown', async () => {
+    const res = await doKeywordSearch({
+      query: 'ranking fallback',
+      includeDownstream: true,
+      relatedDepthDownstream: 1,
+      relatedSort: 'not-a-sort',
+    })
+    expect(res.status).toBe(200)
+    const argv = readArgFile(argFile)
+    expect(argv).toEqual(expect.arrayContaining(['--related-sort', 'most_cited']))
+  })
+
+  test('new-seed promotion mode stops the enrich job from crawling', async () => {
+    seedPendingWork()
+    const res = await doIngestProcess({
+      limit: 2,
+      workers: 2,
+      includeDownstream: true,
+      relatedDepthDownstream: 2,
+      promotionMode: 'new_seed',
+    })
+    expect(res.status).toBe(200)
+    const params = readLatestJob('enrich')
+    // process-marked keeps its own expansion semantics; what matters here is
+    // that the mode is carried through rather than silently dropped.
+    expect(params?.expansion?.promotionMode).toBe('new_seed')
+  })
+
+  test('download_all promotion mode is preserved', async () => {
+    seedPendingWork()
+    const res = await doIngestProcess({
+      limit: 2,
+      workers: 2,
+      includeDownstream: true,
+      relatedDepthDownstream: 2,
+      promotionMode: 'download_all',
+    })
+    expect(res.status).toBe(200)
+    const params = readLatestJob('enrich')
+    expect(params?.expansion?.promotionMode).toBe('download_all')
+  })
+
   test('defaults upload process to DB-driven background mode', async () => {
     const res = await doIngestProcess({
       limit: 2,

@@ -124,6 +124,7 @@ const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_s
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
+const SEED_EXPAND_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_expand.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
 const LOCAL_VENV_PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || (fs.existsSync(LOCAL_VENV_PYTHON) ? LOCAL_VENV_PYTHON : 'python');
@@ -1868,6 +1869,8 @@ function buildKeywordSearchExpansion(body = {}) {
       0
     ),
     maxRelated: coercePositiveInt(body?.maxRelated, RECURSION_DEFAULTS.keyword.maxRelated, 1),
+    relatedSort: coerceRelatedSort(body?.relatedSort),
+    promotionMode: coercePromotionMode(body?.promotionMode),
     includeDownstream: body?.includeDownstream === undefined
       ? RECURSION_DEFAULTS.keyword.includeDownstream
       : Boolean(body.includeDownstream),
@@ -1893,6 +1896,8 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
     args.push('--no-include-downstream');
   }
   args.push('--max-related', String(expansion.maxRelated));
+  // Rank-then-cap: decides WHICH related works survive the cap (spec 12).
+  if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
 function buildUploadedDocsExpansion(body = {}) {
@@ -1913,6 +1918,8 @@ function buildUploadedDocsExpansion(body = {}) {
       RECURSION_DEFAULTS.uploadedDocs.relatedDepthUpstream,
       0
     ),
+    relatedSort: coerceRelatedSort(body?.relatedSort),
+    promotionMode: coercePromotionMode(body?.promotionMode),
     maxRelated: coercePositiveInt(
       body?.maxRelated,
       RECURSION_DEFAULTS.uploadedDocs.maxRelated,
@@ -1945,6 +1952,8 @@ function applyUploadedDocsExpansionArgs(args, expansion) {
     args.push('--no-include-upstream');
   }
   args.push('--max-related', String(expansion.maxRelated));
+  // Rank-then-cap: decides WHICH related works survive the cap (spec 12).
+  if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
 // Each setting maps 1:1 onto the environment variable the Python scripts
@@ -2099,11 +2108,34 @@ function coerceBoolEnv(value, fallback) {
   return fallback;
 }
 
+// Must match RELATED_SORT_OPTIONS in backend/scripts/keyword_search.py.
+const RELATED_SORT_VALUES = new Set(['most_cited', 'newest']);
+const RELATED_SORT_DEFAULT = 'most_cited';
+
+function coerceRelatedSort(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return RELATED_SORT_VALUES.has(raw) ? raw : RELATED_SORT_DEFAULT;
+}
+
+// Promotion modes (spec lines 10 & 11). 'new_seed' promotes only the selected
+// items and lands the expansion as fresh seeds in section 2 for review;
+// 'download_all' is the historical behaviour that pulls the expansion straight
+// into the corpus pipeline.
+const PROMOTION_MODE_VALUES = new Set(['new_seed', 'download_all']);
+const PROMOTION_MODE_DEFAULT = 'new_seed';
+
+function coercePromotionMode(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return PROMOTION_MODE_VALUES.has(raw) ? raw : PROMOTION_MODE_DEFAULT;
+}
+
 const RECURSION_DEFAULTS = {
   keyword: {
     relatedDepthDownstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
     relatedDepthUpstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 0) || 0),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
+    relatedSort: RELATED_SORT_DEFAULT,
+    promotionMode: PROMOTION_MODE_DEFAULT,
     includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, false),
     includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
@@ -2112,6 +2144,8 @@ const RECURSION_DEFAULTS = {
     relatedDepthDownstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
     relatedDepthUpstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 0) || 0),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
+    relatedSort: RELATED_SORT_DEFAULT,
+    promotionMode: PROMOTION_MODE_DEFAULT,
     includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, false),
     includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
@@ -4677,6 +4711,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       maxRelated: coerceInt(req.body?.maxRelated, null),
       includeDownstream: req.body?.includeDownstream,
       includeUpstream: req.body?.includeUpstream,
+      relatedSort: req.body?.relatedSort,
+      promotionMode: req.body?.promotionMode,
     });
 
     if (seedJson) {
@@ -4839,7 +4875,28 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       includeUpstream: req.body?.includeUpstream,
       relatedDepthDownstream: req.body?.relatedDepthDownstream,
       relatedDepthUpstream: req.body?.relatedDepthUpstream,
+      relatedSort: req.body?.relatedSort,
+      promotionMode: req.body?.promotionMode,
     });
+    // Mode A (default): the selected items go to the corpus, but their expansion
+    // lands in section 2 as new seeds for review rather than being pulled
+    // straight in. Mode B keeps the historical download-everything path.
+    const wantsExpansion = Boolean(
+      (expansion.includeDownstream && expansion.relatedDepthDownstream >= 1) ||
+      (expansion.includeUpstream && expansion.relatedDepthUpstream >= 1)
+    );
+    const expansionAsNewSeeds = expansion.promotionMode === 'new_seed' && wantsExpansion;
+    // In new-seed mode the enrich job must not crawl — the expansion is handled
+    // separately and reviewed before anything else enters the corpus.
+    const enrichExpansion = expansionAsNewSeeds
+      ? {
+        ...expansion,
+        includeDownstream: false,
+        includeUpstream: false,
+        relatedDepthDownstream: 0,
+        relatedDepthUpstream: 0,
+      }
+      : expansion;
     if (workers === null || workers === undefined || !Number.isFinite(workers) || workers <= 0) {
       return res.status(400).json({ error: 'workers must be a positive number' });
     }
@@ -4945,7 +5002,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         enrichJobId = enqueuePipelineJob(req.corpusId, 'enrich', {
           limit: pendingWorkIds.length,
           workers,
-          expansion,
+          expansion: enrichExpansion,
           pending_work_ids: pendingWorkIds,
         });
         jobs.push({ id: enrichJobId, type: 'enrich' });
@@ -4957,6 +5014,60 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         jobs.push({ id: downloadJobId, type: 'download' });
       }
 
+      // Mode A: land the expansion as reviewable seeds in section 2. Failures
+      // here must not undo a successful promotion, so they are reported
+      // alongside the result rather than thrown.
+      let expansionSeeds = [];
+      let expansionError = null;
+      if (expansionAsNewSeeds) {
+        try {
+          const expandArgs = [
+            '--db-path', DB_PATH,
+            '--seed-json', JSON.stringify(promotionCandidates.map((candidate) => ({
+              openalex_id: candidate.openalex_id,
+              doi: candidate.doi,
+              title: candidate.title,
+            }))),
+            '--max-related', String(expansion.maxRelated),
+            '--related-sort', String(expansion.relatedSort || RELATED_SORT_DEFAULT),
+          ];
+          if (expansion.includeDownstream && expansion.relatedDepthDownstream >= 1) {
+            expandArgs.push('--include-downstream');
+          }
+          if (expansion.includeUpstream && expansion.relatedDepthUpstream >= 1) {
+            expandArgs.push('--include-upstream');
+          }
+          const expandResult = await runPythonJson(SEED_EXPAND_SCRIPT, expandArgs, {
+            dbPath: DB_PATH,
+            corpusId: req.corpusId,
+          });
+          for (const run of expandResult?.runs || []) {
+            const runId = Number(run?.run_id);
+            if (!Number.isFinite(runId) || runId <= 0) continue;
+            // Registering the run against this corpus is what makes it appear
+            // as a seed in section 2.
+            upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: req.corpusId });
+            expansionSeeds.push({
+              run_id: runId,
+              direction: run?.direction || '',
+              label: run?.label || '',
+              count: Number(run?.count || 0),
+            });
+          }
+        } catch (error) {
+          console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Expansion seeding failed:', error);
+          expansionError = error?.message || 'Failed to build expansion seeds';
+        }
+      }
+
+      const expansionMessage = expansionAsNewSeeds
+        ? expansionError
+          ? ` Expansion seeds could not be built: ${expansionError}`
+          : expansionSeeds.length > 0
+            ? ` ${expansionSeeds.length} expansion seed(s) added to Seed for review.`
+            : ' No related works were found to seed.'
+        : '';
+
       return res.json({
         success: true,
         request_id: '',
@@ -4965,10 +5076,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         enrich_job_id: enrichJobId,
         download_job_id: downloadJobId,
         promotion,
+        promotion_mode: expansion.promotionMode,
+        expansion_seeds: expansionSeeds,
+        expansion_error: expansionError,
         backlog: readWorkerBacklogSummary(req.corpusId),
-        message: shouldQueueEnrich || shouldQueueDownload
+        message: (shouldQueueEnrich || shouldQueueDownload
           ? 'Selected candidates were added to the corpus pipeline. Background workers will continue from DB state.'
-          : 'Selected candidates were already reflected in the corpus state.',
+          : 'Selected candidates were already reflected in the corpus state.') + expansionMessage,
       });
     } catch (error) {
       console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Error:', error);
@@ -5476,6 +5590,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       includeUpstream: req.body?.includeUpstream,
       relatedDepthDownstream: req.body?.relatedDepthDownstream,
       relatedDepthUpstream: req.body?.relatedDepthUpstream,
+      relatedSort: req.body?.relatedSort,
+      promotionMode: req.body?.promotionMode,
     });
     if (limit === null || limit === undefined || !Number.isFinite(limit) || limit <= 0) {
       return res.status(400).json({ error: 'limit must be a positive number' });
