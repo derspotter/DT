@@ -676,6 +676,35 @@ export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' }
   return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
 }
 
+// Fetched as a blob rather than linked directly: this route is behind the
+// normal auth header, and a plain <a href> would not carry it.
+export async function fetchSeedSourceDocument(sourceKey) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/sources/pdf/${encodeURIComponent(String(sourceKey || ''))}/file`
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to download the seed document')
+  }
+  const disposition = response.headers.get('content-disposition') || ''
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
+  const filename = match ? decodeURIComponent(match[1]) : `${sourceKey || 'seed'}.pdf`
+  return { blob: await response.blob(), filename }
+}
+
+export async function removeCorpusWork(workId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/${encodeURIComponent(String(workId))}`, {
+    method: 'DELETE',
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to remove item from corpus')
+  }
+  return response.json()
+}
+
 export async function fetchDownloadQueue() {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/api/downloads`)
@@ -963,10 +992,15 @@ function graph3DParams({
   yearTo = null,
   groupBy = 'field',
   refresh = false,
+  corpusId = 'all',
 } = {}) {
-  // status/scope are fixed server-side (downloaded works, whole corpus); the
-  // backend ignores them, so they are not sent.
+  // status/scope are fixed server-side (downloaded works); the backend ignores
+  // them, so they are not sent. corpus_id scopes the graph: 'all' keeps the
+  // historical view that merges every corpus.
   const params = new URLSearchParams()
+  if (corpusId !== null && corpusId !== undefined && corpusId !== '') {
+    params.set('corpus_id', String(corpusId))
+  }
   params.set('max_nodes', String(maxNodes))
   if (relationship) params.set('relationship', relationship)
   if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {

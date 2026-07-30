@@ -327,7 +327,13 @@ function buildGraph3dRequest(req) {
   const scope = 'all';
   const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
   const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
-  const corpusId = null;
+  // 'all' (or an absent param) keeps the historical global view that merges
+  // every corpus; anything else scopes the graph to one corpus (spec line 22).
+  const requestedCorpus = String(req.query?.corpus_id ?? req.query?.corpusId ?? '').trim();
+  const parsedCorpusId = coerceInt(requestedCorpus, null);
+  const corpusId = !requestedCorpus || requestedCorpus.toLowerCase() === 'all' || !Number.isFinite(Number(parsedCorpusId))
+    ? null
+    : parsedCorpusId;
   const requestedGroupBy = String(req.query?.group_by || req.query?.groupBy || 'field');
   const groupBy = GRAPH_3D_GROUP_BY.has(requestedGroupBy) ? requestedGroupBy : 'field';
   let dbModifiedMs = 0;
@@ -356,6 +362,9 @@ function graph3dScriptArgs(options, extraArgs = []) {
   ];
   if (options.yearFrom !== null) args.push('--year-from', String(options.yearFrom));
   if (options.yearTo !== null) args.push('--year-to', String(options.yearTo));
+  if (options.corpusId !== null && options.corpusId !== undefined) {
+    args.push('--corpus-id', String(options.corpusId));
+  }
   return args;
 }
 
@@ -1389,10 +1398,16 @@ function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
     .all(String(targetId || ''));
 
   const itemsByWorkId = new Map();
+  const missingFileWorkIds = new Set();
   for (const row of rows) {
     const workId = Number(row.id);
     if (!Number.isFinite(workId) || workId <= 0) continue;
     if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
+    // upstream_update.py skips works whose PDF is not physically present, so a
+    // status-only count promises more than actually reaches the RAG (spec 24).
+    // Flag rather than hide them: they stay visible and in the graph, but do
+    // not count towards the "N pending" promise.
+    if (!upstreamFileIsPresent(row.file_path)) missingFileWorkIds.add(workId);
 
     const sourceCorpus = {
       id: Number(row.corpus_id),
@@ -1421,7 +1436,22 @@ function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
     }
   }
 
-  return [...itemsByWorkId.values()];
+  const items = [...itemsByWorkId.values()].map((item) => ({
+    ...item,
+    file_missing: missingFileWorkIds.has(Number(item.work_id ?? item.id)),
+  }));
+  items.missingFileCount = missingFileWorkIds.size;
+  return items;
+}
+
+function upstreamFileIsPresent(filePath) {
+  const raw = String(filePath || '').trim();
+  if (!raw) return false;
+  try {
+    return fs.statSync(raw).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function buildKantroposBrowsePayload(db, targetId, options = {}) {
@@ -1437,7 +1467,10 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
   const importedWorkIdSet = listImportedKantroposWorkIdSet(db, target);
   const currentItems = listImportedKantroposWorkItems(db, target, currentLimit);
   const pendingItemsAll = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet);
-  const pendingItemsCount = pendingItemsAll.length;
+  const pendingMissingFileCount = Number(pendingItemsAll.missingFileCount || 0);
+  // "N pending" promises what will actually reach the RAG, so it excludes works
+  // whose PDF is gone; those are reported separately (spec line 24).
+  const pendingItemsCount = pendingItemsAll.length - pendingMissingFileCount;
   const pendingItems = pendingItemsAll.slice(0, pendingLimit);
 
   const assignedById = new Map(assignedCorpora.map((corpus) => [Number(corpus.id), { ...corpus }]));
@@ -1472,6 +1505,7 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
     summary: {
       current_items_count: currentItemsCount,
       pending_items_count: pendingItemsCount,
+      pending_skipped_missing_file: pendingMissingFileCount,
       assigned_corpora_count: assignedCorpora.length,
       metadata_bib_modified_at: overview?.metadata_bib_modified_at || '',
       metadata_bib_exists: Boolean(overview?.metadata_bib_exists),
@@ -1482,7 +1516,9 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
       current_items_loaded: currentItems.length,
       pending_items_loaded: pendingItems.length,
       current_items_has_more: currentItems.length < currentItemsCount,
-      pending_items_has_more: pendingItems.length < pendingItemsCount,
+      // Paging compares against the full list, which still includes the
+      // file-missing rows; pendingItemsCount deliberately excludes them.
+      pending_items_has_more: pendingItems.length < pendingItemsAll.length,
     },
     assigned_corpora: [...assignedById.values()],
     current_items: currentItems,
@@ -4552,6 +4588,34 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
+  // Serves the ORIGINAL uploaded seed PDF (spec line 20). Distinct from
+  // .../candidates/:candidateKey/file, which serves a promoted corpus item.
+  // Only seed-document sources have one; search runs have no single PDF.
+  app.get('/api/seed/sources/pdf/:sourceKey/file', requireAuthMiddleware, (req, res) => {
+    const sourceKey = String(req.params?.sourceKey || '').trim();
+    if (!sourceKey) return res.status(400).json({ error: 'Invalid seed source' });
+    try {
+      const row = authDb
+        .prepare('SELECT source_pdf FROM ingest_source_metadata WHERE corpus_id = ? AND ingest_source = ?')
+        .get(req.corpusId, sourceKey);
+      const sourcePdf = String(row?.source_pdf || '').trim();
+      if (!sourcePdf) {
+        return res.status(404).json({ error: 'No original document stored for this seed' });
+      }
+      // The stored path is written by us as UPLOADS_DIR/<name>, but re-check it
+      // rather than trust the DB — this is the same traversal guard the
+      // extract-bibliography route uses.
+      const resolved = path.resolve(sourcePdf);
+      if (!ensureInsideDirectory(UPLOADS_DIR, resolved) || !fs.existsSync(resolved)) {
+        return res.status(404).json({ error: 'Original document is no longer available' });
+      }
+      return res.download(resolved, path.basename(resolved));
+    } catch (error) {
+      console.error('[/api/seed/sources/pdf/:sourceKey/file] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to serve seed document' });
+    }
+  });
+
   app.get('/api/seed/sources/:sourceType/:sourceKey/candidates', requireAuthMiddleware, (req, res) => {
     try {
       const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
@@ -4834,6 +4898,35 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
+    }
+  });
+
+  // Removal means unlinking from THIS corpus, never deleting the work or its
+  // PDF: corpus_works is many-to-many, so the same work can belong to other
+  // corpora, and the file still counts as reusable for future promotions.
+  app.delete('/api/corpus/works/:workId', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const workId = coerceInt(req.params?.workId, null);
+    if (!Number.isFinite(workId) || workId <= 0) {
+      return res.status(400).json({ error: 'Invalid work id' });
+    }
+    try {
+      const result = authDb
+        .prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+        .run(req.corpusId, workId);
+      if (result.changes === 0) {
+        return res.status(404).json({ error: 'Work is not a member of this corpus' });
+      }
+      // Drop the explicit seed marker too, so the seed table stops showing the
+      // item as promoted and offers it for promotion again.
+      if (tableExists(authDb, 'seed_candidates_in_corpus')) {
+        authDb
+          .prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+          .run(req.corpusId, workId);
+      }
+      return res.json({ removed: true, work_id: workId });
+    } catch (error) {
+      console.error('[/api/corpus/works/:workId] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to remove work from corpus' });
     }
   });
 

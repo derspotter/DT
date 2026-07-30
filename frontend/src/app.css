@@ -1966,6 +1966,29 @@ button.seed-download-tag:focus-visible {
   min-width: 0;
 }
 
+.document-run__download,
+.corpus-remove {
+  border: 0;
+  background: none;
+  padding: 0 4px;
+  margin-left: 6px;
+  font: inherit;
+  line-height: 1;
+  color: var(--muted, #71717a);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.document-run__download:hover,
+.document-run__download:focus-visible {
+  color: #1f2937;
+}
+
+.corpus-remove:hover,
+.corpus-remove:focus-visible {
+  color: #b91c1c;
+}
+
 .table-filter {
   display: flex;
   align-items: center;

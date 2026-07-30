@@ -33,6 +33,8 @@
     runKeywordSearch,
     fetchRecursionConfig,
     fetchCorpus,
+    removeCorpusWork,
+    fetchSeedSourceDocument,
     fetchDownloadQueue,
     fetchDownloadWorkerStatus,
     startDownloadWorker,
@@ -380,6 +382,9 @@
   let corpusActionStatus = ''
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
+  // The graph opens scoped to the workspace corpus; "All corpora" in its own
+  // dropdown restores the previous global view (spec line 22).
+  $: graphCorpusId = Number.isFinite(Number(currentCorpusId)) && currentCorpusId ? String(currentCorpusId) : 'all'
   $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
   $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && (isAdmin || currentCorpus?.role === 'owner' || currentCorpus?.role === 'editor'))
   let shareUsername = ''
@@ -2582,6 +2587,30 @@
     }, 300)
   }
 
+  // Unlinks the work from this corpus only — the work row and its PDF survive,
+  // so it stays reusable and can be promoted again (spec line 23).
+  async function handleRemoveCorpusWork(item) {
+    const workId = Number(item?.work_id ?? item?.id)
+    if (!Number.isFinite(workId) || workId <= 0) return
+    try {
+      await removeCorpusWork(workId)
+      corpusItems = corpusItems.filter((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
+      corpusTotal = Math.max(0, corpusTotal - 1)
+      await Promise.all([
+        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadSeedSources({ quiet: true }),
+        loadIngestStats({ quiet: true }),
+      ])
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      corpusLoadStatus = error?.message || 'Failed to remove the item from this corpus.'
+    }
+  }
+
   function toggleCorpusSort(column) {
     const [currentColumn, currentDirection] = String(corpusSort || '').split(':')
     const direction = currentColumn === column && currentDirection === 'asc' ? 'desc' : 'asc'
@@ -3570,6 +3599,31 @@
     }
   }
 
+  async function handleDownloadSeedDocument(ingestSource) {
+    const sourceKey = String(ingestSource || '').trim()
+    if (!sourceKey) return
+    let objectUrl = ''
+    try {
+      const { blob, filename } = await fetchSeedSourceDocument(sourceKey)
+      objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      ingestRunsStatus = error?.message || 'Failed to download the seed document.'
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }
+
   async function handleSeedCandidateFile(candidate) {
     const workId = Number(candidate?.downloaded_work_id)
     const sourceType = String(candidate?.source_type || '').trim()
@@ -4167,6 +4221,15 @@
 	                      </span>
 	                      <span class="muted small">{run.entry_count} entries</span>
 	                    </button>
+	                    {#if run.source_pdf}
+	                      <button
+	                        class="document-run__download"
+	                        type="button"
+	                        title="Download the original seed document"
+	                        aria-label={`Download the original document for ${run.seed_title || run.ingest_source}`}
+	                        on:click|stopPropagation={() => handleDownloadSeedDocument(run.ingest_source)}
+	                      >⤓</button>
+	                    {/if}
 	                  {/each}
 	                </div>
 	              {/if}
@@ -4573,6 +4636,7 @@
                 {formatAuthors}
                 {corpusFilterQuery}
                 {handleCorpusFilterInput}
+                {handleRemoveCorpusWork}
                 {toggleCorpusSort}
                 {corpusSortIndicator}
                 {corpusSort}
@@ -5251,7 +5315,7 @@
       {/if}
 
       {#if activeTab === 'graph'}
-        <ThreeGraph />
+        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} />
       {/if}
     </section>
   </div>

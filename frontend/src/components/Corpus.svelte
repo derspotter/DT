@@ -28,6 +28,7 @@
   export let toggleCorpusSort = () => {};
   export let corpusSortIndicator = () => '';
   export let corpusSort = '';
+  export let handleRemoveCorpusWork = () => {};
   let stageFilter = 'all';
   let activeCorpusKey = '';
   const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending']);
@@ -202,7 +203,16 @@
           <span class="muted small line-clamp-2" title={corpusItemSource(item) || '-'}>
             {corpusItemSource(item) || '-'}
           </span>
-          <span class="nowrap muted small corpus-stage-pill">{itemStageLabel(item, bucket)}</span>
+          <span class="nowrap muted small corpus-stage-pill">
+            {itemStageLabel(item, bucket)}
+            <button
+              class="corpus-remove"
+              type="button"
+              title="Remove from this corpus (keeps the work and its PDF)"
+              aria-label={`Remove ${item.title || 'item'} from this corpus`}
+              on:click|stopPropagation={() => handleRemoveCorpusWork(item)}
+            >✕</button>
+          </span>
         </div>
         {#if selected}
           <div class="table-row corpus-inline-detail-row">

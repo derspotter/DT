@@ -333,4 +333,68 @@ describe('corpus sharing and multi-user isolation', () => {
       })
     )
   })
+
+  test('removing a corpus work unlinks it without deleting the work or other memberships', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const workId = seedCorpusWork(corpusId, 'Removable Work')
+
+    // Same work also lives in a second corpus; removal must not touch that.
+    const otherCorpusId = withDb((db) => {
+      const corpus = db
+        .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+        .run('Second corpus', Number(admin.user.id))
+      const id = Number(corpus.lastInsertRowid)
+      db.prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')").run(Number(admin.user.id), id)
+      db.prepare('INSERT INTO corpus_works (corpus_id, work_id) VALUES (?, ?)').run(id, workId)
+      return id
+    })
+
+    const res = await request(app)
+      .delete(`/api/corpus/works/${workId}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual(expect.objectContaining({ removed: true, work_id: workId }))
+
+    withDb((db) => {
+      const membership = db
+        .prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+        .get(corpusId, workId)
+      expect(membership).toBeUndefined()
+
+      // The work itself survives, and so does its other corpus membership.
+      const work = db.prepare('SELECT id FROM works WHERE id = ?').get(workId)
+      expect(work).toBeTruthy()
+      const otherMembership = db
+        .prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+        .get(otherCorpusId, workId)
+      expect(otherMembership).toBeTruthy()
+    })
+  })
+
+  test('removing a work that is not in the current corpus returns 404', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const orphanWorkId = withDb((db) => {
+      const work = db
+        .prepare(
+          `INSERT INTO works (title, normalized_title, authors, year, metadata_status, download_status)
+           VALUES ('Unrelated', 'unrelated', 'A', 2026, 'matched', 'not_requested')`
+        )
+        .run()
+      return Number(work.lastInsertRowid)
+    })
+
+    const res = await request(app)
+      .delete(`/api/corpus/works/${orphanWorkId}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(404)
+  })
+
+  test('rejects an invalid work id', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const res = await request(app)
+      .delete('/api/corpus/works/not-a-number')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(400)
+  })
 })

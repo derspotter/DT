@@ -412,9 +412,15 @@ def pending_rows(conn: sqlite3.Connection, target_id: str, metadata_bib: Path) -
 
 
 def pending_counts(conn: sqlite3.Connection, target_id: str, metadata_bib: Path) -> dict:
+    """Count works that will actually reach the RAG.
+
+    The staging loop skips any work whose PDF is not physically present, so a
+    status-only count overstates what gets there. Check the file the same way
+    staging does and report the shortfall as `missing` instead of hiding it.
+    """
     rows = conn.execute(
         """
-        SELECT c.id, c.name, COUNT(DISTINCT w.id) AS pending
+        SELECT DISTINCT c.id, c.name, w.id AS work_id, w.file_path
           FROM works w
           JOIN corpus_works cw ON cw.work_id = w.id
           JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
@@ -426,15 +432,33 @@ def pending_counts(conn: sqlite3.Connection, target_id: str, metadata_bib: Path)
               WHERE origin_type = 'bibtex_import'
                 AND origin_key = ?
            )
-         GROUP BY c.id, c.name
-         ORDER BY pending DESC, LOWER(c.name)
         """,
         (target_id, str(metadata_bib)),
     ).fetchall()
-    total = sum(int(row["pending"]) for row in rows)
+
+    per_corpus: dict[int, dict] = {}
+    total = 0
+    missing_total = 0
+    for row in rows:
+        entry = per_corpus.setdefault(
+            row["id"], {"id": row["id"], "name": row["name"], "pending": 0, "missing": 0}
+        )
+        source_path = Path(str(row["file_path"] or ""))
+        if source_path.exists() and source_path.is_file():
+            entry["pending"] += 1
+            total += 1
+        else:
+            entry["missing"] += 1
+            missing_total += 1
+
+    corpora = sorted(
+        per_corpus.values(),
+        key=lambda item: (-int(item["pending"]), str(item["name"] or "").lower()),
+    )
     return {
         "total": total,
-        "corpora": [dict(row) for row in rows],
+        "missing": missing_total,
+        "corpora": corpora,
     }
 
 
