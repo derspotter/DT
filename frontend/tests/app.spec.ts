@@ -4,9 +4,9 @@ import { dirname } from 'node:path'
 
 async function ensureSignedIn(page: Page, request: APIRequestContext) {
   await page.goto('/')
-  const heading = page.getByRole('heading', { name: 'Corpus orchestration workspace' })
+  const heading = page.getByRole('heading', { name: 'Korpus Builder' })
   if (await heading.isVisible().catch(() => false)) {
-    await expect(page.getByText(/API status:/).first()).toContainText('API status:')
+    await expect(page.getByText(/items found/).first()).toContainText('items found')
     return
   }
 
@@ -23,7 +23,7 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
   }
 
   await expect(heading).toBeVisible({ timeout: 20_000 })
-  await expect(page.getByText(/API status:/).first()).toContainText('API status:')
+  await expect(page.getByText(/items found/).first()).toContainText('items found')
 }
 
 async function waitUntilSearchSettled(page: Page) {
@@ -140,7 +140,7 @@ test.describe('Korpus Builder live integration', () => {
     )
     const pdfName = 'ingest-smoke.pdf'
 
-    await uploadCard.locator('input[type="file"][accept=".pdf"]').setInputFiles(pdfPath)
+    await uploadCard.locator('input[type="file"][accept*=".pdf"]').setInputFiles(pdfPath)
     const uploadRow = uploadCard.locator('.upload-item', { hasText: pdfName })
     await expect(uploadRow).toBeVisible()
     await expect(uploadRow.locator('.status')).toHaveText('uploaded', { timeout: 120_000 })
