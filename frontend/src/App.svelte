@@ -654,8 +654,8 @@
       matched: { label: 'Matched', tone: 'completed' },
       queued_download: { label: 'Queued download', tone: 'in_progress' },
       downloaded: { label: 'Downloaded', tone: 'completed' },
-      failed_enrichment: { label: 'Enrich failed', tone: 'in_progress' },
-      failed_download: { label: 'Download failed', tone: 'in_progress' },
+      failed_enrichment: { label: 'Metadata not confirmed', tone: 'in_progress' },
+      failed_download: { label: 'Not retrievable', tone: 'in_progress' },
     }
     if (map[status]) return { ...map[status], raw: status }
     if (!status) return { label: 'Unknown', tone: 'in_progress', raw: '' }
@@ -2493,7 +2493,7 @@
         }
       case 'downloaded_elsewhere':
         return candidate?.file_available === true
-          ? { label: 'PDF reusable', className: 'downloaded', hint: 'Downloaded by another corpus and the file is present — promoting reuses it' }
+          ? { label: 'PDF downloaded', className: 'downloaded', hint: 'Downloaded by another corpus and the file is present — promoting reuses it' }
           : { label: 'Stale record', className: 'pending', hint: 'Another corpus recorded a download but the file is gone — promoting downloads it fresh' }
       case 'queued_download':
         return { label: 'Download queued', className: 'queued' }
@@ -2506,9 +2506,9 @@
       case 'added':
         return { label: 'In corpus', className: 'completed' }
       case 'failed_enrichment':
-        return { label: 'Metadata failed', className: 'failed' }
+        return { label: 'Metadata not confirmed', className: 'failed', hint: 'No Crossref match found' }
       case 'failed_download':
-        return { label: 'Download failed', className: 'failed' }
+        return { label: 'Not retrievable', className: 'failed', hint: 'Document not retrievable' }
       default:
         return { label: 'To review', className: 'pending' }
     }
@@ -3156,8 +3156,8 @@
       } else {
         if (!quiet) {
           corpusLoadStatus = corpusHasMore
-            ? `Loaded ${corpusItems.length} of ${corpusTotal} entries. Scroll to load more.`
-            : `Loaded ${corpusItems.length} entries.`
+            ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
+            : `Showing ${corpusItems.length} entries.`
         }
       }
       if (scrollSnapshot) {
@@ -4241,7 +4241,7 @@
                           <span class="pill" title="Already a member of this corpus — expand for each item's stage">In corpus: {source.state_counts.in_corpus}</span>
                         {/if}
                         {#if source.state_counts.downloaded_elsewhere_available}
-                          <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF reusable: {source.state_counts.downloaded_elsewhere_available}</span>
+                          <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF downloaded: {source.state_counts.downloaded_elsewhere_available}</span>
                         {/if}
                       </div>
                       <span class={`disclosure-chevron ${isExpanded ? 'open' : ''}`} aria-hidden="true">▸</span>
@@ -4265,9 +4265,6 @@
                                 <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
                                   Promote to Corpus
                                 </button>
-                                <button class="danger" type="button" on:click={() => handleRemoveSeedSource(source)} disabled={seedActionBusy}>
-                                  Remove source
-                                </button>
                               </div>
                             </div>
                           </div>
@@ -4287,7 +4284,7 @@
                                 <span>Year</span>
                                 <span>Source</span>
                                 <span>DOI</span>
-                                <span aria-hidden="true"></span>
+                                <span>Corpus</span>
                               </div>
                               {#each sourceCandidates as candidate (candidate.candidate_key)}
                                 {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}

@@ -66,8 +66,8 @@
 
   function itemStageLabel(item, bucket = getBucketForItem(item)) {
     if (!item) return '-';
-    if (FAILED_ENRICHMENT_STATUSES.has(item.status)) return 'Enrich failed';
-    if (FAILED_DOWNLOAD_STATUSES.has(item.status)) return 'Download failed';
+    if (FAILED_ENRICHMENT_STATUSES.has(item.status)) return 'Metadata not confirmed';
+    if (FAILED_DOWNLOAD_STATUSES.has(item.status)) return 'Not retrievable';
     if (item.status === 'enriching') return 'Enriching';
     if (item.status === 'queued_download') return 'Queued download';
     if (item.status === 'matched') return 'Matched';
@@ -148,11 +148,11 @@
           </optgroup>
           <optgroup label="Promoted">
             <option value="metadata">Fetching bibliographic metadata ({metadataTotal || 0})</option>
-            <option value="failed_enrichment">Failed enrichments ({failedEnrichmentTotal || 0})</option>
+            <option value="failed_enrichment">Metadata not confirmed ({failedEnrichmentTotal || 0})</option>
           </optgroup>
           <optgroup label="Downloaded">
             <option value="downloaded">Downloaded ({downloadedTotal || 0})</option>
-            <option value="failed_download">Failed downloads ({failedDownloadTotal || 0})</option>
+            <option value="failed_download">Not retrievable ({failedDownloadTotal || 0})</option>
           </optgroup>
         </select>
       </label>
@@ -246,7 +246,7 @@
     <span class="muted">{corpusLoadStatus}</span>
     {#if corpusHasMore}
       <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore || corpusLoading}>
-        {corpusLoadingMore ? 'Loading…' : 'Load more'}
+        {corpusLoadingMore ? 'Loading…' : 'Show more'}
       </button>
     {/if}
   </div>
