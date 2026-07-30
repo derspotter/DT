@@ -12,6 +12,23 @@ const allowedHosts = String(process.env.VITE_ALLOWED_HOSTS || '')
   .map((value) => value.trim())
   .filter(Boolean)
 
+// Vite's dev server treats any extension-less URL as a JS module request, so a
+// probe for /Dockerfile reaches vite:import-analysis, fails to parse, and the
+// 500 it returns embeds the file's full source. Deny the extension-less config
+// files at the frontend root so those probes get a 403 instead. This is a
+// stopgap for genkia.de still running `target: dev`; the real fix is serving the
+// built `runner` stage in production. Repeats Vite's defaults because setting
+// `deny` replaces them rather than extending them.
+const fsDeny = [
+  '.env',
+  '.env.*',
+  '*.{crt,pem}',
+  '**/.git/**',
+  'Dockerfile',
+  'Dockerfile.*',
+  '.dockerignore',
+]
+
 const hmr = disableHmr
   ? false
   : hmrHost
@@ -31,6 +48,9 @@ export default defineConfig({
     strictPort: true,
     host: '0.0.0.0',
     allowedHosts,
+    fs: {
+      deny: fsDeny,
+    },
     watch: {
       usePolling: true,
     },
