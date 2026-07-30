@@ -587,6 +587,32 @@
     return entry.authors || entry.author || ''
   }
 
+  function formatAuthorsList(entry) {
+    if (!entry) return []
+    if (Array.isArray(entry.authors)) return entry.authors
+    if (typeof entry.authors === 'string') {
+      try {
+        const parsed = JSON.parse(entry.authors)
+        if (Array.isArray(parsed)) return parsed
+      } catch (error) {
+        // fall through
+      }
+    }
+    if (Array.isArray(entry.author)) return entry.author
+    const raw = String(entry.authors || entry.author || '').trim()
+    return raw ? raw.split(',').map((name) => name.trim()).filter(Boolean) : []
+  }
+
+  // Table cells show at most `cap` authors; the full list stays in the expanded
+  // detail card and on hover. formatAuthors itself must keep returning the full
+  // string — the corpus search filter matches against it.
+  function formatAuthorsShort(entry, cap = 3) {
+    const list = formatAuthorsList(entry)
+    if (list.length === 0) return formatAuthors(entry)
+    if (list.length <= cap) return list.join(', ')
+    return `${list.slice(0, cap).join(', ')} et al.`
+  }
+
   function normalizeCorpusItem(entry) {
     if (!entry || typeof entry !== 'object') return entry
     return {
@@ -4341,7 +4367,7 @@
 	                                    {/if}
                                   </span>
                                   <span>{formatTitle(candidate)}</span>
-                                  <span>{formatAuthors(candidate)}</span>
+                                  <span title={formatAuthors(candidate)}>{formatAuthorsShort(candidate)}</span>
                                   <span>{candidate.year || ''}</span>
                                   <span>{candidate.source || candidate.publisher || ''}</span>
                                   <span>{candidate.doi || ''}</span>
