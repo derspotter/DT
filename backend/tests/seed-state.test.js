@@ -127,3 +127,69 @@ describe('seed candidate state resolution', () => {
     ])
   })
 })
+
+function createSearchSeedDb() {
+  const db = createSeedDb()
+  db.exec(`
+    CREATE TABLE search_runs (
+      id INTEGER PRIMARY KEY,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE search_results (
+      id INTEGER PRIMARY KEY,
+      search_run_id INTEGER NOT NULL,
+      title TEXT,
+      doi TEXT,
+      openalex_id TEXT,
+      year TEXT,
+      raw_json TEXT
+    );
+  `)
+  db.prepare(`INSERT INTO search_runs (id) VALUES (7)`).run()
+  db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (7, 130)`).run()
+  return db
+}
+
+function insertSearchResult(db, rawJson) {
+  db.prepare(
+    `INSERT INTO search_results (id, search_run_id, title, year, raw_json)
+     VALUES (1, 7, 'A Work', '2020', ?)`
+  ).run(JSON.stringify(rawJson))
+}
+
+describe('seed candidate venue fallback', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('returns null instead of a landing page URL when the venue has no display_name', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, {
+      primary_location: {
+        source: { display_name: null },
+        landing_page_url: 'https://doi.org/10.1234/abcd',
+      },
+    })
+
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+
+    expect(candidate.source).toBeNull()
+  })
+
+  test('still returns the venue display_name when present', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, {
+      primary_location: {
+        source: { display_name: 'Journal of Labour Studies' },
+        landing_page_url: 'https://doi.org/10.1234/abcd',
+      },
+    })
+
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+
+    expect(candidate.source).toBe('Journal of Labour Studies')
+  })
+})

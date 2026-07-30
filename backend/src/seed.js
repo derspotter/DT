@@ -505,7 +505,7 @@ function normalizeSearchCandidate(row, resolverBundle) {
     authors,
     year: row.year || raw.publication_year || null,
     doi: row.doi || raw.doi || null,
-    source: primarySource.display_name || raw?.primary_location?.landing_page_url || null,
+    source: primarySource.display_name || null,
     publisher: primarySource.publisher || primarySource.host_organization_name || raw?.host_organization_name || null,
     volume: biblio.volume || null,
     issue: biblio.issue || null,
