@@ -1966,6 +1966,47 @@ button.seed-download-tag:focus-visible {
   min-width: 0;
 }
 
+.table-sort {
+  border: 0;
+  background: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: inherit;
+}
+
+.table-sort:hover,
+.table-sort:focus-visible {
+  text-decoration: underline;
+}
+
+.seed-candidate__promote {
+  border: 1px solid var(--border, #d4d4d8);
+  background: #fff;
+  color: #1f2937;
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.seed-candidate__promote:hover:not(:disabled),
+.seed-candidate__promote:focus-visible {
+  background: #f4f4f5;
+  text-decoration: underline;
+}
+
+.seed-candidate__promote:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .tag.in_progress {
   background: #fef3c7;
   color: #92400e;

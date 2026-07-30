@@ -204,6 +204,7 @@
   let seedCandidatesLoading = {}
   let seedSelections = {}
   let seedSelectionVersions = {}
+  let seedSorts = {}
   let selectedSeedCandidateKeys = {}
   let seedActionStatus = ''
   let seedActionBusy = false
@@ -2540,12 +2541,69 @@
     }
   }
 
-  function isSeedCandidateSelectable(candidate) {
+  // With downstream expansion at depth >= 1 an already-downloaded or already
+  // in-corpus item is still worth promoting: the point is its references, not
+  // the item itself. Depend on the reactive vars directly so toggling the
+  // Downstream checkbox re-evaluates every row.
+  function isSeedCandidateSelectable(candidate, downstreamOn = includeDownstream, downstreamDepth = relatedDepthDownstream) {
+    if (downstreamOn && downstreamDepth >= 1) return true
     return seedCandidateState(candidate) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
   }
 
+  // The seed tables render inside {#key ...} blocks, so selectability changes
+  // driven by the Promotion Settings need to appear in the key itself.
+  $: downstreamPromotesAll = includeDownstream && relatedDepthDownstream >= 1
+
   function getSeedCandidatesForSource(source) {
     return seedCandidatesBySource[seedSourceId(source)] || []
+  }
+
+  // Client-side sort for the seed candidate table. Safe because
+  // fetchSeedCandidates returns the whole candidate set for a seed in one
+  // response — there is no paging to sort across. The paged corpus table uses
+  // server-side sorting instead.
+  const SEED_SORT_ACCESSORS = {
+    state: (candidate) => seedCandidateTag(candidate).label,
+    title: (candidate) => formatTitle(candidate),
+    authors: (candidate) => formatAuthors(candidate),
+    year: (candidate) => candidate?.year,
+    source: (candidate) => candidate?.source || candidate?.publisher || '',
+  }
+
+  function toggleSeedSort(source, column) {
+    if (!SEED_SORT_ACCESSORS[column]) return
+    const sourceId = seedSourceId(source)
+    const current = seedSorts[sourceId]
+    const direction = current && current.column === column && current.direction === 'asc' ? 'desc' : 'asc'
+    seedSorts = { ...seedSorts, [sourceId]: { column, direction } }
+  }
+
+  // `sorts` is passed in from the template rather than read off the module
+  // binding so Svelte tracks seedSorts as a dependency of the markup.
+  function seedSortIndicator(source, column, sorts = seedSorts) {
+    const current = sorts[seedSourceId(source)]
+    if (!current || current.column !== column) return ''
+    return current.direction === 'asc' ? ' ▲' : ' ▼'
+  }
+
+  function sortSeedCandidates(source, candidates, sorts = seedSorts) {
+    const current = sorts[seedSourceId(source)]
+    const accessor = current && SEED_SORT_ACCESSORS[current.column]
+    if (!accessor) return candidates
+    const factor = current.direction === 'desc' ? -1 : 1
+    return [...candidates].sort((left, right) => {
+      const a = accessor(left)
+      const b = accessor(right)
+      const aMissing = a === null || a === undefined || a === ''
+      const bMissing = b === null || b === undefined || b === ''
+      // Blanks sort last in both directions so a descending sort does not fill
+      // the top of the table with empty cells.
+      if (aMissing && bMissing) return 0
+      if (aMissing) return 1
+      if (bMissing) return -1
+      if (current.column === 'year') return (Number(a) - Number(b)) * factor
+      return String(a).localeCompare(String(b), undefined, { sensitivity: 'base', numeric: true }) * factor
+    })
   }
 
   function getSeedSelectionForSource(source) {
@@ -2757,9 +2815,11 @@
     })
   }
 
-  async function handlePromoteSeedSource(source) {
+  // Shared promote path for the selection-scoped bulk button and the per-row
+  // inline promote. Both must honour the same Promotion Settings, so the
+  // expansion block lives here rather than being duplicated per caller.
+  async function promoteSeedCandidateKeys(source, candidateKeys, { clearSelection = false } = {}) {
     const sourceId = seedSourceId(source)
-    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
     if (candidateKeys.length === 0) {
       seedActionStatus = 'Select at least one seed candidate to promote.'
       return
@@ -2778,7 +2838,7 @@
         downloadBatchSize: Math.max(25, candidateKeys.length),
         workers: 6,
       })
-      clearSeedSelection(source)
+      if (clearSelection) clearSeedSelection(source)
       const refreshTasks = [
         loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
@@ -2806,6 +2866,18 @@
     } finally {
       seedActionBusy = false
     }
+  }
+
+  async function handlePromoteSeedSource(source) {
+    const sourceId = seedSourceId(source)
+    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    await promoteSeedCandidateKeys(source, candidateKeys, { clearSelection: true })
+  }
+
+  async function handlePromoteSingleSeedCandidate(source, candidate) {
+    const candidateKey = String(candidate?.candidate_key || '')
+    if (!candidateKey) return
+    await promoteSeedCandidateKeys(source, [candidateKey])
   }
 
   async function handlePromoteWholeSeedSource(source) {
@@ -4187,7 +4259,7 @@
               {#each seedSources as source (seedSourceId(source))}
                 {@const sourceId = seedSourceId(source)}
                 {@const isExpanded = expandedSeedSourceId === sourceId}
-                {@const sourceCandidates = getSeedCandidatesForSource(source)}
+                {@const sourceCandidates = sortSeedCandidates(source, getSeedCandidatesForSource(source), seedSorts)}
                 {@const selectionVersion = seedSelectionVersions[sourceId] || 0}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
@@ -4276,7 +4348,7 @@
 
                   {#if isExpanded}
                       <div class="seed-source__body">
-                        {#key `${sourceId}:toolbar:${selectionVersion}`}
+                        {#key `${sourceId}:toolbar:${selectionVersion}:${downstreamPromotesAll}`}
                           <div class="table-toolbar">
                             <div class="table-toolbar-left">
                               <span class="muted">Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable</span>
@@ -4301,14 +4373,16 @@
                         {:else if sourceCandidates.length === 0}
                           <p class="muted">No active items remain in this seed.</p>
                         {:else}
-                          {#key `${sourceId}:selection:${selectionVersion}`}
+                          {#key `${sourceId}:selection:${selectionVersion}:${downstreamPromotesAll}`}
                             <div class="table table-scroll seed-candidate-table">
                               <div class="table-row header cols-7">
-                                <span class="ingest-select-cell">State</span>
-                                <span>Title</span>
-                                <span>Authors</span>
-                                <span>Year</span>
-                                <span>Source</span>
+                                <span class="ingest-select-cell">
+                                  <button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'state')}>State{seedSortIndicator(source, 'state', seedSorts)}</button>
+                                </span>
+                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'title')}>Title{seedSortIndicator(source, 'title', seedSorts)}</button></span>
+                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'authors')}>Authors{seedSortIndicator(source, 'authors', seedSorts)}</button></span>
+                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'year')}>Year{seedSortIndicator(source, 'year', seedSorts)}</button></span>
+                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'source')}>Source{seedSortIndicator(source, 'source', seedSorts)}</button></span>
                                 <span>DOI</span>
                                 <span>Corpus</span>
                               </div>
@@ -4335,7 +4409,7 @@
                                   tabindex="0"
                                 >
                                   <span class="ingest-select-cell">
-                                    {#if isSeedCandidateSelectable(candidate)}
+                                    {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
                                       <input
                                         type="checkbox"
                                         checked={isSeedCandidateSelected(source, candidate)}
@@ -4374,6 +4448,15 @@
                                   <span class="seed-candidate__corpus-cell">
                                     {#if isSeedCandidateInCorpus(candidate)}
                                       <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                    {:else if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
+                                      <button
+                                        class="seed-candidate__promote"
+                                        type="button"
+                                        title="Promote this item to the corpus using the current Promotion Settings"
+                                        aria-label={`Promote ${formatTitle(candidate)} to corpus`}
+                                        disabled={seedActionBusy}
+                                        on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                      >→ Promote</button>
                                     {/if}
                                   </span>
                                 </div>
