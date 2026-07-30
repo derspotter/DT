@@ -10,6 +10,7 @@
   
   export let bucketLabel;
   export let formatAuthors;
+  export let formatAuthorsShort = (entry) => formatAuthors(entry);
   export let doiHref;
   export let openAlexHref;
   export let handleDownloadedCorpusFile;
@@ -29,6 +30,18 @@
   export let corpusSortIndicator = () => '';
   export let corpusSort = '';
   export let handleRemoveCorpusWork = () => {};
+
+  import ColumnPicker from './ColumnPicker.svelte'
+  import { gridTemplate, loadVisibility, saveVisibility, visibleColumns } from '../lib/tableColumns'
+
+  let columnVisibility = loadVisibility('corpus')
+  $: activeColumns = visibleColumns('corpus', columnVisibility)
+  $: gridStyle = `grid-template-columns: ${gridTemplate(activeColumns)}`
+
+  function updateColumns(next) {
+    columnVisibility = next
+    saveVisibility('corpus', next)
+  }
   let stageFilter = 'all';
   let activeCorpusKey = '';
   const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending']);
@@ -90,20 +103,88 @@
     return `${bucket}:${item.id}`
   }
 
+  // Spec line 8: cells show at most three authors; the full list stays on hover
+  // and in the expanded detail card.
   function corpusItemAuthors(item) {
+    if (!item) return ''
+    if (typeof item.authors_display === 'string' && item.authors_display.trim()) {
+      return formatAuthorsShort({ authors: item.authors_display.split(',').map((name) => name.trim()) })
+    }
+    return formatAuthorsShort(item)
+  }
+
+  function corpusItemAuthorsFull(item) {
     if (!item) return ''
     if (typeof item.authors_display === 'string' && item.authors_display.trim()) return item.authors_display
     return formatAuthors(item)
   }
 
+  // Spec line 19: "Source" is the article's venue in both tables. Provenance
+  // moved to its own "Seed" column below.
   function corpusItemSource(item) {
+    return String(item?.source || '').trim()
+  }
+
+  // Spec C2 + line 19: where the item came from — the search query, or the
+  // seed document's title and author.
+  function corpusItemSeed(item) {
     const label = String(item?.source_label || '').trim()
     if (label) return label
-    const raw = String(item?.source || '').trim()
+    const raw = String(item?.origin || '').trim()
     if (!raw) return ''
     if (raw.endsWith('/metadata.bib')) return 'Upstream metadata.bib'
     if (raw.startsWith('search:')) return `Search #${raw.slice('search:'.length)}`
     return raw
+  }
+
+  const METADATA_LABELS = {
+    pending: 'Pending',
+    enriching: 'Enriching',
+    matched: 'Confirmed',
+    failed_enrichment: 'Metadata not confirmed',
+  }
+  const DOWNLOAD_LABELS = {
+    not_requested: 'Not requested',
+    queued: 'Queued',
+    in_progress: 'Downloading',
+    downloaded: 'Downloaded',
+    failed: 'Not retrievable',
+    failed_download: 'Not retrievable',
+  }
+
+  // Spec line 16: display the two axes separately. The collapsed `status` is
+  // still what every behaviour (selection, stage filter, colours) keys off —
+  // only the presentation splits.
+  function metadataLabel(item) {
+    if (FAILED_ENRICHMENT_STATUSES.has(item?.status)) return METADATA_LABELS.failed_enrichment
+    const raw = String(item?.metadata_status || '').trim().toLowerCase()
+    return METADATA_LABELS[raw] || (raw ? raw.replace(/_/g, ' ') : '-')
+  }
+
+  function downloadLabel(item) {
+    if (FAILED_DOWNLOAD_STATUSES.has(item?.status)) return DOWNLOAD_LABELS.failed_download
+    const raw = String(item?.download_status || '').trim().toLowerCase()
+    return DOWNLOAD_LABELS[raw] || (raw ? raw.replace(/_/g, ' ') : '-')
+  }
+
+  function cellText(item, key, bucket) {
+    switch (key) {
+      case 'metadata': return metadataLabel(item)
+      case 'download': return downloadLabel(item)
+      case 'title': return item?.title || 'Untitled'
+      case 'authors': return corpusItemAuthors(item)
+      case 'year': return item?.year || '-'
+      case 'source': return corpusItemSource(item) || '-'
+      case 'seed': return corpusItemSeed(item) || '-'
+      case 'doi': return item?.doi || '-'
+      case 'publisher': return item?.publisher || '-'
+      case 'type': return item?.type || '-'
+      case 'openalex': return item?.openalex_id || '-'
+      case 'pages': return item?.pages || '-'
+      case 'open_access': return item?.open_access_url ? 'Yes' : 'No'
+      case 'file': return item?.file_path ? 'Yes' : 'No'
+      default: return itemStageLabel(item, bucket)
+    }
   }
 
   function toggleCorpusItemSelection(item, bucket) {
@@ -159,6 +240,7 @@
           </optgroup>
         </select>
       </label>
+      <ColumnPicker table="corpus" visibility={columnVisibility} onChange={updateColumns} />
     </div>
   </div>
 
@@ -167,18 +249,26 @@
       class="table table-scroll corpus-table"
       on:scroll={handleCorpusColumnScroll}
     >
-      <div class="table-row header cols-corpus-main">
-        <span><button class="table-sort" type="button" on:click={() => toggleCorpusSort('title')}>Title{corpusSortIndicator('title', corpusSort)}</button></span>
-        <span><button class="table-sort" type="button" on:click={() => toggleCorpusSort('year')}>Year{corpusSortIndicator('year', corpusSort)}</button></span>
-        <span><button class="table-sort" type="button" on:click={() => toggleCorpusSort('source')}>Source{corpusSortIndicator('source', corpusSort)}</button></span>
-        <span>Stage</span>
+      <div class="table-row header" style={gridStyle}>
+        {#each activeColumns as column (column.key)}
+          <span>
+            {#if column.sortable}
+              <button class="table-sort" type="button" on:click={() => toggleCorpusSort(column.key)}>
+                {column.label}{corpusSortIndicator(column.key, corpusSort)}
+              </button>
+            {:else}
+              {column.label}
+            {/if}
+          </span>
+        {/each}
       </div>
       {#each filteredItems as item (item.id)}
         {@const bucket = getBucketForItem(item)}
         {@const itemKey = corpusItemKey(item, bucket)}
         {@const selected = itemKey !== '' && itemKey === activeCorpusKey}
         <div
-          class={`table-row cols-corpus-main clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
+          class={`table-row clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
+          style={gridStyle}
           on:click={() => toggleCorpusItemSelection(item, bucket)}
           on:keydown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
@@ -191,28 +281,33 @@
           aria-pressed={selected}
           tabindex="0"
         >
-          <span class="corpus-row-main">
-            <span class="corpus-title-line">
-              <span class={`disclosure-chevron ${selected ? 'open' : ''}`} aria-hidden="true">▸</span>
-              <span class="corpus-row-title line-clamp-2" title={item.title}>
-                {item.title || 'Untitled'}
+          {#each activeColumns as column, columnIndex (column.key)}
+            {#if column.key === 'title'}
+              <span class="corpus-row-main">
+                <span class="corpus-title-line">
+                  <span class={`disclosure-chevron ${selected ? 'open' : ''}`} aria-hidden="true">▸</span>
+                  <span class="corpus-row-title line-clamp-2" title={item.title}>
+                    {item.title || 'Untitled'}
+                  </span>
+                </span>
               </span>
-            </span>
-          </span>
-          <span class="nowrap">{item.year || '-'}</span>
-          <span class="muted small line-clamp-2" title={corpusItemSource(item) || '-'}>
-            {corpusItemSource(item) || '-'}
-          </span>
-          <span class="nowrap muted small corpus-stage-pill">
-            {itemStageLabel(item, bucket)}
-            <button
-              class="corpus-remove"
-              type="button"
-              title="Remove from this corpus (keeps the work and its PDF)"
-              aria-label={`Remove ${item.title || 'item'} from this corpus`}
-              on:click|stopPropagation={() => handleRemoveCorpusWork(item)}
-            >✕</button>
-          </span>
+            {:else if column.key === 'authors'}
+              <span class="muted small line-clamp-2" title={corpusItemAuthorsFull(item)}>{cellText(item, column.key, bucket)}</span>
+            {:else}
+              <span class="muted small line-clamp-2 corpus-cell" title={cellText(item, column.key, bucket)}>
+                {cellText(item, column.key, bucket)}
+                {#if columnIndex === activeColumns.length - 1}
+                  <button
+                    class="corpus-remove"
+                    type="button"
+                    title="Remove from this corpus (keeps the work and its PDF)"
+                    aria-label={`Remove ${item.title || 'item'} from this corpus`}
+                    on:click|stopPropagation={() => handleRemoveCorpusWork(item)}
+                  >✕</button>
+                {/if}
+              </span>
+            {/if}
+          {/each}
         </div>
         {#if selected}
           <div class="table-row corpus-inline-detail-row">
@@ -233,7 +328,7 @@
                   {/if}
                   <span class="inline-detail-chip">Year: {item.year || '-'}</span>
                   <span class="inline-detail-chip">Source: {corpusItemSource(item) || '-'}</span>
-                  <span class="inline-detail-chip">Author: {corpusItemAuthors(item) || '-'}</span>
+                  <span class="inline-detail-chip">Author: {corpusItemAuthorsFull(item) || '-'}</span>
                   {#if item.doi}
                     <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI</a>
                   {/if}

@@ -54,6 +54,13 @@
   import Logs from './components/Logs.svelte'
   import ThreeGraph from './components/ThreeGraph.svelte'
   import Corpus from './components/Corpus.svelte'
+  import ColumnPicker from './components/ColumnPicker.svelte'
+  import {
+    gridTemplate,
+    loadVisibility as loadColumnVisibility,
+    saveVisibility as saveColumnVisibility,
+    visibleColumns,
+  } from './lib/tableColumns'
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
@@ -209,6 +216,16 @@
   let seedSelections = {}
   let seedSelectionVersions = {}
   let seedSorts = {}
+  let seedColumnVisibility = loadColumnVisibility('seed')
+  $: seedActiveColumns = visibleColumns('seed', seedColumnVisibility)
+  // The seed table keeps a leading selection cell, so the grid gets an extra
+  // fixed track in front of the shared columns.
+  $: seedGridStyle = `grid-template-columns: 44px ${gridTemplate(seedActiveColumns)}`
+
+  function updateSeedColumns(next) {
+    seedColumnVisibility = next
+    saveColumnVisibility('seed', next)
+  }
   let selectedSeedCandidateKeys = {}
   let seedActionStatus = ''
   let seedActionBusy = false
@@ -2647,11 +2664,65 @@
   // response — there is no paging to sort across. The paged corpus table uses
   // server-side sorting instead.
   const SEED_SORT_ACCESSORS = {
-    state: (candidate) => seedCandidateTag(candidate).label,
+    metadata: (candidate) => seedMetadataLabel(candidate),
+    download: (candidate) => seedDownloadLabel(candidate),
     title: (candidate) => formatTitle(candidate),
     authors: (candidate) => formatAuthors(candidate),
     year: (candidate) => candidate?.year,
-    source: (candidate) => candidate?.source || candidate?.publisher || '',
+    source: (candidate) => candidate?.source || '',
+    seed: (candidate) => candidate?.ingest_source || '',
+  }
+
+  // Spec line 16: show the metadata and download axes separately. The derived
+  // `state` still drives every behaviour — only the display splits.
+  const SEED_METADATA_LABELS = {
+    pending: 'Pending',
+    enriching: 'Enriching',
+    matched: 'Confirmed',
+    failed_enrichment: 'Metadata not confirmed',
+  }
+  const SEED_DOWNLOAD_LABELS = {
+    not_requested: 'Not requested',
+    queued: 'Queued',
+    in_progress: 'Downloading',
+    downloaded: 'Downloaded',
+    failed: 'Not retrievable',
+    failed_download: 'Not retrievable',
+  }
+
+  function seedMetadataLabel(candidate) {
+    const state = seedCandidateState(candidate)
+    if (state === 'failed_enrichment') return SEED_METADATA_LABELS.failed_enrichment
+    const raw = String(candidate?.metadata_status || '').trim().toLowerCase()
+    if (SEED_METADATA_LABELS[raw]) return SEED_METADATA_LABELS[raw]
+    return raw ? raw.replace(/_/g, ' ') : '-'
+  }
+
+  function seedDownloadLabel(candidate) {
+    const state = seedCandidateState(candidate)
+    if (state === 'failed_download') return SEED_DOWNLOAD_LABELS.failed_download
+    const raw = String(candidate?.download_status || '').trim().toLowerCase()
+    if (SEED_DOWNLOAD_LABELS[raw]) return SEED_DOWNLOAD_LABELS[raw]
+    return raw ? raw.replace(/_/g, ' ') : '-'
+  }
+
+  function seedCellText(candidate, key) {
+    switch (key) {
+      case 'metadata': return seedMetadataLabel(candidate)
+      case 'download': return seedDownloadLabel(candidate)
+      case 'title': return formatTitle(candidate)
+      case 'authors': return formatAuthorsShort(candidate)
+      case 'year': return candidate?.year || ''
+      case 'source': return candidate?.source || ''
+      case 'doi': return candidate?.doi || ''
+      case 'publisher': return candidate?.publisher || ''
+      case 'type': return candidate?.type || ''
+      case 'openalex': return candidate?.openalex_id || ''
+      case 'pages': return candidate?.pages || ''
+      case 'open_access': return candidate?.open_access_url ? 'Yes' : 'No'
+      case 'file': return candidate?.file_available ? 'Yes' : 'No'
+      default: return ''
+    }
   }
 
   function toggleSeedSort(source, column) {
@@ -4564,6 +4635,7 @@
                           <div class="table-toolbar">
                             <div class="table-toolbar-left">
                               <span class="muted">Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable</span>
+                              <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
                               <button class="secondary" type="button" on:click={() => selectAllSeedCandidates(source)} disabled={seedActionBusy}>Select all</button>
                               <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
                             </div>
@@ -4587,16 +4659,19 @@
                         {:else}
                           {#key `${sourceId}:selection:${selectionVersion}:${downstreamPromotesAll}`}
                             <div class="table table-scroll seed-candidate-table">
-                              <div class="table-row header cols-7">
-                                <span class="ingest-select-cell">
-                                  <button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'state')}>State{seedSortIndicator(source, 'state', seedSorts)}</button>
-                                </span>
-                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'title')}>Title{seedSortIndicator(source, 'title', seedSorts)}</button></span>
-                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'authors')}>Authors{seedSortIndicator(source, 'authors', seedSorts)}</button></span>
-                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'year')}>Year{seedSortIndicator(source, 'year', seedSorts)}</button></span>
-                                <span><button class="table-sort" type="button" on:click={() => toggleSeedSort(source, 'source')}>Source{seedSortIndicator(source, 'source', seedSorts)}</button></span>
-                                <span>DOI</span>
-                                <span>Corpus</span>
+                              <div class="table-row header" style={seedGridStyle}>
+                                <span class="ingest-select-cell" aria-hidden="true"></span>
+                                {#each seedActiveColumns as column (column.key)}
+                                  <span>
+                                    {#if column.sortable}
+                                      <button class="table-sort" type="button" on:click={() => toggleSeedSort(source, column.key)}>
+                                        {column.label}{seedSortIndicator(source, column.key, seedSorts)}
+                                      </button>
+                                    {:else}
+                                      {column.label}
+                                    {/if}
+                                  </span>
+                                {/each}
                               </div>
                               {#each sourceCandidates as candidate (candidate.candidate_key)}
                                 {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
@@ -4604,7 +4679,8 @@
                                 {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
                                 {@const candidateTag = seedCandidateTag(candidate)}
                                 <div
-                                  class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                  class={`table-row clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                  style={seedGridStyle}
                                   on:click={(e) => {
                                     if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
                                     setSelectedSeedCandidate(source, candidate);
@@ -4652,25 +4728,28 @@
 	                                      </span>
 	                                    {/if}
                                   </span>
-                                  <span>{formatTitle(candidate)}</span>
-                                  <span title={formatAuthors(candidate)}>{formatAuthorsShort(candidate)}</span>
-                                  <span>{candidate.year || ''}</span>
-                                  <span>{candidate.source || candidate.publisher || ''}</span>
-                                  <span>{candidate.doi || ''}</span>
-                                  <span class="seed-candidate__corpus-cell">
-                                    {#if isSeedCandidateInCorpus(candidate)}
-                                      <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
-                                    {:else if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                      <button
-                                        class="seed-candidate__promote"
-                                        type="button"
-                                        title="Promote this item to the corpus using the current Promotion Settings"
-                                        aria-label={`Promote ${formatTitle(candidate)} to corpus`}
-                                        disabled={seedActionBusy}
-                                        on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
-                                      >→ Promote</button>
+                                  {#each seedActiveColumns as column (column.key)}
+                                    {#if column.key === 'corpus'}
+                                      <span class="seed-candidate__corpus-cell">
+                                        {#if isSeedCandidateInCorpus(candidate)}
+                                          <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                        {:else if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
+                                          <button
+                                            class="seed-candidate__promote"
+                                            type="button"
+                                            title="Promote this item to the corpus using the current Promotion Settings"
+                                            aria-label={`Promote ${formatTitle(candidate)} to corpus`}
+                                            disabled={seedActionBusy}
+                                            on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                          >→ Promote</button>
+                                        {/if}
+                                      </span>
+                                    {:else if column.key === 'authors'}
+                                      <span title={formatAuthors(candidate)}>{seedCellText(candidate, column.key)}</span>
+                                    {:else}
+                                      <span title={seedCellText(candidate, column.key)}>{seedCellText(candidate, column.key)}</span>
                                     {/if}
-                                  </span>
+                                  {/each}
                                 </div>
                                 {#if active}
                                   <div class="seed-inline-detail-row">
@@ -4723,6 +4802,7 @@
                 {failedDownloadTotal}
                 {bucketLabel}
                 {formatAuthors}
+                {formatAuthorsShort}
                 {corpusFilterQuery}
                 {handleCorpusFilterInput}
                 {handleRemoveCorpusWork}

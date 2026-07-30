@@ -74,7 +74,7 @@ def load_pdf_source_labels(conn, corpus_id):
         return {}
     rows = conn.execute(
         """
-        SELECT corpus_id, ingest_source, title, source_pdf
+        SELECT corpus_id, ingest_source, title, authors, source_pdf
         FROM ingest_source_metadata
         WHERE (? IS NULL OR corpus_id = ?)
         """,
@@ -86,9 +86,29 @@ def load_pdf_source_labels(conn, corpus_id):
         if not key:
             continue
         label = row["title"] or (Path(str(row["source_pdf"])).stem if row["source_pdf"] else "") or key
+        # Spec line 19: a seed-document origin shows its full title AND author.
+        author = _first_author(row["authors"])
+        if author:
+            label = f"{label} — {author}"
         labels[(row["corpus_id"], key)] = label
         labels[(None, key)] = label
     return labels
+
+
+def _first_author(raw):
+    """ingest_source_metadata.authors is a JSON list when it is populated."""
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return str(raw).strip()
+    if isinstance(parsed, list):
+        names = [str(name).strip() for name in parsed if str(name or "").strip()]
+        if not names:
+            return ""
+        return names[0] if len(names) == 1 else f"{names[0]} et al."
+    return str(parsed).strip()
 
 
 def load_search_source_labels(conn):
@@ -279,7 +299,12 @@ def main():
     for row in rows:
         data = dict(row)
         status = status_from_row(data)
-        source = data.get("origin_key") or data.get("source_pdf") or data.get("metadata_source") or data.get("source")
+        # Spec line 19 splits two things that both used to be called "Source":
+        #   source = the article's venue (journal / publication)
+        #   origin = where the record came from (raw provenance path/key)
+        # The user-facing provenance column is "Seed" (source_label) instead.
+        venue = data.get("source")
+        origin = data.get("origin_key") or data.get("source_pdf") or data.get("metadata_source") or data.get("source")
         source_info = source_label_for_work(data, args.corpus_id, pdf_source_labels, search_source_labels, seed_provenance)
         items.append(
             {
@@ -288,7 +313,10 @@ def main():
                 "title": data.get("title"),
                 "authors": data.get("authors"),
                 "year": data.get("year"),
-                "source": source,
+                "source": venue,
+                "origin": origin,
+                "publisher": data.get("publisher"),
+                "type": data.get("type"),
                 "source_label": source_info["source_label"],
                 "source_type": source_info["source_type"],
                 "source_key": source_info["source_key"],
