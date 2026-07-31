@@ -304,11 +304,14 @@ def _rank_candidate_ids(ids, related_sort, max_related, mailto):
 
 def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_sort=DEFAULT_RELATED_SORT):
     cited_by_url = work.get('cited_by_api_url')
-    if not cited_by_url and work.get('id'):
-        refreshed = fetch_work_by_openalex_id(work.get('id'), mailto=mailto)
-        if refreshed:
-            refreshed_work = _to_openalex_like(refreshed) or work
-            cited_by_url = refreshed_work.get('cited_by_api_url')
+    if not cited_by_url:
+        # OpenAlex has removed cited_by_api_url from the works payload — it is
+        # absent even when no `select` is given, so refetching the work cannot
+        # recover it and upstream expansion silently returned nothing. Build the
+        # equivalent `cites:` query ourselves.
+        work_id = normalize_openalex_id(work.get('id'))
+        if work_id:
+            cited_by_url = f'{OPENALEX_WORKS_URL}?filter=cites:{work_id}'
 
     if not cited_by_url:
         return []
