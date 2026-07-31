@@ -697,6 +697,20 @@ export async function fetchSeedSourceDocument(sourceKey) {
   return { blob: await response.blob(), filename }
 }
 
+export async function removeCorpusWorks(workIds) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/remove`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workIds }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to remove items from corpus')
+  }
+  return response.json()
+}
+
 export async function fetchAppSettings() {
   const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`)
   await throwIfUnauthorized(response)

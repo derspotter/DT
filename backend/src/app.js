@@ -5175,6 +5175,45 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
+  // Bulk counterpart of DELETE /api/corpus/works/:workId. Transactional so a
+  // partial removal cannot leave the table disagreeing with the DB, and ids not
+  // in this corpus are reported rather than silently treated as removed.
+  app.post('/api/corpus/works/remove', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const rawIds = Array.isArray(req.body?.workIds) ? req.body.workIds : [];
+    const workIds = [...new Set(rawIds.map((value) => coerceInt(value, null)))]
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (workIds.length === 0) {
+      return res.status(400).json({ error: 'workIds must be a non-empty array of positive ids' });
+    }
+    try {
+      const unlink = authDb.prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?');
+      const clearMarker = tableExists(authDb, 'seed_candidates_in_corpus')
+        ? authDb.prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+        : null;
+      const apply = authDb.transaction((ids) => {
+        const removedIds = [];
+        for (const workId of ids) {
+          const result = unlink.run(req.corpusId, workId);
+          if (result.changes > 0) {
+            removedIds.push(workId);
+            // Let the seed table offer the item for promotion again.
+            if (clearMarker) clearMarker.run(req.corpusId, workId);
+          }
+        }
+        return removedIds;
+      });
+      const removedIds = apply(workIds);
+      return res.json({
+        removed: removedIds.length,
+        removed_work_ids: removedIds,
+        skipped_work_ids: workIds.filter((id) => !removedIds.includes(id)),
+      });
+    } catch (error) {
+      console.error('[/api/corpus/works/remove] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to remove works from corpus' });
+    }
+  });
+
   app.post('/api/corpus/downloaded/:id/download-ticket', requireAuthMiddleware, (req, res) => {
     const itemId = coerceInt(req.params?.id, null);
     if (!Number.isFinite(itemId) || itemId <= 0) {

@@ -1989,6 +1989,18 @@ button.seed-download-tag:focus-visible {
   color: #b91c1c;
 }
 
+.corpus-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+
+.corpus-select-row.row-checked {
+  background: var(--row-checked, #f1f5f9);
+}
+
 .column-picker {
   position: relative;
   display: inline-block;

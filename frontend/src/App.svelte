@@ -34,6 +34,7 @@
     fetchRecursionConfig,
     fetchCorpus,
     removeCorpusWork,
+    removeCorpusWorks,
     fetchSeedSourceDocument,
     fetchAppSettings,
     saveAppSettings,
@@ -2642,6 +2643,34 @@
     }
   }
 
+  // Bulk counterpart of handleRemoveCorpusWork. Same semantics: unlink from
+  // this corpus only, the works and their PDFs survive (spec line 23).
+  async function handleRemoveSelectedCorpusWorks(workIds) {
+    const ids = (Array.isArray(workIds) ? workIds : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+    if (ids.length === 0) return
+    try {
+      const result = await removeCorpusWorks(ids)
+      const removed = new Set((result?.removed_work_ids || ids).map((value) => Number(value)))
+      corpusItems = corpusItems.filter((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
+      corpusTotal = Math.max(0, corpusTotal - removed.size)
+      corpusLoadStatus = `Removed ${removed.size} item(s) from this corpus.`
+      await Promise.all([
+        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadSeedSources({ quiet: true }),
+        loadIngestStats({ quiet: true }),
+      ])
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      corpusLoadStatus = error?.message || 'Failed to remove the selected items.'
+    }
+  }
+
   function toggleCorpusSort(column) {
     const [currentColumn, currentDirection] = String(corpusSort || '').split(':')
     const direction = currentColumn === column && currentDirection === 'asc' ? 'desc' : 'asc'
@@ -4806,6 +4835,7 @@
                 {corpusFilterQuery}
                 {handleCorpusFilterInput}
                 {handleRemoveCorpusWork}
+                {handleRemoveSelectedCorpusWorks}
                 {toggleCorpusSort}
                 {corpusSortIndicator}
                 {corpusSort}

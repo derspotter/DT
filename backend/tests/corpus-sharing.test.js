@@ -390,6 +390,87 @@ describe('corpus sharing and multi-user isolation', () => {
     expect(res.status).toBe(404)
   })
 
+  test('bulk removal unlinks every id and reports ids that were not members', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const first = seedCorpusWork(corpusId, 'Bulk One')
+    const second = seedCorpusWork(corpusId, 'Bulk Two')
+    const outsiderWorkId = withDb((db) => {
+      const work = db
+        .prepare(
+          `INSERT INTO works (title, normalized_title, authors, year, metadata_status, download_status)
+           VALUES ('Not a member', 'not a member', 'A', 2026, 'matched', 'not_requested')`
+        )
+        .run()
+      return Number(work.lastInsertRowid)
+    })
+
+    const res = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [first, second, outsiderWorkId] })
+
+    expect(res.status).toBe(200)
+    expect(res.body.removed).toBe(2)
+    expect(res.body.removed_work_ids.sort()).toEqual([first, second].sort())
+    expect(res.body.skipped_work_ids).toEqual([outsiderWorkId])
+
+    withDb((db) => {
+      for (const workId of [first, second]) {
+        expect(db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?').get(corpusId, workId)).toBeUndefined()
+        // The works themselves survive — removal is an unlink, not a delete.
+        expect(db.prepare('SELECT id FROM works WHERE id = ?').get(workId)).toBeTruthy()
+      }
+    })
+  })
+
+  test('bulk removal deduplicates ids and rejects an empty list', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const workId = seedCorpusWork(corpusId, 'Bulk Duplicate')
+
+    const dupeRes = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [workId, workId, workId] })
+    expect(dupeRes.status).toBe(200)
+    expect(dupeRes.body.removed).toBe(1)
+
+    const emptyRes = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [] })
+    expect(emptyRes.status).toBe(400)
+
+    const junkRes = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: ['abc', -1, 0] })
+    expect(junkRes.status).toBe(400)
+  })
+
+  test('bulk removal cannot reach another users corpus', async () => {
+    const username = 'bulk-outsider'
+    const password = 'bulk-outsider-password'
+    const { corpusId: outsiderCorpusId } = createActiveUser(username, password)
+    const outsiderWorkId = seedCorpusWork(outsiderCorpusId, 'Outsider Work')
+
+    const admin = await login(adminUsername, adminPassword)
+    const res = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [outsiderWorkId] })
+
+    // Scoped to req.corpusId, so the id is simply not a member here.
+    expect(res.status).toBe(200)
+    expect(res.body.removed).toBe(0)
+    withDb((db) => {
+      expect(
+        db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?').get(outsiderCorpusId, outsiderWorkId)
+      ).toBeTruthy()
+    })
+  })
+
   test('admin settings never echo secrets back and persist non-secrets', async () => {
     const admin = await login(adminUsername, adminPassword)
 

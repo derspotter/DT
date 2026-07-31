@@ -36,11 +36,66 @@
 
   let columnVisibility = loadVisibility('corpus')
   $: activeColumns = visibleColumns('corpus', columnVisibility)
-  $: gridStyle = `grid-template-columns: ${gridTemplate(activeColumns)}`
+  // A leading fixed track carries the selection checkbox, mirroring the seed table.
+  $: gridStyle = `grid-template-columns: 44px ${gridTemplate(activeColumns)}`
 
   function updateColumns(next) {
     columnVisibility = next
     saveVisibility('corpus', next)
+  }
+
+  // Multi-select for bulk actions (spec line 23). Deliberately separate from
+  // activeCorpusKey, which is the single-row detail expansion — a row can be
+  // expanded without being selected and vice versa.
+  export let handleRemoveSelectedCorpusWorks = () => {}
+
+  let selectedWorkIds = []
+
+  function workIdOf(item) {
+    const raw = Number(item?.work_id ?? item?.id)
+    return Number.isFinite(raw) && raw > 0 ? raw : null
+  }
+
+  $: selectableWorkIds = filteredItems.map(workIdOf).filter((id) => id !== null)
+  // Derived rather than written back into selectedWorkIds: a reactive statement
+  // that assigns to its own dependency loops. Ids hidden by the stage filter are
+  // ignored here so the count never claims more than the table can act on, but
+  // they survive in selectedWorkIds if the filter is cleared again.
+  $: visibleSelection = selectedWorkIds.filter((id) => selectableWorkIds.includes(id))
+  $: allSelected = selectableWorkIds.length > 0 && visibleSelection.length === selectableWorkIds.length
+
+  function isRowSelected(item) {
+    const id = workIdOf(item)
+    return id !== null && selectedWorkIds.includes(id)
+  }
+
+  function toggleRowSelection(item) {
+    const id = workIdOf(item)
+    if (id === null) return
+    selectedWorkIds = selectedWorkIds.includes(id)
+      ? selectedWorkIds.filter((value) => value !== id)
+      : [...selectedWorkIds, id]
+  }
+
+  function toggleSelectAll() {
+    selectedWorkIds = allSelected ? [] : [...selectableWorkIds]
+  }
+
+  function clearSelection() {
+    selectedWorkIds = []
+  }
+
+  async function removeSelected() {
+    const targets = visibleSelection
+    if (targets.length === 0) return
+    // Light confirm on bulk (spec line 177); the per-row cross stays immediate.
+    const ok = confirm(
+      `Remove ${targets.length} item${targets.length === 1 ? '' : 's'} from this corpus?\n\n` +
+      'The works and their PDFs are kept — they are only unlinked from this corpus.'
+    )
+    if (!ok) return
+    await handleRemoveSelectedCorpusWorks([...targets])
+    selectedWorkIds = []
   }
   let stageFilter = 'all';
   let activeCorpusKey = '';
@@ -244,12 +299,35 @@
     </div>
   </div>
 
+  <div class="corpus-bulk-bar">
+    <span class="muted small">Selected: {visibleSelection.length} / {selectableWorkIds.length}</span>
+    <button class="secondary" type="button" on:click={toggleSelectAll} disabled={selectableWorkIds.length === 0}>
+      {allSelected ? 'Clear' : 'Select all'}
+    </button>
+    <button class="secondary" type="button" on:click={clearSelection} disabled={visibleSelection.length === 0}>
+      Clear selection
+    </button>
+    <button class="danger" type="button" on:click={removeSelected} disabled={visibleSelection.length === 0}>
+      Remove selected
+    </button>
+  </div>
+
   <div class="corpus-table-unified">
     <div
       class="table table-scroll corpus-table"
       on:scroll={handleCorpusColumnScroll}
     >
       <div class="table-row header" style={gridStyle}>
+        <span class="ingest-select-cell">
+          <input
+            type="checkbox"
+            checked={allSelected}
+            disabled={selectableWorkIds.length === 0}
+            on:change={toggleSelectAll}
+            aria-label={allSelected ? 'Clear selection' : 'Select all visible corpus items'}
+            title={allSelected ? 'Clear selection' : 'Select all visible corpus items'}
+          />
+        </span>
         {#each activeColumns as column (column.key)}
           <span>
             {#if column.sortable}
@@ -267,7 +345,7 @@
         {@const itemKey = corpusItemKey(item, bucket)}
         {@const selected = itemKey !== '' && itemKey === activeCorpusKey}
         <div
-          class={`table-row clickable corpus-select-row ${selected ? 'selected active-row' : ''}`}
+          class={`table-row clickable corpus-select-row ${selected ? 'selected active-row' : ''} ${isRowSelected(item) ? 'row-checked' : ''}`}
           style={gridStyle}
           on:click={() => toggleCorpusItemSelection(item, bucket)}
           on:keydown={(e) => {
@@ -281,6 +359,15 @@
           aria-pressed={selected}
           tabindex="0"
         >
+          <span class="ingest-select-cell">
+            <input
+              type="checkbox"
+              checked={isRowSelected(item)}
+              on:click|stopPropagation
+              on:change={() => toggleRowSelection(item)}
+              aria-label={`Select ${item.title || 'item'}`}
+            />
+          </span>
           {#each activeColumns as column, columnIndex (column.key)}
             {#if column.key === 'title'}
               <span class="corpus-row-main">
