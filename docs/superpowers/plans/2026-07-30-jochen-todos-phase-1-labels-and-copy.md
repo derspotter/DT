@@ -30,18 +30,30 @@
 | 6 | 13&14 | `app_settings` store + admin Settings UI | `0491685` |
 | 7 | 10&11, 12 | Two promotion modes + related-paper ranking | `93cbb89` |
 | 4 | C1, C2, 16, 18, 19 | Unified sortable/toggleable column system, metadata/download split | `d3d8085` |
+| 8 | 23 (completion) | Corpus multi-select + bulk removal | `b23f6de` |
 
 Line 17 moved from phase 4 into phase 3: the spec notes it shares the
 `/api/corpus` round-trip with the line-6 filter, and both land in the same
 `corpus_list.py` region.
 
-### Known gap
+No known gaps remain. Phase 5 originally shipped line 23 as the per-row **✕**
+only — the corpus table had single-row expansion, not multi-select, so the bulk
+half needed selection infrastructure the spec did not scope. Phase 8 built it:
 
-Line 23 asked for a per-row **✕** *and* a bulk "Remove selected". Only the
-per-row removal shipped: the corpus table has single-row expansion, not
-multi-select, so a bulk action needs selection infrastructure the spec did not
-scope. `DELETE /api/corpus/works/:workId` is per-work, so a bulk UI can be
-layered on top without further backend work.
+- Leading checkbox column and select-all header checkbox, mirroring the seed
+  table; a bulk bar with Select all / Clear selection / Remove selected.
+- Selection state is separate from `activeCorpusKey` (the detail expansion), and
+  row checkboxes `stopPropagation` so ticking one does not open the detail card.
+- `POST /api/corpus/works/remove` — transactional, deduplicates ids, and reports
+  `removed_work_ids` vs `skipped_work_ids` instead of counting non-members as
+  removed. Same semantics as the single-item endpoint: unlink from this corpus,
+  keep the work and its PDF, clear the seed in-corpus marker.
+- Light confirm on bulk; the per-row **✕** stays immediate, per spec line 177.
+
+Implementation note worth keeping: the visible selection is *derived*
+(`visibleSelection`), not written back into `selectedWorkIds`. A reactive
+statement that assigns to its own dependency loops in Svelte, and deriving also
+means a selection survives narrowing then widening the stage filter.
 
 ---
 
