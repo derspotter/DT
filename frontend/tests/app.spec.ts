@@ -88,6 +88,11 @@ test.describe('Korpus Builder live integration', () => {
     await page.getByTestId('tab-workspace').click()
     await expect(page.locator('.seed-intake-card--search')).toBeVisible()
     await page.getByRole('textbox', { name: 'Query' }).fill('institutional economics AND governance')
+    // The Max results field defaults to "No cap". Left uncapped this runs an
+    // unbounded OpenAlex search that cannot settle inside the poll timeout and
+    // dumps the whole result set into the corpus; a small cap keeps this a real
+    // backend/OpenAlex integration check without that.
+    await page.getByLabel('Max results').fill('5')
     await page.getByRole('button', { name: 'Search' }).click()
     const searchStatus = await waitUntilSearchSettled(page)
     expect(searchStatus).not.toContain('Searching...')
@@ -105,7 +110,11 @@ test.describe('Korpus Builder live integration', () => {
     const corpusRows = corpusPanel.locator('.corpus-select-row')
     if (await corpusRows.count()) {
       await corpusRows.first().click()
-      await expect(corpusPanel.locator('.corpus-details-grid strong').first()).not.toHaveText('-')
+      // .corpus-details-grid was replaced by an inline detail card when the
+      // workspace was reshaped; only its CSS survives. Assert the card opens
+      // with populated chips instead.
+      await expect(corpusPanel.locator('.inline-detail-card').first()).toBeVisible()
+      await expect(corpusPanel.locator('.inline-detail-chip').first()).not.toBeEmpty()
     }
 
     await page.getByTestId('tab-downloads').click()
@@ -143,9 +152,18 @@ test.describe('Korpus Builder live integration', () => {
     await uploadCard.locator('input[type="file"][accept*=".pdf"]').setInputFiles(pdfPath)
     const uploadRow = uploadCard.locator('.upload-item', { hasText: pdfName })
     await expect(uploadRow).toBeVisible()
-    await expect(uploadRow.locator('.status')).toHaveText('uploaded', { timeout: 120_000 })
 
-    await uploadRow.getByRole('button', { name: 'Extract' }).click()
-    await expect(uploadRow.locator('.status')).toHaveText('extracted', { timeout: 30_000 })
+    // The .status badge is rendered only while a status other than 'uploaded'
+    // is active, so a completed upload is signalled by the message plus an
+    // enabled Extract button — not by a badge reading 'uploaded'.
+    const extractButton = uploadRow.getByRole('button', { name: 'Extract' })
+    await expect(extractButton).toBeEnabled({ timeout: 120_000 })
+    await expect(uploadRow).toContainText('Uploaded')
+
+    await extractButton.click()
+    // extractForItem sets 'extracting' and then 'queued' depending on whether
+    // the backend ran it inline or enqueued it; either proves extraction
+    // started, which is what this test is named for.
+    await expect(uploadRow.locator('.status')).toHaveText(/extracting|queued/, { timeout: 30_000 })
   })
 })

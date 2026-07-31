@@ -608,8 +608,13 @@
     if (extractedBaseNames.size === 0) return
     const nextUploads = uploads.filter((item) => {
       const backendFilename = String(item?.backendFilename || '').trim()
+      // An upload still in flight has no backend filename yet. It must survive:
+      // this prune runs on the ingest-runs poll, so dropping it here deletes the
+      // row mid-upload and the later updateUpload() patch finds nothing to
+      // update, leaving the file silently gone from the list.
+      if (!backendFilename) return true
       const baseName = backendFilename.replace(/\.pdf$/i, '')
-      return backendFilename && !extractedBaseNames.has(baseName) && normalizeStoredUploadStatus(item.status) !== 'extracted'
+      return !extractedBaseNames.has(baseName) && normalizeStoredUploadStatus(item.status) !== 'extracted'
     })
     if (nextUploads.length !== uploads.length) {
       uploads = nextUploads
