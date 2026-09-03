@@ -95,6 +95,32 @@ const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+const OPENALEX_QUOTA_STALE_MS = 24 * 60 * 60 * 1000;
+
+function openalexQuotaPath() {
+  // Resolved per request so tests (and admins) can point it elsewhere via env.
+  const override = String(process.env.RAG_FEEDER_OPENALEX_QUOTA_PATH || '').trim();
+  return override || path.join(path.dirname(DB_PATH), 'openalex_quota.json');
+}
+
+function readOpenAlexQuota() {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(openalexQuotaPath(), 'utf8'));
+  } catch {
+    return { available: false };
+  }
+  if (!parsed || typeof parsed !== 'object') return { available: false };
+  const now = Date.now();
+  const observedMs = Date.parse(parsed.observed_at || '');
+  const resetMs = Date.parse(parsed.reset_at || '');
+  return {
+    ...parsed,
+    available: true,
+    stale: !Number.isFinite(observedMs) || now - observedMs > OPENALEX_QUOTA_STALE_MS,
+    reset_in_seconds: Number.isFinite(resetMs) ? Math.max(0, Math.round((resetMs - now) / 1000)) : null,
+  };
+}
 const FRONTEND_URL = process.env.RAG_FEEDER_FRONTEND_URL || 'https://genkia.de';
 const SMTP_FROM = process.env.RAG_FEEDER_SMTP_FROM || process.env.SMTP_FROM || 'noreply@example.com';
 const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
@@ -5283,6 +5309,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       console.error('[/api/corpus/downloaded/:id/file] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to download corpus file' });
     }
+  });
+
+  app.get('/api/openalex/quota', requireAuthMiddleware, (req, res) => {
+    return res.json(readOpenAlexQuota());
   });
 
   app.get('/api/recursion-config', requireAuthMiddleware, (req, res) => {

@@ -661,6 +661,16 @@ export async function fetchRecursionConfig() {
   return response.json()
 }
 
+export async function fetchOpenAlexQuota() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/openalex/quota`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load OpenAlex quota')
+  }
+  return response.json()
+}
+
 export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' } = {}) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
