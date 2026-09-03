@@ -14,6 +14,12 @@ export const COLUMN_DEFS = [
   { key: 'title', label: 'Title', width: 'minmax(220px, 3fr)', sortable: true, defaultVisible: true },
   { key: 'authors', label: 'Authors', width: 'minmax(140px, 1.5fr)', sortable: true, defaultVisible: true },
   { key: 'year', label: 'Year', width: '70px', sortable: true, defaultVisible: true },
+  // Round 2 item 7: how many works the item cites on OpenAlex — what a
+  // downstream promote pulls in. Seed table only this round.
+  { key: 'refs', label: 'Refs', width: '70px', sortable: true, defaultVisible: true, tables: ['seed'],
+    hint: 'Works this item cites on OpenAlex — what a downstream promote pulls in' },
+  { key: 'cited_by', label: 'Cited by', width: '80px', sortable: true, defaultVisible: false, tables: ['seed'],
+    hint: 'How often OpenAlex has seen this item cited' },
   // "Source" is the article's venue in BOTH tables — never provenance.
   { key: 'source', label: 'Source', width: 'minmax(120px, 1.5fr)', sortable: true, defaultVisible: true },
   // "Seed" is the provenance: the search query or the seed document. In the

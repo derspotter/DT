@@ -166,4 +166,21 @@ test.describe('Korpus Builder live integration', () => {
     // started, which is what this test is named for.
     await expect(uploadRow.locator('.status')).toHaveText(/extracting|queued/, { timeout: 30_000 })
   })
+
+  test('seed table exposes a Refs column', async ({ page, request }) => {
+    await ensureSignedIn(page, request)
+    const firstSeed = page.locator('.seed-source__summary').first()
+    // Seed sources load asynchronously after the "items found" text that
+    // ensureSignedIn already waited for, so give them a moment to arrive
+    // before deciding this corpus has none.
+    const hasSeed = await firstSeed
+      .waitFor({ state: 'visible', timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (!hasSeed) {
+      test.skip(true, 'No seeds in this corpus')
+    }
+    await firstSeed.click()
+    await expect(page.getByText('Refs', { exact: true }).first()).toBeVisible()
+  })
 })

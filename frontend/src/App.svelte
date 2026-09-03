@@ -2705,6 +2705,8 @@
     year: (candidate) => candidate?.year,
     source: (candidate) => candidate?.source || '',
     seed: (candidate) => candidate?.ingest_source || '',
+    refs: (candidate) => candidate?.refs_count,
+    cited_by: (candidate) => candidate?.cited_by_count,
   }
 
   // Spec line 16: show the metadata and download axes separately. The derived
@@ -2747,6 +2749,8 @@
       case 'title': return formatTitle(candidate)
       case 'authors': return formatAuthorsShort(candidate)
       case 'year': return candidate?.year || ''
+      case 'refs': return candidate?.refs_count ?? ''
+      case 'cited_by': return candidate?.cited_by_count ?? ''
       case 'source': return candidate?.source || ''
       case 'doi': return candidate?.doi || ''
       case 'publisher': return candidate?.publisher || ''
@@ -2790,7 +2794,9 @@
       if (aMissing && bMissing) return 0
       if (aMissing) return 1
       if (bMissing) return -1
-      if (current.column === 'year') return (Number(a) - Number(b)) * factor
+      if (current.column === 'year' || current.column === 'refs' || current.column === 'cited_by') {
+        return (Number(a) - Number(b)) * factor
+      }
       return String(a).localeCompare(String(b), undefined, { sensitivity: 'base', numeric: true }) * factor
     })
   }
@@ -4696,7 +4702,7 @@
                               <div class="table-row header" style={seedGridStyle}>
                                 <span class="ingest-select-cell" aria-hidden="true"></span>
                                 {#each seedActiveColumns as column (column.key)}
-                                  <span>
+                                  <span title={column.hint || ''}>
                                     {#if column.sortable}
                                       <button class="table-sort" type="button" on:click={() => toggleSeedSort(source, column.key)}>
                                         {column.label}{seedSortIndicator(source, column.key, seedSorts)}
