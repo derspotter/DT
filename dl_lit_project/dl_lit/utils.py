@@ -1,9 +1,12 @@
+import json
 import re
+import sys
+import tempfile
 from pathlib import Path
 import time
 import threading
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -204,6 +207,73 @@ def get_openalex_mailto() -> str | None:
     return mailto or None
 
 
+OPENALEX_QUOTA_FILENAME = 'openalex_quota.json'
+
+
+def openalex_quota_path() -> Path:
+    override = _env_str('RAG_FEEDER_OPENALEX_QUOTA_PATH')
+    if override:
+        return Path(override)
+    db_path = _env_str('RAG_FEEDER_DB_PATH')
+    if db_path:
+        return Path(db_path).resolve().parent / OPENALEX_QUOTA_FILENAME
+    return Path(__file__).resolve().parents[1] / 'data' / OPENALEX_QUOTA_FILENAME
+
+
+def _header_int(headers, name: str) -> int | None:
+    try:
+        raw = headers.get(name)
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def record_openalex_quota(response) -> dict | None:
+    """Persist the daily-budget headers OpenAlex sends with keyed requests.
+
+    The rate limiter lives per Python process, so this file is how the Node
+    backend learns where the budget stands. Never raises: a failed write is
+    logged and ignored because it must not sink the request that produced it.
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    observed_at = now.isoformat().replace('+00:00', 'Z')
+    headers = getattr(response, 'headers', None) or {}
+    limit = _header_int(headers, 'X-RateLimit-Limit')
+    if limit is None:
+        snapshot = {'api_key_present': False, 'observed_at': observed_at}
+    else:
+        reset_seconds = _header_int(headers, 'X-RateLimit-Reset')
+        snapshot = {
+            'limit': limit,
+            'remaining': _header_int(headers, 'X-RateLimit-Remaining'),
+            'credits_used': _header_int(headers, 'X-RateLimit-Credits-Used'),
+            'reset_seconds': reset_seconds,
+            'observed_at': observed_at,
+            'reset_at': (
+                (now + timedelta(seconds=reset_seconds)).isoformat().replace('+00:00', 'Z')
+                if reset_seconds is not None else None
+            ),
+            'api_key_present': True,
+        }
+
+    target = openalex_quota_path()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix='.openalex_quota-', dir=str(target.parent))
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(snapshot, handle)
+        os.replace(tmp_name, target)
+    except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
+        print(f'[OpenAlex WARN] Could not write quota snapshot to {target}: {exc}', file=sys.stderr)
+        return None
+    return snapshot
+
+
 def _warn_missing_openalex_api_key() -> None:
     global _missing_openalex_api_key_warned
     if _missing_openalex_api_key_warned:
@@ -375,6 +445,7 @@ def openalex_request_json(
                 params=request_params,
                 timeout=timeout,
             )
+            record_openalex_quota(response)
             wait_seconds = _apply_openalex_response_limits(
                 response,
                 rate_limiter,
