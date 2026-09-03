@@ -54,6 +54,7 @@ select {
 .app-shell.workspace-mode {
   padding-top: 16px;
   padding-bottom: 16px;
+  overflow: visible;
 }
 
 .app-shell.upstream-mode {
@@ -3688,7 +3689,7 @@ button.seed-download-tag:focus-visible {
   gap: 18px;
   flex: 1;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .upstream-browser {
@@ -5237,4 +5238,61 @@ button.seed-download-tag:focus-visible {
   .table-row.cols-corpus-workspace { min-width: 560px; }
   .table-row.cols-corpus-main { min-width: 620px; }
   .table-row.cols-upstream-current { min-width: 640px; }
+}
+
+.workspace-sticky-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  margin-bottom: 12px;
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.workspace-sticky-bar__links {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.workspace-sticky-bar__link {
+  background: none;
+  border: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.workspace-sticky-bar__link:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.workspace-sticky-bar__actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#section-find,
+#section-seed,
+#section-corpus {
+  scroll-margin-top: 64px;
+}
+
+@media (max-width: 640px) {
+  .workspace-sticky-bar {
+    padding: 6px 10px;
+  }
+  .workspace-sticky-bar__actions button {
+    padding: 4px 8px;
+  }
 }

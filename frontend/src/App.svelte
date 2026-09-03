@@ -2994,6 +2994,18 @@
     })
   }
 
+  function jumpToSection(id) {
+    const el = document.getElementById(id)
+    if (!el) return
+    const behavior = prefersReducedMotion ? 'auto' : 'smooth'
+    el.scrollIntoView({ behavior, block: 'start' })
+  }
+
+  function collapseExpandedSeed() {
+    expandedSeedSourceId = ''
+    jumpToSection('section-seed')
+  }
+
   async function focusSeedSource(sourceType, sourceKey) {
     const nextSourceId = `${sourceType}:${sourceKey}`
     if (!seedSources.some((source) => seedSourceId(source) === nextSourceId)) {
@@ -4326,7 +4338,20 @@
     <section class="content">
       {#if activeTab === 'workspace'}
         <div class="seed-corpus-workspace">
-        <div class="card seed-corpus-toolbar">
+        <nav class="workspace-sticky-bar" aria-label="Workspace sections" data-testid="workspace-sticky-bar">
+          <div class="workspace-sticky-bar__links">
+            <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-find')}>1 Find items</button>
+            <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-seed')}>2 Seed <span class="muted small">({seedSources.length})</span></button>
+            <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-corpus')}>3 Corpus <span class="muted small">({corpusTotal})</span></button>
+          </div>
+          <div class="workspace-sticky-bar__actions">
+            {#if expandedSeedSourceId}
+              <button type="button" class="secondary" on:click={collapseExpandedSeed}>Collapse seed</button>
+            {/if}
+            <button type="button" class="secondary" on:click={() => jumpToSection('section-find')}>Top</button>
+          </div>
+        </nav>
+        <div class="card seed-corpus-toolbar" id="section-find">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">
               <h2 class="workspace-section-title">1. Find items</h2>
@@ -4502,7 +4527,7 @@
 
         <div class="seed-corpus-columns">
           <div class="seed-corpus-column seed-corpus-column--seed">
-        <div class="card seed-sources-panel" data-testid="seed-panel">
+        <div class="card seed-sources-panel" id="section-seed" data-testid="seed-panel">
           <div class="workspace-panel-header">
             <div class="workspace-panel-title">
               <h3 class="workspace-section-title">2. Seed <span class="muted small">({seedSources.length})</span></h3>
@@ -4838,7 +4863,7 @@
         </div>
           </div>
 
-          <div class="seed-corpus-column seed-corpus-column--corpus">
+          <div class="seed-corpus-column seed-corpus-column--corpus" id="section-corpus">
             <div class="corpus-workspace-shell">
               <Corpus
                 {corpusSource}
