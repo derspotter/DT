@@ -138,6 +138,7 @@ services:
       - RAG_FEEDER_DOWNLOAD_WORKERS=${RAG_FEEDER_DOWNLOAD_WORKERS:-32}
       - RAG_FEEDER_DOWNLOAD_BATCH_SIZE=${RAG_FEEDER_DOWNLOAD_BATCH_SIZE:-50}
       - RAG_FEEDER_LOG_DIR=/usr/src/app/logs
+      - RAG_FEEDER_OPENALEX_QUOTA_PATH=${RAG_FEEDER_OPENALEX_QUOTA_PATH:-}
     volumes:
       - ./backend/src:/usr/src/app/src
       - ./backend/scripts:/usr/src/app/scripts

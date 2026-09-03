@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import request from 'supertest'
+import { jest } from '@jest/globals'
 import { createApp } from '../src/app.js'
 
 function tmpQuotaPath() {
@@ -72,5 +73,24 @@ describe('GET /api/openalex/quota', () => {
     const res = await request(app).get('/api/openalex/quota')
     expect(res.status).toBe(200)
     expect(res.body).toEqual({ available: false })
+  })
+
+  test('warns on a read error that is not a missing file', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    fs.writeFileSync(quotaPath, '{not json')
+    const res = await request(app).get('/api/openalex/quota')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ available: false })
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[openalex-quota]'))
+    warnSpy.mockRestore()
+  })
+
+  test('does not warn when the snapshot file is simply missing', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await request(app).get('/api/openalex/quota')
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ available: false })
+    expect(warnSpy).not.toHaveBeenCalled()
+    warnSpy.mockRestore()
   })
 })

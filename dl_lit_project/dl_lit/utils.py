@@ -239,12 +239,23 @@ def record_openalex_quota(response) -> dict | None:
     The rate limiter lives per Python process, so this file is how the Node
     backend learns where the budget stands. Never raises: a failed write is
     logged and ignored because it must not sink the request that produced it.
+
+    A response without the rate-limit headers (a gateway error page, a 429
+    that carries no headers, ...) is not necessarily proof that no API key
+    is configured. When a key *is* configured, such a response is treated as
+    "no data this time" and the last good snapshot is left on disk instead
+    of being overwritten with a misleading no-key snapshot.
     """
     now = datetime.now(timezone.utc).replace(microsecond=0)
     observed_at = now.isoformat().replace('+00:00', 'Z')
     headers = getattr(response, 'headers', None) or {}
     limit = _header_int(headers, 'X-RateLimit-Limit')
     if limit is None:
+        if get_openalex_api_key():
+            # A key is configured but this particular response carried no
+            # rate-limit headers (gateway error, headerless 429, ...).
+            # Keep whatever snapshot is already on disk.
+            return None
         snapshot = {'api_key_present': False, 'observed_at': observed_at}
     else:
         reset_seconds = _header_int(headers, 'X-RateLimit-Reset')
@@ -262,15 +273,24 @@ def record_openalex_quota(response) -> dict | None:
         }
 
     target = openalex_quota_path()
+    tmp_name = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix='.openalex_quota-', dir=str(target.parent))
         with os.fdopen(fd, 'w', encoding='utf-8') as handle:
             json.dump(snapshot, handle)
+        os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, target)
+        tmp_name = None
     except Exception as exc:  # noqa: BLE001 - deliberately broad, see docstring
         print(f'[OpenAlex WARN] Could not write quota snapshot to {target}: {exc}', file=sys.stderr)
         return None
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
     return snapshot
 
 

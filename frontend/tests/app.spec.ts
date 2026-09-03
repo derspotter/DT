@@ -181,7 +181,12 @@ test.describe('Korpus Builder live integration', () => {
       test.skip(true, 'No seeds in this corpus')
     }
     await firstSeed.click()
-    await expect(page.getByText('Refs', { exact: true }).first()).toBeVisible()
+    // Scope to the expanded seed's table (not the page at large — other
+    // "Refs" text can exist elsewhere) and give the candidates time to load
+    // from the live backend before the default 5s timeout would flake.
+    await expect(
+      page.locator('.seed-source.expanded').getByText('Refs', { exact: true }).first()
+    ).toBeVisible({ timeout: 30_000 })
   })
 
   test('search panel shows the OpenAlex budget pill', async ({ page, request }) => {

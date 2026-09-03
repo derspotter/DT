@@ -45,9 +45,31 @@ def test_record_writes_snapshot(monkeypatch, tmp_path):
 def test_record_without_headers_marks_no_key(monkeypatch, tmp_path):
     target = tmp_path / "q.json"
     monkeypatch.setenv("RAG_FEEDER_OPENALEX_QUOTA_PATH", str(target))
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    monkeypatch.delenv("RAG_FEEDER_OPENALEX_API_KEY", raising=False)
     snapshot = utils.record_openalex_quota(_Resp({}))
     assert snapshot == {"api_key_present": False, "observed_at": snapshot["observed_at"]}
     assert json.loads(target.read_text())["api_key_present"] is False
+
+
+def test_record_without_headers_keeps_existing_snapshot_when_key_present(monkeypatch, tmp_path):
+    target = tmp_path / "q.json"
+    monkeypatch.setenv("RAG_FEEDER_OPENALEX_QUOTA_PATH", str(target))
+    monkeypatch.setenv("OPENALEX_API_KEY", "test-key")
+    good_snapshot = utils.record_openalex_quota(_Resp({
+        "X-RateLimit-Limit": "100000",
+        "X-RateLimit-Remaining": "87412",
+        "X-RateLimit-Credits-Used": "1",
+        "X-RateLimit-Reset": "18720",
+    }))
+    assert good_snapshot is not None
+    on_disk_before = json.loads(target.read_text())
+
+    result = utils.record_openalex_quota(_Resp({}))
+
+    assert result is None
+    on_disk_after = json.loads(target.read_text())
+    assert on_disk_after == on_disk_before
 
 
 def test_record_never_raises(monkeypatch, tmp_path):

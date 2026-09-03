@@ -294,8 +294,10 @@
 
   function formatResetIn(seconds) {
     if (!Number.isFinite(seconds) || seconds <= 0) return 'now'
-    const h = Math.floor(seconds / 3600)
-    const m = Math.round((seconds % 3600) / 60)
+    const totalMin = Math.round(seconds / 60)
+    if (totalMin === 0) return 'now'
+    const h = Math.floor(totalMin / 60)
+    const m = totalMin % 60
     if (h === 0) return `${m} min`
     return m === 0 ? `${h} h` : `${h} h ${m} min`
   }
@@ -308,11 +310,14 @@
     if (!quota.api_key_present) {
       return { text: 'OpenAlex: no API key — daily budget not reported', tone: 'muted' }
     }
-    const remaining = Number(quota.remaining ?? 0)
-    const limit = Number(quota.limit ?? 0)
+    const remaining = Number(quota.remaining)
+    const limit = Number(quota.limit)
+    if (!Number.isFinite(remaining) || !Number.isFinite(limit)) {
+      return { text: 'OpenAlex budget: unknown until the first request', tone: 'muted' }
+    }
     const base = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left · resets in ${formatResetIn(quota.reset_in_seconds)}`
     if (quota.stale) {
-      const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString() : 'unknown'
+      const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString('en-US') : 'unknown'
       return { text: `${base} · last seen ${seen}`, tone: 'muted' }
     }
     if (remaining <= 0) return { text: base, tone: 'danger' }
@@ -1725,6 +1730,11 @@
 
   async function refreshAll(targetTab = activeTab) {
     restoreStoredUploads()
+    // The OpenAlex quota pill is shown on both the workspace search panel
+    // and the admin settings row, so it needs to load once after every
+    // authentication regardless of which tab the user lands on (notably
+    // #/admin, which the workspace-only tasks below never touch).
+    void loadOpenAlexQuota()
     // Only the workspace/dashboard/downloads tabs render this pipeline + corpus
     // data. For other landing tabs (notably the graph, which loads its own
     // snapshot) these are several synchronous DB queries that can stall the
@@ -1738,7 +1748,6 @@
       loadIngestRuns(),
       loadCorpus(),
       loadKantroposAssignment(),
-      loadOpenAlexQuota(),
     ]
     if (diagnosticsEnabled) {
       tasks.push(
@@ -2797,8 +2806,8 @@
       case 'title': return formatTitle(candidate)
       case 'authors': return formatAuthorsShort(candidate)
       case 'year': return candidate?.year || ''
-      case 'refs': return candidate?.refs_count ?? ''
-      case 'cited_by': return candidate?.cited_by_count ?? ''
+      case 'refs': return candidate?.refs_count ?? '–'
+      case 'cited_by': return candidate?.cited_by_count ?? '–'
       case 'source': return candidate?.source || ''
       case 'doi': return candidate?.doi || ''
       case 'publisher': return candidate?.publisher || ''

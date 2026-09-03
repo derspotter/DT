@@ -107,7 +107,10 @@ function readOpenAlexQuota() {
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(openalexQuotaPath(), 'utf8'));
-  } catch {
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      console.warn(`[openalex-quota] could not read quota snapshot: ${err.message}`);
+    }
     return { available: false };
   }
   if (!parsed || typeof parsed !== 'object') return { available: false };

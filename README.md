@@ -48,6 +48,10 @@ Status lives directly on `works`:
 1. Set `.env` values (at least `GOOGLE_API_KEY`, optional `OPENALEX_API_KEY`).
 2. Start stack:
    - `docker compose up -d`
+3. Open:
+   - `http://localhost:5175`
+
+The production site does not hot reload. Rebuild the frontend when you want changes on the live stack.
 
 ### LLM provider
 
@@ -77,11 +81,6 @@ budget headers. The Python request helper writes them to
 `GET /api/openalex/quota`, and the workspace shows them as a pill next to the
 Search button. Without a key OpenAlex does not report a budget and the pill
 says so.
-
-3. Open:
-   - `http://localhost:5175`
-
-The production site does not hot reload. Rebuild the frontend when you want changes on the live stack.
 
 ## Live Deploys Behind Caddy
 
