@@ -50,6 +50,7 @@
     pausePipelineWorker,
     downloadCorpusExport,
     createCorpusItemDownloadUrl,
+    fetchOpenAlexQuota,
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
@@ -275,6 +276,51 @@
     const key = searchResultKey(result, index)
     return key && searchSelection.includes(key) ? count + 1 : count
   }, 0)
+
+  let openalexQuota = null
+  let openalexQuotaLoading = false
+
+  async function loadOpenAlexQuota() {
+    if (openalexQuotaLoading || authStatus !== 'authenticated') return
+    openalexQuotaLoading = true
+    try {
+      openalexQuota = await fetchOpenAlexQuota()
+    } catch {
+      // Leave the last known value; the pill is informational only.
+    } finally {
+      openalexQuotaLoading = false
+    }
+  }
+
+  function formatResetIn(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return 'now'
+    const h = Math.floor(seconds / 3600)
+    const m = Math.round((seconds % 3600) / 60)
+    if (h === 0) return `${m} min`
+    return m === 0 ? `${h} h` : `${h} h ${m} min`
+  }
+
+  // Copy is fixed by the spec; tone drives the pill colour.
+  function formatOpenAlexQuota(quota) {
+    if (!quota || !quota.available) {
+      return { text: 'OpenAlex budget: unknown until the first request', tone: 'muted' }
+    }
+    if (!quota.api_key_present) {
+      return { text: 'OpenAlex: no API key — daily budget not reported', tone: 'muted' }
+    }
+    const remaining = Number(quota.remaining ?? 0)
+    const limit = Number(quota.limit ?? 0)
+    const base = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left · resets in ${formatResetIn(quota.reset_in_seconds)}`
+    if (quota.stale) {
+      const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString() : 'unknown'
+      return { text: `${base} · last seen ${seen}`, tone: 'muted' }
+    }
+    if (remaining <= 0) return { text: base, tone: 'danger' }
+    if (limit > 0 && remaining / limit < 0.1) return { text: base, tone: 'warn' }
+    return { text: base, tone: 'ok' }
+  }
+
+  $: openalexQuotaView = formatOpenAlexQuota(openalexQuota)
 
   const CORPUS_PAGE_SIZE = 120
   const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending'])
@@ -1433,6 +1479,7 @@
       const tasks = [
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
+        loadOpenAlexQuota(),
       ]
       if (diagnosticsEnabled) {
         tasks.push(
@@ -1691,6 +1738,7 @@
       loadIngestRuns(),
       loadCorpus(),
       loadKantroposAssignment(),
+      loadOpenAlexQuota(),
     ]
     if (diagnosticsEnabled) {
       tasks.push(
@@ -3074,6 +3122,7 @@
       seedActionStatus = error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
+      loadOpenAlexQuota()
     }
   }
 
@@ -3143,6 +3192,7 @@
       seedActionStatus = error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
+      loadOpenAlexQuota()
     }
   }
 
@@ -3225,6 +3275,7 @@
         fallbackToSample: false,
       })
       searchResults = data
+      loadOpenAlexQuota()
       searchSource = source
       initializeSearchQueueConfig(data)
       searchQueueStatus = ''
@@ -4520,6 +4571,13 @@
                 </div>
               </form>
               <p class="muted">{searchStatus}</p>
+              <div class="search-quota-row">
+                <span
+                  class={`openalex-quota-pill openalex-quota-pill--${openalexQuotaView.tone}`}
+                  data-testid="openalex-quota"
+                  title="Daily OpenAlex API budget as reported by the last request"
+                >{openalexQuotaView.text}</span>
+              </div>
             </div>
           </div>
 
@@ -4960,6 +5018,7 @@
           {appSettingsError}
           bind:appSettingsDraft={appSettingsDraft}
           {handleSaveAppSettings}
+          openalexQuotaText={openalexQuotaView.text}
         />
       {/if}
 

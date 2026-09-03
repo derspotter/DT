@@ -14,6 +14,7 @@
   export let appSettingsDraft = {}
   export let handleSaveAppSettings = () => {}
   export let showAdvancedSettings = false
+  export let openalexQuotaText = ''
 
   function secretHint(entry) {
     if (entry?.is_set) return 'Stored — leave blank to keep, type to replace'
@@ -87,6 +88,10 @@
           <input type="number" min="1" step="1" placeholder="30" bind:value={appSettingsDraft.openalex_rps} />
           <span class="muted small">{fallbackHint(appSettings.openalex_rps)}</span>
         </label>
+        <div class="admin-settings-form__readonly">
+          <span class="muted small">Daily budget</span>
+          <span data-testid="admin-openalex-quota">{openalexQuotaText}</span>
+        </div>
 
         <h4 class="admin-settings-form__group">LLM</h4>
         <label>

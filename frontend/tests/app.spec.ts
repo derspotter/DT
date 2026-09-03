@@ -183,4 +183,11 @@ test.describe('Korpus Builder live integration', () => {
     await firstSeed.click()
     await expect(page.getByText('Refs', { exact: true }).first()).toBeVisible()
   })
+
+  test('search panel shows the OpenAlex budget pill', async ({ page, request }) => {
+    await ensureSignedIn(page, request)
+    const pill = page.getByTestId('openalex-quota')
+    await expect(pill).toBeVisible()
+    await expect(pill).toContainText(/OpenAlex/)
+  })
 })

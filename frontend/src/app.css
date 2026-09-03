@@ -5296,3 +5296,27 @@ button.seed-download-tag:focus-visible {
     padding: 4px 8px;
   }
 }
+
+.openalex-quota-pill {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+  background: #f4f4f5;
+  color: #3f3f46;
+}
+.openalex-quota-pill--ok { background: #ecfdf5; color: #047857; }
+.openalex-quota-pill--warn { background: #fffbeb; color: #b45309; }
+.openalex-quota-pill--danger { background: #fef2f2; color: #b91c1c; }
+.openalex-quota-pill--muted { background: #f4f4f5; color: #52525b; }
+
+.search-quota-row {
+  margin-top: 8px;
+}
+
+.admin-settings-form__readonly {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
