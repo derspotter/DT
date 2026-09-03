@@ -56,6 +56,12 @@ function normalizeYear(value) {
   return raw || null
 }
 
+function normalizeCount(value) {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : null
+}
+
 function normalizeContributors(authors) {
   const names = parseNameList(authors)
   if (names.length === 0) return null
@@ -437,6 +443,8 @@ function normalizePdfCandidate(row, sourceKey, resolverBundle) {
     openalex_id: null,
     created_at: row.created_at || null,
     source_pdf: row.source_pdf || null,
+    refs_count: null,
+    cited_by_count: null,
   }
   candidate.state = resolverBundle.resolveState(candidate)
   const availability = resolverBundle.resolveDownloadedAvailability
@@ -514,6 +522,8 @@ function normalizeSearchCandidate(row, resolverBundle) {
     open_access_url: openAccess.oa_url || null,
     openalex_id: row.openalex_id || raw.id || null,
     type: raw?.type || null,
+    refs_count: normalizeCount(raw?.referenced_works_count),
+    cited_by_count: normalizeCount(raw?.cited_by_count),
     abstract: abstractFromOpenAlex(raw),
     keywords: keywordsFromOpenAlex(raw),
     openalex_json: raw,

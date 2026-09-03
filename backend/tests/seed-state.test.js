@@ -194,6 +194,31 @@ describe('seed candidate venue fallback', () => {
   })
 })
 
+describe('seed candidate reference counts', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('exposes referenced_works_count and cited_by_count from raw_json', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { referenced_works_count: 42, cited_by_count: 1234 })
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+    expect(candidate.refs_count).toBe(42)
+    expect(candidate.cited_by_count).toBe(1234)
+  })
+
+  test('is null when the run predates the select change', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { display_name: 'Old run' })
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+    expect(candidate.refs_count).toBeNull()
+    expect(candidate.cited_by_count).toBeNull()
+  })
+})
+
 describe('seed candidate text filter', () => {
   let db
 

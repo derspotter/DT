@@ -61,7 +61,7 @@ OPENALEX_WORKS_URL = 'https://api.openalex.org/works'
 OPENALEX_SELECT = (
     'id,doi,display_name,authorships,publication_year,type,'
     'abstract_inverted_index,keywords,primary_location,open_access,biblio,'
-    'referenced_works,cited_by_api_url'
+    'referenced_works,cited_by_api_url,referenced_works_count,cited_by_count'
 )
 OPENALEX_ID_RE = re.compile(r'^W\d+$', re.IGNORECASE)
 DOI_RE = re.compile(r'10\.\d{4,9}/\S+', re.IGNORECASE)
@@ -160,6 +160,8 @@ def _to_openalex_like(work):
         'biblio': work.get('biblio') or {},
         'referenced_works': work.get('referenced_works') or [],
         'cited_by_api_url': work.get('cited_by_api_url'),
+        'referenced_works_count': work.get('referenced_works_count'),
+        'cited_by_count': work.get('cited_by_count'),
     }
     return out
 

@@ -180,7 +180,7 @@ def search_openalex(query: str,
 
     params = {
         "per-page": 200,
-        "select": "id,doi,display_name,authorships,publication_year,type,abstract_inverted_index,keywords,primary_location,open_access,biblio",
+        "select": "id,doi,display_name,authorships,publication_year,type,abstract_inverted_index,keywords,primary_location,open_access,biblio,referenced_works_count,cited_by_count",
     }
     if mailto:
         params["mailto"] = mailto

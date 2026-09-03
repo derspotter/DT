@@ -170,6 +170,20 @@ def test_search_openalex_rejects_unknown_sort():
         keyword_search.search_openalex("foo", sort="banana")
 
 
+def test_search_select_includes_reference_counts(monkeypatch):
+    captured = {}
+
+    def fake_request(endpoint, params, rate_limiter, retries=3):
+        captured.update(params)
+        return {"results": [], "meta": {"next_cursor": None}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake_request)
+    keyword_search.search_openalex(query="labour", max_results=5)
+    select_fields = captured["select"].split(",")
+    assert "referenced_works_count" in select_fields
+    assert "cited_by_count" in select_fields
+
+
 def test_effective_max_results():
     assert keyword_search.effective_max_results(0) is None
     assert keyword_search.effective_max_results(-5) is None
