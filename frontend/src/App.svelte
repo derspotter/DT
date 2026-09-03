@@ -4621,7 +4621,16 @@
                             />
                           </label>
                         {/key}
-                        <span class={`tag ${source.source_type === 'pdf' ? 'pending' : 'queued'}`}>{source.source_type === 'pdf' ? 'Document items' : 'Search items'}</span>
+                        {#if source.seed_kind === 'snowball'}
+                          <span
+                            class="tag snowball"
+                            title={`${source.snowball?.direction === 'upstream' ? 'Upstream' : 'Downstream'} of «${source.snowball?.of_title || 'untitled work'}»`}
+                          >Snowball items</span>
+                        {:else if source.source_type === 'pdf'}
+                          <span class="tag pending">Document items</span>
+                        {:else}
+                          <span class="tag queued">Search items</span>
+                        {/if}
                         <strong>{source.label}</strong>
                       </div>
                       {#if source.subtitle}

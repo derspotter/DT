@@ -768,6 +768,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
     sources.push({
       id: buildSourceId('pdf', sourceKey),
       source_type: 'pdf',
+      seed_kind: 'pdf',
       source_key: sourceKey,
       label: row.seed_title || sourceKey,
       subtitle: formatPdfSubtitle(meta) || (row.source_pdf || ''),
@@ -784,9 +785,22 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
     if (!sourceKey) return
     const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
+    const filters = parseJson(row.filters_json, {}) || {}
+    const direction = String(filters.expansion_direction || '').trim().toLowerCase()
+    const isSnowball = direction === 'downstream' || direction === 'upstream'
     sources.push({
       id: buildSourceId('search', sourceKey),
       source_type: 'search',
+      seed_kind: isSnowball ? 'snowball' : 'search',
+      ...(isSnowball
+        ? {
+          snowball: {
+            direction,
+            of_title: filters.expansion_of_title || null,
+            of_openalex_id: filters.expansion_of_openalex_id || null,
+          },
+        }
+        : {}),
       source_key: sourceKey,
       label: row.query || `Search #${sourceKey}`,
       subtitle: formatSearchSubtitle(row),
@@ -794,10 +808,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
       candidate_count: candidates.length,
       state_counts: summarizeStates(candidates),
       removable: true,
-      meta: {
-        query: row.query,
-        filters: parseJson(row.filters_json, {}) || {},
-      },
+      meta: { query: row.query, filters },
     })
   })
 

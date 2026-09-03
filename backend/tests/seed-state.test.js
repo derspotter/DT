@@ -308,4 +308,40 @@ describe('seed candidate text filter', () => {
     expect(sources).toHaveLength(1)
     expect(sources[0].candidate_count).toBe(1)
   })
+
+  test('marks expansion runs as snowball seeds', () => {
+    seedTwoEntries() // assigns `db` with two pdf entries and empty search tables
+    db.prepare(
+      `INSERT INTO search_runs (id, query, filters_json) VALUES (9, 'Downstream of «Bazaar Economies»', ?)`
+    ).run(JSON.stringify({
+      expansion_direction: 'downstream',
+      expansion_of_openalex_id: 'https://openalex.org/W1',
+      expansion_of_title: 'Bazaar Economies',
+    }))
+    db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (9, 130)`).run()
+    db.prepare(
+      `INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (50, 9, 'Cited Work', '2010', '{}')`
+    ).run()
+    db.prepare(
+      `INSERT INTO search_runs (id, query, filters_json) VALUES (10, 'plain query', ?)`
+    ).run(JSON.stringify({ mode: 'query' }))
+    db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (10, 130)`).run()
+    db.prepare(
+      `INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (51, 10, 'Plain Work', '2011', '{}')`
+    ).run()
+
+    const sources = listSeedSources(db, 130)
+    const snowball = sources.find((s) => s.source_key === '9')
+    const plain = sources.find((s) => s.source_key === '10')
+    const pdf = sources.find((s) => s.source_type === 'pdf')
+    expect(snowball.seed_kind).toBe('snowball')
+    expect(snowball.snowball).toEqual({
+      direction: 'downstream',
+      of_title: 'Bazaar Economies',
+      of_openalex_id: 'https://openalex.org/W1',
+    })
+    expect(plain.seed_kind).toBe('search')
+    expect(plain.snowball).toBeUndefined()
+    expect(pdf.seed_kind).toBe('pdf')
+  })
 })
