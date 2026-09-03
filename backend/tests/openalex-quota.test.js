@@ -23,6 +23,10 @@ describe('GET /api/openalex/quota', () => {
   afterEach(() => {
     delete process.env.RAG_FEEDER_STUB
     delete process.env.RAG_FEEDER_OPENALEX_QUOTA_PATH
+    const dir = path.dirname(quotaPath)
+    if (dir && fs.existsSync(dir)) {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('reports unavailable when no snapshot exists', async () => {
@@ -63,7 +67,7 @@ describe('GET /api/openalex/quota', () => {
     expect(res.body).toMatchObject({ available: true, api_key_present: false, stale: false })
   })
 
-  test('treats an unreadable file as unavailable', async () => {
+  test('treats a malformed/unparsable file as unavailable', async () => {
     fs.writeFileSync(quotaPath, '{not json')
     const res = await request(app).get('/api/openalex/quota')
     expect(res.status).toBe(200)
