@@ -315,13 +315,17 @@
     if (!Number.isFinite(remaining) || !Number.isFinite(limit)) {
       return { text: 'OpenAlex budget: unknown until the first request', tone: 'muted' }
     }
-    const resetIn = Number(quota.reset_in_seconds)
-    if (Number.isFinite(resetIn) && resetIn <= 0) {
+    // reset_in_seconds is null when OpenAlex sent no usable reset header; that
+    // is "unknown", not "reset already happened".
+    const hasReset = quota.reset_in_seconds !== null && quota.reset_in_seconds !== undefined
+    const resetIn = hasReset ? Number(quota.reset_in_seconds) : NaN
+    if (hasReset && Number.isFinite(resetIn) && resetIn <= 0) {
       // The daily reset happened after the last OpenAlex request, so the
       // counts in the snapshot are pre-reset. The next request refreshes them.
       return { text: `OpenAlex budget: reset since the last request · ${limit.toLocaleString('en-US')} per day`, tone: 'muted' }
     }
-    const base = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left · resets in ${formatResetIn(resetIn)}`
+    const counts = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left`
+    const base = Number.isFinite(resetIn) ? `${counts} · resets in ${formatResetIn(resetIn)}` : counts
     if (quota.stale) {
       const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString('en-US') : 'unknown'
       return { text: `${base} · last seen ${seen}`, tone: 'muted' }
@@ -1483,7 +1487,12 @@
   }
 
   async function runLiveRefreshCycle() {
-    if (!shouldRunLiveRefresh()) return
+    if (!shouldRunLiveRefresh()) {
+      // The Admin panel shows the OpenAlex budget too; keep it current there
+      // without the full workspace refresh.
+      if (activeTab === 'admin') void loadOpenAlexQuota()
+      return
+    }
     if (pipelineRefreshInFlight) return
     pipelineRefreshInFlight = true
     try {

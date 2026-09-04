@@ -188,7 +188,7 @@ def fetch_referenced_work_details(
 
     def _fetch_batch(work_ids):
         ids_query = "|".join(work_ids)
-        select_fields = "id,title,display_name,authorships,publication_year,doi,type"
+        select_fields = "id,title,display_name,authorships,publication_year,doi,type,referenced_works_count,cited_by_count"
         if include_links:
             select_fields += ",referenced_works,cited_by_api_url"
         url = f"https://api.openalex.org/works?filter=openalex_id:{ids_query}&select={select_fields}&per-page=50&mailto={mailto}"
@@ -214,6 +214,9 @@ def fetch_referenced_work_details(
                     'year': work.get("publication_year"),
                     'doi': work.get("doi"),
                     'type': work.get("type"),
+                    # Feed the Refs / Cited by columns for expanded works too.
+                    'referenced_works_count': work.get("referenced_works_count"),
+                    'cited_by_count': work.get("cited_by_count"),
                 }
                 if include_links:
                     work_details['referenced_works'] = work.get("referenced_works") or []
