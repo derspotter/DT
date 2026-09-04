@@ -901,7 +901,15 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
 // extracted reference-page artifact instead, so fall back to the upload that
 // carries the seed's own name. Anything outside uploadsDir is refused (same
 // traversal guard as the extract-bibliography route).
-export function resolveSeedDocumentPath({ sourcePdf, sourceKey, uploadsDir, exists = fs.existsSync }) {
+function isReadableFile(candidate) {
+  try {
+    return fs.statSync(candidate).isFile()
+  } catch {
+    return false
+  }
+}
+
+export function resolveSeedDocumentPath({ sourcePdf, sourceKey, uploadsDir, exists = isReadableFile }) {
   const root = path.resolve(String(uploadsDir || ''))
   if (!root) return null
   const inside = (candidate) => {

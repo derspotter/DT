@@ -269,7 +269,7 @@
   <div class="table-toolbar corpus-toolbar">
     <div class="table-toolbar-left corpus-toolbar__filters">
       <label class="corpus-filter corpus-filter--wide">
-        <span class="muted small">Search Title, Year, or Source</span>
+        <span class="muted small">Search title, author or publication</span>
         <input
           type="search"
           value={corpusFilterQuery}
@@ -350,7 +350,9 @@
           on:click={() => toggleCorpusItemSelection(item, bucket)}
           on:keydown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
-              if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return
+              // INPUT included so Space/Enter on the row checkbox toggles the
+              // checkbox instead of being cancelled and expanding the row.
+              if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return
               e.preventDefault()
               toggleCorpusItemSelection(item, bucket)
             }

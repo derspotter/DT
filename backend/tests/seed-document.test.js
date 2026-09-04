@@ -50,3 +50,28 @@ describe('seed expansion argument size', () => {
     expect(app).toContain("expandArgs.push('--seed-file', tempExpandSeedPath)")
   })
 })
+
+describe('resolveSeedDocumentPath rejects non-files', () => {
+  let uploadsDir
+
+  beforeEach(() => {
+    uploadsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'seed-doc-dir-'))
+  })
+
+  afterEach(() => {
+    fs.rmSync(uploadsDir, { recursive: true, force: true })
+  })
+
+  test('a directory matching the seed name is not treated as the document', () => {
+    // existsSync is true for directories; res.download() would then fail at
+    // runtime with a confusing error instead of a clean 404.
+    fs.mkdirSync(path.join(uploadsDir, 'seed-key.pdf'))
+    expect(resolveSeedDocumentPath({ sourcePdf: '', sourceKey: 'seed-key', uploadsDir })).toBeNull()
+  })
+
+  test('a real file with the same name still resolves', () => {
+    const file = path.join(uploadsDir, 'seed-key.pdf')
+    fs.writeFileSync(file, 'pdf')
+    expect(resolveSeedDocumentPath({ sourcePdf: '', sourceKey: 'seed-key', uploadsDir })).toBe(file)
+  })
+})
