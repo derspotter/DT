@@ -1,4 +1,28 @@
-import { expect, test, type Route } from '@playwright/test'
+import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
+
+async function ensureSignedIn(page: Page, request: APIRequestContext) {
+  await page.goto('/')
+  const heading = page.getByRole('heading', { name: 'Korpus Builder' })
+  if (await heading.isVisible().catch(() => false)) {
+    await expect(page.getByText(/items found/).first()).toContainText('items found')
+    return
+  }
+
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD for Playwright login').toBeTruthy()
+
+  const signInButton = page.getByRole('button', { name: 'Sign in' })
+  if (await signInButton.isVisible().catch(() => false)) {
+    await page.getByRole('textbox', { name: 'Username' }).fill(username)
+    await page.getByRole('textbox', { name: 'Password' }).fill(password)
+    await signInButton.click()
+  }
+
+  await expect(heading).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText(/items found/).first()).toContainText('items found')
+}
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -78,4 +102,14 @@ test('does not snap back to workspace when navigating during post-login load', a
 
   await expect(page).toHaveURL(/#\/graph$/)
   await expect(page.getByTestId('tab-graph')).toHaveClass(/active/)
+})
+
+test('sticky bar jumps to the corpus section', async ({ page, request }) => {
+  await ensureSignedIn(page, request)
+  const bar = page.getByTestId('workspace-sticky-bar')
+  await expect(bar).toBeVisible()
+  await bar.getByRole('button', { name: /3 Corpus/ }).click()
+  const corpus = page.locator('#section-corpus')
+  await expect(corpus).toBeInViewport()
+  await expect(bar).toBeInViewport()
 })

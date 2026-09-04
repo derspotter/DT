@@ -401,8 +401,11 @@ export async function fetchIngestRuns(limit = 20) {
   return response.json()
 }
 
-export async function fetchSeedSources(limit = 100) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/seed/sources?limit=${encodeURIComponent(String(limit))}`)
+export async function fetchSeedSources(limit = 100, { q = '' } = {}) {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  if (q) params.set('q', q)
+  const response = await fetchWithTimeout(`${API_BASE}/api/seed/sources?${params.toString()}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
@@ -411,9 +414,10 @@ export async function fetchSeedSources(limit = 100) {
   return response.json()
 }
 
-export async function fetchSeedCandidates(sourceType, sourceKey) {
+export async function fetchSeedCandidates(sourceType, sourceKey, { q = '' } = {}) {
+  const suffix = q ? `?q=${encodeURIComponent(q)}` : ''
   const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates`
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates${suffix}`
   )
   await throwIfUnauthorized(response)
   if (!response.ok) {
@@ -458,6 +462,8 @@ export async function promoteSeedCandidates(sourceType, sourceKey, {
   relatedDepthDownstream = 0,
   relatedDepthUpstream = 0,
   maxRelated = 30,
+  relatedSort = 'most_cited',
+  promotionMode = 'new_seed',
   enqueueDownload = true,
   downloadBatchSize = 25,
   workers = 6,
@@ -474,6 +480,8 @@ export async function promoteSeedCandidates(sourceType, sourceKey, {
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        relatedSort,
+        promotionMode,
         enqueueDownload,
         downloadBatchSize,
         workers,
@@ -653,10 +661,22 @@ export async function fetchRecursionConfig() {
   return response.json()
 }
 
-export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
+export async function fetchOpenAlexQuota() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/openalex/quota`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load OpenAlex quota')
+  }
+  return response.json()
+}
+
+export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' } = {}) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   params.set('offset', String(offset))
+  if (q) params.set('q', q)
+  if (sort) params.set('sort', sort)
   const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
@@ -668,6 +688,87 @@ export async function fetchCorpus({ limit = 200, offset = 0 } = {}) {
   const stageTotals = payload?.stage_totals || null
   const statusCounts = payload?.status_counts || null
   return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
+}
+
+// Fetched as a blob rather than linked directly: this route is behind the
+// normal auth header, and a plain <a href> would not carry it.
+// A Content-Disposition filename may be percent-encoded (RFC 5987) or plain;
+// a plain name containing "%" would make decodeURIComponent throw, so fall
+// back to the raw value, and never let a path separator through.
+function safeDownloadFilename(raw) {
+  let name = String(raw || '')
+  try {
+    name = decodeURIComponent(name)
+  } catch {
+    // keep the raw name
+  }
+  name = name.split(/[\\/]/).pop() || ''
+  return name || 'download.pdf'
+}
+
+export async function fetchSeedSourceDocument(sourceKey) {
+  const response = await fetchWithTimeout(
+    `${API_BASE}/api/seed/sources/pdf/${encodeURIComponent(String(sourceKey || ''))}/file`
+  )
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to download the seed document')
+  }
+  const disposition = response.headers.get('content-disposition') || ''
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
+  const filename = match ? safeDownloadFilename(match[1]) : `${sourceKey || 'seed'}.pdf`
+  return { blob: await response.blob(), filename }
+}
+
+export async function removeCorpusWorks(workIds) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/remove`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ workIds }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to remove items from corpus')
+  }
+  return response.json()
+}
+
+export async function fetchAppSettings() {
+  const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`)
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to load settings')
+  }
+  return response.json()
+}
+
+export async function saveAppSettings(settings) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ settings }),
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to save settings')
+  }
+  return response.json()
+}
+
+export async function removeCorpusWork(workId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/${encodeURIComponent(String(workId))}`, {
+    method: 'DELETE',
+  })
+  await throwIfUnauthorized(response)
+  if (!response.ok) {
+    const payload = await response.text()
+    throw new Error(payload || 'Failed to remove item from corpus')
+  }
+  return response.json()
 }
 
 export async function fetchDownloadQueue() {
@@ -957,10 +1058,15 @@ function graph3DParams({
   yearTo = null,
   groupBy = 'field',
   refresh = false,
+  corpusId = 'all',
 } = {}) {
-  // status/scope are fixed server-side (downloaded works, whole corpus); the
-  // backend ignores them, so they are not sent.
+  // status/scope are fixed server-side (downloaded works); the backend ignores
+  // them, so they are not sent. corpus_id scopes the graph: 'all' keeps the
+  // historical view that merges every corpus.
   const params = new URLSearchParams()
+  if (corpusId !== null && corpusId !== undefined && corpusId !== '') {
+    params.set('corpus_id', String(corpusId))
+  }
   params.set('max_nodes', String(maxNodes))
   if (relationship) params.set('relationship', relationship)
   if (yearFrom !== null && yearFrom !== undefined && yearFrom !== '') {

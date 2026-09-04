@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { ensureSeedSchema, listSeedCandidates } from '../src/seed.js'
+import { ensureSeedSchema, listSeedCandidates, listSeedSources } from '../src/seed.js'
 
 function createSeedDb() {
   const db = new Database(':memory:')
@@ -125,5 +125,248 @@ describe('seed candidate state resolution', () => {
         },
       },
     ])
+  })
+})
+
+function createSearchSeedDb() {
+  const db = createSeedDb()
+  db.exec(`
+    CREATE TABLE search_runs (
+      id INTEGER PRIMARY KEY,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE search_results (
+      id INTEGER PRIMARY KEY,
+      search_run_id INTEGER NOT NULL,
+      title TEXT,
+      doi TEXT,
+      openalex_id TEXT,
+      year TEXT,
+      raw_json TEXT
+    );
+  `)
+  db.prepare(`INSERT INTO search_runs (id) VALUES (7)`).run()
+  db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (7, 130)`).run()
+  return db
+}
+
+function insertSearchResult(db, rawJson) {
+  db.prepare(
+    `INSERT INTO search_results (id, search_run_id, title, year, raw_json)
+     VALUES (1, 7, 'A Work', '2020', ?)`
+  ).run(JSON.stringify(rawJson))
+}
+
+describe('seed candidate venue fallback', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('returns null instead of a landing page URL when the venue has no display_name', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, {
+      primary_location: {
+        source: { display_name: null },
+        landing_page_url: 'https://doi.org/10.1234/abcd',
+      },
+    })
+
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+
+    expect(candidate.source).toBeNull()
+  })
+
+  test('still returns the venue display_name when present', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, {
+      primary_location: {
+        source: { display_name: 'Journal of Labour Studies' },
+        landing_page_url: 'https://doi.org/10.1234/abcd',
+      },
+    })
+
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+
+    expect(candidate.source).toBe('Journal of Labour Studies')
+  })
+})
+
+describe('seed candidate reference counts', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('exposes referenced_works_count and cited_by_count from raw_json', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { referenced_works_count: 42, cited_by_count: 1234 })
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+    expect(candidate.refs_count).toBe(42)
+    expect(candidate.cited_by_count).toBe(1234)
+  })
+
+  test('is null when the run predates the select change', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { display_name: 'Old run' })
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+    expect(candidate.refs_count).toBeNull()
+    expect(candidate.cited_by_count).toBeNull()
+  })
+})
+
+describe('seed candidate text filter', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  function seedTwoEntries() {
+    db = createSeedDb()
+    // listSeedSources joins the seed-document metadata table; the shared
+    // createSeedDb helper only sets up what listSeedCandidates needs.
+    db.exec(`
+      CREATE TABLE ingest_source_metadata (
+        corpus_id INTEGER NOT NULL,
+        ingest_source TEXT NOT NULL,
+        title TEXT,
+        authors TEXT,
+        year TEXT,
+        doi TEXT,
+        source TEXT,
+        publisher TEXT,
+        source_pdf TEXT
+      );
+    `)
+    // ensureSeedSchema creates search_run_corpora, so listSeedSources takes the
+    // search branch and needs these two present even when empty.
+    db.exec(`
+      CREATE TABLE search_runs (
+        id INTEGER PRIMARY KEY,
+        query TEXT,
+        filters_json TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE search_results (
+        id INTEGER PRIMARY KEY,
+        search_run_id INTEGER NOT NULL,
+        title TEXT,
+        doi TEXT,
+        openalex_id TEXT,
+        year TEXT,
+        raw_json TEXT
+      );
+    `)
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
+       VALUES (1, 130, 'basare', 'Bazaar Economies', '["Anna Author"]', '2001', 'Journal of Labour Studies')`
+    ).run()
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
+       VALUES (2, 130, 'basare', 'Shuttle Trade', '["Bert Writer"]', '2015', 'Economic Review')`
+    ).run()
+  }
+
+  test('returns every candidate when no query is given', () => {
+    seedTwoEntries()
+    expect(listSeedCandidates(db, 130, 'pdf', 'basare')).toHaveLength(2)
+  })
+
+  test('matches on title case-insensitively', () => {
+    seedTwoEntries()
+    const results = listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'BAZAAR' })
+    expect(results.map((row) => row.title)).toEqual(['Bazaar Economies'])
+  })
+
+  test('matches on author', () => {
+    seedTwoEntries()
+    const results = listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'bert' })
+    expect(results.map((row) => row.title)).toEqual(['Shuttle Trade'])
+  })
+
+  test('matches on publication', () => {
+    seedTwoEntries()
+    const results = listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'economic review' })
+    expect(results.map((row) => row.title)).toEqual(['Shuttle Trade'])
+  })
+
+  test('hides seeds whose candidates all fail to match', () => {
+    seedTwoEntries()
+    const sources = listSeedSources(db, 130, { q: 'nothing matches this' })
+    expect(sources).toHaveLength(0)
+  })
+
+  test('keeps a seed that still has one matching candidate', () => {
+    seedTwoEntries()
+    const sources = listSeedSources(db, 130, { q: 'bazaar' })
+    expect(sources).toHaveLength(1)
+    expect(sources[0].candidate_count).toBe(1)
+  })
+
+  test('marks expansion runs as snowball seeds', () => {
+    seedTwoEntries() // assigns `db` with two pdf entries and empty search tables
+    db.prepare(
+      `INSERT INTO search_runs (id, query, filters_json) VALUES (9, 'Downstream of «Bazaar Economies»', ?)`
+    ).run(JSON.stringify({
+      expansion_direction: 'downstream',
+      expansion_of_openalex_id: 'https://openalex.org/W1',
+      expansion_of_title: 'Bazaar Economies',
+    }))
+    db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (9, 130)`).run()
+    db.prepare(
+      `INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (50, 9, 'Cited Work', '2010', '{}')`
+    ).run()
+    db.prepare(
+      `INSERT INTO search_runs (id, query, filters_json) VALUES (10, 'plain query', ?)`
+    ).run(JSON.stringify({ mode: 'query' }))
+    db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (10, 130)`).run()
+    db.prepare(
+      `INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (51, 10, 'Plain Work', '2011', '{}')`
+    ).run()
+
+    const sources = listSeedSources(db, 130)
+    const snowball = sources.find((s) => s.source_key === '9')
+    const plain = sources.find((s) => s.source_key === '10')
+    const pdf = sources.find((s) => s.source_type === 'pdf')
+    expect(snowball.seed_kind).toBe('snowball')
+    expect(snowball.snowball).toEqual({
+      direction: 'downstream',
+      of_title: 'Bazaar Economies',
+      of_openalex_id: 'https://openalex.org/W1',
+    })
+    expect(plain.seed_kind).toBe('search')
+    expect(plain.snowball).toBeUndefined()
+    expect(pdf.seed_kind).toBe('pdf')
+  })
+})
+
+describe('seed state resolver cache', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('picks up a newly downloaded work on the next call', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { doi: 'https://doi.org/10.1000/cached', display_name: 'Cached Work' })
+    db.prepare(`UPDATE search_results SET doi = '10.1000/cached' WHERE id = 1`).run()
+    expect(listSeedCandidates(db, 130, 'search', '7')[0].state).toBe('pending')
+
+    // Another corpus downloads the same work; the fingerprint (count + max id
+    // + downloaded count) changes, so the cached global lookup is rebuilt.
+    db.prepare(
+      `INSERT INTO works (id, title, doi, metadata_status, download_status, file_path)
+       VALUES (900, 'Cached Work', '10.1000/cached', 'matched', 'downloaded', '/tmp/cached.pdf')`
+    ).run()
+    db.prepare(`INSERT INTO corpus_works (corpus_id, work_id) VALUES (999, 900)`).run()
+    expect(listSeedCandidates(db, 130, 'search', '7')[0].state).toBe('downloaded_elsewhere')
   })
 })

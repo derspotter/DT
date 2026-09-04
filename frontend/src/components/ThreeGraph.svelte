@@ -11,6 +11,11 @@
   import { buildEdgeBuffers } from '../lib/graphEdges'
 
   export let autoLoad = true
+  // Corpus scoping (spec line 22). 'all' preserves the previous global view
+  // that merged every corpus; the workspace passes its current corpus as the
+  // default so the graph opens on what the user is actually working in.
+  export let corpora = []
+  export let selectedGraphCorpusId = 'all'
 
   let THREE
   let OrbitControls
@@ -1250,6 +1255,7 @@
         maxNodes,
         relationship,
         groupBy,
+        corpusId: selectedGraphCorpusId,
       })
       loadedGroupBy = groupBy
       const snapshot = await fetchGraph3DSnapshotResources(manifest)
@@ -1859,6 +1865,15 @@
   </div>
 
   <div class="graph-3d-controls">
+    <label>
+      <span class="muted small">Corpus</span>
+      <select bind:value={selectedGraphCorpusId} on:change={load3DGraph} disabled={graphLoading}>
+        <option value="all">All corpora</option>
+        {#each corpora as corpus (corpus.id)}
+          <option value={String(corpus.id)}>{corpus.name || `Corpus ${corpus.id}`}</option>
+        {/each}
+      </select>
+    </label>
     <label>
       <span class="muted small">Relationship</span>
       <select bind:value={relationship} disabled={graphLoading}>

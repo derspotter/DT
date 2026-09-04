@@ -74,7 +74,7 @@ def load_pdf_source_labels(conn, corpus_id):
         return {}
     rows = conn.execute(
         """
-        SELECT corpus_id, ingest_source, title, source_pdf
+        SELECT corpus_id, ingest_source, title, authors, source_pdf
         FROM ingest_source_metadata
         WHERE (? IS NULL OR corpus_id = ?)
         """,
@@ -86,9 +86,29 @@ def load_pdf_source_labels(conn, corpus_id):
         if not key:
             continue
         label = row["title"] or (Path(str(row["source_pdf"])).stem if row["source_pdf"] else "") or key
+        # Spec line 19: a seed-document origin shows its full title AND author.
+        author = _first_author(row["authors"])
+        if author:
+            label = f"{label} — {author}"
         labels[(row["corpus_id"], key)] = label
         labels[(None, key)] = label
     return labels
+
+
+def _first_author(raw):
+    """ingest_source_metadata.authors is a JSON list when it is populated."""
+    if not raw:
+        return ""
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return str(raw).strip()
+    if isinstance(parsed, list):
+        names = [str(name).strip() for name in parsed if str(name or "").strip()]
+        if not names:
+            return ""
+        return names[0] if len(names) == 1 else f"{names[0]} et al."
+    return str(parsed).strip()
 
 
 def load_search_source_labels(conn):
@@ -177,12 +197,63 @@ def source_label_for_work(data, corpus_id, pdf_source_labels, search_source_labe
     return {"source_type": "", "source_key": "", "source_label": source}
 
 
+def _searchable_text(item):
+    """Fields the corpus text filter matches on: title, author, publication."""
+    parts = [
+        item.get("title"),
+        item.get("authors"),
+        item.get("source"),
+        item.get("source_label"),
+    ]
+    return " ".join(str(part) for part in parts if part).lower()
+
+
+def apply_query_filter(items, query):
+    needle = str(query or "").strip().lower()
+    if not needle:
+        return items
+    return [item for item in items if needle in _searchable_text(item)]
+
+
+# Sorting happens here rather than in SQL because the rows are already
+# materialised in Python above; paging slices this same list.
+SORT_KEYS = {
+    "title": lambda item: str(item.get("title") or "").lower(),
+    "year": lambda item: normalize_year(item.get("year")),
+    "source": lambda item: str(item.get("source") or "").lower(),
+    "seed": lambda item: str(item.get("source_label") or "").lower(),
+    "metadata": lambda item: str(item.get("metadata_status") or "").lower(),
+    "download": lambda item: str(item.get("download_status") or "").lower(),
+}
+
+
+def apply_sort(items, sort):
+    raw = str(sort or "").strip().lower()
+    column, _, direction = raw.partition(":")
+    key = SORT_KEYS.get(column)
+    if key is None:
+        # Default ordering, unchanged: newest first, then newest id.
+        items.sort(key=lambda x: (normalize_year(x.get("year")), normalize_id(x.get("id"))), reverse=True)
+        return
+    reverse = direction != "asc"
+    # Stable secondary ordering by id keeps paging deterministic when the sort
+    # column ties (very common for year and status columns).
+    items.sort(key=lambda x: normalize_id(x.get("id")), reverse=True)
+    items.sort(key=key, reverse=reverse)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
     parser.add_argument("--limit", type=int, default=200)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--corpus-id", type=int, default=None)
+    parser.add_argument("--q", default=None, help="Case-insensitive substring filter over title, authors and source")
+    parser.add_argument(
+        "--sort",
+        default=None,
+        help="Sort as <column>:<asc|desc>. Columns: title, year, source, seed, metadata, download",
+    )
     args = parser.parse_args()
 
     if "RAG_FEEDER_STUB" in __import__("os").environ:
@@ -228,7 +299,12 @@ def main():
     for row in rows:
         data = dict(row)
         status = status_from_row(data)
-        source = data.get("origin_key") or data.get("source_pdf") or data.get("metadata_source") or data.get("source")
+        # Spec line 19 splits two things that both used to be called "Source":
+        #   source = the article's venue (journal / publication)
+        #   origin = where the record came from (raw provenance path/key)
+        # The user-facing provenance column is "Seed" (source_label) instead.
+        venue = data.get("source")
+        origin = data.get("origin_key") or data.get("source_pdf") or data.get("metadata_source") or data.get("source")
         source_info = source_label_for_work(data, args.corpus_id, pdf_source_labels, search_source_labels, seed_provenance)
         items.append(
             {
@@ -237,7 +313,10 @@ def main():
                 "title": data.get("title"),
                 "authors": data.get("authors"),
                 "year": data.get("year"),
-                "source": source,
+                "source": venue,
+                "origin": origin,
+                "publisher": data.get("publisher"),
+                "type": data.get("type"),
                 "source_label": source_info["source_label"],
                 "source_type": source_info["source_type"],
                 "source_key": source_info["source_key"],
@@ -252,6 +331,8 @@ def main():
 
     conn.close()
 
+    items = apply_query_filter(items, args.q)
+
     status_counts = Counter(item.get("status") for item in items)
     stage_totals = {
         "raw": sum(status_counts.get(status, 0) for status in ("raw", "extract_references_from_pdf", "pending")),
@@ -261,7 +342,7 @@ def main():
         "failed_download": status_counts.get("failed_download", 0),
     }
 
-    items.sort(key=lambda x: (normalize_year(x.get("year")), normalize_id(x.get("id"))), reverse=True)
+    apply_sort(items, args.sort)
     total = len(items)
     start = max(args.offset, 0)
     end = start + max(args.limit, 0)

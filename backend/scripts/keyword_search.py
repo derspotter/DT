@@ -61,7 +61,7 @@ OPENALEX_WORKS_URL = 'https://api.openalex.org/works'
 OPENALEX_SELECT = (
     'id,doi,display_name,authorships,publication_year,type,'
     'abstract_inverted_index,keywords,primary_location,open_access,biblio,'
-    'referenced_works,cited_by_api_url'
+    'referenced_works,cited_by_api_url,referenced_works_count,cited_by_count'
 )
 OPENALEX_ID_RE = re.compile(r'^W\d+$', re.IGNORECASE)
 DOI_RE = re.compile(r'10\.\d{4,9}/\S+', re.IGNORECASE)
@@ -160,6 +160,8 @@ def _to_openalex_like(work):
         'biblio': work.get('biblio') or {},
         'referenced_works': work.get('referenced_works') or [],
         'cited_by_api_url': work.get('cited_by_api_url'),
+        'referenced_works_count': work.get('referenced_works_count'),
+        'cited_by_count': work.get('cited_by_count'),
     }
     return out
 
@@ -230,16 +232,98 @@ def _extract_referenced_work_ids(work):
     return _extract_openalex_ids(refs)
 
 
-def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related):
+# How related papers are chosen when the expansion has to cap (spec line 12).
+# Previously the cap was a plain slice of OpenAlex's arbitrary listing order;
+# now the kept N are the top N by the requested sort. Relevance is intentionally
+# absent: a pure expansion has no query term, so relevance_score is undefined.
+RELATED_SORT_OPTIONS = {
+    'most_cited': 'cited_by_count:desc',
+    'newest': 'publication_date:desc',
+}
+DEFAULT_RELATED_SORT = 'most_cited'
+
+# OpenAlex ORs ids in a single filter; keep batches well inside the URL limit.
+_RELATED_RANK_BATCH = 50
+
+
+def _resolve_related_sort(value):
+    key = str(value or '').strip().lower()
+    return key if key in RELATED_SORT_OPTIONS else DEFAULT_RELATED_SORT
+
+
+def _rank_candidate_ids(ids, related_sort, max_related, mailto):
+    """Rank ids by the chosen sort, then cap — never cap before ranking.
+
+    Ranking happens across ALL ids (batched only because of URL length), so the
+    kept N are the global top N, not the top N of whichever batch came first.
+    Ids OpenAlex does not return keep their original order at the end, so a
+    lookup failure degrades to the old behaviour instead of dropping works.
+    """
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        return []
+    if not max_related or max_related <= 0 or len(unique_ids) <= max_related:
+        return unique_ids
+
+    sort_key = _resolve_related_sort(related_sort)
+    metrics = {}
+    for start in range(0, len(unique_ids), _RELATED_RANK_BATCH):
+        batch = unique_ids[start:start + _RELATED_RANK_BATCH]
+        try:
+            data = _openalex_get(
+                {
+                    'filter': f"openalex_id:{'|'.join(batch)}",
+                    'select': 'id,cited_by_count,publication_date',
+                    'per-page': len(batch),
+                    'sort': RELATED_SORT_OPTIONS[sort_key],
+                },
+                mailto=mailto,
+            )
+        except Exception:
+            # A ranking lookup must never sink the whole expansion.
+            continue
+        for row in data.get('results') or []:
+            norm = _normalize_candidate_id(row.get('id'))
+            if norm:
+                metrics[norm] = row
+
+    if not metrics:
+        return unique_ids[:max_related]
+
+    def rank_value(candidate_id):
+        row = metrics.get(candidate_id)
+        if not row:
+            return None
+        if sort_key == 'newest':
+            return str(row.get('publication_date') or '')
+        return int(row.get('cited_by_count') or 0)
+
+    ranked = [cid for cid in unique_ids if metrics.get(cid) is not None]
+    unranked = [cid for cid in unique_ids if metrics.get(cid) is None]
+    ranked.sort(key=rank_value, reverse=True)
+    return (ranked + unranked)[:max_related]
+
+
+def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_sort=DEFAULT_RELATED_SORT):
     cited_by_url = work.get('cited_by_api_url')
-    if not cited_by_url and work.get('id'):
-        refreshed = fetch_work_by_openalex_id(work.get('id'), mailto=mailto)
-        if refreshed:
-            refreshed_work = _to_openalex_like(refreshed) or work
-            cited_by_url = refreshed_work.get('cited_by_api_url')
+    if not cited_by_url:
+        # OpenAlex has removed cited_by_api_url from the works payload — it is
+        # absent even when no `select` is given, so refetching the work cannot
+        # recover it and upstream expansion silently returned nothing. Build the
+        # equivalent `cites:` query ourselves.
+        work_id = normalize_openalex_id(work.get('id'))
+        if work_id:
+            cited_by_url = f'{OPENALEX_WORKS_URL}?filter=cites:{work_id}'
 
     if not cited_by_url:
         return []
+
+    # Ask OpenAlex to order the cited-by feed, so the first page it paginates
+    # already holds the top-ranked citing works rather than an arbitrary slice.
+    sort_value = RELATED_SORT_OPTIONS[_resolve_related_sort(related_sort)]
+    if 'sort=' not in cited_by_url:
+        separator = '&' if '?' in cited_by_url else '?'
+        cited_by_url = f'{cited_by_url}{separator}sort={sort_value}'
 
     citing_items = fetch_citing_work_ids(
         cited_by_url,
@@ -256,6 +340,7 @@ def _collect_candidate_ids(
     rate_limiter,
     mailto,
     direction='downstream',
+    related_sort=DEFAULT_RELATED_SORT,
 ):
     downstream_ids = []
     upstream_ids = []
@@ -267,9 +352,8 @@ def _collect_candidate_ids(
             if refreshed:
                 refreshed_work = _to_openalex_like(refreshed) or work
                 downstream_ids = _extract_referenced_work_ids(refreshed_work)
-        if max_related and max_related > 0:
-            downstream_ids = downstream_ids[:max_related]
-        return list(dict.fromkeys(downstream_ids)), []
+        # Rank first, then cap (spec line 12).
+        return _rank_candidate_ids(downstream_ids, related_sort, max_related, mailto), []
 
     if direction == 'upstream':
         upstream_ids = _fetch_upstream_candidates(
@@ -277,6 +361,7 @@ def _collect_candidate_ids(
             rate_limiter=rate_limiter,
             mailto=mailto,
             max_related=max_related,
+            related_sort=related_sort,
         )
         return [], list(dict.fromkeys(upstream_ids))
 
@@ -292,6 +377,7 @@ def _crawl_direction(
     all_items,
     global_ids,
     rate_limiter,
+    related_sort=DEFAULT_RELATED_SORT,
 ):
     if max_depth <= 0 or not base_items:
         return {'added': 0, 'processed': 0, 'matched': 0}
@@ -314,6 +400,7 @@ def _crawl_direction(
                 rate_limiter=rate_limiter,
                 mailto=mailto,
                 direction=direction,
+                related_sort=related_sort,
             )
         except OpenAlexRateLimitExceeded as exc:
             print(f"[OpenAlex WARN] Expansion stopped early: {exc}")
@@ -378,6 +465,7 @@ def expand_references_recursive(
     mailto,
     include_downstream=True,
     include_upstream=False,
+    related_sort=DEFAULT_RELATED_SORT,
 ):
     if not base_items:
         return base_items, {
@@ -414,6 +502,7 @@ def expand_references_recursive(
             all_items=all_items,
             global_ids=global_ids,
             rate_limiter=rate_limiter,
+            related_sort=related_sort,
         )
         downstream_added += downstream_stats.get('matched', 0)
         added += downstream_stats.get('added', 0)
@@ -429,6 +518,7 @@ def expand_references_recursive(
             all_items=all_items,
             global_ids=global_ids,
             rate_limiter=rate_limiter,
+            related_sort=related_sort,
         )
         upstream_added += upstream_stats.get('matched', 0)
         added += upstream_stats.get('added', 0)
@@ -525,6 +615,12 @@ def main():
     parser.add_argument('--related-depth-upstream', type=int, default=None)
     parser.add_argument('--max-related', type=int, default=DEFAULT_MAX_RELATED)
     parser.add_argument(
+        '--related-sort',
+        default=DEFAULT_RELATED_SORT,
+        choices=sorted(RELATED_SORT_OPTIONS.keys()),
+        help='How related papers are ranked before the max-related cap is applied',
+    )
+    parser.add_argument(
         '--include-downstream',
         dest='include_downstream',
         action='store_true',
@@ -619,6 +715,7 @@ def main():
             mailto=args.mailto,
             include_downstream=args.include_downstream,
             include_upstream=args.include_upstream,
+            related_sort=args.related_sort,
         )
 
         records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]

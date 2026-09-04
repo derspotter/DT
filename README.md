@@ -48,6 +48,10 @@ Status lives directly on `works`:
 1. Set `.env` values (at least `GOOGLE_API_KEY`, optional `OPENALEX_API_KEY`).
 2. Start stack:
    - `docker compose up -d`
+3. Open:
+   - `http://localhost:5175`
+
+The production site does not hot reload. Rebuild the frontend when you want changes on the live stack.
 
 ### LLM provider
 
@@ -67,10 +71,16 @@ and model must support PDF inputs. Endpoints with non-standard URL or auth
 shapes (e.g. Azure OpenAI's `api-key` header and deployment URLs) need an
 OpenAI-compatible gateway in front. Misconfiguration (missing key or model)
 fails fast with a clear error instead of silently falling back to Gemini.
-3. Open:
-   - `http://localhost:5175`
 
-The production site does not hot reload. Rebuild the frontend when you want changes on the live stack.
+### OpenAlex daily budget
+
+With an `OPENALEX_API_KEY` set, every OpenAlex response carries the daily
+budget headers. The Python request helper writes them to
+`openalex_quota.json` next to the SQLite database (override with
+`RAG_FEEDER_OPENALEX_QUOTA_PATH`), the backend serves them at
+`GET /api/openalex/quota`, and the workspace shows them as a pill next to the
+Search button. Without a key OpenAlex does not report a budget and the pill
+says so.
 
 ## Live Deploys Behind Caddy
 

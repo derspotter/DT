@@ -1,3 +1,5 @@
+import fs from 'node:fs'
+import path from 'node:path'
 function tableExists(db, tableName) {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName)
   return Boolean(row)
@@ -56,6 +58,12 @@ function normalizeYear(value) {
   return raw || null
 }
 
+function normalizeCount(value) {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : null
+}
+
 function normalizeContributors(authors) {
   const names = parseNameList(authors)
   if (names.length === 0) return null
@@ -98,7 +106,7 @@ function sortSeedCandidates(candidates) {
   })
 }
 
-function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false } = {}) {
+function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false, onlyDownloaded = false } = {}) {
   if (!tableExists(db, table)) return []
 
   const joins = []
@@ -114,6 +122,9 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
   }
   if (table === 'works' && onlyQueued) {
     where.push(`COALESCE(t.download_status, 'not_requested') IN ('queued', 'in_progress')`)
+  }
+  if (table === 'works' && onlyDownloaded) {
+    where.push(`COALESCE(t.download_status, '') = 'downloaded'`)
   }
 
   const columns = ['t.id', 't.title', 't.authors', 't.year', 't.doi']
@@ -272,10 +283,49 @@ function findIdsWithAliases(row, lookup, aliasIndex) {
   return matched
 }
 
-function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
-  const allRows = loadMatchRows(db, 'works')
+// The cross-corpus half of the resolver ("is this already downloaded
+// anywhere?") indexes every downloaded work in the database — 70k+ rows,
+// about 1.5 s of normalisation — and it changed only when a worker finishes.
+// Cache it per DB handle, keyed by a cheap fingerprint of the works table,
+// with a max age as a backstop for edits the fingerprint cannot see. The
+// corpus-local half (a few hundred rows) is rebuilt on every call.
+const GLOBAL_DOWNLOADED_MAX_AGE_MS = 5 * 60_000
+const globalDownloadedCache = new WeakMap()
+
+function worksFingerprint(db) {
+  const works = db.prepare(
+    `SELECT COUNT(*) AS n,
+            COALESCE(MAX(id), 0) AS max_id,
+            SUM(CASE WHEN COALESCE(download_status, '') = 'downloaded' THEN 1 ELSE 0 END) AS downloaded
+     FROM works`
+  ).get()
+  const aliases = tableExists(db, 'work_aliases')
+    ? db.prepare('SELECT COUNT(*) AS n FROM work_aliases').get().n
+    : 0
+  return `${works.n}:${works.max_id}:${works.downloaded || 0}:${aliases}`
+}
+
+function loadGlobalDownloaded(db) {
+  const now = Date.now()
+  const fingerprint = worksFingerprint(db)
+  const cached = globalDownloadedCache.get(db)
+  if (cached && cached.fingerprint === fingerprint && now - cached.builtAt < GLOBAL_DOWNLOADED_MAX_AGE_MS) {
+    return cached.value
+  }
+  const rows = loadMatchRows(db, 'works', { onlyDownloaded: true })
+  const downloadedIds = new Set(rows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
+  const value = {
+    lookup: buildMatchLookup(rows),
+    downloadedIds,
+    aliasIndex: loadAliasIndex(db, 'works', downloadedIds),
+  }
+  globalDownloadedCache.set(db, { fingerprint, builtAt: now, value })
+  return value
+}
+
+export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
+  const globalDownloaded = loadGlobalDownloaded(db)
   const localRows = loadMatchRows(db, 'works', { corpusId })
-  const allDownloadedRows = allRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localDownloadedRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localRawRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'pending')
   const localWithMetadataRows = localRows.filter((row) => {
@@ -292,15 +342,14 @@ function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } 
     queuedEnrichment: buildMatchIndex(localQueuedEnrichmentRows),
     withMetadata: buildMatchIndex(localWithMetadataRows),
     queuedDownload: buildMatchIndex(localQueuedDownloadRows),
-    downloaded: buildMatchLookup(allDownloadedRows),
+    downloaded: globalDownloaded.lookup,
     failedDownloadLookup: buildMatchLookup(localFailedDownloadRows),
     failedEnrichment: buildMatchIndex(localFailedEnrichmentRows),
     failedDownload: buildMatchIndex(localFailedDownloadRows),
   }
-  const downloadedIds = new Set(allDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localDownloadedIds = new Set(localDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localFailedDownloadIds = new Set(localFailedDownloadRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
-  const downloadedAliasIndex = loadAliasIndex(db, 'works', downloadedIds)
+  const downloadedAliasIndex = globalDownloaded.aliasIndex
   const failedDownloadAliasIndex = loadAliasIndex(db, 'works', localFailedDownloadIds)
   const isInCorpus = (row) => {
     const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
@@ -437,6 +486,8 @@ function normalizePdfCandidate(row, sourceKey, resolverBundle) {
     openalex_id: null,
     created_at: row.created_at || null,
     source_pdf: row.source_pdf || null,
+    refs_count: null,
+    cited_by_count: null,
   }
   candidate.state = resolverBundle.resolveState(candidate)
   const availability = resolverBundle.resolveDownloadedAvailability
@@ -505,7 +556,7 @@ function normalizeSearchCandidate(row, resolverBundle) {
     authors,
     year: row.year || raw.publication_year || null,
     doi: row.doi || raw.doi || null,
-    source: primarySource.display_name || raw?.primary_location?.landing_page_url || null,
+    source: primarySource.display_name || null,
     publisher: primarySource.publisher || primarySource.host_organization_name || raw?.host_organization_name || null,
     volume: biblio.volume || null,
     issue: biblio.issue || null,
@@ -514,6 +565,8 @@ function normalizeSearchCandidate(row, resolverBundle) {
     open_access_url: openAccess.oa_url || null,
     openalex_id: row.openalex_id || raw.id || null,
     type: raw?.type || null,
+    refs_count: normalizeCount(raw?.referenced_works_count),
+    cited_by_count: normalizeCount(raw?.cited_by_count),
     abstract: abstractFromOpenAlex(raw),
     keywords: keywordsFromOpenAlex(raw),
     openalex_json: raw,
@@ -599,7 +652,26 @@ export function upsertSearchRunCorpus(db, { searchRunId, corpusId }) {
   return true
 }
 
-export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null } = {}) {
+// The seed/corpus text filter matches title, author and publication (venue),
+// case-insensitively. Kept here so listSeedCandidates and listSeedSources agree
+// on what "matching" means — a seed is hidden exactly when none of its items match.
+export function matchesSeedQuery(candidate, needle) {
+  if (!needle) return true
+  const authors = Array.isArray(candidate?.authors) ? candidate.authors.join(' ') : candidate?.authors || ''
+  const haystack = [
+    candidate?.title,
+    authors,
+    candidate?.source,
+    candidate?.publisher,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return haystack.includes(needle)
+}
+
+export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null, q = '' } = {}) {
+  const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   if (!sourceRef || !['pdf', 'search'].includes(sourceKind)) return []
@@ -620,7 +692,8 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
         const candidate = normalizePdfCandidate(row, sourceRef, resolverBundle)
         return applyExplicitCorpusMembership(candidate, inCorpusMarked)
       })
-      .filter((candidate) => !dismissed.has(candidate.candidate_key)))
+      .filter((candidate) => !dismissed.has(candidate.candidate_key))
+      .filter((candidate) => matchesSeedQuery(candidate, needle)))
   }
 
   const runId = Number(sourceRef)
@@ -638,7 +711,8 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
       const candidate = normalizeSearchCandidate(row, resolverBundle)
       return applyExplicitCorpusMembership(candidate, inCorpusMarked)
     })
-    .filter((candidate) => !dismissed.has(candidate.candidate_key)))
+    .filter((candidate) => !dismissed.has(candidate.candidate_key))
+    .filter((candidate) => matchesSeedQuery(candidate, needle)))
 }
 
 function summarizeStates(candidates) {
@@ -676,8 +750,17 @@ function summarizeStates(candidates) {
   return stateCounts
 }
 
-export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFilePath = null } = {}) {
-  const resolver = createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+export function listSeedSources(db, corpusId, {
+  limit = 200,
+  resolveDownloadedFilePath = null,
+  q = '',
+  stateResolver = null,
+  only = null, // { sourceType, sourceKey } — list just that seed
+} = {}) {
+  const resolver = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+  const onlyType = only ? String(only.sourceType || '').trim().toLowerCase() : ''
+  const onlyKey = only ? String(only.sourceKey || '').trim() : ''
+  const wanted = (type, key) => !only || (onlyType === type && onlyKey === String(key || '').trim())
   const pdfSources = db.prepare(
     `SELECT ie.ingest_source AS source_key,
             MAX(ie.created_at) AS created_at,
@@ -723,7 +806,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
   const sources = []
   pdfSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
-    if (!sourceKey) return
+    if (!sourceKey || !wanted('pdf', sourceKey)) return
     const meta = {
       title: row.seed_title,
       authors: parseNameList(row.seed_authors),
@@ -732,11 +815,12 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
       source: row.seed_source,
       publisher: row.seed_publisher,
     }
-    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver })
+    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
     sources.push({
       id: buildSourceId('pdf', sourceKey),
       source_type: 'pdf',
+      seed_kind: 'pdf',
       source_key: sourceKey,
       label: row.seed_title || sourceKey,
       subtitle: formatPdfSubtitle(meta) || (row.source_pdf || ''),
@@ -750,12 +834,25 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
 
   searchSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
-    if (!sourceKey) return
-    const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver })
+    if (!sourceKey || !wanted('search', sourceKey)) return
+    const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
+    const filters = parseJson(row.filters_json, {}) || {}
+    const direction = String(filters.expansion_direction || '').trim().toLowerCase()
+    const isSnowball = direction === 'downstream' || direction === 'upstream'
     sources.push({
       id: buildSourceId('search', sourceKey),
       source_type: 'search',
+      seed_kind: isSnowball ? 'snowball' : 'search',
+      ...(isSnowball
+        ? {
+          snowball: {
+            direction,
+            of_title: filters.expansion_of_title || null,
+            of_openalex_id: filters.expansion_of_openalex_id || null,
+          },
+        }
+        : {}),
       source_key: sourceKey,
       label: row.query || `Search #${sourceKey}`,
       subtitle: formatSearchSubtitle(row),
@@ -763,10 +860,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
       candidate_count: candidates.length,
       state_counts: summarizeStates(candidates),
       removable: true,
-      meta: {
-        query: row.query,
-        filters: parseJson(row.filters_json, {}) || {},
-      },
+      meta: { query: row.query, filters },
     })
   })
 
@@ -800,4 +894,37 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
   })
   tx(normalized)
   return normalized.length
+}
+
+// The original upload for a seed document. `ingest_source_metadata.source_pdf`
+// normally points at UPLOADS_DIR/<name>.pdf, but older rows recorded the
+// extracted reference-page artifact instead, so fall back to the upload that
+// carries the seed's own name. Anything outside uploadsDir is refused (same
+// traversal guard as the extract-bibliography route).
+function isReadableFile(candidate) {
+  try {
+    return fs.statSync(candidate).isFile()
+  } catch {
+    return false
+  }
+}
+
+export function resolveSeedDocumentPath({ sourcePdf, sourceKey, uploadsDir, exists = isReadableFile }) {
+  const root = path.resolve(String(uploadsDir || ''))
+  if (!root) return null
+  const inside = (candidate) => {
+    const rel = path.relative(root, candidate)
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  }
+  const candidates = []
+  const stored = String(sourcePdf || '').trim()
+  if (stored) candidates.push(path.resolve(stored))
+  const key = String(sourceKey || '').trim()
+  if (key && !key.includes('/') && !key.includes('\\')) {
+    candidates.push(path.resolve(root, `${key}.pdf`))
+  }
+  for (const candidate of candidates) {
+    if (inside(candidate) && exists(candidate)) return candidate
+  }
+  return null
 }

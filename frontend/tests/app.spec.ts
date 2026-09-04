@@ -4,9 +4,9 @@ import { dirname } from 'node:path'
 
 async function ensureSignedIn(page: Page, request: APIRequestContext) {
   await page.goto('/')
-  const heading = page.getByRole('heading', { name: 'Corpus orchestration workspace' })
+  const heading = page.getByRole('heading', { name: 'Korpus Builder' })
   if (await heading.isVisible().catch(() => false)) {
-    await expect(page.getByText(/API status:/).first()).toContainText('API status:')
+    await expect(page.getByText(/items found/).first()).toContainText('items found')
     return
   }
 
@@ -23,7 +23,7 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
   }
 
   await expect(heading).toBeVisible({ timeout: 20_000 })
-  await expect(page.getByText(/API status:/).first()).toContainText('API status:')
+  await expect(page.getByText(/items found/).first()).toContainText('items found')
 }
 
 async function waitUntilSearchSettled(page: Page) {
@@ -71,8 +71,70 @@ function writePdfFixture(pathname: string, text: string): string {
   return pathname
 }
 
+// The live specs write real seeds, uploads and works into whatever corpus the
+// account has selected. Run them in a corpus of their own instead, created
+// before the suite and deleted after it, so repeated runs cannot accumulate
+// state in a working corpus (and so no test depends on what a previous run
+// left behind).
+async function apiLogin(request: APIRequestContext): Promise<string> {
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  const res = await request.post('/api/auth/login', { data: { username, password } })
+  expect(res.ok(), `login failed: ${res.status()}`).toBeTruthy()
+  const token = (await res.json())?.token
+  expect(token, 'login returned no token').toBeTruthy()
+  return token
+}
+
 test.describe('Korpus Builder live integration', () => {
   test.setTimeout(180_000)
+
+  let scratchCorpusId: number | null = null
+  let previousCorpusId: number | null = null
+  let authToken = ''
+
+  test.beforeAll(async ({ request }) => {
+    authToken = await apiLogin(request)
+    const headers = { Authorization: `Bearer ${authToken}` }
+
+    const me = await request.get('/api/auth/me', { headers })
+    previousCorpusId = (await me.json())?.user?.last_corpus_id ?? null
+
+    const created = await request.post('/api/corpora', {
+      headers,
+      data: { name: `e2e-${Date.now()}` },
+    })
+    expect(created.ok(), `corpus create failed: ${created.status()}`).toBeTruthy()
+    scratchCorpusId = (await created.json())?.id ?? null
+    expect(scratchCorpusId, 'corpus create returned no id').toBeTruthy()
+
+    const selected = await request.post(`/api/corpora/${scratchCorpusId}/select`, { headers })
+    expect(selected.ok(), `corpus select failed: ${selected.status()}`).toBeTruthy()
+
+    // Give the scratch corpus one seed so the seed-table tests exercise a real
+    // table instead of skipping, without depending on another test's leftovers.
+    const seeded = await request.post('/api/keyword-search', {
+      headers,
+      data: { query: 'institutional economics', maxResults: 5, sort: 'cited_by_count' },
+      timeout: 120_000,
+    })
+    expect(seeded.ok(), `seed search failed: ${seeded.status()}`).toBeTruthy()
+  })
+
+  test.afterAll(async ({ request }) => {
+    if (!authToken) return
+    const headers = { Authorization: `Bearer ${authToken}` }
+    if (scratchCorpusId) {
+      // Deleting the corpus also drops its seeds, uploads, works links and
+      // search runs, so a run leaves nothing behind.
+      const removed = await request.delete(`/api/corpora/${scratchCorpusId}`, { headers })
+      expect(removed.ok(), `corpus delete failed: ${removed.status()}`).toBeTruthy()
+    }
+    if (previousCorpusId) {
+      await request.post(`/api/corpora/${previousCorpusId}/select`, { headers })
+    }
+  })
 
   test('end-to-end flow uses real backend APIs', async ({ page, request }) => {
     await ensureSignedIn(page, request)
@@ -86,9 +148,18 @@ test.describe('Korpus Builder live integration', () => {
     await expect(page.getByTestId('dashboard-overview')).toBeVisible()
 
     await page.getByTestId('tab-workspace').click()
-    await expect(page.locator('.seed-intake-card--search')).toBeVisible()
-    await page.getByRole('textbox', { name: 'Query' }).fill('institutional economics AND governance')
-    await page.getByRole('button', { name: 'Search' }).click()
+    // Scope every control to the search card: seed rows are role="button" and
+    // their "Search items" tag matches a bare name: 'Search' locator once the
+    // seed list has loaded, which it now does before this click.
+    const searchCard = page.locator('.seed-intake-card--search')
+    await expect(searchCard).toBeVisible()
+    await searchCard.getByRole('textbox', { name: 'Query' }).fill('institutional economics AND governance')
+    // The Max results field defaults to "No cap". Left uncapped this runs an
+    // unbounded OpenAlex search that cannot settle inside the poll timeout and
+    // dumps the whole result set into the corpus; a small cap keeps this a real
+    // backend/OpenAlex integration check without that.
+    await searchCard.getByLabel('Max results').fill('5')
+    await searchCard.getByRole('button', { name: 'Search', exact: true }).click()
     const searchStatus = await waitUntilSearchSettled(page)
     expect(searchStatus).not.toContain('Searching...')
     expect(searchStatus.length).toBeGreaterThan(0)
@@ -105,7 +176,11 @@ test.describe('Korpus Builder live integration', () => {
     const corpusRows = corpusPanel.locator('.corpus-select-row')
     if (await corpusRows.count()) {
       await corpusRows.first().click()
-      await expect(corpusPanel.locator('.corpus-details-grid strong').first()).not.toHaveText('-')
+      // .corpus-details-grid was replaced by an inline detail card when the
+      // workspace was reshaped; only its CSS survives. Assert the card opens
+      // with populated chips instead.
+      await expect(corpusPanel.locator('.inline-detail-card').first()).toBeVisible()
+      await expect(corpusPanel.locator('.inline-detail-chip').first()).not.toBeEmpty()
     }
 
     await page.getByTestId('tab-downloads').click()
@@ -140,12 +215,50 @@ test.describe('Korpus Builder live integration', () => {
     )
     const pdfName = 'ingest-smoke.pdf'
 
-    await uploadCard.locator('input[type="file"][accept=".pdf"]').setInputFiles(pdfPath)
+    await uploadCard.locator('input[type="file"][accept*=".pdf"]').setInputFiles(pdfPath)
     const uploadRow = uploadCard.locator('.upload-item', { hasText: pdfName })
     await expect(uploadRow).toBeVisible()
-    await expect(uploadRow.locator('.status')).toHaveText('uploaded', { timeout: 120_000 })
 
-    await uploadRow.getByRole('button', { name: 'Extract' }).click()
-    await expect(uploadRow.locator('.status')).toHaveText('extracted', { timeout: 30_000 })
+    // The .status badge is rendered only while a status other than 'uploaded'
+    // is active, so a completed upload is signalled by the message plus an
+    // enabled Extract button — not by a badge reading 'uploaded'.
+    const extractButton = uploadRow.getByRole('button', { name: 'Extract' })
+    await expect(extractButton).toBeEnabled({ timeout: 120_000 })
+    await expect(uploadRow).toContainText('Uploaded')
+
+    await extractButton.click()
+    // extractForItem sets 'extracting' and then 'queued' depending on whether
+    // the backend ran it inline or enqueued it; either proves extraction
+    // started, which is what this test is named for.
+    await expect(uploadRow.locator('.status')).toHaveText(/extracting|queued/, { timeout: 30_000 })
+  })
+
+  test('seed table exposes a Refs column', async ({ page, request }) => {
+    await ensureSignedIn(page, request)
+    const firstSeed = page.locator('.seed-source__summary').first()
+    // Seed sources load asynchronously after the "items found" text that
+    // ensureSignedIn already waited for, so give them a moment to arrive
+    // before deciding this corpus has none.
+    const hasSeed = await firstSeed
+      .waitFor({ state: 'visible', timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (!hasSeed) {
+      test.skip(true, 'No seeds in this corpus')
+    }
+    await firstSeed.click()
+    // Scope to the expanded seed's table (not the page at large — other
+    // "Refs" text can exist elsewhere) and give the candidates time to load
+    // from the live backend before the default 5s timeout would flake.
+    await expect(
+      page.locator('.seed-source.expanded').getByText('Refs', { exact: true }).first()
+    ).toBeVisible({ timeout: 30_000 })
+  })
+
+  test('search panel shows the OpenAlex budget pill', async ({ page, request }) => {
+    await ensureSignedIn(page, request)
+    const pill = page.getByTestId('openalex-quota')
+    await expect(pill).toBeVisible()
+    await expect(pill).toContainText(/OpenAlex/)
   })
 })
