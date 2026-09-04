@@ -345,3 +345,28 @@ describe('seed candidate text filter', () => {
     expect(pdf.seed_kind).toBe('pdf')
   })
 })
+
+describe('seed state resolver cache', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('picks up a newly downloaded work on the next call', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { doi: 'https://doi.org/10.1000/cached', display_name: 'Cached Work' })
+    db.prepare(`UPDATE search_results SET doi = '10.1000/cached' WHERE id = 1`).run()
+    expect(listSeedCandidates(db, 130, 'search', '7')[0].state).toBe('pending')
+
+    // Another corpus downloads the same work; the fingerprint (count + max id
+    // + downloaded count) changes, so the cached global lookup is rebuilt.
+    db.prepare(
+      `INSERT INTO works (id, title, doi, metadata_status, download_status, file_path)
+       VALUES (900, 'Cached Work', '10.1000/cached', 'matched', 'downloaded', '/tmp/cached.pdf')`
+    ).run()
+    db.prepare(`INSERT INTO corpus_works (corpus_id, work_id) VALUES (999, 900)`).run()
+    expect(listSeedCandidates(db, 130, 'search', '7')[0].state).toBe('downloaded_elsewhere')
+  })
+})

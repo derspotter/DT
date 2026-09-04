@@ -21,6 +21,7 @@ import {
   hideSeedSource,
   dismissSeedCandidates,
   resolveSeedDocumentPath,
+  createStateResolver,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4818,12 +4819,19 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
+      // One resolver for both calls: building it is the expensive part.
+      const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
-        stateResolver: null,
+        stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
         q: String(req.query?.q || '').trim(),
       });
-      const sourceSummary = listSeedSources(authDb, req.corpusId, { limit: 500, resolveDownloadedFilePath: findDownloadedFilePath }).find(
+      const sourceSummary = listSeedSources(authDb, req.corpusId, {
+        limit: 500,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+        stateResolver,
+        only: { sourceType, sourceKey },
+      }).find(
         (source) => source.source_type === sourceType && String(source.source_key) === sourceKey
       ) || null;
       return res.json({

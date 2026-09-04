@@ -106,7 +106,7 @@ function sortSeedCandidates(candidates) {
   })
 }
 
-function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false } = {}) {
+function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false, onlyDownloaded = false } = {}) {
   if (!tableExists(db, table)) return []
 
   const joins = []
@@ -122,6 +122,9 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
   }
   if (table === 'works' && onlyQueued) {
     where.push(`COALESCE(t.download_status, 'not_requested') IN ('queued', 'in_progress')`)
+  }
+  if (table === 'works' && onlyDownloaded) {
+    where.push(`COALESCE(t.download_status, '') = 'downloaded'`)
   }
 
   const columns = ['t.id', 't.title', 't.authors', 't.year', 't.doi']
@@ -280,10 +283,49 @@ function findIdsWithAliases(row, lookup, aliasIndex) {
   return matched
 }
 
-function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
-  const allRows = loadMatchRows(db, 'works')
+// The cross-corpus half of the resolver ("is this already downloaded
+// anywhere?") indexes every downloaded work in the database — 70k+ rows,
+// about 1.5 s of normalisation — and it changed only when a worker finishes.
+// Cache it per DB handle, keyed by a cheap fingerprint of the works table,
+// with a max age as a backstop for edits the fingerprint cannot see. The
+// corpus-local half (a few hundred rows) is rebuilt on every call.
+const GLOBAL_DOWNLOADED_MAX_AGE_MS = 5 * 60_000
+const globalDownloadedCache = new WeakMap()
+
+function worksFingerprint(db) {
+  const works = db.prepare(
+    `SELECT COUNT(*) AS n,
+            COALESCE(MAX(id), 0) AS max_id,
+            SUM(CASE WHEN COALESCE(download_status, '') = 'downloaded' THEN 1 ELSE 0 END) AS downloaded
+     FROM works`
+  ).get()
+  const aliases = tableExists(db, 'work_aliases')
+    ? db.prepare('SELECT COUNT(*) AS n FROM work_aliases').get().n
+    : 0
+  return `${works.n}:${works.max_id}:${works.downloaded || 0}:${aliases}`
+}
+
+function loadGlobalDownloaded(db) {
+  const now = Date.now()
+  const fingerprint = worksFingerprint(db)
+  const cached = globalDownloadedCache.get(db)
+  if (cached && cached.fingerprint === fingerprint && now - cached.builtAt < GLOBAL_DOWNLOADED_MAX_AGE_MS) {
+    return cached.value
+  }
+  const rows = loadMatchRows(db, 'works', { onlyDownloaded: true })
+  const downloadedIds = new Set(rows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
+  const value = {
+    lookup: buildMatchLookup(rows),
+    downloadedIds,
+    aliasIndex: loadAliasIndex(db, 'works', downloadedIds),
+  }
+  globalDownloadedCache.set(db, { fingerprint, builtAt: now, value })
+  return value
+}
+
+export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
+  const globalDownloaded = loadGlobalDownloaded(db)
   const localRows = loadMatchRows(db, 'works', { corpusId })
-  const allDownloadedRows = allRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localDownloadedRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localRawRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'pending')
   const localWithMetadataRows = localRows.filter((row) => {
@@ -300,15 +342,14 @@ function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } 
     queuedEnrichment: buildMatchIndex(localQueuedEnrichmentRows),
     withMetadata: buildMatchIndex(localWithMetadataRows),
     queuedDownload: buildMatchIndex(localQueuedDownloadRows),
-    downloaded: buildMatchLookup(allDownloadedRows),
+    downloaded: globalDownloaded.lookup,
     failedDownloadLookup: buildMatchLookup(localFailedDownloadRows),
     failedEnrichment: buildMatchIndex(localFailedEnrichmentRows),
     failedDownload: buildMatchIndex(localFailedDownloadRows),
   }
-  const downloadedIds = new Set(allDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localDownloadedIds = new Set(localDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localFailedDownloadIds = new Set(localFailedDownloadRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
-  const downloadedAliasIndex = loadAliasIndex(db, 'works', downloadedIds)
+  const downloadedAliasIndex = globalDownloaded.aliasIndex
   const failedDownloadAliasIndex = loadAliasIndex(db, 'works', localFailedDownloadIds)
   const isInCorpus = (row) => {
     const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
@@ -709,8 +750,17 @@ function summarizeStates(candidates) {
   return stateCounts
 }
 
-export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFilePath = null, q = '' } = {}) {
-  const resolver = createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+export function listSeedSources(db, corpusId, {
+  limit = 200,
+  resolveDownloadedFilePath = null,
+  q = '',
+  stateResolver = null,
+  only = null, // { sourceType, sourceKey } — list just that seed
+} = {}) {
+  const resolver = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+  const onlyType = only ? String(only.sourceType || '').trim().toLowerCase() : ''
+  const onlyKey = only ? String(only.sourceKey || '').trim() : ''
+  const wanted = (type, key) => !only || (onlyType === type && onlyKey === String(key || '').trim())
   const pdfSources = db.prepare(
     `SELECT ie.ingest_source AS source_key,
             MAX(ie.created_at) AS created_at,
@@ -756,7 +806,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
   const sources = []
   pdfSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
-    if (!sourceKey) return
+    if (!sourceKey || !wanted('pdf', sourceKey)) return
     const meta = {
       title: row.seed_title,
       authors: parseNameList(row.seed_authors),
@@ -784,7 +834,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
 
   searchSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
-    if (!sourceKey) return
+    if (!sourceKey || !wanted('search', sourceKey)) return
     const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
     const filters = parseJson(row.filters_json, {}) || {}
