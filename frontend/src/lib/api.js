@@ -692,6 +692,20 @@ export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' }
 
 // Fetched as a blob rather than linked directly: this route is behind the
 // normal auth header, and a plain <a href> would not carry it.
+// A Content-Disposition filename may be percent-encoded (RFC 5987) or plain;
+// a plain name containing "%" would make decodeURIComponent throw, so fall
+// back to the raw value, and never let a path separator through.
+function safeDownloadFilename(raw) {
+  let name = String(raw || '')
+  try {
+    name = decodeURIComponent(name)
+  } catch {
+    // keep the raw name
+  }
+  name = name.split(/[\\/]/).pop() || ''
+  return name || 'download.pdf'
+}
+
 export async function fetchSeedSourceDocument(sourceKey) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/seed/sources/pdf/${encodeURIComponent(String(sourceKey || ''))}/file`
@@ -703,7 +717,7 @@ export async function fetchSeedSourceDocument(sourceKey) {
   }
   const disposition = response.headers.get('content-disposition') || ''
   const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
-  const filename = match ? decodeURIComponent(match[1]) : `${sourceKey || 'seed'}.pdf`
+  const filename = match ? safeDownloadFilename(match[1]) : `${sourceKey || 'seed'}.pdf`
   return { blob: await response.blob(), filename }
 }
 

@@ -17,12 +17,22 @@
     onChange(next)
   }
 
+  let root = null
+
   function close(event) {
     if (!event.currentTarget.contains(event.relatedTarget)) open = false
   }
+
+  // focusout alone misses clicks on non-focusable page areas, which leave the
+  // menu open; close on any pointer press outside the picker as well.
+  function closeOnOutsidePress(event) {
+    if (open && root && !root.contains(event.target)) open = false
+  }
 </script>
 
-<div class="column-picker" on:focusout={close}>
+<svelte:window on:pointerdown={closeOnOutsidePress} />
+
+<div class="column-picker" bind:this={root} on:focusout={close}>
   <button class="secondary column-picker__toggle" type="button" on:click={() => (open = !open)} aria-expanded={open}>
     Columns ▾
   </button>

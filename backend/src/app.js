@@ -1554,7 +1554,9 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
       has_imported_current: currentItemsCount > 0,
       pending_is_provisional: currentItemsCount === 0,
       current_items_loaded: currentItems.length,
-      pending_items_loaded: pendingItems.length,
+      // Same semantics as pending_items_count: file-missing rows are excluded,
+      // otherwise the UI can read "Loaded 120 of 100".
+      pending_items_loaded: pendingItems.filter((item) => !item?.file_missing).length,
       current_items_has_more: currentItems.length < currentItemsCount,
       // Paging compares against the full list, which still includes the
       // file-missing rows; pendingItemsCount deliberately excludes them.
