@@ -2401,6 +2401,17 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   assertNoLegacyLibraryData(authDb);
   ensureAuthSchema(authDb);
   ensureSeedSchema(authDb);
+  // Warm the cross-corpus downloaded-works lookup once the server is up, so
+  // the first workspace load does not pay the ~1.5 s index build. Best effort.
+  if (!isStubMode()) {
+    setTimeout(() => {
+      try {
+        createStateResolver(authDb, 0, { resolveDownloadedFilePath: findDownloadedFilePath });
+      } catch (error) {
+        console.warn('[seed-state] Cache warm-up failed:', error?.message || error);
+      }
+    }, 250);
+  }
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
