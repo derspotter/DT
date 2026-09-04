@@ -1933,15 +1933,16 @@ button.danger:disabled {
   padding-inline: 10px;
 }
 
-button.seed-download-tag {
-  border: 0;
-  cursor: pointer;
-  font-family: inherit;
+.table-row button.seed-download-link {
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  white-space: nowrap;
 }
 
-button.seed-download-tag:hover,
-button.seed-download-tag:focus-visible {
-  filter: brightness(0.96);
+.table-row button.seed-download-link:hover,
+.table-row button.seed-download-link:focus-visible {
   text-decoration: underline;
 }
 

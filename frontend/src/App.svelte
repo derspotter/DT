@@ -2789,12 +2789,27 @@
     failed_download: 'Not retrievable',
   }
 
+  // Search candidates carry no metadata_status of their own, so the column
+  // falls back to the resolved state (what the old row tag used to say).
+  const SEED_METADATA_BY_STATE = {
+    enriched: 'Confirmed',
+    added: 'Confirmed',
+    downloaded: 'Confirmed',
+    downloaded_elsewhere: 'Confirmed',
+    queued_download: 'Confirmed',
+    failed_download: 'Confirmed',
+    queued_enrichment: 'Enriching',
+    staged_raw: 'Pending',
+    pending: 'Pending',
+  }
+
   function seedMetadataLabel(candidate) {
     const state = seedCandidateState(candidate)
     if (state === 'failed_enrichment') return SEED_METADATA_LABELS.failed_enrichment
     const raw = String(candidate?.metadata_status || '').trim().toLowerCase()
     if (SEED_METADATA_LABELS[raw]) return SEED_METADATA_LABELS[raw]
-    return raw ? raw.replace(/_/g, ' ') : '-'
+    if (raw) return raw.replace(/_/g, ' ')
+    return SEED_METADATA_BY_STATE[state] || '-'
   }
 
   function seedDownloadLabel(candidate) {
@@ -2802,7 +2817,11 @@
     if (state === 'failed_download') return SEED_DOWNLOAD_LABELS.failed_download
     const raw = String(candidate?.download_status || '').trim().toLowerCase()
     if (SEED_DOWNLOAD_LABELS[raw]) return SEED_DOWNLOAD_LABELS[raw]
-    return raw ? raw.replace(/_/g, ' ') : '-'
+    if (raw) return raw.replace(/_/g, ' ')
+    if (state === 'downloaded') return candidate?.file_available === false ? 'File missing' : 'Downloaded'
+    if (state === 'downloaded_elsewhere') return candidate?.file_available === true ? 'Downloaded' : 'Stale record'
+    if (state === 'queued_download') return SEED_DOWNLOAD_LABELS.queued
+    return '-'
   }
 
   function seedCellText(candidate, key) {
@@ -4822,7 +4841,6 @@
                                 {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
                                 {@const candidateKey = String(candidate?.candidate_key || '')}
                                 {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
-                                {@const candidateTag = seedCandidateTag(candidate)}
                                 <div
                                   class={`table-row clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
                                   style={seedGridStyle}
@@ -4855,23 +4873,6 @@
                                     {:else}
                                       <input type="checkbox" disabled />
                                     {/if}
-                                    {#if canDownloadSeedCandidate(candidate)}
-	                                      <button
-	                                        class={`tag ${candidateTag.className} ingest-state-tag seed-download-tag`}
-	                                        type="button"
-	                                        title={`Download available file from work ${candidate.downloaded_work_id}`}
-	                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
-	                                      >
-	                                        {candidateTag.label}
-	                                      </button>
-	                                    {:else}
-	                                      <span
-	                                        class={`tag ${candidateTag.className} ingest-state-tag`}
-	                                        title={candidateTag.hint || (candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : '')}
-	                                      >
-	                                        {candidateTag.label}
-	                                      </span>
-	                                    {/if}
                                   </span>
                                   {#each seedActiveColumns as column (column.key)}
                                     {#if column.key === 'corpus'}
@@ -4888,6 +4889,15 @@
                                             on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
                                           >→ Promote</button>
                                         {/if}
+                                      </span>
+                                    {:else if column.key === 'download' && canDownloadSeedCandidate(candidate)}
+                                      <span>
+                                        <button
+                                          class="link seed-download-link"
+                                          type="button"
+                                          title={`Download the file from work ${candidate.downloaded_work_id}`}
+                                          on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
+                                        >{seedCellText(candidate, column.key)} ⤓</button>
                                       </span>
                                     {:else if column.key === 'authors'}
                                       <span title={formatAuthors(candidate)}>{seedCellText(candidate, column.key)}</span>
