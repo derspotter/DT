@@ -41,3 +41,12 @@ describe('resolveSeedDocumentPath', () => {
     }
   })
 })
+
+describe('seed expansion argument size', () => {
+  test('seed_expand accepts --seed-file so a large promotion cannot exceed ARG_MAX', () => {
+    const script = fs.readFileSync(new URL('../scripts/seed_expand.py', import.meta.url).pathname, 'utf8')
+    expect(script).toContain("'--seed-file'")
+    const app = fs.readFileSync(new URL('../src/app.js', import.meta.url).pathname, 'utf8')
+    expect(app).toContain("expandArgs.push('--seed-file', tempExpandSeedPath)")
+  })
+})

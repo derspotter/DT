@@ -60,7 +60,12 @@ export function loadVisibility(table) {
     if (!parsed || typeof parsed !== 'object') return defaults
     // Merge onto defaults so a column added in a later release shows up
     // instead of being silently hidden by a stale stored object.
-    return { ...defaults, ...parsed }
+    const merged = { ...defaults, ...parsed }
+    // toggle() refuses to hide the last column, but a corrupted or hand-edited
+    // stored value can still be all-false, which renders a table with no
+    // headers and no way back. Fall back to the defaults in that case.
+    if (!Object.values(merged).some(Boolean)) return defaults
+    return merged
   } catch {
     return defaults
   }

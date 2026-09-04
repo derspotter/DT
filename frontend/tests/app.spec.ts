@@ -86,14 +86,18 @@ test.describe('Korpus Builder live integration', () => {
     await expect(page.getByTestId('dashboard-overview')).toBeVisible()
 
     await page.getByTestId('tab-workspace').click()
-    await expect(page.locator('.seed-intake-card--search')).toBeVisible()
-    await page.getByRole('textbox', { name: 'Query' }).fill('institutional economics AND governance')
+    // Scope every control to the search card: seed rows are role="button" and
+    // their "Search items" tag matches a bare name: 'Search' locator once the
+    // seed list has loaded, which it now does before this click.
+    const searchCard = page.locator('.seed-intake-card--search')
+    await expect(searchCard).toBeVisible()
+    await searchCard.getByRole('textbox', { name: 'Query' }).fill('institutional economics AND governance')
     // The Max results field defaults to "No cap". Left uncapped this runs an
     // unbounded OpenAlex search that cannot settle inside the poll timeout and
     // dumps the whole result set into the corpus; a small cap keeps this a real
     // backend/OpenAlex integration check without that.
-    await page.getByLabel('Max results').fill('5')
-    await page.getByRole('button', { name: 'Search' }).click()
+    await searchCard.getByLabel('Max results').fill('5')
+    await searchCard.getByRole('button', { name: 'Search', exact: true }).click()
     const searchStatus = await waitUntilSearchSettled(page)
     expect(searchStatus).not.toContain('Searching...')
     expect(searchStatus.length).toBeGreaterThan(0)

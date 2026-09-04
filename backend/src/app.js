@@ -5068,18 +5068,31 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       // alongside the result rather than thrown.
       let expansionSeeds = [];
       let expansionError = null;
+      let tempExpandSeedPath = null;
       if (expansionAsNewSeeds) {
         try {
+          const expandSeedJson = JSON.stringify(promotionCandidates.map((candidate) => ({
+            openalex_id: candidate.openalex_id,
+            doi: candidate.doi,
+            title: candidate.title,
+          })));
           const expandArgs = [
             '--db-path', DB_PATH,
-            '--seed-json', JSON.stringify(promotionCandidates.map((candidate) => ({
-              openalex_id: candidate.openalex_id,
-              doi: candidate.doi,
-              title: candidate.title,
-            }))),
             '--max-related', String(expansion.maxRelated),
             '--related-sort', String(expansion.relatedSort || RELATED_SORT_DEFAULT),
           ];
+          // Same ARG_MAX guard as the promotion call above: a big promotion's
+          // seed list must not go through the command line.
+          if (expandSeedJson.length > 100_000) {
+            tempExpandSeedPath = path.join(
+              os.tmpdir(),
+              `seed-expand-${req.corpusId}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+            );
+            fs.writeFileSync(tempExpandSeedPath, expandSeedJson, 'utf8');
+            expandArgs.push('--seed-file', tempExpandSeedPath);
+          } else {
+            expandArgs.push('--seed-json', expandSeedJson);
+          }
           if (expansion.includeDownstream && expansion.relatedDepthDownstream >= 1) {
             expandArgs.push('--include-downstream');
           }
@@ -5106,6 +5119,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         } catch (error) {
           console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Expansion seeding failed:', error);
           expansionError = error?.message || 'Failed to build expansion seeds';
+        } finally {
+          if (tempExpandSeedPath) {
+            try {
+              fs.unlinkSync(tempExpandSeedPath);
+            } catch (cleanupError) {
+              console.warn('[/api/seed/sources/:sourceType/:sourceKey/promote] Failed to remove temp expansion seed file:', cleanupError);
+            }
+          }
         }
       }
 

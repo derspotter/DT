@@ -85,7 +85,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--db-path', required=True)
     parser.add_argument('--corpus-id', type=int, default=None)
-    parser.add_argument('--seed-json', required=True, help='JSON list of promoted items')
+    seed_source = parser.add_mutually_exclusive_group(required=True)
+    seed_source.add_argument('--seed-json', help='JSON list of promoted items')
+    # A large promotion's seed list can exceed ARG_MAX on the command line, so
+    # the backend writes it to a temp file instead (same as seed_promote.py).
+    seed_source.add_argument('--seed-file', help='Path to a JSON file with the promoted items')
     parser.add_argument('--max-related', type=int, default=30)
     parser.add_argument('--related-sort', default=DEFAULT_RELATED_SORT, choices=sorted(RELATED_SORT_OPTIONS.keys()))
     parser.add_argument('--include-downstream', action='store_true', default=False)
@@ -94,8 +98,11 @@ def main():
     args = parser.parse_args()
 
     try:
-        seeds = json.loads(args.seed_json)
-    except json.JSONDecodeError as exc:
+        if args.seed_file:
+            seeds = json.loads(Path(args.seed_file).read_text(encoding='utf-8'))
+        else:
+            seeds = json.loads(args.seed_json)
+    except (json.JSONDecodeError, OSError) as exc:
         print(json.dumps({'runs': [], 'error': f'Invalid seed JSON: {exc}'}))
         return
     if not isinstance(seeds, list):
