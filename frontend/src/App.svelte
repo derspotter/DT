@@ -4470,17 +4470,22 @@
 	                <div class="document-run-list">
 	                  <div class="document-run-list__header">
 	                    <span class="muted small">Extracted seed documents</span>
+	                    {#if ingestRunsStatus}
+	                      <span class="muted small" role="status">{ingestRunsStatus}</span>
+	                    {/if}
 	                  </div>
 	                  {#each recentDocumentRuns as run}
 	                    <button
 	                      class="document-run"
 	                      type="button"
-	                      title={`Bibliographic metadata extracted from this PDF. ${formatSeedDocumentDetails({
+	                      title={`${run.source_pdf ? 'Click to download the original seed document. ' : ''}Bibliographic metadata extracted from this PDF. ${formatSeedDocumentDetails({
 	                        authors: run.seed_authors,
 	                        source: run.seed_source,
 	                        publisher: run.seed_publisher,
 	                      }) || (run.source_pdf || '')}`.trim()}
-	                      on:click={() => focusSeedSource('pdf', run.ingest_source)}
+	                      on:click={() => (run.source_pdf
+	                        ? handleDownloadSeedDocument(run.ingest_source)
+	                        : focusSeedSource('pdf', run.ingest_source))}
 	                    >
 	                      <span class="truncate-line">
 	                        {formatSeedDocumentLabel(
@@ -4494,15 +4499,6 @@
 	                      </span>
 	                      <span class="muted small">{run.entry_count} entries</span>
 	                    </button>
-	                    {#if run.source_pdf}
-	                      <button
-	                        class="document-run__download"
-	                        type="button"
-	                        title="Download the original seed document"
-	                        aria-label={`Download the original document for ${run.seed_title || run.ingest_source}`}
-	                        on:click|stopPropagation={() => handleDownloadSeedDocument(run.ingest_source)}
-	                      >⤓</button>
-	                    {/if}
 	                  {/each}
 	                </div>
 	              {/if}

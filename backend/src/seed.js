@@ -1,3 +1,5 @@
+import fs from 'node:fs'
+import path from 'node:path'
 function tableExists(db, tableName) {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName)
   return Boolean(row)
@@ -842,4 +844,29 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
   })
   tx(normalized)
   return normalized.length
+}
+
+// The original upload for a seed document. `ingest_source_metadata.source_pdf`
+// normally points at UPLOADS_DIR/<name>.pdf, but older rows recorded the
+// extracted reference-page artifact instead, so fall back to the upload that
+// carries the seed's own name. Anything outside uploadsDir is refused (same
+// traversal guard as the extract-bibliography route).
+export function resolveSeedDocumentPath({ sourcePdf, sourceKey, uploadsDir, exists = fs.existsSync }) {
+  const root = path.resolve(String(uploadsDir || ''))
+  if (!root) return null
+  const inside = (candidate) => {
+    const rel = path.relative(root, candidate)
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  }
+  const candidates = []
+  const stored = String(sourcePdf || '').trim()
+  if (stored) candidates.push(path.resolve(stored))
+  const key = String(sourceKey || '').trim()
+  if (key && !key.includes('/') && !key.includes('\\')) {
+    candidates.push(path.resolve(root, `${key}.pdf`))
+  }
+  for (const candidate of candidates) {
+    if (inside(candidate) && exists(candidate)) return candidate
+  }
+  return null
 }

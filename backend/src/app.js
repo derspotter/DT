@@ -20,6 +20,7 @@ import {
   listSeedCandidates,
   hideSeedSource,
   dismissSeedCandidates,
+  resolveSeedDocumentPath,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4794,15 +4795,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const row = authDb
         .prepare('SELECT source_pdf FROM ingest_source_metadata WHERE corpus_id = ? AND ingest_source = ?')
         .get(req.corpusId, sourceKey);
-      const sourcePdf = String(row?.source_pdf || '').trim();
-      if (!sourcePdf) {
+      if (!row) {
         return res.status(404).json({ error: 'No original document stored for this seed' });
       }
-      // The stored path is written by us as UPLOADS_DIR/<name>, but re-check it
-      // rather than trust the DB — this is the same traversal guard the
-      // extract-bibliography route uses.
-      const resolved = path.resolve(sourcePdf);
-      if (!ensureInsideDirectory(UPLOADS_DIR, resolved) || !fs.existsSync(resolved)) {
+      // Stored path first, then the upload named after the seed — see
+      // resolveSeedDocumentPath for why both are tried.
+      const resolved = resolveSeedDocumentPath({ sourcePdf: row.source_pdf, sourceKey, uploadsDir: UPLOADS_DIR });
+      if (!resolved) {
         return res.status(404).json({ error: 'Original document is no longer available' });
       }
       return res.download(resolved, path.basename(resolved));

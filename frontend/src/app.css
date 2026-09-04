@@ -1967,7 +1967,6 @@ button.seed-download-tag:focus-visible {
   min-width: 0;
 }
 
-.document-run__download,
 .corpus-remove {
   border: 0;
   background: none;
@@ -1978,11 +1977,6 @@ button.seed-download-tag:focus-visible {
   color: var(--muted, #71717a);
   cursor: pointer;
   flex: 0 0 auto;
-}
-
-.document-run__download:hover,
-.document-run__download:focus-visible {
-  color: #1f2937;
 }
 
 .corpus-remove:hover,
@@ -4339,8 +4333,13 @@ button.seed-download-tag:focus-visible {
 .seed-corpus-toolbar .seed-intake-card--search .seed-search-form {
   display: grid;
   grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.2fr) 78px 78px 104px minmax(0, 1fr);
+  /* The third (footer) track absorbs the card's spare height so Reset /
+     Search stay in the bottom-right corner even when the seed card beside
+     this one makes the row taller. */
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 10px 12px;
   align-items: end;
+  flex: 1 1 auto;
 }
 
 .seed-corpus-toolbar .seed-intake-card--search .seed-search-row {
@@ -4366,6 +4365,7 @@ button.seed-download-tag:focus-visible {
    right, so the buttons are always the bottom-right corner of the card. */
 .seed-corpus-toolbar .seed-intake-card--search .seed-search-footer {
   grid-column: 1 / -1;
+  align-self: end;
   display: flex;
   justify-content: space-between;
   align-items: flex-end;
@@ -4509,6 +4509,7 @@ button.seed-download-tag:focus-visible {
 @container keyword-search (max-width: 520px) {
   .seed-corpus-toolbar .seed-intake-card--search .seed-search-form {
     grid-template-columns: 1fr;
+    grid-template-rows: none;
     gap: 10px;
   }
 
