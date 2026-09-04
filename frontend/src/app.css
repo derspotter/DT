@@ -4362,11 +4362,24 @@ button.seed-download-tag:focus-visible {
   max-width: 100%;
 }
 
-.seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
+/* Bottom row of the box: the status text on the left, Reset / Search on the
+   right, so the buttons are always the bottom-right corner of the card. */
+.seed-corpus-toolbar .seed-intake-card--search .seed-search-footer {
   grid-column: 1 / -1;
-  justify-self: end;
-  width: max-content;
-  max-width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 12px;
+  min-width: 0;
+}
+
+.seed-corpus-toolbar .seed-intake-card--search .seed-search-footer .muted {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
+  flex: 0 0 auto;
 }
 
 .seed-corpus-toolbar .seed-intake-card--search .muted {
@@ -4499,8 +4512,12 @@ button.seed-download-tag:focus-visible {
     gap: 10px;
   }
 
+  .seed-corpus-toolbar .seed-intake-card--search .seed-search-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
   .seed-corpus-toolbar .seed-intake-card--search .seed-search-actions {
-    justify-self: stretch;
     justify-content: flex-end;
     width: auto;
   }

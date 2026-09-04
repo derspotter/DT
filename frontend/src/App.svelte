@@ -4586,13 +4586,15 @@
                       <option value="oldest">Oldest</option>
                     </select>
                   </label>
-                  <div class="seed-search-actions">
-                    <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
-                    <button class="primary" type="submit">Search</button>
+                  <div class="seed-search-footer">
+                    <p class="muted">{searchStatus}</p>
+                    <div class="seed-search-actions">
+                      <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
+                      <button class="primary" type="submit">Search</button>
+                    </div>
                   </div>
                 </div>
               </form>
-              <p class="muted">{searchStatus}</p>
             </div>
           </div>
 
