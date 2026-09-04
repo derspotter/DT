@@ -947,6 +947,48 @@ function migrateExistingToCorpus(db, corpusId) {
   }
 }
 
+// Rows keyed to a corpus that no longer exists. They come from corpora deleted
+// before the delete route cleaned every table, and from work that lands after a
+// corpus is removed (a background extraction finishing, say). They are
+// invisible in the UI but accumulate forever, so sweep them at startup.
+const CORPUS_SCOPED_TABLES = [
+  'ingest_entries',
+  'ingest_source_metadata',
+  'corpus_works',
+  'corpus_items',
+  'pipeline_jobs',
+  'corpus_kantropos_assignments',
+  'search_run_corpora',
+  'seed_sources_hidden',
+  'seed_candidates_dismissed',
+  'seed_candidates_in_corpus',
+];
+
+export function pruneOrphanedCorpusRows(db) {
+  if (!tableExists(db, 'corpora')) return {};
+  const removed = {};
+  for (const table of CORPUS_SCOPED_TABLES) {
+    if (!tableExists(db, table)) continue;
+    const result = db
+      .prepare(`DELETE FROM ${table} WHERE corpus_id IS NOT NULL AND corpus_id NOT IN (SELECT id FROM corpora)`)
+      .run();
+    if (result.changes > 0) removed[table] = result.changes;
+  }
+  // A search run whose last corpus registration is gone is unreachable.
+  if (tableExists(db, 'search_runs') && tableExists(db, 'search_run_corpora')) {
+    const orphanRuns = `SELECT sr.id FROM search_runs sr
+       LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
+       WHERE src.search_run_id IS NULL`;
+    if (tableExists(db, 'search_results')) {
+      const res = db.prepare(`DELETE FROM search_results WHERE search_run_id IN (${orphanRuns})`).run();
+      if (res.changes > 0) removed.search_results = res.changes;
+    }
+    const runs = db.prepare(`DELETE FROM search_runs WHERE id IN (${orphanRuns})`).run();
+    if (runs.changes > 0) removed.search_runs = runs.changes;
+  }
+  return removed;
+}
+
 function pruneStaleCorpusItems(db) {
   if (!tableExists(db, 'works') || !tableExists(db, 'corpus_works')) return;
   db.exec(
@@ -2417,6 +2459,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
+  const prunedOrphans = pruneOrphanedCorpusRows(authDb);
+  if (Object.keys(prunedOrphans).length > 0) {
+    console.log('[startup] Removed rows for deleted corpora:', prunedOrphans);
+  }
   const requireAuthMiddleware = requireAuth(authDb, authConfig);
   const pruneCorpusDownloadTickets = () => {
     const now = Date.now();
@@ -4166,6 +4212,37 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         }
         if (tableExists(authDb, 'corpus_works')) {
           authDb.prepare('DELETE FROM corpus_works WHERE corpus_id = ?').run(corpusId);
+        }
+        // Everything else keyed by corpus_id. These were missed before, which
+        // left seed state and search-run registrations pointing at a corpus
+        // that no longer exists.
+        for (const table of ['corpus_items', 'seed_sources_hidden', 'seed_candidates_dismissed', 'seed_candidates_in_corpus', 'search_run_corpora']) {
+          if (tableExists(authDb, table)) {
+            authDb.prepare(`DELETE FROM ${table} WHERE corpus_id = ?`).run(corpusId);
+          }
+        }
+        // A search run belongs to the corpora it was registered against; once
+        // the last one goes, the run and its results are unreachable, so drop
+        // them instead of leaving them to accumulate forever.
+        if (tableExists(authDb, 'search_runs') && tableExists(authDb, 'search_run_corpora')) {
+          if (tableExists(authDb, 'search_results')) {
+            authDb.prepare(
+              `DELETE FROM search_results
+               WHERE search_run_id IN (
+                 SELECT sr.id FROM search_runs sr
+                 LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
+                 WHERE src.search_run_id IS NULL
+               )`
+            ).run();
+          }
+          authDb.prepare(
+            `DELETE FROM search_runs
+             WHERE id IN (
+               SELECT sr.id FROM search_runs sr
+               LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
+               WHERE src.search_run_id IS NULL
+             )`
+          ).run();
         }
         authDb.prepare('DELETE FROM user_corpora WHERE corpus_id = ?').run(corpusId);
         authDb.prepare('DELETE FROM corpora WHERE id = ?').run(corpusId);

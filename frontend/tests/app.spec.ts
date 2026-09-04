@@ -71,8 +71,70 @@ function writePdfFixture(pathname: string, text: string): string {
   return pathname
 }
 
+// The live specs write real seeds, uploads and works into whatever corpus the
+// account has selected. Run them in a corpus of their own instead, created
+// before the suite and deleted after it, so repeated runs cannot accumulate
+// state in a working corpus (and so no test depends on what a previous run
+// left behind).
+async function apiLogin(request: APIRequestContext): Promise<string> {
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  const res = await request.post('/api/auth/login', { data: { username, password } })
+  expect(res.ok(), `login failed: ${res.status()}`).toBeTruthy()
+  const token = (await res.json())?.token
+  expect(token, 'login returned no token').toBeTruthy()
+  return token
+}
+
 test.describe('Korpus Builder live integration', () => {
   test.setTimeout(180_000)
+
+  let scratchCorpusId: number | null = null
+  let previousCorpusId: number | null = null
+  let authToken = ''
+
+  test.beforeAll(async ({ request }) => {
+    authToken = await apiLogin(request)
+    const headers = { Authorization: `Bearer ${authToken}` }
+
+    const me = await request.get('/api/auth/me', { headers })
+    previousCorpusId = (await me.json())?.user?.last_corpus_id ?? null
+
+    const created = await request.post('/api/corpora', {
+      headers,
+      data: { name: `e2e-${Date.now()}` },
+    })
+    expect(created.ok(), `corpus create failed: ${created.status()}`).toBeTruthy()
+    scratchCorpusId = (await created.json())?.id ?? null
+    expect(scratchCorpusId, 'corpus create returned no id').toBeTruthy()
+
+    const selected = await request.post(`/api/corpora/${scratchCorpusId}/select`, { headers })
+    expect(selected.ok(), `corpus select failed: ${selected.status()}`).toBeTruthy()
+
+    // Give the scratch corpus one seed so the seed-table tests exercise a real
+    // table instead of skipping, without depending on another test's leftovers.
+    const seeded = await request.post('/api/keyword-search', {
+      headers,
+      data: { query: 'institutional economics', maxResults: 5, sort: 'cited_by_count' },
+      timeout: 120_000,
+    })
+    expect(seeded.ok(), `seed search failed: ${seeded.status()}`).toBeTruthy()
+  })
+
+  test.afterAll(async ({ request }) => {
+    if (!authToken) return
+    const headers = { Authorization: `Bearer ${authToken}` }
+    if (scratchCorpusId) {
+      // Deleting the corpus also drops its seeds, uploads, works links and
+      // search runs, so a run leaves nothing behind.
+      const removed = await request.delete(`/api/corpora/${scratchCorpusId}`, { headers })
+      expect(removed.ok(), `corpus delete failed: ${removed.status()}`).toBeTruthy()
+    }
+    if (previousCorpusId) {
+      await request.post(`/api/corpora/${previousCorpusId}/select`, { headers })
+    }
+  })
 
   test('end-to-end flow uses real backend APIs', async ({ page, request }) => {
     await ensureSignedIn(page, request)
