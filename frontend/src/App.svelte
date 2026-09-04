@@ -315,7 +315,13 @@
     if (!Number.isFinite(remaining) || !Number.isFinite(limit)) {
       return { text: 'OpenAlex budget: unknown until the first request', tone: 'muted' }
     }
-    const base = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left · resets in ${formatResetIn(quota.reset_in_seconds)}`
+    const resetIn = Number(quota.reset_in_seconds)
+    if (Number.isFinite(resetIn) && resetIn <= 0) {
+      // The daily reset happened after the last OpenAlex request, so the
+      // counts in the snapshot are pre-reset. The next request refreshes them.
+      return { text: `OpenAlex budget: reset since the last request · ${limit.toLocaleString('en-US')} per day`, tone: 'muted' }
+    }
+    const base = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left · resets in ${formatResetIn(resetIn)}`
     if (quota.stale) {
       const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString('en-US') : 'unknown'
       return { text: `${base} · last seen ${seen}`, tone: 'muted' }
@@ -4523,7 +4529,14 @@
             </div>
 
             <div class="seed-intake-card seed-intake-card--search">
-              <h3>Keyword search <span class="muted small keyword-search-note">Queries run against the OpenAlex scholarly index.</span></h3>
+              <div class="seed-intake-card__header">
+                <h3>Keyword search <span class="muted small keyword-search-note">Queries run against the OpenAlex scholarly index.</span></h3>
+                <span
+                  class={`openalex-quota-pill openalex-quota-pill--${openalexQuotaView.tone}`}
+                  data-testid="openalex-quota"
+                  title="Daily OpenAlex API budget as reported by the last request"
+                >{openalexQuotaView.text}</span>
+              </div>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
                   <label class="seed-search-main">
@@ -4580,13 +4593,6 @@
                 </div>
               </form>
               <p class="muted">{searchStatus}</p>
-              <div class="search-quota-row">
-                <span
-                  class={`openalex-quota-pill openalex-quota-pill--${openalexQuotaView.tone}`}
-                  data-testid="openalex-quota"
-                  title="Daily OpenAlex API budget as reported by the last request"
-                >{openalexQuotaView.text}</span>
-              </div>
             </div>
           </div>
 

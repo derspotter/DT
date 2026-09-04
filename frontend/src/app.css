@@ -5311,8 +5311,23 @@ button.seed-download-tag:focus-visible {
 .openalex-quota-pill--danger { background: #fef2f2; color: #b91c1c; }
 .openalex-quota-pill--muted { background: #f4f4f5; color: #52525b; }
 
-.search-quota-row {
-  margin-top: 8px;
+.seed-intake-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.seed-intake-card__header .openalex-quota-pill {
+  flex-shrink: 0;
+}
+
+@media (max-width: 640px) {
+  .seed-intake-card__header .openalex-quota-pill {
+    white-space: normal;
+    max-width: 100%;
+  }
 }
 
 .admin-settings-form__readonly {
