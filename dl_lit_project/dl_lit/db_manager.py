@@ -2545,6 +2545,35 @@ class DatabaseManager:
         row = self.conn.execute("SELECT COUNT(*) FROM search_results WHERE search_run_id = ?", (int(run_id),)).fetchone()
         return int(row[0] if row else 0)
 
+    def fetch_search_results(self, run_id: int, limit: int) -> list[dict]:
+        """Read back a run's stored results (newest-insert order), capped at `limit`.
+
+        Used to render the inline payload without keeping every fetched item in memory.
+        """
+        if limit <= 0:
+            return []
+        cursor = self.conn.execute(
+            """SELECT openalex_id, doi, title, year, raw_json
+                 FROM search_results WHERE search_run_id = ? ORDER BY id LIMIT ?""",
+            (int(run_id), int(limit)),
+        )
+        rows = []
+        for openalex_id, doi, title, year, raw_json in cursor.fetchall():
+            parsed = None
+            if raw_json:
+                try:
+                    parsed = json.loads(raw_json)
+                except (ValueError, TypeError):
+                    parsed = None
+            rows.append({
+                'openalex_id': openalex_id,
+                'doi': doi,
+                'title': title,
+                'year': year,
+                'raw_json': parsed,
+            })
+        return rows
+
     def add_search_results(self, search_run_id: int, results: list[dict]) -> int:
         """Insert search results for a run. Returns number of inserted rows."""
         if not results:

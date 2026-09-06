@@ -601,6 +601,29 @@ def _render_results(records):
     return results
 
 
+def _render_stored_results(db, run_id, limit):
+    """Render the inline payload from the run's persisted rows.
+
+    The unbounded path never keeps the fetched items in memory, so the rows the
+    run already wrote are the only source for the inline preview.
+    """
+    records = []
+    for row in db.fetch_search_results(run_id, limit):
+        raw = row.get('raw_json')
+        if isinstance(raw, dict):
+            records.append(openalex_result_to_record(raw, run_id=run_id))
+        else:
+            records.append({
+                'openalex_id': row.get('openalex_id'),
+                'doi': row.get('doi'),
+                'title': row.get('title'),
+                'year': row.get('year'),
+                'authors': [],
+                'type': None,
+            })
+    return _render_results(records)
+
+
 _progress_stream = sys.stdout
 
 
@@ -758,12 +781,21 @@ def main():
 
         signal.signal(signal.SIGTERM, on_sigterm)
 
+        # Expansion and enqueue are the only consumers of the fetched items; without
+        # them an unbounded run must not hold millions of works in memory.
+        expansion_enabled = (
+            (args.include_downstream and related_depth_downstream >= 1)
+            or (args.include_upstream and related_depth_upstream >= 1)
+        )
+        needs_items = bool(expansion_enabled or args.enqueue)
+
         try:
             if is_query_mode:
                 base_items = search_openalex(
                     query=args.query or '', max_results=effective_max_results(args.max_results),
                     year_from=args.year_from, year_to=args.year_to, author=args.author,
                     field=args.field, mailto=args.mailto, sort=args.sort, on_page=persist,
+                    accumulate=needs_items,
                 )
             else:
                 seeds = _parse_seed_json(args.seed_json)
@@ -783,11 +815,17 @@ def main():
                 state['expected'] = (state['expected'] or 0) + len(extra)
                 persist(extra, None)
 
-            records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]
-            records = dedupe_results(records)
-            if args.enqueue:
-                for record in records:
-                    db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
+            limit = _inline_results_limit(args.inline_results_limit)
+            truncated = state['fetched'] > limit
+            if needs_items:
+                records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]
+                records = dedupe_results(records)
+                if args.enqueue:
+                    for record in records:
+                        db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
+                inline_results = [] if truncated else _render_results(records)
+            else:
+                inline_results = [] if truncated else _render_stored_results(db, run_id, limit)
             db.finish_search_run(run_id, 'done')
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
         except SystemExit:
@@ -799,11 +837,9 @@ def main():
             raise
         db.close_connection()
 
-    limit = _inline_results_limit(args.inline_results_limit)
-    truncated = state['fetched'] > limit
     payload = {
         'runId': run_id,
-        'results': [] if truncated else _render_results(records),
+        'results': inline_results,
         'source': 'openalex',
         'mode': mode_label,
         'expansion': expansion_stats,

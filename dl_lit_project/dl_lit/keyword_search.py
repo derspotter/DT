@@ -247,11 +247,21 @@ def search_openalex(query: str,
                     field: str | None = "default",
                     author: str | None = None,
                     sort: str | None = None,
-                    on_page=None) -> list[dict]:
+                    on_page=None,
+                    accumulate: bool = True) -> list[dict]:
+    """Page through OpenAlex.
+
+    With ``accumulate=False`` and an ``on_page`` callback, pages are handed to the
+    callback and then dropped, so an unbounded search stays flat in memory; the
+    return value is then an empty list. ``accumulate=True`` keeps every item.
+    """
     try:
         params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort)
     except _NoAuthorMatch:
         return []
+
+    if not accumulate and on_page is None:
+        raise ValueError("accumulate=False requires an on_page callback")
 
     # Use cursor-based pagination for robustness
     params["per-page"] = 200
@@ -259,6 +269,7 @@ def search_openalex(query: str,
     rate_limiter = get_global_rate_limiter()
     results: list[dict] = []
     seen_ids: set[str] = set()
+    fetched = 0
 
     while True:
         data = _openalex_request('works', params, rate_limiter)
@@ -268,13 +279,16 @@ def search_openalex(query: str,
             if not item_id or item_id in seen_ids:
                 continue
             seen_ids.add(item_id)
-            results.append(item)
+            fetched += 1
+            if accumulate:
+                results.append(item)
             page_items.append(item)
-            if max_results is not None and len(results) >= max_results:
+            if max_results is not None and fetched >= max_results:
                 break
         if on_page is not None and page_items:
             on_page(page_items, data.get("meta") or {})
-        if max_results is not None and len(results) >= max_results:
+        page_items = None
+        if max_results is not None and fetched >= max_results:
             return results
         next_cursor = (data.get("meta") or {}).get("next_cursor")
         if not next_cursor:
