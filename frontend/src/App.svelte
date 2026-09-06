@@ -161,7 +161,49 @@
   $: pipelineMetadataCount = Number(ingestStats.matched || 0)
   $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
   $: itemsFoundCount = seedSources.reduce((total, source) => total + (Number(source?.candidate_count) || 0), 0)
-  $: anySearchRunning = seedSources.some((s) => s?.run?.status === 'running')
+  // Runs this session started but the seed list has not caught up with yet.
+  // Deriving `anySearchRunning` from seedSources alone lost the very first
+  // search of a session: the run only shows up in the seed list after a poll,
+  // and the poll only starts once a run shows up.
+  let startedSearchRunIds = new Set()
+  const startedSearchRunMisses = new Map()
+  const TERMINAL_RUN_STATUSES = new Set(['done', 'failed', 'cancelled'])
+  // Two polls, so one seed-list response that raced the run's registration
+  // does not drop it.
+  const STARTED_RUN_MISS_LIMIT = 2
+
+  function reconcileStartedSearchRuns(sources) {
+    if (startedSearchRunIds.size === 0) return
+    const reported = new Map()
+    for (const source of sources || []) {
+      if (source?.source_type !== 'search') continue
+      reported.set(String(source.source_key), source?.run?.status || null)
+    }
+    const next = new Set()
+    for (const runId of startedSearchRunIds) {
+      const key = String(runId)
+      if (reported.has(key)) {
+        startedSearchRunMisses.delete(key)
+        const status = reported.get(key)
+        // Once the list reports the run, its own status is authoritative; a
+        // missing status means the backend cannot track it, which is terminal
+        // as far as polling goes.
+        if (!status || TERMINAL_RUN_STATUSES.has(status)) continue
+        next.add(runId)
+        continue
+      }
+      const misses = (startedSearchRunMisses.get(key) || 0) + 1
+      if (misses >= STARTED_RUN_MISS_LIMIT) {
+        startedSearchRunMisses.delete(key)
+        continue
+      }
+      startedSearchRunMisses.set(key, misses)
+      next.add(runId)
+    }
+    if (next.size !== startedSearchRunIds.size) startedSearchRunIds = next
+  }
+
+  $: anySearchRunning = startedSearchRunIds.size > 0 || seedSources.some((s) => s?.run?.status === 'running')
   $: if (anySearchRunning) {
     if (!searchRefreshIntervalId) {
       searchRefreshIntervalId = setInterval(() => runLiveRefreshCycle(), 2000)
@@ -1528,7 +1570,10 @@
         loadCorpus({ preserveSelection: true, quiet: true }),
         loadOpenAlexQuota(),
       ]
-      if (anySearchRunning) {
+      // Not only while a run is known to be running: the workspace is where
+      // seeds live, and a run started elsewhere (or one this tab has not seen
+      // yet) has to be able to show up on its own.
+      if (anySearchRunning || activeTab === 'workspace') {
         tasks.push(loadSeedSources({ quiet: true }))
       }
       if (diagnosticsEnabled) {
@@ -3060,11 +3105,19 @@
     selectAllSeedCandidates(source)
   }
 
+  // Monotonic request tokens: the 2s live poll can have several seed-list
+  // requests in flight at once, and an older, slower response overwriting a
+  // newer one used to resurrect stale run status and lose a just-started run.
+  let seedSourcesRequestToken = 0
+
   async function loadSeedSources({ quiet = false } = {}) {
     if (!quiet) seedSourcesStatus = 'Loading seeds...'
+    const token = ++seedSourcesRequestToken
     try {
       const payload = await fetchSeedSources(100, { q: seedFilterQuery })
+      if (token !== seedSourcesRequestToken) return
       seedSources = payload.sources || []
+      reconcileStartedSearchRuns(seedSources)
       const validSourceIds = new Set(seedSources.map((source) => seedSourceId(source)))
       if (expandedSeedSourceId && !validSourceIds.has(expandedSeedSourceId)) {
         expandedSeedSourceId = ''
@@ -3089,6 +3142,7 @@
         setAuthToken('')
         return
       }
+      if (token !== seedSourcesRequestToken) return
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
   }
@@ -3114,9 +3168,15 @@
     }
   }
 
+  // Per-seed request tokens, same reason as seedSourcesRequestToken: a
+  // background reload racing a user-driven "Show more" must not win.
+  const seedCandidatesRequestTokens = new Map()
+
   async function loadSeedCandidatesForSource(source, { quiet = false, background = false, append = false } = {}) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
+    const token = (seedCandidatesRequestTokens.get(sourceId) || 0) + 1
+    seedCandidatesRequestTokens.set(sourceId, token)
     const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
     const showLoadingState = !background || !hasCachedCandidates
     if (showLoadingState) {
@@ -3133,8 +3193,22 @@
       const payload = await fetchSeedCandidates(source.source_type, source.source_key, {
         q: seedFilterQuery, limit, offset, ...seedSortParams(source),
       })
+      if (token !== seedCandidatesRequestTokens.get(sourceId)) return
       const incoming = payload.candidates || []
-      const nextCandidates = append ? [...currentlyLoaded, ...incoming] : incoming
+      // A run still filling in shifts rows down under `sr.id DESC`, so the
+      // page at offset=loaded.length can overlap what is already on screen.
+      // Appending it blind produced duplicate keys (and duplicate rows).
+      let nextCandidates = incoming
+      if (append) {
+        const known = new Set(currentlyLoaded.map((c) => String(c?.candidate_key || '')).filter(Boolean))
+        const fresh = incoming.filter((candidate) => {
+          const key = String(candidate?.candidate_key || '')
+          if (!key || known.has(key)) return false
+          known.add(key)
+          return true
+        })
+        nextCandidates = [...currentlyLoaded, ...fresh]
+      }
       seedCandidatesBySource = {
         ...seedCandidatesBySource,
         [sourceId]: nextCandidates,
@@ -3165,7 +3239,7 @@
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
-      } else if (!quiet) {
+      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId)) {
         seedActionStatus = error?.message || 'Failed to load seed candidates.'
       }
     } finally {
@@ -3455,11 +3529,40 @@
     }
   }
 
-  function searchEstimate(count) {
+  // Measured wall-clock cost of one OpenAlex page in this pipeline. The
+  // configured RPS is a *ceiling* for parallel callers; keyword paging is
+  // strictly sequential (each request needs the previous page's cursor), so
+  // dividing by RPS understated a large fetch by more than an order of
+  // magnitude. 1.1s/request is the observed round trip including rate-limit
+  // sleep and the per-page DB write.
+  const SEARCH_SECONDS_PER_REQUEST = 1.1
+  // 90 minutes: past this an answer in minutes stops being readable.
+  const SEARCH_HOURS_CUTOFF_SECONDS = 5400
+
+  // `quota` is a parameter rather than a read of the module-level
+  // `openalexQuota` so the {@const} in the warning markup re-runs when the
+  // quota arrives (Svelte only tracks what the template expression names).
+  function searchEstimate(count, quota) {
     const requests = Math.ceil(count / 200)
-    const rps = Number(appSettings?.openalex_rps?.value || appSettings?.openalex_rps?.env_fallback || 30) || 30
-    const minutes = requests / rps / 60
-    return { requests, minutes: minutes.toFixed(1) }
+    const seconds = requests * SEARCH_SECONDS_PER_REQUEST
+    const duration = seconds >= SEARCH_HOURS_CUTOFF_SECONDS
+      ? `roughly ${(seconds / 3600).toFixed(1)} hours`
+      : `roughly ${(seconds / 60).toFixed(1)} minutes`
+    const remaining = Number(quota?.remaining)
+    const limit = Number(quota?.limit)
+    // Only a fresh, live quota reading may drive copy and a Cap button; a
+    // stale snapshot would cap against yesterday's leftovers.
+    const budgetKnown = Boolean(quota?.available) && !quota?.stale && Number.isFinite(remaining)
+    const overBudget = budgetKnown && requests > remaining
+    return {
+      requests,
+      duration,
+      remaining: budgetKnown ? remaining : null,
+      budgetSentence: overBudget
+        ? `That is more than today's remaining OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${Number.isFinite(limit) ? limit.toLocaleString('en-US') : 'unknown'} requests left.`
+        : '',
+      canCapAtBudget: overBudget && remaining > 0,
+    }
   }
 
   // Submit: ask for the count first; warn above the threshold, else start.
@@ -3492,6 +3595,11 @@
       const { data, source, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
       searchSource = source
       loadOpenAlexQuota()
+      if (runId && running) {
+        // Start polling on the 202 itself; the seed list may not report this
+        // run for another poll or two (or at all, if registration lagged).
+        startedSearchRunIds = new Set([...startedSearchRunIds, Number(runId)])
+      }
       if (runId) {
         await loadSeedSources({ quiet: true })
         await focusSeedSource('search', runId)
@@ -4800,11 +4908,14 @@
                       <p class="muted small search-preview" data-testid="search-preview">About {searchPreview.count.toLocaleString('en-US')} works match</p>
                     {/if}
                     {#if searchWarning && searchPreview}
-                      {@const est = searchEstimate(searchPreview.count)}
+                      {@const est = searchEstimate(searchPreview.count, openalexQuota)}
                       <div class="search-warning" role="alert" data-testid="search-warning">
-                        <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests and roughly {est.minutes} minutes. Narrow the query, or:</p>
+                        <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests and {est.duration}.{#if est.budgetSentence} {est.budgetSentence}{/if} Narrow the query, or:</p>
                         <div class="search-warning__actions">
                           <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: Math.floor(searchPreview.threshold / 10) })}>Cap at {Math.floor(searchPreview.threshold / 10).toLocaleString('en-US')}</button>
+                          {#if est.canCapAtBudget}
+                            <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.remaining * 200 })}>Cap at budget</button>
+                          {/if}
                           <button class="primary" type="button" on:click={() => startSearch()}>Fetch all {searchPreview.count.toLocaleString('en-US')}</button>
                         </div>
                       </div>
@@ -5019,7 +5130,7 @@
                                 {/if}
                               </span>
                               <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
-                              <button class="secondary" type="button" on:click={() => selectAllSeedCandidates(source)} disabled={seedActionBusy}>Select all</button>
+                              <button class="secondary" type="button" on:click={() => setAllSeedCandidatesSelected(source, true)} disabled={seedActionBusy}>Select all</button>
                               <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
                             </div>
                             <div class="table-toolbar-right">

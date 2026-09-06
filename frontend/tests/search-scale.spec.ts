@@ -81,6 +81,75 @@ test('a search above the threshold shows the warning and "Cap at" starts a cappe
   await expect(card.locator('p.muted').first()).toContainText('Fetching in the background')
 })
 
+test('the warning names the OpenAlex budget and "Cap at budget" caps to it', async ({ page }) => {
+  let searchBody: any = null
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url())
+    if (url.pathname === '/api/openalex/quota') {
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          available: true, stale: false, api_key_present: true,
+          remaining: 50, limit: 100000, reset_in_seconds: 3600,
+        }),
+      })
+    }
+    if (url.pathname === '/api/keyword-search/preview') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 342118, threshold: 100000 }) })
+    }
+    if (url.pathname === '/api/keyword-search' && route.request().method() === 'POST') {
+      searchBody = route.request().postDataJSON()
+      return route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ runId: 55, status: 'running' }) })
+    }
+    return mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  const warning = page.getByTestId('search-warning')
+  // 342,118 / 200 = 1,711 requests; at 1.1s each that is ~31 minutes, and it
+  // is far more than the 50 requests left in today's budget.
+  await expect(warning).toContainText('1,711 OpenAlex requests and roughly 31.4 minutes')
+  await expect(warning).toContainText("That is more than today's remaining OpenAlex budget: 50 of 100,000 requests left.")
+  await warning.getByTestId('search-cap-at-budget').click()
+  // 50 requests x 200 results per page.
+  await expect.poll(() => searchBody?.maxResults).toBe(10000)
+})
+
+test('no budget button when the quota is unknown or stale', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url())
+    if (url.pathname === '/api/openalex/quota') {
+      // A stale snapshot must not drive a cap: it may describe yesterday.
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ available: true, stale: true, api_key_present: true, remaining: 50, limit: 100000, reset_in_seconds: 3600 }),
+      })
+    }
+    if (url.pathname === '/api/keyword-search/preview') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 342118, threshold: 100000 }) })
+    }
+    return mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  const warning = page.getByTestId('search-warning')
+  await expect(warning).toContainText('This search matches 342,118 works')
+  await expect(warning).not.toContainText("today's remaining OpenAlex budget")
+  await expect(warning.getByTestId('search-cap-at-budget')).toHaveCount(0)
+})
+
 test('Reset clears the warning instead of leaving stale "Cap at" / "Fetch all" actions live', async ({ page }) => {
   let searchRequests = 0
   await page.addInitScript(() => {
@@ -128,7 +197,7 @@ function makeSeedCandidates(count: number, startIndex = 0) {
 }
 
 test('seed table pages through search results, shows every-item selection, and dismisses all', async ({ page }) => {
-  let lastCandidatesOffset: number | null = null
+  const candidatesOffsets: number[] = []
   let dismissBody: any = null
   await page.route('**/api/**', mockApi)
   await page.route('**/api/seed/sources**', async (route) => {
@@ -147,12 +216,16 @@ test('seed table pages through search results, shows every-item selection, and d
   await page.route('**/api/seed/sources/search/77/candidates**', async (route) => {
     const url = new URL(route.request().url())
     const offset = Number(url.searchParams.get('offset') || 0)
-    lastCandidatesOffset = offset
-    const count = offset === 0 ? 200 : 100
+    const limit = Number(url.searchParams.get('limit') || 200)
+    candidatesOffsets.push(offset)
+    // Honour limit/offset like the real route: the workspace now polls seeds
+    // continuously, and a background reload re-requests everything loaded so
+    // far in one page.
+    const count = Math.max(0, Math.min(limit, 300 - offset))
     return route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ candidates: makeSeedCandidates(count, offset), total: 300, offset, limit: 200 }),
+      body: JSON.stringify({ candidates: makeSeedCandidates(count, offset), total: 300, offset, limit }),
     })
   })
   await page.route('**/api/seed/candidates/dismiss', async (route) => {
@@ -166,7 +239,9 @@ test('seed table pages through search results, shows every-item selection, and d
   const footer = page.locator('.seed-table-footer')
   await expect(footer).toContainText('Showing 200 of 300')
   await footer.getByRole('button', { name: 'Show more' }).click()
-  await expect.poll(() => lastCandidatesOffset).toBe(200)
+  // A background poll can re-request offset 0 at any time, so assert the page
+  // was requested, not that it was the most recent request.
+  await expect.poll(() => candidatesOffsets.includes(200)).toBe(true)
   await expect(footer).toHaveCount(0)
 
   const selectAllCheckbox = page.locator('.seed-source__select input[type="checkbox"]')
@@ -175,6 +250,83 @@ test('seed table pages through search results, shows every-item selection, and d
 
   await page.getByRole('button', { name: 'Dismiss selected' }).click()
   await expect.poll(() => dismissBody?.all).toBe(true)
+})
+
+test('Show more does not duplicate rows when the second page overlaps the first', async ({ page }) => {
+  // A run still filling in shifts rows down under `sr.id DESC`, so the page at
+  // offset=200 can repeat 50 rows the table already shows.
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sources: [{
+          id: 'search:99', source_type: 'search', seed_kind: 'search', source_key: '99', label: 'overlapping',
+          subtitle: '', created_at: '2026-09-06T10:00:00Z', candidate_count: 250, state_counts: null,
+          removable: true, meta: {}, run: null,
+        }],
+      }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/99/candidates**', async (route) => {
+    const url = new URL(route.request().url())
+    const offset = Number(url.searchParams.get('offset') || 0)
+    const limit = Number(url.searchParams.get('limit') || 200)
+    // Page 1: c0..c199. Page 2 (offset 200) starts 50 rows earlier: c150..c249.
+    const start = offset === 0 ? 0 : offset - 50
+    const count = Math.max(0, Math.min(limit, 250 - start))
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ candidates: makeSeedCandidates(count, start), total: 250, offset, limit }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByText('overlapping', { exact: false }).click()
+  const rows = page.locator('.seed-candidate-table .table-row.clickable')
+  await expect(rows).toHaveCount(200)
+  await page.locator('.seed-table-footer').getByRole('button', { name: 'Show more' }).click()
+  // Union of c0..c199 and c150..c249 is 250 rows, not 200 + 100 = 300.
+  await expect(rows).toHaveCount(250)
+  // And each of the 50 overlapping rows renders exactly once.
+  await expect(rows.filter({ hasText: 'Economics paper 150' })).toHaveCount(1)
+  await expect(rows.filter({ hasText: 'Economics paper 199' })).toHaveCount(1)
+})
+
+test('the toolbar "Select all" selects the whole seed, like the header checkbox', async ({ page }) => {
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sources: [{
+          id: 'search:66', source_type: 'search', seed_kind: 'search', source_key: '66', label: 'toolbar seed',
+          subtitle: '', created_at: '2026-09-06T10:00:00Z', candidate_count: 300, state_counts: null,
+          removable: true, meta: {}, run: null,
+        }],
+      }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/66/candidates**', async (route) => {
+    const url = new URL(route.request().url())
+    const offset = Number(url.searchParams.get('offset') || 0)
+    const limit = Number(url.searchParams.get('limit') || 200)
+    const count = Math.max(0, Math.min(limit, 300 - offset))
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ candidates: makeSeedCandidates(count, offset), total: 300, offset, limit }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByText('toolbar seed', { exact: false }).click()
+  await page.locator('.seed-source__body').getByRole('button', { name: 'Select all', exact: true }).click()
+  // The whole seed (300), not just the loaded page (200).
+  await expect(page.locator('.seed-source__body .table-toolbar-left')).toContainText('All 300 items selected')
 })
 
 test('promoting while a seed filter is active forwards q to the promote request', async ({ page }) => {
@@ -213,13 +365,20 @@ test('promoting while a seed filter is active forwards q to the promote request'
 })
 
 test('a running seed shows progress and settles to done', async ({ page }) => {
-  let polls = 0
+  // The transition is driven by the test, not by how many times the 2s poll
+  // happens to have fired: a request-count trigger made this flake whenever a
+  // poll landed early or late.
+  const PHASES = {
+    first: { status: 'running', fetched_count: 400, expected_count: 1200, error: null },
+    second: { status: 'running', fetched_count: 800, expected_count: 1200, error: null },
+    done: { status: 'done', fetched_count: 1200, expected_count: 1200, error: null },
+  }
+  let phase: keyof typeof PHASES = 'first'
+  const served: string[] = []
   await page.route('**/api/**', mockApi)
   await page.route('**/api/seed/sources**', async (route) => {
-    polls += 1
-    const run = polls < 3
-      ? { status: 'running', fetched_count: 400 * polls, expected_count: 1200, error: null }
-      : { status: 'done', fetched_count: 1200, expected_count: 1200, error: null }
+    const run = PHASES[phase]
+    served.push(`${run.status}:${run.fetched_count}`)
     return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ sources: [{
       id: 'search:55', source_type: 'search', seed_kind: 'search', source_key: '55', label: 'economics', subtitle: '',
       created_at: '2026-09-06T10:00:00Z', candidate_count: run.fetched_count, state_counts: null, removable: true, meta: {}, run,
@@ -228,6 +387,13 @@ test('a running seed shows progress and settles to done', async ({ page }) => {
   await page.goto('/')
   const status = page.getByTestId('seed-run-status')
   await expect(status).toContainText('fetching 400 of 1,200')
+  phase = 'second'
   await expect(status).toContainText('fetching 800 of 1,200', { timeout: 10_000 })
+  phase = 'done'
   await expect(status).toHaveCount(0, { timeout: 10_000 })
+  // The sequence, not the intermediate counts: it started running, stayed
+  // running while the run advanced, and the last thing served was 'done'.
+  expect(served[0]).toBe('running:400')
+  expect(served).toContain('running:800')
+  expect(served[served.length - 1]).toBe('done:1200')
 })

@@ -171,12 +171,29 @@ done), `fetched_count INTEGER`, `expected_count INTEGER`, `error TEXT`,
   immediately. At or above it, an inline warning replaces the status line:
 
   > This search matches 342,118 works. Fetching all of them takes about
-  > 1,711 OpenAlex requests and roughly 6 minutes. Narrow the query, or:
+  > 1,711 OpenAlex requests and roughly 31.4 minutes. Narrow the query, or:
   > [Cap at 10,000] [Fetch all 342,118]
 
-  Request estimate = `ceil(count / 200)`; time estimate uses the configured
-  RPS. "Cap at N" sets `searchMaxResults` to N (N = threshold / 10) and
-  starts. "Fetch all" starts uncapped.
+  Request estimate = `ceil(count / 200)`. Time estimate = `requests × 1.1s`,
+  **not** `requests / RPS`: keyword paging is strictly sequential (each
+  request needs the previous page's cursor), so the configured RPS — a
+  ceiling for parallel callers — understated a large fetch by more than an
+  order of magnitude. 1.1s/request is the measured round trip including
+  rate-limit sleep and the per-page DB write. Rendered as
+  `roughly {x} minutes` (one decimal), or `roughly {x} hours` (one decimal)
+  once the estimate reaches 5,400 seconds.
+
+  When the OpenAlex quota snapshot is live (`available`, not `stale`, with a
+  finite `remaining`) and the run needs more requests than remain, a third
+  sentence is appended and a third button appears:
+
+  > … roughly 31.4 minutes. That is more than today's remaining OpenAlex
+  > budget: 50 of 100,000 requests left. Narrow the query, or:
+  > [Cap at 10,000] [Cap at budget] [Fetch all 342,118]
+
+  "Cap at budget" (shown only when `remaining > 0`) starts with
+  `maxResults = remaining × 200`. "Cap at N" sets `searchMaxResults` to N
+  (N = threshold / 10) and starts. "Fetch all" starts uncapped.
 - Preview failures (rate limit, network) do not block: the warning is skipped
   and the search proceeds as today, with the error in the status line.
 
