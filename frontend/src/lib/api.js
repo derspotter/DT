@@ -414,16 +414,17 @@ export async function fetchSeedSources(limit = 100, { q = '' } = {}) {
   return response.json()
 }
 
-export async function fetchSeedCandidates(sourceType, sourceKey, { q = '' } = {}) {
-  const suffix = q ? `?q=${encodeURIComponent(q)}` : ''
+export async function fetchSeedCandidates(sourceType, sourceKey, { q = '', limit = 200, offset = 0, sort = '', dir = 'asc' } = {}) {
+  const params = new URLSearchParams()
+  if (q) params.set('q', q)
+  params.set('limit', String(limit))
+  params.set('offset', String(offset))
+  if (sort) { params.set('sort', sort); params.set('dir', dir) }
   const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates${suffix}`
+    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates?${params}`
   )
   await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load seed candidates')
-  }
+  if (!response.ok) throw new Error((await response.text()) || 'Failed to load seed candidates')
   return response.json()
 }
 
@@ -497,13 +498,13 @@ export async function promoteSeedCandidates(sourceType, sourceKey, {
   return response.json()
 }
 
-export async function dismissSeedCandidates(sourceType, sourceKey, candidateKeys) {
+export async function dismissSeedCandidates(sourceType, sourceKey, candidateKeys, { all = false, q = '' } = {}) {
   const response = await fetchWithTimeout(
     `${API_BASE}/api/seed/candidates/dismiss`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourceType, sourceKey, candidateKeys }),
+      body: JSON.stringify({ sourceType, sourceKey, ...(all ? { all: true, q } : { candidateKeys }) }),
     },
     PIPELINE_TIMEOUT
   )
@@ -585,6 +586,22 @@ export async function processMarkedIngestEntries({
   return response.json()
 }
 
+export async function previewKeywordSearch(body) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search/preview`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  }, 60_000)
+  await throwIfUnauthorized(response)
+  if (!response.ok) throw new Error((await response.text()) || 'Preview failed')
+  return response.json()
+}
+
+export async function cancelKeywordSearch(runId) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search/${encodeURIComponent(String(runId))}/cancel`, { method: 'POST' })
+  await throwIfUnauthorized(response)
+  if (!response.ok) throw new Error((await response.text()) || 'Cancel failed')
+  return response.json()
+}
+
 export async function runKeywordSearch({
   query,
   seedJson,
@@ -632,13 +649,14 @@ export async function runKeywordSearch({
       throw new Error(`HTTP ${response.status}`)
     }
     const payload = await response.json()
-    const data = Array.isArray(payload) ? payload : payload.results || []
+    const running = response.status === 202
+    const data = running ? [] : (Array.isArray(payload) ? payload : payload.results || [])
     return {
       data,
       source: payload.source || 'api',
       runId: payload.runId,
-      mode: payload.mode,
       expansion: payload.expansion,
+      running,
     }
   } catch (error) {
     if (error?.status === 401) {
