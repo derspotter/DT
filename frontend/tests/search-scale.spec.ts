@@ -110,6 +110,73 @@ test('Reset clears the warning instead of leaving stale "Cap at" / "Fetch all" a
   expect(searchRequests).toBe(0)
 })
 
+function makeSeedCandidates(count: number, startIndex = 0) {
+  return Array.from({ length: count }, (_, i) => {
+    const n = startIndex + i
+    return {
+      candidate_key: `c${n}`,
+      title: `Economics paper ${n}`,
+      authors: [{ name: 'A. Author' }],
+      year: 2020,
+      source: 'openalex',
+      state: 'pending',
+      in_corpus: false,
+      refs_count: n,
+      cited_by_count: n,
+    }
+  })
+}
+
+test('seed table pages through search results, shows every-item selection, and dismisses all', async ({ page }) => {
+  let lastCandidatesOffset: number | null = null
+  let dismissBody: any = null
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sources: [{
+          id: 'search:77', source_type: 'search', seed_kind: 'search', source_key: '77', label: 'economics',
+          subtitle: '', created_at: '2026-09-06T10:00:00Z', candidate_count: 300, state_counts: null,
+          removable: true, meta: {}, run: null,
+        }],
+      }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/77/candidates**', async (route) => {
+    const url = new URL(route.request().url())
+    const offset = Number(url.searchParams.get('offset') || 0)
+    lastCandidatesOffset = offset
+    const count = offset === 0 ? 200 : 100
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ candidates: makeSeedCandidates(count, offset), total: 300, offset, limit: 200 }),
+    })
+  })
+  await page.route('**/api/seed/candidates/dismiss', async (route) => {
+    dismissBody = route.request().postDataJSON()
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true, dismissed: 300 }) })
+  })
+
+  await page.goto('/')
+  await page.getByText('economics', { exact: false }).click()
+
+  const footer = page.locator('.seed-table-footer')
+  await expect(footer).toContainText('Showing 200 of 300')
+  await footer.getByRole('button', { name: 'Show more' }).click()
+  await expect.poll(() => lastCandidatesOffset).toBe(200)
+  await expect(footer).toHaveCount(0)
+
+  const selectAllCheckbox = page.locator('.seed-source__select input[type="checkbox"]')
+  await selectAllCheckbox.check()
+  await expect(page.locator('.seed-source__body .table-toolbar-left')).toContainText('All 300 items selected')
+
+  await page.getByRole('button', { name: 'Dismiss selected' }).click()
+  await expect.poll(() => dismissBody?.all).toBe(true)
+})
+
 test('a running seed shows progress and settles to done', async ({ page }) => {
   let polls = 0
   await page.route('**/api/**', mockApi)

@@ -229,6 +229,17 @@
   let seedSelections = {}
   let seedSelectionVersions = {}
   let seedSorts = {}
+  let seedPages = {}          // sourceId -> { total, offset, limit }
+  let seedAllSelected = {}    // sourceId -> true when "All N items selected"
+  const SEED_PAGE_SIZE = 200
+
+  function seedPage(source) {
+    return seedPages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
+  }
+  function seedSortParams(source) {
+    const current = seedSorts[seedSourceId(source)]
+    return current ? { sort: current.column, dir: current.direction } : { sort: '', dir: 'asc' }
+  }
   let seedColumnVisibility = loadColumnVisibility('seed')
   $: seedActiveColumns = visibleColumns('seed', seedColumnVisibility)
   // The seed table keeps a leading selection cell, so the grid gets an extra
@@ -1810,6 +1821,8 @@
     seedCandidatesBySource = {}
     seedCandidatesLoading = {}
     seedSelections = {}
+    seedPages = {}
+    seedAllSelected = {}
     seedActionStatus = ''
     seedActionBusy = false
     seedLastRunKey = ''
@@ -2702,6 +2715,8 @@
     clearTimeout(seedFilterDebounce)
     seedFilterDebounce = setTimeout(() => {
       seedCandidatesBySource = {}
+      seedPages = {}
+      seedAllSelected = {}
       loadSeedSources({ quiet: true })
     }, 300)
   }
@@ -2783,10 +2798,9 @@
     return seedCandidatesBySource[seedSourceId(source)] || []
   }
 
-  // Client-side sort for the seed candidate table. Safe because
-  // fetchSeedCandidates returns the whole candidate set for a seed in one
-  // response — there is no paging to sort across. The paged corpus table uses
-  // server-side sorting instead.
+  // Accessors used by the client-side sort (sortSeedCandidates), which only
+  // applies to PDF seeds — those load in full. Search seeds page server-side
+  // and sort server-side too (see toggleSeedSort / sortSeedCandidates).
   const SEED_SORT_ACCESSORS = {
     metadata: (candidate) => seedMetadataLabel(candidate),
     download: (candidate) => seedDownloadLabel(candidate),
@@ -2878,6 +2892,12 @@
     const current = seedSorts[sourceId]
     const direction = current && current.column === column && current.direction === 'asc' ? 'desc' : 'asc'
     seedSorts = { ...seedSorts, [sourceId]: { column, direction } }
+    // Search seeds sort server-side (the metadata/download axes require every
+    // row resolved, which the client only has for the loaded page) — reload
+    // page one under the new sort. PDF seeds keep the client-side sort below.
+    if (source.source_type === 'search') {
+      void loadSeedCandidatesForSource(source, { quiet: true })
+    }
   }
 
   // `sorts` is passed in from the template rather than read off the module
@@ -2889,6 +2909,11 @@
   }
 
   function sortSeedCandidates(source, candidates, sorts = seedSorts) {
+    // Search seeds are already sorted server-side across the full result set
+    // (see toggleSeedSort); re-sorting the loaded page client-side would only
+    // reorder what happens to be loaded, not the whole set. PDF seeds load in
+    // full, so the client-side sort below still gives a correct order.
+    if (source.source_type === 'search') return candidates
     const current = sorts[seedSourceId(source)]
     const accessor = current && SEED_SORT_ACCESSORS[current.column]
     if (!accessor) return candidates
@@ -2915,18 +2940,8 @@
   }
 
   function selectedSeedCount(source) {
-    return getSeedSelectionForSource(source).length
-  }
-
-  function promotableSeedCandidateKeys(source) {
-    return getSeedCandidatesForSource(source)
-      .filter((candidate) => isSeedCandidateSelectable(candidate))
-      .map((candidate) => String(candidate?.candidate_key || ''))
-      .filter(Boolean)
-  }
-
-  function promotableSeedCount(source) {
-    return promotableSeedCandidateKeys(source).length
+    const sourceId = seedSourceId(source)
+    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).length
   }
 
   function getSelectedSeedCandidate(source) {
@@ -2944,8 +2959,12 @@
 
   function estimatedSelectableSeedCount(source) {
     const sourceId = seedSourceId(source)
-    if (Array.isArray(seedCandidatesBySource[sourceId])) {
-      return selectableSeedCount(source)
+    const page = seedPages[sourceId]
+    if (page) {
+      // state_counts is not resolved server-side above the metadata/download
+      // sort limit (Task 5) — in that case the page total is the best estimate.
+      if (source?.state_counts == null) return page.total
+      return Math.max(0, page.total - Number(source.state_counts.in_corpus || 0))
     }
     const total = Number(source?.candidate_count || 0)
     const inCorpus = Number(source?.state_counts?.in_corpus || 0)
@@ -2971,7 +2990,20 @@
     const candidateKey = String(candidate?.candidate_key || '')
     if (!sourceId || !candidateKey || !isSeedCandidateSelectable(candidate)) return
     const current = seedSelections[sourceId] || []
-    seedSelections = current.includes(candidateKey)
+    const isSelected = current.includes(candidateKey)
+    if (isSelected && seedAllSelected[sourceId]) {
+      // Deselecting one row out of "all N selected" drops into explicit mode:
+      // everything else that's loaded stays selected, just not this row.
+      seedAllSelected = { ...seedAllSelected, [sourceId]: false }
+      const loadedSelectableKeys = getSeedCandidatesForSource(source)
+        .filter((entry) => isSeedCandidateSelectable(entry))
+        .map((entry) => String(entry?.candidate_key || ''))
+        .filter(Boolean)
+      seedSelections = { ...seedSelections, [sourceId]: loadedSelectableKeys.filter((key) => key !== candidateKey) }
+      seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+      return
+    }
+    seedSelections = isSelected
       ? { ...seedSelections, [sourceId]: current.filter((value) => value !== candidateKey) }
       : { ...seedSelections, [sourceId]: [...current, candidateKey] }
     seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
@@ -2981,6 +3013,7 @@
     const sourceId = seedSourceId(source)
     if (!sourceId) return
     seedSelections = { ...seedSelections, [sourceId]: [] }
+    seedAllSelected = { ...seedAllSelected, [sourceId]: false }
     seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
   }
 
@@ -2996,16 +3029,22 @@
   }
 
   async function setAllSeedCandidatesSelected(source, checked) {
-    if (checked) {
-      const sourceId = seedSourceId(source)
-      if (!sourceId) return
-      if (!Array.isArray(seedCandidatesBySource[sourceId]) || seedCandidatesBySource[sourceId].length === 0) {
-        await loadSeedCandidatesForSource(source, { quiet: true })
-      }
-      selectAllSeedCandidates(source)
+    if (!checked) {
+      clearSeedSelection(source)
       return
     }
-    clearSeedSelection(source)
+    const sourceId = seedSourceId(source)
+    if (!sourceId) return
+    // Search seeds can hold far more items than are loaded — "select all"
+    // there means every promotable/dismissable item server-side, tracked by
+    // seedAllSelected rather than by materializing every candidate key.
+    if (source.source_type === 'search') {
+      seedAllSelected = { ...seedAllSelected, [sourceId]: true }
+    }
+    if (!Array.isArray(seedCandidatesBySource[sourceId]) || seedCandidatesBySource[sourceId].length === 0) {
+      await loadSeedCandidatesForSource(source, { quiet: true })
+    }
+    selectAllSeedCandidates(source)
   }
 
   async function loadSeedSources({ quiet = false } = {}) {
@@ -3062,7 +3101,7 @@
     }
   }
 
-  async function loadSeedCandidatesForSource(source, { quiet = false, background = false } = {}) {
+  async function loadSeedCandidatesForSource(source, { quiet = false, background = false, append = false } = {}) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
     const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
@@ -3071,11 +3110,19 @@
       seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: true }
     }
     try {
-      const payload = await fetchSeedCandidates(source.source_type, source.source_key, { q: seedFilterQuery })
-      const nextCandidates = payload.candidates || []
+      const offset = append ? (seedCandidatesBySource[sourceId] || []).length : 0
+      const payload = await fetchSeedCandidates(source.source_type, source.source_key, {
+        q: seedFilterQuery, limit: SEED_PAGE_SIZE, offset, ...seedSortParams(source),
+      })
+      const incoming = payload.candidates || []
+      const nextCandidates = append ? [...(seedCandidatesBySource[sourceId] || []), ...incoming] : incoming
       seedCandidatesBySource = {
         ...seedCandidatesBySource,
         [sourceId]: nextCandidates,
+      }
+      seedPages = {
+        ...seedPages,
+        [sourceId]: { total: Number(payload.total || nextCandidates.length), offset, limit: SEED_PAGE_SIZE },
       }
       reconcileSeedSourceCandidates(sourceId, nextCandidates)
       if (nextCandidates.length === 0) {
@@ -3107,6 +3154,10 @@
         seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: false }
       }
     }
+  }
+
+  function loadMoreSeedCandidates(source) {
+    return loadSeedCandidatesForSource(source, { quiet: true, background: true, append: true })
   }
 
   async function toggleSeedSource(source) {
@@ -3210,6 +3261,10 @@
 
   async function handlePromoteSeedSource(source) {
     const sourceId = seedSourceId(source)
+    if (seedAllSelected[sourceId]) {
+      await handlePromoteWholeSeedSource(source)
+      return
+    }
     const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
     await promoteSeedCandidateKeys(source, candidateKeys, { clearSelection: true })
   }
@@ -3220,6 +3275,10 @@
     await promoteSeedCandidateKeys(source, [candidateKey])
   }
 
+  // Sends no candidateKeys: the backend resolves "every promotable item in
+  // this source" itself, so this is correct even when only one page of a
+  // large search seed is loaded client-side — exactly the semantics
+  // "all N items selected" needs (handlePromoteSeedSource delegates here).
   async function handlePromoteWholeSeedSource(source) {
     seedActionBusy = true
     try {
@@ -3227,15 +3286,13 @@
       if (!Array.isArray(seedCandidatesBySource[sourceId])) {
         await loadSeedCandidatesForSource(source, { quiet: true })
       }
-      const candidateKeys = promotableSeedCandidateKeys(source)
-      const candidateCount = candidateKeys.length
+      const candidateCount = estimatedSelectableSeedCount(source)
       if (candidateCount === 0) {
         seedActionStatus = 'No promotable seed candidates remain in this source.'
         return
       }
-      seedActionStatus = `Promoting ${candidateCount} candidate(s) into the corpus...`
+      seedActionStatus = `Promoting ${candidateCount.toLocaleString('en-US')} candidate(s) into the corpus...`
       await promoteSeedCandidates(source.source_type, source.source_key, {
-        candidateKeys,
         includeDownstream,
         includeUpstream,
         relatedDepthDownstream,
@@ -3264,7 +3321,7 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
-      seedActionStatus = `Promoted ${candidateCount} candidate(s). Corpus updated; workers continue in the background.`
+      seedActionStatus = `Promoted ${candidateCount.toLocaleString('en-US')} candidate(s). Corpus updated; workers continue in the background.`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -3280,15 +3337,21 @@
 
   async function handleDismissSelectedSeed(source) {
     const sourceId = seedSourceId(source)
+    const allSelected = Boolean(seedAllSelected[sourceId])
     const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
-    if (candidateKeys.length === 0) {
+    if (!allSelected && candidateKeys.length === 0) {
       seedActionStatus = 'Select at least one seed candidate to dismiss.'
       return
     }
+    const dismissLabel = allSelected ? `all ${seedPage(source).total.toLocaleString('en-US')}` : String(candidateKeys.length)
     seedActionBusy = true
-    seedActionStatus = `Removing ${candidateKeys.length} candidate(s) from Seed...`
+    seedActionStatus = `Removing ${dismissLabel} candidate(s) from Seed...`
     try {
-      await dismissSeedCandidatesApi(source.source_type, source.source_key, candidateKeys)
+      if (allSelected) {
+        await dismissSeedCandidatesApi(source.source_type, source.source_key, [], { all: true, q: seedFilterQuery })
+      } else {
+        await dismissSeedCandidatesApi(source.source_type, source.source_key, candidateKeys)
+      }
       clearSeedSelection(source)
       await Promise.all([
         loadIngestStats({ quiet: true }),
@@ -3297,7 +3360,7 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
-      seedActionStatus = `Removed ${candidateKeys.length} candidate(s) from Seed.`
+      seedActionStatus = `Removed ${dismissLabel} candidate(s) from Seed.`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -4898,7 +4961,13 @@
                         {#key `${sourceId}:toolbar:${selectionVersion}:${downstreamPromotesAll}`}
                           <div class="table-toolbar">
                             <div class="table-toolbar-left">
-                              <span class="muted">Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable</span>
+                              <span class="muted">
+                                {#if seedAllSelected[sourceId]}
+                                  All {seedPage(source).total.toLocaleString('en-US')} items selected
+                                {:else}
+                                  Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable
+                                {/if}
+                              </span>
                               <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
                               <button class="secondary" type="button" on:click={() => selectAllSeedCandidates(source)} disabled={seedActionBusy}>Select all</button>
                               <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
@@ -4926,9 +4995,16 @@
                               <div class="table-row header" style={seedGridStyle}>
                                 <span class="ingest-select-cell" aria-hidden="true"></span>
                                 {#each seedActiveColumns as column (column.key)}
+                                  {@const sortDisabled = (column.key === 'metadata' || column.key === 'download') && source.source_type === 'search' && seedPage(source).total > 2000}
                                   <span title={column.hint || ''}>
                                     {#if column.sortable}
-                                      <button class="table-sort" type="button" on:click={() => toggleSeedSort(source, column.key)}>
+                                      <button
+                                        class="table-sort"
+                                        type="button"
+                                        disabled={sortDisabled}
+                                        title={sortDisabled ? 'Sorting by state needs every item resolved; not available above 2,000 items' : ''}
+                                        on:click={() => toggleSeedSort(source, column.key)}
+                                      >
                                         {column.label}{seedSortIndicator(source, column.key, seedSorts)}
                                       </button>
                                     {:else}
@@ -5033,6 +5109,12 @@
                                 {/if}
                               {/each}
                             </div>
+                            {#if seedPage(source).total > sourceCandidates.length}
+                              <div class="seed-table-footer">
+                                <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {seedPage(source).total.toLocaleString('en-US')}</span>
+                                <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
+                              </div>
+                            {/if}
                           {/key}
                         {/if}
                       </div>

@@ -4785,6 +4785,13 @@ button.danger:disabled {
   max-height: none;
 }
 
+.seed-table-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+}
+
 .corpus-workspace-shell .corpus-table {
   flex: 1;
   min-height: 0;
