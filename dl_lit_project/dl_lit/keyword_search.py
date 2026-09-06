@@ -160,17 +160,20 @@ SORT_OPTIONS = {
 }
 
 
-def search_openalex(query: str,
-                    max_results: int | None = 200,
-                    year_from: int | None = None,
-                    year_to: int | None = None,
-                    mailto: str | None = None,
-                    field: str | None = "default",
-                    author: str | None = None,
-                    sort: str | None = None) -> list[dict]:
+class _NoAuthorMatch(Exception):
+    """Raised internally when an author filter was requested but resolved to nobody."""
+
+
+def _build_search_params(query: str,
+                         year_from: int | None,
+                         year_to: int | None,
+                         mailto: str | None,
+                         field: str | None,
+                         author: str | None,
+                         sort: str | None) -> tuple[dict, str]:
+    """Everything search_openalex sends except pagination. Returns (params, openalex_query)."""
     raw_query = (query or '').strip()
     openalex_query = build_openalex_query_text(raw_query) if raw_query else ''
-    rate_limiter = get_global_rate_limiter()
 
     sort_value = None
     if sort:
@@ -179,7 +182,6 @@ def search_openalex(query: str,
             raise ValueError(f"Unknown sort option: {sort}")
 
     params = {
-        "per-page": 200,
         "select": "id,doi,display_name,authorships,publication_year,type,abstract_inverted_index,keywords,primary_location,open_access,biblio,referenced_works_count,cited_by_count",
     }
     if mailto:
@@ -206,7 +208,7 @@ def search_openalex(query: str,
     filters = []
     author_ids = resolve_openalex_author_ids(author, mailto=mailto) if author else []
     if author and not author_ids:
-        return []
+        raise _NoAuthorMatch()
     if author_ids:
         filters.append(f"authorships.author.id:{'|'.join(author_ids[:100])}")
     year_from_value = int(year_from) if year_from not in (None, '') else None
@@ -234,27 +236,68 @@ def search_openalex(query: str,
     if sort_value and not (sort_value.startswith("relevance") and not openalex_query):
         params["sort"] = sort_value
 
+    return params, openalex_query
+
+
+def search_openalex(query: str,
+                    max_results: int | None = 200,
+                    year_from: int | None = None,
+                    year_to: int | None = None,
+                    mailto: str | None = None,
+                    field: str | None = "default",
+                    author: str | None = None,
+                    sort: str | None = None,
+                    on_page=None) -> list[dict]:
+    try:
+        params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort)
+    except _NoAuthorMatch:
+        return []
+
     # Use cursor-based pagination for robustness
+    params["per-page"] = 200
     params["cursor"] = "*"
+    rate_limiter = get_global_rate_limiter()
     results: list[dict] = []
     seen_ids: set[str] = set()
 
     while True:
         data = _openalex_request('works', params, rate_limiter)
+        page_items = []
         for item in data.get("results", []):
             item_id = item.get("id")
             if not item_id or item_id in seen_ids:
                 continue
             seen_ids.add(item_id)
             results.append(item)
+            page_items.append(item)
             if max_results is not None and len(results) >= max_results:
-                return results
-        next_cursor = data.get("meta", {}).get("next_cursor")
+                break
+        if on_page is not None and page_items:
+            on_page(page_items, data.get("meta") or {})
+        if max_results is not None and len(results) >= max_results:
+            return results
+        next_cursor = (data.get("meta") or {}).get("next_cursor")
         if not next_cursor:
             break
         params["cursor"] = next_cursor
 
     return results
+
+
+def count_openalex(query: str,
+                   year_from: int | None = None,
+                   year_to: int | None = None,
+                   mailto: str | None = None,
+                   field: str | None = "default",
+                   author: str | None = None) -> int:
+    """How many works the same search would return. One request, per-page=1."""
+    try:
+        params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort=None)
+    except _NoAuthorMatch:
+        return 0
+    params["per-page"] = 1
+    data = _openalex_request('works', params, get_global_rate_limiter())
+    return int((data.get("meta") or {}).get("count") or 0)
 
 
 def openalex_result_to_record(item: dict, run_id: int | None = None) -> dict:
