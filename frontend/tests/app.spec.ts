@@ -26,13 +26,20 @@ async function ensureSignedIn(page: Page, request: APIRequestContext) {
   await expect(page.getByText(/items found/).first()).toContainText('items found')
 }
 
+// The submit handler now checks the match count before it starts the run
+// (Task 7: preflight preview), so the status text passes through
+// "Checking how many works match..." and "Starting search..." before it
+// reaches a terminal state. Wait past both, not just the old "Searching..."
+// literal, or this resolves mid-preflight instead of once the run settles.
+const SEARCH_IN_PROGRESS = ['Checking how many works match...', 'Starting search...', 'Searching...']
+
 async function waitUntilSearchSettled(page: Page) {
   const status = page.locator('.seed-intake-card--search p.muted').first()
   await expect
     .poll(
       async () => {
-        const value = (await status.textContent()) || ''
-        return value.includes('Searching...')
+        const value = ((await status.textContent()) || '').trim()
+        return SEARCH_IN_PROGRESS.includes(value)
       },
       { timeout: 120_000 }
     )

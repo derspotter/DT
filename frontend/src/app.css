@@ -5355,6 +5355,11 @@ button.danger:disabled {
   gap: 4px;
 }
 
+.search-preview { margin: 6px 0 0; }
+.search-warning { margin-top: 8px; padding: 10px 12px; border: 1px solid #f59e0b; border-radius: var(--radius-md); background: #fffbeb; }
+.search-warning p { margin: 0 0 8px; }
+.search-warning__actions { display: flex; gap: 8px; justify-content: flex-end; }
+
 .corpus-actions-cell {
   display: inline-flex;
   align-items: center;

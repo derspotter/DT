@@ -51,6 +51,7 @@
     downloadCorpusExport,
     createCorpusItemDownloadUrl,
     fetchOpenAlexQuota,
+    previewKeywordSearch,
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
@@ -260,6 +261,9 @@
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
+  let searchPreview = null
+  let searchWarning = false
+  let searchPreviewBusy = false
   let searchSelection = []
   let searchQueueConfigs = {}
   let searchQueueStatus = ''
@@ -3298,41 +3302,67 @@
     }
   }
 
+  function buildSearchBody(maxResults) {
+    return {
+      query: searchQuery, seedJson: '', field: searchField, author: searchAuthor, yearFrom, yearTo,
+      maxResults: Math.max(0, Math.trunc(Number(maxResults) || 0)), sort: searchSort,
+      includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
+      maxRelated: 30, fallbackToSample: false,
+    }
+  }
+
+  function searchEstimate(count) {
+    const requests = Math.ceil(count / 200)
+    const rps = Number(appSettings?.openalex_rps?.value || appSettings?.openalex_rps?.env_fallback || 30) || 30
+    const minutes = requests / rps / 60
+    return { requests, minutes: minutes.toFixed(1) }
+  }
+
+  // Submit: ask for the count first; warn above the threshold, else start.
   async function runSearch() {
-    searchStatus = 'Searching...'
+    searchWarning = false
+    searchStatus = 'Checking how many works match...'
+    searchPreviewBusy = true
     try {
-      const { data, source, expansion, runId } = await runKeywordSearch({
-        query: searchQuery,
-        seedJson: '',
-        field: searchField,
-        author: searchAuthor,
-        yearFrom,
-        yearTo,
-        maxResults: Math.max(0, Math.trunc(Number(searchMaxResults) || 0)),
-        sort: searchSort,
-        includeDownstream: false,
-        includeUpstream: false,
-        relatedDepthDownstream: 0,
-        relatedDepthUpstream: 0,
-        maxRelated: 30,
-        fallbackToSample: false,
-      })
-      searchResults = data
-      loadOpenAlexQuota()
+      searchPreview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
+    } catch (error) {
+      // A failed preview must not block the search.
+      searchPreview = null
+    } finally {
+      searchPreviewBusy = false
+    }
+    const cap = Math.max(0, Math.trunc(Number(searchMaxResults) || 0))
+    if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
+      searchWarning = true
+      searchStatus = ''
+      return
+    }
+    await startSearch()
+  }
+
+  async function startSearch({ maxResultsOverride = null } = {}) {
+    searchWarning = false
+    if (maxResultsOverride !== null) searchMaxResults = maxResultsOverride
+    searchStatus = 'Starting search...'
+    try {
+      const { data, source, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
       searchSource = source
+      loadOpenAlexQuota()
+      if (runId) {
+        await loadSeedSources({ quiet: true })
+        await focusSeedSource('search', runId)
+      }
+      if (running) {
+        searchStatus = 'Fetching in the background. The seed below fills in as pages arrive.'
+        return
+      }
+      searchResults = data
       initializeSearchQueueConfig(data)
       searchQueueStatus = ''
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
-      if (runId) {
-        await loadSeedSources()
-        await focusSeedSource('search', runId)
-      }
       searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
       searchStatus = error?.message || 'Search failed.'
     }
   }
@@ -4612,6 +4642,19 @@
                   </label>
                   <div class="seed-search-footer">
                     <p class="muted">{searchStatus}</p>
+                    {#if searchPreview && !searchWarning}
+                      <p class="muted small search-preview" data-testid="search-preview">About {searchPreview.count.toLocaleString('en-US')} works match</p>
+                    {/if}
+                    {#if searchWarning && searchPreview}
+                      {@const est = searchEstimate(searchPreview.count)}
+                      <div class="search-warning" role="alert" data-testid="search-warning">
+                        <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests and roughly {est.minutes} minutes. Narrow the query, or:</p>
+                        <div class="search-warning__actions">
+                          <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: Math.floor(searchPreview.threshold / 10) })}>Cap at {Math.floor(searchPreview.threshold / 10).toLocaleString('en-US')}</button>
+                          <button class="primary" type="button" on:click={() => startSearch()}>Fetch all {searchPreview.count.toLocaleString('en-US')}</button>
+                        </div>
+                      </div>
+                    {/if}
                     <div class="seed-search-actions">
                       <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
                       <button class="primary" type="submit">Search</button>
