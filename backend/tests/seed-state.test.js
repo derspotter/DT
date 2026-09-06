@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { ensureSeedSchema, listSeedCandidates, listSeedSources } from '../src/seed.js'
+import { ensureSeedSchema, listSeedCandidates, listSeedSources, countSeedCandidates, dismissAllSeedCandidates } from '../src/seed.js'
 
 function createSeedDb() {
   const db = new Database(':memory:')
@@ -402,5 +402,74 @@ describe('listSeedSources with only + q', () => {
     const [filtered] = listSeedSources(db, 130, { only, q: 'shuttle' })
     expect(filtered.candidate_count).toBe(1)
     expect(listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'shuttle' })).toHaveLength(1)
+  })
+})
+
+describe('search seed paging, sorting and run status', () => {
+  let db
+
+  function seedRun(n) {
+    db = createSearchSeedDb()
+    db.exec(`ALTER TABLE search_runs ADD COLUMN query TEXT; ALTER TABLE search_runs ADD COLUMN filters_json TEXT;
+             ALTER TABLE search_runs ADD COLUMN status TEXT; ALTER TABLE search_runs ADD COLUMN fetched_count INTEGER;
+             ALTER TABLE search_runs ADD COLUMN expected_count INTEGER; ALTER TABLE search_runs ADD COLUMN error TEXT;`)
+    db.prepare(`UPDATE search_runs SET query = 'big', status = 'running', fetched_count = ?, expected_count = 500 WHERE id = 7`).run(n)
+    const ins = db.prepare(`INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (?, 7, ?, ?, ?)`)
+    for (let i = 1; i <= n; i += 1) {
+      ins.run(i, `Title ${String(i).padStart(3, '0')}`, String(1900 + i), JSON.stringify({
+        referenced_works_count: n - i, cited_by_count: i * 10,
+        authorships: [{ author: { display_name: i % 2 ? 'Zed Author' : 'Anna Author' } }],
+        primary_location: { source: { display_name: i % 3 ? 'Journal A' : 'Journal B' } },
+      }))
+    }
+  }
+
+  afterEach(() => { db?.close(); db = null })
+
+  test('pages in SQL and reports the total', () => {
+    seedRun(25)
+    const page = listSeedCandidates(db, 130, 'search', '7', { limit: 10, offset: 10, sort: 'title', dir: 'asc' })
+    expect(page).toHaveLength(10)
+    expect(page[0].title).toBe('Title 011')
+    expect(countSeedCandidates(db, 130, 'search', '7', {})).toBe(25)
+  })
+
+  test('sorts by refs descending in SQL with blanks last', () => {
+    seedRun(5)
+    db.prepare(`UPDATE search_results SET raw_json = '{}' WHERE id = 3`).run()
+    const rows = listSeedCandidates(db, 130, 'search', '7', { limit: 5, offset: 0, sort: 'refs', dir: 'desc' })
+    expect(rows.map((r) => r.refs_count)).toEqual([4, 3, 1, 0, null])
+  })
+
+  test('filter and dismissals apply before paging', () => {
+    seedRun(6)
+    db.prepare(`INSERT INTO seed_candidates_dismissed (corpus_id, source_type, source_key, candidate_key) VALUES (130, 'search', '7', 'search:1')`).run()
+    expect(countSeedCandidates(db, 130, 'search', '7', { q: 'title 00' })).toBe(5)
+    const rows = listSeedCandidates(db, 130, 'search', '7', { q: 'title 00', limit: 2, offset: 0, sort: 'title', dir: 'asc' })
+    expect(rows.map((r) => r.title)).toEqual(['Title 002', 'Title 003'])
+  })
+
+  test('seed sources carry the run status and skip state counts above the limit', () => {
+    process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT = '10'
+    try {
+      seedRun(12)
+      const [source] = listSeedSources(db, 130)
+      expect(source.run).toEqual({ status: 'running', fetched_count: 12, expected_count: 500, error: null })
+      expect(source.candidate_count).toBe(12)
+      expect(source.state_counts).toBeNull()
+    } finally {
+      delete process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT
+    }
+  })
+
+  test('a running run with no results yet is still listed', () => {
+    seedRun(0)
+    expect(listSeedSources(db, 130).map((s) => s.source_key)).toEqual(['7'])
+  })
+
+  test('dismissAllSeedCandidates dismisses the filtered set', () => {
+    seedRun(4)
+    expect(dismissAllSeedCandidates(db, 130, 'search', '7', { q: 'title 00' })).toBe(4)
+    expect(countSeedCandidates(db, 130, 'search', '7', {})).toBe(0)
   })
 })

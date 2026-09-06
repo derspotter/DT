@@ -18,14 +18,20 @@ import {
   upsertSearchRunCorpus,
   listSeedSources,
   listSeedCandidates,
+  countSeedCandidates,
   hideSeedSource,
   dismissSeedCandidates,
+  dismissAllSeedCandidates,
   resolveSeedDocumentPath,
   createStateResolver,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Allowed seed-candidate sort keys: the six SQL sorts (title/year/authors/
+// source/refs/cited_by) plus the two JS-only sorts (metadata/download).
+const SEED_CANDIDATE_SORT_KEYS = new Set(['title', 'year', 'authors', 'source', 'refs', 'cited_by', 'metadata', 'download']);
 
 function findUpwards(startDir, childName) {
   // Walk up parents until we find a directory or file named `childName`.
@@ -5027,11 +5033,22 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       // One resolver for both calls: building it is the expensive part.
       const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
       const q = String(req.query?.q || '').trim();
+      const limit = Math.max(1, Math.min(2000, coerceInt(req.query?.limit, 200) || 200));
+      const offset = Math.max(0, coerceInt(req.query?.offset, 0) || 0);
+      const sort = SEED_CANDIDATE_SORT_KEYS.has(String(req.query?.sort || '').trim().toLowerCase())
+        ? String(req.query?.sort || '').trim().toLowerCase()
+        : '';
+      const dir = String(req.query?.dir || '').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
         q,
+        limit,
+        offset,
+        sort,
+        dir,
       });
+      const total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
       const sourceSummary = listSeedSources(authDb, req.corpusId, {
         limit: 500,
         resolveDownloadedFilePath: findDownloadedFilePath,
@@ -5047,7 +5064,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         source: 'db',
         source_summary: sourceSummary,
         candidates,
-        total: candidates.length,
+        total,
+        offset,
+        limit,
       });
     } catch (error) {
       console.error('[/api/seed/sources/:sourceType/:sourceKey/candidates] Error:', error);
@@ -5360,10 +5379,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     try {
       const sourceType = String(req.body?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.body?.sourceKey || '').trim();
-      const candidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
+      if (req.body?.all === true) {
+        const q = String(req.body?.q || '').trim();
+        const dismissed = dismissAllSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
+        return res.json({ success: true, dismissed });
+      }
+      const candidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
       if (candidateKeys.length === 0) {
         return res.status(400).json({ error: 'candidateKeys must be a non-empty array' });
       }

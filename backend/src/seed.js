@@ -5,6 +5,11 @@ function tableExists(db, tableName) {
   return Boolean(row)
 }
 
+function tableHasColumn(db, tableName, columnName) {
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all()
+  return rows.some((row) => row.name === columnName)
+}
+
 function parseJson(value, fallback = null) {
   if (value === undefined || value === null || value === '') return fallback
   if (typeof value === 'object') return value
@@ -670,49 +675,108 @@ export function matchesSeedQuery(candidate, needle) {
   return haystack.includes(needle)
 }
 
-export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null, q = '' } = {}) {
+// Sort expressions for the search branch, evaluated in SQL. Kept as
+// single-quoted string literals for the JSON path argument — SQLite treats a
+// double-quoted token as an identifier first and only falls back to a string
+// literal, which silently misbehaves for json_extract paths.
+const SEARCH_SORT_SQL = {
+  title: `LOWER(COALESCE(sr.title, ''))`,
+  year: `CAST(sr.year AS INTEGER)`,
+  authors: `LOWER(COALESCE(json_extract(sr.raw_json, '$.authorships[0].author.display_name'), ''))`,
+  source: `LOWER(COALESCE(json_extract(sr.raw_json, '$.primary_location.source.display_name'), ''))`,
+  refs: `json_extract(sr.raw_json, '$.referenced_works_count')`,
+  cited_by: `json_extract(sr.raw_json, '$.cited_by_count')`,
+}
+const SEARCH_JS_SORTS = new Set(['metadata', 'download'])
+
+function seedStateCountLimit() {
+  const parsed = Number(process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT || 2000)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 2000
+}
+
+function searchCandidateWhere(corpusId, runId, sourceRef, needle) {
+  const where = ['src.corpus_id = ?', 'sr.search_run_id = ?',
+    `NOT EXISTS (SELECT 1 FROM seed_candidates_dismissed d
+                 WHERE d.corpus_id = ? AND d.source_type = 'search' AND d.source_key = ? AND d.candidate_key = 'search:' || sr.id)`]
+  const params = [corpusId, runId, corpusId, sourceRef]
+  if (needle) {
+    where.push(`(LOWER(COALESCE(sr.title, '')) LIKE ? OR LOWER(COALESCE(json_extract(sr.raw_json, '$.authorships[0].author.display_name'), '')) LIKE ?
+                 OR LOWER(COALESCE(json_extract(sr.raw_json, '$.primary_location.source.display_name'), '')) LIKE ?)`)
+    const like = `%${needle}%`
+    params.push(like, like, like)
+  }
+  return { where: where.join(' AND '), params }
+}
+
+export function countSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '' } = {}) {
+  const needle = String(q || '').trim().toLowerCase()
+  const sourceKind = String(sourceType || '').trim().toLowerCase()
+  const sourceRef = String(sourceKey || '').trim()
+  if (sourceKind === 'pdf') {
+    return listSeedCandidates(db, corpusId, 'pdf', sourceRef, { q }).length
+  }
+  const runId = Number(sourceRef)
+  if (!Number.isFinite(runId) || runId <= 0) return 0
+  const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
+  return db.prepare(`SELECT COUNT(*) AS n FROM search_results sr JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id WHERE ${where}`).get(...params).n
+}
+
+export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null, q = '', limit = null, offset = 0, sort = '', dir = 'asc' } = {}) {
   const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   if (!sourceRef || !['pdf', 'search'].includes(sourceKind)) return []
 
   const resolverBundle = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
-  const dismissed = loadDismissedCandidateKeySet(db, corpusId, sourceKind, sourceRef)
   const inCorpusMarked = loadInCorpusCandidateKeySet(db, corpusId, sourceKind, sourceRef)
 
   if (sourceKind === 'pdf') {
+    const dismissed = loadDismissedCandidateKeySet(db, corpusId, sourceKind, sourceRef)
     const rows = db.prepare(
       `SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, created_at
        FROM ingest_entries
        WHERE corpus_id = ? AND ingest_source = ?
        ORDER BY created_at DESC, id DESC`
     ).all(corpusId, sourceRef)
-    return sortSeedCandidates(rows
+    const candidates = sortSeedCandidates(rows
       .map((row) => {
         const candidate = normalizePdfCandidate(row, sourceRef, resolverBundle)
         return applyExplicitCorpusMembership(candidate, inCorpusMarked)
       })
       .filter((candidate) => !dismissed.has(candidate.candidate_key))
       .filter((candidate) => matchesSeedQuery(candidate, needle)))
+    return limit !== null ? candidates.slice(Number(offset) || 0, (Number(offset) || 0) + Number(limit)) : candidates
   }
 
   const runId = Number(sourceRef)
   if (!Number.isFinite(runId) || runId <= 0) return []
+  const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
+  const sortKey = String(sort || '').trim().toLowerCase()
+  const direction = String(dir || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC'
+  const sqlSort = SEARCH_SORT_SQL[sortKey]
+  // Blanks last in both directions: NULL/'' sort after real values.
+  const orderBy = sqlSort
+    ? `(${sqlSort} IS NULL OR ${sqlSort} = '') ASC, ${sqlSort} ${direction}, sr.id DESC`
+    : 'sr.id DESC'
+  const useSqlPaging = limit !== null && !SEARCH_JS_SORTS.has(sortKey)
+  const pageSql = useSqlPaging ? ' LIMIT ? OFFSET ?' : ''
   const rows = db.prepare(
     `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at
      FROM search_results sr
      JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id
      JOIN search_runs s ON s.id = sr.search_run_id
-     WHERE src.corpus_id = ? AND sr.search_run_id = ?
-     ORDER BY sr.id DESC`
-  ).all(corpusId, runId)
-  return sortSeedCandidates(rows
-    .map((row) => {
-      const candidate = normalizeSearchCandidate(row, resolverBundle)
-      return applyExplicitCorpusMembership(candidate, inCorpusMarked)
-    })
-    .filter((candidate) => !dismissed.has(candidate.candidate_key))
-    .filter((candidate) => matchesSeedQuery(candidate, needle)))
+     WHERE ${where}
+     ORDER BY ${orderBy}${pageSql}`
+  ).all(...params, ...(useSqlPaging ? [Number(limit), Number(offset) || 0] : []))
+  let candidates = rows.map((row) => applyExplicitCorpusMembership(normalizeSearchCandidate(row, resolverBundle), inCorpusMarked))
+  if (SEARCH_JS_SORTS.has(sortKey)) {
+    const label = sortKey === 'metadata' ? (c) => String(c.metadata_status || c.state || '') : (c) => String(c.download_status || c.state || '')
+    candidates.sort((a, b) => label(a).localeCompare(label(b)) * (direction === 'DESC' ? -1 : 1))
+    if (limit !== null) candidates = candidates.slice(Number(offset) || 0, (Number(offset) || 0) + Number(limit))
+  } else if (!sqlSort) {
+    candidates = sortSeedCandidates(candidates)
+  }
+  return candidates
 }
 
 function summarizeStates(candidates) {
@@ -761,20 +825,26 @@ export function listSeedSources(db, corpusId, {
   const onlyType = only ? String(only.sourceType || '').trim().toLowerCase() : ''
   const onlyKey = only ? String(only.sourceKey || '').trim() : ''
   const wanted = (type, key) => !only || (onlyType === type && onlyKey === String(key || '').trim())
+  // Some seed-only test fixtures (and, in principle, an old DB mid-migration)
+  // have ingest_entries without ingest_source_metadata; a LEFT JOIN against a
+  // table that doesn't exist fails at prepare time, so skip the join instead
+  // of just leaving it unmatched.
+  const hasSeedMetadata = tableExists(db, 'ingest_source_metadata')
   const pdfSources = db.prepare(
     `SELECT ie.ingest_source AS source_key,
             MAX(ie.created_at) AS created_at,
             COUNT(*) AS entry_count,
-            MAX(ism.title) AS seed_title,
+            ${hasSeedMetadata ? `MAX(ism.title) AS seed_title,
             MAX(ism.authors) AS seed_authors,
             MAX(ism.year) AS seed_year,
             MAX(ism.doi) AS seed_doi,
             MAX(ism.source) AS seed_source,
             MAX(ism.publisher) AS seed_publisher,
-            MAX(ism.source_pdf) AS source_pdf
+            MAX(ism.source_pdf) AS source_pdf` : `NULL AS seed_title, NULL AS seed_authors, NULL AS seed_year,
+            NULL AS seed_doi, NULL AS seed_source, NULL AS seed_publisher, NULL AS source_pdf`}
      FROM ingest_entries ie
-     LEFT JOIN ingest_source_metadata ism
-       ON ism.corpus_id = ie.corpus_id AND ism.ingest_source = ie.ingest_source
+     ${hasSeedMetadata ? `LEFT JOIN ingest_source_metadata ism
+       ON ism.corpus_id = ie.corpus_id AND ism.ingest_source = ie.ingest_source` : ''}
      LEFT JOIN seed_sources_hidden ssh
        ON ssh.corpus_id = ie.corpus_id AND ssh.source_type = 'pdf' AND ssh.source_key = ie.ingest_source
      WHERE ie.corpus_id = ?
@@ -784,6 +854,7 @@ export function listSeedSources(db, corpusId, {
      ORDER BY MAX(ie.created_at) DESC`
   ).all(corpusId)
 
+  const hasRunStatus = tableExists(db, 'search_runs') && tableHasColumn(db, 'search_runs', 'status')
   const searchSources = tableExists(db, 'search_run_corpora')
     ? db.prepare(
       `SELECT sr.id AS source_key,
@@ -791,9 +862,10 @@ export function listSeedSources(db, corpusId, {
               sr.query,
               sr.filters_json,
               COUNT(sres.id) AS entry_count
+              ${hasRunStatus ? ', sr.status, sr.fetched_count, sr.expected_count, sr.error' : ''}
        FROM search_runs sr
        JOIN search_run_corpora src ON src.search_run_id = sr.id
-       JOIN search_results sres ON sres.search_run_id = sr.id
+       LEFT JOIN search_results sres ON sres.search_run_id = sr.id
        LEFT JOIN seed_sources_hidden ssh
          ON ssh.corpus_id = src.corpus_id AND ssh.source_type = 'search' AND ssh.source_key = CAST(sr.id AS TEXT)
        WHERE src.corpus_id = ?
@@ -835,8 +907,13 @@ export function listSeedSources(db, corpusId, {
   searchSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
     if (!sourceKey || !wanted('search', sourceKey)) return
-    const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q })
-    if (candidates.length === 0) return
+    const total = countSeedCandidates(db, corpusId, 'search', sourceKey, { q })
+    const run = row.status !== undefined
+      ? { status: row.status || null, fetched_count: row.fetched_count ?? null, expected_count: row.expected_count ?? null, error: row.error || null }
+      : null
+    if (total === 0 && run?.status !== 'running') return
+    const withinLimit = total <= seedStateCountLimit()
+    const candidates = withinLimit ? listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q }) : []
     const filters = parseJson(row.filters_json, {}) || {}
     const direction = String(filters.expansion_direction || '').trim().toLowerCase()
     const isSnowball = direction === 'downstream' || direction === 'upstream'
@@ -857,8 +934,9 @@ export function listSeedSources(db, corpusId, {
       label: row.query || `Search #${sourceKey}`,
       subtitle: formatSearchSubtitle(row),
       created_at: row.created_at,
-      candidate_count: candidates.length,
-      state_counts: summarizeStates(candidates),
+      candidate_count: total,
+      state_counts: withinLimit ? summarizeStates(candidates) : null,
+      run,
       removable: true,
       meta: { query: row.query, filters },
     })
@@ -894,6 +972,14 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
   })
   tx(normalized)
   return normalized.length
+}
+
+// Dismisses every candidate currently matching the filter (a one-off action,
+// so loading the filtered rows once to collect their keys is acceptable even
+// for a large search seed).
+export function dismissAllSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '' } = {}) {
+  const keys = listSeedCandidates(db, corpusId, sourceType, sourceKey, { q }).map((c) => c.candidate_key)
+  return dismissSeedCandidates(db, corpusId, sourceType, sourceKey, keys)
 }
 
 // The original upload for a seed document. `ingest_source_metadata.source_pdf`
