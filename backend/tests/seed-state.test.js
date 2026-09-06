@@ -384,6 +384,10 @@ describe('listSeedSources with only + q', () => {
     db.exec(`
       CREATE TABLE search_runs (id INTEGER PRIMARY KEY, query TEXT, filters_json TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
       CREATE TABLE search_results (id INTEGER PRIMARY KEY, search_run_id INTEGER NOT NULL, title TEXT, doi TEXT, openalex_id TEXT, year TEXT, raw_json TEXT);
+      CREATE TABLE ingest_source_metadata (
+        corpus_id INTEGER NOT NULL DEFAULT 0, ingest_source TEXT NOT NULL, source_pdf TEXT,
+        title TEXT, authors TEXT, year INTEGER, doi TEXT, source TEXT, publisher TEXT
+      );
     `)
     db.prepare(
       `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
