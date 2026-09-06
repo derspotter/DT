@@ -987,6 +987,30 @@ export function pruneOrphanedCorpusRows(db) {
   return removed;
 }
 
+// Background keyword-search runs: PID handles for runs currently in flight,
+// keyed by search_runs.id, so the cancel route can signal them.
+const activeSearchRuns = new Map();
+
+function searchWarnThreshold() {
+  const raw = appSettingsEnv().RAG_FEEDER_SEARCH_WARN_THRESHOLD || process.env.RAG_FEEDER_SEARCH_WARN_THRESHOLD || '';
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 100000;
+}
+
+// Runs left in status='running' from before this backend process started
+// (e.g. a restart mid-search) can never finish — no child process is coming
+// back to update them. Mark them failed so the UI stops polling them.
+export function markOrphanedSearchRuns(db, startedAtIso) {
+  if (!tableExists(db, 'search_runs')) return 0;
+  const cols = db.prepare('PRAGMA table_info(search_runs)').all().map((c) => c.name);
+  if (!cols.includes('status')) return 0;
+  const result = db
+    .prepare(`UPDATE search_runs SET status = 'failed', error = 'backend restarted', finished_at = CURRENT_TIMESTAMP
+              WHERE status = 'running' AND created_at < ?`)
+    .run(startedAtIso);
+  return result.changes;
+}
+
 function pruneStaleCorpusItems(db) {
   if (!tableExists(db, 'works') || !tableExists(db, 'corpus_works')) return;
   db.exec(
@@ -1973,6 +1997,59 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
   if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
+// Shared by /api/keyword-search and /api/keyword-search/preview: validates
+// the request body and builds the keyword_search.py argv. `error` is set
+// (and `args` unusable) when a required filter is missing.
+function buildKeywordSearchArgs(req) {
+  const query = req.body?.query?.trim();
+  const seedJson = req.body?.seedJson;
+  const author = req.body?.author?.trim() || '';
+  const yearFrom = coerceInt(req.body?.yearFrom, null);
+  const yearTo = coerceInt(req.body?.yearTo, null);
+  if (!query && !seedJson && !author && !yearFrom && !yearTo) {
+    return { error: 'query, seedJson, author, or year filter is required' };
+  }
+
+  const field = req.body?.field || 'default';
+  // 0 = uncapped; the user opts into a cap via maxResults
+  const maxResults = Math.max(0, Math.trunc(coerceInt(req.body?.maxResults, 0) ?? 0));
+  const sort = typeof req.body?.sort === 'string' ? req.body.sort.trim() : '';
+  if (sort && !KEYWORD_SEARCH_SORTS.has(sort)) {
+    return { error: `Unknown sort option: ${sort}` };
+  }
+  const mailto = req.body?.mailto || '';
+  const enqueue = Boolean(req.body?.enqueue);
+  const dbPath = DB_PATH;
+
+  const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
+  if (sort) args.push('--sort', sort);
+  const expansion = buildKeywordSearchExpansion({
+    relatedDepth: coerceInt(req.body?.relatedDepth, null),
+    relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
+    relatedDepthUpstream: coerceInt(req.body?.relatedDepthUpstream, null),
+    maxRelated: coerceInt(req.body?.maxRelated, null),
+    includeDownstream: req.body?.includeDownstream,
+    includeUpstream: req.body?.includeUpstream,
+    relatedSort: req.body?.relatedSort,
+    promotionMode: req.body?.promotionMode,
+  });
+
+  if (seedJson) {
+    const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
+    args.push('--seed-json', seedPayload);
+  } else {
+    args.push('--query', query || '');
+  }
+  if (author) args.push('--author', author);
+  if (yearFrom) args.push('--year-from', String(yearFrom));
+  if (yearTo) args.push('--year-to', String(yearTo));
+  if (mailto) args.push('--mailto', String(mailto));
+  if (enqueue) args.push('--enqueue');
+  applyKeywordSearchExpansionArgs(args, expansion);
+
+  return { args };
+}
+
 function buildUploadedDocsExpansion(body = {}) {
   const explicitDepth = coerceInt(body?.relatedDepth, null)
   return {
@@ -2038,6 +2115,7 @@ let appSettingsDb = null;
 const APP_SETTING_DEFS = [
   { key: 'openalex_api_key', env: 'OPENALEX_API_KEY', secret: true },
   { key: 'openalex_rps', env: 'RAG_FEEDER_OPENALEX_RPS', secret: false },
+  { key: 'search_warn_threshold', env: 'RAG_FEEDER_SEARCH_WARN_THRESHOLD', secret: false },
   { key: 'llm_provider', env: 'RAG_FEEDER_LLM_PROVIDER', secret: false },
   { key: 'openai_base_url', env: 'RAG_FEEDER_OPENAI_BASE_URL', secret: false },
   { key: 'openai_api_key', env: 'OPENAI_API_KEY', secret: true },
@@ -2461,6 +2539,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   if (Object.keys(prunedOrphans).length > 0) {
     console.log('[startup] Removed rows for deleted corpora:', prunedOrphans);
   }
+  const orphanedRuns = markOrphanedSearchRuns(authDb, new Date().toISOString());
+  if (orphanedRuns > 0) console.log(`[startup] Marked ${orphanedRuns} interrupted search run(s) as failed`);
   const requireAuthMiddleware = requireAuth(authDb, authConfig);
   const pruneCorpusDownloadTickets = () => {
     const now = Date.now();
@@ -3432,6 +3512,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const parsed = Number(rps);
       if (!Number.isFinite(parsed) || parsed <= 0) {
         return res.status(400).json({ error: 'openalex_rps must be a positive number' });
+      }
+    }
+    const searchWarnThresholdUpdate = updates.search_warn_threshold;
+    if (searchWarnThresholdUpdate !== undefined && String(searchWarnThresholdUpdate).trim() !== '') {
+      const parsed = Number(searchWarnThresholdUpdate);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: 'search_warn_threshold must be a positive integer' });
       }
     }
     try {
@@ -4808,70 +4895,76 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   // Legacy `/api/bibliographies/consolidate` endpoint removed (DB-first pipeline).
 
-  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
-    const query = req.body?.query?.trim();
-    const seedJson = req.body?.seedJson;
-    const author = req.body?.author?.trim() || '';
-    const yearFrom = coerceInt(req.body?.yearFrom, null);
-    const yearTo = coerceInt(req.body?.yearTo, null);
-    if (!query && !seedJson && !author && !yearFrom && !yearTo) {
-      return res.status(400).json({ error: 'query, seedJson, author, or year filter is required' });
-    }
-
+  app.post('/api/keyword-search/preview', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+    const built = buildKeywordSearchArgs(req);
+    if (built.error) return res.status(400).json({ error: built.error });
+    const threshold = searchWarnThreshold();
     if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ runId: 0, results: STUB_RESULTS.keywordResults, source: 'stub' });
+      return res.json({ count: STUB_RESULTS.keywordResults.length, threshold });
     }
-
-    const field = req.body?.field || 'default';
-    // 0 = uncapped; the user opts into a cap via maxResults
-    const maxResults = Math.max(0, Math.trunc(coerceInt(req.body?.maxResults, 0) ?? 0));
-    const sort = typeof req.body?.sort === 'string' ? req.body.sort.trim() : '';
-    if (sort && !KEYWORD_SEARCH_SORTS.has(sort)) {
-      return res.status(400).json({ error: `Unknown sort option: ${sort}` });
-    }
-    const mailto = req.body?.mailto || '';
-    const enqueue = Boolean(req.body?.enqueue);
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
-    if (sort) args.push('--sort', sort);
-    const expansion = buildKeywordSearchExpansion({
-      relatedDepth: coerceInt(req.body?.relatedDepth, null),
-      relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
-      relatedDepthUpstream: coerceInt(req.body?.relatedDepthUpstream, null),
-      maxRelated: coerceInt(req.body?.maxRelated, null),
-      includeDownstream: req.body?.includeDownstream,
-      includeUpstream: req.body?.includeUpstream,
-      relatedSort: req.body?.relatedSort,
-      promotionMode: req.body?.promotionMode,
-    });
-
-    if (seedJson) {
-      const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
-      args.push('--seed-json', seedPayload);
-    } else {
-      args.push('--query', query || '');
-    }
-    if (author) args.push('--author', author);
-    if (yearFrom) args.push('--year-from', String(yearFrom));
-    if (yearTo) args.push('--year-to', String(yearTo));
-    if (mailto) args.push('--mailto', String(mailto));
-    if (enqueue) args.push('--enqueue');
-    applyKeywordSearchExpansionArgs(args, expansion);
-
     try {
-      const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      if (Number.isFinite(Number(payload?.runId)) && Number(payload.runId) > 0 && Number.isFinite(Number(req.corpusId))) {
-        upsertSearchRunCorpus(authDb, {
-          searchRunId: Number(payload.runId),
-          corpusId: Number(req.corpusId),
-        });
-      }
-      return res.json(payload);
+      const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, [...built.args, '--count-only'], { dbPath: DB_PATH, corpusId: req.corpusId });
+      return res.json({ count: Number(payload?.count || 0), threshold });
     } catch (error) {
-      console.error('[/api/keyword-search] Error:', error);
-      return res.status(500).json({ error: error.message || 'Keyword search failed' });
+      console.error('[/api/keyword-search/preview] Error:', error);
+      return res.status(502).json({ error: error.message || 'Preview failed' });
     }
+  });
+
+  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const built = buildKeywordSearchArgs(req);
+    if (built.error) return res.status(400).json({ error: built.error });
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({
+        runId: 0,
+        results: STUB_RESULTS.keywordResults,
+        source: 'stub',
+        fetched_count: STUB_RESULTS.keywordResults.length,
+        truncated_results: false,
+      });
+    }
+    let responded = false;
+    const { child, done } = spawnPythonJson(KEYWORD_SEARCH_SCRIPT, built.args, {
+      dbPath: DB_PATH,
+      corpusId: req.corpusId,
+      onStdoutLine: (line) => {
+        if (!line.startsWith('{')) return;
+        let event;
+        try { event = JSON.parse(line); } catch { return; }
+        if (event?.event === 'run_created' && !responded) {
+          const runId = Number(event.runId);
+          if (Number.isFinite(runId) && runId > 0) {
+            upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: Number(req.corpusId) });
+            activeSearchRuns.set(runId, child);
+            responded = true;
+            res.status(202).json({ runId, status: 'running' });
+          }
+        }
+      },
+    });
+    done
+      .catch((error) => {
+        console.error('[/api/keyword-search] Search script failed:', error?.message || error);
+        if (!responded) { responded = true; res.status(500).json({ error: error?.message || 'Keyword search failed' }); }
+      })
+      .finally(() => {
+        for (const [runId, proc] of activeSearchRuns) if (proc === child) activeSearchRuns.delete(runId);
+        if (!responded) { responded = true; res.status(500).json({ error: 'Search ended before creating a run' }); }
+      });
+  });
+
+  app.post('/api/keyword-search/:runId/cancel', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const runId = Number(req.params.runId);
+    const child = activeSearchRuns.get(runId);
+    if (!child) return res.status(404).json({ error: 'No running search with that id' });
+    const owner = tableExists(authDb, 'search_run_corpora')
+      ? authDb.prepare('SELECT corpus_id FROM search_run_corpora WHERE search_run_id = ?').get(runId)
+      : null;
+    if (!owner || Number(owner.corpus_id) !== Number(req.corpusId)) {
+      return res.status(404).json({ error: 'No running search with that id' });
+    }
+    child.kill('SIGTERM');
+    return res.json({ cancelled: true });
   });
 
   app.get('/api/seed/sources', requireAuthMiddleware, (req, res) => {

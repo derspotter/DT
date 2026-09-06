@@ -30,6 +30,7 @@ const dumpFile = process.env.ARG_DUMP_FILE
 if (dumpFile) {
   fs.writeFileSync(dumpFile, JSON.stringify(process.argv.slice(2)))
 }
+console.log(JSON.stringify({ event: 'run_created', runId: 1 }))
 console.log(JSON.stringify({ results: [], source: 'fake-python' }))
 `
     fs.writeFileSync(fakePython, script)
@@ -151,7 +152,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       includeUpstream: true,
     })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args).toContain('--related-depth-downstream')
     expect(args).toContain('4')
@@ -167,7 +168,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       includeUpstream: false,
     })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args).toContain('--query')
     expect(args[args.indexOf('--query') + 1]).toBe('')
@@ -182,7 +183,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       includeDownstream: false,
       includeUpstream: false,
     })
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args).toContain('--no-include-downstream')
     expect(args).not.toContain('--include-upstream')
@@ -191,7 +192,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
   test('defaults keyword search to uncapped results and no sort', async () => {
     const res = await doKeywordSearch({ query: 'institutional economics' })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args[args.indexOf('--max-results') + 1]).toBe('0')
     expect(args).not.toContain('--sort')
@@ -204,7 +205,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       sort: 'newest',
     })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args[args.indexOf('--max-results') + 1]).toBe('25')
     expect(args[args.indexOf('--sort') + 1]).toBe('newest')
@@ -216,7 +217,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       sort: '   ',
     })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args).not.toContain('--sort')
   })
@@ -236,7 +237,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       maxResults: 25.5,
     })
 
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const args = readArgFile(argFile)
     expect(args[args.indexOf('--max-results') + 1]).toBe('25')
   })
@@ -282,7 +283,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       maxRelated: 5,
       relatedSort: 'newest',
     })
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const argv = readArgFile(argFile)
     expect(argv).toEqual(expect.arrayContaining(['--related-sort', 'newest']))
   })
@@ -294,7 +295,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       relatedDepthDownstream: 1,
       relatedSort: 'not-a-sort',
     })
-    expect(res.status).toBe(200)
+    expect(res.status).toBe(202)
     const argv = readArgFile(argFile)
     expect(argv).toEqual(expect.arrayContaining(['--related-sort', 'most_cited']))
   })
