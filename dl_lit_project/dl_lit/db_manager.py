@@ -72,6 +72,16 @@ class DatabaseManager:
         self._ensure_column("works", "referenced_work_ids", "TEXT")
         self._ensure_column("works", "cited_by_api_url", "TEXT")
 
+    def _ensure_search_runs_columns(self) -> None:
+        """Run lifecycle for background keyword searches (round 2, phase 3)."""
+        if not self._table_columns("search_runs"):
+            return
+        self._ensure_column("search_runs", "status", "TEXT")
+        self._ensure_column("search_runs", "fetched_count", "INTEGER")
+        self._ensure_column("search_runs", "expected_count", "INTEGER")
+        self._ensure_column("search_runs", "error", "TEXT")
+        self._ensure_column("search_runs", "finished_at", "TIMESTAMP")
+
     def close_connection(self):
         """Closes the database connection."""
         if hasattr(self, 'conn') and self.conn:
@@ -268,6 +278,7 @@ class DatabaseManager:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._ensure_search_runs_columns()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS search_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2504,15 +2515,35 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error adding entry to duplicate_references: {e} (Entry: {bibtex_key_val}){RESET}")
             return None, str(e)
 
-    def create_search_run(self, query: str, filters: dict | None = None) -> int:
-        """Create a new search run record and return its ID."""
+    def create_search_run(self, query: str, filters: dict | None = None, status: str | None = None) -> int:
+        """Create a search run. `status` is 'running' for background fetches; None for legacy one-shot runs."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO search_runs (query, filters_json) VALUES (?, ?)",
-            (query, json.dumps(filters) if filters else None),
+            "INSERT INTO search_runs (query, filters_json, status, fetched_count) VALUES (?, ?, ?, ?)",
+            (query, json.dumps(filters) if filters else None, status, 0 if status else None),
         )
         self.conn.commit()
         return cursor.lastrowid
+
+    def update_search_run_progress(self, run_id: int, fetched: int, expected: int | None) -> None:
+        self.conn.execute(
+            "UPDATE search_runs SET fetched_count = ?, expected_count = ? WHERE id = ?",
+            (int(fetched), int(expected) if expected is not None else None, int(run_id)),
+        )
+        self.conn.commit()
+
+    def finish_search_run(self, run_id: int, status: str, error: str | None = None) -> None:
+        if status not in ("done", "failed", "cancelled"):
+            raise ValueError(f"Unknown search run status: {status}")
+        self.conn.execute(
+            "UPDATE search_runs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, error, int(run_id)),
+        )
+        self.conn.commit()
+
+    def count_search_results(self, run_id: int) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM search_results WHERE search_run_id = ?", (int(run_id),)).fetchone()
+        return int(row[0] if row else 0)
 
     def add_search_results(self, search_run_id: int, results: list[dict]) -> int:
         """Insert search results for a run. Returns number of inserted rows."""
