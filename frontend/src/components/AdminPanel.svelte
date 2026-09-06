@@ -64,7 +64,7 @@
     <div class="workspace-panel-header">
       <div class="workspace-panel-title">
         <h3 class="workspace-section-title">External APIs &amp; LLM</h3>
-        <p class="muted">Instance-wide. A blank field falls back to the server environment.</p>
+        <p class="muted">Instance-wide. A blank field falls back to the server environment, except API keys: a blank key keeps the stored one, so type a new key to replace it.</p>
       </div>
     </div>
 

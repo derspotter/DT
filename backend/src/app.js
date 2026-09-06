@@ -974,7 +974,9 @@ export function pruneOrphanedCorpusRows(db) {
   for (const table of CORPUS_SCOPED_TABLES) {
     if (!tableExists(db, table)) continue;
     const result = db
-      .prepare(`DELETE FROM ${table} WHERE corpus_id IS NOT NULL AND corpus_id NOT IN (SELECT id FROM corpora)`)
+      // corpus_id 0 is the schema default and the fallback some write paths
+      // still use when no corpus is known; it is legacy, not an orphan.
+      .prepare(`DELETE FROM ${table} WHERE corpus_id > 0 AND corpus_id NOT IN (SELECT id FROM corpora)`)
       .run();
     if (result.changes > 0) removed[table] = result.changes;
   }

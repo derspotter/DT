@@ -181,6 +181,16 @@ describe('pruneOrphanedCorpusRows', () => {
     expect(db.prepare('SELECT COUNT(*) AS n FROM search_results').get().n).toBe(2)
   })
 
+  test('leaves corpus_id 0 rows alone: schema default and no-corpus fallback, not orphans', () => {
+    db = createDb()
+    db.prepare("INSERT INTO ingest_source_metadata VALUES (0, 'legacy-doc')").run()
+    db.prepare('INSERT INTO pipeline_jobs (id, corpus_id) VALUES (1, 0)').run()
+    db.prepare('INSERT INTO pipeline_jobs (id, corpus_id) VALUES (2, NULL)').run()
+    expect(pruneOrphanedCorpusRows(db)).toEqual({})
+    expect(db.prepare('SELECT COUNT(*) AS n FROM ingest_source_metadata').get().n).toBe(1)
+    expect(db.prepare('SELECT COUNT(*) AS n FROM pipeline_jobs').get().n).toBe(2)
+  })
+
   test('is a no-op on a clean database', () => {
     db = createDb()
     db.prepare('INSERT INTO corpora (id, name) VALUES (8, ?)').run('alive')
