@@ -88,6 +88,11 @@
           <input type="number" min="1" step="1" placeholder="30" bind:value={appSettingsDraft.openalex_rps} />
           <span class="muted small">{fallbackHint(appSettings.openalex_rps)}</span>
         </label>
+        <label>
+          <span class="muted small">Warn when a search matches at least</span>
+          <input type="number" min="1000" step="1000" placeholder="100000" bind:value={appSettingsDraft.search_warn_threshold} />
+          <span class="muted small">{fallbackHint(appSettings.search_warn_threshold)}</span>
+        </label>
         <div class="admin-settings-form__readonly">
           <span class="muted small">Daily budget</span>
           <span data-testid="admin-openalex-quota">{openalexQuotaText}</span>

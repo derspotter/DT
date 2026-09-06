@@ -4022,6 +4022,7 @@
         openai_api_key: '',
         gemini_api_key: '',
         openalex_rps: appSettings?.openalex_rps?.value || '',
+        search_warn_threshold: appSettings?.search_warn_threshold?.value || '',
         llm_provider: appSettings?.llm_provider?.value || '',
         openai_base_url: appSettings?.openai_base_url?.value || '',
         extract_model: appSettings?.extract_model?.value || '',

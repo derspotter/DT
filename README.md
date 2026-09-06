@@ -82,6 +82,15 @@ budget headers. The Python request helper writes them to
 Search button. Without a key OpenAlex does not report a budget and the pill
 says so.
 
+### Large keyword searches
+
+Submitting a search first asks OpenAlex how many works match. At or above
+`RAG_FEEDER_SEARCH_WARN_THRESHOLD` (default 100,000) the search card warns
+with a request estimate and offers a capped run. The search itself runs in
+the background: the seed appears at once and fills in page by page, with a
+cancel action; a cancelled or failed run keeps what it already stored. Seeds
+page their items 200 at a time and sort on the server.
+
 ## Live Deploys Behind Caddy
 
 Do not patch tracked compose files on the server. Keep the live host and Caddy labels in an untracked `docker-compose.override.yml` instead so a `git pull` cannot wipe them.
