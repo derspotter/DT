@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import signal
 import sys
 from collections import deque
 from pathlib import Path
@@ -22,7 +23,13 @@ from dl_lit.OpenAlexScraper import (
     fetch_referenced_work_details,
 )
 from dl_lit.db_manager import DatabaseManager
-from dl_lit.keyword_search import SORT_OPTIONS, dedupe_results, effective_max_results, search_openalex
+from dl_lit.keyword_search import (
+    SORT_OPTIONS,
+    count_openalex,
+    dedupe_results,
+    effective_max_results,
+    search_openalex,
+)
 from dl_lit.utils import (
     OpenAlexRateLimitExceeded,
     get_global_rate_limiter,
@@ -594,7 +601,26 @@ def _render_results(records):
     return results
 
 
+_progress_stream = sys.stdout
+
+
+def _emit(event: dict) -> None:
+    """Progress lines go to the real stdout; main() redirects sys.stdout while the DB works."""
+    _progress_stream.write(json.dumps(event) + "\n")
+    _progress_stream.flush()
+
+
+def _inline_results_limit(cli_value):
+    if cli_value is not None:
+        return max(0, int(cli_value))
+    try:
+        return max(0, int(os.environ.get('RAG_FEEDER_SEARCH_INLINE_RESULTS', '1000')))
+    except ValueError:
+        return 1000
+
+
 def main():
+    global _progress_stream
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--query')
@@ -639,10 +665,21 @@ def main():
         default=DEFAULT_INCLUDE_UPSTREAM,
         help='Include upstream works that cite each work.',
     )
+    parser.add_argument('--count-only', action='store_true')
+    parser.add_argument('--inline-results-limit', type=int, default=None)
     args = parser.parse_args()
 
     if os.environ.get('RAG_FEEDER_STUB') == '1':
         print(json.dumps({'runId': 0, 'results': STUB_RESULTS, 'source': 'stub'}))
+        return
+
+    if args.count_only:
+        if args.query is None:
+            print(json.dumps({'count': 0}))
+            return
+        count = count_openalex(query=args.query or '', year_from=args.year_from, year_to=args.year_to,
+                               author=args.author, field=args.field, mailto=args.mailto)
+        print(json.dumps({'count': int(count)}))
         return
 
     db_path = Path(args.db_path)
@@ -665,6 +702,7 @@ def main():
     )
     max_related = max(1, int(args.max_related or 1))
 
+    _progress_stream = sys.stdout
     with contextlib.redirect_stdout(io.StringIO()):
         db = DatabaseManager(db_path=db_path)
         is_query_mode = args.query is not None
@@ -686,64 +724,89 @@ def main():
             'include_upstream': args.include_upstream,
         }
         run_query_label = args.query if is_query_mode and args.query else (args.author or '[filtered-search]' if is_query_mode else '[seed-json]')
-        run_id = db.create_search_run(query=run_query_label, filters=filters)
+        run_id = db.create_search_run(query=run_query_label, filters=filters, status='running')
+        _emit({'event': 'run_created', 'runId': run_id})
 
-        if is_query_mode:
-            base_items = search_openalex(
-                query=args.query or '',
-                max_results=effective_max_results(args.max_results),
-                year_from=args.year_from,
-                year_to=args.year_to,
-                author=args.author,
-                field=args.field,
-                mailto=args.mailto,
-                sort=args.sort,
+        state = {'fetched': 0, 'expected': None, 'seen': set()}
+
+        def persist(items, meta):
+            records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(items)]
+            fresh = []
+            for r in records:
+                key = r.get('openalex_id') or r.get('doi') or r.get('title')
+                if not key or key in state['seen']:
+                    continue
+                state['seen'].add(key)
+                fresh.append(r)
+            if fresh:
+                db.add_search_results(run_id, [
+                    {'openalex_id': r.get('openalex_id'), 'doi': r.get('doi'), 'title': r.get('title'),
+                     'year': r.get('year'), 'raw_json': r.get('openalex_json')}
+                    for r in fresh
+                ])
+            state['fetched'] += len(fresh)
+            if state['expected'] is None and meta and meta.get('count') is not None:
+                cap = effective_max_results(args.max_results)
+                state['expected'] = min(int(meta['count']), cap) if cap else int(meta['count'])
+            db.update_search_run_progress(run_id, state['fetched'], state['expected'])
+            _emit({'event': 'progress', 'fetched': state['fetched'], 'expected': state['expected']})
+
+        def on_sigterm(signum, frame):
+            db.finish_search_run(run_id, 'cancelled')
+            db.close_connection()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, on_sigterm)
+
+        try:
+            if is_query_mode:
+                base_items = search_openalex(
+                    query=args.query or '', max_results=effective_max_results(args.max_results),
+                    year_from=args.year_from, year_to=args.year_to, author=args.author,
+                    field=args.field, mailto=args.mailto, sort=args.sort, on_page=persist,
+                )
+            else:
+                seeds = _parse_seed_json(args.seed_json)
+                base_items = [w for w in (_resolve_seed_item(s, mailto=args.mailto) for s in seeds) if w]
+                persist(base_items, {'count': len(base_items)})
+
+            all_items, expansion_stats = expand_references_recursive(
+                base_items, related_depth_downstream=related_depth_downstream,
+                related_depth_upstream=related_depth_upstream, max_related=max_related,
+                mailto=args.mailto, include_downstream=args.include_downstream,
+                include_upstream=args.include_upstream, related_sort=args.related_sort,
             )
-        else:
-            seeds = _parse_seed_json(args.seed_json)
-            base_items = []
-            for seed in seeds:
-                work = _resolve_seed_item(seed, mailto=args.mailto)
-                if work:
-                    base_items.append(work)
+            # Expansion results are new items beyond the base set: persist the delta.
+            base_ids = {_normalize_candidate_id(i.get('id')) for i in base_items}
+            extra = [i for i in all_items if _normalize_candidate_id(i.get('id')) not in base_ids]
+            if extra:
+                state['expected'] = (state['expected'] or 0) + len(extra)
+                persist(extra, None)
 
-        all_items, expansion_stats = expand_references_recursive(
-            base_items,
-            related_depth_downstream=related_depth_downstream,
-            related_depth_upstream=related_depth_upstream,
-            max_related=max_related,
-            mailto=args.mailto,
-            include_downstream=args.include_downstream,
-            include_upstream=args.include_upstream,
-            related_sort=args.related_sort,
-        )
-
-        records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]
-        records = dedupe_results(records)
-
-        db.add_search_results(run_id, [
-            {
-                'openalex_id': r.get('openalex_id'),
-                'doi': r.get('doi'),
-                'title': r.get('title'),
-                'year': r.get('year'),
-                'raw_json': r.get('openalex_json'),
-            }
-            for r in records
-        ])
-
-        if args.enqueue:
-            for record in records:
-                db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
-
+            records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]
+            records = dedupe_results(records)
+            if args.enqueue:
+                for record in records:
+                    db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
+            db.finish_search_run(run_id, 'done')
+        except SystemExit:
+            raise
+        except Exception as exc:
+            db.finish_search_run(run_id, 'failed', error=str(exc)[:500])
+            db.close_connection()
+            raise
         db.close_connection()
 
+    limit = _inline_results_limit(args.inline_results_limit)
+    truncated = state['fetched'] > limit
     payload = {
         'runId': run_id,
-        'results': _render_results(records),
+        'results': [] if truncated else _render_results(records),
         'source': 'openalex',
         'mode': mode_label,
         'expansion': expansion_stats,
+        'fetched_count': state['fetched'],
+        'truncated_results': truncated,
     }
     print(json.dumps(payload))
 
