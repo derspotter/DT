@@ -4921,16 +4921,20 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       }
       // One resolver for both calls: building it is the expensive part.
       const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
+      const q = String(req.query?.q || '').trim();
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
-        q: String(req.query?.q || '').trim(),
+        q,
       });
       const sourceSummary = listSeedSources(authDb, req.corpusId, {
         limit: 500,
         resolveDownloadedFilePath: findDownloadedFilePath,
         stateResolver,
         only: { sourceType, sourceKey },
+        // Same filter as the candidate list, so candidate_count / state_counts
+        // describe what is actually returned.
+        q,
       }).find(
         (source) => source.source_type === sourceType && String(source.source_key) === sourceKey
       ) || null;

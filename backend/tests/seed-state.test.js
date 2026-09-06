@@ -370,3 +370,33 @@ describe('seed state resolver cache', () => {
     expect(listSeedCandidates(db, 130, 'search', '7')[0].state).toBe('downloaded_elsewhere')
   })
 })
+
+describe('listSeedSources with only + q', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  test('summary counts reflect the text filter, matching the filtered candidate list', () => {
+    db = createSeedDb()
+    db.exec(`
+      CREATE TABLE search_runs (id INTEGER PRIMARY KEY, query TEXT, filters_json TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE search_results (id INTEGER PRIMARY KEY, search_run_id INTEGER NOT NULL, title TEXT, doi TEXT, openalex_id TEXT, year TEXT, raw_json TEXT);
+    `)
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
+       VALUES (1, 130, 'basare', 'Bazaar Economies', '["Anna Author"]', '2001', 'Journal of Labour Studies')`
+    ).run()
+    db.prepare(
+      `INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, authors, year, source)
+       VALUES (2, 130, 'basare', 'Shuttle Trade', '["Bert Writer"]', '2015', 'Economic Review')`
+    ).run()
+    const only = { sourceType: 'pdf', sourceKey: 'basare' }
+    expect(listSeedSources(db, 130, { only })[0].candidate_count).toBe(2)
+    const [filtered] = listSeedSources(db, 130, { only, q: 'shuttle' })
+    expect(filtered.candidate_count).toBe(1)
+    expect(listSeedCandidates(db, 130, 'pdf', 'basare', { q: 'shuttle' })).toHaveLength(1)
+  })
+})
