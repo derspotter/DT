@@ -3130,9 +3130,13 @@
           ? `Loaded ${seedSources.length} seed${seedSources.length === 1 ? '' : 's'}.`
           : 'No seeds yet.'
       }
+      // Only re-pull the expanded seed's rows while something is actually
+      // filling in. The workspace polls the (cheap) seed list continuously,
+      // but an idle expanded seed has nothing new to show, and re-requesting
+      // it every cycle made the backend re-resolve the whole seed forever.
       if (expandedSeedSourceId) {
         const expandedSource = seedSources.find((source) => seedSourceId(source) === expandedSeedSourceId)
-        if (expandedSource) {
+        if (expandedSource && (anySearchRunning || expandedSource?.run?.status === 'running')) {
           await loadSeedCandidatesForSource(expandedSource, { quiet: true, background: true })
         }
       }
@@ -3192,6 +3196,9 @@
       const limit = background && !append ? Math.max(SEED_PAGE_SIZE, currentlyLoaded.length) : SEED_PAGE_SIZE
       const payload = await fetchSeedCandidates(source.source_type, source.source_key, {
         q: seedFilterQuery, limit, offset, ...seedSortParams(source),
+        // A background poll never reads source_summary; skipping its state
+        // counts saves a full-seed resolution per poll.
+        lightSummary: background,
       })
       if (token !== seedCandidatesRequestTokens.get(sourceId)) return
       const incoming = payload.candidates || []

@@ -414,12 +414,17 @@ export async function fetchSeedSources(limit = 100, { q = '' } = {}) {
   return response.json()
 }
 
-export async function fetchSeedCandidates(sourceType, sourceKey, { q = '', limit = 200, offset = 0, sort = '', dir = 'asc' } = {}) {
+// `lightSummary` asks the route to skip the source_summary state counts,
+// which cost a full-seed state resolution. Background polls do not read them
+// (the expanded seed's pills come from reconcileSeedSourceCandidates over the
+// rows already on screen), so they pay for nothing.
+export async function fetchSeedCandidates(sourceType, sourceKey, { q = '', limit = 200, offset = 0, sort = '', dir = 'asc', lightSummary = false } = {}) {
   const params = new URLSearchParams()
   if (q) params.set('q', q)
   params.set('limit', String(limit))
   params.set('offset', String(offset))
   if (sort) { params.set('sort', sort); params.set('dir', dir) }
+  if (lightSummary) params.set('summary', 'light')
   const response = await fetchWithTimeout(
     `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates?${params}`
   )

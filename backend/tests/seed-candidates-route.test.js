@@ -269,6 +269,29 @@ describe('seed sources route: the list skips per-candidate state resolution', ()
     expect(expanded.status).toBe(200)
     expect(expanded.body.source_summary.state_counts).toMatchObject({ pending: 3 })
   })
+
+  test('summary=light drops the summary state counts but keeps the rest of the response', async () => {
+    const res = await request(app)
+      .get('/api/seed/sources/search/9/candidates')
+      .query({ summary: 'light' })
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.source_summary).toBeTruthy()
+    expect(res.body.source_summary.state_counts).toBeNull()
+    // Everything a background poll actually reads is unchanged.
+    expect(res.body.source_summary.candidate_count).toBe(3)
+    expect(res.body.total).toBe(3)
+    expect(res.body.candidates).toHaveLength(3)
+  })
+
+  test('any other summary value keeps the full counts', async () => {
+    const res = await request(app)
+      .get('/api/seed/sources/search/9/candidates')
+      .query({ summary: 'full' })
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.source_summary.state_counts).toMatchObject({ pending: 3 })
+  })
 })
 
 describe('promote route: filtered "promote all" only resolves candidates matching q', () => {

@@ -364,6 +364,93 @@ test('promoting while a seed filter is active forwards q to the promote request'
   expect(promoteBody.candidateKeys).toEqual([])
 })
 
+test('an idle expanded seed is not re-requested on every workspace poll', async ({ page }) => {
+  // The workspace polls the (cheap) seed list continuously. The expanded
+  // seed's candidates must NOT be re-pulled with it while nothing is running:
+  // that route resolves the whole seed's state, so a forever-poll was four
+  // full-seed passes per cycle.
+  let candidateRequests = 0
+  const summaryFlags: (string | null)[] = []
+  let sourceRequests = 0
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    sourceRequests += 1
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sources: [{
+          id: 'search:41', source_type: 'search', seed_kind: 'search', source_key: '41', label: 'idle seed',
+          subtitle: '', created_at: '2026-09-06T10:00:00Z', candidate_count: 3, state_counts: null,
+          removable: true, meta: {}, run: { status: 'done', fetched_count: 3, expected_count: 3, error: null },
+        }],
+      }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/41/candidates**', async (route) => {
+    candidateRequests += 1
+    summaryFlags.push(new URL(route.request().url()).searchParams.get('summary'))
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ candidates: makeSeedCandidates(3), total: 3, offset: 0, limit: 200 }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByText('idle seed', { exact: false }).click()
+  await expect(page.locator('.seed-candidate-table .table-row.clickable')).toHaveCount(3)
+  const afterExpand = candidateRequests
+  const sourcesAfterExpand = sourceRequests
+
+  await page.waitForTimeout(7000)
+  // The seed list itself kept polling (that is the I2 fix)...
+  expect(sourceRequests).toBeGreaterThan(sourcesAfterExpand + 1)
+  // ...but the expensive candidates route was not touched again.
+  expect(candidateRequests).toBe(afterExpand)
+  // And the pills survived without it: reconcileSeedSourceCandidates derives
+  // them from the rows already loaded, not from source_summary.
+  await expect(page.locator('.pill-row').first()).toContainText('3 items')
+})
+
+test('an expanded seed with a running run keeps refreshing, with a light summary', async ({ page }) => {
+  let candidateRequests = 0
+  const summaryFlags: (string | null)[] = []
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sources: [{
+          id: 'search:42', source_type: 'search', seed_kind: 'search', source_key: '42', label: 'live seed',
+          subtitle: '', created_at: '2026-09-06T10:00:00Z', candidate_count: 3, state_counts: null,
+          removable: true, meta: {}, run: { status: 'running', fetched_count: 3, expected_count: 999, error: null },
+        }],
+      }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/42/candidates**', async (route) => {
+    candidateRequests += 1
+    summaryFlags.push(new URL(route.request().url()).searchParams.get('summary'))
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ candidates: makeSeedCandidates(3), total: 3, offset: 0, limit: 200 }),
+    })
+  })
+
+  await page.goto('/')
+  await page.getByText('live seed', { exact: false }).click()
+  await expect(page.locator('.seed-candidate-table .table-row.clickable')).toHaveCount(3)
+  const afterExpand = candidateRequests
+  // A running run keeps the rows current.
+  await expect.poll(() => candidateRequests, { timeout: 10_000 }).toBeGreaterThan(afterExpand)
+  // The initial expand asks for the full summary; the background polls do not.
+  expect(summaryFlags[0]).toBeNull()
+  expect(summaryFlags.slice(afterExpand)).toContain('light')
+})
+
 test('a running seed shows progress and settles to done', async ({ page }) => {
   // The transition is driven by the test, not by how many times the 2s poll
   // happens to have fired: a request-count trigger made this flake whenever a

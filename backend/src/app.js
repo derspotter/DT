@@ -5124,11 +5124,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         dir,
       });
       if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+      // `summary=light` drops the summary's state counts, which cost a
+      // full-seed state resolution. Background polls send it (they never read
+      // them); the initial expand and user-driven reloads do not.
+      const lightSummary = String(req.query?.summary || '').trim().toLowerCase() === 'light';
       const sourceSummary = listSeedSources(authDb, req.corpusId, {
         limit: 500,
         resolveDownloadedFilePath: findDownloadedFilePath,
         stateResolver,
         only: { sourceType, sourceKey },
+        withStateCounts: !lightSummary,
         // Same filter as the candidate list, so candidate_count / state_counts
         // describe what is actually returned.
         q,
