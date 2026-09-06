@@ -789,9 +789,11 @@ def main():
                 for record in records:
                     db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
             db.finish_search_run(run_id, 'done')
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
         except SystemExit:
             raise
         except Exception as exc:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
             db.finish_search_run(run_id, 'failed', error=str(exc)[:500])
             db.close_connection()
             raise

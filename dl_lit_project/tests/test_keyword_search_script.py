@@ -1,7 +1,11 @@
 import importlib.util
 import json
+import os
+import signal
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parents[2] / 'backend' / 'scripts' / 'keyword_search.py'
 SCRIPTS_DIR = SCRIPT.parent
@@ -80,3 +84,53 @@ def test_count_only(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--count-only"])
     mod.main()
     assert _events(capsys)[-1] == {"count": 342118}
+
+
+def test_sigterm_marks_cancelled_and_exits_zero(monkeypatch, tmp_path, capsys):
+    mod = _load(monkeypatch)
+
+    def fake_search(**kwargs):
+        on_page = kwargs["on_page"]
+        on_page([{"id": "https://openalex.org/W1", "display_name": "one"}], {"count": 5})
+        os.kill(os.getpid(), signal.SIGTERM)
+        # Unreachable once the handler exits, but harmless if the signal is
+        # somehow delivered later than expected.
+        return []
+
+    monkeypatch.setattr(mod, "search_openalex", fake_search)
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--corpus-id", "1"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main()
+    assert excinfo.value.code == 0
+
+    events = _events(capsys)
+    run_id = events[0]["runId"]
+    from dl_lit.db_manager import DatabaseManager
+    db = DatabaseManager(db_path=tmp_path / "t.db")
+    row = db.conn.execute("SELECT status, fetched_count FROM search_runs WHERE id = ?", (run_id,)).fetchone()
+    assert tuple(row) == ("cancelled", 1)
+    db.close_connection()
+
+
+def test_truncation_when_inline_limit_exceeded(monkeypatch, tmp_path, capsys):
+    mod = _load(monkeypatch)
+    items = [
+        {"id": "https://openalex.org/W1", "display_name": "one"},
+        {"id": "https://openalex.org/W2", "display_name": "two"},
+    ]
+
+    def fake_search(**kwargs):
+        kwargs["on_page"](items, {"count": 2})
+        return items
+
+    monkeypatch.setattr(mod, "search_openalex", fake_search)
+    monkeypatch.setattr(sys, "argv", [
+        "x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--corpus-id", "1",
+        "--inline-results-limit", "0",
+    ])
+    mod.main()
+    final = _events(capsys)[-1]
+    assert final["truncated_results"] is True
+    assert final["results"] == []
+    assert final["fetched_count"] == 2
