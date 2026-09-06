@@ -194,6 +194,83 @@ describe('seed candidates route: paging clamps and dismiss-all', () => {
   })
 })
 
+describe('seed candidates route: state sorts are refused above the resolve limit', () => {
+  // Sorting by metadata/download resolves every candidate in JS, so the route
+  // must refuse it above RAG_FEEDER_SEED_STATE_COUNT_LIMIT rather than
+  // materializing an unbounded seed.
+  let originalLimit
+
+  beforeAll(() => {
+    const db = new Database(dbPath)
+    try {
+      db.prepare(`INSERT INTO search_runs (id, query, status) VALUES (9, 'state sort guard', 'done')`).run()
+      db.prepare(`INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (9, ?)`).run(corpusId)
+      const ins = db.prepare(
+        `INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (?, 9, ?, ?, '{}')`
+      )
+      for (let i = 1; i <= 3; i += 1) ins.run(900 + i, `Guard Title ${i}`, String(2010 + i))
+    } finally {
+      db.close()
+    }
+    originalLimit = process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT
+  })
+
+  afterAll(() => {
+    if (originalLimit === undefined) delete process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT
+    else process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT = originalLimit
+  })
+
+  test.each(['metadata', 'download'])('400s a %s sort over a seed larger than the limit', async (sort) => {
+    process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT = '2'
+    const res = await request(app)
+      .get('/api/seed/sources/search/9/candidates')
+      .query({ sort, dir: 'asc' })
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(res.status).toBe(400)
+    expect(res.body.error).toBe('Sorting by state needs every item resolved; not available above 2 items')
+  })
+
+  test('allows the same sort once the seed fits under the limit', async () => {
+    process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT = '10'
+    const res = await request(app)
+      .get('/api/seed/sources/search/9/candidates')
+      .query({ sort: 'download', dir: 'asc' })
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.total).toBe(3)
+    expect(res.body.candidates).toHaveLength(3)
+  })
+
+  test('a SQL sort is never subject to the guard', async () => {
+    process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT = '1'
+    const res = await request(app)
+      .get('/api/seed/sources/search/9/candidates')
+      .query({ sort: 'year', dir: 'asc' })
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(res.status).toBe(200)
+    expect(res.body.candidates.map((c) => c.year)).toEqual(['2011', '2012', '2013'])
+  })
+})
+
+describe('seed sources route: the list skips per-candidate state resolution', () => {
+  test('state_counts is null in the list but present for an expanded seed', async () => {
+    const list = await request(app)
+      .get('/api/seed/sources')
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(list.status).toBe(200)
+    const listed = list.body.sources.find((s) => String(s.source_key) === '9')
+    expect(listed).toBeTruthy()
+    expect(listed.state_counts).toBeNull()
+    expect(listed.candidate_count).toBe(3)
+
+    const expanded = await request(app)
+      .get('/api/seed/sources/search/9/candidates')
+      .set('Authorization', `Bearer ${authToken}`)
+    expect(expanded.status).toBe(200)
+    expect(expanded.body.source_summary.state_counts).toMatchObject({ pending: 3 })
+  })
+})
+
 describe('promote route: filtered "promote all" only resolves candidates matching q', () => {
   // The /promote route hands off to a Python subprocess for the actual
   // promotion, which isn't safe to drive in a unit test — so this exercises

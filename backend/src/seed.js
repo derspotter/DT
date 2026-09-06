@@ -704,7 +704,9 @@ const METADATA_SORT_DEFAULT_RANK = 3
 
 // Download axis: failed_download first, then every not-yet-downloaded state,
 // then queued_download, then downloaded_elsewhere, then downloaded — with
-// file_available === false ranking below (after) true within the same state.
+// file_available === false ranking BEFORE true within the same state: the
+// axis runs worst-first, and a row whose file is missing is worse off than
+// one whose file is there.
 const DOWNLOAD_SORT_RANK = new Map([
   ['failed_download', 0],
   ['pending', 1],
@@ -728,11 +730,11 @@ function downloadSortRank(candidate) {
   const state = String(candidate?.state || '')
   const base = DOWNLOAD_SORT_RANK.has(state) ? DOWNLOAD_SORT_RANK.get(state) : DOWNLOAD_SORT_DEFAULT_RANK
   const isFileAvailabilityState = state === 'downloaded' || state === 'downloaded_elsewhere'
-  const fileSub = isFileAvailabilityState && candidate?.file_available === false ? 1 : 0
+  const fileSub = isFileAvailabilityState && candidate?.file_available === false ? 0 : 1
   return base * 10 + fileSub
 }
 
-function seedStateCountLimit() {
+export function seedStateCountLimit() {
   const parsed = Number(process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT || 2000)
   return Number.isInteger(parsed) && parsed > 0 ? parsed : 2000
 }
@@ -800,20 +802,26 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
   const sortKey = String(sort || '').trim().toLowerCase()
   const direction = String(dir || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC'
   const sqlSort = SEARCH_SORT_SQL[sortKey]
-  // Blanks last in both directions: NULL/'' sort after real values.
-  const orderBy = sqlSort
-    ? `(${sqlSort} IS NULL OR ${sqlSort} = '') ASC, ${sqlSort} ${direction}, sr.id DESC`
-    : 'sr.id DESC'
   const useSqlPaging = limit !== null && !SEARCH_JS_SORTS.has(sortKey)
   const pageSql = useSqlPaging ? ' LIMIT ? OFFSET ?' : ''
-  const rows = db.prepare(
-    `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at
-     FROM search_results sr
+  const baseSelect = `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at`
+  const baseFrom = `FROM search_results sr
      JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id
      JOIN search_runs s ON s.id = sr.search_run_id
-     WHERE ${where}
-     ORDER BY ${orderBy}${pageSql}`
-  ).all(...params, ...(useSqlPaging ? [Number(limit), Number(offset) || 0] : []))
+     WHERE ${where}`
+  // Blanks last in both directions: NULL/'' sort after real values. The sort
+  // expression is a json_extract over raw_json, so it is named once in a CTE
+  // rather than repeated three times in the ORDER BY.
+  const sql = sqlSort
+    ? `WITH page AS (${baseSelect}, ${sqlSort} AS sort_key
+     ${baseFrom})
+     SELECT id, search_run_id, title, doi, openalex_id, year, raw_json, created_at
+     FROM page
+     ORDER BY (sort_key IS NULL OR sort_key = '') ASC, sort_key ${direction}, id DESC${pageSql}`
+    : `${baseSelect}
+     ${baseFrom}
+     ORDER BY sr.id DESC${pageSql}`
+  const rows = db.prepare(sql).all(...params, ...(useSqlPaging ? [Number(limit), Number(offset) || 0] : []))
   let candidates = rows.map((row) => applyExplicitCorpusMembership(normalizeSearchCandidate(row, resolverBundle), inCorpusMarked))
   if (SEARCH_JS_SORTS.has(sortKey)) {
     const rankFn = sortKey === 'metadata' ? metadataSortRank : downloadSortRank
@@ -874,6 +882,12 @@ export function listSeedSources(db, corpusId, {
   q = '',
   stateResolver = null,
   only = null, // { sourceType, sourceKey } — list just that seed
+  // Resolving per-candidate state for every seed on every poll is the most
+  // expensive thing this function does (up to seedStateCountLimit() rows per
+  // seed). The seed *list* only needs candidate_count, so it passes false and
+  // gets `state_counts: null`; the candidates route asks for one seed via
+  // `only` and keeps the counts.
+  withStateCounts = true,
 } = {}) {
   const resolver = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
   const onlyType = only ? String(only.sourceType || '').trim().toLowerCase() : ''
@@ -911,20 +925,24 @@ export function listSeedSources(db, corpusId, {
   const hasRunStatus = tableExists(db, 'search_runs') && tableHasColumn(db, 'search_runs', 'status')
   const searchSources = tableExists(db, 'search_run_corpora')
     ? db.prepare(
+      // No join on search_results: `candidate_count` comes from
+      // countSeedCandidates (which also honours dismissals and `q`), so the
+      // old COUNT(sres.id) AS entry_count was dead weight that scanned every
+      // result row of every run on every poll. Neither join can duplicate a
+      // run — search_run_corpora is keyed by search_run_id and
+      // seed_sources_hidden by (corpus_id, source_type, source_key) — so no
+      // GROUP BY is needed either.
       `SELECT sr.id AS source_key,
               COALESCE(src.created_at, sr.created_at) AS created_at,
               sr.query,
-              sr.filters_json,
-              COUNT(sres.id) AS entry_count
+              sr.filters_json
               ${hasRunStatus ? ', sr.status, sr.fetched_count, sr.expected_count, sr.error' : ''}
        FROM search_runs sr
        JOIN search_run_corpora src ON src.search_run_id = sr.id
-       LEFT JOIN search_results sres ON sres.search_run_id = sr.id
        LEFT JOIN seed_sources_hidden ssh
          ON ssh.corpus_id = src.corpus_id AND ssh.source_type = 'search' AND ssh.source_key = CAST(sr.id AS TEXT)
        WHERE src.corpus_id = ?
          AND ssh.source_key IS NULL
-       GROUP BY sr.id
        ORDER BY COALESCE(src.created_at, sr.created_at) DESC`
     ).all(corpusId)
     : []
@@ -952,7 +970,7 @@ export function listSeedSources(db, corpusId, {
       subtitle: formatPdfSubtitle(meta) || (row.source_pdf || ''),
       created_at: row.created_at,
       candidate_count: candidates.length,
-      state_counts: summarizeStates(candidates),
+      state_counts: withStateCounts ? summarizeStates(candidates) : null,
       removable: true,
       meta,
     })
@@ -966,7 +984,7 @@ export function listSeedSources(db, corpusId, {
       ? { status: row.status || null, fetched_count: row.fetched_count ?? null, expected_count: row.expected_count ?? null, error: row.error || null }
       : null
     if (total === 0 && run?.status !== 'running') return
-    const withinLimit = total <= seedStateCountLimit()
+    const withinLimit = withStateCounts && total <= seedStateCountLimit()
     const candidates = withinLimit ? listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q }) : []
     const filters = parseJson(row.filters_json, {}) || {}
     const direction = String(filters.expansion_direction || '').trim().toLowerCase()

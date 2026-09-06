@@ -532,7 +532,7 @@ describe('search seed paging, sorting and run status', () => {
     expect(desc.map((c) => c.id)).toEqual([1, 3, 5, 4, 2])
   })
 
-  test('download sort ranks failed_download, not-downloaded, queued_download, downloaded_elsewhere (unavailable below available), then downloaded', () => {
+  test('download sort ranks failed_download, not-downloaded, queued_download, downloaded_elsewhere (unavailable before available), then downloaded', () => {
     seedRun(6)
     const stateResolver = stubResolver(
       {
@@ -546,8 +546,10 @@ describe('search seed paging, sorting and run status', () => {
       { 'Title 003': false, 'Title 004': true, 'Title 005': true }
     )
     const asc = listSeedCandidates(db, 130, 'search', '7', { stateResolver, sort: 'download', dir: 'asc' })
-    expect(asc.map((c) => c.id)).toEqual([2, 6, 1, 4, 3, 5])
+    // The axis is worst-first, so a downloaded_elsewhere row whose file is
+    // gone (id3) sorts ahead of one whose file is there (id4).
+    expect(asc.map((c) => c.id)).toEqual([2, 6, 1, 3, 4, 5])
     const desc = listSeedCandidates(db, 130, 'search', '7', { stateResolver, sort: 'download', dir: 'desc' })
-    expect(desc.map((c) => c.id)).toEqual([5, 3, 4, 1, 6, 2])
+    expect(desc.map((c) => c.id)).toEqual([5, 4, 3, 1, 6, 2])
   })
 })

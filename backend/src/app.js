@@ -19,6 +19,7 @@ import {
   listSeedSources,
   listSeedCandidates,
   countSeedCandidates,
+  seedStateCountLimit,
   hideSeedSource,
   dismissSeedCandidates,
   dismissAllSeedCandidates,
@@ -32,6 +33,9 @@ const __dirname = dirname(__filename);
 // Allowed seed-candidate sort keys: the six SQL sorts (title/year/authors/
 // source/refs/cited_by) plus the two JS-only sorts (metadata/download).
 const SEED_CANDIDATE_SORT_KEYS = new Set(['title', 'year', 'authors', 'source', 'refs', 'cited_by', 'metadata', 'download']);
+// The two sorts that SQL cannot express: state is resolved in JS, so these
+// need the whole seed in memory (see the guard in the candidates route).
+const SEED_STATE_SORTS = new Set(['metadata', 'download']);
 
 function findUpwards(startDir, childName) {
   // Walk up parents until we find a directory or file named `childName`.
@@ -1019,6 +1023,27 @@ export function markOrphanedSearchRuns(db, startedAtIso) {
               WHERE status = 'running' AND datetime(created_at) < datetime(?)`)
     .run(startedAtIso);
   return result.changes;
+}
+
+// The search child owns its own row: it marks the run done/failed/cancelled
+// before exiting. When it dies without running those handlers the row stays
+// 'running' with no process behind it, so the parent settles it here.
+export function finalizeDeadSearchRun(db, runId, error) {
+  if (!Number.isFinite(Number(runId))) return false;
+  try {
+    if (!tableExists(db, 'search_runs')) return false;
+    const cols = db.prepare('PRAGMA table_info(search_runs)').all().map((c) => c.name);
+    if (!cols.includes('status')) return false;
+    const reason = String(error?.message || error || 'no exit status').slice(0, 200);
+    const result = db
+      .prepare(`UPDATE search_runs SET status = 'failed', error = ?, finished_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND status = 'running'`)
+      .run(`search process exited (${reason})`, Number(runId));
+    return result.changes > 0;
+  } catch (dbError) {
+    console.error('[search] Could not settle a dead search run:', dbError?.message || dbError);
+    return false;
+  }
 }
 
 function pruneStaleCorpusItems(db) {
@@ -4949,6 +4974,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       });
     }
     let responded = false;
+    let createdRunId = null;
     const { child, done } = spawnPythonJson(KEYWORD_SEARCH_SCRIPT, built.args, {
       dbPath: DB_PATH,
       corpusId: req.corpusId,
@@ -4959,30 +4985,46 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         if (event?.event !== 'run_created' || responded) return;
         const runId = Number(event.runId);
         if (!Number.isFinite(runId) || runId <= 0) return;
-        // The run already exists in the DB the instant this event fires, so
-        // the client must get its 202 regardless of what happens next —
-        // registering corpus ownership is best-effort and can be recovered
-        // later (the seed list re-derives it), it must never cost us the
-        // response or leave `responded` unset (which would re-trigger this
-        // branch on the next stdout chunk and try to send a second response).
+        // Ownership registration is what makes the run visible and cancelable
+        // (the seed list and the cancel route both go through
+        // search_run_corpora). A run we cannot register would keep fetching
+        // with nobody able to see or stop it, so kill it and fail the request
+        // instead of answering 202 for a ghost.
         responded = true;
+        // Set before the upsert: the row exists either way, so the settle hop
+        // below must be able to close it out even on the failure path.
+        createdRunId = runId;
         try {
           upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: Number(req.corpusId) });
         } catch (error) {
-          console.warn('[/api/keyword-search] Failed to record run/corpus ownership:', error?.message || error);
+          console.error('[/api/keyword-search] Failed to record run/corpus ownership:', error?.message || error);
+          try { child.kill('SIGTERM'); } catch { /* already gone */ }
+          res.status(500).json({ error: 'Could not register the search run' });
+          return;
         }
         activeSearchRuns.set(runId, child);
         res.status(202).json({ runId, status: 'running' });
       },
     });
     done
-      .catch((error) => {
-        console.error('[/api/keyword-search] Search script failed:', error?.message || error);
-        if (!responded) { responded = true; res.status(500).json({ error: error?.message || 'Keyword search failed' }); }
-      })
-      .finally(() => {
+      .then(
+        () => null,
+        (error) => {
+          console.error('[/api/keyword-search] Search script failed:', error?.message || error);
+          if (!responded) { responded = true; res.status(500).json({ error: error?.message || 'Keyword search failed' }); }
+          return error;
+        },
+      )
+      .then((error) => {
         for (const [runId, proc] of activeSearchRuns) if (proc === child) activeSearchRuns.delete(runId);
         if (!responded) { responded = true; res.status(500).json({ error: 'Search ended before creating a run' }); }
+        // A child that dies without running its own handlers (SIGKILL, OOM,
+        // a hard container stop) leaves the row 'running' forever and the UI
+        // polling it forever. The process is gone here either way, so any row
+        // still marked running is by definition dead.
+        if (createdRunId !== null) {
+          finalizeDeadSearchRun(authDb, createdRunId, error);
+        }
       });
   });
 
@@ -5004,7 +5046,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     try {
       const limit = Math.max(1, Math.min(500, coerceInt(req.query?.limit, 100) || 100));
       const q = String(req.query?.q || '').trim();
-      const sources = listSeedSources(authDb, req.corpusId, { limit, resolveDownloadedFilePath: findDownloadedFilePath, q });
+      // The list only renders counts and run progress; resolving every
+      // candidate's state for every seed on every poll is what made this
+      // route expensive. The candidates route computes state_counts for the
+      // one seed the user expanded.
+      const sources = listSeedSources(authDb, req.corpusId, {
+        limit,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+        q,
+        withStateCounts: false,
+      });
       return res.json({ source: 'db', sources, total: sources.length });
     } catch (error) {
       console.error('[/api/seed/sources] Error:', error);
@@ -5049,6 +5100,20 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
       const q = String(req.query?.q || '').trim();
       const { limit, offset, sort, dir } = parseCandidatePaging(req.query);
+      // Sorting by state is done in JS over the whole seed (SQL cannot see a
+      // resolved state), so it has to materialize every candidate. The UI
+      // hides the option above the limit; reject it here too so a crafted
+      // request cannot make the backend resolve an unbounded seed.
+      let total = null;
+      if (SEED_STATE_SORTS.has(sort)) {
+        total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+        const stateSortLimit = seedStateCountLimit();
+        if (total > stateSortLimit) {
+          return res.status(400).json({
+            error: `Sorting by state needs every item resolved; not available above ${stateSortLimit.toLocaleString('en-US')} items`,
+          });
+        }
+      }
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
@@ -5058,7 +5123,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         sort,
         dir,
       });
-      const total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+      if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
       const sourceSummary = listSeedSources(authDb, req.corpusId, {
         limit: 500,
         resolveDownloadedFilePath: findDownloadedFilePath,
