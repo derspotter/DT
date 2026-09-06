@@ -4607,25 +4607,28 @@
             {/each}
           </div>
         {/each}
+        {#if activeTab === 'workspace'}
+          <nav class="nav-group workspace-sticky-bar" aria-label="Workspace sections" data-testid="workspace-sticky-bar">
+            <span class="nav-group-title">Sections</span>
+            <div class="workspace-sticky-bar__links">
+              <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-find')}>1 Find items</button>
+              <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-seed')}>2 Seed <span class="muted small">({seedSources.length})</span></button>
+              <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-corpus')}>3 Corpus <span class="muted small">({corpusTotal})</span></button>
+            </div>
+            <div class="workspace-sticky-bar__actions">
+              {#if expandedSeedSourceId}
+                <button type="button" class="secondary" on:click={collapseExpandedSeed}>Collapse seed</button>
+              {/if}
+              <button type="button" class="secondary" on:click={() => jumpToSection('section-find')}>Top</button>
+            </div>
+          </nav>
+        {/if}
       </aside>
     {/if}
 
     <section class="content">
       {#if activeTab === 'workspace'}
         <div class="seed-corpus-workspace">
-        <nav class="workspace-sticky-bar" aria-label="Workspace sections" data-testid="workspace-sticky-bar">
-          <div class="workspace-sticky-bar__links">
-            <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-find')}>1 Find items</button>
-            <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-seed')}>2 Seed <span class="muted small">({seedSources.length})</span></button>
-            <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-corpus')}>3 Corpus <span class="muted small">({corpusTotal})</span></button>
-          </div>
-          <div class="workspace-sticky-bar__actions">
-            {#if expandedSeedSourceId}
-              <button type="button" class="secondary" on:click={collapseExpandedSeed}>Collapse seed</button>
-            {/if}
-            <button type="button" class="secondary" on:click={() => jumpToSection('section-find')}>Top</button>
-          </div>
-        </nav>
         <div class="card seed-corpus-toolbar" id="section-find">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">

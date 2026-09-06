@@ -68,7 +68,8 @@ select {
   margin-bottom: 6px;
 }
 
-.app-shell.workspace-mode .side-nav,
+/* The workspace keeps the side nav sticky: it carries the section rail that
+   follows the reader down the (long) seed and corpus tables. */
 .app-shell.upstream-mode .side-nav {
   position: static;
   top: auto;
@@ -5216,6 +5217,9 @@ button.danger:disabled {
   }
   /* No trailing divider after the final segment. */
   .side-nav .nav-group:last-child button:last-child { border-right: 0; }
+  .side-nav .workspace-sticky-bar { display: contents; }
+  .side-nav .workspace-sticky-bar__links { display: contents; }
+  .side-nav .workspace-sticky-bar__actions { display: none; }
   /* overflow:hidden on the bar would clip the default focus ring, so draw
      focus inside the segment to keep keyboard focus visible. */
   .side-nav button:focus-visible {
@@ -5286,45 +5290,34 @@ button.danger:disabled {
 }
 
 .workspace-sticky-bar {
-  position: sticky;
-  top: 0;
-  z-index: 20;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 14px;
-  margin-bottom: 12px;
-  border-radius: var(--radius-lg);
-  background: var(--surface);
-  box-shadow: var(--shadow);
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--stroke);
 }
 
 .workspace-sticky-bar__links {
   display: flex;
-  gap: 4px;
-  overflow-x: auto;
-  white-space: nowrap;
+  flex-direction: column;
+  gap: 2px;
 }
 
-.workspace-sticky-bar__link {
-  background: none;
-  border: 0;
-  padding: 6px 10px;
-  border-radius: 6px;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-}
-
-.workspace-sticky-bar__link:hover {
-  background: rgba(0, 0, 0, 0.05);
+.side-nav .workspace-sticky-bar__link {
+  text-align: left;
 }
 
 .workspace-sticky-bar__actions {
   display: flex;
-  gap: 8px;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px 0;
+}
+
+.workspace-sticky-bar__actions button {
+  flex: 1 1 auto;
+  padding: 4px 8px;
+  font-size: 0.85rem;
 }
 
 #section-find,
@@ -5333,14 +5326,6 @@ button.danger:disabled {
   scroll-margin-top: 64px;
 }
 
-@media (max-width: 640px) {
-  .workspace-sticky-bar {
-    padding: 6px 10px;
-  }
-  .workspace-sticky-bar__actions button {
-    padding: 4px 8px;
-  }
-}
 
 .openalex-quota-pill {
   display: inline-block;
