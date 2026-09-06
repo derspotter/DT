@@ -217,8 +217,26 @@ def apply_query_filter(items, query):
 
 # Sorting happens here rather than in SQL because the rows are already
 # materialised in Python above; paging slices this same list.
+def _authors_sort_key(item):
+    """First author, lowercased; works.authors is a JSON list or a plain string."""
+    raw = item.get("authors")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw.strip().lower()
+    if isinstance(raw, list):
+        for name in raw:
+            text = str(name or "").strip()
+            if text:
+                return text.lower()
+        return ""
+    return str(raw or "").strip().lower()
+
+
 SORT_KEYS = {
     "title": lambda item: str(item.get("title") or "").lower(),
+    "authors": _authors_sort_key,
     "year": lambda item: normalize_year(item.get("year")),
     "source": lambda item: str(item.get("source") or "").lower(),
     "seed": lambda item: str(item.get("source_label") or "").lower(),

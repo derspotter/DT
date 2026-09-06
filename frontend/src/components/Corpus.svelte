@@ -37,7 +37,9 @@
   let columnVisibility = loadVisibility('corpus')
   $: activeColumns = visibleColumns('corpus', columnVisibility)
   // A leading fixed track carries the selection checkbox, mirroring the seed table.
-  $: gridStyle = `grid-template-columns: 44px ${gridTemplate(activeColumns)}`
+  // Trailing 36px column holds the per-row ✕ so it stays put whatever columns
+  // the user hides (it used to ride on whichever column happened to be last).
+  $: gridStyle = `grid-template-columns: 44px ${gridTemplate(activeColumns)} 36px`
 
   function updateColumns(next) {
     columnVisibility = next
@@ -339,6 +341,7 @@
             {/if}
           </span>
         {/each}
+        <span class="corpus-actions-cell" aria-hidden="true"></span>
       </div>
       {#each filteredItems as item (item.id)}
         {@const bucket = getBucketForItem(item)}
@@ -370,7 +373,7 @@
               aria-label={`Select ${item.title || 'item'}`}
             />
           </span>
-          {#each activeColumns as column, columnIndex (column.key)}
+          {#each activeColumns as column (column.key)}
             {#if column.key === 'title'}
               <span class="corpus-row-main">
                 <span class="corpus-title-line">
@@ -385,18 +388,18 @@
             {:else}
               <span class="muted small line-clamp-2 corpus-cell" title={cellText(item, column.key, bucket)}>
                 {cellText(item, column.key, bucket)}
-                {#if columnIndex === activeColumns.length - 1}
-                  <button
-                    class="corpus-remove"
-                    type="button"
-                    title="Remove from this corpus (keeps the work and its PDF)"
-                    aria-label={`Remove ${item.title || 'item'} from this corpus`}
-                    on:click|stopPropagation={() => handleRemoveCorpusWork(item)}
-                  >✕</button>
-                {/if}
               </span>
             {/if}
           {/each}
+          <span class="corpus-actions-cell">
+            <button
+              class="corpus-remove"
+              type="button"
+              title="Remove from this corpus (keeps the work and its PDF)"
+              aria-label={`Remove ${item.title || 'item'} from this corpus`}
+              on:click|stopPropagation={() => handleRemoveCorpusWork(item)}
+            >✕</button>
+          </span>
         </div>
         {#if selected}
           <div class="table-row corpus-inline-detail-row">

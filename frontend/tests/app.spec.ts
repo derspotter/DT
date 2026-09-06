@@ -80,6 +80,7 @@ async function apiLogin(request: APIRequestContext): Promise<string> {
   const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
   const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
   expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
+  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD for Playwright login').toBeTruthy()
   const res = await request.post('/api/auth/login', { data: { username, password } })
   expect(res.ok(), `login failed: ${res.status()}`).toBeTruthy()
   const token = (await res.json())?.token

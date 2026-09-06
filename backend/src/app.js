@@ -348,7 +348,7 @@ function listTableColumns(db, tableName) {
   return db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => String(row.name || ''));
 }
 
-function buildGraph3dRequest(req) {
+export function buildGraph3dRequest(req) {
   const requestedMaxNodes = coerceInt(req.query?.max_nodes ?? req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
   // 0 means "no cap" (show the whole corpus); otherwise clamp to a sane range.
   const maxNodes = requestedMaxNodes === 0
@@ -362,8 +362,11 @@ function buildGraph3dRequest(req) {
   // 'all' (or an absent param) keeps the historical global view that merges
   // every corpus; anything else scopes the graph to one corpus (spec line 22).
   const requestedCorpus = String(req.query?.corpus_id ?? req.query?.corpusId ?? '').trim();
+  // Corpus ids are integer primary keys: anything else ("1.5", "0", "-3")
+  // means the global view rather than an argument argparse will reject.
   const parsedCorpusId = coerceInt(requestedCorpus, null);
-  const corpusId = !requestedCorpus || requestedCorpus.toLowerCase() === 'all' || !Number.isFinite(Number(parsedCorpusId))
+  const corpusId = !requestedCorpus || requestedCorpus.toLowerCase() === 'all'
+    || !Number.isInteger(parsedCorpusId) || parsedCorpusId <= 0
     ? null
     : parsedCorpusId;
   const requestedGroupBy = String(req.query?.group_by || req.query?.groupBy || 'field');

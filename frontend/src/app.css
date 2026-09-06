@@ -5354,3 +5354,9 @@ button.danger:disabled {
   flex-direction: column;
   gap: 4px;
 }
+
+.corpus-actions-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+}
