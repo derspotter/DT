@@ -950,7 +950,8 @@ function migrateExistingToCorpus(db, corpusId) {
 // Rows keyed to a corpus that no longer exists. They come from corpora deleted
 // before the delete route cleaned every table, and from work that lands after a
 // corpus is removed (a background extraction finishing, say). They are
-// invisible in the UI but accumulate forever, so sweep them at startup.
+// invisible in the UI but accumulate forever, so sweep them at startup. Only
+// tables with a corpus_id column are swept; see the note on search runs below.
 const CORPUS_SCOPED_TABLES = [
   'ingest_entries',
   'ingest_source_metadata',
@@ -974,18 +975,10 @@ export function pruneOrphanedCorpusRows(db) {
       .run();
     if (result.changes > 0) removed[table] = result.changes;
   }
-  // A search run whose last corpus registration is gone is unreachable.
-  if (tableExists(db, 'search_runs') && tableExists(db, 'search_run_corpora')) {
-    const orphanRuns = `SELECT sr.id FROM search_runs sr
-       LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
-       WHERE src.search_run_id IS NULL`;
-    if (tableExists(db, 'search_results')) {
-      const res = db.prepare(`DELETE FROM search_results WHERE search_run_id IN (${orphanRuns})`).run();
-      if (res.changes > 0) removed.search_results = res.changes;
-    }
-    const runs = db.prepare(`DELETE FROM search_runs WHERE id IN (${orphanRuns})`).run();
-    if (runs.changes > 0) removed.search_runs = runs.changes;
-  }
+  // Deliberately no search_runs / search_results here: an unregistered run
+  // cannot be told apart from one that predates registration, and works keep
+  // run_id pointers into them for provenance. Only the delete route removes
+  // runs, and only the ones registered to the corpus being deleted.
   return removed;
 }
 
@@ -4216,33 +4209,45 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         // Everything else keyed by corpus_id. These were missed before, which
         // left seed state and search-run registrations pointing at a corpus
         // that no longer exists.
-        for (const table of ['corpus_items', 'seed_sources_hidden', 'seed_candidates_dismissed', 'seed_candidates_in_corpus', 'search_run_corpora']) {
+        for (const table of ['corpus_items', 'seed_sources_hidden', 'seed_candidates_dismissed', 'seed_candidates_in_corpus']) {
           if (tableExists(authDb, table)) {
             authDb.prepare(`DELETE FROM ${table} WHERE corpus_id = ?`).run(corpusId);
           }
         }
-        // A search run belongs to the corpora it was registered against; once
-        // the last one goes, the run and its results are unreachable, so drop
-        // them instead of leaving them to accumulate forever.
+        // Search runs registered to this corpus go with it (a run belongs to
+        // exactly one corpus). Runs that were never registered — everything
+        // before registration existed, plus runs made without a corpus
+        // context — are NOT touched: works still point at them via run_id
+        // for the provenance label, and they are history, not garbage.
         if (tableExists(authDb, 'search_runs') && tableExists(authDb, 'search_run_corpora')) {
-          if (tableExists(authDb, 'search_results')) {
-            authDb.prepare(
-              `DELETE FROM search_results
-               WHERE search_run_id IN (
-                 SELECT sr.id FROM search_runs sr
-                 LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
-                 WHERE src.search_run_id IS NULL
-               )`
-            ).run();
+          // Keep any owned run that a work still points at (run_id, or an
+          // origin_key of "search:<id>"): its results may have been promoted
+          // into another corpus, whose provenance label would otherwise
+          // degrade to "Search #<id>".
+          const ownedRunIds = authDb
+            .prepare(
+              `SELECT src.search_run_id
+               FROM search_run_corpora src
+               WHERE src.corpus_id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM works w
+                   WHERE w.run_id = src.search_run_id
+                      OR w.origin_key = 'search:' || src.search_run_id
+                 )`
+            )
+            .all(corpusId)
+            .map((row) => Number(row.search_run_id))
+            .filter((id) => Number.isFinite(id) && id > 0);
+          if (ownedRunIds.length > 0) {
+            const placeholders = ownedRunIds.map(() => '?').join(', ');
+            if (tableExists(authDb, 'search_results')) {
+              authDb.prepare(`DELETE FROM search_results WHERE search_run_id IN (${placeholders})`).run(...ownedRunIds);
+            }
+            authDb.prepare(`DELETE FROM search_runs WHERE id IN (${placeholders})`).run(...ownedRunIds);
           }
-          authDb.prepare(
-            `DELETE FROM search_runs
-             WHERE id IN (
-               SELECT sr.id FROM search_runs sr
-               LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
-               WHERE src.search_run_id IS NULL
-             )`
-          ).run();
+        }
+        if (tableExists(authDb, 'search_run_corpora')) {
+          authDb.prepare('DELETE FROM search_run_corpora WHERE corpus_id = ?').run(corpusId);
         }
         authDb.prepare('DELETE FROM user_corpora WHERE corpus_id = ?').run(corpusId);
         authDb.prepare('DELETE FROM corpora WHERE id = ?').run(corpusId);

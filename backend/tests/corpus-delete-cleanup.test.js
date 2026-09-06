@@ -19,6 +19,7 @@ function createDb() {
     CREATE TABLE corpus_kantropos_assignments (corpus_id INTEGER, target_id TEXT);
     CREATE TABLE search_runs (id INTEGER PRIMARY KEY, query TEXT, filters_json TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE search_results (id INTEGER PRIMARY KEY, search_run_id INTEGER, title TEXT);
+    CREATE TABLE works (id INTEGER PRIMARY KEY, title TEXT, run_id INTEGER, origin_key TEXT);
   `)
   ensureSeedSchema(db)
   return db
@@ -30,22 +31,23 @@ function deleteCorpusRows(db, corpusId) {
     'pipeline_jobs', 'ingest_entries', 'ingest_source_metadata',
     'corpus_kantropos_assignments', 'corpus_works', 'corpus_items',
     'seed_sources_hidden', 'seed_candidates_dismissed', 'seed_candidates_in_corpus',
-    'search_run_corpora',
   ]) {
     db.prepare(`DELETE FROM ${table} WHERE corpus_id = ?`).run(corpusId)
   }
-  db.prepare(
-    `DELETE FROM search_results WHERE search_run_id IN (
-       SELECT sr.id FROM search_runs sr
-       LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
-       WHERE src.search_run_id IS NULL)`
-  ).run()
-  db.prepare(
-    `DELETE FROM search_runs WHERE id IN (
-       SELECT sr.id FROM search_runs sr
-       LEFT JOIN search_run_corpora src ON src.search_run_id = sr.id
-       WHERE src.search_run_id IS NULL)`
-  ).run()
+  // Only runs registered to this corpus, and only if no work points at them.
+  const owned = db.prepare(
+    `SELECT src.search_run_id FROM search_run_corpora src
+     WHERE src.corpus_id = ?
+       AND NOT EXISTS (SELECT 1 FROM works w
+                       WHERE w.run_id = src.search_run_id
+                          OR w.origin_key = 'search:' || src.search_run_id)`
+  ).all(corpusId).map((r) => r.search_run_id)
+  if (owned.length) {
+    const ph = owned.map(() => '?').join(', ')
+    db.prepare(`DELETE FROM search_results WHERE search_run_id IN (${ph})`).run(...owned)
+    db.prepare(`DELETE FROM search_runs WHERE id IN (${ph})`).run(...owned)
+  }
+  db.prepare('DELETE FROM search_run_corpora WHERE corpus_id = ?').run(corpusId)
   db.prepare('DELETE FROM user_corpora WHERE corpus_id = ?').run(corpusId)
   db.prepare('DELETE FROM corpora WHERE id = ?').run(corpusId)
 }
@@ -87,6 +89,34 @@ describe('corpus deletion cleans every corpus-scoped table', () => {
     }
   })
 
+  test('keeps an owned run that a work in another corpus still points at', () => {
+    db = createDb()
+    db.prepare('INSERT INTO corpora (id, name) VALUES (7, ?)').run('doomed')
+    db.prepare("INSERT INTO search_runs (id, query) VALUES (1, 'promoted from here')").run()
+    db.prepare('INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (1, 7)').run()
+    db.prepare("INSERT INTO search_results (id, search_run_id, title) VALUES (1, 1, 'r')").run()
+    // The work was promoted into corpus 8; its Seed provenance label reads the run.
+    db.prepare("INSERT INTO works (id, title, run_id) VALUES (1, 'kept work', 1)").run()
+
+    deleteCorpusRows(db, 7)
+
+    expect(db.prepare('SELECT id FROM search_runs').all()).toEqual([{ id: 1 }])
+    expect(db.prepare('SELECT COUNT(*) AS n FROM search_results').get().n).toBe(1)
+    expect(db.prepare('SELECT COUNT(*) AS n FROM search_run_corpora').get().n).toBe(0)
+  })
+
+  test('never touches a run that was never registered to any corpus', () => {
+    db = createDb()
+    db.prepare('INSERT INTO corpora (id, name) VALUES (7, ?)').run('doomed')
+    db.prepare("INSERT INTO search_runs (id, query) VALUES (5, 'legacy, pre-registration')").run()
+    db.prepare("INSERT INTO search_results (id, search_run_id, title) VALUES (5, 5, 'legacy')").run()
+
+    deleteCorpusRows(db, 7)
+
+    expect(db.prepare('SELECT id FROM search_runs').all()).toEqual([{ id: 5 }])
+    expect(db.prepare('SELECT COUNT(*) AS n FROM search_results').get().n).toBe(1)
+  })
+
   test('leaves another corpus\u2019s search run untouched', () => {
     // search_run_corpora keys on search_run_id alone, so a run belongs to
     // exactly one corpus; deleting one corpus must not reach into another.
@@ -125,9 +155,9 @@ describe('pruneOrphanedCorpusRows', () => {
     db.prepare('INSERT INTO pipeline_jobs (id, corpus_id) VALUES (1, 99)').run()
     db.prepare('INSERT INTO corpus_works VALUES (99, 1)').run()
     db.prepare("INSERT INTO seed_sources_hidden (corpus_id, source_type, source_key) VALUES (99, 'search', '1')").run()
-    db.prepare("INSERT INTO search_runs (id, query) VALUES (1, 'orphan')").run()
+    db.prepare("INSERT INTO search_runs (id, query) VALUES (1, 'registration orphaned')").run()
     db.prepare('INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (1, 99)').run()
-    db.prepare("INSERT INTO search_results (id, search_run_id, title) VALUES (1, 1, 'orphan')").run()
+    db.prepare("INSERT INTO search_results (id, search_run_id, title) VALUES (1, 1, 'stays')").run()
     // Survivors.
     db.prepare("INSERT INTO ingest_source_metadata VALUES (8, 'kept')").run()
     db.prepare('INSERT INTO pipeline_jobs (id, corpus_id) VALUES (2, 8)').run()
@@ -137,19 +167,18 @@ describe('pruneOrphanedCorpusRows', () => {
 
     const removed = pruneOrphanedCorpusRows(db)
 
-    expect(removed).toMatchObject({
+    expect(removed).toEqual({
       ingest_source_metadata: 1,
       pipeline_jobs: 1,
       corpus_works: 1,
       seed_sources_hidden: 1,
       search_run_corpora: 1,
-      search_runs: 1,
-      search_results: 1,
     })
     expect(db.prepare('SELECT ingest_source FROM ingest_source_metadata').all()).toEqual([{ ingest_source: 'kept' }])
     expect(db.prepare('SELECT id FROM pipeline_jobs').all()).toEqual([{ id: 2 }])
-    expect(db.prepare('SELECT query FROM search_runs').all()).toEqual([{ query: 'kept' }])
-    expect(db.prepare('SELECT title FROM search_results').all()).toEqual([{ title: 'kept' }])
+    // The sweep drops the dead registration but never the run or its results.
+    expect(db.prepare('SELECT COUNT(*) AS n FROM search_runs').get().n).toBe(2)
+    expect(db.prepare('SELECT COUNT(*) AS n FROM search_results').get().n).toBe(2)
   })
 
   test('is a no-op on a clean database', () => {
