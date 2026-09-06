@@ -177,6 +177,41 @@ test('seed table pages through search results, shows every-item selection, and d
   await expect.poll(() => dismissBody?.all).toBe(true)
 })
 
+test('promoting while a seed filter is active forwards q to the promote request', async ({ page }) => {
+  let promoteBody: any = null
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        sources: [{
+          id: 'search:88', source_type: 'search', seed_kind: 'search', source_key: '88', label: 'sociology',
+          subtitle: '', created_at: '2026-09-06T10:00:00Z', candidate_count: 5, state_counts: null,
+          removable: true, meta: {}, run: null,
+        }],
+      }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/88/candidates**', async (route) => {
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ candidates: makeSeedCandidates(5), total: 5, offset: 0, limit: 200 }),
+    })
+  })
+  await page.route('**/api/seed/sources/search/88/promote', async (route) => {
+    promoteBody = route.request().postDataJSON()
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ success: true }) })
+  })
+
+  await page.goto('/')
+  await page.getByLabel('Filter seed items by title, author or publication').fill('kinship')
+  await page.locator('.seed-source__action--promote').click()
+  await expect.poll(() => promoteBody?.q).toBe('kinship')
+  expect(promoteBody.candidateKeys).toEqual([])
+})
+
 test('a running seed shows progress and settles to done', async ({ page }) => {
   let polls = 0
   await page.route('**/api/**', mockApi)

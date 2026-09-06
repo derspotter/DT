@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import request from 'supertest'
+import { listSeedCandidates } from '../src/seed.js'
 
 // IMPORTANT: app.js reads process.env.RAG_FEEDER_DB_PATH into a top-level
 // `const DB_PATH` the moment the module is first evaluated. A static
@@ -190,5 +191,56 @@ describe('seed candidates route: paging clamps and dismiss-all', () => {
       .get('/api/seed/sources/search/1/candidates')
       .set('Authorization', `Bearer ${authToken}`)
     expect(after.body.total).toBe(2)
+  })
+})
+
+describe('promote route: filtered "promote all" only resolves candidates matching q', () => {
+  // The /promote route hands off to a Python subprocess for the actual
+  // promotion, which isn't safe to drive in a unit test — so this exercises
+  // the exact resolution step the route performs when candidateKeys is empty
+  // (backend/src/app.js: `listSeedCandidates(..., { q })`, then filtered down
+  // to promotable candidates), proving a filtered "promote all" only ever
+  // sees candidates matching the active seed filter. Inserts its own
+  // dedicated rows (ids 201/202/203) rather than reusing the shared fixture,
+  // so the assertions hold regardless of what earlier tests in this file
+  // have dismissed.
+  test('listSeedCandidates with q excludes non-matching candidates from the promotable set', () => {
+    const db = new Database(dbPath)
+    try {
+      const ins = db.prepare(
+        `INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (?, 1, ?, ?, ?)`
+      )
+      ins.run(201, 'Filter Probe Result A', '2021', JSON.stringify({
+        authorships: [{ author: { display_name: 'Probe Author' } }],
+      }))
+      ins.run(202, 'Filter Probe Result B', '2022', JSON.stringify({
+        authorships: [{ author: { display_name: 'Probe Author' } }],
+      }))
+      ins.run(203, 'Unrelated Decoy Result', '2023', JSON.stringify({
+        authorships: [{ author: { display_name: 'Someone Else' } }],
+      }))
+
+      const unfiltered = listSeedCandidates(db, corpusId, 'search', '1', {
+        stateResolver: null,
+        resolveDownloadedFilePath: null,
+      })
+      const unfilteredKeys = new Set(unfiltered.map((c) => c.candidate_key))
+      expect(unfilteredKeys.has('search:201')).toBe(true)
+      expect(unfilteredKeys.has('search:202')).toBe(true)
+      expect(unfilteredKeys.has('search:203')).toBe(true)
+
+      const availableCandidates = listSeedCandidates(db, corpusId, 'search', '1', {
+        stateResolver: null,
+        resolveDownloadedFilePath: null,
+        q: 'probe author',
+      })
+      const promotableCandidates = availableCandidates.filter((candidate) => {
+        const state = String(candidate?.state || '').trim().toLowerCase()
+        return !Boolean(candidate?.in_corpus) && state !== 'downloaded'
+      })
+      expect(promotableCandidates.map((c) => c.candidate_key).sort()).toEqual(['search:201', 'search:202'])
+    } finally {
+      db.close()
+    }
   })
 })

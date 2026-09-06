@@ -458,6 +458,7 @@ export async function downloadSeedCandidateFile(sourceType, sourceKey, candidate
 
 export async function promoteSeedCandidates(sourceType, sourceKey, {
   candidateKeys = [],
+  q = '',
   includeDownstream = false,
   includeUpstream = false,
   relatedDepthDownstream = 0,
@@ -476,6 +477,7 @@ export async function promoteSeedCandidates(sourceType, sourceKey, {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         candidateKeys,
+        q,
         includeDownstream,
         includeUpstream,
         relatedDepthDownstream,

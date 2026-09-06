@@ -5139,6 +5139,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     const rawCandidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
     const requestedCandidateKeys = [...new Set(rawCandidateKeys.map((value) => String(value || '').trim()).filter(Boolean))];
+    const q = String(req.body?.q || '').trim();
     const workers = coerceInt(req.body?.workers, 6);
     const enqueueDownload = req.body?.enqueueDownload === undefined ? true : Boolean(req.body.enqueueDownload);
     const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 25);
@@ -5182,6 +5183,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const availableCandidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver: null,
         resolveDownloadedFilePath: findDownloadedFilePath,
+        q,
       });
       const promotableCandidates = availableCandidates.filter((candidate) => {
         const state = String(candidate?.state || '').trim().toLowerCase();

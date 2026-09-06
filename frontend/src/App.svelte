@@ -231,6 +231,7 @@
   let seedSorts = {}
   let seedPages = {}          // sourceId -> { total, offset, limit }
   let seedAllSelected = {}    // sourceId -> true when "All N items selected"
+  let seedAppending = {}      // sourceId -> true while a "Show more" append is in flight
   const SEED_PAGE_SIZE = 200
 
   function seedPage(source) {
@@ -1823,6 +1824,7 @@
     seedSelections = {}
     seedPages = {}
     seedAllSelected = {}
+    seedAppending = {}
     seedActionStatus = ''
     seedActionBusy = false
     seedLastRunKey = ''
@@ -2717,6 +2719,7 @@
       seedCandidatesBySource = {}
       seedPages = {}
       seedAllSelected = {}
+      seedAppending = {}
       loadSeedSources({ quiet: true })
     }, 300)
   }
@@ -2960,15 +2963,25 @@
   function estimatedSelectableSeedCount(source) {
     const sourceId = seedSourceId(source)
     const page = seedPages[sourceId]
-    if (page) {
-      // state_counts is not resolved server-side above the metadata/download
-      // sort limit (Task 5) — in that case the page total is the best estimate.
-      if (source?.state_counts == null) return page.total
-      return Math.max(0, page.total - Number(source.state_counts.in_corpus || 0))
+    const loaded = seedCandidatesBySource[sourceId]
+    const total = page ? page.total : Number(source?.candidate_count || 0)
+    // Once every row is actually loaded, count selectability exactly instead
+    // of estimating — isSeedCandidateSelectable excludes more than just
+    // in_corpus/downloaded (e.g. the includeDownstream override), so this is
+    // strictly more accurate than any formula below.
+    if (page && Array.isArray(loaded) && loaded.length >= total) {
+      return selectableSeedCount(source)
     }
-    const total = Number(source?.candidate_count || 0)
-    const inCorpus = Number(source?.state_counts?.in_corpus || 0)
-    return Math.max(0, total - inCorpus)
+    // state_counts is not resolved server-side above the metadata/download
+    // sort limit (Task 5) — in that case the total is the best estimate.
+    const stateCounts = source?.state_counts
+    if (stateCounts == null) return total
+    // isSeedCandidateSelectable excludes exactly two things: already in the
+    // corpus, or state === 'downloaded' (not downloaded_elsewhere, which
+    // stays selectable) — subtract both, matching summarizeStates' key names.
+    const inCorpus = Number(stateCounts.in_corpus || 0)
+    const downloaded = Number(stateCounts.downloaded || 0)
+    return Math.max(0, total - inCorpus - downloaded)
   }
 
   function isSeedCandidateSelected(source, candidate) {
@@ -3110,19 +3123,25 @@
       seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: true }
     }
     try {
-      const offset = append ? (seedCandidatesBySource[sourceId] || []).length : 0
+      const currentlyLoaded = seedCandidatesBySource[sourceId] || []
+      const offset = append ? currentlyLoaded.length : 0
+      // A background (non-append) reload — e.g. loadSeedSources polling the
+      // expanded seed — must not silently drop pages the user already
+      // fetched via "Show more": re-request at least as much as is currently
+      // loaded (the backend clamps to 2000 regardless).
+      const limit = background && !append ? Math.max(SEED_PAGE_SIZE, currentlyLoaded.length) : SEED_PAGE_SIZE
       const payload = await fetchSeedCandidates(source.source_type, source.source_key, {
-        q: seedFilterQuery, limit: SEED_PAGE_SIZE, offset, ...seedSortParams(source),
+        q: seedFilterQuery, limit, offset, ...seedSortParams(source),
       })
       const incoming = payload.candidates || []
-      const nextCandidates = append ? [...(seedCandidatesBySource[sourceId] || []), ...incoming] : incoming
+      const nextCandidates = append ? [...currentlyLoaded, ...incoming] : incoming
       seedCandidatesBySource = {
         ...seedCandidatesBySource,
         [sourceId]: nextCandidates,
       }
       seedPages = {
         ...seedPages,
-        [sourceId]: { total: Number(payload.total || nextCandidates.length), offset, limit: SEED_PAGE_SIZE },
+        [sourceId]: { total: Number(payload.total || nextCandidates.length), offset, limit: Number(payload.limit || limit) },
       }
       reconcileSeedSourceCandidates(sourceId, nextCandidates)
       if (nextCandidates.length === 0) {
@@ -3156,8 +3175,27 @@
     }
   }
 
-  function loadMoreSeedCandidates(source) {
-    return loadSeedCandidatesForSource(source, { quiet: true, background: true, append: true })
+  // background:true means loadSeedCandidatesForSource does not toggle
+  // seedCandidatesLoading when candidates are already cached (it only shows
+  // that spinner state on a cold load), so the footer button needs its own
+  // in-flight flag — otherwise a double-click fires two appends at the same
+  // offset, producing duplicate candidate_key rows in the keyed {#each} and
+  // a Svelte "keys must be unique" crash.
+  async function loadMoreSeedCandidates(source) {
+    const sourceId = seedSourceId(source)
+    if (!sourceId || seedAppending[sourceId]) return
+    seedAppending = { ...seedAppending, [sourceId]: true }
+    try {
+      await loadSeedCandidatesForSource(source, { quiet: true, background: true, append: true })
+      if (seedAllSelected[sourceId]) {
+        // Keep "all N selected" visually consistent: newly appended rows
+        // should render checked too, not just the rows that were loaded
+        // when the checkbox was first ticked.
+        selectAllSeedCandidates(source)
+      }
+    } finally {
+      seedAppending = { ...seedAppending, [sourceId]: false }
+    }
   }
 
   async function toggleSeedSource(source) {
@@ -3293,6 +3331,7 @@
       }
       seedActionStatus = `Promoting ${candidateCount.toLocaleString('en-US')} candidate(s) into the corpus...`
       await promoteSeedCandidates(source.source_type, source.source_key, {
+        q: seedFilterQuery,
         includeDownstream,
         includeUpstream,
         relatedDepthDownstream,
@@ -3328,7 +3367,14 @@
         setAuthToken('')
         return
       }
-      seedActionStatus = error?.message || 'Failed to promote seed candidates.'
+      // estimatedSelectableSeedCount is just that — an estimate. When it
+      // undercounts already-excluded items (e.g. state_counts unresolved
+      // above the summarization limit) the backend can still come back with
+      // "nothing left to promote"; surface the friendly message rather than
+      // the raw 400 body.
+      seedActionStatus = String(error?.message || '').includes('No selectable seed candidates found for promotion')
+        ? 'No promotable seed candidates remain in this source.'
+        : error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
       loadOpenAlexQuota()
@@ -5112,7 +5158,7 @@
                             {#if seedPage(source).total > sourceCandidates.length}
                               <div class="seed-table-footer">
                                 <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {seedPage(source).total.toLocaleString('en-US')}</span>
-                                <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
+                                <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId] || seedAppending[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
                               </div>
                             {/if}
                           {/key}
