@@ -3538,6 +3538,8 @@
     searchSelection = []
     searchQueueConfigs = {}
     searchQueueStatus = ''
+    searchPreview = null
+    searchWarning = false
   }
 
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
@@ -4657,7 +4659,7 @@
                     {/if}
                     <div class="seed-search-actions">
                       <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
-                      <button class="primary" type="submit">Search</button>
+                      <button class="primary" type="submit" disabled={searchPreviewBusy}>Search</button>
                     </div>
                   </div>
                 </div>

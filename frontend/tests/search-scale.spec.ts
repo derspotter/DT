@@ -80,3 +80,32 @@ test('a search above the threshold shows the warning and "Cap at" starts a cappe
   await expect.poll(() => searchBody?.maxResults).toBe(10000)
   await expect(card.locator('p.muted').first()).toContainText('Fetching in the background')
 })
+
+test('Reset clears the warning instead of leaving stale "Cap at" / "Fetch all" actions live', async ({ page }) => {
+  let searchRequests = 0
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url())
+    if (url.pathname === '/api/keyword-search/preview') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 342118, threshold: 100000 }) })
+    }
+    if (url.pathname === '/api/keyword-search' && route.request().method() === 'POST') {
+      searchRequests += 1
+      return route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ runId: 55, status: 'running' }) })
+    }
+    return mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  const warning = page.getByTestId('search-warning')
+  await expect(warning).toContainText('This search matches 342,118 works')
+
+  await card.getByRole('button', { name: 'Reset' }).click()
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+  await expect(page.getByTestId('search-preview')).toHaveCount(0)
+  expect(searchRequests).toBe(0)
+})
