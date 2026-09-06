@@ -270,7 +270,7 @@ def main():
     parser.add_argument(
         "--sort",
         default=None,
-        help="Sort as <column>:<asc|desc>. Columns: title, year, source, seed, metadata, download",
+        help=f"Sort as <column>:<asc|desc>. Columns: {', '.join(SORT_KEYS)}",
     )
     args = parser.parse_args()
 
