@@ -26,6 +26,7 @@ describe('POST /api/keyword-search', () => {
     expect(res.body).toHaveProperty('results')
     expect(Array.isArray(res.body.results)).toBe(true)
     expect(res.body.results[0]).toHaveProperty('title')
+    expect(res.body).toMatchObject({ fetched_count: 2, truncated_results: false })
   })
 
   test('accepts author-only search in stub', async () => {

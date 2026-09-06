@@ -988,8 +988,9 @@ export function pruneOrphanedCorpusRows(db) {
 }
 
 // Background keyword-search runs: PID handles for runs currently in flight,
-// keyed by search_runs.id, so the cancel route can signal them.
-const activeSearchRuns = new Map();
+// keyed by search_runs.id, so the cancel route can signal them. Exported so
+// tests can assert on registration/cleanup without a real Python process.
+export const activeSearchRuns = new Map();
 
 function searchWarnThreshold() {
   const raw = appSettingsEnv().RAG_FEEDER_SEARCH_WARN_THRESHOLD || process.env.RAG_FEEDER_SEARCH_WARN_THRESHOLD || '';
@@ -1004,9 +1005,12 @@ export function markOrphanedSearchRuns(db, startedAtIso) {
   if (!tableExists(db, 'search_runs')) return 0;
   const cols = db.prepare('PRAGMA table_info(search_runs)').all().map((c) => c.name);
   if (!cols.includes('status')) return 0;
+  // created_at is SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS'); startedAtIso
+  // is a JS ISO string ('...T...Z'). A bare string comparison is only right by
+  // accident, so normalize both sides through datetime(), which parses either.
   const result = db
     .prepare(`UPDATE search_runs SET status = 'failed', error = 'backend restarted', finished_at = CURRENT_TIMESTAMP
-              WHERE status = 'running' AND created_at < ?`)
+              WHERE status = 'running' AND datetime(created_at) < datetime(?)`)
     .run(startedAtIso);
   return result.changes;
 }
@@ -4931,15 +4935,23 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         if (!line.startsWith('{')) return;
         let event;
         try { event = JSON.parse(line); } catch { return; }
-        if (event?.event === 'run_created' && !responded) {
-          const runId = Number(event.runId);
-          if (Number.isFinite(runId) && runId > 0) {
-            upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: Number(req.corpusId) });
-            activeSearchRuns.set(runId, child);
-            responded = true;
-            res.status(202).json({ runId, status: 'running' });
-          }
+        if (event?.event !== 'run_created' || responded) return;
+        const runId = Number(event.runId);
+        if (!Number.isFinite(runId) || runId <= 0) return;
+        // The run already exists in the DB the instant this event fires, so
+        // the client must get its 202 regardless of what happens next —
+        // registering corpus ownership is best-effort and can be recovered
+        // later (the seed list re-derives it), it must never cost us the
+        // response or leave `responded` unset (which would re-trigger this
+        // branch on the next stdout chunk and try to send a second response).
+        responded = true;
+        try {
+          upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: Number(req.corpusId) });
+        } catch (error) {
+          console.warn('[/api/keyword-search] Failed to record run/corpus ownership:', error?.message || error);
         }
+        activeSearchRuns.set(runId, child);
+        res.status(202).json({ runId, status: 'running' });
       },
     });
     done
