@@ -109,3 +109,23 @@ test('Reset clears the warning instead of leaving stale "Cap at" / "Fetch all" a
   await expect(page.getByTestId('search-preview')).toHaveCount(0)
   expect(searchRequests).toBe(0)
 })
+
+test('a running seed shows progress and settles to done', async ({ page }) => {
+  let polls = 0
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/seed/sources**', async (route) => {
+    polls += 1
+    const run = polls < 3
+      ? { status: 'running', fetched_count: 400 * polls, expected_count: 1200, error: null }
+      : { status: 'done', fetched_count: 1200, expected_count: 1200, error: null }
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ sources: [{
+      id: 'search:55', source_type: 'search', seed_kind: 'search', source_key: '55', label: 'economics', subtitle: '',
+      created_at: '2026-09-06T10:00:00Z', candidate_count: run.fetched_count, state_counts: null, removable: true, meta: {}, run,
+    }] }) })
+  })
+  await page.goto('/')
+  const status = page.getByTestId('seed-run-status')
+  await expect(status).toContainText('fetching 400 of 1,200')
+  await expect(status).toContainText('fetching 800 of 1,200', { timeout: 10_000 })
+  await expect(status).toHaveCount(0, { timeout: 10_000 })
+})

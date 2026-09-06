@@ -4723,6 +4723,25 @@ button.danger:disabled {
   border-color: rgba(185, 28, 28, 0.36);
 }
 
+.seed-run-status--running { color: #0369a1; }
+.seed-run-status--failed { color: #b91c1c; }
+.seed-run-status--cancelled { color: #6b7280; }
+
+.seed-run-status button.link {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-weight: 650;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.seed-run-status button.link:hover {
+  opacity: 0.8;
+}
+
 .seed-source__heading {
   display: flex;
   align-items: center;

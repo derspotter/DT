@@ -31,6 +31,7 @@
     enqueueIngestEntries,
     processMarkedIngestEntries,
     runKeywordSearch,
+    cancelKeywordSearch,
     fetchRecursionConfig,
     fetchCorpus,
     removeCorpusWork,
@@ -160,6 +161,15 @@
   $: pipelineMetadataCount = Number(ingestStats.matched || 0)
   $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
   $: itemsFoundCount = seedSources.reduce((total, source) => total + (Number(source?.candidate_count) || 0), 0)
+  $: anySearchRunning = seedSources.some((s) => s?.run?.status === 'running')
+  $: if (anySearchRunning) {
+    if (!searchRefreshIntervalId) {
+      searchRefreshIntervalId = setInterval(() => runLiveRefreshCycle(), 2000)
+    }
+  } else if (searchRefreshIntervalId) {
+    clearInterval(searchRefreshIntervalId)
+    searchRefreshIntervalId = null
+  }
   $: itemsPromotedCount = Number(corpusTotal) || corpusItems.length
   let ingestStatsStatus = ''
   let latestEntries = []
@@ -467,6 +477,7 @@
   let pipelineRefreshTimer = null
   let pipelineRefreshInFlight = false
   let liveRefreshIntervalId = null
+  let searchRefreshIntervalId = null
   let lastTabRefreshAt = 0
   let rawCorpusTableEl = null
   let metaCorpusTableEl = null
@@ -1505,6 +1516,9 @@
         loadCorpus({ preserveSelection: true, quiet: true }),
         loadOpenAlexQuota(),
       ]
+      if (anySearchRunning) {
+        tasks.push(loadSeedSources({ quiet: true }))
+      }
       if (diagnosticsEnabled) {
         tasks.push(
           loadDownloads(),
@@ -3027,6 +3041,27 @@
     }
   }
 
+  function runSubtitle(source) {
+    const run = source?.run
+    if (!run || !run.status || run.status === 'done') return ''
+    const fetched = Number(run.fetched_count || 0).toLocaleString('en-US')
+    const expected = run.expected_count === null || run.expected_count === undefined ? '…' : Number(run.expected_count).toLocaleString('en-US')
+    if (run.status === 'running') return `fetching ${fetched} of ${expected}`
+    if (run.status === 'failed') return `stopped after ${fetched} of ${expected}: ${run.error || 'unknown error'}`
+    if (run.status === 'cancelled') return `cancelled at ${fetched} of ${expected}`
+    return ''
+  }
+
+  async function handleCancelSearch(source) {
+    try {
+      await cancelKeywordSearch(source.source_key)
+      seedSourcesStatus = 'Cancelling search…'
+      await loadSeedSources({ quiet: true })
+    } catch (error) {
+      seedSourcesStatus = error?.message || 'Could not cancel the search.'
+    }
+  }
+
   async function loadSeedCandidatesForSource(source, { quiet = false, background = false } = {}) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
@@ -4305,6 +4340,10 @@
         clearInterval(liveRefreshIntervalId)
         liveRefreshIntervalId = null
       }
+      if (searchRefreshIntervalId) {
+        clearInterval(searchRefreshIntervalId)
+        searchRefreshIntervalId = null
+      }
       if (promotionFlushTimer) {
         clearTimeout(promotionFlushTimer)
         promotionFlushTimer = null
@@ -4802,7 +4841,14 @@
                         {/if}
                         <strong>{source.label}</strong>
                       </div>
-                      {#if source.subtitle}
+                      {#if runSubtitle(source)}
+                        <span class={`muted small seed-run-status seed-run-status--${source.run.status}`} data-testid="seed-run-status">
+                          {runSubtitle(source)}
+                          {#if source.run.status === 'running'}
+                            · <button type="button" class="link" on:click|stopPropagation={() => handleCancelSearch(source)}>cancel</button>
+                          {/if}
+                        </span>
+                      {:else if source.subtitle}
                         <span class="muted small">{source.subtitle}</span>
                       {/if}
                     </div>
@@ -4833,13 +4879,13 @@
                       {/key}
                       <div class="pill-row">
                         <span class="pill" title="Total items found in this seed">{source.candidate_count} items</span>
-                        {#if source.candidate_count - (source.state_counts.in_corpus || 0) > 0}
-                          <span class="pill" title="Not yet promoted or dismissed — your decision pending">To review: {source.candidate_count - (source.state_counts.in_corpus || 0)}</span>
+                        {#if source.candidate_count - (source.state_counts?.in_corpus || 0) > 0}
+                          <span class="pill" title="Not yet promoted or dismissed — your decision pending">To review: {source.candidate_count - (source.state_counts?.in_corpus || 0)}</span>
                         {/if}
-                        {#if source.state_counts.in_corpus}
+                        {#if source.state_counts?.in_corpus}
                           <span class="pill" title="Already a member of this corpus — expand for each item's stage">In corpus: {source.state_counts.in_corpus}</span>
                         {/if}
-                        {#if source.state_counts.downloaded_elsewhere_available}
+                        {#if source.state_counts?.downloaded_elsewhere_available}
                           <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF downloaded: {source.state_counts.downloaded_elsewhere_available}</span>
                         {/if}
                       </div>
