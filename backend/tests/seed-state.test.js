@@ -472,4 +472,82 @@ describe('search seed paging, sorting and run status', () => {
     expect(dismissAllSeedCandidates(db, 130, 'search', '7', { q: 'title 00' })).toBe(4)
     expect(countSeedCandidates(db, 130, 'search', '7', {})).toBe(0)
   })
+
+  test('dismissAllSeedCandidates dismisses only the filtered rows, leaving the rest untouched', () => {
+    seedRun(5)
+    // i % 2 is truthy for odd i => 'Zed Author'; that's ids 1, 3, 5 (3 of 5).
+    expect(dismissAllSeedCandidates(db, 130, 'search', '7', { q: 'zed author' })).toBe(3)
+    expect(countSeedCandidates(db, 130, 'search', '7', {})).toBe(2)
+    const remainingIds = listSeedCandidates(db, 130, 'search', '7', {}).map((c) => c.id).sort((a, b) => a - b)
+    expect(remainingIds).toEqual([2, 4])
+  })
+
+  test('two consecutive pages with no sort are contiguous by id', () => {
+    seedRun(10)
+    const page1 = listSeedCandidates(db, 130, 'search', '7', { limit: 5, offset: 0 })
+    const page2 = listSeedCandidates(db, 130, 'search', '7', { limit: 5, offset: 5 })
+    expect(page1.map((c) => c.id)).toEqual([10, 9, 8, 7, 6])
+    expect(page2.map((c) => c.id)).toEqual([5, 4, 3, 2, 1])
+  })
+
+  test('sorts by refs ascending in SQL with blanks last', () => {
+    seedRun(5)
+    db.prepare(`UPDATE search_results SET raw_json = '{}' WHERE id = 3`).run()
+    const rows = listSeedCandidates(db, 130, 'search', '7', { limit: 5, offset: 0, sort: 'refs', dir: 'asc' })
+    expect(rows.map((r) => r.refs_count)).toEqual([0, 1, 3, 4, null])
+  })
+
+  test('sorts by year ascending in SQL with blanks last', () => {
+    seedRun(5)
+    db.prepare(`UPDATE search_results SET year = '' WHERE id = 3`).run()
+    const rows = listSeedCandidates(db, 130, 'search', '7', { limit: 5, offset: 0, sort: 'year', dir: 'asc' })
+    expect(rows.map((r) => r.year)).toEqual(['1901', '1902', '1904', '1905', null])
+  })
+
+  function stubResolver(stateByTitle, fileAvailableByTitle = {}) {
+    return {
+      resolveState: (candidate) => stateByTitle[candidate.title] || 'pending',
+      resolveDownloadedAvailability: (candidate) => ({
+        downloaded_work_id: null,
+        file_available: fileAvailableByTitle[candidate.title] ?? true,
+        file_path: null,
+      }),
+      isInCorpus: () => false,
+    }
+  }
+
+  test('metadata sort ranks failed_enrichment, then pending/staged_raw, then queued_enrichment, then the rest', () => {
+    seedRun(5)
+    const stateResolver = stubResolver({
+      'Title 001': 'downloaded',
+      'Title 002': 'failed_enrichment',
+      'Title 003': 'queued_enrichment',
+      'Title 004': 'pending',
+      'Title 005': 'staged_raw',
+    })
+    const asc = listSeedCandidates(db, 130, 'search', '7', { stateResolver, sort: 'metadata', dir: 'asc' })
+    // rank0: id2; rank1 tie {id4, id5} broken by id DESC -> 5 then 4; rank2: id3; rank3 (everything else): id1
+    expect(asc.map((c) => c.id)).toEqual([2, 5, 4, 3, 1])
+    const desc = listSeedCandidates(db, 130, 'search', '7', { stateResolver, sort: 'metadata', dir: 'desc' })
+    expect(desc.map((c) => c.id)).toEqual([1, 3, 5, 4, 2])
+  })
+
+  test('download sort ranks failed_download, not-downloaded, queued_download, downloaded_elsewhere (unavailable below available), then downloaded', () => {
+    seedRun(6)
+    const stateResolver = stubResolver(
+      {
+        'Title 001': 'queued_download',
+        'Title 002': 'failed_download',
+        'Title 003': 'downloaded_elsewhere',
+        'Title 004': 'downloaded_elsewhere',
+        'Title 005': 'downloaded',
+        'Title 006': 'pending',
+      },
+      { 'Title 003': false, 'Title 004': true, 'Title 005': true }
+    )
+    const asc = listSeedCandidates(db, 130, 'search', '7', { stateResolver, sort: 'download', dir: 'asc' })
+    expect(asc.map((c) => c.id)).toEqual([2, 6, 1, 4, 3, 5])
+    const desc = listSeedCandidates(db, 130, 'search', '7', { stateResolver, sort: 'download', dir: 'desc' })
+    expect(desc.map((c) => c.id)).toEqual([5, 3, 4, 1, 6, 2])
+  })
 })

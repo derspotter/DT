@@ -2255,6 +2255,21 @@ function coerceInt(value, fallback = null) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+// Shared query-string parsing for the seed-candidates route, extracted so it
+// can be unit-tested directly (the route itself needs a real corpus/auth
+// fixture DB to drive end-to-end). Clamps limit to 1..2000 and offset to >=0
+// — note Math.trunc happens before clamping, and a bad/zero limit clamps to
+// 1 rather than falling back to the 200 default (only a missing/empty value
+// falls back, via coerceInt's own fallback param).
+export function parseCandidatePaging(query = {}) {
+  const limit = Math.max(1, Math.min(2000, Math.trunc(coerceInt(query?.limit, 200))));
+  const offset = Math.max(0, Math.trunc(coerceInt(query?.offset, 0)));
+  const sortKey = String(query?.sort || '').trim().toLowerCase();
+  const sort = SEED_CANDIDATE_SORT_KEYS.has(sortKey) ? sortKey : '';
+  const dir = String(query?.dir || '').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+  return { limit, offset, sort, dir };
+}
+
 function coerceBoolEnv(value, fallback) {
   if (value === undefined || value === null || value === '') {
     return fallback;
@@ -5033,12 +5048,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       // One resolver for both calls: building it is the expensive part.
       const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
       const q = String(req.query?.q || '').trim();
-      const limit = Math.max(1, Math.min(2000, coerceInt(req.query?.limit, 200) || 200));
-      const offset = Math.max(0, coerceInt(req.query?.offset, 0) || 0);
-      const sort = SEED_CANDIDATE_SORT_KEYS.has(String(req.query?.sort || '').trim().toLowerCase())
-        ? String(req.query?.sort || '').trim().toLowerCase()
-        : '';
-      const dir = String(req.query?.dir || '').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+      const { limit, offset, sort, dir } = parseCandidatePaging(req.query);
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
@@ -5048,7 +5058,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         sort,
         dir,
       });
-      const total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
+      const total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
       const sourceSummary = listSeedSources(authDb, req.corpusId, {
         limit: 500,
         resolveDownloadedFilePath: findDownloadedFilePath,

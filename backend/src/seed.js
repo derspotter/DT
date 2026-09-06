@@ -681,13 +681,56 @@ export function matchesSeedQuery(candidate, needle) {
 // literal, which silently misbehaves for json_extract paths.
 const SEARCH_SORT_SQL = {
   title: `LOWER(COALESCE(sr.title, ''))`,
-  year: `CAST(sr.year AS INTEGER)`,
+  // NULLIF('', '') -> NULL, so an empty/blank year casts to NULL rather than
+  // 0 and sorts as a blank (last in both directions) instead of first in asc.
+  year: `CAST(NULLIF(TRIM(sr.year), '') AS INTEGER)`,
   authors: `LOWER(COALESCE(json_extract(sr.raw_json, '$.authorships[0].author.display_name'), ''))`,
   source: `LOWER(COALESCE(json_extract(sr.raw_json, '$.primary_location.source.display_name'), ''))`,
   refs: `json_extract(sr.raw_json, '$.referenced_works_count')`,
   cited_by: `json_extract(sr.raw_json, '$.cited_by_count')`,
 }
 const SEARCH_JS_SORTS = new Set(['metadata', 'download'])
+
+// Metadata axis: failed_enrichment first, then (pending, staged_raw), then
+// queued_enrichment, then everything else (enriched/added/queued_download/
+// downloaded/downloaded_elsewhere/failed_download) tied at the bottom.
+const METADATA_SORT_RANK = new Map([
+  ['failed_enrichment', 0],
+  ['pending', 1],
+  ['staged_raw', 1],
+  ['queued_enrichment', 2],
+])
+const METADATA_SORT_DEFAULT_RANK = 3
+
+// Download axis: failed_download first, then every not-yet-downloaded state,
+// then queued_download, then downloaded_elsewhere, then downloaded — with
+// file_available === false ranking below (after) true within the same state.
+const DOWNLOAD_SORT_RANK = new Map([
+  ['failed_download', 0],
+  ['pending', 1],
+  ['staged_raw', 1],
+  ['queued_enrichment', 1],
+  ['enriched', 1],
+  ['added', 1],
+  ['queued_download', 2],
+  ['downloaded_elsewhere', 3],
+  ['downloaded', 4],
+])
+const DOWNLOAD_SORT_DEFAULT_RANK = 1
+
+function metadataSortRank(candidate) {
+  const state = String(candidate?.state || '')
+  const base = METADATA_SORT_RANK.has(state) ? METADATA_SORT_RANK.get(state) : METADATA_SORT_DEFAULT_RANK
+  return base
+}
+
+function downloadSortRank(candidate) {
+  const state = String(candidate?.state || '')
+  const base = DOWNLOAD_SORT_RANK.has(state) ? DOWNLOAD_SORT_RANK.get(state) : DOWNLOAD_SORT_DEFAULT_RANK
+  const isFileAvailabilityState = state === 'downloaded' || state === 'downloaded_elsewhere'
+  const fileSub = isFileAvailabilityState && candidate?.file_available === false ? 1 : 0
+  return base * 10 + fileSub
+}
 
 function seedStateCountLimit() {
   const parsed = Number(process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT || 2000)
@@ -708,12 +751,15 @@ function searchCandidateWhere(corpusId, runId, sourceRef, needle) {
   return { where: where.join(' AND '), params }
 }
 
-export function countSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '' } = {}) {
+export function countSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '', stateResolver = null } = {}) {
   const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   if (sourceKind === 'pdf') {
-    return listSeedCandidates(db, corpusId, 'pdf', sourceRef, { q }).length
+    // The pdf branch has no cheap SQL count (state/dismissal filtering happens
+    // in JS); forward the caller's resolver so a route that already built one
+    // doesn't pay to build a second.
+    return listSeedCandidates(db, corpusId, 'pdf', sourceRef, { q, stateResolver }).length
   }
   const runId = Number(sourceRef)
   if (!Number.isFinite(runId) || runId <= 0) return 0
@@ -770,12 +816,20 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
   ).all(...params, ...(useSqlPaging ? [Number(limit), Number(offset) || 0] : []))
   let candidates = rows.map((row) => applyExplicitCorpusMembership(normalizeSearchCandidate(row, resolverBundle), inCorpusMarked))
   if (SEARCH_JS_SORTS.has(sortKey)) {
-    const label = sortKey === 'metadata' ? (c) => String(c.metadata_status || c.state || '') : (c) => String(c.download_status || c.state || '')
-    candidates.sort((a, b) => label(a).localeCompare(label(b)) * (direction === 'DESC' ? -1 : 1))
+    const rankFn = sortKey === 'metadata' ? metadataSortRank : downloadSortRank
+    // Rank order honours dir; the id DESC tie-break inside the same rank does
+    // not (mirrors the SQL ORDER BY's fixed `sr.id DESC` tie-break).
+    candidates.sort((a, b) => {
+      const diff = rankFn(a) - rankFn(b)
+      if (diff !== 0) return diff * (direction === 'DESC' ? -1 : 1)
+      return (Number(b.id) || 0) - (Number(a.id) || 0)
+    })
     if (limit !== null) candidates = candidates.slice(Number(offset) || 0, (Number(offset) || 0) + Number(limit))
-  } else if (!sqlSort) {
-    candidates = sortSeedCandidates(candidates)
   }
+  // No further JS re-sort otherwise: the SQL ORDER BY (sqlSort, or the
+  // default `sr.id DESC`) already reflects the requested order, and each
+  // page was already sliced in SQL — re-sorting here would shuffle pages
+  // independently and break contiguity across LIMIT/OFFSET calls.
   return candidates
 }
 
@@ -974,12 +1028,31 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
   return normalized.length
 }
 
-// Dismisses every candidate currently matching the filter (a one-off action,
-// so loading the filtered rows once to collect their keys is acceptable even
-// for a large search seed).
+// Dismisses every candidate currently matching the filter. Pdf seeds keep the
+// JS round-trip (load the filtered rows, dismiss by key) since their
+// filtering already happens in JS; search seeds do it in one INSERT ... SELECT
+// so a 100k-item seed doesn't need every row materialized in JS first.
 export function dismissAllSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '' } = {}) {
-  const keys = listSeedCandidates(db, corpusId, sourceType, sourceKey, { q }).map((c) => c.candidate_key)
-  return dismissSeedCandidates(db, corpusId, sourceType, sourceKey, keys)
+  const sourceKind = String(sourceType || '').trim().toLowerCase()
+  const sourceRef = String(sourceKey || '').trim()
+  if (sourceKind !== 'search') {
+    const keys = listSeedCandidates(db, corpusId, sourceType, sourceKey, { q }).map((c) => c.candidate_key)
+    return dismissSeedCandidates(db, corpusId, sourceType, sourceKey, keys)
+  }
+  const runId = Number(sourceRef)
+  if (!Number.isFinite(runId) || runId <= 0) return 0
+  const needle = String(q || '').trim().toLowerCase()
+  const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
+  // NOT EXISTS in `where` already excludes already-dismissed rows, so this
+  // only ever inserts new rows — OR REPLACE is just defensive.
+  const result = db.prepare(
+    `INSERT OR REPLACE INTO seed_candidates_dismissed (corpus_id, source_type, source_key, candidate_key, dismissed_at)
+     SELECT ?, 'search', ?, 'search:' || sr.id, CURRENT_TIMESTAMP
+     FROM search_results sr
+     JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id
+     WHERE ${where}`
+  ).run(corpusId, sourceRef, ...params)
+  return Number(result?.changes || 0)
 }
 
 // The original upload for a seed document. `ingest_source_metadata.source_pdf`
