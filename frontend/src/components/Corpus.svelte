@@ -66,16 +66,17 @@
   $: selectableWorkIdSet = new Set(selectableWorkIds)
   $: visibleSelection = selectedWorkIds.filter((id) => selectableWorkIdSet.has(id))
   $: allSelected = selectableWorkIds.length > 0 && visibleSelection.length === selectableWorkIds.length
+  $: selectedWorkIdSet = new Set(selectedWorkIds)
 
   function isRowSelected(item) {
     const id = workIdOf(item)
-    return id !== null && selectedWorkIds.includes(id)
+    return id !== null && selectedWorkIdSet.has(id)
   }
 
   function toggleRowSelection(item) {
     const id = workIdOf(item)
     if (id === null) return
-    selectedWorkIds = selectedWorkIds.includes(id)
+    selectedWorkIds = selectedWorkIdSet.has(id)
       ? selectedWorkIds.filter((value) => value !== id)
       : [...selectedWorkIds, id]
   }
