@@ -1634,6 +1634,12 @@
     authError = ''
     const startupTab = !preserveAuthFlow ? readTabFromHash({ includeUnavailable: true }) : null
     const startupNavigationRevision = navigationRevision
+    const landingTab = startupTab || activeTab
+    // The backend scopes every workspace request to the token's corpus, so
+    // the seed list, corpus table and counts do not have to wait for the
+    // auth round trip: start them now and let refreshAll collect them. A bad
+    // token fails them with a 401 exactly as it fails fetchMe below.
+    const inFlight = tabNeedsWorkspaceData(landingTab) ? startWorkspaceLoads() : null
     try {
       const payload = await fetchMe()
       authUser = payload.user
@@ -1644,8 +1650,7 @@
         authFlow = 'login'
         authFlowToken = ''
       }
-      await loadRecursionConfig()
-      await refreshAll(startupTab || activeTab)
+      await Promise.all([loadRecursionConfig(), refreshAll(landingTab, { inFlight })])
       connectLogs()
       if (!preserveAuthFlow && navigationRevision === startupNavigationRevision) {
         const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
@@ -1818,27 +1823,37 @@
     resetFrontendState()
   }
 
-  async function refreshAll(targetTab = activeTab) {
+  // Only the workspace/dashboard/downloads tabs render the pipeline + corpus
+  // data. For other landing tabs (notably the graph, which loads its own
+  // snapshot) these are several synchronous DB queries that can stall the
+  // backend while the workers hold the SQLite lock — so skip them and let
+  // setActiveTab()/refreshForActiveTab() load exactly what the tab needs.
+  function tabNeedsWorkspaceData(tabId) {
+    return tabId === 'workspace' || tabId === 'dashboard' || tabId === 'downloads'
+  }
+
+  // The loads that need nothing from the auth payload: the backend scopes
+  // them to the token's corpus itself. bootstrapAuth starts these before
+  // fetchMe returns; refreshAll starts them itself on every later refresh.
+  function startWorkspaceLoads() {
+    return [
+      loadSeedSources(),
+      loadIngestStats(),
+      loadIngestRuns(),
+      loadCorpus(),
+    ]
+  }
+
+  async function refreshAll(targetTab = activeTab, { inFlight = null } = {}) {
     restoreStoredUploads()
     // The OpenAlex quota pill is shown on both the workspace search panel
     // and the admin settings row, so it needs to load once after every
     // authentication regardless of which tab the user lands on (notably
     // #/admin, which the workspace-only tasks below never touch).
     void loadOpenAlexQuota()
-    // Only the workspace/dashboard/downloads tabs render this pipeline + corpus
-    // data. For other landing tabs (notably the graph, which loads its own
-    // snapshot) these are several synchronous DB queries that can stall the
-    // backend while the workers hold the SQLite lock — so skip them and let
-    // setActiveTab()/refreshForActiveTab() load exactly what the tab needs.
-    const needsWorkspaceData = targetTab === 'workspace' || targetTab === 'dashboard' || targetTab === 'downloads'
-    if (!needsWorkspaceData) return
-    const tasks = [
-      loadSeedSources(),
-      loadIngestStats(),
-      loadIngestRuns(),
-      loadCorpus(),
-      loadKantroposAssignment(),
-    ]
+    if (!tabNeedsWorkspaceData(targetTab)) return
+    const tasks = inFlight ? [...inFlight] : startWorkspaceLoads()
+    tasks.push(loadKantroposAssignment())
     if (diagnosticsEnabled) {
       tasks.push(
         loadDownloads(),
@@ -1847,6 +1862,9 @@
       )
     }
     await Promise.all(tasks)
+    // Everything a tab refresh would fetch is fresh now. Stamp it so the
+    // setActiveTab() that follows a bootstrap does not fetch it all again.
+    lastTabRefreshAt = Date.now()
   }
 
   function resetFrontendState() {
@@ -3806,7 +3824,9 @@
     if (!append && quiet && corpusLoadingMore) return
 
     const requestSeq = ++corpusLoadRequestSeq
-    const requestCorpusId = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+    // null until the auth payload names the corpus (the initial value is 0):
+    // the backend then answers for the token's corpus, which is that one.
+    const requestCorpusId = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
     const scrollSnapshot = !append && preserveSelection ? snapshotCorpusScroll() : null
     if (append) {
       if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
@@ -3833,8 +3853,12 @@
         sort: corpusSort,
       })
       const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
-      const currentCorpusNumeric = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
-      if (requestSeq !== corpusLoadRequestSeq || requestCorpusId !== currentCorpusNumeric) {
+      const currentCorpusNumeric = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
+      // Drop the response if the user switched corpus meanwhile. A load that
+      // started before the corpus was known (requestCorpusId null) was
+      // answered for the token's corpus, which is the one fetchMe reports.
+      const switchedCorpus = requestCorpusId !== null && requestCorpusId !== currentCorpusNumeric
+      if (requestSeq !== corpusLoadRequestSeq || switchedCorpus) {
         return
       }
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
