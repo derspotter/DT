@@ -203,7 +203,6 @@ def _searchable_text(item):
         item.get("title"),
         item.get("authors"),
         item.get("source"),
-        item.get("source_label"),
     ]
     return " ".join(str(part) for part in parts if part).lower()
 

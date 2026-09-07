@@ -26,3 +26,15 @@ def test_sort_by_authors_uses_first_author_and_is_case_insensitive():
 
 def test_authors_sort_key_is_registered():
     assert 'authors' in corpus_list.SORT_KEYS
+
+
+def test_query_filter_matches_title_author_publication_only():
+    items = [
+        {'id': 1, 'title': 'Labour markets', 'authors': 'Ada', 'source': 'J. Econ', 'source_label': 'Search #7'},
+        {'id': 2, 'title': 'Other', 'authors': 'Bob', 'source': 'Rev', 'source_label': 'Labour seed'},
+    ]
+    assert [i['id'] for i in corpus_list.apply_query_filter(items, 'labour')] == [1]
+    assert [i['id'] for i in corpus_list.apply_query_filter(items, 'bob')] == [2]
+    assert [i['id'] for i in corpus_list.apply_query_filter(items, 'econ')] == [1]
+    # The seed/provenance label is shown in its own column but is not a filter field.
+    assert corpus_list.apply_query_filter(items, 'search #7') == []
