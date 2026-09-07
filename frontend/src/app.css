@@ -3476,6 +3476,23 @@ button.danger:disabled {
   width: 220px;
 }
 
+/* The picker has no label above it: sit it on the input row, at input height,
+   and open its menu towards the free space on the left. */
+.corpus-toolbar__filters .column-picker {
+  align-self: flex-end;
+}
+
+.corpus-toolbar__filters .column-picker__toggle {
+  padding: 10px 14px;
+  font-size: 0.9rem;
+  line-height: normal;
+}
+
+.corpus-toolbar__filters .column-picker__menu {
+  left: auto;
+  right: 0;
+}
+
 .corpus-stage-pill {
   text-transform: capitalize;
 }
