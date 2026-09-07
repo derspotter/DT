@@ -255,3 +255,38 @@ def test_search_openalex_accumulate_false_requires_callback():
 
     with _pytest.raises(ValueError):
         ks.search_openalex("q", accumulate=False)
+
+
+def test_search_openalex_reports_empty_first_page(monkeypatch):
+    """A query matching nothing still hands meta.count = 0 to the callback once."""
+    from dl_lit import keyword_search as ks
+
+    monkeypatch.setattr(ks, "_openalex_request",
+                        lambda *a, **k: {"results": [], "meta": {"count": 0, "next_cursor": None}})
+    pages = []
+    out = ks.search_openalex("q", max_results=None, on_page=lambda items, meta: pages.append((items, meta.get("count"))),
+                             accumulate=False)
+    assert out == []
+    assert pages == [([], 0)]
+
+
+def test_zero_result_run_records_expected_count_zero(monkeypatch, tmp_path, capsys):
+    mod = _load(monkeypatch)
+
+    def fake_search(**kwargs):
+        kwargs["on_page"]([], {"count": 0})
+        return []
+
+    monkeypatch.setattr(mod, "search_openalex", fake_search)
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "nothing", "--corpus-id", "1"])
+    mod.main()
+    events = _events(capsys)
+    run_id = events[0]["runId"]
+    progress = [e for e in events if e.get("event") == "progress"]
+    assert [(p["fetched"], p["expected"]) for p in progress] == [(0, 0)]
+
+    from dl_lit.db_manager import DatabaseManager
+    db = DatabaseManager(db_path=tmp_path / "t.db")
+    row = db.conn.execute("SELECT status, fetched_count, expected_count FROM search_runs WHERE id = ?", (run_id,)).fetchone()
+    assert tuple(row) == ("done", 0, 0)
+    db.close_connection()

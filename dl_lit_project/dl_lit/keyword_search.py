@@ -270,6 +270,7 @@ def search_openalex(query: str,
     results: list[dict] = []
     seen_ids: set[str] = set()
     fetched = 0
+    first_page = True
 
     while True:
         data = _openalex_request('works', params, rate_limiter)
@@ -285,8 +286,11 @@ def search_openalex(query: str,
             page_items.append(item)
             if max_results is not None and fetched >= max_results:
                 break
-        if on_page is not None and page_items:
+        # The first page always reports, even when empty, so a caller learns
+        # meta.count (possibly 0) for a query that matches nothing.
+        if on_page is not None and (page_items or first_page):
             on_page(page_items, data.get("meta") or {})
+        first_page = False
         page_items = None
         if max_results is not None and fetched >= max_results:
             return results
