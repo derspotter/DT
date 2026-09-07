@@ -208,6 +208,7 @@ def test_count_openalex_uses_per_page_one(monkeypatch):
     monkeypatch.setattr(keyword_search, "_openalex_request", fake)
     assert keyword_search.count_openalex(query="labour") == 342118
     assert captured["per-page"] == 1
+    assert captured["select"] == "id"
     assert "cursor" not in captured
 
 

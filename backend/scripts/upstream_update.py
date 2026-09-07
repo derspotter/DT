@@ -434,7 +434,7 @@ def pending_counts(conn: sqlite3.Connection, target_id: str, metadata_bib: Path)
            )
         """,
         (target_id, str(metadata_bib)),
-    ).fetchall()
+    )
 
     per_corpus: dict[int, dict] = {}
     total = 0

@@ -314,6 +314,7 @@ def count_openalex(query: str,
     except _NoAuthorMatch:
         return 0
     params["per-page"] = 1
+    params["select"] = "id"  # only meta.count is read; skip the full-record payload
     data = _openalex_request('works', params, get_global_rate_limiter())
     return int((data.get("meta") or {}).get("count") or 0)
 
