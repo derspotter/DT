@@ -13,7 +13,7 @@
   export let appSettingsError = false
   export let appSettingsDraft = {}
   export let handleSaveAppSettings = () => {}
-  export let showAdvancedSettings = false
+  let showAdvancedSettings = false
   export let openalexQuotaText = ''
 
   function secretHint(entry) {

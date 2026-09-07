@@ -63,7 +63,8 @@
   // that assigns to its own dependency loops. Ids hidden by the stage filter are
   // ignored here so the count never claims more than the table can act on, but
   // they survive in selectedWorkIds if the filter is cleared again.
-  $: visibleSelection = selectedWorkIds.filter((id) => selectableWorkIds.includes(id))
+  $: selectableWorkIdSet = new Set(selectableWorkIds)
+  $: visibleSelection = selectedWorkIds.filter((id) => selectableWorkIdSet.has(id))
   $: allSelected = selectableWorkIds.length > 0 && visibleSelection.length === selectableWorkIds.length
 
   function isRowSelected(item) {

@@ -2546,7 +2546,7 @@ class DatabaseManager:
         return int(row[0] if row else 0)
 
     def fetch_search_results(self, run_id: int, limit: int) -> list[dict]:
-        """Read back a run's stored results (newest-insert order), capped at `limit`.
+        """Read back a run's stored results in insertion order (oldest first), capped at `limit`.
 
         Used to render the inline payload without keeping every fetched item in memory.
         """

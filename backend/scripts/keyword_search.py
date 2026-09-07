@@ -743,6 +743,7 @@ def main():
             'related_depth_downstream': related_depth_downstream,
             'related_depth_upstream': related_depth_upstream,
             'max_related': max_related,
+            'related_sort': args.related_sort,
             'include_downstream': args.include_downstream,
             'include_upstream': args.include_upstream,
         }

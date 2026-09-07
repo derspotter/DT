@@ -53,6 +53,8 @@ def test_persists_each_page_and_emits_progress(monkeypatch, tmp_path, capsys):
     row = db.conn.execute("SELECT status, fetched_count, expected_count FROM search_runs WHERE id = ?", (run_id,)).fetchone()
     assert tuple(row) == ("done", 3, 3)
     assert db.count_search_results(run_id) == 3
+    filters = json.loads(db.conn.execute("SELECT filters_json FROM search_runs WHERE id = ?", (run_id,)).fetchone()[0])
+    assert filters["related_sort"] == mod.DEFAULT_RELATED_SORT
     db.close_connection()
 
 
