@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import signal
 import sys
 from collections import deque
 from pathlib import Path
@@ -22,7 +23,13 @@ from dl_lit.OpenAlexScraper import (
     fetch_referenced_work_details,
 )
 from dl_lit.db_manager import DatabaseManager
-from dl_lit.keyword_search import SORT_OPTIONS, dedupe_results, effective_max_results, search_openalex
+from dl_lit.keyword_search import (
+    SORT_OPTIONS,
+    count_openalex,
+    dedupe_results,
+    effective_max_results,
+    search_openalex,
+)
 from dl_lit.utils import (
     OpenAlexRateLimitExceeded,
     get_global_rate_limiter,
@@ -61,7 +68,7 @@ OPENALEX_WORKS_URL = 'https://api.openalex.org/works'
 OPENALEX_SELECT = (
     'id,doi,display_name,authorships,publication_year,type,'
     'abstract_inverted_index,keywords,primary_location,open_access,biblio,'
-    'referenced_works,cited_by_api_url'
+    'referenced_works,cited_by_api_url,referenced_works_count,cited_by_count'
 )
 OPENALEX_ID_RE = re.compile(r'^W\d+$', re.IGNORECASE)
 DOI_RE = re.compile(r'10\.\d{4,9}/\S+', re.IGNORECASE)
@@ -160,6 +167,8 @@ def _to_openalex_like(work):
         'biblio': work.get('biblio') or {},
         'referenced_works': work.get('referenced_works') or [],
         'cited_by_api_url': work.get('cited_by_api_url'),
+        'referenced_works_count': work.get('referenced_works_count'),
+        'cited_by_count': work.get('cited_by_count'),
     }
     return out
 
@@ -230,16 +239,98 @@ def _extract_referenced_work_ids(work):
     return _extract_openalex_ids(refs)
 
 
-def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related):
+# How related papers are chosen when the expansion has to cap (spec line 12).
+# Previously the cap was a plain slice of OpenAlex's arbitrary listing order;
+# now the kept N are the top N by the requested sort. Relevance is intentionally
+# absent: a pure expansion has no query term, so relevance_score is undefined.
+RELATED_SORT_OPTIONS = {
+    'most_cited': 'cited_by_count:desc',
+    'newest': 'publication_date:desc',
+}
+DEFAULT_RELATED_SORT = 'most_cited'
+
+# OpenAlex ORs ids in a single filter; keep batches well inside the URL limit.
+_RELATED_RANK_BATCH = 50
+
+
+def _resolve_related_sort(value):
+    key = str(value or '').strip().lower()
+    return key if key in RELATED_SORT_OPTIONS else DEFAULT_RELATED_SORT
+
+
+def _rank_candidate_ids(ids, related_sort, max_related, mailto):
+    """Rank ids by the chosen sort, then cap — never cap before ranking.
+
+    Ranking happens across ALL ids (batched only because of URL length), so the
+    kept N are the global top N, not the top N of whichever batch came first.
+    Ids OpenAlex does not return keep their original order at the end, so a
+    lookup failure degrades to the old behaviour instead of dropping works.
+    """
+    unique_ids = list(dict.fromkeys(ids))
+    if not unique_ids:
+        return []
+    if not max_related or max_related <= 0 or len(unique_ids) <= max_related:
+        return unique_ids
+
+    sort_key = _resolve_related_sort(related_sort)
+    metrics = {}
+    for start in range(0, len(unique_ids), _RELATED_RANK_BATCH):
+        batch = unique_ids[start:start + _RELATED_RANK_BATCH]
+        try:
+            data = _openalex_get(
+                {
+                    'filter': f"openalex_id:{'|'.join(batch)}",
+                    'select': 'id,cited_by_count,publication_date',
+                    'per-page': len(batch),
+                    'sort': RELATED_SORT_OPTIONS[sort_key],
+                },
+                mailto=mailto,
+            )
+        except Exception:
+            # A ranking lookup must never sink the whole expansion.
+            continue
+        for row in data.get('results') or []:
+            norm = _normalize_candidate_id(row.get('id'))
+            if norm:
+                metrics[norm] = row
+
+    if not metrics:
+        return unique_ids[:max_related]
+
+    def rank_value(candidate_id):
+        row = metrics.get(candidate_id)
+        if not row:
+            return None
+        if sort_key == 'newest':
+            return str(row.get('publication_date') or '')
+        return int(row.get('cited_by_count') or 0)
+
+    ranked = [cid for cid in unique_ids if metrics.get(cid) is not None]
+    unranked = [cid for cid in unique_ids if metrics.get(cid) is None]
+    ranked.sort(key=rank_value, reverse=True)
+    return (ranked + unranked)[:max_related]
+
+
+def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_sort=DEFAULT_RELATED_SORT):
     cited_by_url = work.get('cited_by_api_url')
-    if not cited_by_url and work.get('id'):
-        refreshed = fetch_work_by_openalex_id(work.get('id'), mailto=mailto)
-        if refreshed:
-            refreshed_work = _to_openalex_like(refreshed) or work
-            cited_by_url = refreshed_work.get('cited_by_api_url')
+    if not cited_by_url:
+        # OpenAlex has removed cited_by_api_url from the works payload — it is
+        # absent even when no `select` is given, so refetching the work cannot
+        # recover it and upstream expansion silently returned nothing. Build the
+        # equivalent `cites:` query ourselves.
+        work_id = normalize_openalex_id(work.get('id'))
+        if work_id:
+            cited_by_url = f'{OPENALEX_WORKS_URL}?filter=cites:{work_id}'
 
     if not cited_by_url:
         return []
+
+    # Ask OpenAlex to order the cited-by feed, so the first page it paginates
+    # already holds the top-ranked citing works rather than an arbitrary slice.
+    sort_value = RELATED_SORT_OPTIONS[_resolve_related_sort(related_sort)]
+    if 'sort=' not in cited_by_url:
+        separator = '&' if '?' in cited_by_url else '?'
+        cited_by_url = f'{cited_by_url}{separator}sort={sort_value}'
 
     citing_items = fetch_citing_work_ids(
         cited_by_url,
@@ -256,6 +347,7 @@ def _collect_candidate_ids(
     rate_limiter,
     mailto,
     direction='downstream',
+    related_sort=DEFAULT_RELATED_SORT,
 ):
     downstream_ids = []
     upstream_ids = []
@@ -267,9 +359,8 @@ def _collect_candidate_ids(
             if refreshed:
                 refreshed_work = _to_openalex_like(refreshed) or work
                 downstream_ids = _extract_referenced_work_ids(refreshed_work)
-        if max_related and max_related > 0:
-            downstream_ids = downstream_ids[:max_related]
-        return list(dict.fromkeys(downstream_ids)), []
+        # Rank first, then cap (spec line 12).
+        return _rank_candidate_ids(downstream_ids, related_sort, max_related, mailto), []
 
     if direction == 'upstream':
         upstream_ids = _fetch_upstream_candidates(
@@ -277,6 +368,7 @@ def _collect_candidate_ids(
             rate_limiter=rate_limiter,
             mailto=mailto,
             max_related=max_related,
+            related_sort=related_sort,
         )
         return [], list(dict.fromkeys(upstream_ids))
 
@@ -292,6 +384,7 @@ def _crawl_direction(
     all_items,
     global_ids,
     rate_limiter,
+    related_sort=DEFAULT_RELATED_SORT,
 ):
     if max_depth <= 0 or not base_items:
         return {'added': 0, 'processed': 0, 'matched': 0}
@@ -314,6 +407,7 @@ def _crawl_direction(
                 rate_limiter=rate_limiter,
                 mailto=mailto,
                 direction=direction,
+                related_sort=related_sort,
             )
         except OpenAlexRateLimitExceeded as exc:
             print(f"[OpenAlex WARN] Expansion stopped early: {exc}")
@@ -378,6 +472,7 @@ def expand_references_recursive(
     mailto,
     include_downstream=True,
     include_upstream=False,
+    related_sort=DEFAULT_RELATED_SORT,
 ):
     if not base_items:
         return base_items, {
@@ -414,6 +509,7 @@ def expand_references_recursive(
             all_items=all_items,
             global_ids=global_ids,
             rate_limiter=rate_limiter,
+            related_sort=related_sort,
         )
         downstream_added += downstream_stats.get('matched', 0)
         added += downstream_stats.get('added', 0)
@@ -429,6 +525,7 @@ def expand_references_recursive(
             all_items=all_items,
             global_ids=global_ids,
             rate_limiter=rate_limiter,
+            related_sort=related_sort,
         )
         upstream_added += upstream_stats.get('matched', 0)
         added += upstream_stats.get('added', 0)
@@ -504,7 +601,49 @@ def _render_results(records):
     return results
 
 
+def _render_stored_results(db, run_id, limit):
+    """Render the inline payload from the run's persisted rows.
+
+    The unbounded path never keeps the fetched items in memory, so the rows the
+    run already wrote are the only source for the inline preview.
+    """
+    records = []
+    for row in db.fetch_search_results(run_id, limit):
+        raw = row.get('raw_json')
+        if isinstance(raw, dict):
+            records.append(openalex_result_to_record(raw, run_id=run_id))
+        else:
+            records.append({
+                'openalex_id': row.get('openalex_id'),
+                'doi': row.get('doi'),
+                'title': row.get('title'),
+                'year': row.get('year'),
+                'authors': [],
+                'type': None,
+            })
+    return _render_results(records)
+
+
+_progress_stream = sys.stdout
+
+
+def _emit(event: dict) -> None:
+    """Progress lines go to the real stdout; main() redirects sys.stdout while the DB works."""
+    _progress_stream.write(json.dumps(event) + "\n")
+    _progress_stream.flush()
+
+
+def _inline_results_limit(cli_value):
+    if cli_value is not None:
+        return max(0, int(cli_value))
+    try:
+        return max(0, int(os.environ.get('RAG_FEEDER_SEARCH_INLINE_RESULTS', '1000')))
+    except ValueError:
+        return 1000
+
+
 def main():
+    global _progress_stream
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--query')
@@ -525,6 +664,12 @@ def main():
     parser.add_argument('--related-depth-upstream', type=int, default=None)
     parser.add_argument('--max-related', type=int, default=DEFAULT_MAX_RELATED)
     parser.add_argument(
+        '--related-sort',
+        default=DEFAULT_RELATED_SORT,
+        choices=sorted(RELATED_SORT_OPTIONS.keys()),
+        help='How related papers are ranked before the max-related cap is applied',
+    )
+    parser.add_argument(
         '--include-downstream',
         dest='include_downstream',
         action='store_true',
@@ -543,10 +688,21 @@ def main():
         default=DEFAULT_INCLUDE_UPSTREAM,
         help='Include upstream works that cite each work.',
     )
+    parser.add_argument('--count-only', action='store_true')
+    parser.add_argument('--inline-results-limit', type=int, default=None)
     args = parser.parse_args()
 
     if os.environ.get('RAG_FEEDER_STUB') == '1':
         print(json.dumps({'runId': 0, 'results': STUB_RESULTS, 'source': 'stub'}))
+        return
+
+    if args.count_only:
+        if args.query is None:
+            print(json.dumps({'count': 0}))
+            return
+        count = count_openalex(query=args.query or '', year_from=args.year_from, year_to=args.year_to,
+                               author=args.author, field=args.field, mailto=args.mailto)
+        print(json.dumps({'count': int(count)}))
         return
 
     db_path = Path(args.db_path)
@@ -569,6 +725,7 @@ def main():
     )
     max_related = max(1, int(args.max_related or 1))
 
+    _progress_stream = sys.stdout
     with contextlib.redirect_stdout(io.StringIO()):
         db = DatabaseManager(db_path=db_path)
         is_query_mode = args.query is not None
@@ -586,67 +743,103 @@ def main():
             'related_depth_downstream': related_depth_downstream,
             'related_depth_upstream': related_depth_upstream,
             'max_related': max_related,
+            'related_sort': args.related_sort,
             'include_downstream': args.include_downstream,
             'include_upstream': args.include_upstream,
         }
         run_query_label = args.query if is_query_mode and args.query else (args.author or '[filtered-search]' if is_query_mode else '[seed-json]')
-        run_id = db.create_search_run(query=run_query_label, filters=filters)
+        run_id = db.create_search_run(query=run_query_label, filters=filters, status='running')
+        _emit({'event': 'run_created', 'runId': run_id})
 
-        if is_query_mode:
-            base_items = search_openalex(
-                query=args.query or '',
-                max_results=effective_max_results(args.max_results),
-                year_from=args.year_from,
-                year_to=args.year_to,
-                author=args.author,
-                field=args.field,
-                mailto=args.mailto,
-                sort=args.sort,
-            )
-        else:
-            seeds = _parse_seed_json(args.seed_json)
-            base_items = []
-            for seed in seeds:
-                work = _resolve_seed_item(seed, mailto=args.mailto)
-                if work:
-                    base_items.append(work)
+        state = {'fetched': 0, 'expected': None}
 
-        all_items, expansion_stats = expand_references_recursive(
-            base_items,
-            related_depth_downstream=related_depth_downstream,
-            related_depth_upstream=related_depth_upstream,
-            max_related=max_related,
-            mailto=args.mailto,
-            include_downstream=args.include_downstream,
-            include_upstream=args.include_upstream,
+        def persist(items, meta):
+            # Per-run dedupe lives in the store (add_search_results skips ids
+            # already inserted for this run), so memory stays flat on big runs.
+            records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(items)]
+            inserted = db.add_search_results(run_id, [
+                {'openalex_id': r.get('openalex_id'), 'doi': r.get('doi'), 'title': r.get('title'),
+                 'year': r.get('year'), 'raw_json': r.get('openalex_json')}
+                for r in records
+            ]) if records else 0
+            state['fetched'] += int(inserted or 0)
+            if state['expected'] is None and meta and meta.get('count') is not None:
+                cap = effective_max_results(args.max_results)
+                state['expected'] = min(int(meta['count']), cap) if cap else int(meta['count'])
+            db.update_search_run_progress(run_id, state['fetched'], state['expected'])
+            _emit({'event': 'progress', 'fetched': state['fetched'], 'expected': state['expected']})
+
+        def on_sigterm(signum, frame):
+            db.finish_search_run(run_id, 'cancelled')
+            db.close_connection()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, on_sigterm)
+
+        # Expansion and enqueue are the only consumers of the fetched items; without
+        # them an unbounded run must not hold millions of works in memory.
+        expansion_enabled = (
+            (args.include_downstream and related_depth_downstream >= 1)
+            or (args.include_upstream and related_depth_upstream >= 1)
         )
+        needs_items = bool(expansion_enabled or args.enqueue)
 
-        records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]
-        records = dedupe_results(records)
+        try:
+            if is_query_mode:
+                base_items = search_openalex(
+                    query=args.query or '', max_results=effective_max_results(args.max_results),
+                    year_from=args.year_from, year_to=args.year_to, author=args.author,
+                    field=args.field, mailto=args.mailto, sort=args.sort, on_page=persist,
+                    accumulate=needs_items,
+                )
+            else:
+                seeds = _parse_seed_json(args.seed_json)
+                base_items = [w for w in (_resolve_seed_item(s, mailto=args.mailto) for s in seeds) if w]
+                persist(base_items, {'count': len(base_items)})
 
-        db.add_search_results(run_id, [
-            {
-                'openalex_id': r.get('openalex_id'),
-                'doi': r.get('doi'),
-                'title': r.get('title'),
-                'year': r.get('year'),
-                'raw_json': r.get('openalex_json'),
-            }
-            for r in records
-        ])
+            all_items, expansion_stats = expand_references_recursive(
+                base_items, related_depth_downstream=related_depth_downstream,
+                related_depth_upstream=related_depth_upstream, max_related=max_related,
+                mailto=args.mailto, include_downstream=args.include_downstream,
+                include_upstream=args.include_upstream, related_sort=args.related_sort,
+            )
+            # Expansion results are new items beyond the base set: persist the delta.
+            base_ids = {_normalize_candidate_id(i.get('id')) for i in base_items}
+            extra = [i for i in all_items if _normalize_candidate_id(i.get('id')) not in base_ids]
+            if extra:
+                state['expected'] = (state['expected'] or 0) + len(extra)
+                persist(extra, None)
 
-        if args.enqueue:
-            for record in records:
-                db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
-
+            limit = _inline_results_limit(args.inline_results_limit)
+            truncated = state['fetched'] > limit
+            if needs_items:
+                records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(all_items)]
+                records = dedupe_results(records)
+                if args.enqueue:
+                    for record in records:
+                        db.add_entry_to_download_queue(record, corpus_id=args.corpus_id)
+                inline_results = [] if truncated else _render_results(records)
+            else:
+                inline_results = [] if truncated else _render_stored_results(db, run_id, limit)
+            db.finish_search_run(run_id, 'done')
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            db.finish_search_run(run_id, 'failed', error=str(exc)[:500])
+            db.close_connection()
+            raise
         db.close_connection()
 
     payload = {
         'runId': run_id,
-        'results': _render_results(records),
+        'results': inline_results,
         'source': 'openalex',
         'mode': mode_label,
         'expansion': expansion_stats,
+        'fetched_count': state['fetched'],
+        'truncated_results': truncated,
     }
     print(json.dumps(payload))
 

@@ -190,6 +190,12 @@
     <div class="tab-hero__stats">
       <span><strong>{targets.length}</strong> targets</span>
       <span><strong>{browse?.summary?.pending_items_count || 0}</strong> pending</span>
+      {#if browse?.summary?.pending_skipped_missing_file}
+        <span
+          class="muted"
+          title="These works are marked downloaded but their PDF is not on disk, so upstream staging skips them."
+        >{browse.summary.pending_skipped_missing_file} skipped (file missing)</span>
+      {/if}
       <span><strong>{browse?.summary?.current_items_count || 0}</strong> upstream</span>
     </div>
   </section>

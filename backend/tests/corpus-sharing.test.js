@@ -333,4 +333,220 @@ describe('corpus sharing and multi-user isolation', () => {
       })
     )
   })
+
+  test('removing a corpus work unlinks it without deleting the work or other memberships', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const workId = seedCorpusWork(corpusId, 'Removable Work')
+
+    // Same work also lives in a second corpus; removal must not touch that.
+    const otherCorpusId = withDb((db) => {
+      const corpus = db
+        .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+        .run('Second corpus', Number(admin.user.id))
+      const id = Number(corpus.lastInsertRowid)
+      db.prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')").run(Number(admin.user.id), id)
+      db.prepare('INSERT INTO corpus_works (corpus_id, work_id) VALUES (?, ?)').run(id, workId)
+      return id
+    })
+
+    const res = await request(app)
+      .delete(`/api/corpus/works/${workId}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual(expect.objectContaining({ removed: true, work_id: workId }))
+
+    withDb((db) => {
+      const membership = db
+        .prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+        .get(corpusId, workId)
+      expect(membership).toBeUndefined()
+
+      // The work itself survives, and so does its other corpus membership.
+      const work = db.prepare('SELECT id FROM works WHERE id = ?').get(workId)
+      expect(work).toBeTruthy()
+      const otherMembership = db
+        .prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+        .get(otherCorpusId, workId)
+      expect(otherMembership).toBeTruthy()
+    })
+  })
+
+  test('removing a work that is not in the current corpus returns 404', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const orphanWorkId = withDb((db) => {
+      const work = db
+        .prepare(
+          `INSERT INTO works (title, normalized_title, authors, year, metadata_status, download_status)
+           VALUES ('Unrelated', 'unrelated', 'A', 2026, 'matched', 'not_requested')`
+        )
+        .run()
+      return Number(work.lastInsertRowid)
+    })
+
+    const res = await request(app)
+      .delete(`/api/corpus/works/${orphanWorkId}`)
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(404)
+  })
+
+  test('bulk removal unlinks every id and reports ids that were not members', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const first = seedCorpusWork(corpusId, 'Bulk One')
+    const second = seedCorpusWork(corpusId, 'Bulk Two')
+    const outsiderWorkId = withDb((db) => {
+      const work = db
+        .prepare(
+          `INSERT INTO works (title, normalized_title, authors, year, metadata_status, download_status)
+           VALUES ('Not a member', 'not a member', 'A', 2026, 'matched', 'not_requested')`
+        )
+        .run()
+      return Number(work.lastInsertRowid)
+    })
+
+    const res = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [first, second, outsiderWorkId] })
+
+    expect(res.status).toBe(200)
+    expect(res.body.removed).toBe(2)
+    expect(res.body.removed_work_ids.sort()).toEqual([first, second].sort())
+    expect(res.body.skipped_work_ids).toEqual([outsiderWorkId])
+
+    withDb((db) => {
+      for (const workId of [first, second]) {
+        expect(db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?').get(corpusId, workId)).toBeUndefined()
+        // The works themselves survive — removal is an unlink, not a delete.
+        expect(db.prepare('SELECT id FROM works WHERE id = ?').get(workId)).toBeTruthy()
+      }
+    })
+  })
+
+  test('bulk removal deduplicates ids and rejects an empty list', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const workId = seedCorpusWork(corpusId, 'Bulk Duplicate')
+
+    const dupeRes = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [workId, workId, workId] })
+    expect(dupeRes.status).toBe(200)
+    expect(dupeRes.body.removed).toBe(1)
+
+    const emptyRes = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [] })
+    expect(emptyRes.status).toBe(400)
+
+    const junkRes = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: ['abc', -1, 0] })
+    expect(junkRes.status).toBe(400)
+  })
+
+  test('bulk removal cannot reach another users corpus', async () => {
+    const username = 'bulk-outsider'
+    const password = 'bulk-outsider-password'
+    const { corpusId: outsiderCorpusId } = createActiveUser(username, password)
+    const outsiderWorkId = seedCorpusWork(outsiderCorpusId, 'Outsider Work')
+
+    const admin = await login(adminUsername, adminPassword)
+    const res = await request(app)
+      .post('/api/corpus/works/remove')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ workIds: [outsiderWorkId] })
+
+    // Scoped to req.corpusId, so the id is simply not a member here.
+    expect(res.status).toBe(200)
+    expect(res.body.removed).toBe(0)
+    withDb((db) => {
+      expect(
+        db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?').get(outsiderCorpusId, outsiderWorkId)
+      ).toBeTruthy()
+    })
+  })
+
+  test('admin settings never echo secrets back and persist non-secrets', async () => {
+    const admin = await login(adminUsername, adminPassword)
+
+    const saveRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { openalex_api_key: 'super-secret', openalex_rps: '12', llm_provider: 'openai' } })
+    expect(saveRes.status).toBe(200)
+
+    const getRes = await request(app)
+      .get('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(getRes.status).toBe(200)
+    // The secret is reported as set but its value is never returned.
+    expect(getRes.body.settings.openalex_api_key).toEqual(expect.objectContaining({ is_set: true }))
+    expect(JSON.stringify(getRes.body)).not.toContain('super-secret')
+    expect(getRes.body.settings.openalex_rps.value).toBe('12')
+    expect(getRes.body.settings.llm_provider.value).toBe('openai')
+  })
+
+  test('clearing a setting removes the override', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { extract_model: 'some-model' } })
+
+    await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { extract_model: '' } })
+
+    const getRes = await request(app)
+      .get('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(getRes.body.settings.extract_model.value).toBe('')
+  })
+
+  test('rejects unknown settings keys and a non-positive rps', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const unknownRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { not_a_setting: 'x' } })
+    expect(unknownRes.status).toBe(400)
+
+    const rpsRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${admin.token}`)
+      .send({ settings: { openalex_rps: '0' } })
+    expect(rpsRes.status).toBe(400)
+  })
+
+  test('non-admins cannot read or write settings', async () => {
+    const username = 'settings-outsider'
+    const password = 'settings-outsider-password'
+    createActiveUser(username, password)
+    const outsider = await login(username, password)
+
+    const getRes = await request(app)
+      .get('/api/admin/settings')
+      .set('Authorization', `Bearer ${outsider.token}`)
+    expect(getRes.status).toBe(403)
+
+    const putRes = await request(app)
+      .put('/api/admin/settings')
+      .set('Authorization', `Bearer ${outsider.token}`)
+      .send({ settings: { llm_provider: 'gemini' } })
+    expect(putRes.status).toBe(403)
+  })
+
+  test('rejects an invalid work id', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const res = await request(app)
+      .delete('/api/corpus/works/not-a-number')
+      .set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(400)
+  })
 })

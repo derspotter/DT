@@ -18,12 +18,24 @@ import {
   upsertSearchRunCorpus,
   listSeedSources,
   listSeedCandidates,
+  countSeedCandidates,
+  seedStateCountLimit,
   hideSeedSource,
   dismissSeedCandidates,
+  dismissAllSeedCandidates,
+  resolveSeedDocumentPath,
+  createStateResolver,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Allowed seed-candidate sort keys: the six SQL sorts (title/year/authors/
+// source/refs/cited_by) plus the two JS-only sorts (metadata/download).
+const SEED_CANDIDATE_SORT_KEYS = new Set(['title', 'year', 'authors', 'source', 'refs', 'cited_by', 'metadata', 'download']);
+// The two sorts that SQL cannot express: state is resolved in JS, so these
+// need the whole seed in memory (see the guard in the candidates route).
+const SEED_STATE_SORTS = new Set(['metadata', 'download']);
 
 function findUpwards(startDir, childName) {
   // Walk up parents until we find a directory or file named `childName`.
@@ -95,6 +107,35 @@ const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
 const DB_PATH = process.env.RAG_FEEDER_DB_PATH || DEFAULT_DB_PATH;
+const OPENALEX_QUOTA_STALE_MS = 24 * 60 * 60 * 1000;
+
+function openalexQuotaPath() {
+  // Resolved per request so tests (and admins) can point it elsewhere via env.
+  const override = String(process.env.RAG_FEEDER_OPENALEX_QUOTA_PATH || '').trim();
+  return override || path.join(path.dirname(DB_PATH), 'openalex_quota.json');
+}
+
+function readOpenAlexQuota() {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(openalexQuotaPath(), 'utf8'));
+  } catch (err) {
+    if (err && err.code !== 'ENOENT') {
+      console.warn(`[openalex-quota] could not read quota snapshot: ${err.message}`);
+    }
+    return { available: false };
+  }
+  if (!parsed || typeof parsed !== 'object') return { available: false };
+  const now = Date.now();
+  const observedMs = Date.parse(parsed.observed_at || '');
+  const resetMs = Date.parse(parsed.reset_at || '');
+  return {
+    ...parsed,
+    available: true,
+    stale: !Number.isFinite(observedMs) || now - observedMs > OPENALEX_QUOTA_STALE_MS,
+    reset_in_seconds: Number.isFinite(resetMs) ? Math.max(0, Math.round((resetMs - now) / 1000)) : null,
+  };
+}
 const FRONTEND_URL = process.env.RAG_FEEDER_FRONTEND_URL || 'https://genkia.de';
 const SMTP_FROM = process.env.RAG_FEEDER_SMTP_FROM || process.env.SMTP_FROM || 'noreply@example.com';
 const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
@@ -124,6 +165,7 @@ const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_s
 const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
 const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
+const SEED_EXPAND_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_expand.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
 const LOCAL_VENV_PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || (fs.existsSync(LOCAL_VENV_PYTHON) ? LOCAL_VENV_PYTHON : 'python');
@@ -316,7 +358,7 @@ function listTableColumns(db, tableName) {
   return db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => String(row.name || ''));
 }
 
-function buildGraph3dRequest(req) {
+export function buildGraph3dRequest(req) {
   const requestedMaxNodes = coerceInt(req.query?.max_nodes ?? req.query?.maxNodes, GRAPH_3D_DEFAULT_MAX_NODES);
   // 0 means "no cap" (show the whole corpus); otherwise clamp to a sane range.
   const maxNodes = requestedMaxNodes === 0
@@ -327,7 +369,16 @@ function buildGraph3dRequest(req) {
   const scope = 'all';
   const yearFrom = coerceInt(req.query?.year_from || req.query?.yearFrom, null);
   const yearTo = coerceInt(req.query?.year_to || req.query?.yearTo, null);
-  const corpusId = null;
+  // 'all' (or an absent param) keeps the historical global view that merges
+  // every corpus; anything else scopes the graph to one corpus (spec line 22).
+  const requestedCorpus = String(req.query?.corpus_id ?? req.query?.corpusId ?? '').trim();
+  // Corpus ids are integer primary keys: anything else ("1.5", "0", "-3")
+  // means the global view rather than an argument argparse will reject.
+  const parsedCorpusId = coerceInt(requestedCorpus, null);
+  const corpusId = !requestedCorpus || requestedCorpus.toLowerCase() === 'all'
+    || !Number.isInteger(parsedCorpusId) || parsedCorpusId <= 0
+    ? null
+    : parsedCorpusId;
   const requestedGroupBy = String(req.query?.group_by || req.query?.groupBy || 'field');
   const groupBy = GRAPH_3D_GROUP_BY.has(requestedGroupBy) ? requestedGroupBy : 'field';
   let dbModifiedMs = 0;
@@ -356,6 +407,9 @@ function graph3dScriptArgs(options, extraArgs = []) {
   ];
   if (options.yearFrom !== null) args.push('--year-from', String(options.yearFrom));
   if (options.yearTo !== null) args.push('--year-to', String(options.yearTo));
+  if (options.corpusId !== null && options.corpusId !== undefined) {
+    args.push('--corpus-id', String(options.corpusId));
+  }
   return args;
 }
 
@@ -713,6 +767,14 @@ function ensureAuthSchema(db) {
       added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, work_id)
     );
+    -- Instance-wide external API / LLM configuration (spec lines 13 & 14).
+    -- Values override the corresponding environment variables when set.
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_by_user_id INTEGER,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS ingest_source_metadata (
       corpus_id INTEGER NOT NULL DEFAULT 0,
       ingest_source TEXT NOT NULL,
@@ -895,6 +957,92 @@ function cleanupInvitedUser(db, userId) {
 function migrateExistingToCorpus(db, corpusId) {
   if (tableExists(db, 'ingest_entries')) {
     db.prepare('UPDATE ingest_entries SET corpus_id = ? WHERE corpus_id IS NULL').run(corpusId);
+  }
+}
+
+// Rows keyed to a corpus that no longer exists. They come from corpora deleted
+// before the delete route cleaned every table, and from work that lands after a
+// corpus is removed (a background extraction finishing, say). They are
+// invisible in the UI but accumulate forever, so sweep them at startup. Only
+// tables with a corpus_id column are swept; see the note on search runs below.
+const CORPUS_SCOPED_TABLES = [
+  'ingest_entries',
+  'ingest_source_metadata',
+  'corpus_works',
+  'corpus_items',
+  'pipeline_jobs',
+  'corpus_kantropos_assignments',
+  'search_run_corpora',
+  'seed_sources_hidden',
+  'seed_candidates_dismissed',
+  'seed_candidates_in_corpus',
+];
+
+export function pruneOrphanedCorpusRows(db) {
+  if (!tableExists(db, 'corpora')) return {};
+  const removed = {};
+  for (const table of CORPUS_SCOPED_TABLES) {
+    if (!tableExists(db, table)) continue;
+    const result = db
+      // corpus_id 0 is the schema default and the fallback some write paths
+      // still use when no corpus is known; it is legacy, not an orphan.
+      .prepare(`DELETE FROM ${table} WHERE corpus_id > 0 AND corpus_id NOT IN (SELECT id FROM corpora)`)
+      .run();
+    if (result.changes > 0) removed[table] = result.changes;
+  }
+  // Deliberately no search_runs / search_results here: an unregistered run
+  // cannot be told apart from one that predates registration, and works keep
+  // run_id pointers into them for provenance. Only the delete route removes
+  // runs, and only the ones registered to the corpus being deleted.
+  return removed;
+}
+
+// Background keyword-search runs: PID handles for runs currently in flight,
+// keyed by search_runs.id, so the cancel route can signal them. Exported so
+// tests can assert on registration/cleanup without a real Python process.
+export const activeSearchRuns = new Map();
+
+function searchWarnThreshold() {
+  const raw = appSettingsEnv().RAG_FEEDER_SEARCH_WARN_THRESHOLD || process.env.RAG_FEEDER_SEARCH_WARN_THRESHOLD || '';
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 100000;
+}
+
+// Runs left in status='running' from before this backend process started
+// (e.g. a restart mid-search) can never finish — no child process is coming
+// back to update them. Mark them failed so the UI stops polling them.
+export function markOrphanedSearchRuns(db, startedAtIso) {
+  if (!tableExists(db, 'search_runs')) return 0;
+  const cols = db.prepare('PRAGMA table_info(search_runs)').all().map((c) => c.name);
+  if (!cols.includes('status')) return 0;
+  // created_at is SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS'); startedAtIso
+  // is a JS ISO string ('...T...Z'). A bare string comparison is only right by
+  // accident, so normalize both sides through datetime(), which parses either.
+  const result = db
+    .prepare(`UPDATE search_runs SET status = 'failed', error = 'backend restarted', finished_at = CURRENT_TIMESTAMP
+              WHERE status = 'running' AND datetime(created_at) < datetime(?)`)
+    .run(startedAtIso);
+  return result.changes;
+}
+
+// The search child owns its own row: it marks the run done/failed/cancelled
+// before exiting. When it dies without running those handlers the row stays
+// 'running' with no process behind it, so the parent settles it here.
+export function finalizeDeadSearchRun(db, runId, error) {
+  if (!Number.isFinite(Number(runId))) return false;
+  try {
+    if (!tableExists(db, 'search_runs')) return false;
+    const cols = db.prepare('PRAGMA table_info(search_runs)').all().map((c) => c.name);
+    if (!cols.includes('status')) return false;
+    const reason = String(error?.message || error || 'no exit status').slice(0, 200);
+    const result = db
+      .prepare(`UPDATE search_runs SET status = 'failed', error = ?, finished_at = CURRENT_TIMESTAMP
+                 WHERE id = ? AND status = 'running'`)
+      .run(`search process exited (${reason})`, Number(runId));
+    return result.changes > 0;
+  } catch (dbError) {
+    console.error('[search] Could not settle a dead search run:', dbError?.message || dbError);
+    return false;
   }
 }
 
@@ -1389,10 +1537,16 @@ function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
     .all(String(targetId || ''));
 
   const itemsByWorkId = new Map();
+  const missingFileWorkIds = new Set();
   for (const row of rows) {
     const workId = Number(row.id);
     if (!Number.isFinite(workId) || workId <= 0) continue;
     if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
+    // upstream_update.py skips works whose PDF is not physically present, so a
+    // status-only count promises more than actually reaches the RAG (spec 24).
+    // Flag rather than hide them: they stay visible and in the graph, but do
+    // not count towards the "N pending" promise.
+    if (!upstreamFileIsPresent(row.file_path)) missingFileWorkIds.add(workId);
 
     const sourceCorpus = {
       id: Number(row.corpus_id),
@@ -1421,7 +1575,22 @@ function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
     }
   }
 
-  return [...itemsByWorkId.values()];
+  const items = [...itemsByWorkId.values()].map((item) => ({
+    ...item,
+    file_missing: missingFileWorkIds.has(Number(item.work_id ?? item.id)),
+  }));
+  items.missingFileCount = missingFileWorkIds.size;
+  return items;
+}
+
+function upstreamFileIsPresent(filePath) {
+  const raw = String(filePath || '').trim();
+  if (!raw) return false;
+  try {
+    return fs.statSync(raw).isFile();
+  } catch {
+    return false;
+  }
 }
 
 function buildKantroposBrowsePayload(db, targetId, options = {}) {
@@ -1437,7 +1606,10 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
   const importedWorkIdSet = listImportedKantroposWorkIdSet(db, target);
   const currentItems = listImportedKantroposWorkItems(db, target, currentLimit);
   const pendingItemsAll = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet);
-  const pendingItemsCount = pendingItemsAll.length;
+  const pendingMissingFileCount = Number(pendingItemsAll.missingFileCount || 0);
+  // "N pending" promises what will actually reach the RAG, so it excludes works
+  // whose PDF is gone; those are reported separately (spec line 24).
+  const pendingItemsCount = pendingItemsAll.length - pendingMissingFileCount;
   const pendingItems = pendingItemsAll.slice(0, pendingLimit);
 
   const assignedById = new Map(assignedCorpora.map((corpus) => [Number(corpus.id), { ...corpus }]));
@@ -1472,6 +1644,7 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
     summary: {
       current_items_count: currentItemsCount,
       pending_items_count: pendingItemsCount,
+      pending_skipped_missing_file: pendingMissingFileCount,
       assigned_corpora_count: assignedCorpora.length,
       metadata_bib_modified_at: overview?.metadata_bib_modified_at || '',
       metadata_bib_exists: Boolean(overview?.metadata_bib_exists),
@@ -1480,9 +1653,13 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
       has_imported_current: currentItemsCount > 0,
       pending_is_provisional: currentItemsCount === 0,
       current_items_loaded: currentItems.length,
-      pending_items_loaded: pendingItems.length,
+      // Same semantics as pending_items_count: file-missing rows are excluded,
+      // otherwise the UI can read "Loaded 120 of 100".
+      pending_items_loaded: pendingItems.filter((item) => !item?.file_missing).length,
       current_items_has_more: currentItems.length < currentItemsCount,
-      pending_items_has_more: pendingItems.length < pendingItemsCount,
+      // Paging compares against the full list, which still includes the
+      // file-missing rows; pendingItemsCount deliberately excludes them.
+      pending_items_has_more: pendingItems.length < pendingItemsAll.length,
     },
     assigned_corpora: [...assignedById.values()],
     current_items: currentItems,
@@ -1824,6 +2001,8 @@ function buildKeywordSearchExpansion(body = {}) {
       0
     ),
     maxRelated: coercePositiveInt(body?.maxRelated, RECURSION_DEFAULTS.keyword.maxRelated, 1),
+    relatedSort: coerceRelatedSort(body?.relatedSort),
+    promotionMode: coercePromotionMode(body?.promotionMode),
     includeDownstream: body?.includeDownstream === undefined
       ? RECURSION_DEFAULTS.keyword.includeDownstream
       : Boolean(body.includeDownstream),
@@ -1849,6 +2028,61 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
     args.push('--no-include-downstream');
   }
   args.push('--max-related', String(expansion.maxRelated));
+  // Rank-then-cap: decides WHICH related works survive the cap (spec 12).
+  if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
+}
+
+// Shared by /api/keyword-search and /api/keyword-search/preview: validates
+// the request body and builds the keyword_search.py argv. `error` is set
+// (and `args` unusable) when a required filter is missing.
+function buildKeywordSearchArgs(req) {
+  const query = req.body?.query?.trim();
+  const seedJson = req.body?.seedJson;
+  const author = req.body?.author?.trim() || '';
+  const yearFrom = coerceInt(req.body?.yearFrom, null);
+  const yearTo = coerceInt(req.body?.yearTo, null);
+  if (!query && !seedJson && !author && !yearFrom && !yearTo) {
+    return { error: 'query, seedJson, author, or year filter is required' };
+  }
+
+  const field = req.body?.field || 'default';
+  // 0 = uncapped; the user opts into a cap via maxResults
+  const maxResults = Math.max(0, Math.trunc(coerceInt(req.body?.maxResults, 0) ?? 0));
+  const sort = typeof req.body?.sort === 'string' ? req.body.sort.trim() : '';
+  if (sort && !KEYWORD_SEARCH_SORTS.has(sort)) {
+    return { error: `Unknown sort option: ${sort}` };
+  }
+  const mailto = req.body?.mailto || '';
+  const enqueue = Boolean(req.body?.enqueue);
+  const dbPath = DB_PATH;
+
+  const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
+  if (sort) args.push('--sort', sort);
+  const expansion = buildKeywordSearchExpansion({
+    relatedDepth: coerceInt(req.body?.relatedDepth, null),
+    relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
+    relatedDepthUpstream: coerceInt(req.body?.relatedDepthUpstream, null),
+    maxRelated: coerceInt(req.body?.maxRelated, null),
+    includeDownstream: req.body?.includeDownstream,
+    includeUpstream: req.body?.includeUpstream,
+    relatedSort: req.body?.relatedSort,
+    promotionMode: req.body?.promotionMode,
+  });
+
+  if (seedJson) {
+    const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
+    args.push('--seed-json', seedPayload);
+  } else {
+    args.push('--query', query || '');
+  }
+  if (author) args.push('--author', author);
+  if (yearFrom) args.push('--year-from', String(yearFrom));
+  if (yearTo) args.push('--year-to', String(yearTo));
+  if (mailto) args.push('--mailto', String(mailto));
+  if (enqueue) args.push('--enqueue');
+  applyKeywordSearchExpansionArgs(args, expansion);
+
+  return { args };
 }
 
 function buildUploadedDocsExpansion(body = {}) {
@@ -1869,6 +2103,8 @@ function buildUploadedDocsExpansion(body = {}) {
       RECURSION_DEFAULTS.uploadedDocs.relatedDepthUpstream,
       0
     ),
+    relatedSort: coerceRelatedSort(body?.relatedSort),
+    promotionMode: coercePromotionMode(body?.promotionMode),
     maxRelated: coercePositiveInt(
       body?.maxRelated,
       RECURSION_DEFAULTS.uploadedDocs.maxRelated,
@@ -1901,6 +2137,56 @@ function applyUploadedDocsExpansionArgs(args, expansion) {
     args.push('--no-include-upstream');
   }
   args.push('--max-related', String(expansion.maxRelated));
+  // Rank-then-cap: decides WHICH related works survive the cap (spec 12).
+  if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
+}
+
+// Each setting maps 1:1 onto the environment variable the Python scripts
+// already read, so this is a UI over the existing env plumbing rather than a
+// new configuration mechanism. `secret: true` values are never returned to the
+// client — the API reports only whether they are set.
+let appSettingsDb = null;
+
+const APP_SETTING_DEFS = [
+  { key: 'openalex_api_key', env: 'OPENALEX_API_KEY', secret: true },
+  { key: 'openalex_rps', env: 'RAG_FEEDER_OPENALEX_RPS', secret: false },
+  { key: 'search_warn_threshold', env: 'RAG_FEEDER_SEARCH_WARN_THRESHOLD', secret: false },
+  { key: 'llm_provider', env: 'RAG_FEEDER_LLM_PROVIDER', secret: false },
+  { key: 'openai_base_url', env: 'RAG_FEEDER_OPENAI_BASE_URL', secret: false },
+  { key: 'openai_api_key', env: 'OPENAI_API_KEY', secret: true },
+  { key: 'gemini_api_key', env: 'GEMINI_API_KEY', secret: true },
+  { key: 'extract_model', env: 'RAG_FEEDER_API_EXTRACT_MODEL', secret: false },
+  { key: 'openai_model', env: 'RAG_FEEDER_OPENAI_MODEL', secret: false },
+  { key: 'gemini_model', env: 'RAG_FEEDER_GEMINI_MODEL', secret: false },
+];
+
+const APP_SETTING_BY_KEY = new Map(APP_SETTING_DEFS.map((def) => [def.key, def]));
+
+function readAppSettings(db) {
+  if (!tableExists(db, 'app_settings')) return {};
+  const rows = db.prepare('SELECT key, value FROM app_settings').all();
+  const out = {};
+  for (const row of rows) {
+    const value = String(row.value ?? '').trim();
+    if (value) out[String(row.key)] = value;
+  }
+  return out;
+}
+
+function appSettingsEnv() {
+  if (!appSettingsDb) return {};
+  let stored = {};
+  try {
+    stored = readAppSettings(appSettingsDb);
+  } catch {
+    return {};
+  }
+  const env = {};
+  for (const def of APP_SETTING_DEFS) {
+    const value = stored[def.key];
+    if (value) env[def.env] = value;
+  }
+  return env;
 }
 
 function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {}) {
@@ -1911,6 +2197,9 @@ function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {})
 function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine, lowPriority } = {}) {
   const env = {
     ...process.env,
+    // Admin-managed settings win over the process environment, so changing a
+    // key or model in the UI takes effect on the next script run (spec 13/14).
+    ...appSettingsEnv(),
     PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
     RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
     RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
@@ -1991,6 +2280,21 @@ function coerceInt(value, fallback = null) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+// Shared query-string parsing for the seed-candidates route, extracted so it
+// can be unit-tested directly (the route itself needs a real corpus/auth
+// fixture DB to drive end-to-end). Clamps limit to 1..2000 and offset to >=0
+// — note Math.trunc happens before clamping, and a bad/zero limit clamps to
+// 1 rather than falling back to the 200 default (only a missing/empty value
+// falls back, via coerceInt's own fallback param).
+export function parseCandidatePaging(query = {}) {
+  const limit = Math.max(1, Math.min(2000, Math.trunc(coerceInt(query?.limit, 200))));
+  const offset = Math.max(0, Math.trunc(coerceInt(query?.offset, 0)));
+  const sortKey = String(query?.sort || '').trim().toLowerCase();
+  const sort = SEED_CANDIDATE_SORT_KEYS.has(sortKey) ? sortKey : '';
+  const dir = String(query?.dir || '').trim().toLowerCase() === 'desc' ? 'desc' : 'asc';
+  return { limit, offset, sort, dir };
+}
+
 function coerceBoolEnv(value, fallback) {
   if (value === undefined || value === null || value === '') {
     return fallback;
@@ -2005,11 +2309,34 @@ function coerceBoolEnv(value, fallback) {
   return fallback;
 }
 
+// Must match RELATED_SORT_OPTIONS in backend/scripts/keyword_search.py.
+const RELATED_SORT_VALUES = new Set(['most_cited', 'newest']);
+const RELATED_SORT_DEFAULT = 'most_cited';
+
+function coerceRelatedSort(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return RELATED_SORT_VALUES.has(raw) ? raw : RELATED_SORT_DEFAULT;
+}
+
+// Promotion modes (spec lines 10 & 11). 'new_seed' promotes only the selected
+// items and lands the expansion as fresh seeds in section 2 for review;
+// 'download_all' is the historical behaviour that pulls the expansion straight
+// into the corpus pipeline.
+const PROMOTION_MODE_VALUES = new Set(['new_seed', 'download_all']);
+const PROMOTION_MODE_DEFAULT = 'new_seed';
+
+function coercePromotionMode(value) {
+  const raw = String(value || '').trim().toLowerCase();
+  return PROMOTION_MODE_VALUES.has(raw) ? raw : PROMOTION_MODE_DEFAULT;
+}
+
 const RECURSION_DEFAULTS = {
   keyword: {
     relatedDepthDownstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
     relatedDepthUpstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 0) || 0),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
+    relatedSort: RELATED_SORT_DEFAULT,
+    promotionMode: PROMOTION_MODE_DEFAULT,
     includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, false),
     includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
@@ -2018,6 +2345,8 @@ const RECURSION_DEFAULTS = {
     relatedDepthDownstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH, 0) || 0),
     relatedDepthUpstream: Math.max(0, coerceInt(process.env.RAG_FEEDER_RELATED_DEPTH_UPSTREAM, 0) || 0),
     maxRelated: Math.max(1, coerceInt(process.env.RAG_FEEDER_MAX_RELATED, 30) || 30),
+    relatedSort: RELATED_SORT_DEFAULT,
+    promotionMode: PROMOTION_MODE_DEFAULT,
     includeDownstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_DOWNSTREAM, false),
     includeUpstream: coerceBoolEnv(process.env.RAG_FEEDER_INCLUDE_UPSTREAM, false),
   },
@@ -2224,6 +2553,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   const authDb = new Database(DB_PATH, { timeout: 3_000 });
+  // spawnPythonJson is module-level but needs the settings table; hand it this
+  // connection rather than reopening the DB on every spawn.
+  appSettingsDb = authDb;
   // Test suites spin up multiple app instances in parallel; these settings
   // reduce transient SQLITE_BUSY / "database is locked" bootstrapping failures.
   try {
@@ -2239,9 +2571,26 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   assertNoLegacyLibraryData(authDb);
   ensureAuthSchema(authDb);
   ensureSeedSchema(authDb);
+  // Warm the cross-corpus downloaded-works lookup once the server is up, so
+  // the first workspace load does not pay the ~1.5 s index build. Best effort.
+  if (!isStubMode()) {
+    setTimeout(() => {
+      try {
+        createStateResolver(authDb, 0, { resolveDownloadedFilePath: findDownloadedFilePath });
+      } catch (error) {
+        console.warn('[seed-state] Cache warm-up failed:', error?.message || error);
+      }
+    }, 250);
+  }
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
+  const prunedOrphans = pruneOrphanedCorpusRows(authDb);
+  if (Object.keys(prunedOrphans).length > 0) {
+    console.log('[startup] Removed rows for deleted corpora:', prunedOrphans);
+  }
+  const orphanedRuns = markOrphanedSearchRuns(authDb, new Date().toISOString());
+  if (orphanedRuns > 0) console.log(`[startup] Marked ${orphanedRuns} interrupted search run(s) as failed`);
   const requireAuthMiddleware = requireAuth(authDb, authConfig);
   const pruneCorpusDownloadTickets = () => {
     const now = Date.now();
@@ -3172,6 +3521,83 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     });
   });
 
+  const requireAdminMiddleware = (req, res, next) => {
+    if (!isAdminUser(req.user, authConfig)) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    return next();
+  };
+
+  app.get('/api/admin/settings', requireAuthMiddleware, requireAdminMiddleware, (req, res) => {
+    try {
+      const stored = readAppSettings(authDb);
+      const settings = {};
+      for (const def of APP_SETTING_DEFS) {
+        if (def.secret) {
+          // Never echo a secret back — the UI shows "set"/"not set" and can
+          // only replace it.
+          settings[def.key] = { is_set: Boolean(stored[def.key]), env_fallback: Boolean(process.env[def.env]) };
+        } else {
+          settings[def.key] = { value: stored[def.key] || '', env_fallback: process.env[def.env] || '' };
+        }
+      }
+      return res.json({ settings });
+    } catch (error) {
+      console.error('[/api/admin/settings GET] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to load settings' });
+    }
+  });
+
+  app.put('/api/admin/settings', requireAuthMiddleware, requireAdminMiddleware, (req, res) => {
+    const updates = req.body?.settings;
+    if (!updates || typeof updates !== 'object') {
+      return res.status(400).json({ error: 'Missing settings object' });
+    }
+    const unknown = Object.keys(updates).filter((key) => !APP_SETTING_BY_KEY.has(key));
+    if (unknown.length > 0) {
+      return res.status(400).json({ error: `Unknown setting(s): ${unknown.join(', ')}` });
+    }
+    const rps = updates.openalex_rps;
+    if (rps !== undefined && String(rps).trim() !== '') {
+      const parsed = Number(rps);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: 'openalex_rps must be a positive number' });
+      }
+    }
+    const searchWarnThresholdUpdate = updates.search_warn_threshold;
+    if (searchWarnThresholdUpdate !== undefined && String(searchWarnThresholdUpdate).trim() !== '') {
+      const parsed = Number(searchWarnThresholdUpdate);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: 'search_warn_threshold must be a positive integer' });
+      }
+    }
+    try {
+      const upsert = authDb.prepare(
+        `INSERT INTO app_settings (key, value, updated_by_user_id, updated_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_by_user_id = excluded.updated_by_user_id,
+           updated_at = CURRENT_TIMESTAMP`
+      );
+      const remove = authDb.prepare('DELETE FROM app_settings WHERE key = ?');
+      const apply = authDb.transaction((entries) => {
+        for (const [key, raw] of entries) {
+          const value = String(raw ?? '').trim();
+          // An empty value clears the override and falls back to the
+          // environment, rather than storing an empty string.
+          if (value) upsert.run(key, value, req.user.id);
+          else remove.run(key);
+        }
+      });
+      apply(Object.entries(updates));
+      return res.json({ saved: true });
+    } catch (error) {
+      console.error('[/api/admin/settings PUT] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to save settings' });
+    }
+  });
+
   app.post('/api/auth/register', (req, res) => {
     if (!isStubMode()) {
       return res.status(404).json({ error: 'Not found' });
@@ -3922,6 +4348,49 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         if (tableExists(authDb, 'corpus_works')) {
           authDb.prepare('DELETE FROM corpus_works WHERE corpus_id = ?').run(corpusId);
         }
+        // Everything else keyed by corpus_id. These were missed before, which
+        // left seed state and search-run registrations pointing at a corpus
+        // that no longer exists.
+        for (const table of ['corpus_items', 'seed_sources_hidden', 'seed_candidates_dismissed', 'seed_candidates_in_corpus']) {
+          if (tableExists(authDb, table)) {
+            authDb.prepare(`DELETE FROM ${table} WHERE corpus_id = ?`).run(corpusId);
+          }
+        }
+        // Search runs registered to this corpus go with it (a run belongs to
+        // exactly one corpus). Runs that were never registered — everything
+        // before registration existed, plus runs made without a corpus
+        // context — are NOT touched: works still point at them via run_id
+        // for the provenance label, and they are history, not garbage.
+        if (tableExists(authDb, 'search_runs') && tableExists(authDb, 'search_run_corpora')) {
+          // Keep any owned run that a work still points at (run_id, or an
+          // origin_key of "search:<id>"): its results may have been promoted
+          // into another corpus, whose provenance label would otherwise
+          // degrade to "Search #<id>".
+          const ownedRunIds = authDb
+            .prepare(
+              `SELECT src.search_run_id
+               FROM search_run_corpora src
+               WHERE src.corpus_id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM works w
+                   WHERE w.run_id = src.search_run_id
+                      OR w.origin_key = 'search:' || src.search_run_id
+                 )`
+            )
+            .all(corpusId)
+            .map((row) => Number(row.search_run_id))
+            .filter((id) => Number.isFinite(id) && id > 0);
+          if (ownedRunIds.length > 0) {
+            const placeholders = ownedRunIds.map(() => '?').join(', ');
+            if (tableExists(authDb, 'search_results')) {
+              authDb.prepare(`DELETE FROM search_results WHERE search_run_id IN (${placeholders})`).run(...ownedRunIds);
+            }
+            authDb.prepare(`DELETE FROM search_runs WHERE id IN (${placeholders})`).run(...ownedRunIds);
+          }
+        }
+        if (tableExists(authDb, 'search_run_corpora')) {
+          authDb.prepare('DELETE FROM search_run_corpora WHERE corpus_id = ?').run(corpusId);
+        }
         authDb.prepare('DELETE FROM user_corpora WHERE corpus_id = ?').run(corpusId);
         authDb.prepare('DELETE FROM corpora WHERE id = ?').run(corpusId);
 
@@ -4476,78 +4945,147 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   // Legacy `/api/bibliographies/consolidate` endpoint removed (DB-first pipeline).
 
-  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
-    const query = req.body?.query?.trim();
-    const seedJson = req.body?.seedJson;
-    const author = req.body?.author?.trim() || '';
-    const yearFrom = coerceInt(req.body?.yearFrom, null);
-    const yearTo = coerceInt(req.body?.yearTo, null);
-    if (!query && !seedJson && !author && !yearFrom && !yearTo) {
-      return res.status(400).json({ error: 'query, seedJson, author, or year filter is required' });
-    }
-
+  app.post('/api/keyword-search/preview', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+    const built = buildKeywordSearchArgs(req);
+    if (built.error) return res.status(400).json({ error: built.error });
+    const threshold = searchWarnThreshold();
     if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ runId: 0, results: STUB_RESULTS.keywordResults, source: 'stub' });
+      return res.json({ count: STUB_RESULTS.keywordResults.length, threshold });
     }
-
-    const field = req.body?.field || 'default';
-    // 0 = uncapped; the user opts into a cap via maxResults
-    const maxResults = Math.max(0, Math.trunc(coerceInt(req.body?.maxResults, 0) ?? 0));
-    const sort = typeof req.body?.sort === 'string' ? req.body.sort.trim() : '';
-    if (sort && !KEYWORD_SEARCH_SORTS.has(sort)) {
-      return res.status(400).json({ error: `Unknown sort option: ${sort}` });
-    }
-    const mailto = req.body?.mailto || '';
-    const enqueue = Boolean(req.body?.enqueue);
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
-    if (sort) args.push('--sort', sort);
-    const expansion = buildKeywordSearchExpansion({
-      relatedDepth: coerceInt(req.body?.relatedDepth, null),
-      relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
-      relatedDepthUpstream: coerceInt(req.body?.relatedDepthUpstream, null),
-      maxRelated: coerceInt(req.body?.maxRelated, null),
-      includeDownstream: req.body?.includeDownstream,
-      includeUpstream: req.body?.includeUpstream,
-    });
-
-    if (seedJson) {
-      const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
-      args.push('--seed-json', seedPayload);
-    } else {
-      args.push('--query', query || '');
-    }
-    if (author) args.push('--author', author);
-    if (yearFrom) args.push('--year-from', String(yearFrom));
-    if (yearTo) args.push('--year-to', String(yearTo));
-    if (mailto) args.push('--mailto', String(mailto));
-    if (enqueue) args.push('--enqueue');
-    applyKeywordSearchExpansionArgs(args, expansion);
-
     try {
-      const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      if (Number.isFinite(Number(payload?.runId)) && Number(payload.runId) > 0 && Number.isFinite(Number(req.corpusId))) {
-        upsertSearchRunCorpus(authDb, {
-          searchRunId: Number(payload.runId),
-          corpusId: Number(req.corpusId),
-        });
-      }
-      return res.json(payload);
+      const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, [...built.args, '--count-only'], { dbPath: DB_PATH, corpusId: req.corpusId });
+      return res.json({ count: Number(payload?.count || 0), threshold });
     } catch (error) {
-      console.error('[/api/keyword-search] Error:', error);
-      return res.status(500).json({ error: error.message || 'Keyword search failed' });
+      console.error('[/api/keyword-search/preview] Error:', error);
+      return res.status(502).json({ error: error.message || 'Preview failed' });
     }
+  });
+
+  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const built = buildKeywordSearchArgs(req);
+    if (built.error) return res.status(400).json({ error: built.error });
+    if (process.env.RAG_FEEDER_STUB === '1') {
+      return res.json({
+        runId: 0,
+        results: STUB_RESULTS.keywordResults,
+        source: 'stub',
+        fetched_count: STUB_RESULTS.keywordResults.length,
+        truncated_results: false,
+      });
+    }
+    let responded = false;
+    let createdRunId = null;
+    const { child, done } = spawnPythonJson(KEYWORD_SEARCH_SCRIPT, built.args, {
+      dbPath: DB_PATH,
+      corpusId: req.corpusId,
+      onStdoutLine: (line) => {
+        if (!line.startsWith('{')) return;
+        let event;
+        try { event = JSON.parse(line); } catch { return; }
+        if (event?.event !== 'run_created' || responded) return;
+        const runId = Number(event.runId);
+        if (!Number.isFinite(runId) || runId <= 0) return;
+        // Ownership registration is what makes the run visible and cancelable
+        // (the seed list and the cancel route both go through
+        // search_run_corpora). A run we cannot register would keep fetching
+        // with nobody able to see or stop it, so kill it and fail the request
+        // instead of answering 202 for a ghost.
+        responded = true;
+        // Set before the upsert: the row exists either way, so the settle hop
+        // below must be able to close it out even on the failure path.
+        createdRunId = runId;
+        try {
+          upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: Number(req.corpusId) });
+        } catch (error) {
+          console.error('[/api/keyword-search] Failed to record run/corpus ownership:', error?.message || error);
+          try { child.kill('SIGTERM'); } catch { /* already gone */ }
+          res.status(500).json({ error: 'Could not register the search run' });
+          return;
+        }
+        activeSearchRuns.set(runId, child);
+        res.status(202).json({ runId, status: 'running' });
+      },
+    });
+    done
+      .then(
+        () => null,
+        (error) => {
+          console.error('[/api/keyword-search] Search script failed:', error?.message || error);
+          if (!responded) { responded = true; res.status(500).json({ error: error?.message || 'Keyword search failed' }); }
+          return error;
+        },
+      )
+      .then((error) => {
+        for (const [runId, proc] of activeSearchRuns) if (proc === child) activeSearchRuns.delete(runId);
+        if (!responded) { responded = true; res.status(500).json({ error: 'Search ended before creating a run' }); }
+        // A child that dies without running its own handlers (SIGKILL, OOM,
+        // a hard container stop) leaves the row 'running' forever and the UI
+        // polling it forever. The process is gone here either way, so any row
+        // still marked running is by definition dead.
+        if (createdRunId !== null) {
+          finalizeDeadSearchRun(authDb, createdRunId, error);
+        }
+      });
+  });
+
+  app.post('/api/keyword-search/:runId/cancel', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const runId = Number(req.params.runId);
+    const child = activeSearchRuns.get(runId);
+    if (!child) return res.status(404).json({ error: 'No running search with that id' });
+    const owner = tableExists(authDb, 'search_run_corpora')
+      ? authDb.prepare('SELECT corpus_id FROM search_run_corpora WHERE search_run_id = ?').get(runId)
+      : null;
+    if (!owner || Number(owner.corpus_id) !== Number(req.corpusId)) {
+      return res.status(404).json({ error: 'No running search with that id' });
+    }
+    child.kill('SIGTERM');
+    return res.json({ cancelled: true });
   });
 
   app.get('/api/seed/sources', requireAuthMiddleware, (req, res) => {
     try {
       const limit = Math.max(1, Math.min(500, coerceInt(req.query?.limit, 100) || 100));
-      const sources = listSeedSources(authDb, req.corpusId, { limit, resolveDownloadedFilePath: findDownloadedFilePath });
+      const q = String(req.query?.q || '').trim();
+      // The list only renders counts and run progress; resolving every
+      // candidate's state for every seed on every poll is what made this
+      // route expensive. The candidates route computes state_counts for the
+      // one seed the user expanded.
+      const sources = listSeedSources(authDb, req.corpusId, {
+        limit,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+        q,
+        withStateCounts: false,
+      });
       return res.json({ source: 'db', sources, total: sources.length });
     } catch (error) {
       console.error('[/api/seed/sources] Error:', error);
       return res.status(500).json({ error: error?.message || 'Failed to load seed sources' });
+    }
+  });
+
+  // Serves the ORIGINAL uploaded seed PDF (spec line 20). Distinct from
+  // .../candidates/:candidateKey/file, which serves a promoted corpus item.
+  // Only seed-document sources have one; search runs have no single PDF.
+  app.get('/api/seed/sources/pdf/:sourceKey/file', requireAuthMiddleware, (req, res) => {
+    const sourceKey = String(req.params?.sourceKey || '').trim();
+    if (!sourceKey) return res.status(400).json({ error: 'Invalid seed source' });
+    try {
+      const row = authDb
+        .prepare('SELECT source_pdf FROM ingest_source_metadata WHERE corpus_id = ? AND ingest_source = ?')
+        .get(req.corpusId, sourceKey);
+      if (!row) {
+        return res.status(404).json({ error: 'No original document stored for this seed' });
+      }
+      // Stored path first, then the upload named after the seed — see
+      // resolveSeedDocumentPath for why both are tried.
+      const resolved = resolveSeedDocumentPath({ sourcePdf: row.source_pdf, sourceKey, uploadsDir: UPLOADS_DIR });
+      if (!resolved) {
+        return res.status(404).json({ error: 'Original document is no longer available' });
+      }
+      return res.download(resolved, path.basename(resolved));
+    } catch (error) {
+      console.error('[/api/seed/sources/pdf/:sourceKey/file] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to serve seed document' });
     }
   });
 
@@ -4558,18 +5096,57 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
+      // One resolver for both calls: building it is the expensive part.
+      const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
+      const q = String(req.query?.q || '').trim();
+      const { limit, offset, sort, dir } = parseCandidatePaging(req.query);
+      // Sorting by state is done in JS over the whole seed (SQL cannot see a
+      // resolved state), so it has to materialize every candidate. The UI
+      // hides the option above the limit; reject it here too so a crafted
+      // request cannot make the backend resolve an unbounded seed.
+      let total = null;
+      if (SEED_STATE_SORTS.has(sort)) {
+        total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+        const stateSortLimit = seedStateCountLimit();
+        if (total > stateSortLimit) {
+          return res.status(400).json({
+            error: `Sorting by state needs every item resolved; not available above ${stateSortLimit.toLocaleString('en-US')} items`,
+          });
+        }
+      }
       const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
-        stateResolver: null,
+        stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
+        q,
+        limit,
+        offset,
+        sort,
+        dir,
       });
-      const sourceSummary = listSeedSources(authDb, req.corpusId, { limit: 500, resolveDownloadedFilePath: findDownloadedFilePath }).find(
+      if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+      // `summary=light` drops the summary's state counts, which cost a
+      // full-seed state resolution. Background polls send it (they never read
+      // them); the initial expand and user-driven reloads do not.
+      const lightSummary = String(req.query?.summary || '').trim().toLowerCase() === 'light';
+      const sourceSummary = listSeedSources(authDb, req.corpusId, {
+        limit: 500,
+        resolveDownloadedFilePath: findDownloadedFilePath,
+        stateResolver,
+        only: { sourceType, sourceKey },
+        withStateCounts: !lightSummary,
+        // Same filter as the candidate list, so candidate_count / state_counts
+        // describe what is actually returned.
+        q,
+      }).find(
         (source) => source.source_type === sourceType && String(source.source_key) === sourceKey
       ) || null;
       return res.json({
         source: 'db',
         source_summary: sourceSummary,
         candidates,
-        total: candidates.length,
+        total,
+        offset,
+        limit,
       });
     } catch (error) {
       console.error('[/api/seed/sources/:sourceType/:sourceKey/candidates] Error:', error);
@@ -4632,6 +5209,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     const rawCandidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
     const requestedCandidateKeys = [...new Set(rawCandidateKeys.map((value) => String(value || '').trim()).filter(Boolean))];
+    const q = String(req.body?.q || '').trim();
     const workers = coerceInt(req.body?.workers, 6);
     const enqueueDownload = req.body?.enqueueDownload === undefined ? true : Boolean(req.body.enqueueDownload);
     const downloadBatchSize = coerceInt(req.body?.downloadBatchSize, 25);
@@ -4642,7 +5220,28 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       includeUpstream: req.body?.includeUpstream,
       relatedDepthDownstream: req.body?.relatedDepthDownstream,
       relatedDepthUpstream: req.body?.relatedDepthUpstream,
+      relatedSort: req.body?.relatedSort,
+      promotionMode: req.body?.promotionMode,
     });
+    // Mode A (default): the selected items go to the corpus, but their expansion
+    // lands in section 2 as new seeds for review rather than being pulled
+    // straight in. Mode B keeps the historical download-everything path.
+    const wantsExpansion = Boolean(
+      (expansion.includeDownstream && expansion.relatedDepthDownstream >= 1) ||
+      (expansion.includeUpstream && expansion.relatedDepthUpstream >= 1)
+    );
+    const expansionAsNewSeeds = expansion.promotionMode === 'new_seed' && wantsExpansion;
+    // In new-seed mode the enrich job must not crawl — the expansion is handled
+    // separately and reviewed before anything else enters the corpus.
+    const enrichExpansion = expansionAsNewSeeds
+      ? {
+        ...expansion,
+        includeDownstream: false,
+        includeUpstream: false,
+        relatedDepthDownstream: 0,
+        relatedDepthUpstream: 0,
+      }
+      : expansion;
     if (workers === null || workers === undefined || !Number.isFinite(workers) || workers <= 0) {
       return res.status(400).json({ error: 'workers must be a positive number' });
     }
@@ -4654,6 +5253,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       const availableCandidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver: null,
         resolveDownloadedFilePath: findDownloadedFilePath,
+        q,
       });
       const promotableCandidates = availableCandidates.filter((candidate) => {
         const state = String(candidate?.state || '').trim().toLowerCase();
@@ -4748,7 +5348,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         enrichJobId = enqueuePipelineJob(req.corpusId, 'enrich', {
           limit: pendingWorkIds.length,
           workers,
-          expansion,
+          expansion: enrichExpansion,
           pending_work_ids: pendingWorkIds,
         });
         jobs.push({ id: enrichJobId, type: 'enrich' });
@@ -4760,6 +5360,81 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         jobs.push({ id: downloadJobId, type: 'download' });
       }
 
+      // Mode A: land the expansion as reviewable seeds in section 2. Failures
+      // here must not undo a successful promotion, so they are reported
+      // alongside the result rather than thrown.
+      let expansionSeeds = [];
+      let expansionError = null;
+      let tempExpandSeedPath = null;
+      if (expansionAsNewSeeds) {
+        try {
+          const expandSeedJson = JSON.stringify(promotionCandidates.map((candidate) => ({
+            openalex_id: candidate.openalex_id,
+            doi: candidate.doi,
+            title: candidate.title,
+          })));
+          const expandArgs = [
+            '--db-path', DB_PATH,
+            '--max-related', String(expansion.maxRelated),
+            '--related-sort', String(expansion.relatedSort || RELATED_SORT_DEFAULT),
+          ];
+          // Same ARG_MAX guard as the promotion call above: a big promotion's
+          // seed list must not go through the command line.
+          if (expandSeedJson.length > 100_000) {
+            tempExpandSeedPath = path.join(
+              os.tmpdir(),
+              `seed-expand-${req.corpusId}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
+            );
+            fs.writeFileSync(tempExpandSeedPath, expandSeedJson, 'utf8');
+            expandArgs.push('--seed-file', tempExpandSeedPath);
+          } else {
+            expandArgs.push('--seed-json', expandSeedJson);
+          }
+          if (expansion.includeDownstream && expansion.relatedDepthDownstream >= 1) {
+            expandArgs.push('--include-downstream');
+          }
+          if (expansion.includeUpstream && expansion.relatedDepthUpstream >= 1) {
+            expandArgs.push('--include-upstream');
+          }
+          const expandResult = await runPythonJson(SEED_EXPAND_SCRIPT, expandArgs, {
+            dbPath: DB_PATH,
+            corpusId: req.corpusId,
+          });
+          for (const run of expandResult?.runs || []) {
+            const runId = Number(run?.run_id);
+            if (!Number.isFinite(runId) || runId <= 0) continue;
+            // Registering the run against this corpus is what makes it appear
+            // as a seed in section 2.
+            upsertSearchRunCorpus(authDb, { searchRunId: runId, corpusId: req.corpusId });
+            expansionSeeds.push({
+              run_id: runId,
+              direction: run?.direction || '',
+              label: run?.label || '',
+              count: Number(run?.count || 0),
+            });
+          }
+        } catch (error) {
+          console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Expansion seeding failed:', error);
+          expansionError = error?.message || 'Failed to build expansion seeds';
+        } finally {
+          if (tempExpandSeedPath) {
+            try {
+              fs.unlinkSync(tempExpandSeedPath);
+            } catch (cleanupError) {
+              console.warn('[/api/seed/sources/:sourceType/:sourceKey/promote] Failed to remove temp expansion seed file:', cleanupError);
+            }
+          }
+        }
+      }
+
+      const expansionMessage = expansionAsNewSeeds
+        ? expansionError
+          ? ` Expansion seeds could not be built: ${expansionError}`
+          : expansionSeeds.length > 0
+            ? ` ${expansionSeeds.length} expansion seed(s) added to Seed for review.`
+            : ' No related works were found to seed.'
+        : '';
+
       return res.json({
         success: true,
         request_id: '',
@@ -4768,10 +5443,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         enrich_job_id: enrichJobId,
         download_job_id: downloadJobId,
         promotion,
+        promotion_mode: expansion.promotionMode,
+        expansion_seeds: expansionSeeds,
+        expansion_error: expansionError,
         backlog: readWorkerBacklogSummary(req.corpusId),
-        message: shouldQueueEnrich || shouldQueueDownload
+        message: (shouldQueueEnrich || shouldQueueDownload
           ? 'Selected candidates were added to the corpus pipeline. Background workers will continue from DB state.'
-          : 'Selected candidates were already reflected in the corpus state.',
+          : 'Selected candidates were already reflected in the corpus state.') + expansionMessage,
       });
     } catch (error) {
       console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Error:', error);
@@ -4783,10 +5461,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     try {
       const sourceType = String(req.body?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.body?.sourceKey || '').trim();
-      const candidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
+      if (req.body?.all === true) {
+        const q = String(req.body?.q || '').trim();
+        const dismissed = dismissAllSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
+        return res.json({ success: true, dismissed });
+      }
+      const candidateKeys = Array.isArray(req.body?.candidateKeys) ? req.body.candidateKeys : [];
       if (candidateKeys.length === 0) {
         return res.status(400).json({ error: 'candidateKeys must be a non-empty array' });
       }
@@ -4819,15 +5502,87 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     const limit = coerceInt(req.query?.limit, 200);
     const offset = coerceInt(req.query?.offset, 0);
+    const query = String(req.query?.q || '').trim();
+    const sort = String(req.query?.sort || '').trim();
     const dbPath = DB_PATH;
 
     const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
+    if (query) args.push('--q', query);
+    if (sort) args.push('--sort', sort);
     try {
       const payload = await runPythonJson(CORPUS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
+    }
+  });
+
+  // Removal means unlinking from THIS corpus, never deleting the work or its
+  // PDF: corpus_works is many-to-many, so the same work can belong to other
+  // corpora, and the file still counts as reusable for future promotions.
+  app.delete('/api/corpus/works/:workId', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const workId = coerceInt(req.params?.workId, null);
+    if (!Number.isFinite(workId) || workId <= 0) {
+      return res.status(400).json({ error: 'Invalid work id' });
+    }
+    try {
+      const result = authDb
+        .prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+        .run(req.corpusId, workId);
+      if (result.changes === 0) {
+        return res.status(404).json({ error: 'Work is not a member of this corpus' });
+      }
+      // Drop the explicit seed marker too, so the seed table stops showing the
+      // item as promoted and offers it for promotion again.
+      if (tableExists(authDb, 'seed_candidates_in_corpus')) {
+        authDb
+          .prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+          .run(req.corpusId, workId);
+      }
+      return res.json({ removed: true, work_id: workId });
+    } catch (error) {
+      console.error('[/api/corpus/works/:workId] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to remove work from corpus' });
+    }
+  });
+
+  // Bulk counterpart of DELETE /api/corpus/works/:workId. Transactional so a
+  // partial removal cannot leave the table disagreeing with the DB, and ids not
+  // in this corpus are reported rather than silently treated as removed.
+  app.post('/api/corpus/works/remove', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+    const rawIds = Array.isArray(req.body?.workIds) ? req.body.workIds : [];
+    const workIds = [...new Set(rawIds.map((value) => coerceInt(value, null)))]
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (workIds.length === 0) {
+      return res.status(400).json({ error: 'workIds must be a non-empty array of positive ids' });
+    }
+    try {
+      const unlink = authDb.prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?');
+      const clearMarker = tableExists(authDb, 'seed_candidates_in_corpus')
+        ? authDb.prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+        : null;
+      const apply = authDb.transaction((ids) => {
+        const removedIds = [];
+        for (const workId of ids) {
+          const result = unlink.run(req.corpusId, workId);
+          if (result.changes > 0) {
+            removedIds.push(workId);
+            // Let the seed table offer the item for promotion again.
+            if (clearMarker) clearMarker.run(req.corpusId, workId);
+          }
+        }
+        return removedIds;
+      });
+      const removedIds = apply(workIds);
+      return res.json({
+        removed: removedIds.length,
+        removed_work_ids: removedIds,
+        skipped_work_ids: workIds.filter((id) => !removedIds.includes(id)),
+      });
+    } catch (error) {
+      console.error('[/api/corpus/works/remove] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to remove works from corpus' });
     }
   });
 
@@ -4900,6 +5655,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       console.error('[/api/corpus/downloaded/:id/file] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to download corpus file' });
     }
+  });
+
+  app.get('/api/openalex/quota', requireAuthMiddleware, (req, res) => {
+    return res.json(readOpenAlexQuota());
   });
 
   app.get('/api/recursion-config', requireAuthMiddleware, (req, res) => {
@@ -5246,6 +6005,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       includeUpstream: req.body?.includeUpstream,
       relatedDepthDownstream: req.body?.relatedDepthDownstream,
       relatedDepthUpstream: req.body?.relatedDepthUpstream,
+      relatedSort: req.body?.relatedSort,
+      promotionMode: req.body?.promotionMode,
     });
     if (limit === null || limit === undefined || !Number.isFinite(limit) || limit <= 0) {
       return res.status(400).json({ error: 'limit must be a positive number' });

@@ -178,7 +178,7 @@ test.describe('Real PDF pipeline performance', () => {
 
     await page.getByTestId('tab-ingest').click()
     await expect(page.getByTestId('ingest-panel')).toBeVisible()
-    await page.locator('input[type="file"][accept=".pdf"]').setInputFiles(pdfPath!)
+    await page.locator('input[type="file"][accept*=".pdf"]').setInputFiles(pdfPath!)
     const uploadRow = page.locator('.upload-item', { hasText: sourceName })
     await expect(uploadRow).toBeVisible()
 

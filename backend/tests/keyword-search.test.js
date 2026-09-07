@@ -26,6 +26,7 @@ describe('POST /api/keyword-search', () => {
     expect(res.body).toHaveProperty('results')
     expect(Array.isArray(res.body.results)).toBe(true)
     expect(res.body.results[0]).toHaveProperty('title')
+    expect(res.body).toMatchObject({ fetched_count: 2, truncated_results: false })
   })
 
   test('accepts author-only search in stub', async () => {
@@ -88,5 +89,16 @@ describe('POST /api/keyword-search', () => {
     expect(res.body.uploadedDocs.relatedDepth).toBe(0)
     expect(res.body.uploadedDocs.relatedDepthDownstream).toBe(0)
     expect(res.body.uploadedDocs.relatedDepthUpstream).toBe(0)
+  })
+
+  test('preview returns a count and the threshold in stub mode', async () => {
+    const res = await request(app).post('/api/keyword-search/preview').send({ query: 'x' })
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ count: 2, threshold: 100000 })
+  })
+
+  test('cancel of an unknown run is 404', async () => {
+    const res = await request(app).post('/api/keyword-search/999999/cancel')
+    expect(res.status).toBe(404)
   })
 })

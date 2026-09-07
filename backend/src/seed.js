@@ -1,6 +1,13 @@
+import fs from 'node:fs'
+import path from 'node:path'
 function tableExists(db, tableName) {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName)
   return Boolean(row)
+}
+
+function tableHasColumn(db, tableName, columnName) {
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all()
+  return rows.some((row) => row.name === columnName)
 }
 
 function parseJson(value, fallback = null) {
@@ -56,6 +63,12 @@ function normalizeYear(value) {
   return raw || null
 }
 
+function normalizeCount(value) {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : null
+}
+
 function normalizeContributors(authors) {
   const names = parseNameList(authors)
   if (names.length === 0) return null
@@ -98,7 +111,7 @@ function sortSeedCandidates(candidates) {
   })
 }
 
-function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false } = {}) {
+function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false, onlyDownloaded = false } = {}) {
   if (!tableExists(db, table)) return []
 
   const joins = []
@@ -114,6 +127,9 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
   }
   if (table === 'works' && onlyQueued) {
     where.push(`COALESCE(t.download_status, 'not_requested') IN ('queued', 'in_progress')`)
+  }
+  if (table === 'works' && onlyDownloaded) {
+    where.push(`COALESCE(t.download_status, '') = 'downloaded'`)
   }
 
   const columns = ['t.id', 't.title', 't.authors', 't.year', 't.doi']
@@ -272,10 +288,49 @@ function findIdsWithAliases(row, lookup, aliasIndex) {
   return matched
 }
 
-function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
-  const allRows = loadMatchRows(db, 'works')
+// The cross-corpus half of the resolver ("is this already downloaded
+// anywhere?") indexes every downloaded work in the database — 70k+ rows,
+// about 1.5 s of normalisation — and it changed only when a worker finishes.
+// Cache it per DB handle, keyed by a cheap fingerprint of the works table,
+// with a max age as a backstop for edits the fingerprint cannot see. The
+// corpus-local half (a few hundred rows) is rebuilt on every call.
+const GLOBAL_DOWNLOADED_MAX_AGE_MS = 5 * 60_000
+const globalDownloadedCache = new WeakMap()
+
+function worksFingerprint(db) {
+  const works = db.prepare(
+    `SELECT COUNT(*) AS n,
+            COALESCE(MAX(id), 0) AS max_id,
+            SUM(CASE WHEN COALESCE(download_status, '') = 'downloaded' THEN 1 ELSE 0 END) AS downloaded
+     FROM works`
+  ).get()
+  const aliases = tableExists(db, 'work_aliases')
+    ? db.prepare('SELECT COUNT(*) AS n FROM work_aliases').get().n
+    : 0
+  return `${works.n}:${works.max_id}:${works.downloaded || 0}:${aliases}`
+}
+
+function loadGlobalDownloaded(db) {
+  const now = Date.now()
+  const fingerprint = worksFingerprint(db)
+  const cached = globalDownloadedCache.get(db)
+  if (cached && cached.fingerprint === fingerprint && now - cached.builtAt < GLOBAL_DOWNLOADED_MAX_AGE_MS) {
+    return cached.value
+  }
+  const rows = loadMatchRows(db, 'works', { onlyDownloaded: true })
+  const downloadedIds = new Set(rows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
+  const value = {
+    lookup: buildMatchLookup(rows),
+    downloadedIds,
+    aliasIndex: loadAliasIndex(db, 'works', downloadedIds),
+  }
+  globalDownloadedCache.set(db, { fingerprint, builtAt: now, value })
+  return value
+}
+
+export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
+  const globalDownloaded = loadGlobalDownloaded(db)
   const localRows = loadMatchRows(db, 'works', { corpusId })
-  const allDownloadedRows = allRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localDownloadedRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localRawRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'pending')
   const localWithMetadataRows = localRows.filter((row) => {
@@ -292,15 +347,14 @@ function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } 
     queuedEnrichment: buildMatchIndex(localQueuedEnrichmentRows),
     withMetadata: buildMatchIndex(localWithMetadataRows),
     queuedDownload: buildMatchIndex(localQueuedDownloadRows),
-    downloaded: buildMatchLookup(allDownloadedRows),
+    downloaded: globalDownloaded.lookup,
     failedDownloadLookup: buildMatchLookup(localFailedDownloadRows),
     failedEnrichment: buildMatchIndex(localFailedEnrichmentRows),
     failedDownload: buildMatchIndex(localFailedDownloadRows),
   }
-  const downloadedIds = new Set(allDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localDownloadedIds = new Set(localDownloadedRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const localFailedDownloadIds = new Set(localFailedDownloadRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
-  const downloadedAliasIndex = loadAliasIndex(db, 'works', downloadedIds)
+  const downloadedAliasIndex = globalDownloaded.aliasIndex
   const failedDownloadAliasIndex = loadAliasIndex(db, 'works', localFailedDownloadIds)
   const isInCorpus = (row) => {
     const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
@@ -437,6 +491,8 @@ function normalizePdfCandidate(row, sourceKey, resolverBundle) {
     openalex_id: null,
     created_at: row.created_at || null,
     source_pdf: row.source_pdf || null,
+    refs_count: null,
+    cited_by_count: null,
   }
   candidate.state = resolverBundle.resolveState(candidate)
   const availability = resolverBundle.resolveDownloadedAvailability
@@ -505,7 +561,7 @@ function normalizeSearchCandidate(row, resolverBundle) {
     authors,
     year: row.year || raw.publication_year || null,
     doi: row.doi || raw.doi || null,
-    source: primarySource.display_name || raw?.primary_location?.landing_page_url || null,
+    source: primarySource.display_name || null,
     publisher: primarySource.publisher || primarySource.host_organization_name || raw?.host_organization_name || null,
     volume: biblio.volume || null,
     issue: biblio.issue || null,
@@ -514,6 +570,8 @@ function normalizeSearchCandidate(row, resolverBundle) {
     open_access_url: openAccess.oa_url || null,
     openalex_id: row.openalex_id || raw.id || null,
     type: raw?.type || null,
+    refs_count: normalizeCount(raw?.referenced_works_count),
+    cited_by_count: normalizeCount(raw?.cited_by_count),
     abstract: abstractFromOpenAlex(raw),
     keywords: keywordsFromOpenAlex(raw),
     openalex_json: raw,
@@ -599,46 +657,188 @@ export function upsertSearchRunCorpus(db, { searchRunId, corpusId }) {
   return true
 }
 
-export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null } = {}) {
+// The seed/corpus text filter matches title, author and publication (venue),
+// case-insensitively. Kept here so listSeedCandidates and listSeedSources agree
+// on what "matching" means — a seed is hidden exactly when none of its items match.
+export function matchesSeedQuery(candidate, needle) {
+  if (!needle) return true
+  const authors = Array.isArray(candidate?.authors) ? candidate.authors.join(' ') : candidate?.authors || ''
+  const haystack = [
+    candidate?.title,
+    authors,
+    candidate?.source,
+    candidate?.publisher,
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+  return haystack.includes(needle)
+}
+
+// Sort expressions for the search branch, evaluated in SQL. Kept as
+// single-quoted string literals for the JSON path argument — SQLite treats a
+// double-quoted token as an identifier first and only falls back to a string
+// literal, which silently misbehaves for json_extract paths.
+const SEARCH_SORT_SQL = {
+  title: `LOWER(COALESCE(sr.title, ''))`,
+  // NULLIF('', '') -> NULL, so an empty/blank year casts to NULL rather than
+  // 0 and sorts as a blank (last in both directions) instead of first in asc.
+  year: `CAST(NULLIF(TRIM(sr.year), '') AS INTEGER)`,
+  authors: `LOWER(COALESCE(json_extract(sr.raw_json, '$.authorships[0].author.display_name'), ''))`,
+  source: `LOWER(COALESCE(json_extract(sr.raw_json, '$.primary_location.source.display_name'), ''))`,
+  refs: `json_extract(sr.raw_json, '$.referenced_works_count')`,
+  cited_by: `json_extract(sr.raw_json, '$.cited_by_count')`,
+}
+const SEARCH_JS_SORTS = new Set(['metadata', 'download'])
+
+// Metadata axis: failed_enrichment first, then (pending, staged_raw), then
+// queued_enrichment, then everything else (enriched/added/queued_download/
+// downloaded/downloaded_elsewhere/failed_download) tied at the bottom.
+const METADATA_SORT_RANK = new Map([
+  ['failed_enrichment', 0],
+  ['pending', 1],
+  ['staged_raw', 1],
+  ['queued_enrichment', 2],
+])
+const METADATA_SORT_DEFAULT_RANK = 3
+
+// Download axis: failed_download first, then every not-yet-downloaded state,
+// then queued_download, then downloaded_elsewhere, then downloaded — with
+// file_available === false ranking BEFORE true within the same state: the
+// axis runs worst-first, and a row whose file is missing is worse off than
+// one whose file is there.
+const DOWNLOAD_SORT_RANK = new Map([
+  ['failed_download', 0],
+  ['pending', 1],
+  ['staged_raw', 1],
+  ['queued_enrichment', 1],
+  ['enriched', 1],
+  ['added', 1],
+  ['queued_download', 2],
+  ['downloaded_elsewhere', 3],
+  ['downloaded', 4],
+])
+const DOWNLOAD_SORT_DEFAULT_RANK = 1
+
+function metadataSortRank(candidate) {
+  const state = String(candidate?.state || '')
+  const base = METADATA_SORT_RANK.has(state) ? METADATA_SORT_RANK.get(state) : METADATA_SORT_DEFAULT_RANK
+  return base
+}
+
+function downloadSortRank(candidate) {
+  const state = String(candidate?.state || '')
+  const base = DOWNLOAD_SORT_RANK.has(state) ? DOWNLOAD_SORT_RANK.get(state) : DOWNLOAD_SORT_DEFAULT_RANK
+  const isFileAvailabilityState = state === 'downloaded' || state === 'downloaded_elsewhere'
+  const fileSub = isFileAvailabilityState && candidate?.file_available === false ? 0 : 1
+  return base * 10 + fileSub
+}
+
+export function seedStateCountLimit() {
+  const parsed = Number(process.env.RAG_FEEDER_SEED_STATE_COUNT_LIMIT || 2000)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 2000
+}
+
+function searchCandidateWhere(corpusId, runId, sourceRef, needle) {
+  const where = ['src.corpus_id = ?', 'sr.search_run_id = ?',
+    `NOT EXISTS (SELECT 1 FROM seed_candidates_dismissed d
+                 WHERE d.corpus_id = ? AND d.source_type = 'search' AND d.source_key = ? AND d.candidate_key = 'search:' || sr.id)`]
+  const params = [corpusId, runId, corpusId, sourceRef]
+  if (needle) {
+    where.push(`(LOWER(COALESCE(sr.title, '')) LIKE ? OR LOWER(COALESCE(json_extract(sr.raw_json, '$.authorships[0].author.display_name'), '')) LIKE ?
+                 OR LOWER(COALESCE(json_extract(sr.raw_json, '$.primary_location.source.display_name'), '')) LIKE ?)`)
+    const like = `%${needle}%`
+    params.push(like, like, like)
+  }
+  return { where: where.join(' AND '), params }
+}
+
+export function countSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '', stateResolver = null } = {}) {
+  const needle = String(q || '').trim().toLowerCase()
+  const sourceKind = String(sourceType || '').trim().toLowerCase()
+  const sourceRef = String(sourceKey || '').trim()
+  if (sourceKind === 'pdf') {
+    // The pdf branch has no cheap SQL count (state/dismissal filtering happens
+    // in JS); forward the caller's resolver so a route that already built one
+    // doesn't pay to build a second.
+    return listSeedCandidates(db, corpusId, 'pdf', sourceRef, { q, stateResolver }).length
+  }
+  const runId = Number(sourceRef)
+  if (!Number.isFinite(runId) || runId <= 0) return 0
+  const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
+  return db.prepare(`SELECT COUNT(*) AS n FROM search_results sr JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id WHERE ${where}`).get(...params).n
+}
+
+export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateResolver = null, resolveDownloadedFilePath = null, q = '', limit = null, offset = 0, sort = '', dir = 'asc' } = {}) {
+  const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   if (!sourceRef || !['pdf', 'search'].includes(sourceKind)) return []
 
   const resolverBundle = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
-  const dismissed = loadDismissedCandidateKeySet(db, corpusId, sourceKind, sourceRef)
   const inCorpusMarked = loadInCorpusCandidateKeySet(db, corpusId, sourceKind, sourceRef)
 
   if (sourceKind === 'pdf') {
+    const dismissed = loadDismissedCandidateKeySet(db, corpusId, sourceKind, sourceRef)
     const rows = db.prepare(
       `SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, created_at
        FROM ingest_entries
        WHERE corpus_id = ? AND ingest_source = ?
        ORDER BY created_at DESC, id DESC`
     ).all(corpusId, sourceRef)
-    return sortSeedCandidates(rows
+    const candidates = sortSeedCandidates(rows
       .map((row) => {
         const candidate = normalizePdfCandidate(row, sourceRef, resolverBundle)
         return applyExplicitCorpusMembership(candidate, inCorpusMarked)
       })
-      .filter((candidate) => !dismissed.has(candidate.candidate_key)))
+      .filter((candidate) => !dismissed.has(candidate.candidate_key))
+      .filter((candidate) => matchesSeedQuery(candidate, needle)))
+    return limit !== null ? candidates.slice(Number(offset) || 0, (Number(offset) || 0) + Number(limit)) : candidates
   }
 
   const runId = Number(sourceRef)
   if (!Number.isFinite(runId) || runId <= 0) return []
-  const rows = db.prepare(
-    `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at
-     FROM search_results sr
+  const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
+  const sortKey = String(sort || '').trim().toLowerCase()
+  const direction = String(dir || 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC'
+  const sqlSort = SEARCH_SORT_SQL[sortKey]
+  const useSqlPaging = limit !== null && !SEARCH_JS_SORTS.has(sortKey)
+  const pageSql = useSqlPaging ? ' LIMIT ? OFFSET ?' : ''
+  const baseSelect = `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at`
+  const baseFrom = `FROM search_results sr
      JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id
      JOIN search_runs s ON s.id = sr.search_run_id
-     WHERE src.corpus_id = ? AND sr.search_run_id = ?
-     ORDER BY sr.id DESC`
-  ).all(corpusId, runId)
-  return sortSeedCandidates(rows
-    .map((row) => {
-      const candidate = normalizeSearchCandidate(row, resolverBundle)
-      return applyExplicitCorpusMembership(candidate, inCorpusMarked)
+     WHERE ${where}`
+  // Blanks last in both directions: NULL/'' sort after real values. The sort
+  // expression is a json_extract over raw_json, so it is named once in a CTE
+  // rather than repeated three times in the ORDER BY.
+  const sql = sqlSort
+    ? `WITH page AS (${baseSelect}, ${sqlSort} AS sort_key
+     ${baseFrom})
+     SELECT id, search_run_id, title, doi, openalex_id, year, raw_json, created_at
+     FROM page
+     ORDER BY (sort_key IS NULL OR sort_key = '') ASC, sort_key ${direction}, id DESC${pageSql}`
+    : `${baseSelect}
+     ${baseFrom}
+     ORDER BY sr.id DESC${pageSql}`
+  const rows = db.prepare(sql).all(...params, ...(useSqlPaging ? [Number(limit), Number(offset) || 0] : []))
+  let candidates = rows.map((row) => applyExplicitCorpusMembership(normalizeSearchCandidate(row, resolverBundle), inCorpusMarked))
+  if (SEARCH_JS_SORTS.has(sortKey)) {
+    const rankFn = sortKey === 'metadata' ? metadataSortRank : downloadSortRank
+    // Rank order honours dir; the id DESC tie-break inside the same rank does
+    // not (mirrors the SQL ORDER BY's fixed `sr.id DESC` tie-break).
+    candidates.sort((a, b) => {
+      const diff = rankFn(a) - rankFn(b)
+      if (diff !== 0) return diff * (direction === 'DESC' ? -1 : 1)
+      return (Number(b.id) || 0) - (Number(a.id) || 0)
     })
-    .filter((candidate) => !dismissed.has(candidate.candidate_key)))
+    if (limit !== null) candidates = candidates.slice(Number(offset) || 0, (Number(offset) || 0) + Number(limit))
+  }
+  // No further JS re-sort otherwise: the SQL ORDER BY (sqlSort, or the
+  // default `sr.id DESC`) already reflects the requested order, and each
+  // page was already sliced in SQL — re-sorting here would shuffle pages
+  // independently and break contiguity across LIMIT/OFFSET calls.
+  return candidates
 }
 
 function summarizeStates(candidates) {
@@ -676,22 +876,43 @@ function summarizeStates(candidates) {
   return stateCounts
 }
 
-export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFilePath = null } = {}) {
-  const resolver = createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+export function listSeedSources(db, corpusId, {
+  limit = 200,
+  resolveDownloadedFilePath = null,
+  q = '',
+  stateResolver = null,
+  only = null, // { sourceType, sourceKey } — list just that seed
+  // Resolving per-candidate state for every seed on every poll is the most
+  // expensive thing this function does (up to seedStateCountLimit() rows per
+  // seed). The seed *list* only needs candidate_count, so it passes false and
+  // gets `state_counts: null`; the candidates route asks for one seed via
+  // `only` and keeps the counts.
+  withStateCounts = true,
+} = {}) {
+  const resolver = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+  const onlyType = only ? String(only.sourceType || '').trim().toLowerCase() : ''
+  const onlyKey = only ? String(only.sourceKey || '').trim() : ''
+  const wanted = (type, key) => !only || (onlyType === type && onlyKey === String(key || '').trim())
+  // Some seed-only test fixtures (and, in principle, an old DB mid-migration)
+  // have ingest_entries without ingest_source_metadata; a LEFT JOIN against a
+  // table that doesn't exist fails at prepare time, so skip the join instead
+  // of just leaving it unmatched.
+  const hasSeedMetadata = tableExists(db, 'ingest_source_metadata')
   const pdfSources = db.prepare(
     `SELECT ie.ingest_source AS source_key,
             MAX(ie.created_at) AS created_at,
             COUNT(*) AS entry_count,
-            MAX(ism.title) AS seed_title,
+            ${hasSeedMetadata ? `MAX(ism.title) AS seed_title,
             MAX(ism.authors) AS seed_authors,
             MAX(ism.year) AS seed_year,
             MAX(ism.doi) AS seed_doi,
             MAX(ism.source) AS seed_source,
             MAX(ism.publisher) AS seed_publisher,
-            MAX(ism.source_pdf) AS source_pdf
+            MAX(ism.source_pdf) AS source_pdf` : `NULL AS seed_title, NULL AS seed_authors, NULL AS seed_year,
+            NULL AS seed_doi, NULL AS seed_source, NULL AS seed_publisher, NULL AS source_pdf`}
      FROM ingest_entries ie
-     LEFT JOIN ingest_source_metadata ism
-       ON ism.corpus_id = ie.corpus_id AND ism.ingest_source = ie.ingest_source
+     ${hasSeedMetadata ? `LEFT JOIN ingest_source_metadata ism
+       ON ism.corpus_id = ie.corpus_id AND ism.ingest_source = ie.ingest_source` : ''}
      LEFT JOIN seed_sources_hidden ssh
        ON ssh.corpus_id = ie.corpus_id AND ssh.source_type = 'pdf' AND ssh.source_key = ie.ingest_source
      WHERE ie.corpus_id = ?
@@ -701,21 +922,27 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
      ORDER BY MAX(ie.created_at) DESC`
   ).all(corpusId)
 
+  const hasRunStatus = tableExists(db, 'search_runs') && tableHasColumn(db, 'search_runs', 'status')
   const searchSources = tableExists(db, 'search_run_corpora')
     ? db.prepare(
+      // No join on search_results: `candidate_count` comes from
+      // countSeedCandidates (which also honours dismissals and `q`), so the
+      // old COUNT(sres.id) AS entry_count was dead weight that scanned every
+      // result row of every run on every poll. Neither join can duplicate a
+      // run — search_run_corpora is keyed by search_run_id and
+      // seed_sources_hidden by (corpus_id, source_type, source_key) — so no
+      // GROUP BY is needed either.
       `SELECT sr.id AS source_key,
               COALESCE(src.created_at, sr.created_at) AS created_at,
               sr.query,
-              sr.filters_json,
-              COUNT(sres.id) AS entry_count
+              sr.filters_json
+              ${hasRunStatus ? ', sr.status, sr.fetched_count, sr.expected_count, sr.error' : ''}
        FROM search_runs sr
        JOIN search_run_corpora src ON src.search_run_id = sr.id
-       JOIN search_results sres ON sres.search_run_id = sr.id
        LEFT JOIN seed_sources_hidden ssh
          ON ssh.corpus_id = src.corpus_id AND ssh.source_type = 'search' AND ssh.source_key = CAST(sr.id AS TEXT)
        WHERE src.corpus_id = ?
          AND ssh.source_key IS NULL
-       GROUP BY sr.id
        ORDER BY COALESCE(src.created_at, sr.created_at) DESC`
     ).all(corpusId)
     : []
@@ -723,7 +950,7 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
   const sources = []
   pdfSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
-    if (!sourceKey) return
+    if (!sourceKey || !wanted('pdf', sourceKey)) return
     const meta = {
       title: row.seed_title,
       authors: parseNameList(row.seed_authors),
@@ -732,17 +959,18 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
       source: row.seed_source,
       publisher: row.seed_publisher,
     }
-    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver })
+    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver, q })
     if (candidates.length === 0) return
     sources.push({
       id: buildSourceId('pdf', sourceKey),
       source_type: 'pdf',
+      seed_kind: 'pdf',
       source_key: sourceKey,
       label: row.seed_title || sourceKey,
       subtitle: formatPdfSubtitle(meta) || (row.source_pdf || ''),
       created_at: row.created_at,
       candidate_count: candidates.length,
-      state_counts: summarizeStates(candidates),
+      state_counts: withStateCounts ? summarizeStates(candidates) : null,
       removable: true,
       meta,
     })
@@ -750,23 +978,39 @@ export function listSeedSources(db, corpusId, { limit = 200, resolveDownloadedFi
 
   searchSources.forEach((row) => {
     const sourceKey = String(row.source_key || '').trim()
-    if (!sourceKey) return
-    const candidates = listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver })
-    if (candidates.length === 0) return
+    if (!sourceKey || !wanted('search', sourceKey)) return
+    const total = countSeedCandidates(db, corpusId, 'search', sourceKey, { q })
+    const run = row.status !== undefined
+      ? { status: row.status || null, fetched_count: row.fetched_count ?? null, expected_count: row.expected_count ?? null, error: row.error || null }
+      : null
+    if (total === 0 && run?.status !== 'running') return
+    const withinLimit = withStateCounts && total <= seedStateCountLimit()
+    const candidates = withinLimit ? listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q }) : []
+    const filters = parseJson(row.filters_json, {}) || {}
+    const direction = String(filters.expansion_direction || '').trim().toLowerCase()
+    const isSnowball = direction === 'downstream' || direction === 'upstream'
     sources.push({
       id: buildSourceId('search', sourceKey),
       source_type: 'search',
+      seed_kind: isSnowball ? 'snowball' : 'search',
+      ...(isSnowball
+        ? {
+          snowball: {
+            direction,
+            of_title: filters.expansion_of_title || null,
+            of_openalex_id: filters.expansion_of_openalex_id || null,
+          },
+        }
+        : {}),
       source_key: sourceKey,
       label: row.query || `Search #${sourceKey}`,
       subtitle: formatSearchSubtitle(row),
       created_at: row.created_at,
-      candidate_count: candidates.length,
-      state_counts: summarizeStates(candidates),
+      candidate_count: total,
+      state_counts: withinLimit ? summarizeStates(candidates) : null,
+      run,
       removable: true,
-      meta: {
-        query: row.query,
-        filters: parseJson(row.filters_json, {}) || {},
-      },
+      meta: { query: row.query, filters },
     })
   })
 
@@ -800,4 +1044,64 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
   })
   tx(normalized)
   return normalized.length
+}
+
+// Dismisses every candidate currently matching the filter. Pdf seeds keep the
+// JS round-trip (load the filtered rows, dismiss by key) since their
+// filtering already happens in JS; search seeds do it in one INSERT ... SELECT
+// so a 100k-item seed doesn't need every row materialized in JS first.
+export function dismissAllSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '' } = {}) {
+  const sourceKind = String(sourceType || '').trim().toLowerCase()
+  const sourceRef = String(sourceKey || '').trim()
+  if (sourceKind !== 'search') {
+    const keys = listSeedCandidates(db, corpusId, sourceType, sourceKey, { q }).map((c) => c.candidate_key)
+    return dismissSeedCandidates(db, corpusId, sourceType, sourceKey, keys)
+  }
+  const runId = Number(sourceRef)
+  if (!Number.isFinite(runId) || runId <= 0) return 0
+  const needle = String(q || '').trim().toLowerCase()
+  const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
+  // NOT EXISTS in `where` already excludes already-dismissed rows, so this
+  // only ever inserts new rows — OR REPLACE is just defensive.
+  const result = db.prepare(
+    `INSERT OR REPLACE INTO seed_candidates_dismissed (corpus_id, source_type, source_key, candidate_key, dismissed_at)
+     SELECT ?, 'search', ?, 'search:' || sr.id, CURRENT_TIMESTAMP
+     FROM search_results sr
+     JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id
+     WHERE ${where}`
+  ).run(corpusId, sourceRef, ...params)
+  return Number(result?.changes || 0)
+}
+
+// The original upload for a seed document. `ingest_source_metadata.source_pdf`
+// normally points at UPLOADS_DIR/<name>.pdf, but older rows recorded the
+// extracted reference-page artifact instead, so fall back to the upload that
+// carries the seed's own name. Anything outside uploadsDir is refused (same
+// traversal guard as the extract-bibliography route).
+function isReadableFile(candidate) {
+  try {
+    return fs.statSync(candidate).isFile()
+  } catch {
+    return false
+  }
+}
+
+export function resolveSeedDocumentPath({ sourcePdf, sourceKey, uploadsDir, exists = isReadableFile }) {
+  const root = path.resolve(String(uploadsDir || ''))
+  if (!root) return null
+  const inside = (candidate) => {
+    const rel = path.relative(root, candidate)
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)
+  }
+  const candidates = []
+  const stored = String(sourcePdf || '').trim()
+  if (stored) candidates.push(path.resolve(stored))
+  const key = String(sourceKey || '').trim()
+  if (key && !key.includes('/') && !key.includes('\\')) {
+    candidates.push(path.resolve(root, `${key}.pdf`))
+  }
+  for (const candidate of candidates) {
+    if (inside(candidate) && exists(candidate)) return candidate
+  }
+  return null
 }

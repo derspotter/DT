@@ -72,6 +72,16 @@ class DatabaseManager:
         self._ensure_column("works", "referenced_work_ids", "TEXT")
         self._ensure_column("works", "cited_by_api_url", "TEXT")
 
+    def _ensure_search_runs_columns(self) -> None:
+        """Run lifecycle for background keyword searches (round 2, phase 3)."""
+        if not self._table_columns("search_runs"):
+            return
+        self._ensure_column("search_runs", "status", "TEXT")
+        self._ensure_column("search_runs", "fetched_count", "INTEGER")
+        self._ensure_column("search_runs", "expected_count", "INTEGER")
+        self._ensure_column("search_runs", "error", "TEXT")
+        self._ensure_column("search_runs", "finished_at", "TIMESTAMP")
+
     def close_connection(self):
         """Closes the database connection."""
         if hasattr(self, 'conn') and self.conn:
@@ -268,6 +278,7 @@ class DatabaseManager:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._ensure_search_runs_columns()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS search_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -362,6 +373,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)")
 
         try:
             has_search_results = cursor.execute(
@@ -2504,40 +2516,102 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error adding entry to duplicate_references: {e} (Entry: {bibtex_key_val}){RESET}")
             return None, str(e)
 
-    def create_search_run(self, query: str, filters: dict | None = None) -> int:
-        """Create a new search run record and return its ID."""
+    def create_search_run(self, query: str, filters: dict | None = None, status: str | None = None) -> int:
+        """Create a search run. `status` is 'running' for background fetches; None for legacy one-shot runs."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "INSERT INTO search_runs (query, filters_json) VALUES (?, ?)",
-            (query, json.dumps(filters) if filters else None),
+            "INSERT INTO search_runs (query, filters_json, status, fetched_count) VALUES (?, ?, ?, ?)",
+            (query, json.dumps(filters) if filters else None, status, 0 if status else None),
         )
         self.conn.commit()
         return cursor.lastrowid
 
+    def update_search_run_progress(self, run_id: int, fetched: int, expected: int | None) -> None:
+        self.conn.execute(
+            "UPDATE search_runs SET fetched_count = ?, expected_count = ? WHERE id = ?",
+            (int(fetched), int(expected) if expected is not None else None, int(run_id)),
+        )
+        self.conn.commit()
+
+    def finish_search_run(self, run_id: int, status: str, error: str | None = None) -> None:
+        if status not in ("done", "failed", "cancelled"):
+            raise ValueError(f"Unknown search run status: {status}")
+        self.conn.execute(
+            "UPDATE search_runs SET status = ?, error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, error, int(run_id)),
+        )
+        self.conn.commit()
+
+    def count_search_results(self, run_id: int) -> int:
+        row = self.conn.execute("SELECT COUNT(*) FROM search_results WHERE search_run_id = ?", (int(run_id),)).fetchone()
+        return int(row[0] if row else 0)
+
+    def fetch_search_results(self, run_id: int, limit: int) -> list[dict]:
+        """Read back a run's stored results in insertion order (oldest first), capped at `limit`.
+
+        Used to render the inline payload without keeping every fetched item in memory.
+        """
+        if limit <= 0:
+            return []
+        cursor = self.conn.execute(
+            """SELECT openalex_id, doi, title, year, raw_json
+                 FROM search_results WHERE search_run_id = ? ORDER BY id LIMIT ?""",
+            (int(run_id), int(limit)),
+        )
+        rows = []
+        for openalex_id, doi, title, year, raw_json in cursor.fetchall():
+            parsed = None
+            if raw_json:
+                try:
+                    parsed = json.loads(raw_json)
+                except (ValueError, TypeError):
+                    parsed = None
+            rows.append({
+                'openalex_id': openalex_id,
+                'doi': doi,
+                'title': title,
+                'year': year,
+                'raw_json': parsed,
+            })
+        return rows
+
     def add_search_results(self, search_run_id: int, results: list[dict]) -> int:
-        """Insert search results for a run. Returns number of inserted rows."""
+        """Insert search results for a run. Returns the number of rows actually inserted.
+
+        A row whose openalex_id is already stored for this run is skipped, so the
+        store carries the per-run dedupe and callers need not keep a seen-set in
+        memory. Rows without an openalex_id are always inserted.
+        """
         if not results:
             return 0
         cursor = self.conn.cursor()
         rows = []
         for result in results:
+            openalex_id = result.get('openalex_id')
             rows.append(
                 (
                     search_run_id,
-                    result.get('openalex_id'),
+                    openalex_id,
                     result.get('doi'),
                     result.get('title'),
                     result.get('year'),
                     json.dumps(result.get('raw_json')) if result.get('raw_json') is not None else None,
+                    search_run_id,
+                    openalex_id,
                 )
             )
         cursor.executemany(
             """INSERT INTO search_results (search_run_id, openalex_id, doi, title, year, raw_json)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               SELECT ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM search_results
+                     WHERE search_run_id = ? AND openalex_id = ? AND openalex_id IS NOT NULL
+                )""",
             rows,
         )
+        inserted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else len(rows)
         self.conn.commit()
-        return len(rows)
+        return int(inserted)
 
     def get_all_downloaded_works_as_dicts(self) -> list[dict]:
         """Fetch downloaded works as dictionaries using the canonical works table."""

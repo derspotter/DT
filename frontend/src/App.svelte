@@ -31,8 +31,14 @@
     enqueueIngestEntries,
     processMarkedIngestEntries,
     runKeywordSearch,
+    cancelKeywordSearch,
     fetchRecursionConfig,
     fetchCorpus,
+    removeCorpusWork,
+    removeCorpusWorks,
+    fetchSeedSourceDocument,
+    fetchAppSettings,
+    saveAppSettings,
     fetchDownloadQueue,
     fetchDownloadWorkerStatus,
     startDownloadWorker,
@@ -45,11 +51,20 @@
     pausePipelineWorker,
     downloadCorpusExport,
     createCorpusItemDownloadUrl,
+    fetchOpenAlexQuota,
+    previewKeywordSearch,
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
   import ThreeGraph from './components/ThreeGraph.svelte'
   import Corpus from './components/Corpus.svelte'
+  import ColumnPicker from './components/ColumnPicker.svelte'
+  import {
+    gridTemplate,
+    loadVisibility as loadColumnVisibility,
+    saveVisibility as saveColumnVisibility,
+    visibleColumns,
+  } from './lib/tableColumns'
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
@@ -146,6 +161,57 @@
   $: pipelineMetadataCount = Number(ingestStats.matched || 0)
   $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
   $: itemsFoundCount = seedSources.reduce((total, source) => total + (Number(source?.candidate_count) || 0), 0)
+  // Runs this session started but the seed list has not caught up with yet.
+  // Deriving `anySearchRunning` from seedSources alone lost the very first
+  // search of a session: the run only shows up in the seed list after a poll,
+  // and the poll only starts once a run shows up.
+  let startedSearchRunIds = new Set()
+  const startedSearchRunMisses = new Map()
+  const TERMINAL_RUN_STATUSES = new Set(['done', 'failed', 'cancelled'])
+  // Two polls, so one seed-list response that raced the run's registration
+  // does not drop it.
+  const STARTED_RUN_MISS_LIMIT = 2
+
+  function reconcileStartedSearchRuns(sources) {
+    if (startedSearchRunIds.size === 0) return
+    const reported = new Map()
+    for (const source of sources || []) {
+      if (source?.source_type !== 'search') continue
+      reported.set(String(source.source_key), source?.run?.status || null)
+    }
+    const next = new Set()
+    for (const runId of startedSearchRunIds) {
+      const key = String(runId)
+      if (reported.has(key)) {
+        startedSearchRunMisses.delete(key)
+        const status = reported.get(key)
+        // Once the list reports the run, its own status is authoritative; a
+        // missing status means the backend cannot track it, which is terminal
+        // as far as polling goes.
+        if (!status || TERMINAL_RUN_STATUSES.has(status)) continue
+        next.add(runId)
+        continue
+      }
+      const misses = (startedSearchRunMisses.get(key) || 0) + 1
+      if (misses >= STARTED_RUN_MISS_LIMIT) {
+        startedSearchRunMisses.delete(key)
+        continue
+      }
+      startedSearchRunMisses.set(key, misses)
+      next.add(runId)
+    }
+    if (next.size !== startedSearchRunIds.size) startedSearchRunIds = next
+  }
+
+  $: anySearchRunning = startedSearchRunIds.size > 0 || seedSources.some((s) => s?.run?.status === 'running')
+  $: if (anySearchRunning) {
+    if (!searchRefreshIntervalId) {
+      searchRefreshIntervalId = setInterval(() => runLiveRefreshCycle(), 2000)
+    }
+  } else if (searchRefreshIntervalId) {
+    clearInterval(searchRefreshIntervalId)
+    searchRefreshIntervalId = null
+  }
   $: itemsPromotedCount = Number(corpusTotal) || corpusItems.length
   let ingestStatsStatus = ''
   let latestEntries = []
@@ -204,6 +270,29 @@
   let seedCandidatesLoading = {}
   let seedSelections = {}
   let seedSelectionVersions = {}
+  let seedSorts = {}
+  let seedPages = {}          // sourceId -> { total, offset, limit }
+  let seedAllSelected = {}    // sourceId -> true when "All N items selected"
+  let seedAppending = {}      // sourceId -> true while a "Show more" append is in flight
+  const SEED_PAGE_SIZE = 200
+
+  function seedPage(source) {
+    return seedPages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
+  }
+  function seedSortParams(source) {
+    const current = seedSorts[seedSourceId(source)]
+    return current ? { sort: current.column, dir: current.direction } : { sort: '', dir: 'asc' }
+  }
+  let seedColumnVisibility = loadColumnVisibility('seed')
+  $: seedActiveColumns = visibleColumns('seed', seedColumnVisibility)
+  // The seed table keeps a leading selection cell, so the grid gets an extra
+  // fixed track in front of the shared columns.
+  $: seedGridStyle = `grid-template-columns: 44px ${gridTemplate(seedActiveColumns)}`
+
+  function updateSeedColumns(next) {
+    seedColumnVisibility = next
+    saveColumnVisibility('seed', next)
+  }
   let selectedSeedCandidateKeys = {}
   let seedActionStatus = ''
   let seedActionBusy = false
@@ -221,6 +310,11 @@
   let relatedDepthDownstream = 0
   let relatedDepthUpstream = 0
   let maxRelated = 30
+  // Spec line 12: how related papers are ranked before the max-related cap.
+  let relatedSort = 'most_cited'
+  // Spec lines 10 & 11: new_seed reviews the expansion in section 2 first;
+  // download_all is the historical behaviour. Default is review-first.
+  let promotionMode = 'new_seed'
   let keywordRecursionConfig = {
     includeDownstream: false,
     includeUpstream: false,
@@ -231,6 +325,9 @@
   let searchResults = []
   let searchStatus = ''
   let searchSource = ''
+  let searchPreview = null
+  let searchWarning = false
+  let searchPreviewBusy = false
   let searchSelection = []
   let searchQueueConfigs = {}
   let searchQueueStatus = ''
@@ -248,12 +345,84 @@
     return key && searchSelection.includes(key) ? count + 1 : count
   }, 0)
 
+  let openalexQuota = null
+  let openalexQuotaLoading = false
+
+  async function loadOpenAlexQuota() {
+    if (openalexQuotaLoading || authStatus !== 'authenticated') return
+    openalexQuotaLoading = true
+    try {
+      openalexQuota = await fetchOpenAlexQuota()
+    } catch {
+      // Leave the last known value; the pill is informational only.
+    } finally {
+      openalexQuotaLoading = false
+    }
+  }
+
+  function formatResetIn(seconds) {
+    if (!Number.isFinite(seconds) || seconds <= 0) return 'now'
+    const totalMin = Math.round(seconds / 60)
+    if (totalMin === 0) return 'now'
+    const h = Math.floor(totalMin / 60)
+    const m = totalMin % 60
+    if (h === 0) return `${m} min`
+    return m === 0 ? `${h} h` : `${h} h ${m} min`
+  }
+
+  // Copy is fixed by the spec; tone drives the pill colour.
+  function formatOpenAlexQuota(quota) {
+    if (!quota || !quota.available) {
+      return { text: 'OpenAlex budget: unknown until the first request', tone: 'muted' }
+    }
+    if (!quota.api_key_present) {
+      return { text: 'OpenAlex: no API key — daily budget not reported', tone: 'muted' }
+    }
+    const remaining = Number(quota.remaining)
+    const limit = Number(quota.limit)
+    if (!Number.isFinite(remaining) || !Number.isFinite(limit)) {
+      return { text: 'OpenAlex budget: unknown until the first request', tone: 'muted' }
+    }
+    // reset_in_seconds is null when OpenAlex sent no usable reset header; that
+    // is "unknown", not "reset already happened".
+    const hasReset = quota.reset_in_seconds !== null && quota.reset_in_seconds !== undefined
+    const resetIn = hasReset ? Number(quota.reset_in_seconds) : NaN
+    if (hasReset && Number.isFinite(resetIn) && resetIn <= 0) {
+      // The daily reset happened after the last OpenAlex request, so the
+      // counts in the snapshot are pre-reset. The next request refreshes them.
+      return { text: `OpenAlex budget: reset since the last request · ${limit.toLocaleString('en-US')} per day`, tone: 'muted' }
+    }
+    const counts = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left`
+    const base = Number.isFinite(resetIn) ? `${counts} · resets in ${formatResetIn(resetIn)}` : counts
+    if (quota.stale) {
+      const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString('en-US') : 'unknown'
+      return { text: `${base} · last seen ${seen}`, tone: 'muted' }
+    }
+    if (remaining <= 0) return { text: base, tone: 'danger' }
+    if (limit > 0 && remaining / limit < 0.1) return { text: base, tone: 'warn' }
+    return { text: base, tone: 'ok' }
+  }
+
+  $: openalexQuotaView = formatOpenAlexQuota(openalexQuota)
+
   const CORPUS_PAGE_SIZE = 120
   const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending'])
   const FAILED_STATUSES = new Set(['failed_enrichment', 'failed_download'])
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
+  // Text filter (spec line 6). Applied server-side for both sections: the
+  // corpus is paged, and seeds are collapsed, so client-side filtering would
+  // only ever see what happens to be loaded.
+  let appSettings = null
+  let appSettingsDraft = {}
+  let appSettingsStatus = ''
+  let appSettingsError = false
+  let seedFilterQuery = ''
+  let corpusFilterQuery = ''
+  let seedFilterDebounce = null
+  let corpusFilterDebounce = null
+  let corpusSort = ''
   let corpusLoading = false
   let corpusLoadingMore = false
   let corpusLoadRequestSeq = 0
@@ -362,6 +531,7 @@
   let pipelineRefreshTimer = null
   let pipelineRefreshInFlight = false
   let liveRefreshIntervalId = null
+  let searchRefreshIntervalId = null
   let lastTabRefreshAt = 0
   let rawCorpusTableEl = null
   let metaCorpusTableEl = null
@@ -371,6 +541,11 @@
   let corpusActionStatus = ''
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
+  // The graph opens scoped to the workspace corpus; "All corpora" in its own
+  // dropdown restores the previous global view (spec line 22).
+  $: graphCorpusId = Number.isFinite(Number(currentCorpusId)) && currentCorpusId ? String(currentCorpusId) : 'all'
+  // Load settings the first time an admin opens the Admin tab.
+  $: if (activeTab === 'admin' && isAdmin && appSettings === null) loadAppSettings()
   $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
   $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && (isAdmin || currentCorpus?.role === 'owner' || currentCorpus?.role === 'editor'))
   let shareUsername = ''
@@ -563,8 +738,13 @@
     if (extractedBaseNames.size === 0) return
     const nextUploads = uploads.filter((item) => {
       const backendFilename = String(item?.backendFilename || '').trim()
+      // An upload still in flight has no backend filename yet. It must survive:
+      // this prune runs on the ingest-runs poll, so dropping it here deletes the
+      // row mid-upload and the later updateUpload() patch finds nothing to
+      // update, leaving the file silently gone from the list.
+      if (!backendFilename) return true
       const baseName = backendFilename.replace(/\.pdf$/i, '')
-      return backendFilename && !extractedBaseNames.has(baseName) && normalizeStoredUploadStatus(item.status) !== 'extracted'
+      return !extractedBaseNames.has(baseName) && normalizeStoredUploadStatus(item.status) !== 'extracted'
     })
     if (nextUploads.length !== uploads.length) {
       uploads = nextUploads
@@ -585,6 +765,32 @@
     }
     if (Array.isArray(entry.author)) return entry.author.join(', ')
     return entry.authors || entry.author || ''
+  }
+
+  function formatAuthorsList(entry) {
+    if (!entry) return []
+    if (Array.isArray(entry.authors)) return entry.authors
+    if (typeof entry.authors === 'string') {
+      try {
+        const parsed = JSON.parse(entry.authors)
+        if (Array.isArray(parsed)) return parsed
+      } catch (error) {
+        // fall through
+      }
+    }
+    if (Array.isArray(entry.author)) return entry.author
+    const raw = String(entry.authors || entry.author || '').trim()
+    return raw ? raw.split(',').map((name) => name.trim()).filter(Boolean) : []
+  }
+
+  // Table cells show at most `cap` authors; the full list stays in the expanded
+  // detail card and on hover. formatAuthors itself must keep returning the full
+  // string — the corpus search filter matches against it.
+  function formatAuthorsShort(entry, cap = 3) {
+    const list = formatAuthorsList(entry)
+    if (list.length === 0) return formatAuthors(entry)
+    if (list.length <= cap) return list.join(', ')
+    return `${list.slice(0, cap).join(', ')} et al.`
   }
 
   function normalizeCorpusItem(entry) {
@@ -654,8 +860,8 @@
       matched: { label: 'Matched', tone: 'completed' },
       queued_download: { label: 'Queued download', tone: 'in_progress' },
       downloaded: { label: 'Downloaded', tone: 'completed' },
-      failed_enrichment: { label: 'Enrich failed', tone: 'in_progress' },
-      failed_download: { label: 'Download failed', tone: 'in_progress' },
+      failed_enrichment: { label: 'Metadata not confirmed', tone: 'in_progress' },
+      failed_download: { label: 'Not retrievable', tone: 'in_progress' },
     }
     if (map[status]) return { ...map[status], raw: status }
     if (!status) return { label: 'Unknown', tone: 'in_progress', raw: '' }
@@ -1350,14 +1556,26 @@
   }
 
   async function runLiveRefreshCycle() {
-    if (!shouldRunLiveRefresh()) return
+    if (!shouldRunLiveRefresh()) {
+      // The Admin panel shows the OpenAlex budget too; keep it current there
+      // without the full workspace refresh.
+      if (activeTab === 'admin') void loadOpenAlexQuota()
+      return
+    }
     if (pipelineRefreshInFlight) return
     pipelineRefreshInFlight = true
     try {
       const tasks = [
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
+        loadOpenAlexQuota(),
       ]
+      // Not only while a run is known to be running: the workspace is where
+      // seeds live, and a run started elsewhere (or one this tab has not seen
+      // yet) has to be able to show up on its own.
+      if (anySearchRunning || activeTab === 'workspace') {
+        tasks.push(loadSeedSources({ quiet: true }))
+      }
       if (diagnosticsEnabled) {
         tasks.push(
           loadDownloads(),
@@ -1602,6 +1820,11 @@
 
   async function refreshAll(targetTab = activeTab) {
     restoreStoredUploads()
+    // The OpenAlex quota pill is shown on both the workspace search panel
+    // and the admin settings row, so it needs to load once after every
+    // authentication regardless of which tab the user lands on (notably
+    // #/admin, which the workspace-only tasks below never touch).
+    void loadOpenAlexQuota()
     // Only the workspace/dashboard/downloads tabs render this pipeline + corpus
     // data. For other landing tabs (notably the graph, which loads its own
     // snapshot) these are several synchronous DB queries that can stall the
@@ -1644,6 +1867,9 @@
     seedCandidatesBySource = {}
     seedCandidatesLoading = {}
     seedSelections = {}
+    seedPages = {}
+    seedAllSelected = {}
+    seedAppending = {}
     seedActionStatus = ''
     seedActionBusy = false
     seedLastRunKey = ''
@@ -2493,7 +2719,7 @@
         }
       case 'downloaded_elsewhere':
         return candidate?.file_available === true
-          ? { label: 'PDF reusable', className: 'downloaded', hint: 'Downloaded by another corpus and the file is present — promoting reuses it' }
+          ? { label: 'PDF downloaded', className: 'downloaded', hint: 'Downloaded by another corpus and the file is present — promoting reuses it' }
           : { label: 'Stale record', className: 'pending', hint: 'Another corpus recorded a download but the file is gone — promoting downloads it fresh' }
       case 'queued_download':
         return { label: 'Download queued', className: 'queued' }
@@ -2506,20 +2732,255 @@
       case 'added':
         return { label: 'In corpus', className: 'completed' }
       case 'failed_enrichment':
-        return { label: 'Metadata failed', className: 'failed' }
+        return { label: 'Metadata not confirmed', className: 'failed', hint: 'No Crossref match found' }
       case 'failed_download':
-        return { label: 'Download failed', className: 'failed' }
+        return { label: 'Not retrievable', className: 'failed', hint: 'Document not retrievable' }
       default:
         return { label: 'To review', className: 'pending' }
     }
   }
 
-  function isSeedCandidateSelectable(candidate) {
+  // With downstream expansion at depth >= 1 an already-downloaded or already
+  // in-corpus item is still worth promoting: the point is its references, not
+  // the item itself. Depend on the reactive vars directly so toggling the
+  // Downstream checkbox re-evaluates every row.
+  function isSeedCandidateSelectable(candidate, downstreamOn = includeDownstream, downstreamDepth = relatedDepthDownstream) {
+    if (downstreamOn && downstreamDepth >= 1) return true
     return seedCandidateState(candidate) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
+  }
+
+  // The seed tables render inside {#key ...} blocks, so selectability changes
+  // driven by the Promotion Settings need to appear in the key itself.
+  $: downstreamPromotesAll = includeDownstream && relatedDepthDownstream >= 1
+  $: expansionEnabled = (includeDownstream && relatedDepthDownstream >= 1) || (includeUpstream && relatedDepthUpstream >= 1)
+
+  // Debounced so typing does not fire a request per keystroke. Both reset to
+  // offset 0 implicitly: loadSeedSources reloads from scratch and loadCorpus
+  // without `append` starts at offset 0.
+  function handleSeedFilterInput(event) {
+    seedFilterQuery = String(event?.target?.value || '')
+    clearTimeout(seedFilterDebounce)
+    seedFilterDebounce = setTimeout(() => {
+      seedCandidatesBySource = {}
+      seedPages = {}
+      seedAllSelected = {}
+      seedAppending = {}
+      loadSeedSources({ quiet: true })
+    }, 300)
+  }
+
+  function handleCorpusFilterInput(event) {
+    corpusFilterQuery = String(event?.target?.value || '')
+    clearTimeout(corpusFilterDebounce)
+    corpusFilterDebounce = setTimeout(() => {
+      loadCorpus({ quiet: true })
+    }, 300)
+  }
+
+  // Unlinks the work from this corpus only — the work row and its PDF survive,
+  // so it stays reusable and can be promoted again (spec line 23).
+  async function handleRemoveCorpusWork(item) {
+    const workId = Number(item?.work_id ?? item?.id)
+    if (!Number.isFinite(workId) || workId <= 0) return
+    try {
+      await removeCorpusWork(workId)
+      corpusItems = corpusItems.filter((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
+      corpusTotal = Math.max(0, corpusTotal - 1)
+      await Promise.all([
+        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadSeedSources({ quiet: true }),
+        loadIngestStats({ quiet: true }),
+      ])
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      corpusLoadStatus = error?.message || 'Failed to remove the item from this corpus.'
+    }
+  }
+
+  // Bulk counterpart of handleRemoveCorpusWork. Same semantics: unlink from
+  // this corpus only, the works and their PDFs survive (spec line 23).
+  async function handleRemoveSelectedCorpusWorks(workIds) {
+    const ids = (Array.isArray(workIds) ? workIds : [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0)
+    if (ids.length === 0) return
+    try {
+      const result = await removeCorpusWorks(ids)
+      const removed = new Set((result?.removed_work_ids || ids).map((value) => Number(value)))
+      corpusItems = corpusItems.filter((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
+      corpusTotal = Math.max(0, corpusTotal - removed.size)
+      corpusLoadStatus = `Removed ${removed.size} item(s) from this corpus.`
+      await Promise.all([
+        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadSeedSources({ quiet: true }),
+        loadIngestStats({ quiet: true }),
+      ])
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      corpusLoadStatus = error?.message || 'Failed to remove the selected items.'
+    }
+  }
+
+  function toggleCorpusSort(column) {
+    const [currentColumn, currentDirection] = String(corpusSort || '').split(':')
+    const direction = currentColumn === column && currentDirection === 'asc' ? 'desc' : 'asc'
+    corpusSort = `${column}:${direction}`
+    loadCorpus({ quiet: true })
+  }
+
+  function corpusSortIndicator(column, sort = corpusSort) {
+    const [currentColumn, currentDirection] = String(sort || '').split(':')
+    if (currentColumn !== column) return ''
+    return currentDirection === 'asc' ? ' ▲' : ' ▼'
   }
 
   function getSeedCandidatesForSource(source) {
     return seedCandidatesBySource[seedSourceId(source)] || []
+  }
+
+  // Accessors used by the client-side sort (sortSeedCandidates), which only
+  // applies to PDF seeds — those load in full. Search seeds page server-side
+  // and sort server-side too (see toggleSeedSort / sortSeedCandidates).
+  const SEED_SORT_ACCESSORS = {
+    metadata: (candidate) => seedMetadataLabel(candidate),
+    download: (candidate) => seedDownloadLabel(candidate),
+    title: (candidate) => formatTitle(candidate),
+    authors: (candidate) => formatAuthors(candidate),
+    year: (candidate) => candidate?.year,
+    source: (candidate) => candidate?.source || '',
+    seed: (candidate) => candidate?.ingest_source || '',
+    refs: (candidate) => candidate?.refs_count,
+    cited_by: (candidate) => candidate?.cited_by_count,
+  }
+
+  // Spec line 16: show the metadata and download axes separately. The derived
+  // `state` still drives every behaviour — only the display splits.
+  const SEED_METADATA_LABELS = {
+    pending: 'Pending',
+    enriching: 'Enriching',
+    matched: 'Confirmed',
+    failed_enrichment: 'Metadata not confirmed',
+  }
+  const SEED_DOWNLOAD_LABELS = {
+    not_requested: 'Not requested',
+    queued: 'Queued',
+    in_progress: 'Downloading',
+    downloaded: 'Downloaded',
+    failed: 'Not retrievable',
+    failed_download: 'Not retrievable',
+  }
+
+  // Search candidates carry no metadata_status of their own, so the column
+  // falls back to the resolved state (what the old row tag used to say).
+  const SEED_METADATA_BY_STATE = {
+    enriched: 'Confirmed',
+    added: 'Confirmed',
+    downloaded: 'Confirmed',
+    downloaded_elsewhere: 'Confirmed',
+    queued_download: 'Confirmed',
+    failed_download: 'Confirmed',
+    queued_enrichment: 'Enriching',
+    staged_raw: 'Pending',
+    pending: 'Pending',
+  }
+
+  function seedMetadataLabel(candidate) {
+    const state = seedCandidateState(candidate)
+    if (state === 'failed_enrichment') return SEED_METADATA_LABELS.failed_enrichment
+    const raw = String(candidate?.metadata_status || '').trim().toLowerCase()
+    if (SEED_METADATA_LABELS[raw]) return SEED_METADATA_LABELS[raw]
+    if (raw) return raw.replace(/_/g, ' ')
+    return SEED_METADATA_BY_STATE[state] || '-'
+  }
+
+  function seedDownloadLabel(candidate) {
+    const state = seedCandidateState(candidate)
+    if (state === 'failed_download') return SEED_DOWNLOAD_LABELS.failed_download
+    const raw = String(candidate?.download_status || '').trim().toLowerCase()
+    if (SEED_DOWNLOAD_LABELS[raw]) return SEED_DOWNLOAD_LABELS[raw]
+    if (raw) return raw.replace(/_/g, ' ')
+    if (state === 'downloaded') return candidate?.file_available === false ? 'File missing' : 'Downloaded'
+    if (state === 'downloaded_elsewhere') return candidate?.file_available === true ? 'Downloaded' : 'Stale record'
+    if (state === 'queued_download') return SEED_DOWNLOAD_LABELS.queued
+    return '-'
+  }
+
+  function seedCellText(candidate, key) {
+    switch (key) {
+      case 'metadata': return seedMetadataLabel(candidate)
+      case 'download': return seedDownloadLabel(candidate)
+      case 'title': return formatTitle(candidate)
+      case 'authors': return formatAuthorsShort(candidate)
+      case 'year': return candidate?.year || ''
+      case 'refs': return candidate?.refs_count ?? '–'
+      case 'cited_by': return candidate?.cited_by_count ?? '–'
+      case 'source': return candidate?.source || ''
+      case 'doi': return candidate?.doi || ''
+      case 'publisher': return candidate?.publisher || ''
+      case 'type': return candidate?.type || ''
+      case 'openalex': return candidate?.openalex_id || ''
+      case 'pages': return candidate?.pages || ''
+      case 'open_access': return candidate?.open_access_url ? 'Yes' : 'No'
+      case 'file': return candidate?.file_available ? 'Yes' : 'No'
+      default: return ''
+    }
+  }
+
+  function toggleSeedSort(source, column) {
+    if (!SEED_SORT_ACCESSORS[column]) return
+    const sourceId = seedSourceId(source)
+    const current = seedSorts[sourceId]
+    const direction = current && current.column === column && current.direction === 'asc' ? 'desc' : 'asc'
+    seedSorts = { ...seedSorts, [sourceId]: { column, direction } }
+    // Search seeds sort server-side (the metadata/download axes require every
+    // row resolved, which the client only has for the loaded page) — reload
+    // page one under the new sort. PDF seeds keep the client-side sort below.
+    if (source.source_type === 'search') {
+      void loadSeedCandidatesForSource(source, { quiet: true })
+    }
+  }
+
+  // `sorts` is passed in from the template rather than read off the module
+  // binding so Svelte tracks seedSorts as a dependency of the markup.
+  function seedSortIndicator(source, column, sorts = seedSorts) {
+    const current = sorts[seedSourceId(source)]
+    if (!current || current.column !== column) return ''
+    return current.direction === 'asc' ? ' ▲' : ' ▼'
+  }
+
+  function sortSeedCandidates(source, candidates, sorts = seedSorts) {
+    // Search seeds are already sorted server-side across the full result set
+    // (see toggleSeedSort); re-sorting the loaded page client-side would only
+    // reorder what happens to be loaded, not the whole set. PDF seeds load in
+    // full, so the client-side sort below still gives a correct order.
+    if (source.source_type === 'search') return candidates
+    const current = sorts[seedSourceId(source)]
+    const accessor = current && SEED_SORT_ACCESSORS[current.column]
+    if (!accessor) return candidates
+    const factor = current.direction === 'desc' ? -1 : 1
+    return [...candidates].sort((left, right) => {
+      const a = accessor(left)
+      const b = accessor(right)
+      const aMissing = a === null || a === undefined || a === ''
+      const bMissing = b === null || b === undefined || b === ''
+      // Blanks sort last in both directions so a descending sort does not fill
+      // the top of the table with empty cells.
+      if (aMissing && bMissing) return 0
+      if (aMissing) return 1
+      if (bMissing) return -1
+      if (current.column === 'year' || current.column === 'refs' || current.column === 'cited_by') {
+        return (Number(a) - Number(b)) * factor
+      }
+      return String(a).localeCompare(String(b), undefined, { sensitivity: 'base', numeric: true }) * factor
+    })
   }
 
   function getSeedSelectionForSource(source) {
@@ -2527,18 +2988,8 @@
   }
 
   function selectedSeedCount(source) {
-    return getSeedSelectionForSource(source).length
-  }
-
-  function promotableSeedCandidateKeys(source) {
-    return getSeedCandidatesForSource(source)
-      .filter((candidate) => isSeedCandidateSelectable(candidate))
-      .map((candidate) => String(candidate?.candidate_key || ''))
-      .filter(Boolean)
-  }
-
-  function promotableSeedCount(source) {
-    return promotableSeedCandidateKeys(source).length
+    const sourceId = seedSourceId(source)
+    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).length
   }
 
   function getSelectedSeedCandidate(source) {
@@ -2556,12 +3007,26 @@
 
   function estimatedSelectableSeedCount(source) {
     const sourceId = seedSourceId(source)
-    if (Array.isArray(seedCandidatesBySource[sourceId])) {
+    const page = seedPages[sourceId]
+    const loaded = seedCandidatesBySource[sourceId]
+    const total = page ? page.total : Number(source?.candidate_count || 0)
+    // Once every row is actually loaded, count selectability exactly instead
+    // of estimating — isSeedCandidateSelectable excludes more than just
+    // in_corpus/downloaded (e.g. the includeDownstream override), so this is
+    // strictly more accurate than any formula below.
+    if (page && Array.isArray(loaded) && loaded.length >= total) {
       return selectableSeedCount(source)
     }
-    const total = Number(source?.candidate_count || 0)
-    const inCorpus = Number(source?.state_counts?.in_corpus || 0)
-    return Math.max(0, total - inCorpus)
+    // state_counts is not resolved server-side above the metadata/download
+    // sort limit (Task 5) — in that case the total is the best estimate.
+    const stateCounts = source?.state_counts
+    if (stateCounts == null) return total
+    // isSeedCandidateSelectable excludes exactly two things: already in the
+    // corpus, or state === 'downloaded' (not downloaded_elsewhere, which
+    // stays selectable) — subtract both, matching summarizeStates' key names.
+    const inCorpus = Number(stateCounts.in_corpus || 0)
+    const downloaded = Number(stateCounts.downloaded || 0)
+    return Math.max(0, total - inCorpus - downloaded)
   }
 
   function isSeedCandidateSelected(source, candidate) {
@@ -2583,7 +3048,20 @@
     const candidateKey = String(candidate?.candidate_key || '')
     if (!sourceId || !candidateKey || !isSeedCandidateSelectable(candidate)) return
     const current = seedSelections[sourceId] || []
-    seedSelections = current.includes(candidateKey)
+    const isSelected = current.includes(candidateKey)
+    if (isSelected && seedAllSelected[sourceId]) {
+      // Deselecting one row out of "all N selected" drops into explicit mode:
+      // everything else that's loaded stays selected, just not this row.
+      seedAllSelected = { ...seedAllSelected, [sourceId]: false }
+      const loadedSelectableKeys = getSeedCandidatesForSource(source)
+        .filter((entry) => isSeedCandidateSelectable(entry))
+        .map((entry) => String(entry?.candidate_key || ''))
+        .filter(Boolean)
+      seedSelections = { ...seedSelections, [sourceId]: loadedSelectableKeys.filter((key) => key !== candidateKey) }
+      seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+      return
+    }
+    seedSelections = isSelected
       ? { ...seedSelections, [sourceId]: current.filter((value) => value !== candidateKey) }
       : { ...seedSelections, [sourceId]: [...current, candidateKey] }
     seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
@@ -2593,6 +3071,7 @@
     const sourceId = seedSourceId(source)
     if (!sourceId) return
     seedSelections = { ...seedSelections, [sourceId]: [] }
+    seedAllSelected = { ...seedAllSelected, [sourceId]: false }
     seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
   }
 
@@ -2608,23 +3087,37 @@
   }
 
   async function setAllSeedCandidatesSelected(source, checked) {
-    if (checked) {
-      const sourceId = seedSourceId(source)
-      if (!sourceId) return
-      if (!Array.isArray(seedCandidatesBySource[sourceId]) || seedCandidatesBySource[sourceId].length === 0) {
-        await loadSeedCandidatesForSource(source, { quiet: true })
-      }
-      selectAllSeedCandidates(source)
+    if (!checked) {
+      clearSeedSelection(source)
       return
     }
-    clearSeedSelection(source)
+    const sourceId = seedSourceId(source)
+    if (!sourceId) return
+    // Search seeds can hold far more items than are loaded — "select all"
+    // there means every promotable/dismissable item server-side, tracked by
+    // seedAllSelected rather than by materializing every candidate key.
+    if (source.source_type === 'search') {
+      seedAllSelected = { ...seedAllSelected, [sourceId]: true }
+    }
+    if (!Array.isArray(seedCandidatesBySource[sourceId]) || seedCandidatesBySource[sourceId].length === 0) {
+      await loadSeedCandidatesForSource(source, { quiet: true })
+    }
+    selectAllSeedCandidates(source)
   }
+
+  // Monotonic request tokens: the 2s live poll can have several seed-list
+  // requests in flight at once, and an older, slower response overwriting a
+  // newer one used to resurrect stale run status and lose a just-started run.
+  let seedSourcesRequestToken = 0
 
   async function loadSeedSources({ quiet = false } = {}) {
     if (!quiet) seedSourcesStatus = 'Loading seeds...'
+    const token = ++seedSourcesRequestToken
     try {
-      const payload = await fetchSeedSources(100)
+      const payload = await fetchSeedSources(100, { q: seedFilterQuery })
+      if (token !== seedSourcesRequestToken) return
       seedSources = payload.sources || []
+      reconcileStartedSearchRuns(seedSources)
       const validSourceIds = new Set(seedSources.map((source) => seedSourceId(source)))
       if (expandedSeedSourceId && !validSourceIds.has(expandedSeedSourceId)) {
         expandedSeedSourceId = ''
@@ -2637,9 +3130,13 @@
           ? `Loaded ${seedSources.length} seed${seedSources.length === 1 ? '' : 's'}.`
           : 'No seeds yet.'
       }
+      // Only re-pull the expanded seed's rows while something is actually
+      // filling in. The workspace polls the (cheap) seed list continuously,
+      // but an idle expanded seed has nothing new to show, and re-requesting
+      // it every cycle made the backend re-resolve the whole seed forever.
       if (expandedSeedSourceId) {
         const expandedSource = seedSources.find((source) => seedSourceId(source) === expandedSeedSourceId)
-        if (expandedSource) {
+        if (expandedSource && (anySearchRunning || expandedSource?.run?.status === 'running')) {
           await loadSeedCandidatesForSource(expandedSource, { quiet: true, background: true })
         }
       }
@@ -2649,24 +3146,83 @@
         setAuthToken('')
         return
       }
+      if (token !== seedSourcesRequestToken) return
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
   }
 
-  async function loadSeedCandidatesForSource(source, { quiet = false, background = false } = {}) {
+  function runSubtitle(source) {
+    const run = source?.run
+    if (!run || !run.status || run.status === 'done') return ''
+    const fetched = Number(run.fetched_count || 0).toLocaleString('en-US')
+    const expected = run.expected_count === null || run.expected_count === undefined ? '…' : Number(run.expected_count).toLocaleString('en-US')
+    if (run.status === 'running') return `fetching ${fetched} of ${expected}`
+    if (run.status === 'failed') return `stopped after ${fetched} of ${expected}: ${run.error || 'unknown error'}`
+    if (run.status === 'cancelled') return `cancelled at ${fetched} of ${expected}`
+    return ''
+  }
+
+  async function handleCancelSearch(source) {
+    try {
+      await cancelKeywordSearch(source.source_key)
+      seedSourcesStatus = 'Cancelling search…'
+      await loadSeedSources({ quiet: true })
+    } catch (error) {
+      seedSourcesStatus = error?.message || 'Could not cancel the search.'
+    }
+  }
+
+  // Per-seed request tokens, same reason as seedSourcesRequestToken: a
+  // background reload racing a user-driven "Show more" must not win.
+  const seedCandidatesRequestTokens = new Map()
+
+  async function loadSeedCandidatesForSource(source, { quiet = false, background = false, append = false } = {}) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
+    const token = (seedCandidatesRequestTokens.get(sourceId) || 0) + 1
+    seedCandidatesRequestTokens.set(sourceId, token)
     const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
     const showLoadingState = !background || !hasCachedCandidates
     if (showLoadingState) {
       seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: true }
     }
     try {
-      const payload = await fetchSeedCandidates(source.source_type, source.source_key)
-      const nextCandidates = payload.candidates || []
+      const currentlyLoaded = seedCandidatesBySource[sourceId] || []
+      const offset = append ? currentlyLoaded.length : 0
+      // A background (non-append) reload — e.g. loadSeedSources polling the
+      // expanded seed — must not silently drop pages the user already
+      // fetched via "Show more": re-request at least as much as is currently
+      // loaded (the backend clamps to 2000 regardless).
+      const limit = background && !append ? Math.max(SEED_PAGE_SIZE, currentlyLoaded.length) : SEED_PAGE_SIZE
+      const payload = await fetchSeedCandidates(source.source_type, source.source_key, {
+        q: seedFilterQuery, limit, offset, ...seedSortParams(source),
+        // A background poll never reads source_summary; skipping its state
+        // counts saves a full-seed resolution per poll.
+        lightSummary: background,
+      })
+      if (token !== seedCandidatesRequestTokens.get(sourceId)) return
+      const incoming = payload.candidates || []
+      // A run still filling in shifts rows down under `sr.id DESC`, so the
+      // page at offset=loaded.length can overlap what is already on screen.
+      // Appending it blind produced duplicate keys (and duplicate rows).
+      let nextCandidates = incoming
+      if (append) {
+        const known = new Set(currentlyLoaded.map((c) => String(c?.candidate_key || '')).filter(Boolean))
+        const fresh = incoming.filter((candidate) => {
+          const key = String(candidate?.candidate_key || '')
+          if (!key || known.has(key)) return false
+          known.add(key)
+          return true
+        })
+        nextCandidates = [...currentlyLoaded, ...fresh]
+      }
       seedCandidatesBySource = {
         ...seedCandidatesBySource,
         [sourceId]: nextCandidates,
+      }
+      seedPages = {
+        ...seedPages,
+        [sourceId]: { total: Number(payload.total || nextCandidates.length), offset, limit: Number(payload.limit || limit) },
       }
       reconcileSeedSourceCandidates(sourceId, nextCandidates)
       if (nextCandidates.length === 0) {
@@ -2690,13 +3246,36 @@
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
-      } else if (!quiet) {
+      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId)) {
         seedActionStatus = error?.message || 'Failed to load seed candidates.'
       }
     } finally {
       if (showLoadingState) {
         seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: false }
       }
+    }
+  }
+
+  // background:true means loadSeedCandidatesForSource does not toggle
+  // seedCandidatesLoading when candidates are already cached (it only shows
+  // that spinner state on a cold load), so the footer button needs its own
+  // in-flight flag — otherwise a double-click fires two appends at the same
+  // offset, producing duplicate candidate_key rows in the keyed {#each} and
+  // a Svelte "keys must be unique" crash.
+  async function loadMoreSeedCandidates(source) {
+    const sourceId = seedSourceId(source)
+    if (!sourceId || seedAppending[sourceId]) return
+    seedAppending = { ...seedAppending, [sourceId]: true }
+    try {
+      await loadSeedCandidatesForSource(source, { quiet: true, background: true, append: true })
+      if (seedAllSelected[sourceId]) {
+        // Keep "all N selected" visually consistent: newly appended rows
+        // should render checked too, not just the rows that were loaded
+        // when the checkbox was first ticked.
+        selectAllSeedCandidates(source)
+      }
+    } finally {
+      seedAppending = { ...seedAppending, [sourceId]: false }
     }
   }
 
@@ -2715,6 +3294,18 @@
     })
   }
 
+  function jumpToSection(id) {
+    const el = document.getElementById(id)
+    if (!el) return
+    const behavior = prefersReducedMotion ? 'auto' : 'smooth'
+    el.scrollIntoView({ behavior, block: 'start' })
+  }
+
+  function collapseExpandedSeed() {
+    expandedSeedSourceId = ''
+    jumpToSection('section-seed')
+  }
+
   async function focusSeedSource(sourceType, sourceKey) {
     const nextSourceId = `${sourceType}:${sourceKey}`
     if (!seedSources.some((source) => seedSourceId(source) === nextSourceId)) {
@@ -2731,9 +3322,11 @@
     })
   }
 
-  async function handlePromoteSeedSource(source) {
+  // Shared promote path for the selection-scoped bulk button and the per-row
+  // inline promote. Both must honour the same Promotion Settings, so the
+  // expansion block lives here rather than being duplicated per caller.
+  async function promoteSeedCandidateKeys(source, candidateKeys, { clearSelection = false } = {}) {
     const sourceId = seedSourceId(source)
-    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
     if (candidateKeys.length === 0) {
       seedActionStatus = 'Select at least one seed candidate to promote.'
       return
@@ -2748,11 +3341,13 @@
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        relatedSort,
+        promotionMode,
         enqueueDownload: true,
         downloadBatchSize: Math.max(25, candidateKeys.length),
         workers: 6,
       })
-      clearSeedSelection(source)
+      if (clearSelection) clearSeedSelection(source)
       const refreshTasks = [
         loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
@@ -2779,9 +3374,30 @@
       seedActionStatus = error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
+      loadOpenAlexQuota()
     }
   }
 
+  async function handlePromoteSeedSource(source) {
+    const sourceId = seedSourceId(source)
+    if (seedAllSelected[sourceId]) {
+      await handlePromoteWholeSeedSource(source)
+      return
+    }
+    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    await promoteSeedCandidateKeys(source, candidateKeys, { clearSelection: true })
+  }
+
+  async function handlePromoteSingleSeedCandidate(source, candidate) {
+    const candidateKey = String(candidate?.candidate_key || '')
+    if (!candidateKey) return
+    await promoteSeedCandidateKeys(source, [candidateKey])
+  }
+
+  // Sends no candidateKeys: the backend resolves "every promotable item in
+  // this source" itself, so this is correct even when only one page of a
+  // large search seed is loaded client-side — exactly the semantics
+  // "all N items selected" needs (handlePromoteSeedSource delegates here).
   async function handlePromoteWholeSeedSource(source) {
     seedActionBusy = true
     try {
@@ -2789,20 +3405,21 @@
       if (!Array.isArray(seedCandidatesBySource[sourceId])) {
         await loadSeedCandidatesForSource(source, { quiet: true })
       }
-      const candidateKeys = promotableSeedCandidateKeys(source)
-      const candidateCount = candidateKeys.length
+      const candidateCount = estimatedSelectableSeedCount(source)
       if (candidateCount === 0) {
         seedActionStatus = 'No promotable seed candidates remain in this source.'
         return
       }
-      seedActionStatus = `Promoting ${candidateCount} candidate(s) into the corpus...`
+      seedActionStatus = `Promoting ${candidateCount.toLocaleString('en-US')} candidate(s) into the corpus...`
       await promoteSeedCandidates(source.source_type, source.source_key, {
-        candidateKeys,
+        q: seedFilterQuery,
         includeDownstream,
         includeUpstream,
         relatedDepthDownstream,
         relatedDepthUpstream,
         maxRelated,
+        relatedSort,
+        promotionMode,
         enqueueDownload: true,
         downloadBatchSize: Math.max(25, candidateCount),
         workers: 6,
@@ -2824,30 +3441,44 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
-      seedActionStatus = `Promoted ${candidateCount} candidate(s). Corpus updated; workers continue in the background.`
+      seedActionStatus = `Promoted ${candidateCount.toLocaleString('en-US')} candidate(s). Corpus updated; workers continue in the background.`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
         return
       }
-      seedActionStatus = error?.message || 'Failed to promote seed candidates.'
+      // estimatedSelectableSeedCount is just that — an estimate. When it
+      // undercounts already-excluded items (e.g. state_counts unresolved
+      // above the summarization limit) the backend can still come back with
+      // "nothing left to promote"; surface the friendly message rather than
+      // the raw 400 body.
+      seedActionStatus = String(error?.message || '').includes('No selectable seed candidates found for promotion')
+        ? 'No promotable seed candidates remain in this source.'
+        : error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
+      loadOpenAlexQuota()
     }
   }
 
   async function handleDismissSelectedSeed(source) {
     const sourceId = seedSourceId(source)
+    const allSelected = Boolean(seedAllSelected[sourceId])
     const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
-    if (candidateKeys.length === 0) {
+    if (!allSelected && candidateKeys.length === 0) {
       seedActionStatus = 'Select at least one seed candidate to dismiss.'
       return
     }
+    const dismissLabel = allSelected ? `all ${seedPage(source).total.toLocaleString('en-US')}` : String(candidateKeys.length)
     seedActionBusy = true
-    seedActionStatus = `Removing ${candidateKeys.length} candidate(s) from Seed...`
+    seedActionStatus = `Removing ${dismissLabel} candidate(s) from Seed...`
     try {
-      await dismissSeedCandidatesApi(source.source_type, source.source_key, candidateKeys)
+      if (allSelected) {
+        await dismissSeedCandidatesApi(source.source_type, source.source_key, [], { all: true, q: seedFilterQuery })
+      } else {
+        await dismissSeedCandidatesApi(source.source_type, source.source_key, candidateKeys)
+      }
       clearSeedSelection(source)
       await Promise.all([
         loadIngestStats({ quiet: true }),
@@ -2856,7 +3487,7 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
-      seedActionStatus = `Removed ${candidateKeys.length} candidate(s) from Seed.`
+      seedActionStatus = `Removed ${dismissLabel} candidate(s) from Seed.`
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -2896,40 +3527,101 @@
     }
   }
 
+  function buildSearchBody(maxResults) {
+    return {
+      query: searchQuery, seedJson: '', field: searchField, author: searchAuthor, yearFrom, yearTo,
+      maxResults: Math.max(0, Math.trunc(Number(maxResults) || 0)), sort: searchSort,
+      includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
+      maxRelated: 30, fallbackToSample: false,
+    }
+  }
+
+  // Measured wall-clock cost of one OpenAlex page in this pipeline. The
+  // configured RPS is a *ceiling* for parallel callers; keyword paging is
+  // strictly sequential (each request needs the previous page's cursor), so
+  // dividing by RPS understated a large fetch by more than an order of
+  // magnitude. 1.1s/request is the observed round trip including rate-limit
+  // sleep and the per-page DB write.
+  const SEARCH_SECONDS_PER_REQUEST = 1.1
+  // 90 minutes: past this an answer in minutes stops being readable.
+  const SEARCH_HOURS_CUTOFF_SECONDS = 5400
+
+  // `quota` is a parameter rather than a read of the module-level
+  // `openalexQuota` so the {@const} in the warning markup re-runs when the
+  // quota arrives (Svelte only tracks what the template expression names).
+  function searchEstimate(count, quota) {
+    const requests = Math.ceil(count / 200)
+    const seconds = requests * SEARCH_SECONDS_PER_REQUEST
+    const duration = seconds >= SEARCH_HOURS_CUTOFF_SECONDS
+      ? `roughly ${(seconds / 3600).toFixed(1)} hours`
+      : `roughly ${(seconds / 60).toFixed(1)} minutes`
+    const remaining = Number(quota?.remaining)
+    const limit = Number(quota?.limit)
+    // Only a fresh, live quota reading may drive copy and a Cap button; a
+    // stale snapshot would cap against yesterday's leftovers.
+    const budgetKnown = Boolean(quota?.available) && !quota?.stale && Number.isFinite(remaining)
+    const overBudget = budgetKnown && requests > remaining
+    return {
+      requests,
+      duration,
+      remaining: budgetKnown ? remaining : null,
+      budgetSentence: overBudget
+        ? `That is more than today's remaining OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${Number.isFinite(limit) ? limit.toLocaleString('en-US') : 'unknown'} requests left.`
+        : '',
+      canCapAtBudget: overBudget && remaining > 0,
+    }
+  }
+
+  // Submit: ask for the count first; warn above the threshold, else start.
   async function runSearch() {
-    searchStatus = 'Searching...'
+    searchWarning = false
+    searchStatus = 'Checking how many works match...'
+    searchPreviewBusy = true
     try {
-      const { data, source, expansion, runId } = await runKeywordSearch({
-        query: searchQuery,
-        seedJson: '',
-        field: searchField,
-        author: searchAuthor,
-        yearFrom,
-        yearTo,
-        maxResults: Math.max(0, Math.trunc(Number(searchMaxResults) || 0)),
-        sort: searchSort,
-        includeDownstream: false,
-        includeUpstream: false,
-        relatedDepthDownstream: 0,
-        relatedDepthUpstream: 0,
-        maxRelated: 30,
-        fallbackToSample: false,
-      })
-      searchResults = data
+      searchPreview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
+    } catch (error) {
+      // A failed preview must not block the search.
+      searchPreview = null
+    } finally {
+      searchPreviewBusy = false
+    }
+    const cap = Math.max(0, Math.trunc(Number(searchMaxResults) || 0))
+    if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
+      searchWarning = true
+      searchStatus = ''
+      return
+    }
+    await startSearch()
+  }
+
+  async function startSearch({ maxResultsOverride = null } = {}) {
+    searchWarning = false
+    if (maxResultsOverride !== null) searchMaxResults = maxResultsOverride
+    searchStatus = 'Starting search...'
+    try {
+      const { data, source, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
       searchSource = source
+      loadOpenAlexQuota()
+      if (runId && running) {
+        // Start polling on the 202 itself; the seed list may not report this
+        // run for another poll or two (or at all, if registration lagged).
+        startedSearchRunIds = new Set([...startedSearchRunIds, Number(runId)])
+      }
+      if (runId) {
+        await loadSeedSources({ quiet: true })
+        await focusSeedSource('search', runId)
+      }
+      if (running) {
+        searchStatus = 'Fetching in the background. The seed below fills in as pages arrive.'
+        return
+      }
+      searchResults = data
       initializeSearchQueueConfig(data)
       searchQueueStatus = ''
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
-      if (runId) {
-        await loadSeedSources()
-        await focusSeedSource('search', runId)
-      }
       searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
       searchStatus = error?.message || 'Search failed.'
     }
   }
@@ -3105,6 +3797,8 @@
     searchSelection = []
     searchQueueConfigs = {}
     searchQueueStatus = ''
+    searchPreview = null
+    searchWarning = false
   }
 
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
@@ -3132,7 +3826,12 @@
           : quiet && preserveSelection
             ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
             : CORPUS_PAGE_SIZE
-      const { data, total, source, stageTotals } = await fetchCorpus({ limit: requestedLimit, offset })
+      const { data, total, source, stageTotals } = await fetchCorpus({
+        limit: requestedLimit,
+        offset,
+        q: corpusFilterQuery,
+        sort: corpusSort,
+      })
       const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       const currentCorpusNumeric = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
       if (requestSeq !== corpusLoadRequestSeq || requestCorpusId !== currentCorpusNumeric) {
@@ -3156,8 +3855,8 @@
       } else {
         if (!quiet) {
           corpusLoadStatus = corpusHasMore
-            ? `Loaded ${corpusItems.length} of ${corpusTotal} entries. Scroll to load more.`
-            : `Loaded ${corpusItems.length} entries.`
+            ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
+            : `Showing ${corpusItems.length} entries.`
         }
       }
       if (scrollSnapshot) {
@@ -3423,6 +4122,85 @@
         return
       }
       corpusLoadStatus = error?.message || 'Failed to download file.'
+    }
+  }
+
+  async function loadAppSettings() {
+    if (!isAdmin) return
+    try {
+      const payload = await fetchAppSettings()
+      appSettings = payload?.settings || null
+      // Secrets are never returned, so their draft fields start blank and a
+      // blank field means "leave unchanged" on save.
+      appSettingsDraft = {
+        openalex_api_key: '',
+        openai_api_key: '',
+        gemini_api_key: '',
+        openalex_rps: appSettings?.openalex_rps?.value || '',
+        search_warn_threshold: appSettings?.search_warn_threshold?.value || '',
+        llm_provider: appSettings?.llm_provider?.value || '',
+        openai_base_url: appSettings?.openai_base_url?.value || '',
+        extract_model: appSettings?.extract_model?.value || '',
+        openai_model: appSettings?.openai_model?.value || '',
+        gemini_model: appSettings?.gemini_model?.value || '',
+      }
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      appSettingsStatus = error?.message || 'Failed to load settings.'
+      appSettingsError = true
+    }
+  }
+
+  async function handleSaveAppSettings() {
+    const payload = { ...appSettingsDraft }
+    // A blank secret means "keep what is stored", so omit it entirely rather
+    // than sending '' — which the API treats as "clear this override".
+    for (const key of ['openalex_api_key', 'openai_api_key', 'gemini_api_key']) {
+      if (!String(payload[key] || '').trim()) delete payload[key]
+    }
+    try {
+      appSettingsError = false
+      appSettingsStatus = 'Saving...'
+      await saveAppSettings(payload)
+      appSettingsStatus = 'Settings saved. New values apply to the next pipeline run.'
+      await loadAppSettings()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      appSettingsStatus = error?.message || 'Failed to save settings.'
+      appSettingsError = true
+    }
+  }
+
+  async function handleDownloadSeedDocument(ingestSource) {
+    const sourceKey = String(ingestSource || '').trim()
+    if (!sourceKey) return
+    let objectUrl = ''
+    try {
+      const { blob, filename } = await fetchSeedSourceDocument(sourceKey)
+      objectUrl = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+    } catch (error) {
+      if (error?.status === 401) {
+        authStatus = 'unauthenticated'
+        setAuthToken('')
+        return
+      }
+      ingestRunsStatus = error?.message || 'Failed to download the seed document.'
+    } finally {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }
 
@@ -3787,6 +4565,10 @@
         clearInterval(liveRefreshIntervalId)
         liveRefreshIntervalId = null
       }
+      if (searchRefreshIntervalId) {
+        clearInterval(searchRefreshIntervalId)
+        searchRefreshIntervalId = null
+      }
       if (promotionFlushTimer) {
         clearTimeout(promotionFlushTimer)
         promotionFlushTimer = null
@@ -3940,13 +4722,29 @@
             {/each}
           </div>
         {/each}
+        {#if activeTab === 'workspace'}
+          <nav class="nav-group workspace-sticky-bar" aria-label="Workspace sections" data-testid="workspace-sticky-bar">
+            <span class="nav-group-title">Sections</span>
+            <div class="workspace-sticky-bar__links">
+              <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-find')}>1 Find items</button>
+              <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-seed')}>2 Seed <span class="muted small">({seedSources.length})</span></button>
+              <button type="button" class="workspace-sticky-bar__link" on:click={() => jumpToSection('section-corpus')}>3 Corpus <span class="muted small">({corpusTotal})</span></button>
+            </div>
+            <div class="workspace-sticky-bar__actions">
+              {#if expandedSeedSourceId}
+                <button type="button" class="secondary" on:click={collapseExpandedSeed}>Collapse seed</button>
+              {/if}
+              <button type="button" class="secondary" on:click={() => jumpToSection('section-find')}>Top</button>
+            </div>
+          </nav>
+        {/if}
       </aside>
     {/if}
 
     <section class="content">
       {#if activeTab === 'workspace'}
         <div class="seed-corpus-workspace">
-        <div class="card seed-corpus-toolbar">
+        <div class="card seed-corpus-toolbar" id="section-find">
           <div class="seed-corpus-toolbar__header">
             <div class="seed-corpus-toolbar__intro">
               <h2 class="workspace-section-title">1. Find items</h2>
@@ -3999,17 +4797,22 @@
 	                <div class="document-run-list">
 	                  <div class="document-run-list__header">
 	                    <span class="muted small">Extracted seed documents</span>
+	                    {#if ingestRunsStatus}
+	                      <span class="muted small" role="status">{ingestRunsStatus}</span>
+	                    {/if}
 	                  </div>
 	                  {#each recentDocumentRuns as run}
 	                    <button
 	                      class="document-run"
 	                      type="button"
-	                      title={`Bibliographic metadata extracted from this PDF. ${formatSeedDocumentDetails({
+	                      title={`${run.source_pdf ? 'Click to download the original seed document. ' : ''}Bibliographic metadata extracted from this PDF. ${formatSeedDocumentDetails({
 	                        authors: run.seed_authors,
 	                        source: run.seed_source,
 	                        publisher: run.seed_publisher,
 	                      }) || (run.source_pdf || '')}`.trim()}
-	                      on:click={() => focusSeedSource('pdf', run.ingest_source)}
+	                      on:click={() => (run.source_pdf
+	                        ? handleDownloadSeedDocument(run.ingest_source)
+	                        : focusSeedSource('pdf', run.ingest_source))}
 	                    >
 	                      <span class="truncate-line">
 	                        {formatSeedDocumentLabel(
@@ -4049,7 +4852,14 @@
             </div>
 
             <div class="seed-intake-card seed-intake-card--search">
-              <h3>Keyword search <span class="muted small keyword-search-note">Queries run against the OpenAlex scholarly index.</span></h3>
+              <div class="seed-intake-card__header">
+                <h3>Keyword search <span class="muted small keyword-search-note">Queries run against the OpenAlex scholarly index.</span></h3>
+                <span
+                  class={`openalex-quota-pill openalex-quota-pill--${openalexQuotaView.tone}`}
+                  data-testid="openalex-quota"
+                  title="Daily OpenAlex API budget as reported by the last request"
+                >{openalexQuotaView.text}</span>
+              </div>
               <form class="seed-search-form" on:submit|preventDefault={runSearch}>
                 <div class="seed-search-row">
                   <label class="seed-search-main">
@@ -4099,13 +4909,31 @@
                       <option value="oldest">Oldest</option>
                     </select>
                   </label>
-                  <div class="seed-search-actions">
-                    <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
-                    <button class="primary" type="submit">Search</button>
+                  <div class="seed-search-footer">
+                    <p class="muted">{searchStatus}</p>
+                    {#if searchPreview && !searchWarning}
+                      <p class="muted small search-preview" data-testid="search-preview">About {searchPreview.count.toLocaleString('en-US')} works match</p>
+                    {/if}
+                    {#if searchWarning && searchPreview}
+                      {@const est = searchEstimate(searchPreview.count, openalexQuota)}
+                      <div class="search-warning" role="alert" data-testid="search-warning">
+                        <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests and {est.duration}.{#if est.budgetSentence} {est.budgetSentence}{/if} Narrow the query, or:</p>
+                        <div class="search-warning__actions">
+                          <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: Math.floor(searchPreview.threshold / 10) })}>Cap at {Math.floor(searchPreview.threshold / 10).toLocaleString('en-US')}</button>
+                          {#if est.canCapAtBudget}
+                            <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.remaining * 200 })}>Cap at budget</button>
+                          {/if}
+                          <button class="primary" type="button" on:click={() => startSearch()}>Fetch all {searchPreview.count.toLocaleString('en-US')}</button>
+                        </div>
+                      </div>
+                    {/if}
+                    <div class="seed-search-actions">
+                      <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
+                      <button class="primary" type="submit" disabled={searchPreviewBusy}>Search</button>
+                    </div>
                   </div>
                 </div>
               </form>
-              <p class="muted">{searchStatus}</p>
             </div>
           </div>
 
@@ -4113,7 +4941,7 @@
 
         <div class="seed-corpus-columns">
           <div class="seed-corpus-column seed-corpus-column--seed">
-        <div class="card seed-sources-panel" data-testid="seed-panel">
+        <div class="card seed-sources-panel" id="section-seed" data-testid="seed-panel">
           <div class="workspace-panel-header">
             <div class="workspace-panel-title">
               <h3 class="workspace-section-title">2. Seed <span class="muted small">({seedSources.length})</span></h3>
@@ -4124,6 +4952,20 @@
                 <span class="muted">{seedSourcesStatus}</span>
               {/if}
             </div>
+          </div>
+
+          <div class="table-filter">
+            <input
+              type="search"
+              class="table-filter__input"
+              placeholder="Filter by title, author or publication"
+              aria-label="Filter seed items by title, author or publication"
+              value={seedFilterQuery}
+              on:input={handleSeedFilterInput}
+            />
+            {#if seedFilterQuery}
+              <span class="muted small">Seeds without a match are hidden.</span>
+            {/if}
           </div>
 
           <div class="seed-expansion-row seed-expansion-row--panel">
@@ -4152,6 +4994,24 @@
               <span class="muted small">Max Related / Paper</span>
               <input type="number" min="1" max="100" bind:value={maxRelated} class="short-input" />
             </div>
+            <div class="seed-expansion-pill" class:opacity-50={!expansionEnabled}>
+              <span class="muted small" title="Which related papers survive the Max Related cap">Related papers</span>
+              <select bind:value={relatedSort} disabled={!expansionEnabled}>
+                <option value="most_cited">Most cited</option>
+                <option value="newest">Newest</option>
+              </select>
+            </div>
+            <div class="seed-expansion-divider"></div>
+            <div class="seed-expansion-pill" class:opacity-50={!expansionEnabled}>
+              <span
+                class="muted small"
+                title="New seed: related works land in Seed for review. Download everything: they go straight into the corpus."
+              >Expansion</span>
+              <select bind:value={promotionMode} disabled={!expansionEnabled}>
+                <option value="new_seed">Make new seed (review first)</option>
+                <option value="download_all">Download everything</option>
+              </select>
+            </div>
           </div>
 
           {#if seedSources.length === 0}
@@ -4161,7 +5021,7 @@
               {#each seedSources as source (seedSourceId(source))}
                 {@const sourceId = seedSourceId(source)}
                 {@const isExpanded = expandedSeedSourceId === sourceId}
-                {@const sourceCandidates = getSeedCandidatesForSource(source)}
+                {@const sourceCandidates = sortSeedCandidates(source, getSeedCandidatesForSource(source), seedSorts)}
                 {@const selectionVersion = seedSelectionVersions[sourceId] || 0}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
@@ -4200,10 +5060,26 @@
                             />
                           </label>
                         {/key}
-                        <span class={`tag ${source.source_type === 'pdf' ? 'pending' : 'queued'}`}>{source.source_type === 'pdf' ? 'Document items' : 'Search items'}</span>
+                        {#if source.seed_kind === 'snowball'}
+                          <span
+                            class="tag snowball"
+                            title={`${source.snowball?.direction === 'upstream' ? 'Upstream' : 'Downstream'} of «${source.snowball?.of_title || 'untitled work'}»`}
+                          >Snowball items</span>
+                        {:else if source.source_type === 'pdf'}
+                          <span class="tag pending">Document items</span>
+                        {:else}
+                          <span class="tag queued">Search items</span>
+                        {/if}
                         <strong>{source.label}</strong>
                       </div>
-                      {#if source.subtitle}
+                      {#if runSubtitle(source)}
+                        <span class={`muted small seed-run-status seed-run-status--${source.run.status}`} data-testid="seed-run-status">
+                          {runSubtitle(source)}
+                          {#if source.run.status === 'running'}
+                            · <button type="button" class="link" on:click|stopPropagation={() => handleCancelSearch(source)}>cancel</button>
+                          {/if}
+                        </span>
+                      {:else if source.subtitle}
                         <span class="muted small">{source.subtitle}</span>
                       {/if}
                     </div>
@@ -4234,14 +5110,14 @@
                       {/key}
                       <div class="pill-row">
                         <span class="pill" title="Total items found in this seed">{source.candidate_count} items</span>
-                        {#if source.candidate_count - (source.state_counts.in_corpus || 0) > 0}
-                          <span class="pill" title="Not yet promoted or dismissed — your decision pending">To review: {source.candidate_count - (source.state_counts.in_corpus || 0)}</span>
+                        {#if source.candidate_count - (source.state_counts?.in_corpus || 0) > 0}
+                          <span class="pill" title="Not yet promoted or dismissed — your decision pending">To review: {source.candidate_count - (source.state_counts?.in_corpus || 0)}</span>
                         {/if}
-                        {#if source.state_counts.in_corpus}
+                        {#if source.state_counts?.in_corpus}
                           <span class="pill" title="Already a member of this corpus — expand for each item's stage">In corpus: {source.state_counts.in_corpus}</span>
                         {/if}
-                        {#if source.state_counts.downloaded_elsewhere_available}
-                          <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF reusable: {source.state_counts.downloaded_elsewhere_available}</span>
+                        {#if source.state_counts?.downloaded_elsewhere_available}
+                          <span class="pill" title="Same work downloaded by another corpus and the file is present — promoting reuses it">PDF downloaded: {source.state_counts.downloaded_elsewhere_available}</span>
                         {/if}
                       </div>
                       <span class={`disclosure-chevron ${isExpanded ? 'open' : ''}`} aria-hidden="true">▸</span>
@@ -4250,11 +5126,18 @@
 
                   {#if isExpanded}
                       <div class="seed-source__body">
-                        {#key `${sourceId}:toolbar:${selectionVersion}`}
+                        {#key `${sourceId}:toolbar:${selectionVersion}:${downstreamPromotesAll}`}
                           <div class="table-toolbar">
                             <div class="table-toolbar-left">
-                              <span class="muted">Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable</span>
-                              <button class="secondary" type="button" on:click={() => selectAllSeedCandidates(source)} disabled={seedActionBusy}>Select all</button>
+                              <span class="muted">
+                                {#if seedAllSelected[sourceId]}
+                                  All {seedPage(source).total.toLocaleString('en-US')} items selected
+                                {:else}
+                                  Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable
+                                {/if}
+                              </span>
+                              <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
+                              <button class="secondary" type="button" on:click={() => setAllSeedCandidatesSelected(source, true)} disabled={seedActionBusy}>Select all</button>
                               <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
                             </div>
                             <div class="table-toolbar-right">
@@ -4264,9 +5147,6 @@
                                 </button>
                                 <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
                                   Promote to Corpus
-                                </button>
-                                <button class="danger" type="button" on:click={() => handleRemoveSeedSource(source)} disabled={seedActionBusy}>
-                                  Remove source
                                 </button>
                               </div>
                             </div>
@@ -4278,24 +5158,36 @@
                         {:else if sourceCandidates.length === 0}
                           <p class="muted">No active items remain in this seed.</p>
                         {:else}
-                          {#key `${sourceId}:selection:${selectionVersion}`}
+                          {#key `${sourceId}:selection:${selectionVersion}:${downstreamPromotesAll}`}
                             <div class="table table-scroll seed-candidate-table">
-                              <div class="table-row header cols-7">
-                                <span class="ingest-select-cell">State</span>
-                                <span>Title</span>
-                                <span>Authors</span>
-                                <span>Year</span>
-                                <span>Source</span>
-                                <span>DOI</span>
-                                <span aria-hidden="true"></span>
+                              <div class="table-row header" style={seedGridStyle}>
+                                <span class="ingest-select-cell" aria-hidden="true"></span>
+                                {#each seedActiveColumns as column (column.key)}
+                                  {@const sortDisabled = (column.key === 'metadata' || column.key === 'download') && source.source_type === 'search' && seedPage(source).total > 2000}
+                                  <span title={column.hint || ''}>
+                                    {#if column.sortable}
+                                      <button
+                                        class="table-sort"
+                                        type="button"
+                                        disabled={sortDisabled}
+                                        title={sortDisabled ? 'Sorting by state needs every item resolved; not available above 2,000 items' : ''}
+                                        on:click={() => toggleSeedSort(source, column.key)}
+                                      >
+                                        {column.label}{seedSortIndicator(source, column.key, seedSorts)}
+                                      </button>
+                                    {:else}
+                                      {column.label}
+                                    {/if}
+                                  </span>
+                                {/each}
                               </div>
                               {#each sourceCandidates as candidate (candidate.candidate_key)}
                                 {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
                                 {@const candidateKey = String(candidate?.candidate_key || '')}
                                 {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
-                                {@const candidateTag = seedCandidateTag(candidate)}
                                 <div
-                                  class={`table-row cols-7 clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                  class={`table-row clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                  style={seedGridStyle}
                                   on:click={(e) => {
                                     if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
                                     setSelectedSeedCandidate(source, candidate);
@@ -4312,7 +5204,7 @@
                                   tabindex="0"
                                 >
                                   <span class="ingest-select-cell">
-                                    {#if isSeedCandidateSelectable(candidate)}
+                                    {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
                                       <input
                                         type="checkbox"
                                         checked={isSeedCandidateSelected(source, candidate)}
@@ -4325,34 +5217,38 @@
                                     {:else}
                                       <input type="checkbox" disabled />
                                     {/if}
-                                    {#if canDownloadSeedCandidate(candidate)}
-	                                      <button
-	                                        class={`tag ${candidateTag.className} ingest-state-tag seed-download-tag`}
-	                                        type="button"
-	                                        title={`Download available file from work ${candidate.downloaded_work_id}`}
-	                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
-	                                      >
-	                                        {candidateTag.label}
-	                                      </button>
-	                                    {:else}
-	                                      <span
-	                                        class={`tag ${candidateTag.className} ingest-state-tag`}
-	                                        title={candidateTag.hint || (candidate?.downloaded_work_id ? `Matched work ${candidate.downloaded_work_id}` : '')}
-	                                      >
-	                                        {candidateTag.label}
-	                                      </span>
-	                                    {/if}
                                   </span>
-                                  <span>{formatTitle(candidate)}</span>
-                                  <span>{formatAuthors(candidate)}</span>
-                                  <span>{candidate.year || ''}</span>
-                                  <span>{candidate.source || candidate.publisher || ''}</span>
-                                  <span>{candidate.doi || ''}</span>
-                                  <span class="seed-candidate__corpus-cell">
-                                    {#if isSeedCandidateInCorpus(candidate)}
-                                      <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                  {#each seedActiveColumns as column (column.key)}
+                                    {#if column.key === 'corpus'}
+                                      <span class="seed-candidate__corpus-cell">
+                                        {#if isSeedCandidateInCorpus(candidate)}
+                                          <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                        {:else if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
+                                          <button
+                                            class="seed-candidate__promote"
+                                            type="button"
+                                            title="Promote this item to the corpus using the current Promotion Settings"
+                                            aria-label={`Promote ${formatTitle(candidate)} to corpus`}
+                                            disabled={seedActionBusy}
+                                            on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                          >→ Promote</button>
+                                        {/if}
+                                      </span>
+                                    {:else if column.key === 'download' && canDownloadSeedCandidate(candidate)}
+                                      <span>
+                                        <button
+                                          class="link seed-download-link"
+                                          type="button"
+                                          title={`Download the file from work ${candidate.downloaded_work_id}`}
+                                          on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
+                                        >{seedCellText(candidate, column.key)} ⤓</button>
+                                      </span>
+                                    {:else if column.key === 'authors'}
+                                      <span title={formatAuthors(candidate)}>{seedCellText(candidate, column.key)}</span>
+                                    {:else}
+                                      <span title={seedCellText(candidate, column.key)}>{seedCellText(candidate, column.key)}</span>
                                     {/if}
-                                  </span>
+                                  {/each}
                                 </div>
                                 {#if active}
                                   <div class="seed-inline-detail-row">
@@ -4381,6 +5277,12 @@
                                 {/if}
                               {/each}
                             </div>
+                            {#if seedPage(source).total > sourceCandidates.length}
+                              <div class="seed-table-footer">
+                                <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {seedPage(source).total.toLocaleString('en-US')}</span>
+                                <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId] || seedAppending[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
+                              </div>
+                            {/if}
                           {/key}
                         {/if}
                       </div>
@@ -4392,7 +5294,7 @@
         </div>
           </div>
 
-          <div class="seed-corpus-column seed-corpus-column--corpus">
+          <div class="seed-corpus-column seed-corpus-column--corpus" id="section-corpus">
             <div class="corpus-workspace-shell">
               <Corpus
                 {corpusSource}
@@ -4405,6 +5307,14 @@
                 {failedDownloadTotal}
                 {bucketLabel}
                 {formatAuthors}
+                {formatAuthorsShort}
+                {corpusFilterQuery}
+                {handleCorpusFilterInput}
+                {handleRemoveCorpusWork}
+                {handleRemoveSelectedCorpusWorks}
+                {toggleCorpusSort}
+                {corpusSortIndicator}
+                {corpusSort}
                 {doiHref}
                 {openAlexHref}
                 {handleDownloadedCorpusFile}
@@ -4476,6 +5386,12 @@
           {inviteStatus}
           {inviteError}
           {handleCreateInvitation}
+          {appSettings}
+          {appSettingsStatus}
+          {appSettingsError}
+          bind:appSettingsDraft={appSettingsDraft}
+          {handleSaveAppSettings}
+          openalexQuotaText={openalexQuotaView.text}
         />
       {/if}
 
@@ -5080,7 +5996,7 @@
       {/if}
 
       {#if activeTab === 'graph'}
-        <ThreeGraph />
+        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} />
       {/if}
     </section>
   </div>

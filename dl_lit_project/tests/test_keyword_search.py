@@ -170,6 +170,48 @@ def test_search_openalex_rejects_unknown_sort():
         keyword_search.search_openalex("foo", sort="banana")
 
 
+def test_search_select_includes_reference_counts(monkeypatch):
+    captured = {}
+
+    def fake_request(endpoint, params, rate_limiter, retries=3):
+        captured.update(params)
+        return {"results": [], "meta": {"next_cursor": None}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake_request)
+    keyword_search.search_openalex(query="labour", max_results=5)
+    select_fields = captured["select"].split(",")
+    assert "referenced_works_count" in select_fields
+    assert "cited_by_count" in select_fields
+
+
+def test_search_openalex_reports_each_page(monkeypatch):
+    pages = [
+        {"results": [{"id": "W1"}, {"id": "W2"}], "meta": {"count": 3, "next_cursor": "c2"}},
+        {"results": [{"id": "W2"}, {"id": "W3"}], "meta": {"count": 3, "next_cursor": None}},
+    ]
+    calls = iter(pages)
+    monkeypatch.setattr(keyword_search, "_openalex_request", lambda endpoint, params, rl, retries=3: next(calls))
+    seen = []
+    out = keyword_search.search_openalex(query="x", max_results=None, on_page=lambda items, meta: seen.append(([i["id"] for i in items], meta["count"])))
+    assert [i["id"] for i in out] == ["W1", "W2", "W3"]
+    # The duplicate W2 on page two is not reported twice.
+    assert seen == [(["W1", "W2"], 3), (["W3"], 3)]
+
+
+def test_count_openalex_uses_per_page_one(monkeypatch):
+    captured = {}
+
+    def fake(endpoint, params, rl, retries=3):
+        captured.update(params)
+        return {"results": [], "meta": {"count": 342118}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake)
+    assert keyword_search.count_openalex(query="labour") == 342118
+    assert captured["per-page"] == 1
+    assert captured["select"] == "id"
+    assert "cursor" not in captured
+
+
 def test_effective_max_results():
     assert keyword_search.effective_max_results(0) is None
     assert keyword_search.effective_max_results(-5) is None
