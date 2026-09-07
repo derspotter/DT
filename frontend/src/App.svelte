@@ -53,6 +53,7 @@
     createCorpusItemDownloadUrl,
     fetchOpenAlexQuota,
     previewKeywordSearch,
+    fetchTopicSuggestions,
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
@@ -328,6 +329,17 @@
   let searchPreview = null
   let searchWarning = false
   let searchPreviewBusy = false
+  // Topic field (OpenAlex topics, ~4,500 of them). A topic-only run is a pure
+  // filter listing and costs 1 credit a page instead of 10 for text search.
+  let searchTopics = []
+  let topicQuery = ''
+  let topicSuggestions = []
+  let topicActiveIndex = -1
+  let topicLookupToken = 0
+  let topicDebounce = null
+  $: topicOnlySearch = searchTopics.length > 0 && !String(searchQuery || '').trim()
+  // relevance needs search text; OpenAlex rejects it for a filter-only listing.
+  $: if (topicOnlySearch && searchSort === 'relevance') searchSort = 'cited_by_count'
   let searchSelection = []
   let searchQueueConfigs = {}
   let searchQueueStatus = ''
@@ -390,9 +402,9 @@
     if (hasReset && Number.isFinite(resetIn) && resetIn <= 0) {
       // The daily reset happened after the last OpenAlex request, so the
       // counts in the snapshot are pre-reset. The next request refreshes them.
-      return { text: `OpenAlex budget: reset since the last request · ${limit.toLocaleString('en-US')} per day`, tone: 'muted' }
+      return { text: `OpenAlex budget: reset since the last request · ${limit.toLocaleString('en-US')} credits per day`, tone: 'muted' }
     }
-    const counts = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} left`
+    const counts = `OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${limit.toLocaleString('en-US')} credits left`
     const base = Number.isFinite(resetIn) ? `${counts} · resets in ${formatResetIn(resetIn)}` : counts
     if (quota.stale) {
       const seen = quota.observed_at ? new Date(quota.observed_at).toLocaleString('en-US') : 'unknown'
@@ -3548,6 +3560,7 @@
   function buildSearchBody(maxResults) {
     return {
       query: searchQuery, seedJson: '', field: searchField, author: searchAuthor, yearFrom, yearTo,
+      topics: searchTopics.map(({ id, label }) => ({ id, label })),
       maxResults: Math.max(0, Math.trunc(Number(maxResults) || 0)), sort: searchSort,
       includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
       maxRelated: 30, fallbackToSample: false,
@@ -3567,8 +3580,17 @@
   // `quota` is a parameter rather than a read of the module-level
   // `openalexQuota` so the {@const} in the warning markup re-runs when the
   // quota arrives (Svelte only tracks what the template expression names).
-  function searchEstimate(count, quota) {
+  // OpenAlex charges a list request with search text 10 credits and a pure
+  // filter listing (topics, years, author) 1, whatever the page size.
+  function creditsPerPageFor(preview) {
+    const fromServer = Number(preview?.creditsPerPage)
+    if (Number.isFinite(fromServer) && fromServer > 0) return fromServer
+    return String(searchQuery || '').trim() ? 10 : 1
+  }
+
+  function searchEstimate(count, quota, creditsPerPage = 10) {
     const requests = Math.ceil(count / 200)
+    const credits = requests * creditsPerPage
     const seconds = requests * SEARCH_SECONDS_PER_REQUEST
     const duration = seconds >= SEARCH_HOURS_CUTOFF_SECONDS
       ? `roughly ${(seconds / 3600).toFixed(1)} hours`
@@ -3578,16 +3600,95 @@
     // Only a fresh, live quota reading may drive copy and a Cap button; a
     // stale snapshot would cap against yesterday's leftovers.
     const budgetKnown = Boolean(quota?.available) && !quota?.stale && Number.isFinite(remaining)
-    const overBudget = budgetKnown && requests > remaining
+    const overBudget = budgetKnown && credits > remaining
+    // Pages the remaining credits still pay for, times 200 works a page.
+    const capAtBudget = budgetKnown ? Math.floor(remaining / creditsPerPage) * 200 : 0
     return {
       requests,
+      credits,
+      creditsPerPage,
       duration,
       remaining: budgetKnown ? remaining : null,
+      capAtBudget,
       budgetSentence: overBudget
-        ? `That is more than today's remaining OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${Number.isFinite(limit) ? limit.toLocaleString('en-US') : 'unknown'} requests left.`
+        ? `That is more than today's remaining OpenAlex budget: ${remaining.toLocaleString('en-US')} of ${Number.isFinite(limit) ? limit.toLocaleString('en-US') : 'unknown'} credits left.`
         : '',
-      canCapAtBudget: overBudget && remaining > 0,
+      canCapAtBudget: overBudget && capAtBudget > 0,
     }
+  }
+
+  // --- Topic field -------------------------------------------------------
+  function handleTopicInput(event) {
+    topicQuery = String(event?.target?.value || '')
+    clearTimeout(topicDebounce)
+    const q = topicQuery.trim()
+    if (q.length < 2) {
+      topicSuggestions = []
+      topicActiveIndex = -1
+      return
+    }
+    topicDebounce = setTimeout(async () => {
+      const token = ++topicLookupToken
+      try {
+        const found = await fetchTopicSuggestions(q)
+        if (token !== topicLookupToken) return
+        const chosen = new Set(searchTopics.map((t) => t.id))
+        topicSuggestions = found.filter((t) => !chosen.has(t.id)).slice(0, 8)
+        topicActiveIndex = topicSuggestions.length > 0 ? 0 : -1
+      } catch (error) {
+        if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
+        if (token === topicLookupToken) topicSuggestions = []
+      }
+    }, 250)
+  }
+
+  function addTopic(topic) {
+    if (!topic?.id || searchTopics.some((t) => t.id === topic.id)) return
+    searchTopics = [...searchTopics, { id: topic.id, label: topic.label, hint: topic.hint || '', works_count: topic.works_count ?? null }]
+    topicQuery = ''
+    topicSuggestions = []
+    topicActiveIndex = -1
+    searchPreview = null
+    searchWarning = false
+  }
+
+  function removeTopic(id) {
+    searchTopics = searchTopics.filter((t) => t.id !== id)
+    searchPreview = null
+    searchWarning = false
+  }
+
+  function closeTopicSuggestions() {
+    topicSuggestions = []
+    topicActiveIndex = -1
+  }
+
+  function handleTopicKeydown(event) {
+    if (event.key === 'ArrowDown' && topicSuggestions.length > 0) {
+      event.preventDefault()
+      topicActiveIndex = (topicActiveIndex + 1) % topicSuggestions.length
+    } else if (event.key === 'ArrowUp' && topicSuggestions.length > 0) {
+      event.preventDefault()
+      topicActiveIndex = (topicActiveIndex - 1 + topicSuggestions.length) % topicSuggestions.length
+    } else if (event.key === 'Enter') {
+      // Enter picks a suggestion instead of submitting the form while the
+      // picker is open; with nothing to pick it submits as usual.
+      if (topicSuggestions.length > 0) {
+        event.preventDefault()
+        addTopic(topicSuggestions[Math.max(0, topicActiveIndex)])
+      }
+    } else if (event.key === 'Escape' && topicSuggestions.length > 0) {
+      event.preventDefault()
+      closeTopicSuggestions()
+    } else if (event.key === 'Backspace' && !topicQuery && searchTopics.length > 0) {
+      removeTopic(searchTopics[searchTopics.length - 1].id)
+    }
+  }
+
+  function formatWorksCount(n) {
+    const value = Number(n)
+    if (!Number.isFinite(value)) return ''
+    return `${value.toLocaleString('en-US')} works`
   }
 
   // Submit: ask for the count first; warn above the threshold, else start.
@@ -3810,6 +3911,9 @@
     yearTo = ''
     searchMaxResults = ''
     searchSort = 'relevance'
+    searchTopics = []
+    topicQuery = ''
+    closeTopicSuggestions()
     searchStatus = ''
     searchSource = ''
     searchSelection = []
@@ -4894,6 +4998,43 @@
                       bind:value={searchQuery}
                     />
                   </label>
+                  <div class="seed-search-topic" data-testid="topic-field">
+                    <span id="topic-field-label">Topic <span class="muted small">— OpenAlex topics; alone they cost 1 credit per 200 works, text search costs 10</span></span>
+                    <div class="topic-picker">
+                      {#each searchTopics as topic (topic.id)}
+                        <span class="topic-chip" data-testid="topic-chip" title={topic.hint}>
+                          <span class="topic-chip__label">{topic.label}</span>
+                          {#if topic.works_count !== null}<span class="topic-chip__count">{formatWorksCount(topic.works_count)}</span>{/if}
+                          <button type="button" class="topic-chip__remove" aria-label={`Remove topic ${topic.label}`} on:click={() => removeTopic(topic.id)}>×</button>
+                        </span>
+                      {/each}
+                      <input
+                        type="text"
+                        role="combobox"
+                        aria-labelledby="topic-field-label"
+                        aria-autocomplete="list"
+                        aria-expanded={topicSuggestions.length > 0}
+                        aria-controls="topic-suggestions"
+                        placeholder={searchTopics.length > 0 ? 'Add another topic' : 'Labor market dynamics and wage inequality'}
+                        value={topicQuery}
+                        on:input={handleTopicInput}
+                        on:keydown={handleTopicKeydown}
+                        on:blur={() => setTimeout(closeTopicSuggestions, 150)}
+                      />
+                      {#if topicSuggestions.length > 0}
+                        <ul class="topic-suggestions" id="topic-suggestions" role="listbox" aria-label="Matching topics">
+                          {#each topicSuggestions as suggestion, index (suggestion.id)}
+                            <li role="option" aria-selected={index === topicActiveIndex}>
+                              <button type="button" class:active={index === topicActiveIndex} on:mousedown|preventDefault on:click={() => addTopic(suggestion)}>
+                                <span class="topic-suggestion__title"><strong>{suggestion.label}</strong> <span class="muted small">{formatWorksCount(suggestion.works_count)}</span></span>
+                                {#if suggestion.hint}<span class="muted small topic-suggestion__hint">{suggestion.hint}</span>{/if}
+                              </button>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                    </div>
+                  </div>
                   <label>
                     <span>Field</span>
                     <select bind:value={searchField}>
@@ -4927,7 +5068,7 @@
                   <label>
                     <span>Sort</span>
                     <select bind:value={searchSort}>
-                      <option value="relevance">Relevance (default)</option>
+                      {#if !topicOnlySearch}<option value="relevance">Relevance (default)</option>{/if}
                       <option value="cited_by_count">Most cited</option>
                       <option value="newest">Newest</option>
                       <option value="oldest">Oldest</option>
@@ -4936,16 +5077,16 @@
                   <div class="seed-search-footer">
                     <p class="muted">{searchStatus}</p>
                     {#if searchPreview && !searchWarning}
-                      <p class="muted small search-preview" data-testid="search-preview">About {searchPreview.count.toLocaleString('en-US')} works match</p>
+                      <p class="muted small search-preview" data-testid="search-preview">About {searchPreview.count.toLocaleString('en-US')} works match · {creditsPerPageFor(searchPreview)} {creditsPerPageFor(searchPreview) === 1 ? 'credit' : 'credits'} per page of 200</p>
                     {/if}
                     {#if searchWarning && searchPreview}
-                      {@const est = searchEstimate(searchPreview.count, openalexQuota)}
+                      {@const est = searchEstimate(searchPreview.count, openalexQuota, creditsPerPageFor(searchPreview))}
                       <div class="search-warning" role="alert" data-testid="search-warning">
-                        <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests and {est.duration}.{#if est.budgetSentence} {est.budgetSentence}{/if} Narrow the query, or:</p>
+                        <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests ({est.credits.toLocaleString('en-US')} credits) and {est.duration}.{#if est.budgetSentence} {est.budgetSentence}{/if} Narrow the query, or:</p>
                         <div class="search-warning__actions">
                           <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: Math.floor(searchPreview.threshold / 10) })}>Cap at {Math.floor(searchPreview.threshold / 10).toLocaleString('en-US')}</button>
                           {#if est.canCapAtBudget}
-                            <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.remaining * 200 })}>Cap at budget</button>
+                            <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.capAtBudget })}>Cap at budget</button>
                           {/if}
                           <button class="primary" type="button" on:click={() => startSearch()}>Fetch all {searchPreview.count.toLocaleString('en-US')}</button>
                         </div>
