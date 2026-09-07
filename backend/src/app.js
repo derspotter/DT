@@ -2035,14 +2035,61 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
 // Shared by /api/keyword-search and /api/keyword-search/preview: validates
 // the request body and builds the keyword_search.py argv. `error` is set
 // (and `args` unusable) when a required filter is missing.
-function buildKeywordSearchArgs(req) {
+const TOPIC_ID_RE = /^T\d+$/;
+const MAX_TOPICS_PER_SEARCH = 50; // OpenAlex caps an OR filter at 50 values
+
+// Topics arrive from the UI as [{ id, label }] (or bare ids / OpenAlex URLs).
+// Reduce them to validated bare ids plus one label per id, in order, deduped.
+export function parseTopicSelection(raw) {
+  const ids = [];
+  const labels = [];
+  if (!Array.isArray(raw)) return { ids, labels };
+  for (const entry of raw) {
+    const idValue = typeof entry === 'string' ? entry : entry?.id;
+    if (typeof idValue !== 'string') continue;
+    const id = idValue.trim().replace(/\/+$/, '').split('/').pop().toUpperCase();
+    if (!TOPIC_ID_RE.test(id) || ids.includes(id)) continue;
+    const label = typeof entry === 'object' && entry !== null && typeof entry.label === 'string' && entry.label.trim()
+      ? entry.label.trim().slice(0, 200)
+      : id;
+    ids.push(id);
+    labels.push(label);
+    if (ids.length >= MAX_TOPICS_PER_SEARCH) break;
+  }
+  return { ids, labels };
+}
+
+// Shape of the OpenAlex /autocomplete/topics payload the UI needs.
+export function normalizeTopicSuggestions(payload) {
+  const out = [];
+  for (const item of Array.isArray(payload?.results) ? payload.results : []) {
+    const id = String(item?.id || '').split('/').pop().toUpperCase();
+    if (!TOPIC_ID_RE.test(id)) continue;
+    out.push({
+      id,
+      label: String(item?.display_name || id),
+      hint: typeof item?.hint === 'string' ? item.hint : '',
+      works_count: Number.isFinite(Number(item?.works_count)) ? Number(item.works_count) : null,
+    });
+  }
+  return out;
+}
+
+// Mirrors search_credits_per_page in dl_lit: text search 10 credits a page,
+// pure filter listing 1 (measured against the live API, 2026-09-07).
+function searchCreditsPerPage(query) {
+  return String(query || '').trim() ? 10 : 1;
+}
+
+export function buildKeywordSearchArgs(req) {
   const query = req.body?.query?.trim();
   const seedJson = req.body?.seedJson;
   const author = req.body?.author?.trim() || '';
   const yearFrom = coerceInt(req.body?.yearFrom, null);
   const yearTo = coerceInt(req.body?.yearTo, null);
-  if (!query && !seedJson && !author && !yearFrom && !yearTo) {
-    return { error: 'query, seedJson, author, or year filter is required' };
+  const topics = parseTopicSelection(req.body?.topics);
+  if (!query && !seedJson && !author && !yearFrom && !yearTo && topics.ids.length === 0) {
+    return { error: 'query, seedJson, topics, author, or year filter is required' };
   }
 
   const field = req.body?.field || 'default';
@@ -2076,6 +2123,10 @@ function buildKeywordSearchArgs(req) {
     args.push('--query', query || '');
   }
   if (author) args.push('--author', author);
+  if (topics.ids.length > 0) {
+    args.push('--topics', topics.ids.join(','));
+    args.push('--topic-labels', JSON.stringify(topics.labels));
+  }
   if (yearFrom) args.push('--year-from', String(yearFrom));
   if (yearTo) args.push('--year-to', String(yearTo));
   if (mailto) args.push('--mailto', String(mailto));
@@ -4949,12 +5000,17 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const built = buildKeywordSearchArgs(req);
     if (built.error) return res.status(400).json({ error: built.error });
     const threshold = searchWarnThreshold();
+    const creditsPerPage = searchCreditsPerPage(req.body?.query);
     if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ count: STUB_RESULTS.keywordResults.length, threshold });
+      return res.json({ count: STUB_RESULTS.keywordResults.length, threshold, creditsPerPage });
     }
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, [...built.args, '--count-only'], { dbPath: DB_PATH, corpusId: req.corpusId });
-      return res.json({ count: Number(payload?.count || 0), threshold });
+      return res.json({
+        count: Number(payload?.count || 0),
+        threshold,
+        creditsPerPage: Number(payload?.credits_per_page) > 0 ? Number(payload.credits_per_page) : creditsPerPage,
+      });
     } catch (error) {
       console.error('[/api/keyword-search/preview] Error:', error);
       return res.status(502).json({ error: error.message || 'Preview failed' });
@@ -5659,6 +5715,37 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   app.get('/api/openalex/quota', requireAuthMiddleware, (req, res) => {
     return res.json(readOpenAlexQuota());
+  });
+
+  // Type-ahead for the Topic field. OpenAlex autocomplete costs no credits,
+  // so this can fire per keystroke (the UI debounces anyway). The key and
+  // mailto go along so the request is attributed like every other one.
+  app.get('/api/openalex/topics', requireAuthMiddleware, async (req, res) => {
+    const q = String(req.query?.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'q is required' });
+    const settings = appSettingsEnv();
+    const params = new URLSearchParams({ q: q.slice(0, 200) });
+    const apiKey = settings.OPENALEX_API_KEY || process.env.OPENALEX_API_KEY || process.env.RAG_FEEDER_OPENALEX_API_KEY;
+    if (apiKey) params.set('api_key', apiKey);
+    const mailto = process.env.OPENALEX_MAILTO || process.env.RAG_FEEDER_OPENALEX_MAILTO;
+    if (mailto) params.set('mailto', mailto);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      let upstream;
+      try {
+        upstream = await fetch(`https://api.openalex.org/autocomplete/topics?${params.toString()}`, {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!upstream.ok) return res.status(502).json({ error: `OpenAlex answered ${upstream.status}` });
+      return res.json({ topics: normalizeTopicSuggestions(await upstream.json()) });
+    } catch (error) {
+      return res.status(502).json({ error: error?.message || 'Topic lookup failed' });
+    }
   });
 
   app.get('/api/recursion-config', requireAuthMiddleware, (req, res) => {
