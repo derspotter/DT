@@ -373,6 +373,7 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)")
 
         try:
             has_search_results = cursor.execute(
@@ -2575,29 +2576,42 @@ class DatabaseManager:
         return rows
 
     def add_search_results(self, search_run_id: int, results: list[dict]) -> int:
-        """Insert search results for a run. Returns number of inserted rows."""
+        """Insert search results for a run. Returns the number of rows actually inserted.
+
+        A row whose openalex_id is already stored for this run is skipped, so the
+        store carries the per-run dedupe and callers need not keep a seen-set in
+        memory. Rows without an openalex_id are always inserted.
+        """
         if not results:
             return 0
         cursor = self.conn.cursor()
         rows = []
         for result in results:
+            openalex_id = result.get('openalex_id')
             rows.append(
                 (
                     search_run_id,
-                    result.get('openalex_id'),
+                    openalex_id,
                     result.get('doi'),
                     result.get('title'),
                     result.get('year'),
                     json.dumps(result.get('raw_json')) if result.get('raw_json') is not None else None,
+                    search_run_id,
+                    openalex_id,
                 )
             )
         cursor.executemany(
             """INSERT INTO search_results (search_run_id, openalex_id, doi, title, year, raw_json)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               SELECT ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM search_results
+                     WHERE search_run_id = ? AND openalex_id = ? AND openalex_id IS NOT NULL
+                )""",
             rows,
         )
+        inserted = cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else len(rows)
         self.conn.commit()
-        return len(rows)
+        return int(inserted)
 
     def get_all_downloaded_works_as_dicts(self) -> list[dict]:
         """Fetch downloaded works as dictionaries using the canonical works table."""

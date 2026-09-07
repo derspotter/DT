@@ -277,12 +277,16 @@ def search_openalex(query: str,
         page_items = []
         for item in data.get("results", []):
             item_id = item.get("id")
-            if not item_id or item_id in seen_ids:
+            if not item_id:
                 continue
-            seen_ids.add(item_id)
-            fetched += 1
             if accumulate:
+                # Only the in-memory result list needs an in-memory dedupe; a
+                # streaming consumer dedupes in its store, so no set grows here.
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
                 results.append(item)
+            fetched += 1
             page_items.append(item)
             if max_results is not None and fetched >= max_results:
                 break

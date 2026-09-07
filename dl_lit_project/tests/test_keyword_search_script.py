@@ -290,3 +290,50 @@ def test_zero_result_run_records_expected_count_zero(monkeypatch, tmp_path, caps
     row = db.conn.execute("SELECT status, fetched_count, expected_count FROM search_runs WHERE id = ?", (run_id,)).fetchone()
     assert tuple(row) == ("done", 0, 0)
     db.close_connection()
+
+
+def test_repeated_ids_across_pages_count_once_without_seen_set(monkeypatch, tmp_path, capsys):
+    """The store dedupes per run; the script keeps no in-memory seen-set."""
+    mod = _load(monkeypatch)
+    pages = [
+        [{"id": "https://openalex.org/W1", "display_name": "one"}, {"id": "https://openalex.org/W2", "display_name": "two"}],
+        [{"id": "https://openalex.org/W2", "display_name": "two"}, {"id": "https://openalex.org/W3", "display_name": "three"}],
+    ]
+
+    def fake_search(**kwargs):
+        for page in pages:
+            kwargs["on_page"](page, {"count": 3})
+        return []
+
+    monkeypatch.setattr(mod, "search_openalex", fake_search)
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--corpus-id", "1"])
+    mod.main()
+    events = _events(capsys)
+    progress = [(e["fetched"], e["expected"]) for e in events if e.get("event") == "progress"]
+    assert progress == [(2, 3), (3, 3)]
+    assert events[-1]["fetched_count"] == 3
+
+    from dl_lit.db_manager import DatabaseManager
+    db = DatabaseManager(db_path=tmp_path / "t.db")
+    assert db.count_search_results(events[0]["runId"]) == 3
+    db.close_connection()
+
+
+def test_search_openalex_streaming_passes_duplicates_to_the_store(monkeypatch):
+    """With accumulate=False the paginator keeps no seen-set; the callback's store dedupes."""
+    from dl_lit import keyword_search as ks
+
+    responses = [
+        {"results": [{"id": "W1"}, {"id": "W2"}], "meta": {"count": 3, "next_cursor": "c2"}},
+        {"results": [{"id": "W2"}, {"id": "W3"}], "meta": {"count": 3, "next_cursor": None}},
+    ]
+    calls = iter(responses)
+    monkeypatch.setattr(ks, "_openalex_request", lambda *a, **k: next(calls))
+    pages = []
+    ks.search_openalex("q", max_results=None, on_page=lambda items, meta: pages.append([i["id"] for i in items]),
+                       accumulate=False)
+    assert pages == [["W1", "W2"], ["W2", "W3"]]
+
+    calls = iter(responses)
+    kept = ks.search_openalex("q", max_results=None, on_page=lambda items, meta: None, accumulate=True)
+    assert [i["id"] for i in kept] == ["W1", "W2", "W3"]

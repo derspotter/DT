@@ -41,3 +41,20 @@ def test_count_search_results(tmp_path):
     db.add_search_results(run_id, [{"openalex_id": "W1", "title": "a"}, {"openalex_id": "W2", "title": "b"}])
     assert db.count_search_results(run_id) == 2
     db.close_connection()
+
+
+def test_add_search_results_dedupes_per_run_and_reports_inserted(tmp_path):
+    db = _db(tmp_path)
+    run_a = db.create_search_run(query="a")
+    run_b = db.create_search_run(query="b")
+    assert db.add_search_results(run_a, [{"openalex_id": "W1", "title": "a"}, {"openalex_id": "W2", "title": "b"}]) == 2
+    # A later page repeating W2 (and a new W3) inserts only W3.
+    assert db.add_search_results(run_a, [{"openalex_id": "W2", "title": "b"}, {"openalex_id": "W3", "title": "c"}]) == 1
+    # Duplicates inside one batch collapse too.
+    assert db.add_search_results(run_a, [{"openalex_id": "W4", "title": "d"}, {"openalex_id": "W4", "title": "d"}]) == 1
+    # Rows without an openalex_id are always kept; the same id in another run is independent.
+    assert db.add_search_results(run_a, [{"openalex_id": None, "title": "x"}, {"openalex_id": None, "title": "x"}]) == 2
+    assert db.add_search_results(run_b, [{"openalex_id": "W1", "title": "a"}]) == 1
+    assert db.count_search_results(run_a) == 6
+    assert db.count_search_results(run_b) == 1
+    db.close_connection()

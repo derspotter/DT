@@ -751,24 +751,18 @@ def main():
         run_id = db.create_search_run(query=run_query_label, filters=filters, status='running')
         _emit({'event': 'run_created', 'runId': run_id})
 
-        state = {'fetched': 0, 'expected': None, 'seen': set()}
+        state = {'fetched': 0, 'expected': None}
 
         def persist(items, meta):
+            # Per-run dedupe lives in the store (add_search_results skips ids
+            # already inserted for this run), so memory stays flat on big runs.
             records = [openalex_result_to_record(item, run_id=run_id) for item in _dedupe_openalex_items(items)]
-            fresh = []
-            for r in records:
-                key = r.get('openalex_id') or r.get('doi') or r.get('title')
-                if not key or key in state['seen']:
-                    continue
-                state['seen'].add(key)
-                fresh.append(r)
-            if fresh:
-                db.add_search_results(run_id, [
-                    {'openalex_id': r.get('openalex_id'), 'doi': r.get('doi'), 'title': r.get('title'),
-                     'year': r.get('year'), 'raw_json': r.get('openalex_json')}
-                    for r in fresh
-                ])
-            state['fetched'] += len(fresh)
+            inserted = db.add_search_results(run_id, [
+                {'openalex_id': r.get('openalex_id'), 'doi': r.get('doi'), 'title': r.get('title'),
+                 'year': r.get('year'), 'raw_json': r.get('openalex_json')}
+                for r in records
+            ]) if records else 0
+            state['fetched'] += int(inserted or 0)
             if state['expected'] is None and meta and meta.get('count') is not None:
                 cap = effective_max_results(args.max_results)
                 state['expected'] = min(int(meta['count']), cap) if cap else int(meta['count'])
