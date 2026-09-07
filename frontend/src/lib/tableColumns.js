@@ -59,8 +59,13 @@ export function loadVisibility(table) {
     const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object') return defaults
     // Merge onto defaults so a column added in a later release shows up
-    // instead of being silently hidden by a stale stored object.
-    const merged = { ...defaults, ...parsed }
+    // instead of being silently hidden by a stale stored object. Only keys
+    // that are columns of this table survive: a stale or foreign key must not
+    // count as "a visible column" below, nor leak into the picker's state.
+    const merged = {}
+    for (const key of Object.keys(defaults)) {
+      merged[key] = key in parsed ? Boolean(parsed[key]) : defaults[key]
+    }
     // toggle() refuses to hide the last column, but a corrupted or hand-edited
     // stored value can still be all-false, which renders a table with no
     // headers and no way back. Fall back to the defaults in that case.

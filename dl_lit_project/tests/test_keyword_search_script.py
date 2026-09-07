@@ -337,3 +337,19 @@ def test_search_openalex_streaming_passes_duplicates_to_the_store(monkeypatch):
     calls = iter(responses)
     kept = ks.search_openalex("q", max_results=None, on_page=lambda items, meta: None, accumulate=True)
     assert [i["id"] for i in kept] == ["W1", "W2", "W3"]
+
+
+def test_search_openalex_capped_streaming_run_does_not_spend_cap_on_duplicates(monkeypatch):
+    from dl_lit import keyword_search as ks
+
+    responses = [
+        {"results": [{"id": "W1"}, {"id": "W2"}], "meta": {"count": 4, "next_cursor": "c2"}},
+        {"results": [{"id": "W2"}, {"id": "W3"}], "meta": {"count": 4, "next_cursor": "c3"}},
+        {"results": [{"id": "W4"}], "meta": {"count": 4, "next_cursor": None}},
+    ]
+    calls = iter(responses)
+    monkeypatch.setattr(ks, "_openalex_request", lambda *a, **k: next(calls))
+    pages = []
+    ks.search_openalex("q", max_results=3, on_page=lambda items, meta: pages.append([i["id"] for i in items]),
+                       accumulate=False)
+    assert [i for p in pages for i in p] == ["W1", "W2", "W3"]

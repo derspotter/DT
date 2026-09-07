@@ -271,6 +271,7 @@ def search_openalex(query: str,
     seen_ids: set[str] = set()
     fetched = 0
     first_page = True
+    track_seen = accumulate or max_results is not None
 
     while True:
         data = _openalex_request('works', params, rate_limiter)
@@ -279,12 +280,14 @@ def search_openalex(query: str,
             item_id = item.get("id")
             if not item_id:
                 continue
-            if accumulate:
-                # Only the in-memory result list needs an in-memory dedupe; a
-                # streaming consumer dedupes in its store, so no set grows here.
+            if track_seen:
+                # Needed when results are kept in memory, and when a cap applies
+                # (a duplicate must not consume a slot of max_results). An
+                # unbounded streaming run keeps no set: its store dedupes.
                 if item_id in seen_ids:
                     continue
                 seen_ids.add(item_id)
+            if accumulate:
                 results.append(item)
             fetched += 1
             page_items.append(item)

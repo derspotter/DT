@@ -13,7 +13,7 @@
     const next = { ...visibility, [key]: !visibility[key] }
     // Never let the user hide every column — an empty table has no affordance
     // to get back, and the picker itself would be the only thing left.
-    if (!Object.values(next).some(Boolean)) return
+    if (!defs.some((def) => next[def.key])) return
     onChange(next)
   }
 
