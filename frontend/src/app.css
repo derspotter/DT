@@ -4379,20 +4379,27 @@ button.danger:disabled {
   min-width: 0;
 }
 
+/* Sized and drawn like the native Query input above it: the browser paints
+   that input's 2px inset border as a thin 1px line, so a 1px solid border
+   plus 1px of padding gives the same 24px box and the same look. */
 .topic-picker {
   position: relative;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 4px 6px;
-  border: 1px solid var(--stroke);
-  border-radius: var(--radius-md);
+  gap: 3px;
+  box-sizing: border-box;
+  min-height: 24px;
+  padding: 1px 3px;
+  border: 1px solid rgb(118, 118, 118);
+  border-radius: 2px;
   background: white;
 }
 
 .topic-picker:focus-within {
-  border-color: var(--accent, #b18553);
+  outline: 2px solid -webkit-focus-ring-color;
+  outline: 2px solid Highlight;
+  outline-offset: -2px;
 }
 
 .topic-picker input {
@@ -4400,19 +4407,21 @@ button.danger:disabled {
   min-width: 120px;
   border: none;
   outline: none;
-  padding: 6px 4px;
+  padding: 1px 2px;
+  font-size: 13.3333px;
   background: transparent;
 }
 
 .topic-chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 4px 3px 10px;
+  gap: 4px;
+  padding: 0 2px 0 8px;
+  line-height: 16px;
   border-radius: 999px;
   background: var(--bg-alt, #f3efe8);
   border: 1px solid var(--stroke);
-  font-size: 0.85rem;
+  font-size: 0.75rem;
   max-width: 100%;
 }
 
@@ -4434,9 +4443,9 @@ button.danger:disabled {
   background: transparent;
   cursor: pointer;
   line-height: 1;
-  padding: 2px 6px;
+  padding: 0 5px;
   border-radius: 999px;
-  font-size: 1rem;
+  font-size: 0.9rem;
 }
 
 .topic-chip__remove:hover {
