@@ -30,6 +30,11 @@ const dumpFile = process.env.ARG_DUMP_FILE
 if (dumpFile) {
   fs.writeFileSync(dumpFile, JSON.stringify(process.argv.slice(2)))
 }
+if (process.env.FAKE_PYTHON_FAIL === 'openalex-rate-limit') {
+  console.error('Traceback (most recent call last):')
+  console.error('dl_lit.utils.OpenAlexRateLimitExceeded: OpenAlex rate limit exceeded. Retry after 123s.')
+  process.exit(1)
+}
 console.log(JSON.stringify({ event: 'run_created', runId: 1 }))
 console.log(JSON.stringify({ results: [], source: 'fake-python' }))
 `
@@ -142,6 +147,17 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       db.close()
     }
   }
+
+  test('preserves the concise production rate-limit response', async () => {
+    process.env.FAKE_PYTHON_FAIL = 'openalex-rate-limit'
+    try {
+      const res = await doKeywordSearch({ query: 'economics', maxResults: 50 })
+      expect(res.status).toBe(429)
+      expect(res.body.error).toBe('OpenAlex rate limit exceeded. Retry after 123s.')
+    } finally {
+      delete process.env.FAKE_PYTHON_FAIL
+    }
+  })
 
   test('passes separate downstream/upstream depths for keyword search', async () => {
     const res = await doKeywordSearch({

@@ -227,6 +227,28 @@ describe('seed candidate text filter', () => {
     db = null
   })
 
+  test('search filtering matches co-authors, publisher and literal wildcards', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, {
+      authorships: [{ author: { display_name: 'Alice First' } }, { author: { display_name: 'Bob Second' } }],
+      primary_location: { source: { display_name: 'Test Journal', publisher: 'Unique Publisher' } },
+    })
+    for (const q of ['Bob Second', 'unique publisher', 'test journal']) {
+      expect(listSeedCandidates(db, 130, 'search', '7', { q, limit: 1 })).toHaveLength(1)
+      expect(countSeedCandidates(db, 130, 'search', '7', { q })).toBe(1)
+    }
+    expect(countSeedCandidates(db, 130, 'search', '7', { q: '%' })).toBe(0)
+    expect(countSeedCandidates(db, 130, 'search', '7', { q: '_' })).toBe(0)
+  })
+
+  test('search filtering honors legacy authors and venue metadata', () => {
+    db = createSearchSeedDb()
+    insertSearchResult(db, { authors: ['Alice', 'Legacy Coauthor'], host_venue: { display_name: 'Old Journal', publisher: 'Old Publisher' } })
+    for (const q of ['Legacy Coauthor', 'Old Journal', 'Old Publisher']) {
+      expect(countSeedCandidates(db, 130, 'search', '7', { q })).toBe(1)
+    }
+  })
+
   function seedTwoEntries() {
     db = createSeedDb()
     // listSeedSources joins the seed-document metadata table; the shared

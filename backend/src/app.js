@@ -2035,6 +2035,15 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
 // Shared by /api/keyword-search and /api/keyword-search/preview: validates
 // the request body and builds the keyword_search.py argv. `error` is set
 // (and `args` unusable) when a required filter is missing.
+export function keywordSearchErrorResponse(error) {
+  const rawMessage = String(error?.message || 'Keyword search failed');
+  const rateLimitMatch = rawMessage.match(/OpenAlex rate limit exceeded\.?(?: Retry after \d+s\.)?/);
+  if (rateLimitMatch) return { status: 429, message: rateLimitMatch[0] };
+  const queryMatch = rawMessage.match(/(?:QuerySyntaxError|ValueError):\s*([^\n]+)/);
+  if (queryMatch) return { status: 400, message: queryMatch[1].trim() };
+  return { status: 500, message: rawMessage };
+}
+
 const TOPIC_ID_RE = /^T\d+$/;
 const MAX_TOPICS_PER_SEARCH = 50; // OpenAlex caps an OR filter at 50 values
 
@@ -2624,15 +2633,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   ensureSeedSchema(authDb);
   // Warm the cross-corpus downloaded-works lookup once the server is up, so
   // the first workspace load does not pay the ~1.5 s index build. Best effort.
-  if (!isStubMode()) {
-    setTimeout(() => {
+  app.warmSeedState = () => {
+    if (!isStubMode()) {
       try {
         createStateResolver(authDb, 0, { resolveDownloadedFilePath: findDownloadedFilePath });
       } catch (error) {
         console.warn('[seed-state] Cache warm-up failed:', error?.message || error);
       }
-    }, 250);
-  }
+    }
+  };
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
@@ -5013,7 +5022,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       });
     } catch (error) {
       console.error('[/api/keyword-search/preview] Error:', error);
-      return res.status(502).json({ error: error.message || 'Preview failed' });
+      const failure = keywordSearchErrorResponse(error);
+      return res.status(failure.status === 500 ? 502 : failure.status).json({ error: failure.message });
     }
   });
 
@@ -5067,7 +5077,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         () => null,
         (error) => {
           console.error('[/api/keyword-search] Search script failed:', error?.message || error);
-          if (!responded) { responded = true; res.status(500).json({ error: error?.message || 'Keyword search failed' }); }
+          if (!responded) {
+            responded = true;
+            const failure = keywordSearchErrorResponse(error);
+            res.status(failure.status).json({ error: failure.message });
+          }
           return error;
         },
       )

@@ -74,6 +74,7 @@ test('topics are picked from the type-ahead and a topic-only run is priced at 1 
   await topicInput.fill('')
 
   // Topic-only: relevance is meaningless without text, so the sort falls back.
+  await card.getByRole('spinbutton', { name: 'Max results' }).fill('0')
   await expect(card.getByRole('combobox', { name: 'Sort' })).toHaveValue('cited_by_count')
   await expect(card.getByRole('combobox', { name: 'Sort' }).getByRole('option', { name: /Relevance/ })).toHaveCount(0)
 

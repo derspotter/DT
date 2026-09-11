@@ -304,7 +304,8 @@
   let searchAuthor = ''
   let yearFrom = ''
   let yearTo = ''
-  let searchMaxResults = ''
+  const DEFAULT_SEARCH_MAX_RESULTS = 50
+  let searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
   let searchSort = 'relevance'
   let includeDownstream = false
   let includeUpstream = false
@@ -1904,6 +1905,7 @@
     seedActionBusy = false
     seedLastRunKey = ''
     searchQuery = ''
+    searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
     searchResults = []
     searchStatus = ''
     searchSource = ''
@@ -3561,10 +3563,16 @@
     return {
       query: searchQuery, seedJson: '', field: searchField, author: searchAuthor, yearFrom, yearTo,
       topics: searchTopics.map(({ id, label }) => ({ id, label })),
-      maxResults: Math.max(0, Math.trunc(Number(maxResults) || 0)), sort: searchSort,
+      maxResults: searchResultCap(maxResults), sort: searchSort,
       includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
       maxRelated: 30, fallbackToSample: false,
     }
+  }
+
+  function searchResultCap(value) {
+    if (value === '' || value === null || value === undefined) return DEFAULT_SEARCH_MAX_RESULTS
+    const parsed = Number(value)
+    return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : DEFAULT_SEARCH_MAX_RESULTS
   }
 
   // Measured wall-clock cost of one OpenAlex page in this pipeline. The
@@ -3704,7 +3712,7 @@
     } finally {
       searchPreviewBusy = false
     }
-    const cap = Math.max(0, Math.trunc(Number(searchMaxResults) || 0))
+    const cap = searchResultCap(searchMaxResults)
     if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
       searchWarning = true
       searchStatus = ''
@@ -3909,7 +3917,7 @@
     searchAuthor = ''
     yearFrom = ''
     yearTo = ''
-    searchMaxResults = ''
+    searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
     searchSort = 'relevance'
     searchTopics = []
     topicQuery = ''
@@ -5063,7 +5071,7 @@
                   </label>
                   <label>
                     <span>Max results</span>
-                    <input type="number" min="1" step="1" placeholder="No cap" bind:value={searchMaxResults} />
+                    <input type="number" min="0" step="1" placeholder="50 (0 = no cap)" bind:value={searchMaxResults} />
                   </label>
                   <label>
                     <span>Sort</span>

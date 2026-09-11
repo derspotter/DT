@@ -54,6 +54,38 @@ async function mockApi(route: Route) {
   return route.fulfill({ status: 200, contentType: 'application/json', body: '{}' })
 }
 
+test('search defaults to 50, allows a larger cap, and Reset restores 50', async ({ page }) => {
+  let searchBody: any = null
+  await page.addInitScript(() => window.localStorage.setItem('rag_feeder_token', 'playwright-token'))
+  await page.route('**/api/**', async (route) => {
+    const pathname = new URL(route.request().url()).pathname
+    if (pathname === '/api/keyword-search/preview') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ count: 342118, threshold: 100000 }) })
+    }
+    if (pathname === '/api/keyword-search') {
+      searchBody = route.request().postDataJSON()
+      return route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ runId: 55, status: 'running' }) })
+    }
+    return mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  const cap = card.getByRole('spinbutton', { name: 'Max results' })
+  await expect(cap).toHaveValue('50')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect.poll(() => searchBody?.maxResults).toBe(50)
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+  await cap.fill('1000')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect.poll(() => searchBody?.maxResults).toBe(1000)
+  await cap.fill('')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect.poll(() => searchBody?.maxResults).toBe(50)
+  await card.getByRole('button', { name: 'Reset' }).click()
+  await expect(cap).toHaveValue('50')
+})
+
 test('a search above the threshold shows the warning and "Cap at" starts a capped run', async ({ page }) => {
   let searchBody: any = null
   await page.addInitScript(() => {
@@ -73,6 +105,7 @@ test('a search above the threshold shows the warning and "Cap at" starts a cappe
   await page.goto('/#/workspace')
   const card = page.locator('.seed-intake-card--search')
   await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('spinbutton', { name: 'Max results' }).fill('0')
   await card.getByRole('button', { name: 'Search', exact: true }).click()
   const warning = page.getByTestId('search-warning')
   await expect(warning).toContainText('This search matches 342,118 works')
@@ -110,6 +143,7 @@ test('the warning names the OpenAlex budget and "Cap at budget" caps to it', asy
   await page.goto('/#/workspace')
   const card = page.locator('.seed-intake-card--search')
   await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('spinbutton', { name: 'Max results' }).fill('0')
   await card.getByRole('button', { name: 'Search', exact: true }).click()
   const warning = page.getByTestId('search-warning')
   // 342,118 / 200 = 1,711 requests; a text search costs 10 credits a request,
@@ -144,6 +178,7 @@ test('no budget button when the quota is unknown or stale', async ({ page }) => 
   await page.goto('/#/workspace')
   const card = page.locator('.seed-intake-card--search')
   await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('spinbutton', { name: 'Max results' }).fill('0')
   await card.getByRole('button', { name: 'Search', exact: true }).click()
   const warning = page.getByTestId('search-warning')
   await expect(warning).toContainText('This search matches 342,118 works')
@@ -170,6 +205,7 @@ test('Reset clears the warning instead of leaving stale "Cap at" / "Fetch all" a
   await page.goto('/#/workspace')
   const card = page.locator('.seed-intake-card--search')
   await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('spinbutton', { name: 'Max results' }).fill('0')
   await card.getByRole('button', { name: 'Search', exact: true }).click()
   const warning = page.getByTestId('search-warning')
   await expect(warning).toContainText('This search matches 342,118 works')
