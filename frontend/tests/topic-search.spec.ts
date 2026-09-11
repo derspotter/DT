@@ -12,15 +12,20 @@ function json(route: Route, body: unknown, status = 200) {
   return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
 }
 
-function mockApi(route: Route, state: { searchBody: any; previewBody: any; topicQueries: string[] }) {
+function mockApi(route: Route, state: { searchBody: any; previewBody: any; topicQueries: string[]; corpusId?: number }) {
   const url = new URL(route.request().url())
   const path = url.pathname
   if (path === '/api/auth/me') {
     return json(route, {
-      user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
-      corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
+      user: { id: 1, username: 'admin', last_corpus_id: state.corpusId || 1, is_admin: true },
+      corpora: [1, 2].map(id => ({ id, name: `Research corpus ${id}`, role: 'owner', owner_username: 'admin' })),
     })
   }
+  if (path === '/api/corpora/2/select') {
+    state.corpusId = 2
+    return json(route, { selected: 2 })
+  }
+  if (path === '/api/auth/login') return json(route, { token: 'new-session-token' })
   if (path === '/api/openalex/topics') {
     const q = (url.searchParams.get('q') || '').toLowerCase()
     state.topicQueries.push(q)
@@ -116,3 +121,77 @@ test('a chip can be removed and Reset clears the topics', async ({ page }) => {
   // With no query and no topic, relevance is offered again.
   await expect(card.getByRole('combobox', { name: 'Sort' }).getByRole('option', { name: /Relevance/ })).toHaveCount(1)
 })
+
+// Hold an actual request open so the response arrives AFTER the UI action.
+// Immediate mocks cannot expose this race.
+for (const action of ['reset', 'clear', 'escape', 'blur', 'workspace'] as const) {
+  test(`a late topic response cannot reopen suggestions after ${action}`, async ({ page }) => {
+    const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
+    await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
+    await page.route('**/api/**', route => mockApi(route, state))
+    let pending: Route | undefined
+    await page.route('**/api/openalex/topics?*', route => { pending = route })
+    await page.goto('/#/workspace')
+    const card = page.locator('.seed-intake-card--search')
+    const input = card.getByRole('combobox', { name: /^Topic/ })
+    await input.fill('labor')
+    await expect.poll(() => Boolean(pending)).toBe(true)
+    if (action === 'reset') await card.getByRole('button', { name: 'Reset', exact: true }).click()
+    if (action === 'clear') await input.fill('')
+    if (action === 'escape') await input.press('Escape')
+    if (action === 'blur') await card.getByRole('textbox', { name: 'Query', exact: true }).focus()
+    if (action === 'workspace') await page.locator('.header-corpus-picker select').selectOption('2')
+    // Let the intentionally delayed blur-close run before delivering the reply.
+    await page.waitForTimeout(250)
+    const response = page.waitForResponse(r => r.url().includes('/api/openalex/topics?'))
+    await json(pending!, { topics: TOPICS })
+    await response
+    await page.waitForTimeout(100)
+    await expect(card.getByRole('listbox', { name: 'Matching topics' })).toHaveCount(0)
+    if (['reset', 'clear', 'workspace'].includes(action)) await expect(input).toHaveValue('')
+  })
+}
+
+test('a stale unauthorized topic response cannot log out the current session', async ({ page }) => {
+  const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
+  await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
+  await page.route('**/api/**', route => mockApi(route, state))
+  let pending: Route | undefined
+  await page.route('**/api/openalex/topics?*', route => { pending = route })
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('combobox', { name: /^Topic/ }).fill('labor')
+  await expect.poll(() => Boolean(pending)).toBe(true)
+  await card.getByRole('button', { name: 'Reset', exact: true }).click()
+  await json(pending!, { error: 'old request unauthorized' }, 401)
+  await page.waitForTimeout(250)
+  await expect(card).toBeVisible()
+  expect(await page.evaluate(() => localStorage.getItem('rag_feeder_token'))).toBe('playwright-token')
+})
+
+for (const action of ['workspace', 'logout'] as const) {
+  test(`topic selection is cleared on ${action}`, async ({ page }) => {
+    const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
+    await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
+    await page.route('**/api/**', route => mockApi(route, state))
+    await page.goto('/#/workspace')
+    const card = page.locator('.seed-intake-card--search')
+    const input = card.getByRole('combobox', { name: /^Topic/ })
+    await input.fill('labor')
+    await card.getByRole('listbox').getByRole('option').first().getByRole('button').click()
+    await expect(card.getByTestId('topic-chip')).toHaveCount(1)
+    await input.fill('u')
+    if (action === 'workspace') {
+      await page.locator('.header-corpus-picker select').selectOption('2')
+      await expect(page.locator('.header-corpus-picker select')).toHaveValue('2')
+    } else {
+      await page.getByRole('button', { name: 'Log out', exact: true }).click()
+      await page.getByLabel('Username', { exact: true }).fill('admin')
+      await page.getByLabel('Password', { exact: true }).fill('test-password')
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+    }
+    await expect(card).toBeVisible()
+    await expect(card.getByTestId('topic-chip')).toHaveCount(0)
+    await expect(input).toHaveValue('')
+  })
+}
