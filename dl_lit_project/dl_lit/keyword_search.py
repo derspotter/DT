@@ -164,13 +164,42 @@ class _NoAuthorMatch(Exception):
     """Raised internally when an author filter was requested but resolved to nobody."""
 
 
+_TOPIC_ID_RE = re.compile(r"^T\d+$")
+MAX_TOPICS_PER_SEARCH = 50  # OpenAlex caps an OR filter at 50 values
+
+
+def normalize_topic_ids(values) -> list[str]:
+    """Reduce user/UI supplied topic references to bare OpenAlex ids (T10102).
+
+    Accepts 'T10102', 't10102' or 'https://openalex.org/T10102'; drops anything
+    else, keeps first-seen order, and caps at the OR-filter limit.
+    """
+    out: list[str] = []
+    for value in values or []:
+        if not isinstance(value, str):
+            continue
+        token = value.strip().rstrip('/').rsplit('/', 1)[-1].upper()
+        if _TOPIC_ID_RE.match(token) and token not in out:
+            out.append(token)
+        if len(out) >= MAX_TOPICS_PER_SEARCH:
+            break
+    return out
+
+
+def search_credits_per_page(query) -> int:
+    """OpenAlex charges a list request with search text 10 credits and a pure
+    filter listing 1, independent of page size (measured 2026-09-07)."""
+    return 10 if (query or '').strip() else 1
+
+
 def _build_search_params(query: str,
                          year_from: int | None,
                          year_to: int | None,
                          mailto: str | None,
                          field: str | None,
                          author: str | None,
-                         sort: str | None) -> tuple[dict, str]:
+                         sort: str | None,
+                         topics=None) -> tuple[dict, str]:
     """Everything search_openalex sends except pagination. Returns (params, openalex_query)."""
     raw_query = (query or '').strip()
     openalex_query = build_openalex_query_text(raw_query) if raw_query else ''
@@ -206,6 +235,9 @@ def _build_search_params(query: str,
         params["search"] = openalex_query
 
     filters = []
+    topic_ids = normalize_topic_ids(topics)
+    if topic_ids:
+        filters.append(f"topics.id:{'|'.join(topic_ids)}")
     author_ids = resolve_openalex_author_ids(author, mailto=mailto) if author else []
     if author and not author_ids:
         raise _NoAuthorMatch()
@@ -248,7 +280,8 @@ def search_openalex(query: str,
                     author: str | None = None,
                     sort: str | None = None,
                     on_page=None,
-                    accumulate: bool = True) -> list[dict]:
+                    accumulate: bool = True,
+                    topics=None) -> list[dict]:
     """Page through OpenAlex.
 
     With ``accumulate=False`` and an ``on_page`` callback, pages are handed to the
@@ -256,7 +289,7 @@ def search_openalex(query: str,
     return value is then an empty list. ``accumulate=True`` keeps every item.
     """
     try:
-        params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort)
+        params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort, topics=topics)
     except _NoAuthorMatch:
         return []
 
@@ -314,10 +347,11 @@ def count_openalex(query: str,
                    year_to: int | None = None,
                    mailto: str | None = None,
                    field: str | None = "default",
-                   author: str | None = None) -> int:
+                   author: str | None = None,
+                   topics=None) -> int:
     """How many works the same search would return. One request, per-page=1."""
     try:
-        params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort=None)
+        params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort=None, topics=topics)
     except _NoAuthorMatch:
         return 0
     params["per-page"] = 1

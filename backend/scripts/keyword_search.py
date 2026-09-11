@@ -24,6 +24,8 @@ from dl_lit.OpenAlexScraper import (
 )
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.keyword_search import (
+    normalize_topic_ids,
+    search_credits_per_page,
     SORT_OPTIONS,
     count_openalex,
     dedupe_results,
@@ -642,6 +644,36 @@ def _inline_results_limit(cli_value):
         return 1000
 
 
+def _parse_topic_labels(raw, topics):
+    """Display names for the seed label; falls back to the ids when absent or malformed."""
+    labels = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                labels = [str(x).strip() for x in parsed if str(x).strip()]
+        except (TypeError, ValueError):
+            labels = []
+    if len(labels) != len(topics):
+        return list(topics)
+    return labels
+
+
+def _run_label(args, is_query_mode, topics, topic_labels):
+    """What the seed row is called: the query, the topics, or the author."""
+    if not is_query_mode:
+        return '[seed-json]'
+    query = (args.query or '').strip()
+    topic_part = f"Topics: {', '.join(topic_labels)}" if topics else ''
+    if query and topic_part:
+        return f"{query} · {topic_part}"
+    if query:
+        return query
+    if topic_part:
+        return topic_part
+    return args.author or '[filtered-search]'
+
+
 def main():
     global _progress_stream
     parser = argparse.ArgumentParser()
@@ -688,6 +720,9 @@ def main():
         default=DEFAULT_INCLUDE_UPSTREAM,
         help='Include upstream works that cite each work.',
     )
+    parser.add_argument('--topics', default=None,
+                        help='Comma-separated OpenAlex topic ids (T10102,...) to filter on; a topic-only run needs no query text')
+    parser.add_argument('--topic-labels', default=None, help='JSON list of display names matching --topics, for the seed label')
     parser.add_argument('--count-only', action='store_true')
     parser.add_argument('--inline-results-limit', type=int, default=None)
     args = parser.parse_args()
@@ -696,13 +731,16 @@ def main():
         print(json.dumps({'runId': 0, 'results': STUB_RESULTS, 'source': 'stub'}))
         return
 
+    topics = normalize_topic_ids((args.topics or '').split(','))
+    topic_labels = _parse_topic_labels(args.topic_labels, topics)
+
     if args.count_only:
         if args.query is None:
             print(json.dumps({'count': 0}))
             return
         count = count_openalex(query=args.query or '', year_from=args.year_from, year_to=args.year_to,
-                               author=args.author, field=args.field, mailto=args.mailto)
-        print(json.dumps({'count': int(count)}))
+                               author=args.author, field=args.field, mailto=args.mailto, topics=topics)
+        print(json.dumps({'count': int(count), 'credits_per_page': search_credits_per_page(args.query)}))
         return
 
     db_path = Path(args.db_path)
@@ -737,6 +775,8 @@ def main():
             'year_from': args.year_from,
             'year_to': args.year_to,
             'author': args.author,
+            'topics': topics,
+            'topic_labels': topic_labels,
             'field': args.field,
             'mailto': args.mailto,
             'related_depth': related_depth,
@@ -747,7 +787,7 @@ def main():
             'include_downstream': args.include_downstream,
             'include_upstream': args.include_upstream,
         }
-        run_query_label = args.query if is_query_mode and args.query else (args.author or '[filtered-search]' if is_query_mode else '[seed-json]')
+        run_query_label = _run_label(args, is_query_mode, topics, topic_labels)
         run_id = db.create_search_run(query=run_query_label, filters=filters, status='running')
         _emit({'event': 'run_created', 'runId': run_id})
 
@@ -790,7 +830,7 @@ def main():
                     query=args.query or '', max_results=effective_max_results(args.max_results),
                     year_from=args.year_from, year_to=args.year_to, author=args.author,
                     field=args.field, mailto=args.mailto, sort=args.sort, on_page=persist,
-                    accumulate=needs_items,
+                    accumulate=needs_items, topics=topics,
                 )
             else:
                 seeds = _parse_seed_json(args.seed_json)

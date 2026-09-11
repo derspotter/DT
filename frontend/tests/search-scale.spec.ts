@@ -112,13 +112,14 @@ test('the warning names the OpenAlex budget and "Cap at budget" caps to it', asy
   await card.getByRole('textbox', { name: 'Query' }).fill('economics')
   await card.getByRole('button', { name: 'Search', exact: true }).click()
   const warning = page.getByTestId('search-warning')
-  // 342,118 / 200 = 1,711 requests; at 1.1s each that is ~31 minutes, and it
-  // is far more than the 50 requests left in today's budget.
-  await expect(warning).toContainText('1,711 OpenAlex requests and roughly 31.4 minutes')
-  await expect(warning).toContainText("That is more than today's remaining OpenAlex budget: 50 of 100,000 requests left.")
+  // 342,118 / 200 = 1,711 requests; a text search costs 10 credits a request,
+  // so 17,110 credits; at 1.1s each that is ~31 minutes, and it is far more
+  // than the 50 credits left in today's budget.
+  await expect(warning).toContainText('1,711 OpenAlex requests (17,110 credits) and roughly 31.4 minutes')
+  await expect(warning).toContainText("That is more than today's remaining OpenAlex budget: 50 of 100,000 credits left.")
   await warning.getByTestId('search-cap-at-budget').click()
-  // 50 requests x 200 results per page.
-  await expect.poll(() => searchBody?.maxResults).toBe(10000)
+  // 50 credits pay for 5 text-search pages x 200 results.
+  await expect.poll(() => searchBody?.maxResults).toBe(1000)
 })
 
 test('no budget button when the quota is unknown or stale', async ({ page }) => {

@@ -219,3 +219,49 @@ def test_effective_max_results():
     assert keyword_search.effective_max_results("") is None
     assert keyword_search.effective_max_results(25) == 25
     assert keyword_search.effective_max_results("200") == 200
+
+
+def _capture_params(monkeypatch):
+    captured = {}
+
+    def fake(endpoint, params, rl, retries=3):
+        captured.update(params)
+        return {"results": [], "meta": {"count": 0, "next_cursor": None}}
+
+    monkeypatch.setattr(keyword_search, "_openalex_request", fake)
+    return captured
+
+
+def test_topics_become_a_filter_and_topic_only_search_has_no_search_param(monkeypatch):
+    captured = _capture_params(monkeypatch)
+    keyword_search.search_openalex("", topics=["T10102", "https://openalex.org/T11421"], sort="relevance")
+    assert "search" not in captured
+    assert "topics.id:T10102|T11421" in captured["filter"]
+    # relevance needs search text; a topic-only harvest drops it rather than erroring
+    assert "sort" not in captured
+
+
+def test_topics_combine_with_query_and_years(monkeypatch):
+    captured = _capture_params(monkeypatch)
+    keyword_search.search_openalex("labour", topics=["T10102"], year_from=2020, year_to=2024)
+    assert captured["search"] == "labour"
+    assert captured["filter"] == "topics.id:T10102,publication_year:2020-2024"
+
+
+def test_normalize_topic_ids_rejects_garbage():
+    assert keyword_search.normalize_topic_ids(["t10102", "https://openalex.org/T11421", "", None, "W123", "T1;DROP"]) == ["T10102", "T11421"]
+
+
+def test_count_openalex_passes_topics(monkeypatch):
+    captured = _capture_params(monkeypatch)
+    keyword_search.count_openalex(query="", topics=["T10102"])
+    assert captured["filter"] == "topics.id:T10102"
+    assert captured["per-page"] == 1
+
+
+def test_search_credits_per_page():
+    # Measured against the live API on 2026-09-07: any text search costs 10
+    # credits a page, a pure filter listing costs 1, regardless of page size.
+    assert keyword_search.search_credits_per_page("labour") == 10
+    assert keyword_search.search_credits_per_page("  ") == 1
+    assert keyword_search.search_credits_per_page(None) == 1

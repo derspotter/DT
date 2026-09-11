@@ -85,7 +85,7 @@ def test_count_only(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(mod, "count_openalex", lambda **kwargs: 342118)
     monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--count-only"])
     mod.main()
-    assert _events(capsys)[-1] == {"count": 342118}
+    assert _events(capsys)[-1] == {"count": 342118, "credits_per_page": 10}
 
 
 def test_sigterm_marks_cancelled_and_exits_zero(monkeypatch, tmp_path, capsys):
@@ -353,3 +353,50 @@ def test_search_openalex_capped_streaming_run_does_not_spend_cap_on_duplicates(m
     ks.search_openalex("q", max_results=3, on_page=lambda items, meta: pages.append([i["id"] for i in items]),
                        accumulate=False)
     assert [i for p in pages for i in p] == ["W1", "W2", "W3"]
+
+
+def test_count_only_passes_topics_and_reports_credits(monkeypatch, tmp_path, capsys):
+    mod = _load(monkeypatch)
+    seen = {}
+
+    def fake_count(**kwargs):
+        seen.update(kwargs)
+        return 91061
+
+    monkeypatch.setattr(mod, "count_openalex", fake_count)
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "", "--topics", "T10208,T11421", "--count-only"])
+    mod.main()
+    assert seen["topics"] == ["T10208", "T11421"]
+    assert _events(capsys)[-1] == {"count": 91061, "credits_per_page": 1}
+
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "labour", "--count-only"])
+    mod.main()
+    assert _events(capsys)[-1] == {"count": 91061, "credits_per_page": 10}
+
+
+def test_topic_only_run_is_labelled_and_records_topics(monkeypatch, tmp_path, capsys):
+    mod = _load(monkeypatch)
+    seen = {}
+
+    def fake_search(**kwargs):
+        seen.update(kwargs)
+        kwargs["on_page"]([{"id": "https://openalex.org/W1", "display_name": "one"}], {"count": 1})
+        return []
+
+    monkeypatch.setattr(mod, "search_openalex", fake_search)
+    monkeypatch.setattr(sys, "argv", [
+        "x", "--db-path", str(tmp_path / "t.db"), "--query", "", "--corpus-id", "1",
+        "--topics", "T10208,T11421", "--topic-labels", json.dumps(["Labor market dynamics", "Labor Movements and Unions"]),
+    ])
+    mod.main()
+    assert seen["topics"] == ["T10208", "T11421"]
+    run_id = _events(capsys)[0]["runId"]
+
+    from dl_lit.db_manager import DatabaseManager
+    db = DatabaseManager(db_path=tmp_path / "t.db")
+    query, filters_json = db.conn.execute("SELECT query, filters_json FROM search_runs WHERE id = ?", (run_id,)).fetchone()
+    assert query == "Topics: Labor market dynamics, Labor Movements and Unions"
+    filters = json.loads(filters_json)
+    assert filters["topics"] == ["T10208", "T11421"]
+    assert filters["topic_labels"] == ["Labor market dynamics", "Labor Movements and Unions"]
+    db.close_connection()
