@@ -1906,6 +1906,7 @@
     seedLastRunKey = ''
     searchQuery = ''
     searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
+    resetTopicSearch()
     searchResults = []
     searchStatus = ''
     searchSource = ''
@@ -3628,15 +3629,14 @@
   // --- Topic field -------------------------------------------------------
   function handleTopicInput(event) {
     topicQuery = String(event?.target?.value || '')
-    clearTimeout(topicDebounce)
+    // Invalidate immediately, not only after the next debounce fires: an
+    // earlier response must not revive suggestions for cleared/changed input.
+    closeTopicSuggestions()
     const q = topicQuery.trim()
-    if (q.length < 2) {
-      topicSuggestions = []
-      topicActiveIndex = -1
-      return
-    }
+    if (q.length < 2) return
+    const token = topicLookupToken
     topicDebounce = setTimeout(async () => {
-      const token = ++topicLookupToken
+      topicDebounce = null
       try {
         const found = await fetchTopicSuggestions(q)
         if (token !== topicLookupToken) return
@@ -3644,8 +3644,9 @@
         topicSuggestions = found.filter((t) => !chosen.has(t.id)).slice(0, 8)
         topicActiveIndex = topicSuggestions.length > 0 ? 0 : -1
       } catch (error) {
+        if (token !== topicLookupToken) return
         if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
-        if (token === topicLookupToken) topicSuggestions = []
+        topicSuggestions = []
       }
     }, 250)
   }
@@ -3654,8 +3655,7 @@
     if (!topic?.id || searchTopics.some((t) => t.id === topic.id)) return
     searchTopics = [...searchTopics, { id: topic.id, label: topic.label, hint: topic.hint || '', works_count: topic.works_count ?? null }]
     topicQuery = ''
-    topicSuggestions = []
-    topicActiveIndex = -1
+    closeTopicSuggestions()
     searchPreview = null
     searchWarning = false
   }
@@ -3667,8 +3667,19 @@
   }
 
   function closeTopicSuggestions() {
+    clearTimeout(topicDebounce)
+    topicDebounce = null
+    topicLookupToken += 1
     topicSuggestions = []
     topicActiveIndex = -1
+  }
+
+  function resetTopicSearch() {
+    closeTopicSuggestions()
+    searchTopics = []
+    topicQuery = ''
+    searchPreview = null
+    searchWarning = false
   }
 
   function handleTopicKeydown(event) {
@@ -3685,7 +3696,7 @@
         event.preventDefault()
         addTopic(topicSuggestions[Math.max(0, topicActiveIndex)])
       }
-    } else if (event.key === 'Escape' && topicSuggestions.length > 0) {
+    } else if (event.key === 'Escape') {
       event.preventDefault()
       closeTopicSuggestions()
     } else if (event.key === 'Backspace' && !topicQuery && searchTopics.length > 0) {
@@ -3919,9 +3930,7 @@
     yearTo = ''
     searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
     searchSort = 'relevance'
-    searchTopics = []
-    topicQuery = ''
-    closeTopicSuggestions()
+    resetTopicSearch()
     searchStatus = ''
     searchSource = ''
     searchSelection = []
@@ -4687,6 +4696,7 @@
     }, 3000)
 
     return () => {
+      closeTopicSuggestions()
       window.removeEventListener('hashchange', onHashChange)
       window.removeEventListener('focus', onFocusOrVisible)
       document.removeEventListener('visibilitychange', onFocusOrVisible)
