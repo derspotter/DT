@@ -593,6 +593,16 @@ export async function processMarkedIngestEntries({
   return response.json()
 }
 
+// Type-ahead for the Topic field; the backend proxies OpenAlex autocomplete
+// (free of credits) and returns [{ id, label, hint, works_count }].
+export async function fetchTopicSuggestions(q) {
+  const response = await fetchWithTimeout(`${API_BASE}/api/openalex/topics?q=${encodeURIComponent(String(q || ''))}`, {}, 15_000)
+  await throwIfUnauthorized(response)
+  if (!response.ok) throw new Error((await response.text()) || 'Topic lookup failed')
+  const payload = await response.json()
+  return Array.isArray(payload?.topics) ? payload.topics : []
+}
+
 export async function previewKeywordSearch(body) {
   const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search/preview`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -625,6 +635,7 @@ export async function runKeywordSearch({
   maxRelated = 30,
   enqueue = false,
   fallbackToSample = true,
+  topics = [],
 }) {
   try {
     const response = await fetchWithTimeout(
@@ -647,13 +658,15 @@ export async function runKeywordSearch({
           relatedDepthUpstream,
           maxRelated,
           enqueue,
+          topics,
         }),
       },
       PIPELINE_TIMEOUT
     )
     await throwIfUnauthorized(response)
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.error || `HTTP ${response.status}`)
     }
     const payload = await response.json()
     const running = response.status === 202

@@ -86,10 +86,22 @@ says so.
 
 Submitting a search first asks OpenAlex how many works match. At or above
 `RAG_FEEDER_SEARCH_WARN_THRESHOLD` (default 100,000) the search card warns
-with a request estimate and offers a capped run. The search itself runs in
-the background: the seed appears at once and fills in page by page, with a
-cancel action; a cancelled or failed run keeps what it already stored. Seeds
-page their items 200 at a time and sort on the server.
+with a request and credit estimate and offers a capped run. The search itself
+runs in the background: the seed appears at once and fills in page by page,
+with a cancel action; a cancelled or failed run keeps what it already stored.
+Seeds page their items 200 at a time and sort on the server.
+
+### OpenAlex credits and the Topic field
+
+OpenAlex prices requests in credits, not works: a list request with search
+text costs 10 credits, a pure filter listing costs 1, a single work by id
+costs 0, and page size makes no difference (measured 2026-09-07). The daily
+budget pill counts these credits. Because of that, the search card has a
+**Topic** field: pick one or more of OpenAlex's ~4,500 topics from the
+type-ahead (free) and run the search without query text to harvest by topic
+at 1 credit per 200 works, ten times cheaper than text search. Topics
+combined with a query narrow the text search instead. Topic-only runs sort
+by citations or date; relevance needs search text.
 
 ## Live Deploys Behind Caddy
 

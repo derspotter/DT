@@ -745,10 +745,18 @@ function searchCandidateWhere(corpusId, runId, sourceRef, needle) {
                  WHERE d.corpus_id = ? AND d.source_type = 'search' AND d.source_key = ? AND d.candidate_key = 'search:' || sr.id)`]
   const params = [corpusId, runId, corpusId, sourceRef]
   if (needle) {
-    where.push(`(LOWER(COALESCE(sr.title, '')) LIKE ? OR LOWER(COALESCE(json_extract(sr.raw_json, '$.authorships[0].author.display_name'), '')) LIKE ?
-                 OR LOWER(COALESCE(json_extract(sr.raw_json, '$.primary_location.source.display_name'), '')) LIKE ?)`)
-    const like = `%${needle}%`
-    params.push(like, like, like)
+    // Match the displayed metadata, including every co-author and legacy
+    // author/venue fields. instr treats '%' and '_' as literal query text.
+    const raw = `CASE WHEN json_valid(sr.raw_json) THEN sr.raw_json ELSE '{}' END`
+    const venue = `COALESCE(json_extract(${raw}, '$.primary_location.source'), json_extract(${raw}, '$.host_venue'), '{}')`
+    const authors = `CASE WHEN json_type(${raw}, '$.authors') = 'array'
+      THEN (SELECT group_concat(CAST(a.value AS TEXT), ' ') FROM json_each(${raw}, '$.authors') a)
+      ELSE (SELECT group_concat(COALESCE(json_extract(a.value, '$.author.display_name'), json_extract(a.value, '$.raw_author_name'), ''), ' ')
+            FROM json_each(${raw}, '$.authorships') a) END`
+    where.push(`instr(LOWER(COALESCE(NULLIF(sr.title, ''), json_extract(${raw}, '$.display_name'), '') || ' ' ||
+      COALESCE(${authors}, '') || ' ' || COALESCE(json_extract(${venue}, '$.display_name'), '') || ' ' ||
+      COALESCE(json_extract(${venue}, '$.publisher'), json_extract(${venue}, '$.host_organization_name'), json_extract(${raw}, '$.host_organization_name'), '')), ?) > 0`)
+    params.push(needle)
   }
   return { where: where.join(' AND '), params }
 }
