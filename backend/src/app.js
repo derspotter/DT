@@ -1851,6 +1851,23 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
   args.push('--max-related', String(expansion.maxRelated));
 }
 
+function keywordSearchErrorResponse(error) {
+  const rawMessage = String(error?.message || 'Keyword search failed');
+  const rateLimitMatch = rawMessage.match(/OpenAlex rate limit exceeded\.?(?: Retry after \d+s\.)?/);
+  if (rateLimitMatch) {
+    return { status: 429, message: rateLimitMatch[0] };
+  }
+  const syntaxMatch = rawMessage.match(/QuerySyntaxError:\s*([^\n]+)/);
+  if (syntaxMatch) {
+    return { status: 400, message: syntaxMatch[1].trim() };
+  }
+  const valueMatch = rawMessage.match(/ValueError:\s*([^\n]+)/);
+  if (valueMatch) {
+    return { status: 400, message: valueMatch[1].trim() };
+  }
+  return { status: 500, message: rawMessage };
+}
+
 function buildUploadedDocsExpansion(body = {}) {
   const explicitDepth = coerceInt(body?.relatedDepth, null)
   return {
@@ -4536,7 +4553,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json(payload);
     } catch (error) {
       console.error('[/api/keyword-search] Error:', error);
-      return res.status(500).json({ error: error.message || 'Keyword search failed' });
+      const responseError = keywordSearchErrorResponse(error);
+      return res.status(responseError.status).json({ error: responseError.message });
     }
   });
 

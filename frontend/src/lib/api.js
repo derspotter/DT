@@ -621,7 +621,8 @@ export async function runKeywordSearch({
     )
     await throwIfUnauthorized(response)
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.error || `HTTP ${response.status}`)
     }
     const payload = await response.json()
     const data = Array.isArray(payload) ? payload : payload.results || []

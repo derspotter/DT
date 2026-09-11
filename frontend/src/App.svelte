@@ -82,6 +82,7 @@
     }
   ]
   const knownTabIds = new Set([...userTabGroups, ...adminTabGroups].flatMap(group => group.tabs).map(tab => tab.id))
+  const DEFAULT_SEARCH_MAX_RESULTS = 50
 
   let activeTab = 'workspace'
   let apiStatus = 'unknown'
@@ -214,7 +215,7 @@
   let searchAuthor = ''
   let yearFrom = ''
   let yearTo = ''
-  let searchMaxResults = ''
+  let searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
   let searchSort = 'relevance'
   let includeDownstream = false
   let includeUpstream = false
@@ -1648,6 +1649,7 @@
     seedActionBusy = false
     seedLastRunKey = ''
     searchQuery = ''
+    searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
     searchResults = []
     searchStatus = ''
     searchSource = ''
@@ -2906,7 +2908,7 @@
         author: searchAuthor,
         yearFrom,
         yearTo,
-        maxResults: Math.max(0, Math.trunc(Number(searchMaxResults) || 0)),
+        maxResults: Math.max(1, Math.trunc(Number(searchMaxResults) || DEFAULT_SEARCH_MAX_RESULTS)),
         sort: searchSort,
         includeDownstream: false,
         includeUpstream: false,
@@ -3098,7 +3100,7 @@
     searchAuthor = ''
     yearFrom = ''
     yearTo = ''
-    searchMaxResults = ''
+    searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
     searchSort = 'relevance'
     searchStatus = ''
     searchSource = ''
@@ -4088,7 +4090,7 @@
                   </label>
                   <label>
                     <span>Max results</span>
-                    <input type="number" min="1" step="1" placeholder="No cap" bind:value={searchMaxResults} />
+                    <input type="number" min="1" step="1" placeholder={String(DEFAULT_SEARCH_MAX_RESULTS)} bind:value={searchMaxResults} />
                   </label>
                   <label>
                     <span>Sort</span>

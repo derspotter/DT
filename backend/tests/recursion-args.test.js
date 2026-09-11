@@ -30,6 +30,11 @@ const dumpFile = process.env.ARG_DUMP_FILE
 if (dumpFile) {
   fs.writeFileSync(dumpFile, JSON.stringify(process.argv.slice(2)))
 }
+if (process.env.FAKE_PYTHON_FAIL === 'openalex-rate-limit') {
+  console.error('Traceback (most recent call last):')
+  console.error('dl_lit.utils.OpenAlexRateLimitExceeded: OpenAlex rate limit exceeded. Retry after 123s.')
+  process.exit(1)
+}
 console.log(JSON.stringify({ results: [], source: 'fake-python' }))
 `
     fs.writeFileSync(fakePython, script)
@@ -71,6 +76,7 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
       process.env.RAG_FEEDER_DB_PATH = originalDbPath
     }
     delete process.env.ARG_DUMP_FILE
+    delete process.env.FAKE_PYTHON_FAIL
     delete process.env.RAG_FEEDER_JWT_SECRET
     delete process.env.RAG_ADMIN_USER
     delete process.env.RAG_ADMIN_PASSWORD
@@ -228,6 +234,21 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     })
 
     expect(res.status).toBe(400)
+  })
+
+  test('returns a concise OpenAlex rate limit error', async () => {
+    process.env.FAKE_PYTHON_FAIL = 'openalex-rate-limit'
+    try {
+      const res = await doKeywordSearch({
+        query: 'institutional economics',
+        maxResults: 25,
+      })
+
+      expect(res.status).toBe(429)
+      expect(res.body.error).toBe('OpenAlex rate limit exceeded. Retry after 123s.')
+    } finally {
+      delete process.env.FAKE_PYTHON_FAIL
+    }
   })
 
   test('truncates a fractional max results value', async () => {
