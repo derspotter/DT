@@ -283,7 +283,31 @@ def render_bibtex_entry(row: sqlite3.Row, pdf_name: str, used_keys: set[str]) ->
     return key, "\n".join(lines)
 
 
-def scan_pdf_text(path: Path) -> dict:
+def explain_pdf_warning(message: str) -> tuple[str, str]:
+    """Classify symptoms, without claiming that a damaged PDF is harmless."""
+    lower = message.lower()
+    if "unknown colorspace" in lower:
+        return "colorspace", "Farbraum nicht auflösbar; Bilder/Grafiken können fehlen. Betroffene Seite visuell prüfen."
+    if "cmsopenprofilefrommem" in lower or "icc" in lower:
+        return "color_profile", "Farbprofil konnte nicht korrekt verarbeitet werden. Farbdarstellung prüfen."
+    if "cannot find page" in lower and "page tree" in lower:
+        return "page_reference", "Ungültiger Seitenverweis oder beschädigte Seitenstruktur. Seitenzahl und Vollständigkeit prüfen."
+    if any(value in lower for value in ("syntax", "unknown keyword", "not closed", "page may not be correct")):
+        return "content_syntax", "PDF-Inhalt fehlerhaft oder nicht interpretierbar; Text/Grafiken können unvollständig sein. Seite prüfen."
+    return "pdf_structure", "PDF-Leser meldet ein Problem. Vollständigkeit prüfen; erfolgreiche Textextraktion ist keine Entwarnung."
+
+
+def pdf_scan_log(path: Path, work_id: object, page: int | None, message: str) -> None:
+    # JSON escaping keeps filenames / PDF-originated text from injecting log lines.
+    location = f"PDF-Seite {page}" if page is not None else "Dokument (ohne Seitenzuordnung)"
+    print(
+        f"[PDF-Prüfung] work_id={work_id} Datei={json.dumps(str(path), ensure_ascii=False)} "
+        f"| {location} | {message}",
+        file=sys.stderr, flush=True,
+    )
+
+
+def scan_pdf_text(path: Path, *, work_id: object = None) -> dict:
     try:
         import fitz  # type: ignore
     except Exception as exc:
@@ -292,24 +316,81 @@ def scan_pdf_text(path: Path) -> dict:
             "the backend virtualenv Python or install dl_lit_project/requirements.txt."
         ) from exc
 
-    with fitz.open(path) as doc:
-        pages = len(doc)
-        text_chars = 0
-        nonempty_pages = 0
-        for page in doc:
-            text = page.get_text("text") or ""
-            page_chars = len(text.strip())
-            text_chars += page_chars
-            if page_chars >= 20:
-                nonempty_pages += 1
-    return {
-        "pages": pages,
-        "text_chars": text_chars,
-        "nonempty_pages": nonempty_pages,
+    result = {
+        "pages": 0, "text_chars": 0, "nonempty_pages": 0,
+        "warnings": [], "warning_count": 0,
+        "pymupdf_version": getattr(fitz, "VersionBind", None),
+        "mupdf_version": getattr(fitz, "VersionFitz", None),
     }
+    # This CLI scans serially: MuPDF's warning store and display flags are global.
+    tools = fitz.TOOLS
+    display_errors = tools.mupdf_display_errors()
+    display_warnings = tools.mupdf_display_warnings()
+
+    def collect(page: int | None, stage: str) -> None:
+        raw = tools.mupdf_warnings(reset=True).strip()
+        if not raw:
+            return
+        category, explanation = explain_pdf_warning(raw)
+        result["warnings"].append({
+            "page": page, "stage": stage, "category": category,
+            "message": raw, "explanation": explanation,
+        })
+        result["warning_count"] += 1
+        # Keep the terminal short; the full diagnostic block remains in JSON.
+        sample = raw.splitlines()[0][:240]
+        pdf_scan_log(path, work_id, page,
+                     f"WARNUNG: {explanation} Original (Auszug): {json.dumps(sample, ensure_ascii=False)}")
+
+    doc = None
+    page_number = None
+    stage = "open"
+    try:
+        tools.reset_mupdf_warnings()
+        tools.mupdf_display_errors(False)
+        tools.mupdf_display_warnings(False)
+        doc = fitz.open(path)
+        result["pages"] = len(doc)
+        collect(None, stage)
+        for index in range(result["pages"]):
+            page_number = index + 1
+            stage = "extract_text"
+            try:
+                text = doc[index].get_text("text") or ""
+                page_chars = len(text.strip())
+                result["text_chars"] += page_chars
+                if page_chars >= 20:
+                    result["nonempty_pages"] += 1
+            finally:
+                collect(page_number, stage)
+    except Exception as exc:
+        collect(page_number, stage)
+        result.update(error=str(exc), error_page=page_number, error_stage=stage)
+        pdf_scan_log(path, work_id, page_number,
+                     "FEHLER: Textextraktion dieser Datei abgebrochen; Ergebnis kann unvollständig sein. "
+                     f"Datei prüfen/ersetzen. Original: {json.dumps(str(exc), ensure_ascii=False)}")
+    finally:
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception as exc:
+            if "error" not in result:
+                result.update(error=str(exc), error_page=None, error_stage="close")
+            pdf_scan_log(path, work_id, None,
+                         f"FEHLER beim Schließen der PDF: {json.dumps(str(exc), ensure_ascii=False)}")
+        finally:
+            # Also drain close-time diagnostics on exceptions, before the next PDF.
+            try:
+                collect(None, "close")
+            finally:
+                tools.mupdf_display_errors(display_errors)
+                tools.mupdf_display_warnings(display_warnings)
+    return result
 
 
 def text_scan_reason(scan: dict, min_chars: int, min_page_ratio: float) -> str:
+    if "error" in scan:
+        return "error"
     text_chars = int(scan.get("text_chars") or 0)
     pages = int(scan.get("pages") or 0)
     nonempty_pages = int(scan.get("nonempty_pages") or 0)
@@ -317,7 +398,7 @@ def text_scan_reason(scan: dict, min_chars: int, min_page_ratio: float) -> str:
         return "empty_text"
     if text_chars < min_chars or nonempty_pages / max(pages, 1) < min_page_ratio:
         return "low_text"
-    return "ok"
+    return "ok_with_warnings" if scan.get("warning_count") else "ok"
 
 
 def scan_item_text(item: dict, draft_dir: Path, min_chars: int, min_page_ratio: float) -> dict:
@@ -331,17 +412,26 @@ def scan_item_text(item: dict, draft_dir: Path, min_chars: int, min_page_ratio: 
         "target_file": item.get("target_file"),
         "source_file_path": source_file,
         "staged_file": staged_file,
+        "pdf_path": str(pdf_path),
     }
     if not pdf_path.exists():
         result["reason"] = "missing"
+        pdf_scan_log(pdf_path, item.get("work_id"), None, "FEHLER: PDF-Datei fehlt; keine Textextraktion möglich.")
         return result
     try:
-        scan = scan_pdf_text(pdf_path)
+        scan = scan_pdf_text(pdf_path, work_id=item.get("work_id"))
         result.update(scan)
         result["reason"] = text_scan_reason(scan, min_chars, min_page_ratio)
+        if result["reason"] == "ok_with_warnings":
+            pdf_scan_log(pdf_path, item.get("work_id"), None,
+                         f"Text extrahiert ({scan['text_chars']} Zeichen), aber mit PDF-Warnungen. "
+                         "Lauf geht weiter; keine automatische OCR nur wegen dieser Warnungen. "
+                         "Inhaltliche Vollständigkeit nicht bestätigt.")
     except Exception as exc:
         result["reason"] = "error"
         result["error"] = str(exc)
+        pdf_scan_log(pdf_path, item.get("work_id"), None,
+                     f"FEHLER: PDF-Prüfung fehlgeschlagen. Original: {json.dumps(str(exc), ensure_ascii=False)}")
     return result
 
 
@@ -349,6 +439,9 @@ def summarize_text_scan(results: list[dict]) -> dict:
     summary = {
         "total": len(results),
         "ok": 0,
+        "ok_with_warnings": 0,
+        "warning_files": 0,
+        "warned": [],
         "low_text": 0,
         "empty_text": 0,
         "missing": 0,
@@ -360,6 +453,8 @@ def summarize_text_scan(results: list[dict]) -> dict:
         reason = result.get("reason")
         if reason == "ok":
             summary["ok"] += 1
+        elif reason == "ok_with_warnings":
+            summary["ok_with_warnings"] += 1
         elif reason == "low_text":
             summary["low_text"] += 1
             summary["problematic"].append(result)
@@ -372,6 +467,9 @@ def summarize_text_scan(results: list[dict]) -> dict:
         else:
             summary["errors"] += 1
             summary["problematic"].append(result)
+        if result.get("warning_count"):
+            summary["warning_files"] += 1
+            summary["warned"].append(result)
         if isinstance(result.get("text_chars"), int):
             text_char_counts.append(result["text_chars"])
 

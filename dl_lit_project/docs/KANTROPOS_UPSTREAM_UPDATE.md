@@ -154,6 +154,29 @@ The default weak-text thresholds are:
 
 The scan writes `text-scan.json` into the draft when `--write` is used.
 
+### PDF warnings during text scanning
+
+Diagnostics on stderr now identify the work ID, PDF path and **1-based PDF page**
+(not the printed page number). Open/close warnings have no page number. Each
+warning includes a German explanation and a short original-message excerpt.
+Full MuPDF messages, processing stage and PyMuPDF/MuPDF versions remain in the
+JSON report. Repeated messages are grouped per page/processing stage;
+`warning_count` counts these diagnostic blocks, not individual engine messages.
+
+- `ok`: sufficient text and no MuPDF warnings during this scan; this is not a visual quality check.
+- `ok_with_warnings`: sufficient text, but the PDF reader reported problems.
+  Text/graphics may be incomplete. The run continues; warnings alone do not trigger OCR.
+- `low_text` / `empty_text`: still selected for OCR, including when warnings also occurred.
+- `error`: extraction failed; any partial text counts and collected warnings are retained.
+  Check/replace the PDF; this status is not automatically selected for OCR.
+
+The summary separates `ok_with_warnings` from clean `ok` files. `warning_files`
+and `warned` include all files with warnings, including weak/failed files.
+`problematic_count` and `--fail-on-weak` retain their previous meaning: weak,
+missing or failed PDFs. Warnings alone do not make this flag fail. Keep stdout
+for JSON and stderr for live diagnostic messages. These diagnostics cover DT's
+text scan (also run before OCR), not the external OCR or Kantropos markdown engines.
+
 Preferred OCR runtime: Rechtmaschine branch `codex/debian-rag-ocr`. On that branch, the normal endpoint is `service_manager.py` on port `8004`, which lazy-loads `ocr/ocr_service_hibernate.py` on port `9003`. The backend processes PDFs page-by-page with `pypdfium2`, accepts `X-Request-ID`, and returns OCR text plus page/confidence/VRAM metadata.
 
 Run or reach that service, then OCR weak staged PDFs through the service-manager endpoint:
