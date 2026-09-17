@@ -154,6 +154,35 @@ The default weak-text thresholds are:
 
 The scan writes `text-scan.json` into the draft when `--write` is used.
 
+### Progress display
+
+`scan-text` and `ocr` print progress to stderr at start, approximately every
+10 seconds, and at the end. This also works in `rag-flow` and redirected logs;
+stdout remains JSON. Each line shows processed/total PDFs, percentage, elapsed
+time, outcome counts and the current work ID/file. Text scanning also shows the
+current 1-based PDF page. No ETA is claimed because PDF/OCR durations vary widely.
+
+The phases are labelled `Textprüfung`, `Textprüfung vor OCR (erneuter Scan)`
+and `OCR`. The second scan is existing behavior: OCR checks the draft again
+before selecting weak PDFs. OCR counts successful, skipped (existing text
+sidecar) and failed files separately. The percentage counts processed files,
+not successful files, pages, or progress through the entire RAG workflow.
+
+During an OCR request the heartbeat indicates that the client is still waiting;
+it does not measure server-side OCR progress or prove that the OCR server is
+healthy. A native PDF operation that holds Python's GIL can delay heartbeats.
+Interruptions and errors that terminate processing print `Abgebrochen` instead
+of a normal end marker. Progress and PDF warning lines share one bounded output
+queue and are written as whole lines. Broken output streams do not replace
+processing exceptions; shutdown waits at most 250 ms for diagnostic output.
+With a stalled output consumer, terminal messages (including the final line)
+may be delayed or dropped rather than blocking processing. Full PDF warnings
+remain in the JSON report. This best-effort behavior applies to diagnostics,
+not to the normal JSON stdout output or writing the report/manifest files. This display
+does not cover external Kantropos markdown generation or background embedding.
+Already-running Python processes keep their previous code; new invocations
+pick up the progress display after deployment.
+
 ### PDF warnings during text scanning
 
 Diagnostics on stderr now identify the work ID, PDF path and **1-based PDF page**

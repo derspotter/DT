@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import sqlite3
 import sys
+import threading
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +26,114 @@ DEFAULT_CORPORA_ROOT = "/data/projects/kantropos/corpora"
 DEFAULT_MIN_TEXT_CHARS = 500
 DEFAULT_MIN_TEXT_PAGE_RATIO = 0.25
 DEFAULT_OCR_SERVICE_URL = "http://127.0.0.1:8004"
+
+
+class ProgressReporter:
+    """CLI-only heartbeat; the worker thread never touches MuPDF or OCR state."""
+
+    def __init__(self, label: str, total: int, interval: float = 10.0):
+        self.label = label
+        self.total = total
+        self.interval = interval
+        self.done = 0
+        self.counts: dict[str, int] = {}
+        self.current = "-"
+        self.page = ""
+        self.started = time.monotonic()
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.messages: queue.Queue[tuple[str, bool]] = queue.Queue(maxsize=256)
+        self.output_failed = threading.Event()
+        self.stream = None
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+
+    def __enter__(self):
+        self.stream = sys.stderr
+        self.emit("Start")
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.log(self.format_line("Abgebrochen" if exc_type else "Beendet"), final=True)
+        self.stop.set()
+        # A stalled log consumer must not hold up the import or hide its error.
+        self.thread.join(timeout=0.25)
+
+    def _heartbeat(self):
+        next_beat = time.monotonic() + self.interval
+        while not self.stop.is_set() or not self.messages.empty():
+            try:
+                line, final = self.messages.get(timeout=max(0, next_beat - time.monotonic()))
+            except queue.Empty:
+                line, final = None, False
+            if line is not None and not write_diagnostic_line(self.stream, line):
+                self.output_failed.set()
+                return
+            if final:
+                return
+            if not self.stop.is_set() and time.monotonic() >= next_beat:
+                if not write_diagnostic_line(self.stream, self.format_line("In Arbeit")):
+                    self.output_failed.set()
+                    return
+                next_beat = time.monotonic() + self.interval
+
+    def log(self, line: str, *, final: bool = False):
+        if self.output_failed.is_set():
+            return
+        try:
+            self.messages.put_nowait((line, final))
+        except queue.Full:
+            # Console output is best-effort. PDF diagnostics remain in JSON.
+            pass
+
+    def start_item(self, item: dict):
+        name = item.get("target_file") or item.get("staged_file") or item.get("source_file_path") or "?"
+        with self.lock:
+            self.current = f"work_id={item.get('work_id')} Datei={json.dumps(str(name), ensure_ascii=False)}"
+            self.page = ""
+
+    def update_page(self, page: int, total: int):
+        with self.lock:
+            self.page = f" | PDF-Seite {page}/{total}"
+
+    def advance(self, status: str):
+        with self.lock:
+            self.done += 1
+            self.counts[status] = self.counts.get(status, 0) + 1
+            self.current = "-"
+            self.page = ""
+
+    def emit(self, state: str):
+        self.log(self.format_line(state))
+
+    def format_line(self, state: str) -> str:
+        with self.lock:
+            percent = 100 * self.done / self.total if self.total else 100
+            elapsed = int(time.monotonic() - self.started)
+            duration = f"{elapsed // 3600:02}:{elapsed // 60 % 60:02}:{elapsed % 60:02}"
+            counts = " ".join(f"{key}={value}" for key, value in sorted(self.counts.items()))
+            line = (f"[{self.label}] {self.done}/{self.total} PDFs ({percent:.1f}%) | "
+                    f"Laufzeit {duration} | {state} | {counts or 'Noch keine Datei abgeschlossen'} | "
+                    f"aktuell {self.current}{self.page}")
+        return line
+
+
+def write_diagnostic_line(stream, line: str) -> bool:
+    """One write per line; output failures never replace processing errors."""
+    try:
+        try:
+            fd = stream.fileno()
+        except (AttributeError, OSError, ValueError):
+            stream.write(line + "\n")
+            stream.flush()
+        else:
+            # Avoid holding Python's buffered-stderr lock in a stalled daemon
+            # thread (which could otherwise also block interpreter shutdown).
+            data = (line + "\n").encode(getattr(stream, "encoding", None) or "utf-8", errors="backslashreplace")
+            return os.write(fd, data) == len(data)
+        return True
+    except Exception:
+        return False
 
 
 def slugify(value: str) -> str:
@@ -297,17 +408,21 @@ def explain_pdf_warning(message: str) -> tuple[str, str]:
     return "pdf_structure", "PDF-Leser meldet ein Problem. Vollständigkeit prüfen; erfolgreiche Textextraktion ist keine Entwarnung."
 
 
-def pdf_scan_log(path: Path, work_id: object, page: int | None, message: str) -> None:
+def pdf_scan_log(path: Path, work_id: object, page: int | None, message: str,
+                 *, progress: ProgressReporter | None = None) -> None:
     # JSON escaping keeps filenames / PDF-originated text from injecting log lines.
     location = f"PDF-Seite {page}" if page is not None else "Dokument (ohne Seitenzuordnung)"
-    print(
+    line = (
         f"[PDF-Prüfung] work_id={work_id} Datei={json.dumps(str(path), ensure_ascii=False)} "
-        f"| {location} | {message}",
-        file=sys.stderr, flush=True,
+        f"| {location} | {message}"
     )
+    if progress:
+        progress.log(line)
+    else:
+        write_diagnostic_line(sys.stderr, line)
 
 
-def scan_pdf_text(path: Path, *, work_id: object = None) -> dict:
+def scan_pdf_text(path: Path, *, work_id: object = None, progress: ProgressReporter | None = None) -> dict:
     try:
         import fitz  # type: ignore
     except Exception as exc:
@@ -340,7 +455,7 @@ def scan_pdf_text(path: Path, *, work_id: object = None) -> dict:
         # Keep the terminal short; the full diagnostic block remains in JSON.
         sample = raw.splitlines()[0][:240]
         pdf_scan_log(path, work_id, page,
-                     f"WARNUNG: {explanation} Original (Auszug): {json.dumps(sample, ensure_ascii=False)}")
+                     f"WARNUNG: {explanation} Original (Auszug): {json.dumps(sample, ensure_ascii=False)}", progress=progress)
 
     doc = None
     page_number = None
@@ -354,6 +469,8 @@ def scan_pdf_text(path: Path, *, work_id: object = None) -> dict:
         collect(None, stage)
         for index in range(result["pages"]):
             page_number = index + 1
+            if progress:
+                progress.update_page(page_number, result["pages"])
             stage = "extract_text"
             try:
                 text = doc[index].get_text("text") or ""
@@ -368,7 +485,7 @@ def scan_pdf_text(path: Path, *, work_id: object = None) -> dict:
         result.update(error=str(exc), error_page=page_number, error_stage=stage)
         pdf_scan_log(path, work_id, page_number,
                      "FEHLER: Textextraktion dieser Datei abgebrochen; Ergebnis kann unvollständig sein. "
-                     f"Datei prüfen/ersetzen. Original: {json.dumps(str(exc), ensure_ascii=False)}")
+                     f"Datei prüfen/ersetzen. Original: {json.dumps(str(exc), ensure_ascii=False)}", progress=progress)
     finally:
         try:
             if doc is not None:
@@ -377,7 +494,7 @@ def scan_pdf_text(path: Path, *, work_id: object = None) -> dict:
             if "error" not in result:
                 result.update(error=str(exc), error_page=None, error_stage="close")
             pdf_scan_log(path, work_id, None,
-                         f"FEHLER beim Schließen der PDF: {json.dumps(str(exc), ensure_ascii=False)}")
+                         f"FEHLER beim Schließen der PDF: {json.dumps(str(exc), ensure_ascii=False)}", progress=progress)
         finally:
             # Also drain close-time diagnostics on exceptions, before the next PDF.
             try:
@@ -401,7 +518,8 @@ def text_scan_reason(scan: dict, min_chars: int, min_page_ratio: float) -> str:
     return "ok_with_warnings" if scan.get("warning_count") else "ok"
 
 
-def scan_item_text(item: dict, draft_dir: Path, min_chars: int, min_page_ratio: float) -> dict:
+def scan_item_text(item: dict, draft_dir: Path, min_chars: int, min_page_ratio: float,
+                   *, progress: ProgressReporter | None = None) -> dict:
     staged_file = str(item.get("staged_file") or "")
     source_file = str(item.get("source_file_path") or item.get("source_file") or "")
     pdf_path = draft_dir / staged_file if staged_file else Path(source_file)
@@ -416,22 +534,22 @@ def scan_item_text(item: dict, draft_dir: Path, min_chars: int, min_page_ratio: 
     }
     if not pdf_path.exists():
         result["reason"] = "missing"
-        pdf_scan_log(pdf_path, item.get("work_id"), None, "FEHLER: PDF-Datei fehlt; keine Textextraktion möglich.")
+        pdf_scan_log(pdf_path, item.get("work_id"), None, "FEHLER: PDF-Datei fehlt; keine Textextraktion möglich.", progress=progress)
         return result
     try:
-        scan = scan_pdf_text(pdf_path, work_id=item.get("work_id"))
+        scan = scan_pdf_text(pdf_path, work_id=item.get("work_id"), progress=progress)
         result.update(scan)
         result["reason"] = text_scan_reason(scan, min_chars, min_page_ratio)
         if result["reason"] == "ok_with_warnings":
             pdf_scan_log(pdf_path, item.get("work_id"), None,
                          f"Text extrahiert ({scan['text_chars']} Zeichen), aber mit PDF-Warnungen. "
                          "Lauf geht weiter; keine automatische OCR nur wegen dieser Warnungen. "
-                         "Inhaltliche Vollständigkeit nicht bestätigt.")
+                         "Inhaltliche Vollständigkeit nicht bestätigt.", progress=progress)
     except Exception as exc:
         result["reason"] = "error"
         result["error"] = str(exc)
         pdf_scan_log(pdf_path, item.get("work_id"), None,
-                     f"FEHLER: PDF-Prüfung fehlgeschlagen. Original: {json.dumps(str(exc), ensure_ascii=False)}")
+                     f"FEHLER: PDF-Prüfung fehlgeschlagen. Original: {json.dumps(str(exc), ensure_ascii=False)}", progress=progress)
     return result
 
 
@@ -765,13 +883,22 @@ def load_draft_manifest(draft_dir: Path) -> dict:
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
+def scan_items_with_progress(items: list[dict], draft_dir: Path, args: argparse.Namespace) -> list[dict]:
+    results = []
+    with ProgressReporter(getattr(args, "progress_label", "Textprüfung"), len(items)) as progress:
+        for item in items:
+            progress.start_item(item)
+            result = scan_item_text(item, draft_dir, args.min_text_chars, args.min_text_page_ratio,
+                                    progress=progress)
+            results.append(result)
+            progress.advance(result["reason"])
+    return results
+
+
 def scan_draft_items(args: argparse.Namespace) -> tuple[Path, list[dict], dict]:
     draft_dir = Path(args.draft_dir)
     manifest = load_draft_manifest(draft_dir)
-    results = [
-        scan_item_text(item, draft_dir, args.min_text_chars, args.min_text_page_ratio)
-        for item in manifest.get("items", [])
-    ]
+    results = scan_items_with_progress(manifest.get("items", []), draft_dir, args)
     summary = summarize_text_scan(results)
     return draft_dir, results, summary
 
@@ -807,7 +934,7 @@ def command_scan_text(args: argparse.Namespace) -> None:
         rows = pending_rows(conn, target["id"], metadata_bib)
     limit = args.limit if args.limit and args.limit > 0 else None
     selected_rows = rows[:limit] if limit else rows
-    results = []
+    items = []
     for row in selected_rows:
         source_path = Path(str(row["file_path"] or ""))
         item = {
@@ -816,7 +943,8 @@ def command_scan_text(args: argparse.Namespace) -> None:
             "year": row["year"],
             "source_file_path": str(source_path),
         }
-        results.append(scan_item_text(item, Path("/"), args.min_text_chars, args.min_text_page_ratio))
+        items.append(item)
+    results = scan_items_with_progress(items, Path("/"), args)
     summary = summarize_text_scan(results)
     output = {
         "target": target,
@@ -859,6 +987,7 @@ def command_ocr(args: argparse.Namespace) -> None:
         draft_dir=args.draft_dir,
         min_text_chars=args.min_text_chars,
         min_text_page_ratio=args.min_text_page_ratio,
+        progress_label="Textprüfung vor OCR (erneuter Scan)",
     )
     _, scan_results, scan_summary = scan_draft_items(scan_args)
     scan_by_target = {item.get("target_file"): item for item in scan_results}
@@ -873,56 +1002,61 @@ def command_ocr(args: argparse.Namespace) -> None:
     completed = []
     skipped = []
     failed = []
-    for item, scan in selected:
-        staged_pdf = draft_dir / item["staged_file"]
-        text_name = f"{Path(item['target_file']).stem}.txt"
-        text_rel = str(Path("files") / text_name)
-        text_path = draft_dir / text_rel
-        if text_path.exists() and not args.overwrite:
-            skipped.append({
-                "work_id": item.get("work_id"),
-                "target_file": item.get("target_file"),
-                "ocr_text_file": text_rel,
-                "reason": "text_sidecar_exists",
-            })
-            item["ocr_text_file"] = text_rel
-            continue
-        try:
-            request_id = f"dt-upstream-{item.get('work_id')}-{timestamp()}"
-            result = ocr_pdf(ocr_url, staged_pdf, args.timeout, request_id)
-            full_text = str(result.get("full_text") or result.get("text") or "").strip()
-            if not full_text:
-                raise RuntimeError("OCR response did not contain full_text/text")
-            text_path.write_text(full_text + "\n", encoding="utf-8")
-            item["ocr_text_file"] = text_rel
-            item["ocr"] = {
-                "created_at": datetime.now().isoformat(),
-                "service_url": ocr_url,
-                "request_id": result.get("request_id") or request_id,
-                "source_reason": scan.get("reason"),
-                "page_count": result.get("page_count"),
-                "avg_confidence": result.get("avg_confidence", result.get("confidence")),
-                "text_chars": len(full_text),
-                "metadata": result.get("metadata"),
-            }
-            completed.append({
-                "work_id": item.get("work_id"),
-                "target_file": item.get("target_file"),
-                "ocr_text_file": text_rel,
-                "request_id": result.get("request_id") or request_id,
-                "text_chars": len(full_text),
-                "page_count": result.get("page_count"),
-                "avg_confidence": result.get("avg_confidence", result.get("confidence")),
-            })
-        except Exception as exc:
-            failed.append({
-                "work_id": item.get("work_id"),
-                "target_file": item.get("target_file"),
-                "error": str(exc),
-            })
-            if not args.keep_going:
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-                raise
+    with ProgressReporter("OCR", len(selected)) as progress:
+        for item, scan in selected:
+            progress.start_item(item)
+            staged_pdf = draft_dir / item["staged_file"]
+            text_name = f"{Path(item['target_file']).stem}.txt"
+            text_rel = str(Path("files") / text_name)
+            text_path = draft_dir / text_rel
+            if text_path.exists() and not args.overwrite:
+                skipped.append({
+                    "work_id": item.get("work_id"),
+                    "target_file": item.get("target_file"),
+                    "ocr_text_file": text_rel,
+                    "reason": "text_sidecar_exists",
+                })
+                item["ocr_text_file"] = text_rel
+                progress.advance("übersprungen")
+                continue
+            try:
+                request_id = f"dt-upstream-{item.get('work_id')}-{timestamp()}"
+                result = ocr_pdf(ocr_url, staged_pdf, args.timeout, request_id)
+                full_text = str(result.get("full_text") or result.get("text") or "").strip()
+                if not full_text:
+                    raise RuntimeError("OCR response did not contain full_text/text")
+                text_path.write_text(full_text + "\n", encoding="utf-8")
+                item["ocr_text_file"] = text_rel
+                item["ocr"] = {
+                    "created_at": datetime.now().isoformat(),
+                    "service_url": ocr_url,
+                    "request_id": result.get("request_id") or request_id,
+                    "source_reason": scan.get("reason"),
+                    "page_count": result.get("page_count"),
+                    "avg_confidence": result.get("avg_confidence", result.get("confidence")),
+                    "text_chars": len(full_text),
+                    "metadata": result.get("metadata"),
+                }
+                completed.append({
+                    "work_id": item.get("work_id"),
+                    "target_file": item.get("target_file"),
+                    "ocr_text_file": text_rel,
+                    "request_id": result.get("request_id") or request_id,
+                    "text_chars": len(full_text),
+                    "page_count": result.get("page_count"),
+                    "avg_confidence": result.get("avg_confidence", result.get("confidence")),
+                })
+                progress.advance("erfolgreich")
+            except Exception as exc:
+                failed.append({
+                    "work_id": item.get("work_id"),
+                    "target_file": item.get("target_file"),
+                    "error": str(exc),
+                })
+                progress.advance("fehlgeschlagen")
+                if not args.keep_going:
+                    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                    raise
 
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     output = {
