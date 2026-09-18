@@ -11,6 +11,9 @@ def load_manager():
         raise RuntimeError("A test backend port must not be used for the production manager")
     configure_environment()
     os.environ["SERVICE_MANAGER_ROLE"] = "ocr"
+    # The legacy manager otherwise unloads unrelated Ollama models even in
+    # OCR-only mode. DT must not evict other services from this shared GPU.
+    os.environ["KEEP_SERVICES_RUNNING"] = "1"
     source = Path(os.environ.get("RAG_FEEDER_OCR_HOME", "/home/spott/rechtmaschine-debian-rag-ocr")) / "service_manager.py"
     spec = importlib.util.spec_from_file_location("dt_ocr_manager", source)
     manager = importlib.util.module_from_spec(spec)
@@ -20,6 +23,7 @@ def load_manager():
         "venv": str(python_path()),
         "start_cmd": [str(python_path()), str(DIRECTORY / "launch_backend.py")],
         "cwd": str(DIRECTORY),
+        "process_name": "ocr_service_hibernate:app",
         "process_match": str(python_path()) + " -m uvicorn ocr_service_hibernate:app --host 127.0.0.1 --port 9003",
         "env": {},
     })

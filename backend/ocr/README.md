@@ -11,6 +11,8 @@ This is a runtime dependency, not a new push or modification to that repository.
 The manager must include the long-request timeout fix (local production commit `1948e87`):
 3600 seconds to its backend and no legacy retry on timeout. DT's OCR client waits 3660 seconds.
 Only the `ocr` role is enabled. The launcher points the manager at this DT backend and runtime.
+It also forces `KEEP_SERVICES_RUNNING=1` before importing the manager, so switching to OCR
+does not unload unrelated Ollama models or stop other GPU services.
 
 ## Dependencies
 
@@ -56,5 +58,8 @@ This change does not start corpus import, markdown generation or embeddings.
 
 The production GPU is also used by other processes. During the first isolated test, two Ollama
 models occupied most of its 20 GB and the test process aborted with a CUDA illegal-access error.
-Those models were not stopped or reconfigured. Check GPU headroom before large OCR runs;
+Those models were not stopped or reconfigured during the isolated test. The first manager-path
+test subsequently exposed legacy automatic Ollama eviction (two resident models were unloaded).
+The DT launcher now disables that policy; Ollama itself was not stopped or reconfigured.
+Check GPU headroom before large OCR runs;
 the OCR queue only serializes OCR requests, not workloads submitted to other GPU services.

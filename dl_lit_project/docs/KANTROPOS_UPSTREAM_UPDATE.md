@@ -245,16 +245,21 @@ missing or failed PDFs. Warnings alone do not make this flag fail. Keep stdout
 for JSON and stderr for live diagnostic messages. These diagnostics cover DT's
 text scan (also run before OCR), not the external OCR or Kantropos markdown engines.
 
-Preferred OCR runtime: Rechtmaschine branch `codex/debian-rag-ocr`. On that branch, the normal endpoint is `service_manager.py` on port `8004`, which lazy-loads `ocr/ocr_service_hibernate.py` on port `9003`. The backend processes PDFs page-by-page with `pypdfium2`, accepts `X-Request-ID`, and returns OCR text plus page/confidence/VRAM metadata.
+Preferred OCR runtime: DT's Debian-matched v6 profile, documented in
+[`backend/ocr/README.md`](../../backend/ocr/README.md). DT's `launch_manager.py` serves port
+`8004` and lazy-loads DT's `ocr_service_hibernate.py` on loopback port `9003`.
+The backend processes PDFs page-by-page with `pypdfium2`, accepts `X-Request-ID`, and returns
+OCR text plus page/confidence/VRAM metadata. The HTTP/queue manager is still imported from
+the legacy checkout below; the backend code and pinned runtime now belong to DT.
 
 Run or reach that service, then OCR weak staged PDFs through the service-manager endpoint:
 
 ```bash
-RAG_FEEDER_OCR_SERVICE_URL=http://<rechtmaschine-host>:8004 \
+RAG_FEEDER_OCR_SERVICE_URL=http://<ocr-host>:8004 \
   bash backend/scripts/kantropos_upstream.sh ocr <draft_dir> --keep-going
 ```
 
-The OCR client expects this Rechtmaschine contract:
+The OCR client preserves this HTTP contract:
 
 ```text
 POST /ocr
@@ -273,19 +278,24 @@ files/<target-pdf-stem>.txt
 
 It also records `ocr_text_file` and OCR statistics in `manifest.json`. Re-run `scan-text` after OCR if you want to confirm which PDFs were OCR sidecar-backed before applying.
 
-The wrapper can start the local Rechtmaschine OCR manager automatically when needed:
+The wrapper can start the DT OCR manager automatically when needed:
 
 ```bash
 bash backend/scripts/kantropos_upstream.sh ocr <draft_dir> --keep-going
 ```
 
-By default it expects the Rechtmaschine checkout at:
+By default it expects the legacy manager dependency at:
 
 ```text
 /home/spott/rechtmaschine-debian-rag-ocr
 ```
 
-It starts `service_manager.py` in OCR-only mode on the host (`127.0.0.1:8004`), discovers the Docker host gateway for `rag_feeder_backend`, and passes the container-reachable OCR URL into the backend command. Override paths/URLs with:
+It starts `backend/ocr/launch_manager.py` using DT's `.runtime/ocr/debian-20260918/bin/python`
+in OCR-only mode on the host, discovers the Docker host gateway for `rag_feeder_backend`,
+and passes the container-reachable OCR URL into the backend command. The manager must be
+reachable from that gateway; port `9003` remains loopback-only. The launcher disables
+automatic eviction of unrelated GPU services. Override the prepared runtime with
+`DT_OCR_VENV=/path/to/venv`, or paths/URLs with:
 
 ```bash
 RAG_FEEDER_OCR_HOME=/path/to/rechtmaschine \

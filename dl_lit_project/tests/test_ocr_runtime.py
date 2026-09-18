@@ -65,16 +65,23 @@ class RuntimeTests(unittest.TestCase):
             spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
             legacy = Path(directory) / 'service_manager.py'
-            original = 'SERVICES = {"ocr": {"use_http_service": True, "port": 9003}}\n'
+            original = ('import os\n'
+                        'KEEP_SERVICES_RUNNING = os.environ.get("KEEP_SERVICES_RUNNING") == "1"\n'
+                        'SERVICES = {"ocr": {"use_http_service": True, "port": 9003, '
+                        '"process_name": "ocr_service_hibernate.py"}}\n')
             legacy.write_text(original)
             with patch.object(module, 'configure_environment'), \
-                    patch.dict(os.environ, {'RAG_FEEDER_OCR_HOME': directory}, clear=True), \
+                    patch.dict(os.environ, {'RAG_FEEDER_OCR_HOME': directory,
+                                           'KEEP_SERVICES_RUNNING': '0'}, clear=True), \
                     patch.dict(sys.modules):
                 manager = module.load_manager()
                 service = manager.SERVICES['ocr']
                 self.assertEqual(service['venv'], str(runtime.python_path()))
                 self.assertEqual(service['start_cmd'][1], str(ROOT / 'launch_backend.py'))
                 self.assertIn('--port 9003', service['process_match'])
+                self.assertEqual(service['process_name'], 'ocr_service_hibernate:app')
+                self.assertIn(service['process_name'], service['process_match'])
+                self.assertTrue(manager.KEEP_SERVICES_RUNNING)
                 self.assertEqual(os.environ['SERVICE_MANAGER_ROLE'], 'ocr')
             self.assertEqual(legacy.read_text(), original)
 
