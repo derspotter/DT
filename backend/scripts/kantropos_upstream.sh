@@ -10,6 +10,8 @@ OCR_HOME="${RAG_FEEDER_OCR_HOME:-/home/spott/rechtmaschine-debian-rag-ocr}"
 OCR_HOST_URL="${RAG_FEEDER_OCR_HOST_URL:-http://127.0.0.1:8004}"
 OCR_CONTAINER_URL="${RAG_FEEDER_OCR_SERVICE_URL:-}"
 CORPUS_UPDATER_CONTAINER="${RAG_FEEDER_KANTROPOS_UPDATER_CONTAINER:-kantropos-corpus-updater}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+DT_OCR_PYTHON="${DT_OCR_VENV:-$REPO_DIR/.runtime/ocr/debian-20260918}/bin/python"
 FLOW_STAGE="initialization"
 FLOW_DRAFT=""
 trap 'status=$?; echo "STOP: stage $FLOW_STAGE failed (exit $status). Later stages were NOT started. Saved draft: ${FLOW_DRAFT:-none}." >&2; exit "$status"' ERR
@@ -72,22 +74,22 @@ ensure_ocr_service() {
   if curl -fsS "$OCR_HOST_URL/health" >/dev/null 2>&1; then
     return
   fi
-  if [[ ! -x "$OCR_HOME/ocr/.venv_hpi/bin/python" ]]; then
-    echo "Missing OCR venv at $OCR_HOME/ocr/.venv_hpi." >&2
+  if [[ ! -x "$DT_OCR_PYTHON" ]]; then
+    echo "Missing DT OCR runtime at $DT_OCR_PYTHON. See backend/ocr/README.md." >&2
     exit 1
   fi
   if [[ ! -f "$OCR_HOME/service_manager.py" ]]; then
     echo "Missing Rechtmaschine service_manager.py at $OCR_HOME." >&2
     exit 1
   fi
-  mkdir -p "$OCR_HOME/logs"
+  mkdir -p "$REPO_DIR/logs"
   (
-    cd "$OCR_HOME"
+    cd "$REPO_DIR"
     env \
       SERVICE_MANAGER_ROLE=ocr \
-      OCR_SERVICE_FILE=ocr_service_hibernate.py \
-      setsid ocr/.venv_hpi/bin/python service_manager.py \
-        >> "$OCR_HOME/logs/service_manager.log" 2>&1 < /dev/null &
+      RAG_FEEDER_OCR_HOME="$OCR_HOME" \
+      setsid "$DT_OCR_PYTHON" backend/ocr/launch_manager.py \
+        >> "$REPO_DIR/logs/ocr-manager.log" 2>&1 < /dev/null &
   )
   for _ in $(seq 1 60); do
     if curl -fsS "$OCR_HOST_URL/health" >/dev/null 2>&1; then
@@ -96,7 +98,7 @@ ensure_ocr_service() {
     sleep 1
   done
   echo "OCR service did not become healthy at $OCR_HOST_URL." >&2
-  echo "Check $OCR_HOME/logs/service_manager.log" >&2
+  echo "Check $REPO_DIR/logs/ocr-manager.log" >&2
   exit 1
 }
 

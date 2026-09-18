@@ -1,0 +1,27 @@
+{
+  "profile": "debian-20260918",
+  "source_sha256": "545934f9fd7a37a15467e0386c7614efd03e65a7834351dabfc6c8987bf6f5ff",
+  "packages": {
+    "paddleocr": "3.7.0",
+    "paddlex": "3.7.2",
+    "paddlepaddle-gpu": "3.2.0",
+    "pypdfium2": "5.3.0",
+    "ultra-infer-gpu-python": "1.2.0"
+  },
+  "environment": {
+    "PYTHONUNBUFFERED": "1",
+    "OCR_DET_MODEL_NAME": "PP-OCRv6_medium_det",
+    "OCR_REC_MODEL_NAME": "PP-OCRv6_medium_rec",
+    "OCR_USE_UNWARPING": "true",
+    "OCR_USE_DOC_ORIENTATION": "1",
+    "OCR_USE_TEXTLINE_ORIENTATION": "1",
+    "OCR_ENABLE_HPI": "1",
+    "OCR_HPI_BACKEND": "paddle",
+    "OCR_RETURN_WORD_BOX": "1",
+    "OCR_PDF_RENDER_DPI": "200",
+    "OCR_PDF_MAX_RENDER_LONG_EDGE": "2600",
+    "OCR_PDF_MAX_RENDER_MEGAPIXELS": "8.0",
+    "OCR_HTTP_TIMEOUT_SECONDS": "3600",
+    "DISABLE_MODEL_SOURCE_CHECK": "True"
+  }
+}

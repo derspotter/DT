@@ -82,6 +82,7 @@ Scraper_first_version/
 /.codex
 /.codex/
 /.tmp/
+/.runtime/
 /logs/
 
 # Invoices / billing docs (contain personal data: IBAN, Steuernummer) — keep out of the repo
