@@ -8,7 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 ROOT = Path(__file__).resolve().parents[2] / 'backend/ocr'
 SPEC = importlib.util.spec_from_file_location('dt_test_runtime', ROOT / 'runtime.py')
@@ -73,7 +73,7 @@ class RuntimeTests(unittest.TestCase):
             with patch.object(module, 'configure_environment'), \
                     patch.dict(os.environ, {'RAG_FEEDER_OCR_HOME': directory,
                                            'KEEP_SERVICES_RUNNING': '0'}, clear=True), \
-                    patch.dict(sys.modules):
+                    patch.dict(sys.modules, gpu_guard=types.SimpleNamespace(install_gpu_guard=Mock())):
                 manager = module.load_manager()
                 service = manager.SERVICES['ocr']
                 self.assertEqual(service['venv'], str(runtime.python_path()))
@@ -82,6 +82,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(service['process_name'], 'ocr_service_hibernate:app')
                 self.assertIn(service['process_name'], service['process_match'])
                 self.assertTrue(manager.KEEP_SERVICES_RUNNING)
+                sys.modules['gpu_guard'].install_gpu_guard.assert_called_once_with(manager)
                 self.assertEqual(os.environ['SERVICE_MANAGER_ROLE'], 'ocr')
             self.assertEqual(legacy.read_text(), original)
 

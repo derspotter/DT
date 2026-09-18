@@ -63,3 +63,10 @@ test subsequently exposed legacy automatic Ollama eviction (two resident models 
 The DT launcher now disables that policy; Ollama itself was not stopped or reconfigured.
 Check GPU headroom before large OCR runs;
 the OCR queue only serializes OCR requests, not workloads submitted to other GPU services.
+DT checks free GPU-0 memory before loading and before each request (including warm requests).
+Below 6144 MiB free it returns HTTP 503 with the measured headroom and a retry explanation;
+`DT_OCR_MIN_FREE_VRAM_MIB` may override this positive admission threshold.
+Unavailable GPU telemetry also fails closed. This is a conservative admission check, not a
+VRAM reservation: another service can still allocate memory during a long PDF request.
+If the backend has exited, the next admitted request restarts it even when the queue's
+current service is already OCR.

@@ -27,6 +27,8 @@ def load_manager():
         "process_match": str(python_path()) + " -m uvicorn ocr_service_hibernate:app --host 127.0.0.1 --port 9003",
         "env": {},
     })
+    from gpu_guard import install_gpu_guard
+    install_gpu_guard(manager)
     return manager
 
 
