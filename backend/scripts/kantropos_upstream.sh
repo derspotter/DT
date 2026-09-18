@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 CONTAINER="${RAG_FEEDER_BACKEND_CONTAINER:-rag_feeder_backend}"
 TARGET_ID="${RAG_FEEDER_UPSTREAM_TARGET_ID:-anthropozan-nachhaltiges-management}"
@@ -10,6 +10,9 @@ OCR_HOME="${RAG_FEEDER_OCR_HOME:-/home/spott/rechtmaschine-debian-rag-ocr}"
 OCR_HOST_URL="${RAG_FEEDER_OCR_HOST_URL:-http://127.0.0.1:8004}"
 OCR_CONTAINER_URL="${RAG_FEEDER_OCR_SERVICE_URL:-}"
 CORPUS_UPDATER_CONTAINER="${RAG_FEEDER_KANTROPOS_UPDATER_CONTAINER:-kantropos-corpus-updater}"
+FLOW_STAGE="initialization"
+FLOW_DRAFT=""
+trap 'status=$?; echo "STOP: stage $FLOW_STAGE failed (exit $status). Later stages were NOT started. Saved draft: ${FLOW_DRAFT:-none}." >&2; exit "$status"' ERR
 
 usage() {
   cat <<'EOF'
@@ -18,7 +21,7 @@ Usage:
   bash backend/scripts/kantropos_upstream.sh draft [--limit N]
   bash backend/scripts/kantropos_upstream.sh scan-text [--draft-dir DIR]
   bash backend/scripts/kantropos_upstream.sh ocr <draft_dir> [--ocr-url URL]
-  bash backend/scripts/kantropos_upstream.sh rag-flow [--yes] [--skip-ocr] [--skip-apply] [--skip-markdown] [--skip-embed]
+  bash backend/scripts/kantropos_upstream.sh rag-flow [--draft-dir DIR] [--yes] [--skip-ocr] [--skip-apply] [--skip-markdown] [--skip-embed]
   bash backend/scripts/kantropos_upstream.sh validate <draft_dir>
   bash backend/scripts/kantropos_upstream.sh apply <draft_dir> [--yes]
   bash backend/scripts/kantropos_upstream.sh commands
@@ -84,7 +87,7 @@ ensure_ocr_service() {
       SERVICE_MANAGER_ROLE=ocr \
       OCR_SERVICE_FILE=ocr_service_hibernate.py \
       setsid ocr/.venv_hpi/bin/python service_manager.py \
-        > "$OCR_HOME/logs/service_manager.log" 2>&1 < /dev/null &
+        >> "$OCR_HOME/logs/service_manager.log" 2>&1 < /dev/null &
   )
   for _ in $(seq 1 60); do
     if curl -fsS "$OCR_HOST_URL/health" >/dev/null 2>&1; then
@@ -97,16 +100,52 @@ ensure_ocr_service() {
   exit 1
 }
 
-run_updater_post() {
-  local path="$1"
-  local log_name="$2"
-  docker exec "$CORPUS_UPDATER_CONTAINER" sh -lc \
-    "nohup curl -fsS -X POST 'http://localhost:8001${path}' > '/tmp/${log_name}.log' 2>&1 &"
-}
-
 call_updater_post() {
   local path="$1"
-  docker exec "$CORPUS_UPDATER_CONTAINER" curl -fsS -X POST "http://localhost:8001${path}"
+  docker exec "$CORPUS_UPDATER_CONTAINER" curl -fsS -X POST "http://localhost:8001${path}" &
+  local request_pid=$! elapsed=0
+  while kill -0 "$request_pid" 2>/dev/null; do
+    sleep 2
+    elapsed=$((elapsed + 2))
+    if (( elapsed % 30 == 0 )); then
+      echo "[$FLOW_STAGE] Still waiting (${elapsed}s). File-level progress: docker logs --tail 20 $CORPUS_UPDATER_CONTAINER" >&2
+    fi
+  done
+  wait "$request_pid"
+}
+
+apply_draft() {
+  local draft_dir="$1"
+  shift
+  local arg write=0
+  for arg in "$@"; do
+    [[ "$arg" != --yes ]] || write=1
+    if [[ "$arg" == --target-path* ]]; then
+      echo "Target override is not allowed in the scoped writer; use the reviewed manifest." >&2
+      return 2
+    fi
+  done
+  if [[ "$write" -eq 0 ]]; then
+    docker exec "$CONTAINER" "$PYTHON" "$TOOL" apply --draft-dir "$draft_dir" "$@"
+    return
+  fi
+  local target_dir image
+  target_dir="$(docker exec "$CONTAINER" "$PYTHON" -c '
+import json, pathlib, sys
+manifest = json.loads((pathlib.Path(sys.argv[1]) / "manifest.json").read_text())
+root = pathlib.Path("/data/projects/kantropos/corpora").resolve()
+target = pathlib.Path(manifest["target"]["path"]).resolve()
+if target.parent != root or not target.is_dir():
+    raise SystemExit("Refusing writer: target must be one existing corpus directly below the corpora root")
+print(target)
+' "$draft_dir")"
+  [[ -d "$target_dir" ]] || { echo "Missing host corpus: $target_dir" >&2; return 1; }
+  image="$(docker inspect --format '{{.Image}}' "$CONTAINER")"
+  # Only this corpus is writable. The web backend and all inherited mounts stay read-only.
+  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --user "$(id -u):$(id -g)" --volumes-from "$CONTAINER:ro" \
+    --mount "type=bind,src=$target_dir,dst=$target_dir" \
+    --entrypoint "$PYTHON" "$image" "$TOOL" apply --draft-dir "$draft_dir" "$@"
 }
 
 run_rag_flow() {
@@ -116,6 +155,7 @@ run_rag_flow() {
   local skip_markdown=0
   local skip_embed=0
   local ocr_url_arg=""
+  local resume_draft=""
   local draft_extra=()
 
   while [[ $# -gt 0 ]]; do
@@ -125,6 +165,10 @@ run_rag_flow() {
       --skip-apply) skip_apply=1 ;;
       --skip-markdown) skip_markdown=1 ;;
       --skip-embed) skip_embed=1 ;;
+      --draft-dir)
+        shift
+        resume_draft="${1:?Missing value for --draft-dir}"
+        ;;
       --ocr-url)
         shift
         ocr_url_arg="${1:-}"
@@ -145,15 +189,26 @@ run_rag_flow() {
   done
 
   local draft_json draft_dir target_name target_encoded ocr_url
-  draft_json="$(docker exec "$CONTAINER" "$PYTHON" "$TOOL" draft --target-id "$TARGET_ID" "${draft_extra[@]}")"
-  echo "$draft_json"
-  draft_dir="$(printf '%s\n' "$draft_json" | json_field "['draft_dir']")"
-  target_name="$(printf '%s\n' "$draft_json" | json_field "['target']['name']")"
+  FLOW_STAGE="draft"
+  if [[ -n "$resume_draft" ]]; then
+    [[ ${#draft_extra[@]} -eq 0 ]] || { echo "Draft creation options cannot be combined with --draft-dir." >&2; return 2; }
+    draft_dir="$resume_draft"
+    target_name="$(docker exec "$CONTAINER" "$PYTHON" -c 'import json,pathlib,sys; print(json.loads((pathlib.Path(sys.argv[1]) / "manifest.json").read_text())["target"]["name"])' "$draft_dir")"
+    echo "Resuming saved draft: $draft_dir"
+  else
+    draft_json="$(docker exec "$CONTAINER" "$PYTHON" "$TOOL" draft --target-id "$TARGET_ID" "${draft_extra[@]}")"
+    echo "$draft_json"
+    draft_dir="$(printf '%s\n' "$draft_json" | json_field "['draft_dir']")"
+    target_name="$(printf '%s\n' "$draft_json" | json_field "['target']['name']")"
+  fi
+  FLOW_DRAFT="$draft_dir"
   target_encoded="$(docker exec "$CONTAINER" "$PYTHON" -c 'from urllib.parse import quote; import sys; print(quote(sys.argv[1], safe=""))' "$target_name")"
 
+  FLOW_STAGE="text scan"
   docker exec "$CONTAINER" "$PYTHON" "$TOOL" scan-text --draft-dir "$draft_dir" --write
 
   if [[ "$skip_ocr" -eq 0 ]]; then
+    FLOW_STAGE="OCR"
     ensure_ocr_service
     ocr_url="${ocr_url_arg:-$(container_ocr_url)}"
     docker exec \
@@ -161,23 +216,34 @@ run_rag_flow() {
       "$CONTAINER" "$PYTHON" "$TOOL" ocr --draft-dir "$draft_dir" --keep-going
   fi
 
-  docker exec "$CONTAINER" "$PYTHON" "$TOOL" apply --draft-dir "$draft_dir"
-  if [[ "$skip_apply" -eq 0 && "$apply_yes" -eq 1 ]]; then
-    docker exec "$CONTAINER" "$PYTHON" "$TOOL" apply --draft-dir "$draft_dir" --yes
-  elif [[ "$skip_apply" -eq 0 ]]; then
-    echo "Dry run only. Rerun with --yes to apply, markdown, and embed." >&2
+  FLOW_STAGE="import validation"
+  apply_draft "$draft_dir" --require-text-ready
+  if [[ "$apply_yes" -ne 1 ]]; then
+    echo "Dry run only. Rerun with --draft-dir '$draft_dir' --yes to apply, markdown, and embed." >&2
     return
+  fi
+  if [[ "$skip_apply" -eq 0 && "$apply_yes" -eq 1 ]]; then
+    FLOW_STAGE="import"
+    apply_draft "$draft_dir" --require-text-ready --yes
+  else
+    apply_draft "$draft_dir" --require-text-ready --require-applied
   fi
 
   if [[ "$skip_markdown" -eq 0 ]]; then
+    FLOW_STAGE="markdown"
     echo "Running Kantropos markdown generation for $target_name..."
     call_updater_post "/markdowns/$target_encoded"
     echo
     echo "Kantropos markdown generation finished for $target_name."
   fi
   if [[ "$skip_embed" -eq 0 ]]; then
-    run_updater_post "/embeddings/$target_encoded?sync_mode=INSERT" "kantropos-embeddings-$TARGET_ID-$(date +%Y%m%d_%H%M%S)"
-    echo "Started Kantropos incremental embedding for $target_name."
+    FLOW_STAGE="markdown coverage verification"
+    docker exec "$CONTAINER" "$PYTHON" "$TOOL" check-markdown --draft-dir "$draft_dir"
+    FLOW_STAGE="embedding"
+    echo "Requesting Kantropos incremental embedding for $target_name; waiting for HTTP result..."
+    call_updater_post "/embeddings/$target_encoded?sync_mode=INSERT"
+    echo
+    echo "Kantropos embedding request succeeded for $target_name. Check corpus-updater logs for processing details."
   fi
 }
 
@@ -187,6 +253,11 @@ if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
   exit 0
 fi
 shift || true
+
+if [[ "$cmd" == rag-flow || "$cmd" == apply || "$cmd" == ocr ]]; then
+  exec 9>"/tmp/dt-kantropos-upstream-${TARGET_ID}.lock"
+  flock -n 9 || { echo "Another upstream operation for $TARGET_ID is already running." >&2; exit 1; }
+fi
 
 case "$cmd" in
   count|draft|scan-text|commands)
@@ -215,7 +286,7 @@ case "$cmd" in
       exit 2
     fi
     shift || true
-    docker exec "$CONTAINER" "$PYTHON" "$TOOL" apply --draft-dir "$draft_dir" "$@"
+    apply_draft "$draft_dir" "$@"
     ;;
   validate)
     draft_dir="${1:-}"

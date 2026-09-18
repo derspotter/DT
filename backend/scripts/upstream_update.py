@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
 import os
 import queue
@@ -14,6 +15,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -739,6 +741,10 @@ def validate_draft_dir(draft_dir: Path) -> dict:
         if not target_file:
             errors.append(f"work {item.get('work_id')} has no target_file")
             continue
+        if Path(target_file).name != target_file or target_file in {".", ".."}:
+            errors.append(f"unsafe target filename: {target_file}")
+        if not staged_file or not (draft_dir / staged_file).resolve().is_relative_to(files_dir.resolve()):
+            errors.append(f"staged file outside draft files directory: {staged_file}")
         expected = f"{target_file}:PDF"
         expected_files.append(expected)
         if expected not in files_by_value:
@@ -748,7 +754,7 @@ def validate_draft_dir(draft_dir: Path) -> dict:
         if staged_file and not (draft_dir / staged_file).exists():
             errors.append(f"missing staged file for {target_file}: {staged_file}")
 
-    duplicate_files = sorted({value for value in expected_files if expected_files.count(value) > 1})
+    duplicate_files = sorted(value for value, count in Counter(expected_files).items() if count > 1)
     if duplicate_files:
         errors.append(f"duplicate target file fields: {', '.join(duplicate_files)}")
 
@@ -883,6 +889,15 @@ def load_draft_manifest(draft_dir: Path) -> dict:
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
+def write_json_atomic(path: Path, value: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def scan_items_with_progress(items: list[dict], draft_dir: Path, args: argparse.Namespace) -> list[dict]:
     results = []
     with ProgressReporter(getattr(args, "progress_label", "Textprüfung"), len(items)) as progress:
@@ -898,7 +913,14 @@ def scan_items_with_progress(items: list[dict], draft_dir: Path, args: argparse.
 def scan_draft_items(args: argparse.Namespace) -> tuple[Path, list[dict], dict]:
     draft_dir = Path(args.draft_dir)
     manifest = load_draft_manifest(draft_dir)
-    results = scan_items_with_progress(manifest.get("items", []), draft_dir, args)
+    items = manifest.get("items", [])
+    work_ids = set(getattr(args, "work_id", []) or [])
+    if work_ids:
+        missing = work_ids - {item.get("work_id") for item in items}
+        if missing:
+            raise SystemExit(f"Unknown work ids: {sorted(missing)}")
+        items = [item for item in items if item.get("work_id") in work_ids]
+    results = scan_items_with_progress(items, draft_dir, args)
     summary = summarize_text_scan(results)
     return draft_dir, results, summary
 
@@ -988,6 +1010,7 @@ def command_ocr(args: argparse.Namespace) -> None:
         min_text_chars=args.min_text_chars,
         min_text_page_ratio=args.min_text_page_ratio,
         progress_label="Textprüfung vor OCR (erneuter Scan)",
+        work_id=getattr(args, "work_id", []),
     )
     _, scan_results, scan_summary = scan_draft_items(scan_args)
     scan_by_target = {item.get("target_file"): item for item in scan_results}
@@ -995,8 +1018,10 @@ def command_ocr(args: argparse.Namespace) -> None:
 
     selected = []
     for item in manifest.get("items", []):
+        if getattr(args, "work_id", []) and item.get("work_id") not in args.work_id:
+            continue
         scan = scan_by_target.get(item.get("target_file")) or {}
-        if args.all or scan.get("reason") in {"empty_text", "low_text"}:
+        if args.all or scan.get("reason") in {"empty_text", "low_text", "error"}:
             selected.append((item, scan))
 
     completed = []
@@ -1009,7 +1034,7 @@ def command_ocr(args: argparse.Namespace) -> None:
             text_name = f"{Path(item['target_file']).stem}.txt"
             text_rel = str(Path("files") / text_name)
             text_path = draft_dir / text_rel
-            if text_path.exists() and not args.overwrite:
+            if text_path.exists() and text_path.read_text(encoding="utf-8").strip() and not args.overwrite:
                 skipped.append({
                     "work_id": item.get("work_id"),
                     "target_file": item.get("target_file"),
@@ -1025,6 +1050,8 @@ def command_ocr(args: argparse.Namespace) -> None:
                 full_text = str(result.get("full_text") or result.get("text") or "").strip()
                 if not full_text:
                     raise RuntimeError("OCR response did not contain full_text/text")
+                if scan.get("pages") and result.get("page_count") != scan["pages"]:
+                    raise RuntimeError(f"Incomplete OCR: expected {scan['pages']} pages, got {result.get('page_count')}")
                 text_path.write_text(full_text + "\n", encoding="utf-8")
                 item["ocr_text_file"] = text_rel
                 item["ocr"] = {
@@ -1037,6 +1064,7 @@ def command_ocr(args: argparse.Namespace) -> None:
                     "text_chars": len(full_text),
                     "metadata": result.get("metadata"),
                 }
+                write_json_atomic(manifest_path, manifest)
                 completed.append({
                     "work_id": item.get("work_id"),
                     "target_file": item.get("target_file"),
@@ -1055,10 +1083,10 @@ def command_ocr(args: argparse.Namespace) -> None:
                 })
                 progress.advance("fehlgeschlagen")
                 if not args.keep_going:
-                    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                    write_json_atomic(manifest_path, manifest)
                     raise
 
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_atomic(manifest_path, manifest)
     output = {
         "draft_dir": str(draft_dir),
         "ocr_url": ocr_url,
@@ -1071,8 +1099,11 @@ def command_ocr(args: argparse.Namespace) -> None:
         "skipped": skipped,
         "failed": failed,
     }
+    write_json_atomic(draft_dir / "ocr-report.json", output)
     print(json.dumps(output, ensure_ascii=False, indent=2))
     if failed:
+        print(f"OCR failed for {len(failed)} file(s). Import and embedding have NOT started. "
+              f"Successful texts are saved. Resume draft: {draft_dir}", file=sys.stderr)
         raise SystemExit(1)
 
 
@@ -1092,6 +1123,27 @@ def command_apply(args: argparse.Namespace) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     target_dir = Path(args.target_path or manifest["target"]["path"])
     metadata_bib = target_dir / "metadata.bib"
+    baseline = draft_dir / "metadata.current.bib"
+    if not baseline.exists():
+        raise SystemExit("Missing metadata baseline; refusing to overwrite the live corpus.")
+    live_metadata = metadata_bib.read_bytes() if metadata_bib.exists() else b""
+    if live_metadata not in (baseline.read_bytes(), metadata_new.read_bytes()):
+        raise SystemExit("Live metadata changed since this draft was created; refusing to overwrite newer entries.")
+    if getattr(args, "require_text_ready", False):
+        scan_path = draft_dir / "text-scan.json"
+        if not scan_path.exists():
+            raise SystemExit("Missing text-scan.json; run scan-text --write before applying.")
+        scans = {item.get("target_file"): item for item in json.loads(scan_path.read_text())["items"]}
+        unresolved = []
+        for item in manifest.get("items", []):
+            scan = scans.get(item.get("target_file"), {})
+            text = draft_dir / item["ocr_text_file"] if item.get("ocr_text_file") else None
+            if scan.get("reason") not in {"ok", "ok_with_warnings"} and not (
+                scan and text and text.is_file() and text.read_text(encoding="utf-8").strip()
+            ):
+                unresolved.append(item.get("work_id"))
+        if unresolved:
+            raise SystemExit(f"Unresolved PDF/text checks for work ids {unresolved}; import and embedding blocked.")
 
     actions = []
     for item in manifest.get("items", []):
@@ -1100,16 +1152,19 @@ def command_apply(args: argparse.Namespace) -> None:
         if not staged.exists():
             raise SystemExit(f"Missing staged file: {staged}")
         if dest.exists() and not args.overwrite_files:
-            if dest.stat().st_size == staged.stat().st_size:
+            if filecmp.cmp(dest, staged, shallow=False):
                 actions.append(("skip_existing_file", staged, dest))
             else:
-                raise SystemExit(f"Target file already exists with different size: {dest}")
+                raise SystemExit(f"Target file already exists with different content: {dest}")
         else:
             actions.append(("copy_file", staged, dest))
         ocr_text_file = str(item.get("ocr_text_file") or "").strip()
         if ocr_text_file:
             staged_text = draft_dir / ocr_text_file
             dest_text = target_dir / Path(ocr_text_file).name
+            if (not staged_text.resolve().is_relative_to(files_dir.resolve()) or
+                    dest_text.name != f"{Path(item['target_file']).stem}.txt"):
+                raise SystemExit(f"Invalid OCR sidecar path: {ocr_text_file}")
             if not staged_text.exists():
                 raise SystemExit(f"Missing OCR text sidecar: {staged_text}")
             if dest_text.exists() and not args.overwrite_files:
@@ -1119,7 +1174,11 @@ def command_apply(args: argparse.Namespace) -> None:
                 raise SystemExit(f"Target OCR text sidecar already exists with different content: {dest_text}")
             actions.append(("copy_text", staged_text, dest_text))
 
-    backup_path = metadata_bib.with_name(f"{metadata_bib.name}.{timestamp()}.bak")
+    if getattr(args, "require_applied", False) and (
+        live_metadata != metadata_new.read_bytes() or any(action.startswith("copy_") for action, _, _ in actions)
+    ):
+        raise SystemExit("Draft is not fully imported; --skip-apply cannot start markdown or embedding.")
+    backup_path = metadata_bib.with_name(f"{metadata_bib.name}.{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.bak")
     if not args.yes:
         print(json.dumps({
             "dry_run": True,
@@ -1138,11 +1197,23 @@ def command_apply(args: argparse.Namespace) -> None:
         shutil.copy2(metadata_bib, backup_path)
     else:
         backup_path = None
-    for action, staged, dest in actions:
-        if action == "skip_existing_file":
-            continue
-        shutil.copy2(staged, dest)
-    shutil.copy2(metadata_new, metadata_bib)
+    with ProgressReporter("Übernahme", len(actions)) as progress:
+        for action, staged, dest in actions:
+            progress.start_item({"title": dest.name, "target_file": dest.name})
+            if action in {"skip_existing_file", "skip_existing_text"}:
+                progress.advance("bereits vorhanden")
+                continue
+            shutil.copy2(staged, dest)
+            progress.advance("kopiert")
+    current_metadata = metadata_bib.read_bytes() if metadata_bib.exists() else b""
+    if current_metadata != live_metadata:
+        raise SystemExit("Live metadata changed during import; copied files remain, metadata was NOT overwritten.")
+    metadata_temporary = metadata_bib.with_name(f".{metadata_bib.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(metadata_new, metadata_temporary)
+        metadata_temporary.replace(metadata_bib)
+    finally:
+        metadata_temporary.unlink(missing_ok=True)
     print(json.dumps({
         "applied": True,
         "target_dir": str(target_dir),
@@ -1180,6 +1251,19 @@ def command_validate(args: argparse.Namespace) -> None:
     print(json.dumps({"draft_dir": args.draft_dir, "validation": validation}, ensure_ascii=False, indent=2))
     if not validation["valid"]:
         raise SystemExit(1)
+
+
+def command_check_markdown(args: argparse.Namespace) -> None:
+    manifest = load_draft_manifest(Path(args.draft_dir))
+    markdown_dir = Path(manifest["target"]["path"]) / "markdown"
+    missing = []
+    for item in manifest.get("items", []):
+        text = markdown_dir / f"{Path(item['target_file']).stem}.txt"
+        if not text.is_file() or not text.read_text(encoding="utf-8").strip():
+            missing.append({"work_id": item.get("work_id"), "text_file": str(text)})
+    print(json.dumps({"checked": len(manifest.get("items", [])), "missing_or_empty": missing}, ensure_ascii=False))
+    if missing:
+        raise SystemExit("Markdown coverage incomplete; embedding has NOT started.")
 
 
 def add_target_args(parser: argparse.ArgumentParser) -> None:
@@ -1220,7 +1304,8 @@ def main(argv: list[str] | None = None) -> int:
     ocr_parser.add_argument("--ocr-url", default="", help="OCR service URL. Defaults to RAG_FEEDER_OCR_SERVICE_URL, OCR_SERVICE_URL, then localhost:8004.")
     ocr_parser.add_argument("--min-text-chars", type=int, default=DEFAULT_MIN_TEXT_CHARS)
     ocr_parser.add_argument("--min-text-page-ratio", type=float, default=DEFAULT_MIN_TEXT_PAGE_RATIO)
-    ocr_parser.add_argument("--timeout", type=int, default=600)
+    ocr_parser.add_argument("--timeout", type=int, default=3660, help="Client timeout in seconds; must exceed the OCR manager's read timeout.")
+    ocr_parser.add_argument("--work-id", type=int, action="append", default=[], help="Restrict recovery to this work id (repeatable).")
     ocr_parser.add_argument("--all", action="store_true", help="OCR all draft PDFs instead of only weak PDFs.")
     ocr_parser.add_argument("--overwrite", action="store_true", help="Overwrite existing staged OCR text sidecars.")
     ocr_parser.add_argument("--keep-going", action="store_true", help="Continue OCR after per-file failures.")
@@ -1230,12 +1315,18 @@ def main(argv: list[str] | None = None) -> int:
     apply_parser.add_argument("--draft-dir", required=True)
     apply_parser.add_argument("--target-path", default="", help="Override target path from manifest.")
     apply_parser.add_argument("--overwrite-files", action="store_true")
+    apply_parser.add_argument("--require-text-ready", action="store_true", help="Block import until scanned PDFs have usable text or OCR sidecars.")
+    apply_parser.add_argument("--require-applied", action="store_true", help="Verify every file and metadata already match before skipping import.")
     apply_parser.add_argument("--yes", action="store_true", help="Actually apply. Without this, prints a dry-run summary.")
     apply_parser.set_defaults(func=command_apply)
 
     validate_parser = sub.add_parser("validate", help="Validate a generated upstream update draft.")
     validate_parser.add_argument("--draft-dir", required=True)
     validate_parser.set_defaults(func=command_validate)
+
+    markdown_parser = sub.add_parser("check-markdown", help="Block embedding if drafted documents have missing or empty upstream text files.")
+    markdown_parser.add_argument("--draft-dir", required=True)
+    markdown_parser.set_defaults(func=command_check_markdown)
 
     commands_parser = sub.add_parser("commands", help="Print corpus-updater commands for the target.")
     add_target_args(commands_parser)

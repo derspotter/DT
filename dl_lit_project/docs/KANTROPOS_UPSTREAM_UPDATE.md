@@ -78,6 +78,44 @@ Apply to the upstream corpus, wait for Kantropos markdown generation, and start 
 bash backend/scripts/kantropos_upstream.sh rag-flow --yes
 ```
 
+### Resume after a failure
+
+Do not create another full draft just to retry OCR. Use the saved **container path** printed by the failed run:
+
+```bash
+bash backend/scripts/kantropos_upstream.sh rag-flow --draft-dir <saved_draft_dir> --yes
+```
+
+This checks the existing PDFs again, retains non-empty OCR sidecars, and retries the remaining weak/broken files.
+For a targeted OCR retry (without importing or embedding anything):
+
+```bash
+bash backend/scripts/kantropos_upstream.sh ocr <saved_draft_dir> --work-id 14849 --timeout 3660 --keep-going
+```
+
+Repeat `--work-id` for multiple files. Successful OCR is checkpointed after each document;
+`ocr-report.json` records the completed run. A nonzero OCR exit stops `rag-flow` before import.
+The client timeout defaults to 3660 seconds. The OCR manager must separately use a read timeout
+long enough for a whole PDF (`OCR_HTTP_TIMEOUT_SECONDS`, 3600 seconds on the repaired manager).
+After a timeout, inspect the OCR backend before retrying: the original computation may still be running.
+
+`--yes` is required for markdown/embedding even with `--skip-apply`. Skipping import additionally
+requires live files and metadata to already match the draft. Concurrent wrapper OCR/import/full-flow
+runs for the same target are rejected with a host-side lock.
+
+Actual import uses a temporary, network-disabled container with only the selected corpus writable.
+The web backend and other corpora remain read-only. Run the wrapper on the Docker host under the
+corpus-owning user; the host/container corpus path must be the same. It does not change permissions
+or require making the entire corpora tree writable. Changed live metadata or different existing PDF
+contents abort import. Existing matching PDFs and OCR texts are retained; metadata is backed up and
+replaced atomically.
+
+Before embedding, `rag-flow` checks that every drafted PDF has a non-empty file in upstream `markdown/`.
+This is necessary because the external markdown endpoint can return success despite individual PDF errors.
+Markdown and embedding requests now wait for their HTTP results, show a waiting message every 30 seconds,
+and stop on HTTP failures; file-level details are in `docker logs kantropos-corpus-updater`.
+For long runs use a persistent terminal (for example tmux), and keep the printed draft path.
+
 ## What "Pending Additions" Means
 
 In DT, pending additions are downloaded works from local DT corpora assigned to a Kantropos target, excluding works already imported from that target's `metadata.bib`.
@@ -178,8 +216,8 @@ processing exceptions; shutdown waits at most 250 ms for diagnostic output.
 With a stalled output consumer, terminal messages (including the final line)
 may be delayed or dropped rather than blocking processing. Full PDF warnings
 remain in the JSON report. This best-effort behavior applies to diagnostics,
-not to the normal JSON stdout output or writing the report/manifest files. This display
-does not cover external Kantropos markdown generation or background embedding.
+not to the normal JSON stdout output or writing the report/manifest files. External Kantropos
+markdown and embedding requests have a separate waiting heartbeat, not a per-file percentage.
 Already-running Python processes keep their previous code; new invocations
 pick up the progress display after deployment.
 
@@ -197,7 +235,8 @@ JSON report. Repeated messages are grouped per page/processing stage;
   Text/graphics may be incomplete. The run continues; warnings alone do not trigger OCR.
 - `low_text` / `empty_text`: still selected for OCR, including when warnings also occurred.
 - `error`: extraction failed; any partial text counts and collected warnings are retained.
-  Check/replace the PDF; this status is not automatically selected for OCR.
+  Selected for an OCR recovery attempt; a missing/incomplete result still blocks the full workflow.
+  A malformed PDF may require a separately reviewed repair. Never discard pages to make the check pass.
 
 The summary separates `ok_with_warnings` from clean `ok` files. `warning_files`
 and `warned` include all files with warnings, including weak/failed files.
@@ -265,7 +304,8 @@ bash backend/scripts/kantropos_upstream.sh rag-flow
 bash backend/scripts/kantropos_upstream.sh rag-flow --yes
 ```
 
-`rag-flow --yes` waits for the Kantropos markdown endpoint to finish before starting embeddings with `sync_mode=INSERT`.
+`rag-flow --yes` waits for the Kantropos markdown endpoint, verifies text-file coverage, and then waits
+for the incremental embedding request with `sync_mode=INSERT`. It does not replace an existing vector collection.
 
 ## Are the PDFs Already Available?
 

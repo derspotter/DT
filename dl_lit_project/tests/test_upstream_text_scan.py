@@ -174,7 +174,7 @@ class TextScanTests(unittest.TestCase):
         self.assertIn("12", stderr.getvalue())
         self.assertIn("absent.pdf", stderr.getvalue())
 
-    def test_ocr_only_selects_weak_text_not_warning_only_files(self):
+    def test_ocr_selects_weak_and_broken_pdfs_not_warning_only_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "files").mkdir()
@@ -191,11 +191,12 @@ class TextScanTests(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()) as stdout, \
                     contextlib.redirect_stderr(io.StringIO()) as stderr:
                 upstream.command_ocr(args)
-            ocr.assert_called_once()
-            self.assertEqual(ocr.call_args.args[1], root / "files/1.pdf")
-            self.assertEqual(json.loads(stdout.getvalue())["selected_count"], 1)
-            self.assertIn("[OCR] 1/1 PDFs (100.0%)", stderr.getvalue())
-            self.assertIn("erfolgreich=1", stderr.getvalue())
+            self.assertEqual(ocr.call_count, 2)
+            self.assertEqual([call.args[1] for call in ocr.call_args_list],
+                             [root / "files/1.pdf", root / "files/2.pdf"])
+            self.assertEqual(json.loads(stdout.getvalue())["selected_count"], 2)
+            self.assertIn("[OCR] 2/2 PDFs (100.0%)", stderr.getvalue())
+            self.assertIn("erfolgreich=2", stderr.getvalue())
 
     def test_page_progress_is_forwarded(self):
         progress = types.SimpleNamespace(update_page=lambda page, total: pages.append((page, total)))
@@ -339,7 +340,7 @@ print('processing returned')
                                       ocr_url="http://unused.invalid", all=True, overwrite=False,
                                       timeout=1, keep_going=False)
             with patch.dict(sys.modules, fitz=fake_fitz()), \
-                    patch.object(upstream, "ocr_pdf", return_value={"full_text": "OCR result"}), \
+                    patch.object(upstream, "ocr_pdf", return_value={"full_text": "OCR result", "page_count": 2}), \
                     contextlib.redirect_stdout(io.StringIO()) as stdout, \
                     contextlib.redirect_stderr(io.StringIO()) as stderr:
                 upstream.command_ocr(args)
