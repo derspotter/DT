@@ -44,6 +44,10 @@ def main():
         "raw_pending": count_fn("metadata_status IN ('pending', 'in_progress')"),
         "matched": count_fn("metadata_status = 'matched' AND COALESCE(download_status, 'not_requested') = 'not_requested'"),
         "queued_download": count_fn("download_status IN ('queued', 'in_progress')"),
+        # Keep the historical totals above; expose active work separately so
+        # clients do not present waiting work as actively running.
+        "enriching": count_fn("metadata_status = 'in_progress'"),
+        "downloading": count_fn("download_status = 'in_progress'"),
         "downloaded": count_fn("download_status = 'downloaded'"),
     }
     conn.close()

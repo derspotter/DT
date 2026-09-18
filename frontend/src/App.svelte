@@ -69,6 +69,7 @@
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
+  import { seedActivity, seedPromotionStatus } from './lib/seedStatus'
 
   const userTabGroups = [
     {
@@ -214,6 +215,15 @@
     searchRefreshIntervalId = null
   }
   $: itemsPromotedCount = Number(corpusTotal) || corpusItems.length
+  $: seedPipelineActivity = seedActivity(ingestStats)
+  let seedWarningMessage = ''
+  $: seedActionWarning = Boolean(seedWarningMessage && seedWarningMessage === seedActionStatus)
+  // Reactive (not a function call) so the markup re-renders when the promotion
+  // settings change; a zero-arg helper would have no tracked dependencies.
+  $: expansionSummary = [
+    includeDownstream && Number(relatedDepthDownstream) > 0 ? `downstream depth ${relatedDepthDownstream}` : '',
+    includeUpstream && Number(relatedDepthUpstream) > 0 ? `upstream depth ${relatedDepthUpstream}` : '',
+  ].filter(Boolean).join(' + ')
   let ingestStatsStatus = ''
   let latestEntries = []
   let latestEntriesStatus = ''
@@ -3365,9 +3375,10 @@
       return
     }
     seedActionBusy = true
+    seedWarningMessage = ''
     seedActionStatus = `Promoting ${candidateKeys.length} candidate(s) into the corpus...`
     try {
-      await promoteSeedCandidates(source.source_type, source.source_key, {
+      const result = await promoteSeedCandidates(source.source_type, source.source_key, {
         candidateKeys,
         includeDownstream,
         includeUpstream,
@@ -3397,7 +3408,9 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
-      seedActionStatus = `Promoted ${candidateKeys.length} candidate(s). Corpus updated; workers continue in the background.`
+      const status = seedPromotionStatus(result, candidateKeys.length)
+      seedActionStatus = status.text
+      seedWarningMessage = status.warning ? status.text : ''
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -3444,7 +3457,8 @@
         return
       }
       seedActionStatus = `Promoting ${candidateCount.toLocaleString('en-US')} candidate(s) into the corpus...`
-      await promoteSeedCandidates(source.source_type, source.source_key, {
+      seedWarningMessage = ''
+      const result = await promoteSeedCandidates(source.source_type, source.source_key, {
         q: seedFilterQuery,
         includeDownstream,
         includeUpstream,
@@ -3474,7 +3488,9 @@
       if (refreshedSource) {
         await loadSeedCandidatesForSource(refreshedSource, { quiet: true })
       }
-      seedActionStatus = `Promoted ${candidateCount.toLocaleString('en-US')} candidate(s). Corpus updated; workers continue in the background.`
+      const status = seedPromotionStatus(result, candidateCount)
+      seedActionStatus = status.text
+      seedWarningMessage = status.warning ? status.text : ''
     } catch (error) {
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
@@ -5131,6 +5147,15 @@
               <p class="muted">Every seed document and search run lands here as a seed. Expand one to review its items and promote the keepers to the corpus.</p>
             </div>
             <div class="workspace-panel-actions">
+              {#if seedPipelineActivity.text}
+                <span class="seed-activity" title="Work the background pipeline still has to do for this corpus">
+                  <span class="seed-activity__dot" class:seed-activity__dot--active={seedPipelineActivity.active} aria-hidden="true"></span>
+                  {seedPipelineActivity.text}
+                </span>
+              {/if}
+              {#if seedActionStatus}
+                <span class:seed-action-warning={seedActionWarning} role={seedActionWarning ? 'alert' : 'status'}>{seedActionStatus}</span>
+              {/if}
               {#if seedSourcesStatus}
                 <span class="muted">{seedSourcesStatus}</span>
               {/if}
@@ -5452,6 +5477,32 @@
                                           {/if}
                                           {#if candidate?.openalex_id}
                                             <a class="inline-detail-link" href={openAlexHref(candidate.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
+                                          {/if}
+                                        </div>
+                                        <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
+                                          <span class="seed-refs-cell__down">↓ Refs: {seedCellText(candidate, 'refs')}</span>
+                                          <span class="seed-refs-cell__up">↑ Cited: {seedCellText(candidate, 'cited_by')}</span>
+                                        </div>
+                                        <div class="inline-detail-actions">
+                                          {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
+                                            <button
+                                              class="primary"
+                                              type="button"
+                                              disabled={seedActionBusy}
+                                              title={expansionSummary
+                                                ? `Promote just this item (reference expansion is on: ${expansionSummary})`
+                                                : 'Promote just this item into the corpus'}
+                                              on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                            >
+                                              Promote this item
+                                            </button>
+                                            {#if expansionSummary}
+                                              <span class="muted small">Pulls in related works: {expansionSummary}, max {maxRelated}/paper.</span>
+                                            {/if}
+                                          {:else}
+                                            <span class="muted small">
+                                              {isSeedCandidateInCorpus(candidate) ? 'Already in this corpus.' : 'Already downloaded.'}
+                                            </span>
                                           {/if}
                                         </div>
                                       </div>

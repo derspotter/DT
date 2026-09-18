@@ -1,4 +1,26 @@
 import { expect, test, type Route } from '@playwright/test'
+import { seedActivity, seedPromotionStatus } from '../src/lib/seedStatus'
+
+test('activity distinguishes waiting, active, idle and legacy stats', () => {
+  expect(seedActivity({ raw_pending: 2, queued_download: 3, enriching: 0, downloading: 0 })).toEqual({
+    text: '2 waiting for metadata · 3 waiting for download', active: false,
+  })
+  expect(seedActivity({ raw_pending: 2, queued_download: 3, enriching: 1, downloading: 2 })).toEqual({
+    text: '1 waiting for metadata · 1 enriching · 1 waiting for download · 2 downloading', active: true,
+  })
+  expect(seedActivity({ raw_pending: 1, queued_download: 1, enriching: 1, downloading: 1 }).text).toBe('1 enriching · 1 downloading')
+  expect(seedActivity()).toEqual({ text: '', active: false })
+  expect(seedActivity({ raw_pending: 2 }).text).toBe('2 metadata pending or running')
+})
+
+test('promotion status preserves server outcomes and prioritizes partial failures', () => {
+  expect(seedPromotionStatus({ message: 'Expansion seeds added for review.' }, 1).text).toBe('Expansion seeds added for review.')
+  expect(seedPromotionStatus({ promotion_mode: 'new_seed', expansion_seeds: [] }, 1).text).toContain('No related works')
+  expect(seedPromotionStatus({ promotion_mode: 'new_seed', expansion_seeds: [{}] }, 1).text).toContain('1 expansion seed(s)')
+  expect(seedPromotionStatus({ success: true, message: 'Promoted', expansion_error: 'OpenAlex timed out' }, 1)).toEqual({
+    warning: true, text: 'Corpus promotion completed, but reference expansion failed: OpenAlex timed out',
+  })
+})
 
 // Exercises the preflight match-count preview and the 100k warning in the
 // keyword-search card with the backend mocked (no auth/DB available in CI):
@@ -232,6 +254,63 @@ function makeSeedCandidates(count: number, startIndex = 0) {
     }
   })
 }
+
+test('restored seed details preserve current expansion and table behavior', async ({ page }, testInfo) => {
+  const errors: string[] = []
+  let promoteBody: any = null
+  page.on('pageerror', (error) => errors.push(error.message))
+  await page.addInitScript(() => window.localStorage.setItem('rag_feeder_token', 'playwright-token'))
+  // Like the HTTP API below, keep the live-log socket independent of a backend.
+  await page.routeWebSocket('**/api/ws', () => {})
+  await page.route('**/api/**', mockApi)
+  await page.route('**/api/recursion-config', (route) => route.fulfill({ json: {
+    keyword: { includeDownstream: true, relatedDepthDownstream: 1, maxRelated: 25 },
+  } }))
+  await page.route('**/api/ingest/stats**', (route) => route.fulfill({ json: {
+    stats: { raw_pending: 2, queued_download: 3, enriching: 1, downloading: 1 },
+  } }))
+  await page.route('**/api/seed/sources**', (route) => route.fulfill({ json: {
+    sources: [{
+      id: 'search:98', source_type: 'search', source_key: '98', seed_kind: 'search',
+      label: 'restored seed', candidate_count: 1, state_counts: null, removable: true, run: null,
+    }],
+  } }))
+  await page.route('**/api/seed/sources/search/98/candidates**', (route) => route.fulfill({ json: {
+    candidates: [{ ...makeSeedCandidates(1, 7)[0], in_corpus: true, state: 'downloaded', refs_count: 42 }],
+    total: 1, offset: 0, limit: 200,
+  } }))
+  await page.route('**/api/seed/sources/search/98/promote', (route) => {
+    promoteBody = route.request().postDataJSON()
+    return route.fulfill({ json: { success: true, message: '1 expansion seed added for review.' } })
+  })
+  await page.goto('/#/workspace')
+  await expect(page.locator('.seed-activity')).toContainText('1 waiting for metadata · 1 enriching')
+  await expect(page.locator('.seed-activity')).toContainText('2 waiting for download · 1 downloading')
+  await page.getByText('restored seed', { exact: false }).click()
+  await expect(page.locator('.seed-candidate-table .header')).toContainText('Metadata')
+  await expect(page.locator('.seed-candidate-table .header')).toContainText('Refs')
+  await page.locator('.seed-candidate-table .table-row.clickable').first().click()
+  await expect(page.locator('.inline-detail-card .seed-refs-cell')).toContainText('Refs: 42')
+  await expect(page.locator('.inline-detail-card .seed-refs-cell')).toContainText('Cited: 7')
+  const promote = page.getByRole('button', { name: 'Promote this item', exact: true })
+  await expect(promote).toBeEnabled()
+  await page.screenshot({ path: testInfo.outputPath('restored-seed.png'), fullPage: true })
+  await promote.click()
+  await expect.poll(() => promoteBody?.candidateKeys).toEqual(['c7'])
+  expect(promoteBody.includeDownstream).toBe(true)
+  expect(promoteBody.relatedDepthDownstream).toBe(1)
+  await expect(page.locator('.workspace-panel-actions')).toContainText('1 expansion seed added for review.')
+  // A 200 response can still report a failed expansion. Test both callers.
+  await page.route('**/api/seed/sources/search/98/promote', (route) => route.fulfill({ json: {
+    success: true, expansion_error: 'OpenAlex timed out', message: 'Promotion completed.',
+  } }))
+  await promote.click()
+  await expect(page.locator('.workspace-panel-actions [role="alert"]')).toContainText('reference expansion failed: OpenAlex timed out')
+  await page.getByTestId('seed-panel').getByRole('button', { name: 'Select all', exact: true }).click()
+  await page.getByRole('button', { name: 'Promote to Corpus', exact: true }).click()
+  await expect(page.locator('.workspace-panel-actions [role="alert"]')).toContainText('reference expansion failed: OpenAlex timed out')
+  expect(errors).toEqual([])
+})
 
 test('seed table pages through search results, shows every-item selection, and dismisses all', async ({ page }) => {
   const candidatesOffsets: number[] = []
