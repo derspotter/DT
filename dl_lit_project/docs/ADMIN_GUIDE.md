@@ -123,7 +123,11 @@ Use this assignment consistently so the later export step is unambiguous.
 
 For the operational procedure that turns pending additions into an updated upstream RAG corpus, see:
 
-- `dl_lit_project/docs/KANTROPOS_UPSTREAM_UPDATE.md`
+- [Corpusbuilder → Kantropos/RAG: operator runbook](KANTROPOS_UPSTREAM_UPDATE.md)
+
+Follow its saved-draft workflow, not older email commands. It covers account and
+corpus selection, OCR versus Markdown versus embedding, recovery and final index
+verification. Preparation and the approved live run must use the same `--draft-dir`.
 
 ## Mail Configuration
 

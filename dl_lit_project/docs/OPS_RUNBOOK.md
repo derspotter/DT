@@ -14,6 +14,11 @@ It covers:
 - backups
 - common failure modes
 
+For corpus transfer into Integral Learning's separate Kantropos/RAG stack, use
+the [upstream operator runbook](KANTROPOS_UPSTREAM_UPDATE.md). Its safety checks
+and restart restrictions apply during an active corpus update. Restarting the
+DT stack is not the same operation as completing a RAG import.
+
 ## Services
 
 The current compose setup defines these main services:

@@ -159,5 +159,5 @@ One-off maintenance scripts (`backend/scripts/`, write to the live DB, re-runnab
 - Frontend details: `frontend/README.md`
 - Python pipeline details: `dl_lit_project/README.md`
 - Architecture & web-app notes: `dl_lit_project/CLAUDE.md`
-- Kantropos upstream update runbook: `dl_lit_project/docs/KANTROPOS_UPSTREAM_UPDATE.md`
+- [Corpusbuilder → Kantropos/RAG: vollständiger Ablauf, Wiederaufnahme und Fehlerbehebung](dl_lit_project/docs/KANTROPOS_UPSTREAM_UPDATE.md)
 - WZB RAG import runbook: `dl_lit_project/docs/WZB_RAG_IMPORT.md`
