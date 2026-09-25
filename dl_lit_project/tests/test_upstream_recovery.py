@@ -93,6 +93,13 @@ class RecoveryTests(unittest.TestCase):
         (directory / '1.txt').write_text('usable text')
         upstream.command_check_markdown(self.args)
 
+    def test_generated_commands_do_not_suggest_corpus_wide_embedding(self):
+        output = io.StringIO()
+        with patch.object(upstream, 'resolve_target', return_value={'name': 'Corpus'}), contextlib.redirect_stdout(output):
+            upstream.command_commands(argparse.Namespace())
+        self.assertIn('embed-draft', output.getvalue())
+        self.assertNotIn('sync_mode=INSERT', output.getvalue())
+
     def test_empty_sidecar_is_retried_and_success_is_checkpointed(self):
         (self.draft / 'files/1.txt').write_text('  ')
         args = argparse.Namespace(draft_dir=str(self.draft), work_id=[1], min_text_chars=500,
@@ -109,7 +116,7 @@ class RecoveryTests(unittest.TestCase):
 
 
 class FlowTests(unittest.TestCase):
-    def run_flow(self, extra=(), fail=''):
+    def run_flow(self, extra=(), fail='', command='rag-flow'):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             docker = root / 'docker'
@@ -117,9 +124,14 @@ class FlowTests(unittest.TestCase):
 import json, os, sys
 args = sys.argv[1:]
 with open(os.environ['CALLS'], 'a') as f: f.write(json.dumps(args) + '\\n')
-stage = next((s for s in ('draft', 'scan-text', 'ocr', 'apply') if s in args), '')
+stage = next((s for s in ('draft', 'scan-text', 'ocr', 'apply', 'check-markdown') if s in args), '')
 if stage and stage == os.environ.get('FAIL_STAGE'): sys.exit(42)
-if 'draft' in args: print(json.dumps({'draft_dir':'/saved', 'target':{'name':'Corpus'}}))
+if '-i' in args and 'kantropos-corpus-updater' in args:
+    payload = json.load(sys.stdin)
+    assert payload['items'] == [{'target_file':'new.pdf'}]
+    if os.environ.get('FAIL_STAGE') == 'embedding': sys.exit(43)
+elif 'draft' in args: print(json.dumps({'draft_dir':'/saved', 'target':{'name':'Corpus'}}))
+elif 'print(json.dumps(json.loads' in ' '.join(args): print(json.dumps({'target':{'name':'Corpus'},'items':[{'target_file':'new.pdf'}]}))
 elif 'manifest.json' in ' '.join(args): print('Corpus')
 elif 'urllib.parse' in ' '.join(args): print('Corpus')
 ''')
@@ -129,8 +141,9 @@ elif 'urllib.parse' in ' '.join(args): print('Corpus')
             curl.chmod(0o755)
             calls = root / 'calls'
             env = {**os.environ, 'PATH': f'{root}:{os.environ["PATH"]}', 'CALLS': str(calls), 'FAIL_STAGE': fail}
-            result = subprocess.run(['bash', str(REPO / 'backend/scripts/kantropos_upstream.sh'),
-                                     'rag-flow', '--draft-dir', '/saved', '--ocr-url', 'http://unused', *extra],
+            arguments = (['rag-flow', '--draft-dir', '/saved', '--ocr-url', 'http://unused']
+                         if command == 'rag-flow' else ['embed-draft', '/saved'])
+            result = subprocess.run(['bash', str(REPO / 'backend/scripts/kantropos_upstream.sh'), *arguments, *extra],
                                     env=env, text=True, capture_output=True)
             return result, [json.loads(line) for line in calls.read_text().splitlines()]
 
@@ -156,6 +169,43 @@ elif 'urllib.parse' in ' '.join(args): print('Corpus')
         result, calls = self.run_flow(('--yes', '--skip-apply', '--skip-markdown', '--skip-embed'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any('--require-applied' in args for args in calls))
+
+    def test_embedding_passes_manifest_to_scoped_runner_not_http(self):
+        result, calls = self.run_flow(('--yes', '--skip-apply', '--skip-markdown'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scoped = [args for args in calls if '-i' in args and 'kantropos-corpus-updater' in args]
+        self.assertEqual(len(scoped), 1)
+        self.assertIn('--yes', scoped[0])
+        self.assertFalse(any('http://localhost:8001/embeddings/' in ' '.join(args) for args in calls))
+
+    def test_coverage_failure_never_invokes_scoped_runner(self):
+        result, calls = self.run_flow(('--yes', '--skip-apply', '--skip-markdown'), fail='check-markdown')
+        self.assertEqual(result.returncode, 42)
+        self.assertFalse(any('kantropos-corpus-updater' in args for args in calls))
+
+    def test_scoped_runner_failure_propagates_to_flow(self):
+        result, calls = self.run_flow(('--yes', '--skip-apply', '--skip-markdown'), fail='embedding')
+        self.assertEqual(result.returncode, 43)
+        self.assertIn('stage embedding failed', result.stderr)
+
+    def test_direct_embedding_command_defaults_to_preview_with_preflights(self):
+        result, calls = self.run_flow(command='embed-draft')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any('--require-applied' in args for args in calls))
+        self.assertTrue(any('check-markdown' in args for args in calls))
+        scoped = next(args for args in calls if '-i' in args and 'kantropos-corpus-updater' in args)
+        self.assertNotIn('--yes', scoped)
+
+    def test_direct_embedding_write_requires_yes(self):
+        result, calls = self.run_flow(('--yes',), command='embed-draft')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scoped = next(args for args in calls if '-i' in args and 'kantropos-corpus-updater' in args)
+        self.assertIn('--yes', scoped)
+
+    def test_direct_embedding_cannot_skip_import_validation(self):
+        result, calls = self.run_flow(('--yes',), fail='apply', command='embed-draft')
+        self.assertEqual(result.returncode, 42)
+        self.assertFalse(any('kantropos-corpus-updater' in args for args in calls))
 
 
 if __name__ == '__main__':

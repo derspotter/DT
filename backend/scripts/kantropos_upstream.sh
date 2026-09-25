@@ -26,6 +26,7 @@ Usage:
   bash backend/scripts/kantropos_upstream.sh rag-flow [--draft-dir DIR] [--yes] [--skip-ocr] [--skip-apply] [--skip-markdown] [--skip-embed]
   bash backend/scripts/kantropos_upstream.sh validate <draft_dir>
   bash backend/scripts/kantropos_upstream.sh apply <draft_dir> [--yes]
+  bash backend/scripts/kantropos_upstream.sh embed-draft <draft_dir> [--yes]
   bash backend/scripts/kantropos_upstream.sh commands
 
 Environment overrides:
@@ -114,6 +115,19 @@ call_updater_post() {
     fi
   done
   wait "$request_pid"
+}
+
+embed_draft() {
+  local draft_dir="$1"
+  shift
+  # Pass the exact saved selection, not just a corpus name. Code is supplied
+  # from this checkout so no image rebuild or upstream service restart is needed.
+  docker exec "$CONTAINER" "$PYTHON" -c '
+import json, pathlib, sys
+print(json.dumps(json.loads((pathlib.Path(sys.argv[1]) / "manifest.json").read_text())))
+' "$draft_dir" |
+    docker exec -i -w /corpus-updater "$CORPUS_UPDATER_CONTAINER" python -B -c \
+      "$(< "$REPO_DIR/backend/kantropos/embed_draft.py")" "$@"
 }
 
 apply_draft() {
@@ -242,10 +256,8 @@ run_rag_flow() {
     FLOW_STAGE="markdown coverage verification"
     docker exec "$CONTAINER" "$PYTHON" "$TOOL" check-markdown --draft-dir "$draft_dir"
     FLOW_STAGE="embedding"
-    echo "Requesting Kantropos incremental embedding for $target_name; waiting for HTTP result..."
-    call_updater_post "/embeddings/$target_encoded?sync_mode=INSERT"
-    echo
-    echo "Kantropos embedding request succeeded for $target_name. Check corpus-updater logs for processing details."
+    echo "Embedding only missing documents from the saved draft for $target_name..."
+    embed_draft "$draft_dir" --yes
   fi
 }
 
@@ -256,12 +268,23 @@ if [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
 fi
 shift || true
 
-if [[ "$cmd" == rag-flow || "$cmd" == apply || "$cmd" == ocr ]]; then
+if [[ "$cmd" == rag-flow || "$cmd" == apply || "$cmd" == ocr || "$cmd" == embed-draft ]]; then
   exec 9>"/tmp/dt-kantropos-upstream-${TARGET_ID}.lock"
   flock -n 9 || { echo "Another upstream operation for $TARGET_ID is already running." >&2; exit 1; }
 fi
 
 case "$cmd" in
+  embed-draft)
+    draft_dir="${1:?Missing draft_dir}"
+    shift
+    FLOW_DRAFT="$draft_dir"
+    FLOW_STAGE="import validation"
+    apply_draft "$draft_dir" --require-text-ready --require-applied
+    FLOW_STAGE="markdown coverage verification"
+    docker exec "$CONTAINER" "$PYTHON" "$TOOL" check-markdown --draft-dir "$draft_dir"
+    FLOW_STAGE="embedding"
+    embed_draft "$draft_dir" "$@"
+    ;;
   count|draft|scan-text|commands)
     docker exec "$CONTAINER" "$PYTHON" "$TOOL" "$cmd" --target-id "$TARGET_ID" "$@"
     ;;

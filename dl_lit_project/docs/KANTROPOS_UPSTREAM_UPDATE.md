@@ -1,6 +1,6 @@
 # Corpusbuilder → Kantropos/RAG: Betriebsanleitung
 
-Stand: 24.09.2026, gegen den aktuellen Code geprüft. Diese Anleitung verhindert
+Stand: 25.09.2026, gegen den aktuellen Code geprüft. Diese Anleitung verhindert
 bekannte Bedienfehler, garantiert aber keine fehlerfreien PDFs. Bei Problemen
 anhalten, Ergebnisse sichern und gezielt fortsetzen. Nicht Prüfungen umgehen.
 
@@ -198,8 +198,11 @@ vollständig, Abschnitt 6 verwenden.
 
 Der Befehl übernimmt PDFs, OCR-Sidecars und Metadaten, wartet auf Kantropos'
 Markdown-Konvertierung, prüft **alle Entwurfs-Dokumente** auf nichtleere Texte
-und startet erst dann Embedding mit `sync_mode=INSERT`. Er wartet auch auf die
-HTTP-Antwort des Embedding-Dienstes.
+und startet erst dann den DT-Runner für inkrementelles Embedding. Dieser läuft
+im Kantropos-Updater mit dessen Modell und Chunking, verarbeitet aber ausschließlich
+die Dokument-IDs aus dem gespeicherten Entwurf. Bereits indexierte IDs werden
+übersprungen. Der Wrapper wartet auf Prozessabschluss und abschließenden
+Vektor-/Metadatenabgleich, nicht auf den alten korpusweiten HTTP-Endpunkt.
 
 **Nicht danach `rag-flow --yes` ohne `--draft-dir` aufrufen.** Das legt einen
 neuen Entwurf an, statt den geprüften Stand fortzusetzen.
@@ -223,8 +226,9 @@ Das ist weder eine ETA noch ein Beweis, dass der Server gesund ist.
 
 Der Adapter meldet `start`, `progress`, `waiting`, `file_complete`, `file_failed`
 und `complete`. Er nutzt standardmäßig höchstens vier CPU-Prozesse, keine OCR/GPU.
-Embedding-Fortschritt stammt separat aus Kantropos. Große Dokumente und Korpora
-können lange dauern. Nicht wegen einer Pause neu starten.
+Embedding-Fortschritt steht seit dem Scoped-Runner im **Wrapper-/tmux-Log**, nicht
+in `docker logs`: `[n/gesamt] Embedding <Dateiname>`. Große Dokumente können lange
+dauern. Nicht wegen einer Pause neu starten.
 
 ## 6. Wiederaufnahme nach Abbruch
 
@@ -266,6 +270,19 @@ aus. **Ein teilweise eingebettetes Dokument kann bereits eine ID besitzen und
 dadurch beim Retry übersprungen werden.** Nach Embedding-Abbruch deshalb betroffene
 Dokumente/Chunks prüfen. Nicht blind `UPSERT` oder `REPLACE` verwenden: Das kann
 vorhandene Daten verändern oder eine Sammlung ersetzen.
+
+Für einen bereits vorbereiteten und übernommenen Entwurf gibt es zusätzlich
+`bash "$upstream" embed-draft "$draft_dir"` als Vorschau ohne Embedding oder
+Datenbank-Schreibzugriffe. Mit `--yes` wird derselbe geprüfte Umfang verarbeitet.
+Diese Variante prüft Übernahme/Textbereitschaft anhand des vorhandenen Scans und
+alle Entwurfs-Texte, wiederholt aber nicht den aufwendigen PDF-Textscan.
+
+**Wichtiger Unterschied zum korpusweiten HTTP-Importer:** Dieser berücksichtigt
+auch alte, noch nicht indexierte Dateien außerhalb des Entwurfs. Eine leere
+Textdatei kann eine leere Ollama-Antwort und `IndexError` auslösen. Der Scoped-Runner
+begrenzt die Auswahl auf das Manifest. Alte Problemdateien bleiben unverändert
+und müssen separat geprüft werden. Leere Texte innerhalb des Entwurfs blockieren
+weiterhin, mit Dateiname statt eines unverständlichen Listenfehlers.
 
 Auch Vektor-IDs und PostgreSQL-Metadaten müssen zusammenpassen: Der Updater
 speichert Vektoren vor dem Metadaten-Commit. Scheitert danach das Speichern einer
@@ -312,9 +329,9 @@ nur für bereits importierte PDFs mit nutzbarer Textebene:
 
 Alle folgenden Kriterien müssen passen:
 
-1. Wrapper beendet ohne Fehler/`STOP`, mit `Kantropos embedding request succeeded`.
-2. Updater meldet Embedding-Abschluss und erfolgreiche HTTP-Antwort, nicht nur
-   `Start embedding` oder eingelesene Dateinamen.
+1. Wrapper beendet ohne Fehler/`STOP`, mit `COMPLETE: ... draft documents have vectors and metadata`.
+2. Im Wrapper-Log steht der Abschluss des Scoped-Runners, nicht nur einzelne
+   Dateinamen. `PREVIEW ONLY` ist ausdrücklich kein abgeschlossener Import.
 3. Alle Manifest-Einträge haben nichtleere Texte. Auf dem Host:
 
    ```bash
