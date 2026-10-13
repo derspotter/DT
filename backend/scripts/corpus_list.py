@@ -246,6 +246,13 @@ SORT_KEYS = {
 }
 
 
+def added_at_for(data, corpus_id):
+    """Membership date for a corpus listing; work creation only when no corpus is selected."""
+    if corpus_id is not None:
+        return data.get("corpus_added_at")
+    return data.get("created_at")
+
+
 def apply_sort(items, sort):
     raw = str(sort or "").strip().lower()
     column, _, direction = raw.partition(":")
@@ -332,9 +339,11 @@ def main():
                 "title": data.get("title"),
                 "authors": data.get("authors"),
                 "year": data.get("year"),
-                # When the work joined this corpus (corpus_works.added_at);
-                # falls back to the work row's creation for the no-corpus listing.
-                "added_at": data.get("corpus_added_at") or data.get("created_at"),
+                # When the work joined this corpus (corpus_works.added_at). A
+                # NULL membership date stays blank (sorts last); only the
+                # no-corpus listing, which has no membership row, shows the
+                # work row's creation instead.
+                "added_at": added_at_for(data, args.corpus_id),
                 "source": venue,
                 "origin": origin,
                 "publisher": data.get("publisher"),
