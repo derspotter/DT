@@ -226,6 +226,16 @@
     return DOWNLOAD_LABELS[raw] || (raw ? raw.replace(/_/g, ' ') : '-')
   }
 
+  // SQLite CURRENT_TIMESTAMP is UTC "YYYY-MM-DD HH:MM:SS"; show the day only.
+  function formatDateAdded(value) {
+    const raw = String(value || '').trim()
+    if (!raw) return '-'
+    const match = raw.match(/^(\d{4}-\d{2}-\d{2})/)
+    if (match) return match[1]
+    const parsed = new Date(raw)
+    return Number.isNaN(parsed.getTime()) ? raw : parsed.toISOString().slice(0, 10)
+  }
+
   function cellText(item, key, bucket) {
     switch (key) {
       case 'metadata': return metadataLabel(item)
@@ -233,6 +243,7 @@
       case 'title': return item?.title || 'Untitled'
       case 'authors': return corpusItemAuthors(item)
       case 'year': return item?.year || '-'
+      case 'added': return formatDateAdded(item?.added_at)
       case 'source': return corpusItemSource(item) || '-'
       case 'seed': return corpusItemSeed(item) || '-'
       case 'doi': return item?.doi || '-'

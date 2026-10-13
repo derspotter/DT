@@ -237,11 +237,20 @@ SORT_KEYS = {
     "title": lambda item: str(item.get("title") or "").lower(),
     "authors": _authors_sort_key,
     "year": lambda item: normalize_year(item.get("year")),
+    # ISO timestamps sort lexically; blanks go last on the usual newest-first.
+    "added": lambda item: str(item.get("added_at") or ""),
     "source": lambda item: str(item.get("source") or "").lower(),
     "seed": lambda item: str(item.get("source_label") or "").lower(),
     "metadata": lambda item: str(item.get("metadata_status") or "").lower(),
     "download": lambda item: str(item.get("download_status") or "").lower(),
 }
+
+
+def added_at_for(data, corpus_id):
+    """Membership date for a corpus listing; work creation only when no corpus is selected."""
+    if corpus_id is not None:
+        return data.get("corpus_added_at")
+    return data.get("created_at")
 
 
 def apply_sort(items, sort):
@@ -302,7 +311,7 @@ def main():
     if args.corpus_id is not None:
         rows = conn.execute(
             """
-            SELECT w.*
+            SELECT w.*, cw.added_at AS corpus_added_at
             FROM works w
             JOIN corpus_works cw ON cw.work_id = w.id
             WHERE cw.corpus_id = ?
@@ -330,6 +339,11 @@ def main():
                 "title": data.get("title"),
                 "authors": data.get("authors"),
                 "year": data.get("year"),
+                # When the work joined this corpus (corpus_works.added_at). A
+                # NULL membership date stays blank (sorts last); only the
+                # no-corpus listing, which has no membership row, shows the
+                # work row's creation instead.
+                "added_at": added_at_for(data, args.corpus_id),
                 "source": venue,
                 "origin": origin,
                 "publisher": data.get("publisher"),

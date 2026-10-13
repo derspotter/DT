@@ -28,3 +28,10 @@ test('loadVisibility keeps a stored choice and drops unknown keys', () => {
     expect(vis.title).toBe(true)
   })
 })
+
+test('Date added is a corpus-only column, on by default', () => {
+  const corpus = columnsForTable('corpus').find((d) => d.key === 'added')
+  expect(corpus?.label).toBe('Date added')
+  expect(corpus?.defaultVisible).toBe(true)
+  expect(columnsForTable('seed').some((d) => d.key === 'added')).toBe(false)
+})
