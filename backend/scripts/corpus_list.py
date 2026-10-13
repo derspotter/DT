@@ -237,6 +237,8 @@ SORT_KEYS = {
     "title": lambda item: str(item.get("title") or "").lower(),
     "authors": _authors_sort_key,
     "year": lambda item: normalize_year(item.get("year")),
+    # ISO timestamps sort lexically; blanks go last on the usual newest-first.
+    "added": lambda item: str(item.get("added_at") or ""),
     "source": lambda item: str(item.get("source") or "").lower(),
     "seed": lambda item: str(item.get("source_label") or "").lower(),
     "metadata": lambda item: str(item.get("metadata_status") or "").lower(),
@@ -302,7 +304,7 @@ def main():
     if args.corpus_id is not None:
         rows = conn.execute(
             """
-            SELECT w.*
+            SELECT w.*, cw.added_at AS corpus_added_at
             FROM works w
             JOIN corpus_works cw ON cw.work_id = w.id
             WHERE cw.corpus_id = ?
@@ -330,6 +332,9 @@ def main():
                 "title": data.get("title"),
                 "authors": data.get("authors"),
                 "year": data.get("year"),
+                # When the work joined this corpus (corpus_works.added_at);
+                # falls back to the work row's creation for the no-corpus listing.
+                "added_at": data.get("corpus_added_at") or data.get("created_at"),
                 "source": venue,
                 "origin": origin,
                 "publisher": data.get("publisher"),

@@ -14,6 +14,9 @@ export const COLUMN_DEFS = [
   { key: 'title', label: 'Title', width: 'minmax(220px, 3fr)', sortable: true, defaultVisible: true },
   { key: 'authors', label: 'Authors', width: 'minmax(140px, 1.5fr)', sortable: true, defaultVisible: true },
   { key: 'year', label: 'Year', width: '70px', sortable: true, defaultVisible: true },
+  // When the work joined the selected corpus (corpus_works.added_at).
+  { key: 'added', label: 'Date added', width: '110px', sortable: true, defaultVisible: true, tables: ['corpus'],
+    hint: 'When this work was added to the corpus' },
   // Round 2 item 7: how many works the item cites on OpenAlex — what a
   // downstream promote pulls in. Seed table only this round.
   { key: 'refs', label: 'Refs', width: '70px', sortable: true, defaultVisible: true, tables: ['seed'],
