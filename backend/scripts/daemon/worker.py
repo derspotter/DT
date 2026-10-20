@@ -77,6 +77,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dl_lit.db_manager import DatabaseManager
+from dl_lit.app_settings import apply_app_settings_env, settings_fingerprint
 from dl_lit.utils import get_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
@@ -121,6 +122,24 @@ def parse_duplicate_merge_marker(message: str | None) -> dict | None:
     return data or None
 
 class PipelineDaemon:
+    def _build_enhancer(self) -> BibliographyEnhancer:
+        return BibliographyEnhancer(
+            db_manager=self.db,
+            rate_limiter=self.rate_limiter,
+            email=self.mailto,
+            output_folder=self.download_dir
+        )
+
+    def refresh_app_settings(self) -> bool:
+        """Re-read Admin settings; rebuild the enhancer (cached LLM client) only on change."""
+        fingerprint = settings_fingerprint(apply_app_settings_env(self.db_path))
+        if fingerprint == self._settings_fingerprint:
+            return False
+        self._settings_fingerprint = fingerprint
+        self.enhancer = self._build_enhancer()
+        log("Admin settings changed; rebuilt enhancer")
+        return True
+
     def __init__(self, db_path: str, role: str = "all"):
         self.db_path = db_path
         self.role = str(role or "all").strip().lower()
@@ -137,12 +156,8 @@ class PipelineDaemon:
         self.download_dir = project_dir / "data" / "pdf_library"
         self.download_dir.mkdir(parents=True, exist_ok=True)
         
-        self.enhancer = BibliographyEnhancer(
-            db_manager=self.db, 
-            rate_limiter=self.rate_limiter, 
-            email=self.mailto, 
-            output_folder=self.download_dir
-        )
+        self._settings_fingerprint = settings_fingerprint(apply_app_settings_env(db_path))
+        self.enhancer = self._build_enhancer()
         self.db_lock = threading.RLock()
         self.running = True
         self.daemon_name = {
@@ -848,17 +863,20 @@ class PipelineDaemon:
         }
 
     def _run_direct_enrich_cycle(self):
+        self.refresh_app_settings()
         default_limit = max(1, int(os.getenv("RAG_FEEDER_ENRICH_BATCH_SIZE", "10") or "10"))
         default_workers = max(1, int(os.getenv("RAG_FEEDER_ENRICH_WORKERS", "6") or "6"))
         result = self.do_enrich(None, default_limit, default_workers, {})
         return result if (result or {}).get("processed", 0) > 0 else None
 
     def _run_direct_download_cycle(self):
+        self.refresh_app_settings()
         default_limit = max(1, int(os.getenv("RAG_FEEDER_DOWNLOAD_BATCH_SIZE", "50") or "50"))
         result = self.do_download(None, default_limit)
         return result if (result or {}).get("processed", 0) > 0 else None
 
     def _process_job(self, job: dict) -> None:
+        self.refresh_app_settings()
         log(f"Picked up job {job['id']} of type '{job['job_type']}'")
         self._heartbeat(
             "running",
