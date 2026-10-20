@@ -1534,20 +1534,31 @@
   }
 
   // Arms exactly one timer: 2 s while active, 20 s idle, nothing when hidden or logged out.
+  // An already armed timer that is due sooner is kept, so a pending trailing run
+  // is never pushed back to the regular cadence. An explicit delayMs skips the
+  // reason check (log-triggered runs happen on any tab) but still never when hidden.
   function scheduleRefresh({ delayMs = null } = {}) {
-    if (refreshTimer) {
-      clearTimeout(refreshTimer)
-      refreshTimer = null
-    }
     if (refreshDisposed) return
     let wait = delayMs
-    if (wait === null) {
-      const reason = refreshReason()
+    const reason = refreshReason()
+    if (reason === 'hidden') wait = null
+    else if (wait === null) {
       if (reason === 'active') wait = REFRESH_ACTIVE_MS
       else if (reason === 'idle') wait = REFRESH_IDLE_MS
-      else return
     }
-    refreshTimerDueAt = Date.now() + wait
+    if (wait === null) {
+      if (refreshTimer) {
+        clearTimeout(refreshTimer)
+        refreshTimer = null
+      }
+      return
+    }
+    const dueAt = Date.now() + wait
+    if (refreshTimer) {
+      if (refreshTimerDueAt <= dueAt) return
+      clearTimeout(refreshTimer)
+    }
+    refreshTimerDueAt = dueAt
     refreshTimer = setTimeout(() => {
       refreshTimer = null
       void runLiveRefreshCycle()
@@ -1558,10 +1569,10 @@
   function requestRefreshSoon(delayMs = REFRESH_TRAILING_MS) {
     if (refreshDisposed || refreshReason() === 'hidden') return
     refreshDirty = true
-    if (refreshTimer && refreshTimerDueAt <= Date.now() + delayMs) return
     scheduleRefresh({ delayMs })
   }
 
+  // The arguments exist only to register authStatus/anySearchRunning as `$:` dependencies.
   function rearmRefreshOnChange() {
     if (refreshDisposed) return
     scheduleRefresh()
@@ -1593,7 +1604,8 @@
     try {
       await runLiveRefreshCycleOnce()
     } finally {
-      scheduleRefresh()
+      // Dirty again means a log burst landed while this cycle was in flight.
+      scheduleRefresh({ delayMs: refreshDirty ? REFRESH_TRAILING_MS : null })
     }
   }
 
@@ -4685,6 +4697,8 @@
       }, 80)
     }
     refreshForActiveTab(safeTab)
+    // The cadence depends on the tab (e.g. corpus has none, workspace is idle-polled).
+    scheduleRefresh()
   }
 
   onMount(() => {
