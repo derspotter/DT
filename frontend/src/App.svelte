@@ -206,14 +206,8 @@
   }
 
   $: anySearchRunning = startedSearchRunIds.size > 0 || seedSources.some((s) => s?.run?.status === 'running')
-  $: if (anySearchRunning) {
-    if (!searchRefreshIntervalId) {
-      searchRefreshIntervalId = setInterval(() => runLiveRefreshCycle(), 2000)
-    }
-  } else if (searchRefreshIntervalId) {
-    clearInterval(searchRefreshIntervalId)
-    searchRefreshIntervalId = null
-  }
+  // Re-arm the refresh timer when the cadence may have changed (login, search start/stop).
+  $: rearmRefreshOnChange(authStatus, anySearchRunning)
   $: itemsPromotedCount = Number(corpusTotal) || corpusItems.length
   $: seedPipelineActivity = seedActivity(ingestStats)
   let seedWarningMessage = ''
@@ -551,10 +545,15 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
-  let pipelineRefreshTimer = null
   let pipelineRefreshInFlight = false
-  let liveRefreshIntervalId = null
-  let searchRefreshIntervalId = null
+  const REFRESH_ACTIVE_MS = 2000
+  const REFRESH_IDLE_MS = 20000
+  const REFRESH_TRAILING_MS = 1500
+  const REFRESH_WORKER_TICK_MS = 300
+  let refreshTimer = null
+  let refreshTimerDueAt = 0
+  let refreshDirty = false
+  let refreshDisposed = false
   let lastTabRefreshAt = 0
   let rawCorpusTableEl = null
   let metaCorpusTableEl = null
@@ -1523,37 +1522,49 @@
     return match[1] === String(corpusFilter)
   }
 
-  function schedulePipelineRefresh(delayMs = 1500) {
-    if (pipelineRefreshTimer || pipelineRefreshInFlight) return
-    pipelineRefreshTimer = setTimeout(async () => {
-      pipelineRefreshTimer = null
-      if (pipelineRefreshInFlight || authStatus !== 'authenticated') return
-      pipelineRefreshInFlight = true
-      try {
-        const tasks = [
-          loadIngestStats({ quiet: true }),
-          loadIngestRuns(),
-        ]
-        // The corpus tab is selection-heavy; avoid replacing the list on every worker tick.
-        if (activeTab !== 'corpus') {
-          tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
-        }
-        // The Seed panel has no manual refresh; keep its state counts current on worker ticks.
-        if (activeTab === 'workspace') {
-          tasks.push(loadSeedSources({ quiet: true }))
-        }
-        if (diagnosticsEnabled) {
-          tasks.push(
-            loadPipelineWorkerStatus({ quiet: true }),
-            loadDownloadWorkerStatus({ quiet: true }),
-            loadDownloads(),
-          )
-        }
-        await Promise.all(tasks)
-      } finally {
-        pipelineRefreshInFlight = false
-      }
-    }, delayMs)
+  function refreshReason() {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
+    if (authStatus !== 'authenticated') return 'none'
+    if (anySearchRunning) return 'active'
+    if (diagnosticsEnabled && (pipelineWorker.running || pipelineWorker.in_flight)) return 'active'
+    if (diagnosticsEnabled && (downloadWorker.running || downloadWorker.in_flight)) return 'active'
+    // The Admin tab only refreshes the OpenAlex quota, at the idle cadence.
+    if (shouldRunLiveRefresh() || activeTab === 'admin') return 'idle'
+    return 'none'
+  }
+
+  // Arms exactly one timer: 2 s while active, 20 s idle, nothing when hidden or logged out.
+  function scheduleRefresh({ delayMs = null } = {}) {
+    if (refreshTimer) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
+    }
+    if (refreshDisposed) return
+    let wait = delayMs
+    if (wait === null) {
+      const reason = refreshReason()
+      if (reason === 'active') wait = REFRESH_ACTIVE_MS
+      else if (reason === 'idle') wait = REFRESH_IDLE_MS
+      else return
+    }
+    refreshTimerDueAt = Date.now() + wait
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null
+      void runLiveRefreshCycle()
+    }, wait)
+  }
+
+  // Worker log lines mark the data dirty and coalesce into one trailing run.
+  function requestRefreshSoon(delayMs = REFRESH_TRAILING_MS) {
+    if (refreshDisposed || refreshReason() === 'hidden') return
+    refreshDirty = true
+    if (refreshTimer && refreshTimerDueAt <= Date.now() + delayMs) return
+    scheduleRefresh({ delayMs })
+  }
+
+  function rearmRefreshOnChange() {
+    if (refreshDisposed) return
+    scheduleRefresh()
   }
 
   function snapshotCorpusScroll() {
@@ -1579,13 +1590,30 @@
   }
 
   async function runLiveRefreshCycle() {
+    try {
+      await runLiveRefreshCycleOnce()
+    } finally {
+      scheduleRefresh()
+    }
+  }
+
+  async function runLiveRefreshCycleOnce() {
+    const dirty = refreshDirty
+    refreshDirty = false
+    if (authStatus !== 'authenticated') return
     if (!shouldRunLiveRefresh()) {
       // The Admin panel shows the OpenAlex budget too; keep it current there
       // without the full workspace refresh.
       if (activeTab === 'admin') void loadOpenAlexQuota()
+      if (dirty && !pipelineRefreshInFlight) {
+        await Promise.all([loadIngestStats({ quiet: true }), loadIngestRuns()])
+      }
       return
     }
-    if (pipelineRefreshInFlight) return
+    if (pipelineRefreshInFlight) {
+      if (dirty) refreshDirty = true
+      return
+    }
     pipelineRefreshInFlight = true
     try {
       const tasks = [
@@ -1593,6 +1621,7 @@
         loadCorpus({ preserveSelection: true, quiet: true }),
         loadOpenAlexQuota(),
       ]
+      if (dirty) tasks.push(loadIngestRuns())
       // Not only while a run is known to be running: the workspace is where
       // seeds live, and a run started elsewhere (or one this tab has not seen
       // yet) has to be able to show up on its own.
@@ -4553,7 +4582,7 @@
         if (shouldTriggerPipelineRefresh(line)) {
           const isWorkerTick =
             String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
-          schedulePipelineRefresh(isWorkerTick ? 300 : 1500)
+          requestRefreshSoon(isWorkerTick ? REFRESH_WORKER_TICK_MS : REFRESH_TRAILING_MS)
         }
       }
       ws.onclose = () => {
@@ -4695,8 +4724,12 @@
     window.addEventListener('hashchange', onHashChange)
 
     const onFocusOrVisible = () => {
-      if (document.visibilityState === 'hidden') return
-      refreshForActiveTab(activeTab)
+      if (document.visibilityState === 'hidden') {
+        scheduleRefresh()
+        return
+      }
+      // Becoming visible refreshes once; the regular cadence resumes afterwards.
+      void refreshForActiveTab(activeTab).finally(() => scheduleRefresh())
     }
     window.addEventListener('focus', onFocusOrVisible)
     document.addEventListener('visibilitychange', onFocusOrVisible)
@@ -4707,9 +4740,9 @@
     }
     boot()
 
-    liveRefreshIntervalId = setInterval(() => {
-      runLiveRefreshCycle()
-    }, 3000)
+    refreshDisposed = false
+    scheduleRefresh()
+    if (import.meta.env.DEV) window.__dtRefresh = { requestRefreshSoon }
 
     return () => {
       closeTopicSuggestions()
@@ -4719,18 +4752,12 @@
       reducedMotionMediaQuery?.removeEventListener?.('change', onReducedMotionChange)
       reducedMotionMediaQuery = null
       disconnectLogs()
-      if (pipelineRefreshTimer) {
-        clearTimeout(pipelineRefreshTimer)
-        pipelineRefreshTimer = null
+      refreshDisposed = true
+      if (refreshTimer) {
+        clearTimeout(refreshTimer)
+        refreshTimer = null
       }
-      if (liveRefreshIntervalId) {
-        clearInterval(liveRefreshIntervalId)
-        liveRefreshIntervalId = null
-      }
-      if (searchRefreshIntervalId) {
-        clearInterval(searchRefreshIntervalId)
-        searchRefreshIntervalId = null
-      }
+      if (import.meta.env.DEV) delete window.__dtRefresh
       if (promotionFlushTimer) {
         clearTimeout(promotionFlushTimer)
         promotionFlushTimer = null

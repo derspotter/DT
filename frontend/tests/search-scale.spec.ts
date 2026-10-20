@@ -519,8 +519,13 @@ test('an idle expanded seed is not re-requested on every workspace poll', async 
   const afterExpand = candidateRequests
   const sourcesAfterExpand = sourceRequests
 
-  await page.waitForTimeout(7000)
-  // The seed list itself kept polling (that is the I2 fix)...
+  // The idle cadence is 20 s now, so drive three refresh cycles the way worker
+  // log lines do instead of waiting for the timer.
+  for (let i = 0; i < 3; i += 1) {
+    await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(100))
+    await page.waitForTimeout(1200)
+  }
+  // The seed list itself kept refreshing (that is the I2 fix)...
   expect(sourceRequests).toBeGreaterThan(sourcesAfterExpand + 1)
   // ...but the expensive candidates route was not touched again.
   expect(candidateRequests).toBe(afterExpand)
