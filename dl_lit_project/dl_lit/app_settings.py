@@ -28,8 +28,10 @@ def load_app_settings_env(db_path) -> dict[str, str]:
             rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
         finally:
             conn.close()
-    except sqlite3.OperationalError:
-        return {}
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise
     env: dict[str, str] = {}
     for key, value in rows:
         name = APP_SETTING_ENV.get(key)
@@ -39,10 +41,20 @@ def load_app_settings_env(db_path) -> dict[str, str]:
     return env
 
 
+# Original process values of the managed env names, captured on first apply so
+# that clearing a setting restores them instead of leaving a stale override.
+_ORIGINAL_ENV: dict[str, str | None] = {}
+
+
 def apply_app_settings_env(db_path) -> dict[str, str]:
     env = load_app_settings_env(db_path)
-    for name, value in env.items():
-        os.environ[name] = value
+    for name in APP_SETTING_ENV.values():
+        _ORIGINAL_ENV.setdefault(name, os.environ.get(name))
+        value = env.get(name, _ORIGINAL_ENV[name])
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
     return env
 
 

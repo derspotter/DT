@@ -132,11 +132,16 @@ class PipelineDaemon:
 
     def refresh_app_settings(self) -> bool:
         """Re-read Admin settings; rebuild the enhancer (cached LLM client) only on change."""
-        fingerprint = settings_fingerprint(apply_app_settings_env(self.db_path))
+        try:
+            fingerprint = settings_fingerprint(apply_app_settings_env(self.db_path))
+        except sqlite3.OperationalError as exc:
+            log(f"Could not read Admin settings, keeping previous: {exc}")
+            return False
         if fingerprint == self._settings_fingerprint:
             return False
-        self._settings_fingerprint = fingerprint
+        # Build first: if it raises, the fingerprint stays stale so the next call retries.
         self.enhancer = self._build_enhancer()
+        self._settings_fingerprint = fingerprint
         log("Admin settings changed; rebuilt enhancer")
         return True
 
