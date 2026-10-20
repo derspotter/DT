@@ -265,3 +265,20 @@ def test_search_credits_per_page():
     assert keyword_search.search_credits_per_page("labour") == 10
     assert keyword_search.search_credits_per_page("  ") == 1
     assert keyword_search.search_credits_per_page(None) == 1
+
+
+def test_openalex_session_is_shared_per_thread():
+    from dl_lit import utils
+    import threading, requests
+    a = utils.get_openalex_session(); b = utils.get_openalex_session()
+    assert a is b and isinstance(a, requests.Session)
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(utils.get_openalex_session())); t.start(); t.join()
+    assert seen[0] is not a
+
+
+def test_keyword_requests_reuse_the_session(monkeypatch):
+    captured = []
+    monkeypatch.setattr(keyword_search, "openalex_request_json", lambda **kw: captured.append(kw) or {"results": [], "meta": {"count": 0}})
+    keyword_search.count_openalex(query="a"); keyword_search.count_openalex(query="b")
+    assert captured[0]["session"] is captured[1]["session"] is not None

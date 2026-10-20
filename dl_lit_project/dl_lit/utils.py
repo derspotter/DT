@@ -503,6 +503,22 @@ def openalex_request_json(
     raise RuntimeError('OpenAlex request failed after retries')
 
 
+_openalex_session_local = threading.local()
+
+
+def get_openalex_session() -> requests.Session:
+    """Return this thread's shared requests.Session for OpenAlex calls.
+
+    requests.Session is not guaranteed thread-safe, so each thread gets its own
+    instance; within a thread the connection pool is reused across pages.
+    """
+    session = getattr(_openalex_session_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        _openalex_session_local.session = session
+    return session
+
+
 def get_global_rate_limiter():
     """Get the shared rate limiter instance for the entire application."""
     global _global_rate_limiter
