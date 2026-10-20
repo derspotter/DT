@@ -905,7 +905,6 @@ class PipelineDaemon:
         result = None
 
         try:
-            self.refresh_app_settings()
             if job["job_type"] == "enrich":
                 limit = params.get("limit", 10)
                 workers = params.get("workers", 6)
@@ -1008,6 +1007,7 @@ class PipelineDaemon:
             while self.running:
                 try:
                     self._heartbeat("idle", {"state": "polling", "mode": "db-driven", "role": self.role})
+                    self.refresh_app_settings()  # before claiming: a failure must not claim a job
                     job = self.fetch_next_job()
                     if job:
                         self._process_job(job)
@@ -1059,6 +1059,7 @@ class PipelineDaemon:
         while self.running:
             try:
                 self._heartbeat("idle", {"state": "polling"})
+                self.refresh_app_settings()  # before claiming: a failure must not claim a job
                 job = self.fetch_next_job()
                 if not job:
                     direct_result = None

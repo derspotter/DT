@@ -117,7 +117,7 @@ def test_saving_value_equal_to_env_does_not_rebuild(monkeypatch, tmp_path):
     assert len(builds) == 1
 
 
-def test_failed_rebuild_marks_claimed_job_failed(monkeypatch, tmp_path):
+def test_persistent_rebuild_failure_claims_no_job_and_backs_off(monkeypatch, tmp_path):
     state = {"fail": False}
 
     def build(self):
@@ -126,17 +126,24 @@ def test_failed_rebuild_marks_claimed_job_failed(monkeypatch, tmp_path):
         return object()
 
     mod, daemon = _daemon(monkeypatch, tmp_path, build)
-    job_id = daemon.enqueue_job(None, "enrich", {})
-    job = daemon.fetch_next_job()
-    assert job["id"] == job_id
+    ids = [daemon.enqueue_job(None, "enrich", {}) for _ in range(2)]
     _set_setting(tmp_path / "lit.db", "llm_provider", "openai")
     state["fail"] = True
-    daemon._process_job(job)
-    row = daemon.db.conn.execute(
-        "SELECT status, result_json FROM pipeline_jobs WHERE id = ?", (job_id,)
-    ).fetchone()
-    assert row[0] == "failed"
-    assert "no model configured" in row[1]
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= 3:
+            daemon.running = False
+
+    monkeypatch.setattr(mod.time, "sleep", fake_sleep)
+    daemon.run()
+    statuses = [
+        daemon.db.conn.execute("SELECT status FROM pipeline_jobs WHERE id = ?", (i,)).fetchone()[0]
+        for i in ids
+    ]
+    assert statuses == ["pending", "pending"]
+    assert sleeps and all(s >= 5 for s in sleeps)
 
 
 def test_failed_refresh_in_direct_cycle_leaks_no_heartbeat_thread(monkeypatch, tmp_path):
