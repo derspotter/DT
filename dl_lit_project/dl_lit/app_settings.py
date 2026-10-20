@@ -62,3 +62,8 @@ def settings_fingerprint(env: dict[str, str]) -> str:
     if not env:
         return ""
     return hashlib.sha256(repr(sorted(env.items())).encode("utf-8")).hexdigest()
+
+
+def effective_env() -> dict[str, str]:
+    """Current process values of the managed env names (stored override or original)."""
+    return {n: os.environ[n] for n in APP_SETTING_ENV.values() if os.environ.get(n)}

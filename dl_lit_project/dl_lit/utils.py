@@ -519,6 +519,12 @@ def get_openalex_session() -> requests.Session:
     return session
 
 
+def reset_global_rate_limiter():
+    """Drop the shared limiter so the next get_global_rate_limiter() re-reads the environment."""
+    global _global_rate_limiter
+    _global_rate_limiter = None
+
+
 def get_global_rate_limiter():
     """Get the shared rate limiter instance for the entire application."""
     global _global_rate_limiter

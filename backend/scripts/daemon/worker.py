@@ -77,8 +77,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dl_lit.db_manager import DatabaseManager
-from dl_lit.app_settings import apply_app_settings_env, settings_fingerprint
-from dl_lit.utils import get_global_rate_limiter
+from dl_lit.app_settings import apply_app_settings_env, effective_env, settings_fingerprint
+from dl_lit.utils import get_global_rate_limiter, reset_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
 from dl_lit.scraper_lab import execute_scraper_job
@@ -133,16 +133,22 @@ class PipelineDaemon:
     def refresh_app_settings(self) -> bool:
         """Re-read Admin settings; rebuild the enhancer (cached LLM client) only on change."""
         try:
-            fingerprint = settings_fingerprint(apply_app_settings_env(self.db_path))
+            apply_app_settings_env(self.db_path)
+            fingerprint = settings_fingerprint(effective_env())
         except sqlite3.OperationalError as exc:
             log(f"Could not read Admin settings, keeping previous: {exc}")
             return False
         if fingerprint == self._settings_fingerprint:
             return False
-        # Build first: if it raises, the fingerprint stays stale so the next call retries.
+        # The searcher caches the OpenAlex key and the global limiter reads its RPS once,
+        # so both are recreated together with the enhancer (cached LLM client).
+        reset_global_rate_limiter()
+        self.rate_limiter = get_global_rate_limiter()
+        self.searcher = OpenAlexCrossrefSearcher(mailto=self.mailto, rate_limiter=self.rate_limiter)
+        # Build last: if it raises, the fingerprint stays stale so the next call retries.
         self.enhancer = self._build_enhancer()
         self._settings_fingerprint = fingerprint
-        log("Admin settings changed; rebuilt enhancer")
+        log("Admin settings changed; rebuilt searcher, rate limiter and enhancer")
         return True
 
     def __init__(self, db_path: str, role: str = "all"):
@@ -153,6 +159,8 @@ class PipelineDaemon:
         self.heartbeat_conn.execute("PRAGMA journal_mode=WAL")
         self.heartbeat_conn.execute("PRAGMA busy_timeout = 3000")
         self.heartbeat_lock = threading.RLock()
+        apply_app_settings_env(db_path)
+        self._settings_fingerprint = settings_fingerprint(effective_env())
         self.rate_limiter = get_global_rate_limiter()
         self.mailto = os.getenv("RAG_FEEDER_MAILTO", "spott@wzb.eu")
         self.searcher = OpenAlexCrossrefSearcher(mailto=self.mailto, rate_limiter=self.rate_limiter)
@@ -161,7 +169,6 @@ class PipelineDaemon:
         self.download_dir = project_dir / "data" / "pdf_library"
         self.download_dir.mkdir(parents=True, exist_ok=True)
         
-        self._settings_fingerprint = settings_fingerprint(apply_app_settings_env(db_path))
         self.enhancer = self._build_enhancer()
         self.db_lock = threading.RLock()
         self.running = True
@@ -881,7 +888,6 @@ class PipelineDaemon:
         return result if (result or {}).get("processed", 0) > 0 else None
 
     def _process_job(self, job: dict) -> None:
-        self.refresh_app_settings()
         log(f"Picked up job {job['id']} of type '{job['job_type']}'")
         self._heartbeat(
             "running",
@@ -899,6 +905,7 @@ class PipelineDaemon:
         result = None
 
         try:
+            self.refresh_app_settings()
             if job["job_type"] == "enrich":
                 limit = params.get("limit", 10)
                 workers = params.get("workers", 6)
@@ -1008,16 +1015,18 @@ class PipelineDaemon:
                     direct_result = None
                     heartbeat_stop = None
                     heartbeat_thread = None
-                    if self.role == "enrich":
-                        heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "enrich"})
-                        direct_result = self._run_direct_enrich_cycle()
-                    elif self.role == "download":
-                        heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "download"})
-                        direct_result = self._run_direct_download_cycle()
-                    if heartbeat_stop:
-                        heartbeat_stop.set()
-                    if heartbeat_thread:
-                        heartbeat_thread.join(timeout=1)
+                    try:
+                        if self.role == "enrich":
+                            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "enrich"})
+                            direct_result = self._run_direct_enrich_cycle()
+                        elif self.role == "download":
+                            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "download"})
+                            direct_result = self._run_direct_download_cycle()
+                    finally:
+                        if heartbeat_stop:
+                            heartbeat_stop.set()
+                        if heartbeat_thread:
+                            heartbeat_thread.join(timeout=1)
                     if direct_result:
                         self._heartbeat(
                             "running",
