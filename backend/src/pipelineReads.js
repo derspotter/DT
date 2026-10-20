@@ -31,7 +31,12 @@ export function readIngestStats(db, corpusId) {
   }
 }
 
-export function listDownloads(db, { corpusId = null, limit = 200, offset = 0 } = {}) {
+// Count and page in one read transaction (one WAL snapshot), so total matches the rows.
+export function listDownloads(db, options = {}) {
+  return db.transaction(readDownloads)(db, options)
+}
+
+function readDownloads(db, { corpusId = null, limit = 200, offset = 0 } = {}) {
   if (!tableExists(db, 'works')) return { items: [], total: 0 }
   const scoped = corpusId !== null && corpusId !== undefined
   const join = scoped ? 'JOIN corpus_works cw ON cw.work_id = w.id' : ''

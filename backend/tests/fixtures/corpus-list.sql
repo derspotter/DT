@@ -3,6 +3,8 @@
 -- shape, odd years, a NULL membership date, LIKE metacharacters in titles and
 -- every provenance path of source_label_for_work. Work 12 has a leading BOM
 -- in its first author, which Python's str.strip() keeps and String#trim drops.
+-- Work 9's metadata_status is wrapped in U+00A0/U+3000 (str.strip() removes
+-- them) and work 13's year is Arabic-Indic digits (int() reads them as 1970).
 CREATE TABLE works (
   id INTEGER PRIMARY KEY,
   title TEXT,
@@ -37,11 +39,11 @@ INSERT INTO works (id, title, authors, year, doi, openalex_id, source, publisher
   (6,  'Éclair studies', '["Émile"]', 2010, NULL, NULL, NULL, NULL, NULL, ' MATCHED ', NULL, 'In_Progress', NULL, NULL, NULL, NULL, 42, '2025-01-01 00:00:06'),
   (7,  'labour history', 'labour', 2005, NULL, NULL, 'History', NULL, NULL, 'matched', NULL, 'failed', NULL, 'bibtex_import', 'x', NULL, NULL, '2025-01-01 00:00:07'),
   (8,  'Gamma', NULL, 2005, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, 'refs/metadata.bib', NULL, NULL, '2025-01-01 00:00:08'),
-  (9,  'Delta', '["Solo Author"]', 1990, NULL, NULL, NULL, NULL, NULL, 'matched', NULL, 'not_requested', NULL, 'pdf', 'pdfB', NULL, NULL, '2025-01-01 00:00:09'),
+  (9,  'Delta', '["Solo Author"]', 1990, NULL, NULL, NULL, NULL, NULL, char(160) || 'matched' || char(12288), NULL, 'not_requested', NULL, 'pdf', 'pdfB', NULL, NULL, '2025-01-01 00:00:09'),
   (10, 'Epsilon', NULL, 1990, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, 'pdfC', NULL, NULL, '2025-01-01 00:00:10'),
   (11, 'Eta', NULL, 'c. 1980', NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, 'unknownkey', NULL, NULL, '2025-01-01 00:00:11'),
   (12, 'Theta', '["' || char(65279) || 'Zed Bom", "Other"]', 1970, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, NULL, '/data/pdfs/Some Paper.v2.pdf', NULL, '2025-01-01 00:00:12'),
-  (13, 'Iota', NULL, 1970, NULL, NULL, 'Venue I', NULL, NULL, 'pending', 'openalex', 'not_requested', NULL, NULL, NULL, NULL, NULL, '2025-01-01 00:00:13'),
+  (13, 'Iota', NULL, '١٩٧٠', NULL, NULL, 'Venue I', NULL, NULL, 'pending', 'openalex', 'not_requested', NULL, NULL, NULL, NULL, NULL, '2025-01-01 00:00:13'),
   (14, NULL, NULL, 1960, NULL, NULL, 'Venue K', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2025-01-01 00:00:14'),
   (15, 'Outside one', NULL, 2020, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, 'upload', 'unknownkey', NULL, NULL, '2025-01-02'),
   (16, 'Outside two labour', NULL, 2021, NULL, NULL, NULL, NULL, NULL, 'matched', NULL, 'downloaded', NULL, NULL, NULL, NULL, NULL, '2025-01-03'),

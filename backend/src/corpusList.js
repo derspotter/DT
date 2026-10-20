@@ -50,9 +50,20 @@ function pyInt(value) {
   if (typeof value === 'bigint') return Number(value)
   if (typeof value === 'string') {
     const text = pyStrip(value)
-    return /^[+-]?\d+(?:_\d+)*$/.test(text) ? Number(text.replace(/_/g, '')) : 0
+    // int() takes any Unicode decimal digit (U+FF11, U+0661, ...), not just ASCII.
+    if (!/^[+-]?\p{Nd}+(?:_\p{Nd}+)*$/u.test(text)) return 0
+    return Number(Array.from(text.replace(/_/g, ''), (ch) => (/\p{Nd}/u.test(ch) ? String(digitValue(ch)) : ch)).join(''))
   }
   return 0
+}
+
+// Decimal digits come in aligned runs of ten (0..9), so a digit's value is its
+// distance from the start of its contiguous \p{Nd} run, modulo 10.
+function digitValue(ch) {
+  const cp = ch.codePointAt(0)
+  let start = cp
+  while (/\p{Nd}/u.test(String.fromCodePoint(start - 1))) start -= 1
+  return (cp - start) % 10
 }
 
 // Python orders strings by code point; JS `<` by UTF-16 unit. They disagree
@@ -128,7 +139,9 @@ function registerFunctions(db) {
 }
 
 // status_from_row, download state first.
-const WS = "char(32, 9, 10, 11, 12, 13)"
+// trim() set = Python's str.isspace() characters. lower() folding only ASCII is
+// exact here: no non-ASCII character lowercases into these status words.
+const WS = 'char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)'
 const META = `lower(trim(COALESCE(w.metadata_status, ''), ${WS}))`
 const DOWNLOAD = `lower(trim(COALESCE(w.download_status, ''), ${WS}))`
 const STATUS_SQL = `CASE
@@ -276,13 +289,27 @@ function stageTotals(counts) {
   }
 }
 
-export function listCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort = '' } = {}) {
+const readTransactions = new WeakMap()
+
+// One read transaction per listing: in WAL mode every statement inside sees the
+// same snapshot, so counts, ids and page rows cannot disagree when a worker or
+// a membership removal commits in between.
+export function listCorpus(db, options = {}) {
+  registerFunctions(db)
+  let read = readTransactions.get(db)
+  if (!read) {
+    read = db.transaction(readCorpus)
+    readTransactions.set(db, read)
+  }
+  return read(db, options)
+}
+
+function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort = '' } = {}) {
   const scoped = corpusId !== null && corpusId !== undefined
   const emptyCounts = {}
   if (!tableExists(db, 'works')) {
     return { items: [], total: 0, stage_totals: stageTotals(emptyCounts), status_counts: emptyCounts }
   }
-  registerFunctions(db)
 
   const pageLimit = nonNegInt(limit, 200)
   const pageOffset = nonNegInt(offset, 0)
@@ -339,10 +366,14 @@ export function listCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '
     if (!ids.length) {
       rows = []
     } else {
-      const fetched = db.prepare(`SELECT ${columns} ${from} ${where.length ? 'AND' : 'WHERE'} w.id IN (${ids.map(() => '?').join(', ')})`)
-        .all(...params, ...ids)
+      // One JSON parameter instead of one per id: pages may exceed SQLite's
+      // bound-variable limit.
+      const fetched = db.prepare(`SELECT ${columns} ${from} ${where.length ? 'AND' : 'WHERE'} w.id IN (SELECT value FROM json_each(?))`)
+        .all(...params, JSON.stringify(ids))
       const byId = new Map(fetched.map((row) => [row.id, row]))
-      rows = ids.map((id) => byId.get(id))
+      // filter(Boolean): never throw on a row gone missing (the transaction
+      // already prevents that on a WAL database).
+      rows = ids.map((id) => byId.get(id)).filter(Boolean)
     }
   } else {
     const key = sortExpression(column, addedSql)

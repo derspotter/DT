@@ -122,3 +122,19 @@ test('ingest runs without the ingest tables returns an empty list', () => {
   expect(listIngestRuns(bare, { corpusId: 1, limit: 5 })).toEqual({ runs: [], total: 0 })
   bare.close()
 })
+
+test('listDownloads reads count and page inside one transaction', () => {
+  seedStats()
+  const seen = []
+  const original = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    seen.push(db.inTransaction)
+    return original(sql)
+  }
+  const result = listDownloads(db, { corpusId: 1 })
+  db.prepare = original
+  expect(result.total).toBe(result.items.length)
+  expect(seen.length).toBeGreaterThan(1)
+  expect(seen.every(Boolean)).toBe(true)
+  expect(db.inTransaction).toBe(false)
+})

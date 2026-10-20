@@ -113,3 +113,123 @@ test('counts and labels for the fixture corpus', () => {
   expect(byId[4].added_at).toBeNull()
   expect(CORPUS_SORT_KEYS).toEqual(['title', 'authors', 'year', 'added', 'source', 'seed', 'metadata', 'download'])
 })
+
+// --- Consistency and large pages -------------------------------------------
+
+// A fresh copy of the fixture, so mutating tests leave the golden DB alone.
+function freshDb(file = ':memory:') {
+  const copy = new Database(file)
+  if (file !== ':memory:') copy.pragma('journal_mode = WAL')
+  copy.exec(fs.readFileSync(FIXTURE, 'utf8'))
+  return copy
+}
+
+// Runs `hook` right before the page query (the only one selecting file_path)
+// is prepared, and records db.inTransaction for every prepared statement.
+function instrument(target, hook) {
+  const seen = []
+  const original = target.prepare.bind(target)
+  target.prepare = (sql) => {
+    seen.push(target.inTransaction)
+    if (hook && sql.includes('w.file_path')) hook()
+    return original(sql)
+  }
+  return seen
+}
+
+test('every statement of a listing runs inside one read transaction', () => {
+  const copy = freshDb()
+  try {
+    for (const sort of ['', 'seed:asc']) {
+      const seen = instrument(copy)
+      listCorpus(copy, { corpusId: 1, limit: 200, offset: 0, q: '', sort })
+      expect(seen.length).toBeGreaterThan(3)
+      expect(seen.every(Boolean)).toBe(true)
+    }
+    expect(copy.inTransaction).toBe(false)
+  } finally {
+    copy.close()
+  }
+})
+
+test.each(['', 'seed:asc'])('a removal committed mid-listing does not leak in (sort %j)', (sort) => {
+  const file = path.join(tempDir, `snapshot-${sort || 'default'}.db`)
+  const copy = freshDb(file)
+  const other = new Database(file)
+  try {
+    instrument(copy, () => other.prepare('DELETE FROM corpus_works WHERE corpus_id = 1 AND work_id = 1').run())
+    const result = listCorpus(copy, { corpusId: 1, limit: 200, offset: 0, q: '', sort })
+    // The removal committed (another connection sees it) but this listing
+    // read one snapshot: counts and rows agree and still include work 1.
+    expect(other.prepare('SELECT COUNT(*) AS n FROM corpus_works WHERE corpus_id = 1').get().n).toBe(13)
+    expect(result.total).toBe(14)
+    expect(result.items).toHaveLength(14)
+    expect(result.items.map((i) => i.id)).toContain(1)
+    expect(listCorpus(copy, { corpusId: 1, limit: 200, offset: 0, q: '', sort }).total).toBe(13)
+  } finally {
+    other.close()
+    copy.close()
+  }
+})
+
+test('seed sort skips a row that vanished before the page fetch instead of throwing', () => {
+  const copy = freshDb()
+  try {
+    // Same connection, so the delete is visible inside the transaction: this
+    // exercises the filter(Boolean) fallback.
+    instrument(copy, () => copy.exec('DELETE FROM corpus_works WHERE corpus_id = 1 AND work_id = 1'))
+    const result = listCorpus(copy, { corpusId: 1, limit: 200, offset: 0, q: '', sort: 'seed:asc' })
+    expect(result.items).toHaveLength(13)
+    expect(result.items.every((i) => i && i.id !== 1)).toBe(true)
+  } finally {
+    copy.close()
+  }
+})
+
+describe('a corpus larger than the bound-parameter limit', () => {
+  // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 32766; a page this size
+  // would overflow a one-placeholder-per-id IN list.
+  const N = 33000
+  const PAGE = 32900
+  let bigPath
+  let big
+  beforeAll(() => {
+    bigPath = path.join(tempDir, 'big.db')
+    big = new Database(bigPath)
+    big.exec(fs.readFileSync(FIXTURE, 'utf8'))
+    big.exec('DELETE FROM corpus_works; DELETE FROM seed_candidates_in_corpus;')
+    const insertRun = big.prepare('INSERT INTO search_runs (id, query) VALUES (?, ?)')
+    for (let r = 100; r < 140; r += 1) insertRun.run(r, `query ${String((r * 7) % 40).padStart(2, '0')}`)
+    const insertWork = big.prepare(`INSERT INTO works (id, title, year, metadata_status, download_status, origin_key, run_id, created_at)
+      VALUES (?, ?, ?, 'pending', 'not_requested', ?, ?, '2025-01-01')`)
+    const insertMember = big.prepare('INSERT INTO corpus_works (corpus_id, work_id, added_at) VALUES (1, ?, ?)')
+    big.transaction(() => {
+      for (let i = 0; i < N; i += 1) {
+        const id = 1000 + i
+        insertWork.run(id, `Work ${id}`, 1950 + (i % 70), i % 3 === 0 ? `search:${100 + (i % 40)}` : null, i % 3 === 1 ? 100 + (i % 40) : null)
+        insertMember.run(id, '2026-01-01')
+      }
+    })()
+  })
+  afterAll(() => big?.close())
+
+  test('seed sort returns a 32,900-row page in label order', () => {
+    const result = listCorpus(big, { corpusId: 1, limit: PAGE, offset: 0, q: '', sort: 'seed:asc' })
+    expect(result.total).toBe(N)
+    expect(result.items).toHaveLength(PAGE)
+    for (let i = 1; i < result.items.length; i += 1) {
+      const a = result.items[i - 1]
+      const b = result.items[i]
+      const ka = a.source_label.toLowerCase()
+      const kb = b.source_label.toLowerCase()
+      if (!(ka < kb || (ka === kb && a.id > b.id))) throw new Error(`out of order at ${i}: ${a.id} ${b.id}`)
+    }
+  }, 30_000)
+
+  goldenTest('seed sort on the large corpus matches corpus_list.py', () => {
+    const env = { ...process.env }
+    delete env.RAG_FEEDER_STUB
+    const expected = JSON.parse(execFileSync(PY, [SCRIPT, '--db-path', bigPath, '--corpus-id', '1', '--sort', 'seed:asc', '--limit', String(PAGE)], { encoding: 'utf8', env, maxBuffer: 1 << 28 }))
+    expect(listCorpus(big, { corpusId: 1, limit: PAGE, offset: 0, q: '', sort: 'seed:asc' })).toEqual(expected)
+  }, 60_000)
+})
