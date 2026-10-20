@@ -14,6 +14,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { listDownloads, listIngestRuns, readIngestStats } from './pipelineReads.js';
+import { listCorpus } from './corpusList.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -143,7 +144,6 @@ const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
 // Must match SORT_OPTIONS in dl_lit/keyword_search.py
 const KEYWORD_SEARCH_SORTS = new Set(['relevance', 'cited_by_count', 'newest', 'oldest']);
-const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
 const GRAPH_3D_CACHE_VERSION = 9;
 // Keep in sync with the frontend "Works shown" default (ThreeGraph.svelte).
@@ -5572,14 +5572,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
-    if (query) args.push('--q', query);
-    if (sort) args.push('--sort', sort);
     try {
-      const payload = await runPythonJson(CORPUS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      return res.json(payload);
+      // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
+      return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort }));
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
