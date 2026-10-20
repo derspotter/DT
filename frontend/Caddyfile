@@ -1,0 +1,15 @@
+{
+	admin off
+}
+
+:5175 {
+	handle /api/* {
+		reverse_proxy {$RAG_FEEDER_BACKEND_UPSTREAM:rag_backend:4000}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -117,6 +117,17 @@ Do not patch tracked compose files on the server. Keep the live host and Caddy l
 
 `docker compose` loads `docker-compose.override.yml` automatically, so the frontend keeps its `caddy` labels and host overrides without requiring a special command.
 
+### Serving the built frontend (production)
+
+Production serves the built `dist` from a small Caddy image instead of the Vite dev server:
+
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.override.yml up -d --build rag_feeder
+
+- The public Caddy still targets port 5175 of the frontend container; nothing changes in its configuration.
+- Inside the container, Caddy proxies `/api/*` (including the `/api/ws` WebSocket) to `rag_backend:4000` (override with `RAG_FEEDER_BACKEND_UPSTREAM`) and serves everything else from `dist` with an `index.html` fallback.
+- `docker-compose.yml` keeps `target: dev`, so `genkia.de` runs the dev server on purpose.
+- `frontend/tests/prod-image.sh` builds the image and checks it against the running dev stack's backend.
+
 ## Paths You Actually Use
 
 - SQLite DB: `dl_lit_project/data/literature.db`
