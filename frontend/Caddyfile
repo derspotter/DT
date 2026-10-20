@@ -9,7 +9,6 @@
 
 	handle {
 		root * /srv
-		try_files {path} /index.html
 		file_server
 	}
 }

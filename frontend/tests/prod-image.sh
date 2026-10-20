@@ -13,10 +13,8 @@ code() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:5176$1"; }
 [ "$(code /)" = 200 ]
 curl -s http://127.0.0.1:5176/ | grep -q '<div id="app"'
 [ "$(code /api/openalex/quota)" = 401 ]          # proxied to the backend, which wants auth
-# SPA fallback answers unknown paths with index.html (200); they must never return real files
-INDEX=$(curl -s http://127.0.0.1:5176/)
 for p in /src/App.svelte /Dockerfile /.env /Caddyfile /package.json; do
-  [ "$(curl -s "http://127.0.0.1:5176$p")" = "$INDEX" ] || { echo "leak: $p" >&2; exit 1; }
+  [ "$(code "$p")" = 404 ] || { echo "not 404: $p" >&2; exit 1; }
 done
 curl -s -D - -o /dev/null http://127.0.0.1:5176/assets/ | head -1
 echo "prod image OK"
