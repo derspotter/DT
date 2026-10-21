@@ -524,6 +524,18 @@ describe('corpus sharing and multi-user isolation', () => {
     expect(rpsRes.status).toBe(400)
   })
 
+  test('rejects a fractional openalex_rps (the worker reads it as an integer)', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    for (const value of ['0.5', '2.5', '1e1']) {
+      const res = await request(app)
+        .put('/api/admin/settings')
+        .set('Authorization', `Bearer ${admin.token}`)
+        .send({ settings: { openalex_rps: value } })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/positive integer/)
+    }
+  })
+
   test('non-admins cannot read or write settings', async () => {
     const username = 'settings-outsider'
     const password = 'settings-outsider-password'

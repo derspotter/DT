@@ -1,10 +1,12 @@
 -- Fixture for tests/corpus-list.test.js: corpus 1 holds works 1-14, works
--- 15-17 sit outside it. Covers every status_from_row branch, each authors
+-- 15-18 sit outside it. Covers every status_from_row branch, each authors
 -- shape, odd years, a NULL membership date, LIKE metacharacters in titles and
 -- every provenance path of source_label_for_work. Work 12 has a leading BOM
 -- in its first author, which Python's str.strip() keeps and String#trim drops.
 -- Work 9's metadata_status is wrapped in U+00A0/U+3000 (str.strip() removes
 -- them) and work 13's year is Arabic-Indic digits (int() reads them as 1970).
+-- Work 18's year starts with U+001C, which str.strip() removes but int()
+-- rejects, so normalize_year gives 0.
 CREATE TABLE works (
   id INTEGER PRIMARY KEY,
   title TEXT,
@@ -47,7 +49,8 @@ INSERT INTO works (id, title, authors, year, doi, openalex_id, source, publisher
   (14, NULL, NULL, 1960, NULL, NULL, 'Venue K', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '2025-01-01 00:00:14'),
   (15, 'Outside one', NULL, 2020, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, 'upload', 'unknownkey', NULL, NULL, '2025-01-02'),
   (16, 'Outside two labour', NULL, 2021, NULL, NULL, NULL, NULL, NULL, 'matched', NULL, 'downloaded', NULL, NULL, NULL, NULL, NULL, '2025-01-03'),
-  (17, 'Outside three', NULL, 2022, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, NULL, NULL, 8, NULL);
+  (17, 'Outside three', NULL, 2022, NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, NULL, NULL, 8, NULL),
+  (18, 'Outside four', NULL, char(28) || '2026', NULL, NULL, NULL, NULL, NULL, 'pending', NULL, 'not_requested', NULL, NULL, NULL, NULL, NULL, '2025-01-04');
 
 INSERT INTO corpus_works (corpus_id, work_id, added_at) VALUES
   (1, 1, '2026-01-05 10:00:00'), (1, 2, '2026-01-04 10:00:00'), (1, 3, '2026-01-04 10:00:00'),

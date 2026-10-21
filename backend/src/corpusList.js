@@ -33,6 +33,9 @@ function pyStr(value) {
 const PY_WS = '\\t\\n\\x0b\\x0c\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000'
 const PY_STRIP_RE = new RegExp(`^[${PY_WS}]+|[${PY_WS}]+$`, 'g')
 const pyStrip = (text) => text.replace(PY_STRIP_RE, '')
+// int() strips the same set minus the separators U+001C..U+001F, which it rejects.
+const PY_INT_WS = '\\t\\n\\x0b\\x0c\\r \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000'
+const PY_INT_STRIP_RE = new RegExp(`^[${PY_INT_WS}]+|[${PY_INT_WS}]+$`, 'g')
 
 // `a or b or c` returns the first truthy operand, else the last one.
 function pyOr(...values) {
@@ -49,7 +52,7 @@ function pyInt(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? Math.trunc(value) : 0
   if (typeof value === 'bigint') return Number(value)
   if (typeof value === 'string') {
-    const text = pyStrip(value)
+    const text = value.replace(PY_INT_STRIP_RE, '')
     // int() takes any Unicode decimal digit (U+FF11, U+0661, ...), not just ASCII.
     if (!/^[+-]?\p{Nd}+(?:_\p{Nd}+)*$/u.test(text)) return 0
     return Number(Array.from(text.replace(/_/g, ''), (ch) => (/\p{Nd}/u.test(ch) ? String(digitValue(ch)) : ch)).join(''))

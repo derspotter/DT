@@ -75,7 +75,7 @@ goldenEach('matches corpus_list.py for %j', (args) => {
 goldenTest('no corpus selected lists every work and uses created_at for added_at', () => {
   const actual = listCorpus(db, { corpusId: null, limit: 200, offset: 0, q: '', sort: '' })
   expect(actual).toEqual(viaScript([]))
-  expect(actual.total).toBe(17)
+  expect(actual.total).toBe(18)
   expect(actual.items.find((i) => i.id === 1).added_at).toBe('2025-01-01 00:00:01')
 })
 
@@ -84,7 +84,7 @@ goldenTest('no corpus selected, sorted by seed, matches the script', () => {
     .toEqual(viaScript(['--sort', 'seed:asc']))
 })
 
-test('escapes LIKE metacharacters in q', () => {
+test('treats % and _ in q literally', () => {
   expect(listCorpus(db, { corpusId: 1, limit: 200, offset: 0, q: '100%', sort: '' }).items.map((i) => i.id)).toEqual([1])
   expect(listCorpus(db, { corpusId: 1, limit: 200, offset: 0, q: 'a_b', sort: '' }).items.map((i) => i.id)).toEqual([2])
 })

@@ -3617,9 +3617,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     const rps = updates.openalex_rps;
     if (rps !== undefined && String(rps).trim() !== '') {
-      const parsed = Number(rps);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        return res.status(400).json({ error: 'openalex_rps must be a positive number' });
+      // The worker parses it with int(), so only plain decimal integers are usable.
+      const text = String(rps).trim();
+      if (!/^\d+$/.test(text) || Number(text) <= 0) {
+        return res.status(400).json({ error: 'openalex_rps must be a positive integer' });
       }
     }
     const searchWarnThresholdUpdate = updates.search_warn_threshold;
