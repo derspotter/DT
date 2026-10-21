@@ -16,5 +16,11 @@ curl -s http://127.0.0.1:5176/ | grep -q '<div id="app"'
 for p in /src/App.svelte /Dockerfile /.env /Caddyfile /package.json; do
   [ "$(code "$p")" = 404 ] || { echo "not 404: $p" >&2; exit 1; }
 done
-curl -s -D - -o /dev/null http://127.0.0.1:5176/assets/ | head -1
+hdr() { curl -s -D - -o /dev/null "http://127.0.0.1:5176$1" | tr -d '\r' | awk -F': ' 'tolower($1) == "cache-control" { print $2 }'; }
+[ "$(hdr /)" = "no-cache" ] || { echo "Cache-Control on / is '$(hdr /)'" >&2; exit 1; }
+ASSET=$(curl -s http://127.0.0.1:5176/ | grep -o '/assets/[^"]*\.js' | head -1)
+[ -n "$ASSET" ] || { echo "no /assets/*.js in index.html" >&2; exit 1; }
+[ "$(code "$ASSET")" = 200 ]
+[ "$(hdr "$ASSET")" = "public, max-age=31536000, immutable" ] || { echo "Cache-Control on $ASSET is '$(hdr "$ASSET")'" >&2; exit 1; }
+echo "cache headers OK: / no-cache, $ASSET immutable"
 echo "prod image OK"

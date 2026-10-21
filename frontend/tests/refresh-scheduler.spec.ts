@@ -7,8 +7,11 @@ function fulfil(route: Route, body: unknown) {
   return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
 }
 
-async function boot(page: Page, { running = false, hash = '#/workspace', corpusDelayMs = 0 } = {}) {
-  const counts = { corpus: 0 }
+async function boot(
+  page: Page,
+  { running = false, hash = '#/workspace', corpusDelayMs = 0, admin = false, stats = {} as Record<string, number> } = {},
+) {
+  const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0 }
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
@@ -16,7 +19,7 @@ async function boot(page: Page, { running = false, hash = '#/workspace', corpusD
     const path = new URL(route.request().url()).pathname
     if (path === '/api/auth/me') {
       return fulfil(route, {
-        user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: false },
+        user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: admin },
         corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
       })
     }
@@ -34,13 +37,23 @@ async function boot(page: Page, { running = false, hash = '#/workspace', corpusD
       return fulfil(route, { sources, total: sources.length, source: 'api' })
     }
     if (path === '/api/ingest/runs') return fulfil(route, { runs: [], total: 0, source: 'api' })
-    if (path === '/api/ingest/stats') return fulfil(route, { stats: {} })
+    if (path === '/api/ingest/stats') return fulfil(route, { stats })
+    if (path === '/api/pipeline/daemon/status') {
+      counts.pipelineStatus += 1
+      return fulfil(route, {})
+    }
+    if (path === '/api/downloads/worker/status') {
+      counts.downloadStatus += 1
+      return fulfil(route, {})
+    }
     return fulfil(route, {})
   })
   await page.goto(`/${hash}`)
   if (hash === '#/workspace') await expect(page.getByTestId('seed-panel')).toBeVisible()
   await page.waitForTimeout(1500)
   counts.corpus = 0
+  counts.pipelineStatus = 0
+  counts.downloadStatus = 0
   return counts
 }
 
@@ -62,14 +75,30 @@ test('idle visible workspace polls at the idle cadence, not every 3 s', async ({
 
 test('switching from a tab without polling to the workspace starts polling', async ({ page }) => {
   test.setTimeout(60000)
-  const counts = await boot(page, { hash: '#/corpus' })
-  await page.waitForTimeout(2500)
-  counts.corpus = 0
+  // #/graph is a real non-polling tab (#/corpus would normalize to the workspace).
+  const counts = await boot(page, { hash: '#/graph' })
+  await page.waitForTimeout(3000)
+  expect(counts.corpus).toBe(0)
   await page.evaluate(() => { window.location.hash = '#/workspace' })
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
   await page.waitForTimeout(1500)
   counts.corpus = 0
   await page.waitForTimeout(21500)
   expect(counts.corpus).toBeGreaterThanOrEqual(1)
+})
+
+test('a non-admin watching enrichment polls every 2 s', async ({ page }) => {
+  const counts = await boot(page, { stats: { enriching: 1 } })
+  await page.waitForTimeout(7000)
+  expect(counts.corpus).toBeGreaterThanOrEqual(3)
+})
+
+test('a log-triggered refresh on a non-polling tab discovers worker status (admin)', async ({ page }) => {
+  const counts = await boot(page, { admin: true, hash: '#/logs' })
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(300))
+  await page.waitForTimeout(1500)
+  expect(counts.pipelineStatus).toBeGreaterThanOrEqual(1)
+  expect(counts.downloadStatus).toBeGreaterThanOrEqual(1)
 })
 
 test('a running search run polls every 2 s', async ({ page }) => {

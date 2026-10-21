@@ -1,0 +1,8 @@
+# Build context hygiene: the image installs its own node_modules (npm ci) and
+# builds its own dist; never ship local secrets.
+node_modules
+dist
+test-results
+.playwright-cli
+.env*
+!.env.example

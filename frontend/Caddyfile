@@ -9,6 +9,12 @@
 
 	handle {
 		root * /srv
+		encode zstd gzip
+		# Hashed build assets never change; index.html must be revalidated so a
+		# redeploy is picked up instead of pointing at removed assets.
+		header /assets/* Cache-Control "public, max-age=31536000, immutable"
+		@html not path /assets/*
+		header @html Cache-Control "no-cache"
 		file_server
 	}
 }

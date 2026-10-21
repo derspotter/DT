@@ -206,8 +206,9 @@
   }
 
   $: anySearchRunning = startedSearchRunIds.size > 0 || seedSources.some((s) => s?.run?.status === 'running')
-  // Re-arm the refresh timer when the cadence may have changed (login, search start/stop).
-  $: rearmRefreshOnChange(authStatus, anySearchRunning)
+  // Re-arm the refresh timer when the cadence may have changed (login, search
+  // start/stop, enrichment/downloads or a worker discovered running/stopped).
+  $: rearmRefreshOnChange(authStatus, anySearchRunning, ingestStats, pipelineWorker, downloadWorker)
   $: itemsPromotedCount = Number(corpusTotal) || corpusItems.length
   $: seedPipelineActivity = seedActivity(ingestStats)
   let seedWarningMessage = ''
@@ -1528,6 +1529,10 @@
     if (anySearchRunning) return 'active'
     if (diagnosticsEnabled && (pipelineWorker.running || pipelineWorker.in_flight)) return 'active'
     if (diagnosticsEnabled && (downloadWorker.running || downloadWorker.in_flight)) return 'active'
+    // Non-admins cannot see worker status; works being enriched/downloaded right
+    // now (not merely queued) mean the counts move. Only where a cycle refreshes them.
+    const stats = ingestStats || {}
+    if ((Number(stats.enriching) > 0 || Number(stats.downloading) > 0) && shouldRunLiveRefresh()) return 'active'
     // The Admin tab only refreshes the OpenAlex quota, at the idle cadence.
     if (shouldRunLiveRefresh() || activeTab === 'admin') return 'idle'
     return 'none'
@@ -1572,7 +1577,7 @@
     scheduleRefresh({ delayMs })
   }
 
-  // The arguments exist only to register authStatus/anySearchRunning as `$:` dependencies.
+  // The arguments exist only to register them as `$:` dependencies.
   function rearmRefreshOnChange() {
     if (refreshDisposed) return
     scheduleRefresh()
@@ -1617,8 +1622,24 @@
       // The Admin panel shows the OpenAlex budget too; keep it current there
       // without the full workspace refresh.
       if (activeTab === 'admin') void loadOpenAlexQuota()
-      if (dirty && !pipelineRefreshInFlight) {
-        await Promise.all([loadIngestStats({ quiet: true }), loadIngestRuns()])
+      if (!dirty) return
+      if (pipelineRefreshInFlight) {
+        refreshDirty = true
+        return
+      }
+      pipelineRefreshInFlight = true
+      try {
+        const tasks = [loadIngestStats({ quiet: true }), loadIngestRuns()]
+        // Discover a worker started elsewhere, so refreshReason() can go active.
+        if (diagnosticsEnabled) {
+          tasks.push(
+            loadPipelineWorkerStatus({ quiet: true }),
+            loadDownloadWorkerStatus({ quiet: true }),
+          )
+        }
+        await Promise.all(tasks)
+      } finally {
+        pipelineRefreshInFlight = false
       }
       return
     }
