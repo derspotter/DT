@@ -525,6 +525,12 @@ def reset_global_rate_limiter():
     _global_rate_limiter = None
 
 
+def set_global_rate_limiter(limiter):
+    """Re-register a limiter as the shared instance (e.g. restore after a failed rebuild)."""
+    global _global_rate_limiter
+    _global_rate_limiter = limiter
+
+
 def get_global_rate_limiter():
     """Get the shared rate limiter instance for the entire application."""
     global _global_rate_limiter
