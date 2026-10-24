@@ -17,4 +17,12 @@
 		header @html Cache-Control "no-cache"
 		file_server
 	}
+
+	# file_server raises 404 as an error, after the /assets/* header above was
+	# set. Without this, a request for an asset missing mid-deploy would be
+	# cached as a 404 for a year.
+	handle_errors {
+		header Cache-Control "no-cache"
+		respond "{err.status_code} {err.status_text}" {err.status_code}
+	}
 }

@@ -9,7 +9,14 @@ function fulfil(route: Route, body: unknown) {
 
 async function boot(
   page: Page,
-  { running = false, hash = '#/workspace', corpusDelayMs = 0, admin = false, stats = {} as Record<string, number> } = {},
+  {
+    running = false,
+    hash = '#/workspace',
+    corpusDelayMs = 0,
+    admin = false,
+    stats = {} as Record<string, number>,
+    daemon = null as null | Record<string, unknown>,
+  } = {},
 ) {
   const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0 }
   await page.addInitScript(() => {
@@ -40,7 +47,7 @@ async function boot(
     if (path === '/api/ingest/stats') return fulfil(route, { stats })
     if (path === '/api/pipeline/daemon/status') {
       counts.pipelineStatus += 1
-      return fulfil(route, {})
+      return fulfil(route, daemon ? { daemon } : {})
     }
     if (path === '/api/downloads/worker/status') {
       counts.downloadStatus += 1
@@ -88,7 +95,33 @@ test('switching from a tab without polling to the workspace starts polling', asy
 })
 
 test('a non-admin watching enrichment polls every 2 s', async ({ page }) => {
-  const counts = await boot(page, { stats: { enriching: 1 } })
+  const counts = await boot(page, { stats: { enriching: 1, enriching_live: 1 } })
+  await page.waitForTimeout(7000)
+  expect(counts.corpus).toBeGreaterThanOrEqual(3)
+})
+
+test('abandoned in_progress claims (expired lease) do not keep a non-admin at 2 s', async ({ page }) => {
+  const counts = await boot(page, { stats: { enriching: 4, downloading: 2, enriching_live: 0, downloading_live: 0 } })
+  await page.waitForTimeout(7000)
+  expect(counts.corpus).toBeLessThanOrEqual(1)
+})
+
+const idleDaemon = {
+  workers: {
+    enrich: { online: true, status: 'idle', last_seen_at: '2026-10-24T09:00:00Z', details: { state: 'polling' } },
+    download: { online: true, status: 'idle', last_seen_at: '2026-10-24T09:00:00Z', details: { state: 'polling' } },
+  },
+}
+
+test('an online but idle daemon does not put an admin on the 2 s cadence', async ({ page }) => {
+  const counts = await boot(page, { admin: true, daemon: idleDaemon })
+  await page.waitForTimeout(7000)
+  expect(counts.corpus).toBeLessThanOrEqual(1)
+})
+
+test('a daemon with a batch in flight puts an admin on the 2 s cadence', async ({ page }) => {
+  const busy = { workers: { ...idleDaemon.workers, enrich: { ...idleDaemon.workers.enrich, status: 'running' } } }
+  const counts = await boot(page, { admin: true, daemon: busy })
   await page.waitForTimeout(7000)
   expect(counts.corpus).toBeGreaterThanOrEqual(3)
 })

@@ -7,8 +7,18 @@ const nonNegInt = (value, fallback) => {
   return Number.isFinite(n) ? Math.max(n, 0) : fallback
 }
 
+function hasColumn(db, table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((col) => col.name === column)
+}
+
+// Counts mirror ingest_stats.py. The *_live counts are extra: in_progress rows
+// whose worker lease has not expired, i.e. work that is being done right now.
+// A claim abandoned by a killed worker stays in_progress until it is requeued,
+// so the plain enriching/downloading counts cannot tell activity from debris.
 export function readIngestStats(db, corpusId) {
   const scoped = corpusId !== null && corpusId !== undefined
+  const leased = hasColumn(db, 'works', 'metadata_lease_expires_at') && hasColumn(db, 'works', 'download_lease_expires_at')
+  const now = Math.floor(Date.now() / 1000)
   const row = db.prepare(`
     SELECT
       COALESCE(SUM(CASE WHEN w.metadata_status IN ('pending', 'in_progress') THEN 1 ELSE 0 END), 0) AS raw_pending,
@@ -17,17 +27,23 @@ export function readIngestStats(db, corpusId) {
       COALESCE(SUM(CASE WHEN w.download_status IN ('queued', 'in_progress') THEN 1 ELSE 0 END), 0) AS queued_download,
       COALESCE(SUM(CASE WHEN w.metadata_status = 'in_progress' THEN 1 ELSE 0 END), 0) AS enriching,
       COALESCE(SUM(CASE WHEN w.download_status = 'in_progress' THEN 1 ELSE 0 END), 0) AS downloading,
-      COALESCE(SUM(CASE WHEN w.download_status = 'downloaded' THEN 1 ELSE 0 END), 0) AS downloaded
+      COALESCE(SUM(CASE WHEN w.download_status = 'downloaded' THEN 1 ELSE 0 END), 0) AS downloaded,
+      ${leased
+        ? `COALESCE(SUM(CASE WHEN w.metadata_status = 'in_progress' AND w.metadata_lease_expires_at > ? THEN 1 ELSE 0 END), 0) AS enriching_live,
+           COALESCE(SUM(CASE WHEN w.download_status = 'in_progress' AND w.download_lease_expires_at > ? THEN 1 ELSE 0 END), 0) AS downloading_live`
+        : '0 AS enriching_live, 0 AS downloading_live'}
     FROM works w
     ${scoped ? 'JOIN corpus_works cw ON cw.work_id = w.id WHERE cw.corpus_id = ?' : ''}
-  `).get(...(scoped ? [corpusId] : []))
+  `).get(...(leased ? [now, now] : []), ...(scoped ? [corpusId] : []))
   return {
     raw_pending: Number(row.raw_pending),
     matched: Number(row.matched),
     queued_download: Number(row.queued_download),
     enriching: Number(row.enriching),
     downloading: Number(row.downloading),
-    downloaded: Number(row.downloaded)
+    downloaded: Number(row.downloaded),
+    enriching_live: Number(row.enriching_live),
+    downloading_live: Number(row.downloading_live)
   }
 }
 

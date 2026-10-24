@@ -3615,20 +3615,23 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (unknown.length > 0) {
       return res.status(400).json({ error: `Unknown setting(s): ${unknown.join(', ')}` });
     }
-    const rps = updates.openalex_rps;
-    if (rps !== undefined && String(rps).trim() !== '') {
-      // The worker parses it with int(), so only plain decimal integers are usable.
-      const text = String(rps).trim();
-      if (!/^\d+$/.test(text) || Number(text) <= 0) {
-        return res.status(400).json({ error: 'openalex_rps must be a positive integer' });
+    // Numeric settings: the worker parses them with int(), so the stored text
+    // must be a plain decimal integer. Integral spellings ("2.0", "1e1") are
+    // normalized rather than rejected, since the previous validator accepted
+    // them. An empty value or null (what a cleared number input binds to)
+    // clears the override.
+    for (const key of ['openalex_rps', 'search_warn_threshold']) {
+      if (!(key in updates)) continue;
+      const raw = updates[key];
+      if (raw === null || raw === undefined || String(raw).trim() === '') {
+        updates[key] = '';
+        continue;
       }
-    }
-    const searchWarnThresholdUpdate = updates.search_warn_threshold;
-    if (searchWarnThresholdUpdate !== undefined && String(searchWarnThresholdUpdate).trim() !== '') {
-      const parsed = Number(searchWarnThresholdUpdate);
+      const parsed = Number(String(raw).trim());
       if (!Number.isInteger(parsed) || parsed <= 0) {
-        return res.status(400).json({ error: 'search_warn_threshold must be a positive integer' });
+        return res.status(400).json({ error: `${key} must be a positive integer` });
       }
+      updates[key] = String(parsed);
     }
     try {
       const upsert = authDb.prepare(

@@ -107,7 +107,8 @@
   let authError = ''
   let authUser = null
   let navigationRevision = 0
-  $: isAdmin = Boolean(authUser?.is_admin || authUser?.username === 'admin')
+  const userIsAdmin = (user) => Boolean(user?.is_admin || user?.username === 'admin')
+  $: isAdmin = userIsAdmin(authUser)
   $: diagnosticsEnabled = isAdmin
   $: tabGroups = isAdmin ? [...userTabGroups, ...adminTabGroups] : userTabGroups
   $: showSideNav = tabGroups.some((group) => (group.tabs || []).some((tab) => tab.id !== 'workspace'))
@@ -1527,12 +1528,15 @@
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
     if (authStatus !== 'authenticated') return 'none'
     if (anySearchRunning) return 'active'
-    if (diagnosticsEnabled && (pipelineWorker.running || pipelineWorker.in_flight)) return 'active'
-    if (diagnosticsEnabled && (downloadWorker.running || downloadWorker.in_flight)) return 'active'
-    // Non-admins cannot see worker status; works being enriched/downloaded right
-    // now (not merely queued) mean the counts move. Only where a cycle refreshes them.
+    // `running` only means the daemon is online; it idles most of the time.
+    // `in_flight` is a heartbeat in state "running", i.e. a batch in progress.
+    if (diagnosticsEnabled && (pipelineWorker.in_flight || downloadWorker.in_flight)) return 'active'
+    // Non-admins cannot see worker status; works under an unexpired worker lease
+    // are being enriched/downloaded right now, so the counts move. The plain
+    // enriching/downloading counts also include claims a killed worker left behind.
+    // Only where a cycle refreshes the stats, otherwise the signal would never clear.
     const stats = ingestStats || {}
-    if ((Number(stats.enriching) > 0 || Number(stats.downloading) > 0) && shouldRunLiveRefresh()) return 'active'
+    if ((Number(stats.enriching_live) > 0 || Number(stats.downloading_live) > 0) && shouldRunLiveRefresh()) return 'active'
     // The Admin tab only refreshes the OpenAlex quota, at the idle cadence.
     if (shouldRunLiveRefresh() || activeTab === 'admin') return 'idle'
     return 'none'
@@ -1600,8 +1604,9 @@
 
   function shouldRunLiveRefresh() {
     if (authStatus !== 'authenticated') return false
-    if (diagnosticsEnabled && (pipelineWorker.running || pipelineWorker.in_flight)) return true
-    if (diagnosticsEnabled && (downloadWorker.running || downloadWorker.in_flight)) return true
+    // A daemon that is merely online (idle heartbeat) does not warrant refreshing
+    // the workspace from other tabs; a batch in flight does.
+    if (diagnosticsEnabled && (pipelineWorker.in_flight || downloadWorker.in_flight)) return true
     return activeTab === 'workspace' || activeTab === 'dashboard' || activeTab === 'downloads'
   }
 
@@ -1939,7 +1944,10 @@
     if (!tabNeedsWorkspaceData(targetTab)) return
     const tasks = inFlight ? [...inFlight] : startWorkspaceLoads()
     tasks.push(loadKantroposAssignment())
-    if (diagnosticsEnabled) {
+    // Not `diagnosticsEnabled`: bootstrapAuth calls this right after assigning
+    // authUser, before Svelte has flushed the `$:` derivations, so the reactive
+    // flag is still false for an admin on the first refresh.
+    if (userIsAdmin(authUser)) {
       tasks.push(
         loadDownloads(),
         loadDownloadWorkerStatus(),
@@ -4777,7 +4785,13 @@
 
     refreshDisposed = false
     scheduleRefresh()
-    if (import.meta.env.DEV) window.__dtRefresh = { requestRefreshSoon }
+    if (import.meta.env.DEV) {
+      window.__dtRefresh = {
+        requestRefreshSoon,
+        reason: () => refreshReason(),
+        workers: () => ({ diagnosticsEnabled, pipelineWorker, downloadWorker, ingestStats }),
+      }
+    }
 
     return () => {
       closeTopicSuggestions()
