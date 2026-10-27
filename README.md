@@ -112,14 +112,27 @@ Do not patch tracked compose files on the server. Keep the live host and Caddy l
    - `RAG_FEEDER_PROXY_NETWORK=reverse_proxy`
 2. Create a local override once:
    - `cp docker-compose.override.example.yml docker-compose.override.yml`
-3. Deploy normally after pulls:
-   - `docker compose up -d`
+3. Deploy with the script:
+   - `scripts/deploy.sh`
 
 `docker compose` loads `docker-compose.override.yml` automatically, so the frontend keeps its `caddy` labels and host overrides without requiring a special command.
 
+### Deploy script
+
+`scripts/deploy.sh` pulls `origin/master` (fast-forward only, master checkout, no local modifications), then does only what the pulled diff needs and verifies the result:
+
+| Changed paths | Action |
+| --- | --- |
+| `frontend/**` | rebuild + recreate `rag_feeder`, on hosts that run the production image (see below); the dev stack serves the bind mount and needs nothing |
+| `backend/scripts/**`, `dl_lit_project/dl_lit/**` | restart `rag_enrich_worker` and `rag_download_worker` (the daemons read their code at start) |
+| `backend/src/**` | nothing; nodemon reloads it from the bind mount |
+| `package*.json`, Dockerfiles, `docker-compose*.yml`, Python requirements | printed as a warning: run `docker compose up -d --build` yourself |
+
+The checks afterwards hit the public URL (`RAG_FEEDER_FRONTEND_URL` from `.env`, or `--url`): `/` 200, `/api/openalex/quota` 401 through the proxy, a WebSocket upgrade on `/api/ws` (101), on production-image hosts also 404 for `/src/App.svelte` and `/.env` plus `no-cache` on `/`, and all four containers running. A failed check exits non-zero. Flags: `--dry-run` (plan plus checks, no changes), `--no-pull` (deploy the checkout as it is), `--frontend` / `--workers` (force those steps). From another machine: `ssh <user>@<host> /path/to/DT/scripts/deploy.sh`.
+
 ### Serving the built frontend (production)
 
-Production serves the built `dist` from a small Caddy image instead of the Vite dev server:
+Production serves the built `dist` from a small Caddy image instead of the Vite dev server. First switch (later deploys go through `scripts/deploy.sh`, which rebuilds the image whenever `frontend/` changed):
 
     docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.override.yml up -d --build rag_feeder
 
