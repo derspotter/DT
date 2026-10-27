@@ -556,11 +556,10 @@ class DatabaseManager:
         self.conn.cursor().execute(f"UPDATE works SET {assignments} WHERE id = ?", tuple(payload.values()) + (int(work_id),))
 
     def _resolve_or_create_work(self, data: dict, *, allow_merge: bool = True, commit: bool = True, existing: tuple[int | None, str | None] | None = None) -> tuple[int, str | None]:
-        # `existing` is a lookup result the caller already has ((None, None) = no match); it skips the lookup.
-        if existing is not None:
-            existing_id, matched_field = existing
-        else:
-            existing_id, matched_field = self._find_existing_work(
+        # `existing` is a lookup result the caller already has ((None, None) = no match); it skips the
+        # lookup. If its row was deleted since, a fresh lookup replaces it.
+        def lookup():
+            return self._find_existing_work(
                 doi=data.get("doi"),
                 openalex_id=data.get("openalex_id"),
                 title=data.get("title"),
@@ -568,9 +567,14 @@ class DatabaseManager:
                 editors=data.get("editors"),
                 year=data.get("year"),
             )
-        if existing_id:
-            existing = self.get_entry_by_id("works", existing_id) or {}
-            merged = self._apply_work_merge_priority(existing, data) if allow_merge else existing
+
+        existing_id, matched_field = existing if existing is not None else lookup()
+        existing_row = self.get_entry_by_id("works", existing_id) if existing_id else None
+        if existing_id and existing_row is None and existing is not None:
+            existing_id, matched_field = lookup()
+            existing_row = self.get_entry_by_id("works", existing_id) if existing_id else None
+        if existing_row is not None:
+            merged = self._apply_work_merge_priority(existing_row, data) if allow_merge else existing_row
             self._update_work_record(existing_id, merged)
             if commit:
                 self.conn.commit()
