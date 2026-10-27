@@ -68,6 +68,8 @@ import sqlite3
 import json
 import time
 import argparse
+import signal
+import secrets
 import random
 import socket
 import hashlib
@@ -193,11 +195,13 @@ class PipelineDaemon:
         }.get(self.role, "pipeline")
         self.heartbeat_interval_seconds = max(1, int(os.getenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", "3") or "3"))
         self._last_heartbeat_at = 0.0
-        self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}"
+        # hostname:pid repeats after an in-place container restart (same hostname,
+        # PID 1 again), which would make a dead predecessor look like us; the
+        # nonce keeps every process distinguishable.
+        self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"
         self.job_timeout_seconds = max(60, int(os.getenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "1800") or "1800"))
         self._ensure_heartbeat_table()
-        if self.role == "all":
-            self._recover_stale_running_jobs()
+        self._recover_stale_running_jobs()
         self._heartbeat("starting", {"worker_id": self.worker_id}, force=True)
         log(f"Initialized {self.role} daemon worker {self.worker_id} at {db_path}")
 
@@ -279,27 +283,151 @@ class PipelineDaemon:
         thread.start()
         return stop_event, thread
 
-    def _recover_stale_running_jobs(self):
-        """Requeue stale running jobs that exceeded the runtime lease."""
+    # Job types this role claims (None = every type, for role "all").
+    ROLE_JOB_TYPES = {
+        "enrich": ("enrich", "pipeline_tick", "scrape_eurlex", "scrape_expert_groups"),
+        "download": ("download",),
+    }
+
+    def _role_job_filter(self):
+        types = self.ROLE_JOB_TYPES.get(self.role)
+        if not types:
+            return "", []
+        return f"AND job_type IN ({','.join('?' for _ in types)})", list(types)
+
+    def _recover_stale_running_jobs(self, heartbeat_stale_seconds: int = 600):
+        """Requeue running jobs of this role whose worker is gone.
+
+        A job is considered abandoned when any of these hold:
+        - it ran longer than the job timeout (the original rule);
+        - it was claimed by this daemon's predecessor: the heartbeat row for our
+          daemon_name names a different worker_id, and there is only ever one
+          process per daemon_name, so that process is dead (container restart);
+        - its worker_id has no heartbeat at all, or none within
+          heartbeat_stale_seconds.
+        Runs for every role at start-up, so a routine container restart never
+        leaves a job stuck in 'running' until a role-"all" worker happens by.
+        """
+        role_sql, role_params = self._role_job_filter()
         cur = self.db.conn.cursor()
         cur.execute(
-            """
+            f"""
             UPDATE pipeline_jobs
                SET status = 'pending',
                    started_at = NULL,
                    worker_id = NULL
              WHERE status = 'running'
+               {role_sql}
                AND (
                     started_at IS NULL
                     OR datetime(started_at) <= datetime('now', ?)
+                    OR worker_id IS NULL
+                    OR worker_id IN (
+                         SELECT worker_id FROM daemon_heartbeat
+                          WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?
+                    )
+                    OR worker_id NOT IN (
+                         SELECT worker_id FROM daemon_heartbeat
+                          WHERE worker_id IS NOT NULL
+                            AND status != 'stopped'
+                            AND datetime(last_seen_at) > datetime('now', ?)
+                    )
                )
             """,
-            (f"-{self.job_timeout_seconds} seconds",),
+            role_params
+            + [f"-{self.job_timeout_seconds} seconds", self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
         )
         requeued = int(cur.rowcount or 0)
         self.db.conn.commit()
         if requeued:
-            log(f"Recovered {requeued} stale pipeline job(s) older than {self.job_timeout_seconds}s.")
+            log(f"Recovered {requeued} abandoned pipeline job(s) for role '{self.role}'.")
+        # The dead workers also hold work-row claims (15 min leases). Without
+        # this, the requeued job finds nothing eligible and completes empty.
+        released = self._release_work_claims(
+            where_claimed_by=(
+                "claimed_by IN (SELECT worker_id FROM daemon_heartbeat WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?)"
+                " OR claimed_by NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL AND status != 'stopped' AND datetime(last_seen_at) > datetime('now', ?))"
+            ),
+            params=[self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
+        )
+        if released:
+            log(f"Released {released} work claim(s) held by dead workers.")
+        return requeued
+
+    # (status column, claimed_by column, lease column, status to return to)
+    ROLE_CLAIMS = {
+        "enrich": [("metadata_status", "metadata_claimed_by", "metadata_claimed_at", "metadata_lease_expires_at", "pending")],
+        "download": [("download_status", "download_claimed_by", "download_claimed_at", "download_lease_expires_at", "queued")],
+    }
+    ROLE_CLAIMS["all"] = ROLE_CLAIMS["enrich"] + ROLE_CLAIMS["download"]
+
+    def _release_work_claims(self, where_claimed_by: str, params: list) -> int:
+        """Return in_progress work rows whose claim matches to their queue state.
+
+        `where_claimed_by` is an SQL condition over the placeholder `claimed_by`,
+        which is substituted with the role's claimed_by column.
+        """
+        total = 0
+        cur = self.db.conn.cursor()
+        for status_col, by_col, at_col, lease_col, back_to in self.ROLE_CLAIMS.get(self.role, []):
+            cond = where_claimed_by.replace("claimed_by", by_col)
+            try:
+                cur.execute(
+                    f"""
+                    UPDATE works
+                       SET {status_col} = ?, {by_col} = NULL, {at_col} = NULL, {lease_col} = NULL
+                     WHERE {status_col} = 'in_progress' AND {by_col} IS NOT NULL AND ({cond})
+                    """,
+                    [back_to] + list(params),
+                )
+                total += int(cur.rowcount or 0)
+            except sqlite3.OperationalError as e:
+                # Only an old schema is tolerable here. A lock or I/O error must
+                # surface: the pipeline job was already requeued, and a claim
+                # left behind would make it complete empty.
+                msg = str(e).lower()
+                if "no such table" in msg or "no such column" in msg:
+                    log(f"Work claim release skipped ({status_col}): {e}")
+                    continue
+                raise
+        self.db.conn.commit()
+        return total
+
+    def _release_own_running_jobs(self):
+        """On shutdown, hand the job we were working on back to the queue."""
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute(
+                """
+                UPDATE pipeline_jobs
+                   SET status = 'pending', started_at = NULL, worker_id = NULL
+                 WHERE status = 'running' AND worker_id = ?
+                """,
+                (self.worker_id,),
+            )
+            released = int(cur.rowcount or 0)
+            self.db.conn.commit()
+            claims = self._release_work_claims("claimed_by = ?", [self.worker_id])
+            if released or claims:
+                log(f"Released {released} running job(s) and {claims} work claim(s) back to the queue before exit.")
+            return released
+        except Exception as e:  # noqa: BLE001 - best effort during shutdown
+            log(f"Could not release running jobs on shutdown: {e}")
+            return 0
+
+    def _install_signal_handlers(self):
+        """docker stop/restart sends SIGTERM; treat it like Ctrl-C so the
+        graceful path (release job, final heartbeat) runs within the grace period."""
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        def _terminate(signum, _frame):
+            raise KeyboardInterrupt(f"signal {signum}")
+
+        try:
+            signal.signal(signal.SIGTERM, _terminate)
+        except (ValueError, OSError):
+            pass
 
     def fetch_next_job(self):
         """Fetch the next pending job from the queue with interactive-priority ordering."""
@@ -1018,6 +1146,7 @@ class PipelineDaemon:
 
     def run(self):
         log(f"{self.role} daemon starting. Waiting for work...")
+        self._install_signal_handlers()
         if self.role in {"enrich", "download"}:
             while self.running:
                 try:
@@ -1064,6 +1193,7 @@ class PipelineDaemon:
                 except KeyboardInterrupt:
                     log("Received shutdown signal. Exiting gracefully...")
                     self.running = False
+                    self._release_own_running_jobs()
                     self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
                 except Exception as e:
                     log(f"Critical error in main loop: {e}")
@@ -1090,6 +1220,7 @@ class PipelineDaemon:
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")
                 self.running = False
+                self._release_own_running_jobs()
                 self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
             except Exception as e:
                 log(f"Critical error in main loop: {e}")
