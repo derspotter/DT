@@ -34,8 +34,10 @@ export function workStatus(meta, dl) {
 }
 
 // Memo of grouped rows per connection and scope. data_version catches commits
-// by other connections (the workers); writes on this same connection do not
-// bump it, so the 1 s TTL bounds how stale the app's own writes can leave it.
+// by other connections (the workers); it does not move for writes on this same
+// connection (e.g. a corpus removal on authDb), which total_changes() catches.
+// Neither moves when a worker lease merely expires, so the 1 s TTL is the
+// backstop that keeps the live_* counts current.
 let stateCountsMemo = new WeakMap()
 const MEMO_TTL_MS = 1000
 
@@ -48,14 +50,16 @@ export function resetWorkStateMemo() {
 // lease columns inside the CASE sums keep it answerable from idx_works_state.
 export function readWorkStateCounts(db, corpusId, { nowSec = Math.floor(Date.now() / 1000) } = {}) {
   const key = String(corpusId ?? 'all')
-  const dataVersion = db.pragma('data_version', { simple: true })
+  const { dataVersion, totalChanges } = db
+    .prepare('SELECT (SELECT data_version FROM pragma_data_version) AS dataVersion, total_changes() AS totalChanges')
+    .get()
   let perDb = stateCountsMemo.get(db)
   if (!perDb) {
     perDb = new Map()
     stateCountsMemo.set(db, perDb)
   }
   const hit = perDb.get(key)
-  if (hit && hit.dataVersion === dataVersion && Date.now() - hit.at < MEMO_TTL_MS) return hit.rows
+  if (hit && hit.dataVersion === dataVersion && hit.totalChanges === totalChanges && Date.now() - hit.at < MEMO_TTL_MS) return hit.rows
 
   const scoped = corpusId !== null && corpusId !== undefined
   const leased = hasColumn(db, 'works', 'metadata_lease_expires_at') && hasColumn(db, 'works', 'download_lease_expires_at')
@@ -69,7 +73,7 @@ export function readWorkStateCounts(db, corpusId, { nowSec = Math.floor(Date.now
     ${scoped ? 'WHERE EXISTS (SELECT 1 FROM corpus_works cw WHERE cw.corpus_id = ? AND cw.work_id = w.id)' : ''}
     GROUP BY 1, 2
   `).all(...(leased ? [nowSec, nowSec] : []), ...(scoped ? [corpusId] : []))
-  perDb.set(key, { dataVersion, at: Date.now(), rows })
+  perDb.set(key, { dataVersion, totalChanges, at: Date.now(), rows })
   return rows
 }
 

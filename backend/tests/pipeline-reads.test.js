@@ -1,3 +1,4 @@
+import { jest } from '@jest/globals'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -100,17 +101,41 @@ test('workStatus buckets like STATUS_SQL, including padded/odd-case values', () 
   expect(workStatus('\ufeffmatched', 'not_requested')).toBe('raw')
 })
 
-test('the memo is per corpus and expires after a same-connection write', async () => {
+test('the memo is per corpus, hits while nothing changed and misses right after a same-connection write', () => {
   seedStats()
+  const grouped = []
+  const original = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    if (sql.includes('GROUP BY 1, 2')) grouped.push(sql)
+    return original(sql)
+  }
   expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  expect(grouped).toHaveLength(1)
   addWork(8, 2, 'pending', null)
   expect(readIngestStats(db, 2).raw_pending).toBe(1)
+  // A write on this same connection leaves data_version alone but bumps total_changes().
   addWork(9, 1, 'pending', null)
-  // Same-connection writes do not bump data_version: served from the memo.
-  expect(readIngestStats(db, 1).raw_pending).toBe(2)
-  await new Promise((r) => setTimeout(r, 1100))
   expect(readIngestStats(db, 1).raw_pending).toBe(3)
-}, 5000)
+  db.prepare("DELETE FROM corpus_works WHERE work_id = 9").run()
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  db.prepare = original
+})
+
+test('the memo expires after 1 s even without writes (lease expiry changes the live counts)', () => {
+  const realNow = Date.now()
+  addWork(1, 1, 'in_progress', null, { metaLease: Math.floor(realNow / 1000) + 2 })
+  const clock = jest.spyOn(Date, 'now').mockReturnValue(realNow)
+  try {
+    expect(readIngestStats(db, 1).enriching_live).toBe(1)
+    clock.mockReturnValue(realNow + 999)
+    expect(readIngestStats(db, 1).enriching_live).toBe(1)
+    clock.mockReturnValue(realNow + 5000)
+    expect(readIngestStats(db, 1).enriching_live).toBe(0)
+  } finally {
+    clock.mockRestore()
+  }
+})
 
 test('the memo misses as soon as another connection commits', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-state-memo-'))
