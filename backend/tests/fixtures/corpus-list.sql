@@ -31,6 +31,9 @@ CREATE TABLE corpus_works (corpus_id INTEGER NOT NULL, work_id INTEGER NOT NULL,
 CREATE TABLE search_runs (id INTEGER PRIMARY KEY, query TEXT);
 CREATE TABLE ingest_source_metadata (corpus_id INTEGER, ingest_source TEXT, title TEXT, authors TEXT, source_pdf TEXT);
 CREATE TABLE seed_candidates_in_corpus (corpus_id INTEGER, work_id INTEGER, source_type TEXT, source_key TEXT, marked_at TEXT);
+-- The indexes listCorpus's index-served sorts rely on (app.js / db_manager.py).
+CREATE INDEX idx_works_year_id ON works(year, id);
+CREATE INDEX idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id);
 
 INSERT INTO works (id, title, authors, year, doi, openalex_id, source, publisher, type, metadata_status, metadata_source, download_status, file_path, origin_type, origin_key, source_pdf, run_id, created_at) VALUES
   (1,  'Labour markets and 100% employment', '["Smith, J", "Doe, A"]', 2001, '10.1/one', 'W1', 'Journal of Labour', 'Pub A', 'article', 'matched', 'openalex', 'not_requested', NULL, NULL, NULL, NULL, NULL, '2025-01-01 00:00:01'),

@@ -387,10 +387,37 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
     }
   } else {
     const key = sortExpression(column, addedSql)
-    // Unknown/absent sort: newest year first, then newest id. Explicit sorts
-    // tie-break on id descending, as the script's two-pass stable sort does.
-    const orderBy = key ? `${key} ${reverse ? 'DESC' : 'ASC'}, w.id DESC` : `${YEAR_SQL} DESC, w.id DESC`
-    rows = db.prepare(`SELECT ${columns} ${from} ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageLimit, pageOffset)
+    const dir = reverse ? 'DESC' : 'ASC'
+    const rest = needle ? ` AND ${where[where.length - 1]}` : ''
+    let sql
+    let args = params
+    if (!key && !db.prepare("SELECT 1 FROM works WHERE typeof(year) = 'text' LIMIT 1").get()) {
+      // Unknown/absent sort: newest year first, then newest id. With only
+      // integer/NULL years, normalize_year is the value itself (NULL -> 0,
+      // and NULL sorts last in DESC just as 0 does), so idx_works_year_id
+      // yields rows in order and the scan stops after LIMIT; membership is an
+      // EXISTS probe and added_at a lookup for the returned rows only.
+      if (scoped) {
+        const member = 'FROM corpus_works cw WHERE cw.corpus_id = ? AND cw.work_id = w.id'
+        sql = `SELECT ${columns.replace(`${addedSql} AS added_at`, `(SELECT cw.added_at ${member}) AS added_at`)}
+          FROM works w WHERE EXISTS (SELECT 1 ${member})${rest}`
+        args = [corpusId, ...params]
+      } else {
+        sql = `SELECT ${columns} ${from}`
+      }
+      sql += ' ORDER BY w.year DESC, w.id DESC'
+    } else if (column === 'added' && scoped) {
+      // Raw added_at orders like str(added_at or "") for timestamp text: NULL
+      // sorts lowest as '' does. Driving from corpus_works lets
+      // idx_corpus_works_added serve the order; cw.work_id equals w.id.
+      sql = `SELECT ${columns} FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE ${where.join(' AND ')}
+        ORDER BY cw.added_at ${dir}, cw.work_id DESC`
+    } else {
+      // Text years take dt_corpus_int via YEAR_SQL. Explicit sorts tie-break
+      // on id descending, as the script's two-pass stable sort does.
+      sql = `SELECT ${columns} ${from} ORDER BY ${key ? `${key} ${dir}` : `${YEAR_SQL} DESC`}, w.id DESC`
+    }
+    rows = db.prepare(`${sql} LIMIT ? OFFSET ?`).all(...args, pageLimit, pageOffset)
   }
 
   const items = rows.map((row) => {
