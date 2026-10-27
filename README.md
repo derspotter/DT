@@ -117,6 +117,22 @@ Do not patch tracked compose files on the server. Keep the live host and Caddy l
 
 `docker compose` loads `docker-compose.override.yml` automatically, so the frontend keeps its `caddy` labels and host overrides without requiring a special command.
 
+### Serving the built frontend (production)
+
+Production serves the built `dist` from a small Caddy image instead of the Vite dev server:
+
+    docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.override.yml up -d --build rag_feeder
+
+- The public Caddy still targets port 5175 of the frontend container; nothing changes in its configuration.
+- Inside the container, Caddy proxies `/api/*` (including the `/api/ws` WebSocket) to `rag_backend:4000` (override with `RAG_FEEDER_BACKEND_UPSTREAM`) and serves everything else from `dist`.
+- `docker-compose.yml` keeps `target: dev`, so `genkia.de` runs the dev server on purpose.
+- Make the production overlay the default on that host, or the routine `docker compose up -d` from step 3 silently switches back to the dev server. Add to the production `.env`:
+  - `COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml:docker-compose.override.yml`
+
+  With `COMPOSE_FILE` set, Compose no longer adds `docker-compose.override.yml` on its own, so it must stay in that list. Plain `docker compose up -d` (and `docker compose up -d --build rag_feeder` after a pull) then keeps the production image.
+- Hashed files under `/assets/` are served with `Cache-Control: public, max-age=31536000, immutable`; everything else (notably `index.html`) with `no-cache`, so browsers pick up a redeploy.
+- `frontend/tests/prod-image.sh` builds the image and checks it against the running dev stack's backend.
+
 ## Paths You Actually Use
 
 - SQLite DB: `dl_lit_project/data/literature.db`

@@ -62,7 +62,7 @@ from dl_lit.llm_provider import get_client
 
 
 class BibliographyEnhancer:
-    def __init__(self, db_manager: DatabaseManager, rate_limiter: ServiceRateLimiter, email: str = None, output_folder: str | Path = None, proxies: dict = None):
+    def __init__(self, db_manager: DatabaseManager, rate_limiter: ServiceRateLimiter, email: str = None, output_folder: str | Path = None, proxies: dict = None, llm_optional: bool = False):
         self.email = email if email else 'spott@wzb.eu'
         self.unpaywall_headers = {'email': self.email}
         self.headers = {
@@ -92,7 +92,15 @@ class BibliographyEnhancer:
         # Set model ID
         self.MODEL_ID = "gemini-2.5-flash"
 
-        self.client = get_client()
+        try:
+            self.client = get_client()
+        except ValueError as exc:
+            # The pipeline daemon never uses the LLM client; a half-configured
+            # provider must not stop enrichment/downloads (llm_optional=True).
+            if not llm_optional:
+                raise
+            print(f"[BibliographyEnhancer] LLM client unavailable, continuing without it: {exc}")
+            self.client = None
         # Google Search for grounding (disabled for compatibility)
         # self.google_search_tool = Tool(google_search=GoogleSearch())
         self.proxies = self._resolve_vpn_proxies(proxies)

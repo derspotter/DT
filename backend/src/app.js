@@ -13,6 +13,8 @@ import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
+import { listDownloads, listIngestRuns, readIngestStats } from './pipelineReads.js';
+import { listCorpus } from './corpusList.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -142,8 +144,6 @@ const PYTHON_SCRIPTS_DIR = path.join(__dirname, '..', 'scripts');
 const KEYWORD_SEARCH_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'keyword_search.py');
 // Must match SORT_OPTIONS in dl_lit/keyword_search.py
 const KEYWORD_SEARCH_SORTS = new Set(['relevance', 'cited_by_count', 'newest', 'oldest']);
-const CORPUS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'corpus_list.py');
-const DOWNLOADS_LIST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'downloads_list.py');
 const GRAPH_3D_EXPORT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'graph_3d_export.py');
 const GRAPH_3D_CACHE_VERSION = 9;
 // Keep in sync with the frontend "Works shown" default (ThreeGraph.svelte).
@@ -162,8 +162,6 @@ const GRAPH_3D_SNAPSHOT_DIR =
 const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_seed.py');
-const INGEST_RUNS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_runs.py');
-const INGEST_STATS_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_stats.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
 const SEED_EXPAND_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_expand.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
@@ -3617,19 +3615,24 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (unknown.length > 0) {
       return res.status(400).json({ error: `Unknown setting(s): ${unknown.join(', ')}` });
     }
-    const rps = updates.openalex_rps;
-    if (rps !== undefined && String(rps).trim() !== '') {
-      const parsed = Number(rps);
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        return res.status(400).json({ error: 'openalex_rps must be a positive number' });
+    // Numeric settings: the worker parses them with int(), so the stored text
+    // must be a plain decimal integer. Integral spellings ("2.0", "1e1") are
+    // normalized rather than rejected, since the previous validator accepted
+    // them. An empty value or null (what a cleared number input binds to)
+    // clears the override.
+    for (const key of ['openalex_rps', 'search_warn_threshold']) {
+      if (!(key in updates)) continue;
+      const raw = updates[key];
+      if (raw === null || raw === undefined || String(raw).trim() === '') {
+        updates[key] = '';
+        continue;
       }
-    }
-    const searchWarnThresholdUpdate = updates.search_warn_threshold;
-    if (searchWarnThresholdUpdate !== undefined && String(searchWarnThresholdUpdate).trim() !== '') {
-      const parsed = Number(searchWarnThresholdUpdate);
-      if (!Number.isInteger(parsed) || parsed <= 0) {
-        return res.status(400).json({ error: 'search_warn_threshold must be a positive integer' });
+      const parsed = Number(String(raw).trim());
+      // Safe integers only: String(1e21) is "1e+21", which int() rejects.
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+        return res.status(400).json({ error: `${key} must be a positive integer` });
       }
+      updates[key] = String(parsed);
     }
     try {
       const upsert = authDb.prepare(
@@ -5574,14 +5577,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
-    if (query) args.push('--q', query);
-    if (sort) args.push('--sort', sort);
     try {
-      const payload = await runPythonJson(CORPUS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      return res.json(payload);
+      // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
+      return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort }));
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
@@ -5775,12 +5773,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     const limit = coerceInt(req.query?.limit, 200);
     const offset = coerceInt(req.query?.offset, 0);
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--limit', String(limit), '--offset', String(offset)];
     try {
-      const payload = await runPythonJson(DOWNLOADS_LIST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      return res.json(payload);
+      return res.json(listDownloads(authDb, { corpusId: req.corpusId, limit, offset }));
     } catch (error) {
       console.error('[/api/downloads] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch download queue' });
@@ -6172,11 +6166,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
   app.get('/api/ingest/runs', requireAuthMiddleware, async (req, res) => {
     const limit = coerceInt(req.query?.limit, 20);
-    const dbPath = DB_PATH;
-    const args = ['--db-path', dbPath, '--limit', String(limit)];
     try {
-      const payload = await runPythonJson(INGEST_RUNS_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      return res.json(payload);
+      const { runs, total } = listIngestRuns(authDb, { corpusId: req.corpusId, limit });
+      return res.json({ runs, total, source: 'db' });
     } catch (error) {
       console.error('[/api/ingest/runs] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest runs' });
@@ -6184,19 +6176,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.get('/api/ingest/stats', requireAuthMiddleware, async (req, res) => {
-    const dbPath = DB_PATH;
     const globalScope = String(req.query?.global || '').trim() === '1';
     if (globalScope && !isAdminUser(req.user, authConfig)) {
       return res.status(403).json({ error: 'Admin access required for global ingest stats' });
     }
-    const args = ['--db-path', dbPath];
     const corpusId = globalScope ? null : req.corpusId;
-    if (corpusId !== null && corpusId !== undefined) {
-      args.push('--corpus-id', String(corpusId));
-    }
     try {
-      const payload = await runPythonJson(INGEST_STATS_SCRIPT, args, { dbPath, corpusId });
-      return res.json(payload);
+      return res.json({ stats: readIngestStats(authDb, corpusId ?? null), source: 'db' });
     } catch (error) {
       console.error('[/api/ingest/stats] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch ingest stats' });

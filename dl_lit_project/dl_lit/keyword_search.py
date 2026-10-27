@@ -4,7 +4,7 @@ import time
 from typing import Iterable
 import requests
 
-from .utils import get_global_rate_limiter, openalex_request_json
+from .utils import get_global_rate_limiter, get_openalex_session, openalex_request_json
 
 TOKEN_RE = re.compile(r'"[^"]+"|\(|\)|\bAND\b|\bOR\b|\bNOT\b|[^()\s]+', re.IGNORECASE)
 OPENALEX_TERM_CLEAN_RE = re.compile(r"[^\w\s-]+", re.UNICODE)
@@ -115,6 +115,7 @@ def _openalex_request(endpoint: str, params: dict, rate_limiter, retries: int = 
         endpoint=endpoint,
         params=params,
         timeout=30,
+        session=get_openalex_session(),
         rate_limiter=rate_limiter,
         retries=retries,
     )

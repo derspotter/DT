@@ -1,0 +1,10 @@
+# Production overlay: serve the built frontend (Caddy) instead of the Vite dev server.
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build rag_feeder
+services:
+  rag_feeder:
+    image: rag_feeder_frontend:prod
+    build:
+      target: runner
+    volumes: !reset []
+    environment: !override
+      - RAG_FEEDER_BACKEND_UPSTREAM=rag_backend:4000

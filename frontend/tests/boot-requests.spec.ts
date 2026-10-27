@@ -15,7 +15,7 @@ function mockApi(route: Route, log: { path: string; at: number }[], authDelayMs:
     return new Promise<void>((resolve) => setTimeout(resolve, authDelayMs)).then(() => {
       done.auth = Date.now()
       return fulfil(route, {
-        user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: false },
+        user: { id: 1, username: 'reader', last_corpus_id: 1, is_admin: false },
         corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
       })
     })

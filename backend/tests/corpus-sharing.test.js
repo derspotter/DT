@@ -524,6 +524,36 @@ describe('corpus sharing and multi-user isolation', () => {
     expect(rpsRes.status).toBe(400)
   })
 
+  test('rejects a fractional openalex_rps (the worker reads it as an integer)', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    for (const value of ['0.5', '2.5', 'abc', true, '1000000000000000000000']) {
+      const res = await request(app)
+        .put('/api/admin/settings')
+        .set('Authorization', `Bearer ${admin.token}`)
+        .send({ settings: { openalex_rps: value } })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/positive integer/)
+    }
+  })
+
+  test('normalizes integral spellings of numeric settings and clears them on null', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const auth = (req) => req.set('Authorization', `Bearer ${admin.token}`)
+    for (const [input, stored] of [['2.0', '2'], ['1e1', '10'], [' 7 ', '7'], [3, '3']]) {
+      const put = await auth(request(app).put('/api/admin/settings')).send({ settings: { openalex_rps: input, search_warn_threshold: input } })
+      expect(put.status).toBe(200)
+      const get = await auth(request(app).get('/api/admin/settings'))
+      expect(get.body.settings.openalex_rps.value).toBe(stored)
+      expect(get.body.settings.search_warn_threshold.value).toBe(stored)
+    }
+    // A cleared number input binds to null; that clears the override (falls back to env).
+    const clear = await auth(request(app).put('/api/admin/settings')).send({ settings: { openalex_rps: null, search_warn_threshold: null } })
+    expect(clear.status).toBe(200)
+    const after = await auth(request(app).get('/api/admin/settings'))
+    expect(after.body.settings.openalex_rps.value).toBe('')
+    expect(after.body.settings.search_warn_threshold.value).toBe('')
+  })
+
   test('non-admins cannot read or write settings', async () => {
     const username = 'settings-outsider'
     const password = 'settings-outsider-password'
