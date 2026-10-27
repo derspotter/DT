@@ -1636,20 +1636,27 @@
       // The Admin panel shows the OpenAlex budget too; keep it current there
       // without the full workspace refresh.
       if (activeTab === 'admin') void loadOpenAlexQuota()
-      if (!dirty) return
+      // A running search run is what keeps the 2 s cadence going here; its
+      // terminal status has to be discoverable from any tab, or the cadence
+      // never ends and the run shows as running until the workspace is opened.
+      if (!dirty && !anySearchRunning) return
       if (pipelineRefreshInFlight) {
-        refreshDirty = true
+        if (dirty) refreshDirty = true
         return
       }
       pipelineRefreshInFlight = true
       try {
-        const tasks = [loadIngestStats({ quiet: true }), loadIngestRuns()]
-        // Discover a worker started elsewhere, so refreshReason() can go active.
-        if (diagnosticsEnabled) {
-          tasks.push(
-            loadPipelineWorkerStatus({ quiet: true }),
-            loadDownloadWorkerStatus({ quiet: true }),
-          )
+        const tasks = []
+        if (anySearchRunning) tasks.push(loadSeedSources({ quiet: true }))
+        if (dirty) {
+          tasks.push(loadIngestStats({ quiet: true }), loadIngestRuns())
+          // Discover a worker started elsewhere, so refreshReason() can go active.
+          if (diagnosticsEnabled) {
+            tasks.push(
+              loadPipelineWorkerStatus({ quiet: true }),
+              loadDownloadWorkerStatus({ quiet: true }),
+            )
+          }
         }
         await Promise.all(tasks)
       } finally {

@@ -526,7 +526,7 @@ describe('corpus sharing and multi-user isolation', () => {
 
   test('rejects a fractional openalex_rps (the worker reads it as an integer)', async () => {
     const admin = await login(adminUsername, adminPassword)
-    for (const value of ['0.5', '2.5', 'abc', true]) {
+    for (const value of ['0.5', '2.5', 'abc', true, '1000000000000000000000']) {
       const res = await request(app)
         .put('/api/admin/settings')
         .set('Authorization', `Bearer ${admin.token}`)

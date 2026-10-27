@@ -18,7 +18,7 @@ async function boot(
     daemon = null as null | Record<string, unknown>,
   } = {},
 ) {
-  const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0, ingestRuns: 0 }
+  const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0, ingestRuns: 0, seeds: 0 }
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
@@ -39,6 +39,7 @@ async function boot(
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
     if (path === '/api/openalex/quota') return fulfil(route, { available: false })
     if (path === '/api/seed/sources') {
+      counts.seeds += 1
       const sources = running
         ? [{ id: 1, title: 'Seed', name: 'Seed', run: { id: 5, status: 'running' }, status: 'running' }]
         : []
@@ -66,6 +67,7 @@ async function boot(
   counts.pipelineStatus = 0
   counts.downloadStatus = 0
   counts.ingestRuns = 0
+  counts.seeds = 0
   return counts
 }
 
@@ -163,6 +165,19 @@ test('a running search run polls every 2 s', async ({ page }) => {
   const counts = await boot(page, { running: true })
   await page.waitForTimeout(7000)
   expect(counts.corpus).toBeGreaterThanOrEqual(3)
+})
+
+test('a running search run is still tracked after switching to a non-polling tab', async ({ page }) => {
+  const counts = await boot(page, { running: true })
+  await page.evaluate(() => { window.location.hash = '#/graph' })
+  await page.waitForTimeout(1500)
+  counts.seeds = 0
+  counts.corpus = 0
+  await page.waitForTimeout(7000)
+  // The run's status keeps being polled so its end is discovered here too...
+  expect(counts.seeds).toBeGreaterThanOrEqual(3)
+  // ...without the full workspace refresh on the graph tab.
+  expect(counts.corpus).toBe(0)
 })
 
 test('a hidden tab does not poll, and becoming visible refreshes once', async ({ page }) => {

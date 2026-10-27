@@ -3628,7 +3628,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         continue;
       }
       const parsed = Number(String(raw).trim());
-      if (!Number.isInteger(parsed) || parsed <= 0) {
+      // Safe integers only: String(1e21) is "1e+21", which int() rejects.
+      if (!Number.isSafeInteger(parsed) || parsed <= 0) {
         return res.status(400).json({ error: `${key} must be a positive integer` });
       }
       updates[key] = String(parsed);
