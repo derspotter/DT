@@ -458,7 +458,7 @@ class DatabaseManager:
         normalized_doi = self._normalize_doi(doi)
         if normalized_doi:
             params = [normalized_doi]
-            query = "SELECT id FROM works WHERE normalized_doi = ?"
+            query = "SELECT id FROM works WHERE normalized_doi = ? AND normalized_doi != ''"
             if exclude_id:
                 query += " AND id != ?"
                 params.append(int(exclude_id))
@@ -468,7 +468,7 @@ class DatabaseManager:
         normalized_openalex = self._normalize_openalex_id(openalex_id)
         if normalized_openalex:
             params = [normalized_openalex]
-            query = "SELECT id FROM works WHERE openalex_id = ?"
+            query = "SELECT id FROM works WHERE openalex_id = ? AND openalex_id != ''"
             if exclude_id:
                 query += " AND id != ?"
                 params.append(int(exclude_id))
@@ -534,15 +534,19 @@ class DatabaseManager:
         assignments = ", ".join([f"{k} = ?" for k in payload.keys()]) + ", updated_at = CURRENT_TIMESTAMP"
         self.conn.cursor().execute(f"UPDATE works SET {assignments} WHERE id = ?", tuple(payload.values()) + (int(work_id),))
 
-    def _resolve_or_create_work(self, data: dict, *, allow_merge: bool = True, commit: bool = True) -> tuple[int, str | None]:
-        existing_id, matched_field = self._find_existing_work(
-            doi=data.get("doi"),
-            openalex_id=data.get("openalex_id"),
-            title=data.get("title"),
-            authors=data.get("authors"),
-            editors=data.get("editors"),
-            year=data.get("year"),
-        )
+    def _resolve_or_create_work(self, data: dict, *, allow_merge: bool = True, commit: bool = True, existing: tuple[int | None, str | None] | None = None) -> tuple[int, str | None]:
+        # `existing` is a lookup result the caller already has ((None, None) = no match); it skips the lookup.
+        if existing is not None:
+            existing_id, matched_field = existing
+        else:
+            existing_id, matched_field = self._find_existing_work(
+                doi=data.get("doi"),
+                openalex_id=data.get("openalex_id"),
+                title=data.get("title"),
+                authors=data.get("authors"),
+                editors=data.get("editors"),
+                year=data.get("year"),
+            )
         if existing_id:
             existing = self.get_entry_by_id("works", existing_id) or {}
             merged = self._apply_work_merge_priority(existing, data) if allow_merge else existing
@@ -1480,7 +1484,11 @@ class DatabaseManager:
 
         try:
             payload = self._build_raw_work_payload(ref)
-            new_id, _ = self._resolve_or_create_work(payload, allow_merge=True)
+            new_id, _ = self._resolve_or_create_work(
+                payload,
+                allow_merge=True,
+                existing=(int(eid), field) if tbl == "works" else (None, None),
+            )
             if corpus_id:
                 self.add_corpus_item(corpus_id, "works", int(new_id))
 
