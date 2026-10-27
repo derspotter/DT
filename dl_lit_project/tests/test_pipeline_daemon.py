@@ -107,6 +107,10 @@ def test_recover_stale_running_jobs_only_requeues_expired_work():
     conn.execute(
         "INSERT INTO daemon_heartbeat (daemon_name, worker_id, status) VALUES ('download', 'worker-live', 'running')"
     )
+    # worker-old is alive too (fresh heartbeat): only the timeout rule may requeue its job.
+    conn.execute(
+        "INSERT INTO daemon_heartbeat (daemon_name, worker_id, status) VALUES ('download-2', 'worker-old', 'running')"
+    )
     conn.commit()
 
     daemon = make_daemon(conn, timeout_seconds=300)

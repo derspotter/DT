@@ -69,6 +69,7 @@ import json
 import time
 import argparse
 import signal
+import secrets
 import random
 import socket
 import hashlib
@@ -194,7 +195,10 @@ class PipelineDaemon:
         }.get(self.role, "pipeline")
         self.heartbeat_interval_seconds = max(1, int(os.getenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", "3") or "3"))
         self._last_heartbeat_at = 0.0
-        self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}"
+        # hostname:pid repeats after an in-place container restart (same hostname,
+        # PID 1 again), which would make a dead predecessor look like us; the
+        # nonce keeps every process distinguishable.
+        self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"
         self.job_timeout_seconds = max(60, int(os.getenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "1800") or "1800"))
         self._ensure_heartbeat_table()
         self._recover_stale_running_jobs()
@@ -336,7 +340,50 @@ class PipelineDaemon:
         self.db.conn.commit()
         if requeued:
             log(f"Recovered {requeued} abandoned pipeline job(s) for role '{self.role}'.")
+        # The dead workers also hold work-row claims (15 min leases). Without
+        # this, the requeued job finds nothing eligible and completes empty.
+        released = self._release_work_claims(
+            where_claimed_by=(
+                "claimed_by IN (SELECT worker_id FROM daemon_heartbeat WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?)"
+                " OR claimed_by NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL AND datetime(last_seen_at) > datetime('now', ?))"
+            ),
+            params=[self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
+        )
+        if released:
+            log(f"Released {released} work claim(s) held by dead workers.")
         return requeued
+
+    # (status column, claimed_by column, lease column, status to return to)
+    ROLE_CLAIMS = {
+        "enrich": [("metadata_status", "metadata_claimed_by", "metadata_claimed_at", "metadata_lease_expires_at", "pending")],
+        "download": [("download_status", "download_claimed_by", "download_claimed_at", "download_lease_expires_at", "queued")],
+    }
+    ROLE_CLAIMS["all"] = ROLE_CLAIMS["enrich"] + ROLE_CLAIMS["download"]
+
+    def _release_work_claims(self, where_claimed_by: str, params: list) -> int:
+        """Return in_progress work rows whose claim matches to their queue state.
+
+        `where_claimed_by` is an SQL condition over the placeholder `claimed_by`,
+        which is substituted with the role's claimed_by column.
+        """
+        total = 0
+        cur = self.db.conn.cursor()
+        for status_col, by_col, at_col, lease_col, back_to in self.ROLE_CLAIMS.get(self.role, []):
+            cond = where_claimed_by.replace("claimed_by", by_col)
+            try:
+                cur.execute(
+                    f"""
+                    UPDATE works
+                       SET {status_col} = ?, {by_col} = NULL, {at_col} = NULL, {lease_col} = NULL
+                     WHERE {status_col} = 'in_progress' AND {by_col} IS NOT NULL AND ({cond})
+                    """,
+                    [back_to] + list(params),
+                )
+                total += int(cur.rowcount or 0)
+            except sqlite3.OperationalError as e:  # no works table / old schema
+                log(f"Work claim release skipped ({status_col}): {e}")
+        self.db.conn.commit()
+        return total
 
     def _release_own_running_jobs(self):
         """On shutdown, hand the job we were working on back to the queue."""
@@ -352,8 +399,9 @@ class PipelineDaemon:
             )
             released = int(cur.rowcount or 0)
             self.db.conn.commit()
-            if released:
-                log(f"Released {released} running job(s) back to the queue before exit.")
+            claims = self._release_work_claims("claimed_by = ?", [self.worker_id])
+            if released or claims:
+                log(f"Released {released} running job(s) and {claims} work claim(s) back to the queue before exit.")
             return released
         except Exception as e:  # noqa: BLE001 - best effort during shutdown
             log(f"Could not release running jobs on shutdown: {e}")

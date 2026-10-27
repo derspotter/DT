@@ -78,6 +78,8 @@ services:
       dockerfile: backend/Dockerfile
     command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role enrich --db-path /usr/src/app/dl_lit_project/data/literature.db
     container_name: rag_feeder_enrich_worker
+    # SIGTERM lets the daemon finish its wave and hand its job back; give it time.
+    stop_grace_period: 60s
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
@@ -120,6 +122,8 @@ services:
       dockerfile: backend/Dockerfile
     command: /opt/venv/bin/python /usr/src/app/scripts/daemon/worker.py --role download --db-path /usr/src/app/dl_lit_project/data/literature.db
     container_name: rag_feeder_download_worker
+    # SIGTERM lets the daemon finish its wave and hand its job back; give it time.
+    stop_grace_period: 60s
     environment:
       - RAG_FEEDER_DB_PATH=/usr/src/app/dl_lit_project/data/literature.db
       - RAG_FEEDER_PYTHON=/opt/venv/bin/python
