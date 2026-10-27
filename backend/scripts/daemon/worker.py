@@ -68,6 +68,7 @@ import sqlite3
 import json
 import time
 import argparse
+import signal
 import random
 import socket
 import hashlib
@@ -196,8 +197,7 @@ class PipelineDaemon:
         self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}"
         self.job_timeout_seconds = max(60, int(os.getenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "1800") or "1800"))
         self._ensure_heartbeat_table()
-        if self.role == "all":
-            self._recover_stale_running_jobs()
+        self._recover_stale_running_jobs()
         self._heartbeat("starting", {"worker_id": self.worker_id}, force=True)
         log(f"Initialized {self.role} daemon worker {self.worker_id} at {db_path}")
 
@@ -279,27 +279,99 @@ class PipelineDaemon:
         thread.start()
         return stop_event, thread
 
-    def _recover_stale_running_jobs(self):
-        """Requeue stale running jobs that exceeded the runtime lease."""
+    # Job types this role claims (None = every type, for role "all").
+    ROLE_JOB_TYPES = {
+        "enrich": ("enrich", "pipeline_tick", "scrape_eurlex", "scrape_expert_groups"),
+        "download": ("download",),
+    }
+
+    def _role_job_filter(self):
+        types = self.ROLE_JOB_TYPES.get(self.role)
+        if not types:
+            return "", []
+        return f"AND job_type IN ({','.join('?' for _ in types)})", list(types)
+
+    def _recover_stale_running_jobs(self, heartbeat_stale_seconds: int = 600):
+        """Requeue running jobs of this role whose worker is gone.
+
+        A job is considered abandoned when any of these hold:
+        - it ran longer than the job timeout (the original rule);
+        - it was claimed by this daemon's predecessor: the heartbeat row for our
+          daemon_name names a different worker_id, and there is only ever one
+          process per daemon_name, so that process is dead (container restart);
+        - its worker_id has no heartbeat at all, or none within
+          heartbeat_stale_seconds.
+        Runs for every role at start-up, so a routine container restart never
+        leaves a job stuck in 'running' until a role-"all" worker happens by.
+        """
+        role_sql, role_params = self._role_job_filter()
         cur = self.db.conn.cursor()
         cur.execute(
-            """
+            f"""
             UPDATE pipeline_jobs
                SET status = 'pending',
                    started_at = NULL,
                    worker_id = NULL
              WHERE status = 'running'
+               {role_sql}
                AND (
                     started_at IS NULL
                     OR datetime(started_at) <= datetime('now', ?)
+                    OR worker_id IS NULL
+                    OR worker_id IN (
+                         SELECT worker_id FROM daemon_heartbeat
+                          WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?
+                    )
+                    OR worker_id NOT IN (
+                         SELECT worker_id FROM daemon_heartbeat
+                          WHERE worker_id IS NOT NULL
+                            AND datetime(last_seen_at) > datetime('now', ?)
+                    )
                )
             """,
-            (f"-{self.job_timeout_seconds} seconds",),
+            role_params
+            + [f"-{self.job_timeout_seconds} seconds", self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
         )
         requeued = int(cur.rowcount or 0)
         self.db.conn.commit()
         if requeued:
-            log(f"Recovered {requeued} stale pipeline job(s) older than {self.job_timeout_seconds}s.")
+            log(f"Recovered {requeued} abandoned pipeline job(s) for role '{self.role}'.")
+        return requeued
+
+    def _release_own_running_jobs(self):
+        """On shutdown, hand the job we were working on back to the queue."""
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute(
+                """
+                UPDATE pipeline_jobs
+                   SET status = 'pending', started_at = NULL, worker_id = NULL
+                 WHERE status = 'running' AND worker_id = ?
+                """,
+                (self.worker_id,),
+            )
+            released = int(cur.rowcount or 0)
+            self.db.conn.commit()
+            if released:
+                log(f"Released {released} running job(s) back to the queue before exit.")
+            return released
+        except Exception as e:  # noqa: BLE001 - best effort during shutdown
+            log(f"Could not release running jobs on shutdown: {e}")
+            return 0
+
+    def _install_signal_handlers(self):
+        """docker stop/restart sends SIGTERM; treat it like Ctrl-C so the
+        graceful path (release job, final heartbeat) runs within the grace period."""
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        def _terminate(signum, _frame):
+            raise KeyboardInterrupt(f"signal {signum}")
+
+        try:
+            signal.signal(signal.SIGTERM, _terminate)
+        except (ValueError, OSError):
+            pass
 
     def fetch_next_job(self):
         """Fetch the next pending job from the queue with interactive-priority ordering."""
@@ -1018,6 +1090,7 @@ class PipelineDaemon:
 
     def run(self):
         log(f"{self.role} daemon starting. Waiting for work...")
+        self._install_signal_handlers()
         if self.role in {"enrich", "download"}:
             while self.running:
                 try:
@@ -1064,6 +1137,7 @@ class PipelineDaemon:
                 except KeyboardInterrupt:
                     log("Received shutdown signal. Exiting gracefully...")
                     self.running = False
+                    self._release_own_running_jobs()
                     self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
                 except Exception as e:
                     log(f"Critical error in main loop: {e}")
@@ -1090,6 +1164,7 @@ class PipelineDaemon:
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")
                 self.running = False
+                self._release_own_running_jobs()
                 self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
             except Exception as e:
                 log(f"Critical error in main loop: {e}")
