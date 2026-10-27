@@ -1528,9 +1528,7 @@
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
     if (authStatus !== 'authenticated') return 'none'
     if (anySearchRunning) return 'active'
-    // `running` only means the daemon is online; it idles most of the time.
-    // `in_flight` is a heartbeat in state "running", i.e. a batch in progress.
-    if (diagnosticsEnabled && (pipelineWorker.in_flight || downloadWorker.in_flight)) return 'active'
+    if (diagnosticsEnabled && (workerBusy(pipelineWorker) || workerBusy(downloadWorker))) return 'active'
     // Non-admins cannot see worker status; works under an unexpired worker lease
     // are being enriched/downloaded right now, so the counts move. The plain
     // enriching/downloading counts also include claims a killed worker left behind.
@@ -1576,8 +1574,11 @@
 
   // Worker log lines mark the data dirty and coalesce into one trailing run.
   function requestRefreshSoon(delayMs = REFRESH_TRAILING_MS) {
-    if (refreshDisposed || refreshReason() === 'hidden') return
+    if (refreshDisposed) return
+    // Hidden tabs do not run, but they remember: the trailing refresh happens
+    // once the tab is visible again (see onFocusOrVisible).
     refreshDirty = true
+    if (refreshReason() === 'hidden') return
     scheduleRefresh({ delayMs })
   }
 
@@ -1602,11 +1603,19 @@
     if (downloadedCorpusTableEl) downloadedCorpusTableEl.scrollTop = snapshot.downloaded
   }
 
+  // `running` only means the daemon heartbeat is fresh; it idles most of the
+  // time. `in_flight` is a heartbeat in state "running", i.e. a batch in
+  // progress, but a daemon killed mid-batch leaves that state behind with a
+  // stale heartbeat, so both are required.
+  function workerBusy(worker) {
+    return Boolean(worker?.running && worker?.in_flight)
+  }
+
   function shouldRunLiveRefresh() {
     if (authStatus !== 'authenticated') return false
     // A daemon that is merely online (idle heartbeat) does not warrant refreshing
     // the workspace from other tabs; a batch in flight does.
-    if (diagnosticsEnabled && (pipelineWorker.in_flight || downloadWorker.in_flight)) return true
+    if (diagnosticsEnabled && (workerBusy(pipelineWorker) || workerBusy(downloadWorker))) return true
     return activeTab === 'workspace' || activeTab === 'dashboard' || activeTab === 'downloads'
   }
 
@@ -4772,7 +4781,9 @@
         return
       }
       // Becoming visible refreshes once; the regular cadence resumes afterwards.
-      void refreshForActiveTab(activeTab).finally(() => scheduleRefresh())
+      // Log lines that arrived while hidden left the data dirty: run their
+      // trailing refresh now instead of at the next regular cycle.
+      void refreshForActiveTab(activeTab).finally(() => scheduleRefresh({ delayMs: refreshDirty ? REFRESH_TRAILING_MS : null }))
     }
     window.addEventListener('focus', onFocusOrVisible)
     document.addEventListener('visibilitychange', onFocusOrVisible)

@@ -10,7 +10,17 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SCRIPT = path.join(HERE, '..', 'scripts', 'corpus_list.py')
 const FIXTURE = path.join(HERE, 'fixtures', 'corpus-list.sql')
 const PY = process.env.RAG_FEEDER_PYTHON || '/home/jay/DT/venv/bin/python'
-const HAS_PY = fs.existsSync(PY)
+// A bare name like `python3` (CI) resolves through PATH, so stat-ing it would
+// skip every golden comparison; probe the interpreter instead.
+function pythonRuns(exe) {
+  try {
+    execFileSync(exe, ['-c', 'import sqlite3'], { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
+const HAS_PY = pythonRuns(PY)
 
 let tempDir
 let dbPath

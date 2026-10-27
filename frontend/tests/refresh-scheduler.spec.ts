@@ -18,7 +18,7 @@ async function boot(
     daemon = null as null | Record<string, unknown>,
   } = {},
 ) {
-  const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0 }
+  const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0, ingestRuns: 0 }
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
@@ -26,7 +26,8 @@ async function boot(
     const path = new URL(route.request().url()).pathname
     if (path === '/api/auth/me') {
       return fulfil(route, {
-        user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: admin },
+        // `admin` as a username is an admin regardless of the flag (App.svelte userIsAdmin).
+        user: { id: 1, username: admin ? 'admin' : 'reader', last_corpus_id: 1, is_admin: admin },
         corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
       })
     }
@@ -43,7 +44,10 @@ async function boot(
         : []
       return fulfil(route, { sources, total: sources.length, source: 'api' })
     }
-    if (path === '/api/ingest/runs') return fulfil(route, { runs: [], total: 0, source: 'api' })
+    if (path === '/api/ingest/runs') {
+      counts.ingestRuns += 1
+      return fulfil(route, { runs: [], total: 0, source: 'api' })
+    }
     if (path === '/api/ingest/stats') return fulfil(route, { stats })
     if (path === '/api/pipeline/daemon/status') {
       counts.pipelineStatus += 1
@@ -61,6 +65,7 @@ async function boot(
   counts.corpus = 0
   counts.pipelineStatus = 0
   counts.downloadStatus = 0
+  counts.ingestRuns = 0
   return counts
 }
 
@@ -124,6 +129,26 @@ test('a daemon with a batch in flight puts an admin on the 2 s cadence', async (
   const counts = await boot(page, { admin: true, daemon: busy })
   await page.waitForTimeout(7000)
   expect(counts.corpus).toBeGreaterThanOrEqual(3)
+})
+
+test('a daemon killed mid-batch (stale heartbeat still "running") does not count as active', async ({ page }) => {
+  const dead = { workers: { ...idleDaemon.workers, enrich: { ...idleDaemon.workers.enrich, online: false, status: 'running' } } }
+  const counts = await boot(page, { admin: true, daemon: dead })
+  await page.waitForTimeout(7000)
+  expect(counts.corpus).toBeLessThanOrEqual(1)
+})
+
+test('a log line that arrives while hidden is refreshed once the tab is visible again', async ({ page }) => {
+  const counts = await boot(page)
+  await setVisibility(page, 'hidden')
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(100))
+  await page.waitForTimeout(2000)
+  expect(counts.corpus).toBe(0)
+  expect(counts.ingestRuns).toBe(0)
+  await setVisibility(page, 'visible')
+  await page.waitForTimeout(3000)
+  // The dirty trailing cycle reloads the extracted-document list (ingest runs).
+  expect(counts.ingestRuns).toBeGreaterThanOrEqual(1)
 })
 
 test('a log-triggered refresh on a non-polling tab discovers worker status (admin)', async ({ page }) => {
