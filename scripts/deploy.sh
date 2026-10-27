@@ -78,7 +78,18 @@ PROD_IMAGE=0
 if printf '%s\n' "$IMAGES" | grep -c '^rag_feeder_frontend:prod$' >/dev/null; then PROD_IMAGE=1; fi
 # The configuration must describe what is actually running, or a frontend deploy
 # is skipped (or --full silently swaps prod for dev) while every check passes.
-RUNNING_IMAGE=$(timeout 30 docker inspect -f '{{.Config.Image}}' rag_feeder_frontend 2>/dev/null || echo none)
+# A missing container is fine (first start); a failing/timed-out inspect is not.
+set +e
+RUNNING_IMAGE=$(timeout 30 docker inspect -f '{{.Config.Image}}' rag_feeder_frontend 2>&1)
+inspect_rc=$?
+set -e
+if [ "$inspect_rc" -ne 0 ]; then
+  if printf '%s' "$RUNNING_IMAGE" | grep -Eiq 'no such (object|container)'; then
+    RUNNING_IMAGE=none
+  else
+    echo "docker inspect rag_feeder_frontend failed (exit $inspect_rc): $RUNNING_IMAGE" >&2; exit 1
+  fi
+fi
 if [ "$RUNNING_IMAGE" != none ]; then
   if [ "$PROD_IMAGE" = 1 ] && [ "$RUNNING_IMAGE" != rag_feeder_frontend:prod ]; then
     echo "compose config selects the production frontend image but the running container uses '$RUNNING_IMAGE'; fix COMPOSE_FILE/.env (see README) before deploying" >&2; exit 1
