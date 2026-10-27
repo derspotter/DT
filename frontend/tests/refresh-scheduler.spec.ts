@@ -161,6 +161,18 @@ test('a log-triggered refresh on a non-polling tab discovers worker status (admi
   expect(counts.downloadStatus).toBeGreaterThanOrEqual(1)
 })
 
+test('a re-arm on a non-polling tab keeps the pending trailing refresh for dirty data', async ({ page }) => {
+  const counts = await boot(page, { hash: '#/logs' })
+  await page.evaluate(() => {
+    const hook = (window as any).__dtRefresh
+    hook.requestRefreshSoon(1500)
+    // A tab switch re-arms the scheduler (reason "none" on #/graph) 200 ms later.
+    setTimeout(() => { window.location.hash = '#/graph' }, 200)
+  })
+  await page.waitForTimeout(4000)
+  expect(counts.ingestRuns).toBeGreaterThanOrEqual(1)
+})
+
 test('a running search run polls every 2 s', async ({ page }) => {
   const counts = await boot(page, { running: true })
   await page.waitForTimeout(7000)

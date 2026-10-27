@@ -1552,6 +1552,9 @@
     else if (wait === null) {
       if (reason === 'active') wait = REFRESH_ACTIVE_MS
       else if (reason === 'idle') wait = REFRESH_IDLE_MS
+      // No cadence on this tab, but a log line left the data dirty: keep (or
+      // arm) its trailing refresh instead of clearing it on a re-arm.
+      else if (reason === 'none' && refreshDirty && authStatus === 'authenticated') wait = REFRESH_TRAILING_MS
     }
     if (wait === null) {
       if (refreshTimer) {
