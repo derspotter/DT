@@ -119,7 +119,7 @@ Do not patch tracked compose files on the server. Keep the live host and Caddy l
 
 ### Deploy script
 
-`scripts/deploy.sh` pulls `origin/master` (fast-forward only, master checkout, no local modifications), then does only what the pulled diff needs and verifies the result:
+`scripts/deploy.sh` pulls `origin/master` (fast-forward only, master checkout, no local modifications), then does only what the diff since the last verified deploy needs and verifies the result. The last deployed and verified revision is kept in the git-ignored `.deploy-state`, so a run that failed half-way is completed by the next one and `--no-pull` after a manual pull still does the right thing:
 
 | Changed paths | Action |
 | --- | --- |
