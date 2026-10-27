@@ -1669,9 +1669,6 @@ class DatabaseManager:
         self,
         work_id: int,
         enrichment: dict,
-        *,
-        expand_related: bool = False,
-        max_related_per_source: int = 40,
     ) -> tuple[int | None, str | None]:
         """Update a pending work with enriched metadata."""
         cur = self.conn.cursor()

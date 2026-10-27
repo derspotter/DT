@@ -97,6 +97,17 @@ def log(msg: str):
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
     print(formatted_msg, flush=True)
+
+
+_EXPANSION_NOTICE_LOGGED = False
+
+
+def _note_expansion_disabled(fetch_refs: bool, fetch_cites: bool):
+    """Log once per process that requested expansion is ignored during enrichment."""
+    global _EXPANSION_NOTICE_LOGGED
+    if (fetch_refs or fetch_cites) and not _EXPANSION_NOTICE_LOGGED:
+        _EXPANSION_NOTICE_LOGGED = True
+        log("Expansion during enrichment is disabled: related works are not persisted; see the expansion plan")
     
     # Also append to the same pipeline log file that Node.js uses, so the UI can read it
     log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
@@ -582,7 +593,7 @@ class PipelineDaemon:
             }
             enriched, diag = process_single_reference(
                 ref, self.searcher, self.rate_limiter,
-                fetch_references=fetch_refs, fetch_citations=fetch_cites,
+                fetch_references=False, fetch_citations=False,
                 max_citations=max_cites, related_depth=rel_down,
                 related_depth_upstream=rel_up, max_related_per_reference=max_rel, return_diagnostics=True
             )
@@ -696,6 +707,7 @@ class PipelineDaemon:
         fetch_cites = bool(expansion.get("includeUpstream", False)) and rel_up > 0
         max_cites = expansion.get("maxCitations", 100)
         max_rel = expansion.get("maxRelated", 30)
+        _note_expansion_disabled(fetch_refs, fetch_cites)
 
         wave_size_cfg = int(os.getenv("RAG_FEEDER_ENRICH_WAVE_SIZE", "2") or "2")
         wave_size = max(1, min(len(to_process), max(1, min(workers, 32)), wave_size_cfg))
@@ -736,9 +748,7 @@ class PipelineDaemon:
                         results.append(result_payload)
                         continue
 
-                    wid, err = self.db.apply_enriched_metadata(
-                        pending_work_id, enriched, expand_related=(rel_down > 1 and fetch_refs), max_related_per_source=max_rel
-                    )
+                    wid, err = self.db.apply_enriched_metadata(pending_work_id, enriched)
                     if not wid:
                         dup = parse_duplicate_merge_marker(err)
                         if dup:
