@@ -101,3 +101,5 @@ node_modules/
 
 # Local responsive screenshot matrix (baseline/after) — evidence, not source
 artifacts/responsive/
+# scripts/deploy.sh: last deployed+verified revision on this host
+.deploy-state

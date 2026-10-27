@@ -50,8 +50,15 @@ fi
 URL=${URL:-http://127.0.0.1:5175}
 URL=${URL%/}
 
+# A broken compose configuration must abort, not pass as "dev stack".
+IMAGES=$(compose config --images) || { echo "docker compose config failed; fix the compose files/.env first" >&2; exit 1; }
 PROD_IMAGE=0
-if compose config --images 2>/dev/null | grep -q '^rag_feeder_frontend:prod$'; then PROD_IMAGE=1; fi
+if printf '%s\n' "$IMAGES" | grep -q '^rag_feeder_frontend:prod$'; then PROD_IMAGE=1; fi
+
+# The last revision that was deployed AND verified. Actions are decided against
+# it, not against the pre-pull HEAD, so a failed build or restart is redone on
+# the next run (and --no-pull after a manual pull still does the right thing).
+STATE_FILE=.deploy-state
 
 # ---- 1. pull -------------------------------------------------------------------
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -61,20 +68,34 @@ fi
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   echo "refusing to deploy: tracked files are modified in the checkout" >&2; git status --short --untracked-files=no >&2; exit 1
 fi
-BEFORE=$(git rev-parse HEAD)
+HEAD_BEFORE=$(git rev-parse HEAD)
 if [ "$NO_PULL" = 1 ]; then
-  AFTER=$BEFORE
+  AFTER=$HEAD_BEFORE
   say "deploying checkout as is: $(git log --oneline -1)"
 else
   git fetch -q origin master
   AFTER=$(git rev-parse origin/master)
-  if [ "$AFTER" = "$BEFORE" ]; then
+  if [ "$AFTER" = "$HEAD_BEFORE" ]; then
     say "already at origin/master: $(git log --oneline -1)"
   else
-    say "pull: ${BEFORE:0:7} -> ${AFTER:0:7} ($(git rev-list --count "$BEFORE..$AFTER") commits)"
-    git log --oneline "$BEFORE..$AFTER" | sed 's/^/    /'
+    say "pull: ${HEAD_BEFORE:0:7} -> ${AFTER:0:7} ($(git rev-list --count "$HEAD_BEFORE..$AFTER") commits)"
+    git log --oneline "$HEAD_BEFORE..$AFTER" | sed 's/^/    /'
     run git merge --ff-only -q origin/master
   fi
+fi
+BEFORE=""
+if [ -s "$STATE_FILE" ]; then
+  DEPLOYED=$(tr -d '[:space:]' < "$STATE_FILE")
+  if git merge-base --is-ancestor "$DEPLOYED" "$AFTER" 2>/dev/null; then
+    BEFORE=$DEPLOYED
+    [ "$BEFORE" != "$HEAD_BEFORE" ] && say "last verified deploy: ${BEFORE:0:7} (an earlier run did not finish); deciding from there"
+  else
+    say "WARNING: $STATE_FILE names ${DEPLOYED:0:7}, which is not in this history; deciding from the pre-pull HEAD"
+  fi
+fi
+if [ -z "$BEFORE" ]; then
+  BEFORE=$HEAD_BEFORE
+  [ -s "$STATE_FILE" ] || say "no $STATE_FILE yet: deciding from the pre-pull HEAD (use --frontend/--workers to force)"
 fi
 
 # ---- 2. decide from the diff ---------------------------------------------------
@@ -147,5 +168,6 @@ fi
 for c in rag_feeder_backend rag_feeder_frontend rag_feeder_enrich_worker rag_feeder_download_worker; do
   check "container $c" running "$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || echo missing)"
 done
-if [ "$fail" = 1 ]; then say "DEPLOY CHECKS FAILED"; exit 1; fi
+if [ "$fail" = 1 ]; then say "DEPLOY CHECKS FAILED (state not advanced; the next run redoes the pending steps)"; exit 1; fi
+if [ "$DRY_RUN" = 0 ]; then printf '%s\n' "$AFTER" > "$STATE_FILE"; fi
 say "deploy OK at $(git log --oneline -1)"
