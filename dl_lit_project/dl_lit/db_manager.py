@@ -1106,6 +1106,47 @@ class DatabaseManager:
             "openalex_id": self._normalize_openalex_id(resolved.get("openalex_id")),
         }
 
+    def _absorb_duplicate(
+        self,
+        canonical_id: int,
+        duplicate_id: int,
+        *,
+        match_field: str | None,
+        notes: str | None = None,
+        updates: dict | None = None,
+    ) -> None:
+        """Fold duplicate works row into canonical: corpus membership, aliases, delete, merge_log.
+
+        Runs inside the caller's transaction; never begins or commits.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT OR IGNORE INTO corpus_works (corpus_id, work_id, added_at)
+               SELECT corpus_id, ?, added_at FROM corpus_works WHERE work_id = ?""",
+            (canonical_id, duplicate_id),
+        )
+        # work_aliases has no unique constraint, so drop the duplicate's aliases the canonical
+        # already carries before moving the rest (otherwise the move would double them).
+        cur.execute(
+            """DELETE FROM work_aliases
+                WHERE work_table = 'works' AND work_id = ?
+                  AND normalized_alias_title IN (
+                      SELECT normalized_alias_title FROM work_aliases WHERE work_table = 'works' AND work_id = ?)""",
+            (duplicate_id, canonical_id),
+        )
+        cur.execute(
+            "UPDATE work_aliases SET work_id = ? WHERE work_table = 'works' AND work_id = ?",
+            (canonical_id, duplicate_id),
+        )
+        cur.execute("DELETE FROM corpus_works WHERE work_id = ?", (duplicate_id,))
+        cur.execute("DELETE FROM works WHERE id = ?", (duplicate_id,))
+        cur.execute(
+            """INSERT INTO merge_log
+               (canonical_table, canonical_id, duplicate_table, duplicate_id, match_field, action, notes, updates_json)
+               VALUES ('works', ?, 'works', ?, ?, 'absorbed', ?, ?)""",
+            (canonical_id, duplicate_id, match_field, notes, json.dumps(updates) if updates else None),
+        )
+
     def _merge_records(
         self,
         canonical_table: str,
@@ -1179,6 +1220,12 @@ class DatabaseManager:
                     updates.get("editors", canonical.get("editors")),
                 )
 
+            absorb = canonical_table == "works" and duplicate_table == "works"
+            if absorb:
+                # Delete the duplicate before backfilling so values under unique indexes
+                # (normalized_doi, openalex_id) can move to the canonical row.
+                self._absorb_duplicate(canonical_id, duplicate_id, match_field=match_field, notes=notes, updates=updates)
+
             if updates:
                 set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
                 cur.execute(
@@ -1186,11 +1233,12 @@ class DatabaseManager:
                     list(updates.values()) + [canonical_id],
                 )
 
-            # Move aliases to canonical record
-            cur.execute(
-                "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
-                (canonical_table, canonical_id, duplicate_table, duplicate_id),
-            )
+            if not absorb:
+                # Move aliases to canonical record
+                cur.execute(
+                    "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
+                    (canonical_table, canonical_id, duplicate_table, duplicate_id),
+                )
 
             # Add duplicate title as alias if different
             duplicate_title = duplicate.get("title")
@@ -1211,15 +1259,9 @@ class DatabaseManager:
                         ),
                     )
 
-            if canonical_table == "works" and duplicate_table == "works":
-                cur.execute(
-                    """INSERT OR IGNORE INTO corpus_works (corpus_id, work_id, added_at)
-                       SELECT corpus_id, ?, CURRENT_TIMESTAMP
-                         FROM corpus_works
-                        WHERE work_id = ?""",
-                    (canonical_id, duplicate_id),
-                )
-                cur.execute("DELETE FROM corpus_works WHERE work_id = ?", (duplicate_id,))
+            if absorb:
+                cur.execute("COMMIT")
+                return True, None
 
             # Delete duplicate row
             cur.execute(f"DELETE FROM {duplicate_table} WHERE id = ?", (duplicate_id,))
@@ -1686,7 +1728,7 @@ class DatabaseManager:
                 existing = self.get_entry_by_id("works", int(existing_id)) or {}
                 self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
                 self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"))
-                self.conn.execute("DELETE FROM works WHERE id = ?", (int(work_id),))
+                self._absorb_duplicate(int(existing_id), int(work_id), match_field=field, notes="apply_enriched_metadata")
                 cur.execute("COMMIT")
                 marker = f"DUPLICATE_MERGED|table=works|id={existing_id}|field={field}|queued=0|queue_id=|queue_error="
                 return None, f"Entry already exists in works (ID {existing_id}) on {field} [{marker}]"
@@ -2101,7 +2143,7 @@ class DatabaseManager:
                     "normalized_authors": normalized_authors,
                 }
                 self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
-                cursor.execute("DELETE FROM works WHERE id = ?", (int(source_id),))
+                self._absorb_duplicate(int(duplicate_id), int(source_id), match_field=duplicate_field, notes="mark_raw_work_downloaded")
                 self.conn.commit()
                 return int(duplicate_id), None
 
@@ -2906,7 +2948,7 @@ class DatabaseManager:
         canonical = self.get_entry_by_id("works", int(existing_work_id)) or {}
         try:
             self._update_work_record(int(existing_work_id), self._apply_work_merge_priority(canonical, duplicate))
-            self.conn.execute("DELETE FROM works WHERE id = ?", (int(queue_id),))
+            self._absorb_duplicate(int(existing_work_id), int(queue_id), match_field=matched_field, notes="merge_duplicate_queued_work")
             self.conn.commit()
         except sqlite3.Error as err:
             self.conn.rollback()

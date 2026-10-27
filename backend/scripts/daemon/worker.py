@@ -764,8 +764,6 @@ class PipelineDaemon:
                             errors.append(err or f"Promotion failed for pending work {pending_work_id}")
                             self.db.reset_enrich_claim(pending_work_id, state="pending", error=err or "promotion_failed", selected=0)
                             results.append({"pending_work_id": pending_work_id, "action": "promotion_failed", "error": err})
-                        if dup:
-                            self.db.delete_work(pending_work_id)
                         continue
 
                     promoted += 1
