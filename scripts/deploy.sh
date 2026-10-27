@@ -249,10 +249,20 @@ if [ "$DRY_RUN" = 0 ]; then
     check "frontend container restarted" fresh "$(started_after rag_feeder_frontend)"
   fi
   if [ "$WORKERS" = 1 ]; then
+    # The daemons import heavy libraries before they log their start line.
+    daemon_started() { # container -> started | no-start-line (polls up to 90 s)
+      local tries=0 lines
+      while :; do
+        lines=$(docker logs --since "$STARTED_AT" "$1" 2>&1 | grep -c 'daemon starting' || true)
+        if [ "${lines:-0}" -gt 0 ]; then echo started; return; fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 18 ]; then echo no-start-line; return; fi
+        sleep 5
+      done
+    }
     for c in $WORKER_CONTAINERS; do
       check "$c restarted" fresh "$(started_after "$c")"
-      lines=$(docker logs --since "$STARTED_AT" "$c" 2>&1 | grep -c 'daemon starting' || true)
-      check "$c daemon started" started "$([ "${lines:-0}" -gt 0 ] && echo started || echo no-start-line)"
+      check "$c daemon started" started "$(daemon_started "$c")"
     done
     # Nothing left behind in 'running' from before the restart.
     stranded=$(compose exec -T rag_enrich_worker /opt/venv/bin/python - <<'PY' 2>/dev/null || echo "?"

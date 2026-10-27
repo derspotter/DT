@@ -30,6 +30,18 @@ def make_conn():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE daemon_heartbeat (
+            daemon_name TEXT PRIMARY KEY,
+            worker_id TEXT,
+            status TEXT,
+            details_json TEXT,
+            last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     return conn
 
 
@@ -39,6 +51,7 @@ def make_daemon(conn, worker_id="worker-1", timeout_seconds=300):
     daemon.worker_id = worker_id
     daemon.job_timeout_seconds = timeout_seconds
     daemon.role = "all"
+    daemon.daemon_name = "pipeline"
     return daemon
 
 
@@ -88,6 +101,11 @@ def test_recover_stale_running_jobs_only_requeues_expired_work():
           (2, 'download', 'running', 'worker-live', datetime('now', '-30 seconds')),
           (3, 'enrich', 'running', 'worker-unknown', NULL)
         """
+    )
+    # worker-live is alive: it has a fresh heartbeat. worker-old timed out,
+    # worker-unknown has no heartbeat at all.
+    conn.execute(
+        "INSERT INTO daemon_heartbeat (daemon_name, worker_id, status) VALUES ('download', 'worker-live', 'running')"
     )
     conn.commit()
 
