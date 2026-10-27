@@ -878,6 +878,9 @@ export function ensureAuthSchema(db) {
   ensureColumn(db, 'users', 'invited_at', 'TIMESTAMP');
   ensureColumn(db, 'users', 'password_set_at', 'TIMESTAMP');
   // corpus_works' PRIMARY KEY (corpus_id, work_id) covers lookups by corpus_id and (corpus_id, work_id).
+  // An old works table may predate the lease columns idx_works_state covers.
+  ensureColumn(db, 'works', 'metadata_lease_expires_at', 'INTEGER');
+  ensureColumn(db, 'works', 'download_lease_expires_at', 'INTEGER');
   db.exec(`CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id);`);
@@ -889,6 +892,15 @@ export function ensureAuthSchema(db) {
     'idx_search_results_run',
   ]) {
     db.exec(`DROP INDEX IF EXISTS ${name};`);
+  }
+  // The indexes the dropped alias/search-result duplicates gave way to (same
+  // DDL as WORKS_INDEXES in db_manager.py); these tables belong to the Python side.
+  if (tableExists(db, 'work_aliases')) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id);`);
+  }
+  if (tableExists(db, 'search_results')) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id);`);
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_kantropos_assignments_target ON corpus_kantropos_assignments(target_id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_runs_created ON scraper_runs(created_at DESC, id DESC);`);
@@ -2610,7 +2622,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   fs.mkdirSync(BIB_OUTPUT_DIR, { recursive: true });
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const authDb = new Database(DB_PATH, { timeout: 3_000 });
+  // 15 s: the first index build on a large works table takes seconds and may
+  // coincide with a worker holding the write lock.
+  const authDb = new Database(DB_PATH, { timeout: 15_000 });
   // spawnPythonJson is module-level but needs the settings table; hand it this
   // connection rather than reopening the DB on every spawn.
   appSettingsDb = authDb;
@@ -2622,7 +2636,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // keep default journal mode if WAL is unavailable
   }
   try {
-    authDb.pragma('busy_timeout = 3000');
+    authDb.pragma('busy_timeout = 15000');
   } catch (error) {
     // timeout option already helps; pragma is best-effort
   }

@@ -576,7 +576,7 @@ class PipelineDaemon:
     # --- MARKING LOGIC ---
     def do_mark(self, corpus_id: int, limit: int):
         # Canonical works no longer require a separate raw-marking step.
-        return {"requested": limit, "marked": 0, "available": 0, "ids": []}
+        return {"requested": limit, "marked": 0, "available": None, "ids": []}
 
     # --- ENRICHMENT LOGIC ---
     def _enrich_single(self, entry, fetch_refs, fetch_cites, max_cites, rel_down, rel_up, max_rel):
