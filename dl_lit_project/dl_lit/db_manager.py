@@ -1549,7 +1549,7 @@ class DatabaseManager:
             """SELECT id
                FROM works
                WHERE metadata_status = 'matched'
-                 AND COALESCE(download_status, 'not_requested') = 'not_requested'
+                 AND download_status = 'not_requested'
                ORDER BY id
                LIMIT ?""",
             (limit,),
@@ -1769,7 +1769,7 @@ class DatabaseManager:
         lease_expires_at = now + int(max(1, lease_seconds))
         eligible_state_sql = """
             (
-              COALESCE(metadata_status, 'pending') = 'pending'
+              metadata_status = 'pending'
               OR (
                    metadata_status = 'in_progress'
                    AND metadata_lease_expires_at IS NOT NULL
@@ -1788,7 +1788,7 @@ class DatabaseManager:
             cur.execute("BEGIN IMMEDIATE")
             where_clauses = [eligible_state_sql]
             query_params: list = list(params)
-            where_clauses.append("COALESCE(nm.download_status, 'not_requested') = 'not_requested'")
+            where_clauses.append("nm.download_status = 'not_requested'")
 
             if corpus_id is not None:
                 where_clauses.append(

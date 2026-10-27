@@ -2880,11 +2880,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // separate COUNT(*) queries, each scanning the (corpus's) works — slow on a
     // 100k-row table and contended when the workers hold the DB lock.
     const sums = `
-      SUM(CASE WHEN COALESCE(t.metadata_status, 'pending') = 'pending' THEN 1 ELSE 0 END) AS raw_pending,
-      SUM(CASE WHEN COALESCE(t.metadata_status, 'pending') = 'in_progress' THEN 1 ELSE 0 END) AS enriching,
-      SUM(CASE WHEN t.metadata_status = 'matched' AND COALESCE(t.download_status, 'not_requested') = 'not_requested' THEN 1 ELSE 0 END) AS matched,
-      SUM(CASE WHEN COALESCE(t.download_status, 'not_requested') = 'queued' THEN 1 ELSE 0 END) AS queued_download,
-      SUM(CASE WHEN COALESCE(t.download_status, 'not_requested') = 'in_progress' THEN 1 ELSE 0 END) AS downloading,
+      SUM(CASE WHEN t.metadata_status = 'pending' THEN 1 ELSE 0 END) AS raw_pending,
+      SUM(CASE WHEN t.metadata_status = 'in_progress' THEN 1 ELSE 0 END) AS enriching,
+      SUM(CASE WHEN t.metadata_status = 'matched' AND t.download_status = 'not_requested' THEN 1 ELSE 0 END) AS matched,
+      SUM(CASE WHEN t.download_status = 'queued' THEN 1 ELSE 0 END) AS queued_download,
+      SUM(CASE WHEN t.download_status = 'in_progress' THEN 1 ELSE 0 END) AS downloading,
       SUM(CASE WHEN t.download_status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
       SUM(CASE WHEN t.metadata_status = 'failed' THEN 1 ELSE 0 END) AS failed_enrichment,
       SUM(CASE WHEN t.download_status = 'failed' THEN 1 ELSE 0 END) AS failed_download`;

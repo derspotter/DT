@@ -565,32 +565,8 @@ class PipelineDaemon:
 
     # --- MARKING LOGIC ---
     def do_mark(self, corpus_id: int, limit: int):
-        cur = self.db.conn.cursor()
-        if corpus_id is None:
-            cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM works
-                WHERE COALESCE(metadata_status, 'pending') IN ('pending', 'in_progress')
-                  AND COALESCE(download_status, 'not_requested') = 'not_requested'
-                """
-            )
-            available = int(cur.fetchone()[0])
-        else:
-            cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM works w
-                JOIN corpus_works cw ON cw.work_id = w.id
-                WHERE cw.corpus_id = ?
-                  AND COALESCE(w.metadata_status, 'pending') IN ('pending', 'in_progress')
-                  AND COALESCE(w.download_status, 'not_requested') = 'not_requested'
-                """, (corpus_id,)
-            )
-            available = int(cur.fetchone()[0])
-
         # Canonical works no longer require a separate raw-marking step.
-        return {"requested": limit, "marked": 0, "available": available, "ids": []}
+        return {"requested": limit, "marked": 0, "available": 0, "ids": []}
 
     # --- ENRICHMENT LOGIC ---
     def _enrich_single(self, entry, fetch_refs, fetch_cites, max_cites, rel_down, rel_up, max_rel):
