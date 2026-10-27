@@ -33,3 +33,12 @@ def test_expansion_request_logs_disabled_notice_once(monkeypatch, tmp_path):
 def test_apply_enriched_metadata_has_no_expansion_parameters():
     params = inspect.signature(DatabaseManager.apply_enriched_metadata).parameters
     assert "expand_related" not in params and "max_related_per_source" not in params
+
+
+def test_log_appends_to_pipeline_log_file(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path / "logs"))
+    mod, _ = _daemon(monkeypatch, tmp_path, lambda self, *a: object())
+    mod.log("x-marker")
+    text = (tmp_path / "logs" / "backend-pipeline.log").read_text()
+    assert "[DAEMON] x-marker" in text
+    assert "Failed to write to log file" not in capsys.readouterr().err

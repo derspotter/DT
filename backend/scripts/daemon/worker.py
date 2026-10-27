@@ -97,6 +97,15 @@ def log(msg: str):
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
     print(formatted_msg, flush=True)
+    # Also append to the same pipeline log file that Node.js uses, so the UI can read it
+    log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
+    log_file = os.path.join(log_dir, "backend-pipeline.log")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(formatted_msg + "\n")
+    except Exception as e:
+        print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 
 
 _EXPANSION_NOTICE_LOGGED = False
@@ -108,16 +117,6 @@ def _note_expansion_disabled(fetch_refs: bool, fetch_cites: bool):
     if (fetch_refs or fetch_cites) and not _EXPANSION_NOTICE_LOGGED:
         _EXPANSION_NOTICE_LOGGED = True
         log("Expansion during enrichment is disabled: related works are not persisted; see the expansion plan")
-    
-    # Also append to the same pipeline log file that Node.js uses, so the UI can read it
-    log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
-    log_file = os.path.join(log_dir, "backend-pipeline.log")
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(formatted_msg + "\n")
-    except Exception as e:
-        print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 
 
 def parse_duplicate_merge_marker(message: str | None) -> dict | None:
