@@ -129,13 +129,15 @@ def _claims(path):
 
 def test_startup_recovery_releases_work_claims_of_dead_workers_for_its_role(monkeypatch, tmp_path):
     db = tmp_path / "lit.db"
-    _seed(db, jobs=[], heartbeats=[("enrich", "daemon:box:1:aaa"), ("download", "daemon:box:2:ccc")])
-    _daemon(monkeypatch, tmp_path, "enrich")  # creates the real works schema; nothing to recover yet
+    _seed(db, jobs=[], heartbeats=[("download", "daemon:box:2:ccc")])
+    # The first daemon is the predecessor: it creates the real works schema and
+    # leaves its (fresh) heartbeat row behind under daemon_name 'enrich'.
+    predecessor = _daemon(monkeypatch, tmp_path, "enrich").worker_id
     c = sqlite3.connect(db)
     c.executemany(
         "INSERT INTO works (id, title, metadata_status, metadata_claimed_by, metadata_lease_expires_at, download_status, download_claimed_by, download_lease_expires_at) VALUES (?,'w',?,?,?,?,?,?)",
         [
-            (1, "in_progress", "daemon:box:1:aaa", 9999999999, "not_requested", None, None),   # predecessor's claim -> pending
+            (1, "in_progress", predecessor, 9999999999, "not_requested", None, None),         # predecessor's claim -> pending
             (2, "in_progress", "daemon:ghost:9:fff", 9999999999, "not_requested", None, None), # no heartbeat -> pending
             (3, "matched", None, None, "in_progress", "daemon:box:2:ccc", 9999999999),        # download role's claim: not ours
             (4, "in_progress", "daemon:live:4:ggg", 9999999999, "not_requested", None, None),  # live worker -> untouched
@@ -151,6 +153,32 @@ def test_startup_recovery_releases_work_claims_of_dead_workers_for_its_role(monk
         (3, "matched", None, "in_progress", "daemon:box:2:ccc"),
         (4, "in_progress", "daemon:live:4:ggg", "not_requested", None),
     ]
+
+
+def test_a_stopped_worker_is_not_live(monkeypatch, tmp_path):
+    db = tmp_path / "lit.db"
+    _seed(db, jobs=[("enrich", "daemon:all:1:sss")], heartbeats=[])
+    c = sqlite3.connect(db)
+    c.execute("INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, last_seen_at) VALUES ('pipeline', 'daemon:all:1:sss', 'stopped', datetime('now'))")
+    c.commit()
+    c.close()
+    _daemon(monkeypatch, tmp_path, "enrich")
+    assert _statuses(db) == [("enrich", None, "pending")]
+
+
+def test_claim_release_raises_on_a_locked_database(monkeypatch, tmp_path):
+    db = tmp_path / "lit.db"
+    _seed(db, jobs=[], heartbeats=[])
+    daemon = _daemon(monkeypatch, tmp_path, "enrich")
+    daemon.db.conn.execute("PRAGMA busy_timeout = 100")
+    blocker = sqlite3.connect(db, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            daemon._release_work_claims("claimed_by = ?", ["x"])
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
 
 
 def test_shutdown_releases_own_work_claims(monkeypatch, tmp_path):

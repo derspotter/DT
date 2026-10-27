@@ -329,6 +329,7 @@ class PipelineDaemon:
                     OR worker_id NOT IN (
                          SELECT worker_id FROM daemon_heartbeat
                           WHERE worker_id IS NOT NULL
+                            AND status != 'stopped'
                             AND datetime(last_seen_at) > datetime('now', ?)
                     )
                )
@@ -345,7 +346,7 @@ class PipelineDaemon:
         released = self._release_work_claims(
             where_claimed_by=(
                 "claimed_by IN (SELECT worker_id FROM daemon_heartbeat WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?)"
-                " OR claimed_by NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL AND datetime(last_seen_at) > datetime('now', ?))"
+                " OR claimed_by NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL AND status != 'stopped' AND datetime(last_seen_at) > datetime('now', ?))"
             ),
             params=[self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
         )
@@ -380,8 +381,15 @@ class PipelineDaemon:
                     [back_to] + list(params),
                 )
                 total += int(cur.rowcount or 0)
-            except sqlite3.OperationalError as e:  # no works table / old schema
-                log(f"Work claim release skipped ({status_col}): {e}")
+            except sqlite3.OperationalError as e:
+                # Only an old schema is tolerable here. A lock or I/O error must
+                # surface: the pipeline job was already requeued, and a claim
+                # left behind would make it complete empty.
+                msg = str(e).lower()
+                if "no such table" in msg or "no such column" in msg:
+                    log(f"Work claim release skipped ({status_col}): {e}")
+                    continue
+                raise
         self.db.conn.commit()
         return total
 

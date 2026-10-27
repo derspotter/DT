@@ -76,6 +76,17 @@ URL=${URL%/}
 IMAGES=$(compose config --images) || { echo "docker compose config failed; fix the compose files/.env first" >&2; exit 1; }
 PROD_IMAGE=0
 if printf '%s\n' "$IMAGES" | grep -c '^rag_feeder_frontend:prod$' >/dev/null; then PROD_IMAGE=1; fi
+# The configuration must describe what is actually running, or a frontend deploy
+# is skipped (or --full silently swaps prod for dev) while every check passes.
+RUNNING_IMAGE=$(timeout 30 docker inspect -f '{{.Config.Image}}' rag_feeder_frontend 2>/dev/null || echo none)
+if [ "$RUNNING_IMAGE" != none ]; then
+  if [ "$PROD_IMAGE" = 1 ] && [ "$RUNNING_IMAGE" != rag_feeder_frontend:prod ]; then
+    echo "compose config selects the production frontend image but the running container uses '$RUNNING_IMAGE'; fix COMPOSE_FILE/.env (see README) before deploying" >&2; exit 1
+  fi
+  if [ "$PROD_IMAGE" = 0 ] && [ "$RUNNING_IMAGE" = rag_feeder_frontend:prod ]; then
+    echo "the running frontend is the production image but compose config selects the dev server; set COMPOSE_FILE (see README) before deploying" >&2; exit 1
+  fi
+fi
 
 STATE_FILE=.deploy-state
 WORKER_SERVICES="rag_enrich_worker rag_download_worker"
@@ -159,14 +170,15 @@ if [ "$TARGET" != "$HEAD_BEFORE" ]; then run git merge --ff-only -q origin/maste
 if [ "$FULL" = 1 ]; then
   say "full: rebuilding every image and recreating every container"
   run compose build
-  run compose up -d --force-recreate
   if [ "$PROD_IMAGE" = 0 ]; then
     # The dev frontend keeps node_modules in a named volume that outlives the
-    # image; refresh it from the (possibly changed) lockfile.
+    # image. Refresh it from the lockfile with the frontend stopped and before
+    # the new container starts, so Vite never sees a half-installed tree.
     say "full: refreshing the dev frontend's node_modules volume"
-    run compose exec -T rag_feeder npm ci --no-audit --no-fund
-    run compose restart rag_feeder
+    run compose stop rag_feeder
+    run compose run --rm --no-deps -T rag_feeder npm ci --no-audit --no-fund
   fi
+  run compose up -d --force-recreate
   FRONTEND=$PROD_IMAGE   # verified below like a frontend deploy
   WORKERS=1              # recreated above; verified below like a restart
 elif [ "$FRONTEND" = 1 ]; then
