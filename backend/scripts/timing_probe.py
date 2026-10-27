@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Read-only timing probe: old vs new SQL shapes on a live literature.db.
 
-Opens the database with mode=ro only and refuses any other URI. Prints a
-markdown table of median milliseconds (3 runs after one warm-up).
+Opens the database with mode=ro and PRAGMA query_only. Prints a markdown
+table of median milliseconds (3 runs after one warm-up).
 """
 import argparse
 import sqlite3
 import statistics
 import sys
 import time
+from pathlib import Path
 
-DEFAULT_DB = "/home/jay/DT/dl_lit_project/data/literature.db"
+DEFAULT_DB = Path(__file__).resolve().parents[2] / "dl_lit_project/data/literature.db"
 
 WS = ("char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, "
       "8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)")
@@ -36,8 +37,6 @@ LIVE_DL = "SUM(CASE WHEN w.download_status = 'in_progress' AND w.download_lease_
 
 def connect(db_path):
     uri = f"file:{db_path}?mode=ro"
-    if "mode=ro" not in uri:
-        raise SystemExit("refusing to open without mode=ro")
     last = None
     for _ in range(4):
         try:
@@ -95,29 +94,61 @@ def main():
     add("enrich claim select (all)", (enrich_old.format(x=""), (nowsec,)), (enrich_new.format(x=""), (nowsec,)))
     add(f"enrich claim select (corpus {big})", (enrich_old.format(x=ex), (nowsec, big)), (enrich_new.format(x=ex), (nowsec, big)))
 
+    # Mirrors pipelineReads.SMALL_CORPUS_LIMIT / corpusIsSmall.
+    small_limit = 5000
+    size_probe = "SELECT COUNT(*) FROM (SELECT 1 FROM corpus_works WHERE corpus_id = ? LIMIT ?)"
+
+    def is_small(cid):
+        return conn.execute(size_probe, (cid, small_limit + 1)).fetchone()[0] <= small_limit
+
+    grouped = (f"SELECT w.metadata_status, w.download_status, COUNT(*) AS n, {LIVE_META} AS live_meta, {LIVE_DL} AS live_dl ")
+    exists_from = "FROM works w WHERE EXISTS (SELECT 1 FROM corpus_works cw WHERE cw.corpus_id = ? AND cw.work_id = w.id) "
+    join_from = "FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE cw.corpus_id = ? "
+
     def counts(cid):
         old = (f"SELECT {STATUS_SQL} AS status, COUNT(*) AS n FROM works w JOIN corpus_works cw ON cw.work_id = w.id "
                "WHERE cw.corpus_id = ? GROUP BY 1", (cid,))
-        new = (f"SELECT w.metadata_status, w.download_status, COUNT(*) AS n, {LIVE_META} AS live_meta, {LIVE_DL} AS live_dl "
-               "FROM works w WHERE EXISTS (SELECT 1 FROM corpus_works cw WHERE cw.corpus_id = ? AND cw.work_id = w.id) "
-               "GROUP BY 1, 2", (nowsec, nowsec, cid))
+        new = (grouped + (join_from if is_small(cid) else exists_from) + "GROUP BY 1, 2", (nowsec, nowsec, cid))
         return old, new
-    add(f"status counts, largest (corpus {big}, {sizes_d[big]} works)", *counts(big))
-    add(f"status counts, small (corpus {small}, {sizes_d[small]} works)", *counts(small))
 
-    only_int = conn.execute("SELECT 1 FROM works WHERE typeof(year) NOT IN ('integer','null') LIMIT 1").fetchone() is None
-    probe = "SELECT 1 FROM works WHERE typeof(year) NOT IN ('integer', 'null') LIMIT 1"
-    rows.append(("year-type probe", None, median_ms(conn, probe), "new only; years integer/NULL only" if only_int else "NON-INTEGER YEARS PRESENT"))
+    def exists_note(cid):
+        if not is_small(cid):
+            return "EXISTS form (large corpus)"
+        t8 = median_ms(conn, grouped + exists_from + "GROUP BY 1, 2", (nowsec, nowsec, cid))
+        return f"JOIN form (small corpus); EXISTS form would take {t8:.2f}"
+    add(f"status counts, largest (corpus {big}, {sizes_d[big]} works)", *counts(big), exists_note(big))
+    small_ids = [small] + [cid for cid in (102, 130) if cid in sizes_d and cid != small]
+    for cid in small_ids:
+        add(f"status counts, small (corpus {cid}, {sizes_d[cid]} works)", *counts(cid), exists_note(cid))
+    rows.append(("corpus size-class probe", None, median_ms(conn, size_probe, (big, small_limit + 1)), f"corpus {big}"))
+
+    probe = ("SELECT EXISTS (SELECT 1 FROM works WHERE year <= 0) "
+             "OR EXISTS (SELECT 1 FROM works WHERE typeof(year) NOT IN ('integer', 'null'))")
+    only_int = not conn.execute(probe).fetchone()[0]
+    rows.append(("year-order probe (memoised)", None, median_ms(conn, probe),
+                 "years positive integer/NULL only" if only_int else "CASE PATH: non-integer or <= 0 years present"))
 
     cols_old = COLS_STATUS.format(added="cw.added_at")
     member = "FROM corpus_works cw WHERE cw.corpus_id = ? AND cw.work_id = w.id"
     cols_new = COLS_STATUS.format(added=f"(SELECT cw.added_at {member})")
-    if only_int:
-        add(f"default page, corpus {big}",
-            (f"SELECT {cols_old} FROM works w JOIN corpus_works cw ON cw.work_id = w.id WHERE cw.corpus_id = ? "
-             f"ORDER BY {YEAR_SQL} DESC, w.id DESC LIMIT 200 OFFSET 0", (big,)),
-            (f"SELECT {cols_new} FROM works w WHERE EXISTS (SELECT 1 {member}) "
-             "ORDER BY w.year DESC, w.id DESC LIMIT 200 OFFSET 0", (big, big)))
+    page_old = (f"SELECT {cols_old} FROM works w JOIN corpus_works cw ON cw.work_id = w.id WHERE cw.corpus_id = ? "
+                f"ORDER BY {YEAR_SQL} DESC, w.id DESC LIMIT 200 OFFSET 0")
+    page_idx = (f"SELECT {cols_new} FROM works w WHERE EXISTS (SELECT 1 {member}) "
+                "ORDER BY w.year DESC, w.id DESC LIMIT 200 OFFSET 0")
+
+    def page_new(cid):
+        if only_int and not is_small(cid):
+            return page_idx, (cid, cid)
+        return page_old, (cid,)
+
+    def page_note(cid):
+        if not only_int:
+            return "CASE path (years)"
+        if not is_small(cid):
+            return "index path (large corpus)"
+        return f"JOIN + YEAR_SQL (small corpus); index path would take {median_ms(conn, page_idx, (cid, cid)):.2f}"
+    for cid in [big] + small_ids:
+        add(f"default page, corpus {cid} ({sizes_d[cid]} works)", (page_old, (cid,)), page_new(cid), page_note(cid))
     cols_add = COLS_STATUS.format(added="cw.added_at")
     add(f"added-sort page, corpus {big}",
         (f"SELECT {cols_add} FROM works w JOIN corpus_works cw ON cw.work_id = w.id WHERE cw.corpus_id = ? "

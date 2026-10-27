@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { readIngestStats, readWorkStateCounts, workStatus, bucketCounts, resetWorkStateMemo, listDownloads, listIngestRuns, tableExists } from '../src/pipelineReads.js'
+import { readIngestStats, readWorkStateCounts, workStatus, bucketCounts, resetWorkStateMemo, listDownloads, listIngestRuns, tableExists, corpusIsSmall, SMALL_CORPUS_LIMIT } from '../src/pipelineReads.js'
 
 let db
 beforeEach(() => {
@@ -153,6 +153,100 @@ test('the memo misses as soon as another connection commits', () => {
     b.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// Records every grouped state-count statement prepared on `target`.
+function recordGrouped(target) {
+  const grouped = []
+  const original = target.prepare.bind(target)
+  target.prepare = (sql) => {
+    if (sql.includes('GROUP BY 1, 2')) grouped.push(sql)
+    return original(sql)
+  }
+  return { grouped, restore: () => { target.prepare = original } }
+}
+
+test('small corpora count through a corpus_works JOIN, large ones through EXISTS, with identical rows', () => {
+  seedStats()
+  const now = Math.floor(Date.now() / 1000)
+  addWork(8, 1, 'in_progress', null, { metaLease: now + 600 })
+  addWork(9, 2, 'matched', 'downloaded')
+  const { grouped, restore } = recordGrouped(db)
+  try {
+    const sorted = (rows) => [...rows].sort((a, b) => `${a.metadata_status}|${a.download_status}`.localeCompare(`${b.metadata_status}|${b.download_status}`))
+    const viaJoin = readWorkStateCounts(db, 1, { nowSec: now })
+    expect(grouped.pop()).toMatch(/FROM corpus_works cw JOIN works w ON w\.id = cw\.work_id WHERE cw\.corpus_id = \?/)
+    // 8 members: above a limit of 7, at or below a limit of 8.
+    const viaExists = readWorkStateCounts(db, 1, { nowSec: now, smallCorpusLimit: 7 })
+    const sql = grouped.pop()
+    expect(sql).toContain('WHERE EXISTS (SELECT 1 FROM corpus_works cw')
+    expect(sql).not.toContain('JOIN')
+    readWorkStateCounts(db, 1, { nowSec: now, smallCorpusLimit: 8 })
+    expect(grouped.pop()).toContain('JOIN works w')
+    expect(sorted(viaJoin)).toEqual(sorted(viaExists))
+    expect(viaJoin.reduce((n, r) => n + r.n, 0)).toBe(8)
+  } finally {
+    restore()
+  }
+})
+
+test('corpusIsSmall classifies by a bounded count and is memoised until a write', () => {
+  expect(SMALL_CORPUS_LIMIT).toBe(5000)
+  seedStats()
+  expect(corpusIsSmall(db, 1)).toBe(true)
+  expect(corpusIsSmall(db, 1, 6)).toBe(false)
+  expect(corpusIsSmall(db, 1, 7)).toBe(true)
+  expect(corpusIsSmall(db, 999, 0)).toBe(true)
+  const seen = []
+  const original = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    if (sql.includes('LIMIT ?)')) seen.push(sql)
+    return original(sql)
+  }
+  try {
+    expect(corpusIsSmall(db, 1, 6)).toBe(false)
+    expect(seen).toHaveLength(0)
+    db.prepare('DELETE FROM corpus_works WHERE work_id = 7').run()
+    expect(corpusIsSmall(db, 1, 6)).toBe(true)
+    expect(seen).toHaveLength(1)
+  } finally {
+    db.prepare = original
+  }
+})
+
+test('a read inside a transaction that is rolled back is not served from the memo afterwards', () => {
+  seedStats()
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  db.exec('BEGIN')
+  db.prepare("DELETE FROM works WHERE metadata_status = 'pending'").run()
+  expect(readIngestStats(db, 1).raw_pending).toBe(1)
+  db.exec('ROLLBACK')
+  // Neither data_version nor total_changes() moves on ROLLBACK.
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+})
+
+test('a read-only transaction may store memo entries after the committed state was noted', () => {
+  seedStats()
+  readIngestStats(db, 1)
+  const { grouped, restore } = recordGrouped(db)
+  try {
+    db.exec('BEGIN')
+    readIngestStats(db, 2)
+    readIngestStats(db, 2)
+    db.exec('COMMIT')
+    readIngestStats(db, 2)
+    expect(grouped).toHaveLength(1)
+  } finally {
+    restore()
+  }
+})
+
+test('an explicit nowSec bypasses the memo', () => {
+  const now = Math.floor(Date.now() / 1000)
+  addWork(1, 1, 'in_progress', null, { metaLease: now + 10 })
+  expect(readIngestStats(db, 1).enriching_live).toBe(1)
+  expect(readWorkStateCounts(db, 1, { nowSec: now + 60 })[0].live_meta).toBe(0)
+  expect(readWorkStateCounts(db, 1, { nowSec: now })[0].live_meta).toBe(1)
 })
 
 function seedDownloads() {
