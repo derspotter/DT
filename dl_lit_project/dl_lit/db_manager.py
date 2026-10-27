@@ -928,8 +928,14 @@ class DatabaseManager:
         alias_year: int | str | None = None,
         alias_language: str | None = None,
         relationship_type: str | None = None,
+        *,
+        commit: bool = True,
     ) -> tuple[int | None, str | None]:
-        """Add an alternate title/translation for a work."""
+        """Add an alternate title/translation for a work.
+
+        With commit=False the insert joins the caller's transaction: nothing is
+        committed or rolled back here, and a database error propagates.
+        """
         if not alias_title:
             return None, "Alias title is required"
 
@@ -950,9 +956,12 @@ class DatabaseManager:
                     relationship_type,
                 ),
             )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
             return cur.lastrowid, None
         except sqlite3.Error as e:
+            if not commit:
+                raise
             self.conn.rollback()
             return None, str(e)
 
@@ -1147,12 +1156,18 @@ class DatabaseManager:
             (canonical_id, duplicate_id),
         )
         # work_aliases has no unique constraint, so drop the duplicate's aliases the canonical
-        # already carries before moving the rest (otherwise the move would double them).
+        # already carries (same title, year, language and relationship) before moving the
+        # rest; otherwise the move would double them. IS compares NULLs as equal.
         cur.execute(
             """DELETE FROM work_aliases
                 WHERE work_table = 'works' AND work_id = ?
-                  AND normalized_alias_title IN (
-                      SELECT normalized_alias_title FROM work_aliases WHERE work_table = 'works' AND work_id = ?)""",
+                  AND EXISTS (
+                      SELECT 1 FROM work_aliases c
+                       WHERE c.work_table = 'works' AND c.work_id = ?
+                         AND c.normalized_alias_title IS work_aliases.normalized_alias_title
+                         AND c.alias_year IS work_aliases.alias_year
+                         AND c.alias_language IS work_aliases.alias_language
+                         AND c.relationship_type IS work_aliases.relationship_type)""",
             (duplicate_id, canonical_id),
         )
         cur.execute(
@@ -1164,7 +1179,7 @@ class DatabaseManager:
         cur.execute(
             """INSERT INTO merge_log
                (canonical_table, canonical_id, duplicate_table, duplicate_id, match_field, action, notes, updates_json)
-               VALUES ('works', ?, 'works', ?, ?, 'absorbed', ?, ?)""",
+               VALUES ('works', ?, 'works', ?, ?, 'merged', ?, ?)""",
             (canonical_id, duplicate_id, match_field, notes, json.dumps(updates) if updates else None),
         )
 
@@ -1744,9 +1759,11 @@ class DatabaseManager:
             )
             if existing_id:
                 existing = self.get_entry_by_id("works", int(existing_id)) or {}
-                self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
-                self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"))
+                # Absorb first: the canonical may take over the duplicate's DOI/openalex id,
+                # which sit under unique indexes while the duplicate row exists.
                 self._absorb_duplicate(int(existing_id), int(work_id), match_field=field, notes="apply_enriched_metadata")
+                self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
+                self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"), commit=False)
                 cur.execute("COMMIT")
                 marker = f"DUPLICATE_MERGED|table=works|id={existing_id}|field={field}|queued=0|queue_id=|queue_error="
                 return None, f"Entry already exists in works (ID {existing_id}) on {field} [{marker}]"
@@ -2160,8 +2177,9 @@ class DatabaseManager:
                     "normalized_title": normalized_title,
                     "normalized_authors": normalized_authors,
                 }
-                self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
+                # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
                 self._absorb_duplicate(int(duplicate_id), int(source_id), match_field=duplicate_field, notes="mark_raw_work_downloaded")
+                self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
                 self.conn.commit()
                 return int(duplicate_id), None
 
@@ -2965,8 +2983,9 @@ class DatabaseManager:
         duplicate = self.get_entry_by_id("works", int(queue_id)) or {}
         canonical = self.get_entry_by_id("works", int(existing_work_id)) or {}
         try:
-            self._update_work_record(int(existing_work_id), self._apply_work_merge_priority(canonical, duplicate))
+            # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
             self._absorb_duplicate(int(existing_work_id), int(queue_id), match_field=matched_field, notes="merge_duplicate_queued_work")
+            self._update_work_record(int(existing_work_id), self._apply_work_merge_priority(canonical, duplicate))
             self.conn.commit()
         except sqlite3.Error as err:
             self.conn.rollback()
