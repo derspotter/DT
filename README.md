@@ -119,16 +119,18 @@ Do not patch tracked compose files on the server. Keep the live host and Caddy l
 
 ### Deploy script
 
-`scripts/deploy.sh` pulls `origin/master` (fast-forward only, master checkout, no local modifications), then does only what the diff since the last verified deploy needs and verifies the result. The last deployed and verified revision is kept in the git-ignored `.deploy-state`, so a run that failed half-way is completed by the next one and `--no-pull` after a manual pull still does the right thing:
+`scripts/deploy.sh` fast-forwards `master` (master checkout, no modified tracked files, no local commits ahead of `origin/master`), then does only what the diff since the last verified deploy needs, and verifies the result:
 
 | Changed paths | Action |
 | --- | --- |
 | `frontend/**` | rebuild + recreate `rag_feeder`, on hosts that run the production image (see below); the dev stack serves the bind mount and needs nothing |
-| `backend/scripts/**`, `dl_lit_project/dl_lit/**` | restart `rag_enrich_worker` and `rag_download_worker` (the daemons read their code at start) |
+| `backend/scripts/**`, `dl_lit_project/dl_lit/**` | restart `rag_enrich_worker` and `rag_download_worker` (the daemons read their code at start); the script first waits up to `--drain-seconds` (default 120) for a running batch to finish, and the daemons hand an interrupted job back to the queue on SIGTERM |
 | `backend/src/**` | nothing; nodemon reloads it from the bind mount |
-| `package*.json`, Dockerfiles, `docker-compose*.yml`, Python requirements | printed as a warning: run `docker compose up -d --build` yourself |
+| `package*.json`, Dockerfiles, `nodemon.json`, `docker-compose*.yml`, Python requirements | the script stops with exit 2; re-run with `--full` (`docker compose build && up -d` of every service) |
 
-The checks afterwards hit the public URL (`RAG_FEEDER_FRONTEND_URL` from `.env`, or `--url`): `/` 200, `/api/openalex/quota` 401 through the proxy, a WebSocket upgrade on `/api/ws` (101), on production-image hosts also 404 for `/src/App.svelte` and `/.env` plus `no-cache` on `/`, and all four containers running. A failed check exits non-zero. Flags: `--dry-run` (plan plus checks, no changes), `--no-pull` (deploy the checkout as it is), `--frontend` / `--workers` (force those steps). From another machine: `ssh <user>@<host> /path/to/DT/scripts/deploy.sh`.
+The last deployed and verified revision is kept in the git-ignored `.deploy-state` and advances only after all checks passed, so a run that failed half-way is completed by the next one, and `--no-pull` after a manual pull still does the right thing. Without a trustworthy state the script deploys everything; `--baseline REV` tells it what is running instead (first run on a host).
+
+Checks afterwards, against `RAG_FEEDER_FRONTEND_URL` from `.env` (or `--url`): `/` 200 (polled up to 60 s), `/api/openalex/quota` 401 through the proxy, a WebSocket upgrade on `/api/ws` (101, HTTP/1.1), on production-image hosts 404 for `/src/App.svelte` and `/.env` plus `no-cache` on `/`, all four containers running, and identity: a rebuilt frontend container runs the freshly built image, restarted workers started after the script began and logged their start line, and no pipeline job is left in `running` without a live worker. Any failure exits non-zero. Flags: `--dry-run`, `--no-pull`, `--frontend`, `--workers`, `--full`, `--baseline REV`, `--drain-seconds N`, `--url URL`. From another machine: `ssh <user>@<host> /path/to/DT/scripts/deploy.sh`.
 
 ### Serving the built frontend (production)
 
