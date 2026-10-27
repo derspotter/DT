@@ -1,8 +1,12 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import Database from 'better-sqlite3'
-import { readIngestStats, listDownloads, listIngestRuns, tableExists } from '../src/pipelineReads.js'
+import { readIngestStats, readWorkStateCounts, workStatus, bucketCounts, resetWorkStateMemo, listDownloads, listIngestRuns, tableExists } from '../src/pipelineReads.js'
 
 let db
 beforeEach(() => {
+  resetWorkStateMemo()
   db = new Database(':memory:')
   db.exec(`
     CREATE TABLE works (id INTEGER PRIMARY KEY, title TEXT, metadata_status TEXT, download_status TEXT, download_attempt_count INTEGER, downloaded_at TEXT,
@@ -44,6 +48,86 @@ test('ingest stats for an empty corpus and for global scope return zeros / all w
   expect(readIngestStats(db, 999)).toEqual({ raw_pending: 0, matched: 0, queued_download: 0, enriching: 0, downloading: 0, downloaded: 0, enriching_live: 0, downloading_live: 0 })
   expect(readIngestStats(db, null).downloaded).toBe(2)
   expect(readIngestStats(db, 1).downloaded).toBe(1)
+})
+
+test('readWorkStateCounts groups by raw status pair with live-lease sums', () => {
+  seedStats()
+  const now = Math.floor(Date.now() / 1000)
+  addWork(8, 1, 'in_progress', null, { metaLease: now + 600 })
+  addWork(9, 1, 'matched', 'in_progress', { dlLease: now + 600 })
+  addWork(10, 2, 'matched', 'downloaded')
+  const byPair = (rows) => Object.fromEntries(rows.map((r) => [`${r.metadata_status}|${r.download_status}`, [r.n, r.live_meta, r.live_dl]]))
+  expect(byPair(readWorkStateCounts(db, 1, { nowSec: now }))).toEqual({
+    'pending|null': [1, 0, 0],
+    'in_progress|null': [2, 1, 0],
+    'matched|not_requested': [1, 0, 0],
+    'matched|queued': [1, 0, 0],
+    'matched|in_progress': [2, 0, 1],
+    'matched|downloaded': [1, 0, 0],
+    'failed|null': [1, 0, 0],
+  })
+  // Global scope has no corpus filter; a corpus without members has no rows.
+  expect(byPair(readWorkStateCounts(db, null, { nowSec: now }))['matched|downloaded']).toEqual([2, 0, 0])
+  expect(readWorkStateCounts(db, 999, { nowSec: now })).toEqual([])
+})
+
+test('bucketCounts derives every consumer\'s numbers from the grouped rows', () => {
+  seedStats()
+  addWork(8, 1, 'matched', 'failed')
+  expect(bucketCounts(readWorkStateCounts(db, 1))).toEqual({
+    status_counts: { raw: 1, enriching: 1, matched: 1, queued_download: 2, downloaded: 1, failed_enrichment: 1, failed_download: 1 },
+    raw_pending_total: 2, pending_only: 1, in_progress: 1, matched_not_requested: 1, queued: 1, downloading: 1,
+    downloaded: 1, failed_meta: 1, failed_dl: 1, enriching_live: 0, downloading_live: 0,
+  })
+})
+
+test('readIngestStats equals the old numbers, derived from the grouped read', () => {
+  seedStats()
+  expect(readIngestStats(db, 1)).toEqual({ raw_pending: 2, matched: 1, queued_download: 2, enriching: 1, downloading: 1, downloaded: 1, enriching_live: 0, downloading_live: 0 })
+})
+
+test('workStatus buckets like STATUS_SQL, including padded/odd-case values', () => {
+  expect(workStatus(' Matched ', 'not_requested')).toBe('matched')
+  expect(workStatus('x', ' downloaded ')).toBe('downloaded')
+  expect(workStatus('matched', '\u3000QUEUED\t')).toBe('queued_download')
+  expect(workStatus('matched', 'In_Progress')).toBe('queued_download')
+  expect(workStatus('matched', ' failed')).toBe('failed_download')
+  expect(workStatus('\xa0in_progress\n', null)).toBe('enriching')
+  expect(workStatus('FAILED', '')).toBe('failed_enrichment')
+  expect(workStatus(null, null)).toBe('raw')
+  expect(workStatus('pending', 'not_requested')).toBe('raw')
+  // U+FEFF is not in Python's whitespace set, so STATUS_SQL keeps it.
+  expect(workStatus('\ufeffmatched', 'not_requested')).toBe('raw')
+})
+
+test('the memo is per corpus and expires after a same-connection write', async () => {
+  seedStats()
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  addWork(8, 2, 'pending', null)
+  expect(readIngestStats(db, 2).raw_pending).toBe(1)
+  addWork(9, 1, 'pending', null)
+  // Same-connection writes do not bump data_version: served from the memo.
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  await new Promise((r) => setTimeout(r, 1100))
+  expect(readIngestStats(db, 1).raw_pending).toBe(3)
+}, 5000)
+
+test('the memo misses as soon as another connection commits', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-state-memo-'))
+  const file = path.join(dir, 'w.db')
+  const a = new Database(file)
+  const b = new Database(file)
+  try {
+    a.exec('CREATE TABLE works (id INTEGER PRIMARY KEY, metadata_status TEXT, download_status TEXT); CREATE TABLE corpus_works (corpus_id INTEGER, work_id INTEGER);')
+    a.prepare("INSERT INTO works VALUES (1, 'pending', 'not_requested')").run()
+    expect(readIngestStats(a, null).raw_pending).toBe(1)
+    b.prepare("INSERT INTO works VALUES (2, 'pending', 'not_requested')").run()
+    expect(readIngestStats(a, null).raw_pending).toBe(2)
+  } finally {
+    a.close()
+    b.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 function seedDownloads() {

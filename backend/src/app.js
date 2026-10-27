@@ -13,7 +13,7 @@ import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
-import { listDownloads, listIngestRuns, readIngestStats } from './pipelineReads.js';
+import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
 import { listCorpus } from './corpusList.js';
 import {
   ensureSeedSchema,
@@ -1293,18 +1293,6 @@ function listKantroposCorporaOverview(db) {
   });
 }
 
-function statusFromWorkRow(data) {
-  const metadata = String(data?.metadata_status || 'pending').trim().toLowerCase();
-  const download = String(data?.download_status || 'not_requested').trim().toLowerCase();
-  if (download === 'downloaded') return 'downloaded';
-  if (download === 'queued' || download === 'in_progress') return 'queued_download';
-  if (download === 'failed') return 'failed_download';
-  if (metadata === 'in_progress') return 'enriching';
-  if (metadata === 'failed') return 'failed_enrichment';
-  if (metadata === 'matched') return 'matched';
-  return 'raw';
-}
-
 function normalizeGraphOpenAlexId(value) {
   const text = String(value || '').trim();
   if (!text) return null;
@@ -1333,7 +1321,7 @@ function mapWorkRowToBrowserItem(data, extra = {}) {
     year: data?.year ?? null,
     type: data?.type || '',
     source: data?.origin_key || data?.source_pdf || data?.metadata_source || data?.source || '',
-    status: statusFromWorkRow(data),
+    status: workStatus(data?.metadata_status, data?.download_status),
     metadata_status: data?.metadata_status || '',
     download_status: data?.download_status || '',
     doi: data?.doi || null,
@@ -2876,34 +2864,19 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0,
     };
     if (!tableExists(authDb, 'works')) return empty;
-    // Single pass with conditional aggregation. The previous version ran 8
-    // separate COUNT(*) queries, each scanning the (corpus's) works — slow on a
-    // 100k-row table and contended when the workers hold the DB lock.
-    const sums = `
-      SUM(CASE WHEN t.metadata_status = 'pending' THEN 1 ELSE 0 END) AS raw_pending,
-      SUM(CASE WHEN t.metadata_status = 'in_progress' THEN 1 ELSE 0 END) AS enriching,
-      SUM(CASE WHEN t.metadata_status = 'matched' AND t.download_status = 'not_requested' THEN 1 ELSE 0 END) AS matched,
-      SUM(CASE WHEN t.download_status = 'queued' THEN 1 ELSE 0 END) AS queued_download,
-      SUM(CASE WHEN t.download_status = 'in_progress' THEN 1 ELSE 0 END) AS downloading,
-      SUM(CASE WHEN t.download_status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
-      SUM(CASE WHEN t.metadata_status = 'failed' THEN 1 ELSE 0 END) AS failed_enrichment,
-      SUM(CASE WHEN t.download_status = 'failed' THEN 1 ELSE 0 END) AS failed_download`;
     try {
-      const row = scopedCorpusId === null
-        ? authDb.prepare(`SELECT ${sums} FROM works t`).get()
-        : authDb.prepare(
-            `SELECT ${sums} FROM works t JOIN corpus_works cw ON cw.work_id = t.id WHERE cw.corpus_id = ?`
-          ).get(scopedCorpusId);
+      const c = bucketCounts(readWorkStateCounts(authDb, scopedCorpusId));
       return {
         corpus_id: scopedCorpusId,
-        raw_pending: Number(row?.raw_pending || 0),
-        enriching: Number(row?.enriching || 0),
-        matched: Number(row?.matched || 0),
-        queued_download: Number(row?.queued_download || 0),
-        downloading: Number(row?.downloading || 0),
-        downloaded: Number(row?.downloaded || 0),
-        failed_enrichment: Number(row?.failed_enrichment || 0),
-        failed_download: Number(row?.failed_download || 0),
+        // Backlog summary: raw_pending = pending only (ingest stats count pending + in_progress).
+        raw_pending: c.pending_only,
+        enriching: c.in_progress,
+        matched: c.matched_not_requested,
+        queued_download: c.queued,
+        downloading: c.downloading,
+        downloaded: c.downloaded,
+        failed_enrichment: c.failed_meta,
+        failed_download: c.failed_dl,
       };
     } catch (error) {
       return empty;
@@ -6120,8 +6093,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
            FROM works w
            JOIN corpus_works cw ON cw.work_id = w.id
            WHERE cw.corpus_id = ?
-             AND COALESCE(w.metadata_status, 'pending') IN ('pending', 'in_progress')
-             AND COALESCE(w.download_status, 'not_requested') = 'not_requested'`
+             AND w.metadata_status IN ('pending', 'in_progress')
+             AND w.download_status = 'not_requested'`
         )
         .get(req.corpusId);
       const marked = Number(markedRow?.count || 0);

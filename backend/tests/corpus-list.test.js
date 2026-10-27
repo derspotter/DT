@@ -124,6 +124,27 @@ test('counts and labels for the fixture corpus', () => {
   expect(CORPUS_SORT_KEYS).toEqual(['title', 'authors', 'year', 'added', 'source', 'seed', 'metadata', 'download'])
 })
 
+test('status counts come from the grouped work-state read, not a per-row STATUS_SQL GROUP BY', () => {
+  const copy = freshDb()
+  try {
+    const seen = []
+    const original = copy.prepare.bind(copy)
+    copy.prepare = (sql) => {
+      seen.push(sql)
+      return original(sql)
+    }
+    const result = listCorpus(copy, { corpusId: 1, limit: 200, offset: 0, q: '', sort: '' })
+    expect(result.total).toBe(14)
+    expect(seen.some((sql) => /GROUP BY/.test(sql) && sql.includes('lower(trim('))).toBe(false)
+    // A q filter needs the search UDF, so it keeps the filtered GROUP BY.
+    seen.length = 0
+    listCorpus(copy, { corpusId: 1, limit: 200, offset: 0, q: 'labour', sort: '' })
+    expect(seen.some((sql) => /GROUP BY/.test(sql) && sql.includes('lower(trim('))).toBe(true)
+  } finally {
+    copy.close()
+  }
+})
+
 // --- Consistency and large pages -------------------------------------------
 
 // A fresh copy of the fixture, so mutating tests leave the golden DB alone.

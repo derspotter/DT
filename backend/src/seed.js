@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { bucketCounts, readWorkStateCounts } from './pipelineReads.js'
 function tableExists(db, tableName) {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName)
   return Boolean(row)
@@ -298,16 +299,14 @@ const GLOBAL_DOWNLOADED_MAX_AGE_MS = 5 * 60_000
 const globalDownloadedCache = new WeakMap()
 
 function worksFingerprint(db) {
-  const works = db.prepare(
-    `SELECT COUNT(*) AS n,
-            COALESCE(MAX(id), 0) AS max_id,
-            SUM(CASE WHEN COALESCE(download_status, '') = 'downloaded' THEN 1 ELSE 0 END) AS downloaded
-     FROM works`
-  ).get()
+  const rows = readWorkStateCounts(db, null)
+  const n = rows.reduce((sum, row) => sum + Number(row.n), 0)
+  const { downloaded } = bucketCounts(rows)
+  const maxId = db.prepare('SELECT COALESCE(MAX(id), 0) AS max_id FROM works').get().max_id
   const aliases = tableExists(db, 'work_aliases')
     ? db.prepare('SELECT COUNT(*) AS n FROM work_aliases').get().n
     : 0
-  return `${works.n}:${works.max_id}:${works.downloaded || 0}:${aliases}`
+  return `${n}:${maxId}:${downloaded}:${aliases}`
 }
 
 function loadGlobalDownloaded(db) {

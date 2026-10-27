@@ -6,7 +6,7 @@
 // the script prints. Filtering, counting, sorting and paging happen in SQL;
 // labels are computed in JS for the returned page only, except for the `seed`
 // sort, whose key is the label itself.
-import { tableExists } from './pipelineReads.js'
+import { tableExists, readWorkStateCounts, bucketCounts } from './pipelineReads.js'
 
 export const CORPUS_SORT_KEYS = ['title', 'authors', 'year', 'added', 'source', 'seed', 'metadata', 'download']
 
@@ -331,11 +331,18 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
   }
   const from = `FROM works w ${scoped ? 'JOIN corpus_works cw ON cw.work_id = w.id' : ''} ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`
 
-  const statusCounts = {}
+  let statusCounts = {}
   let total = 0
-  for (const row of db.prepare(`SELECT ${STATUS_SQL} AS status, COUNT(*) AS n ${from} GROUP BY 1`).all(...params)) {
-    statusCounts[row.status] = row.n
-    total += row.n
+  if (needle) {
+    // The q filter runs through the dt_corpus_search_text UDF on every row, so
+    // the filtered counts need their own GROUP BY over the filtered rows.
+    for (const row of db.prepare(`SELECT ${STATUS_SQL} AS status, COUNT(*) AS n ${from} GROUP BY 1`).all(...params)) {
+      statusCounts[row.status] = row.n
+      total += row.n
+    }
+  } else {
+    statusCounts = bucketCounts(readWorkStateCounts(db, scoped ? corpusId : null)).status_counts
+    for (const n of Object.values(statusCounts)) total += n
   }
 
   const rawSort = pyStrip(strOrEmpty(sort)).toLowerCase()
