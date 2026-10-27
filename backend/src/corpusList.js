@@ -391,7 +391,7 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
     const rest = needle ? ` AND ${where[where.length - 1]}` : ''
     let sql
     let args = params
-    if (!key && !db.prepare("SELECT 1 FROM works WHERE typeof(year) = 'text' LIMIT 1").get()) {
+    if (!key && !db.prepare("SELECT 1 FROM works WHERE typeof(year) NOT IN ('integer', 'null') LIMIT 1").get()) {
       // Unknown/absent sort: newest year first, then newest id. With only
       // integer/NULL years, normalize_year is the value itself (NULL -> 0,
       // and NULL sorts last in DESC just as 0 does), so idx_works_year_id
@@ -413,7 +413,7 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
       sql = `SELECT ${columns} FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE ${where.join(' AND ')}
         ORDER BY cw.added_at ${dir}, cw.work_id DESC`
     } else {
-      // Text years take dt_corpus_int via YEAR_SQL. Explicit sorts tie-break
+      // Text/REAL/BLOB years take dt_corpus_int via YEAR_SQL. Explicit sorts tie-break
       // on id descending, as the script's two-pass stable sort does.
       sql = `SELECT ${columns} ${from} ORDER BY ${key ? `${key} ${dir}` : `${YEAR_SQL} DESC`}, w.id DESC`
     }

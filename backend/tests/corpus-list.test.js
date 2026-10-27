@@ -337,6 +337,27 @@ describe('index-served default and added sorts', () => {
     }
   })
 
+  goldenTest('a REAL year takes the CASE path and matches the Python script', () => {
+    // int(2005.5) is 2005, so work 7 ties with work 8 and the id tie-break puts
+    // 8 first; a raw `ORDER BY w.year` would put 7 first.
+    const realPath = path.join(tempDir, 'real-year.db')
+    const real = new Database(realPath)
+    try {
+      real.exec(fs.readFileSync(INT_FIXTURE, 'utf8'))
+      real.prepare('UPDATE works SET year = 2005.5 WHERE id = 7').run()
+      expect(real.prepare('SELECT typeof(year) AS t FROM works WHERE id = 7').get().t).toBe('real')
+      const page = capturePageQuery(real)
+      for (const args of PAGES) {
+        expect(listCorpus(real, parseArgs(args, { corpusId: 1 }))).toEqual(viaScriptOn(realPath, ['--corpus-id', '1', ...args]))
+        expect(page.sql).toContain('dt_corpus_int')
+      }
+      const ids = listCorpus(real, { corpusId: 1 }).items.map((i) => i.id)
+      expect(ids.indexOf(8)).toBeLessThan(ids.indexOf(7))
+    } finally {
+      real.close()
+    }
+  })
+
   goldenTest('added sort uses idx_corpus_works_added and keeps NULL ordering', () => {
     for (const [target, file] of [[intDb, intPath], [db, dbPath]]) {
       const page = capturePageQuery(target)
