@@ -620,9 +620,10 @@ export function ensureSeedSchema(db) {
       PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
     );
     CREATE INDEX IF NOT EXISTS idx_search_run_corpora_corpus ON search_run_corpora(corpus_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_seed_sources_hidden_lookup ON seed_sources_hidden(corpus_id, source_type, source_key);
-    CREATE INDEX IF NOT EXISTS idx_seed_candidates_dismissed_lookup ON seed_candidates_dismissed(corpus_id, source_type, source_key);
-    CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_lookup ON seed_candidates_in_corpus(corpus_id, source_type, source_key);
+    -- The *_lookup indexes duplicated the tables' PRIMARY KEY (or a prefix of it).
+    DROP INDEX IF EXISTS idx_seed_sources_hidden_lookup;
+    DROP INDEX IF EXISTS idx_seed_candidates_dismissed_lookup;
+    DROP INDEX IF EXISTS idx_seed_candidates_in_corpus_lookup;
   `)
 }
 

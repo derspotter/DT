@@ -13,7 +13,7 @@ def test_enrich_claim_select_uses_the_download_status_index(tmp_path):
         (0,),
     )
     plan = " ".join(str(r[-1]) for r in cur.fetchall())
-    assert "idx_works_download_status" in plan or "idx_works_metadata_status" in plan
+    assert any(name in plan for name in ("idx_works_download_status", "idx_works_metadata_status", "idx_works_state"))
 
 
 def test_claim_sql_has_no_coalesce_on_status_columns():

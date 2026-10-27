@@ -644,7 +644,7 @@ function assertNoLegacyLibraryData(db) {
   );
 }
 
-function ensureAuthSchema(db) {
+export function ensureAuthSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -877,7 +877,19 @@ function ensureAuthSchema(db) {
   ensureColumn(db, 'users', 'invited_by_user_id', 'INTEGER');
   ensureColumn(db, 'users', 'invited_at', 'TIMESTAMP');
   ensureColumn(db, 'users', 'password_set_at', 'TIMESTAMP');
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_lookup ON corpus_works(corpus_id, work_id);`);
+  // corpus_works' PRIMARY KEY (corpus_id, work_id) covers lookups by corpus_id and (corpus_id, work_id).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id);`);
+  for (const name of [
+    'idx_corpus_works_lookup',
+    'idx_corpus_works_corpus',
+    'idx_work_aliases_norm_title',
+    'idx_work_aliases_owner',
+    'idx_search_results_run',
+  ]) {
+    db.exec(`DROP INDEX IF EXISTS ${name};`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_kantropos_assignments_target ON corpus_kantropos_assignments(target_id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_runs_created ON scraper_runs(created_at DESC, id DESC);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_artifacts_run ON scraper_artifacts(run_id, id);`);

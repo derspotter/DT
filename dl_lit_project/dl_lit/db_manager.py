@@ -14,6 +14,40 @@ BLUE = "\033[94m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
 
+WORKS_INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''",
+    "CREATE INDEX IF NOT EXISTS idx_works_title_year ON works(normalized_title, year)",
+    "CREATE INDEX IF NOT EXISTS idx_works_authors ON works(normalized_authors)",
+    "CREATE INDEX IF NOT EXISTS idx_works_metadata_status ON works(metadata_status, metadata_lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_works_download_status ON works(download_status, download_lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_works_origin ON works(origin_type, origin_key)",
+    "CREATE INDEX IF NOT EXISTS idx_corpus_works_work ON corpus_works(work_id)",
+    "CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title)",
+    "CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id)",
+    "CREATE INDEX IF NOT EXISTS idx_duplicate_references_existing ON duplicate_references(existing_entry_table, existing_entry_id)",
+    "CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)",
+    "CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)",
+    "CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)",
+    "CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id)",
+    "CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id)",
+]
+
+# Redundant: covered by a primary key or by the prefix of another index (or legacy, created by nothing).
+DROPPED_INDEXES = [
+    "idx_corpus_works_lookup",
+    "idx_corpus_works_corpus",
+    "idx_work_aliases_norm_title",
+    "idx_work_aliases_owner",
+    "idx_search_results_run",
+    "idx_seed_sources_hidden_lookup",
+    "idx_seed_candidates_dismissed_lookup",
+    "idx_seed_candidates_in_corpus_lookup",
+]
+
+
 class DatabaseManager:
     """Manages all SQLite database interactions for the literature management tool."""
 
@@ -357,23 +391,10 @@ class DatabaseManager:
                 notes TEXT
             )
         """)
-        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''")
-        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_title_year ON works(normalized_title, year)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_authors ON works(normalized_authors)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_metadata_status ON works(metadata_status, metadata_lease_expires_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_download_status ON works(download_status, download_lease_expires_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_origin ON works(origin_type, origin_key)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_works_corpus ON corpus_works(corpus_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_works_work ON corpus_works(work_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_duplicate_references_existing ON duplicate_references(existing_entry_table, existing_entry_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)")
+        for ddl in WORKS_INDEXES:
+            cursor.execute(ddl)
+        for name in DROPPED_INDEXES:
+            cursor.execute(f"DROP INDEX IF EXISTS {name}")
 
         try:
             has_search_results = cursor.execute(
