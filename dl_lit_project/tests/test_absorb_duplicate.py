@@ -174,3 +174,56 @@ def test_absorb_keeps_same_title_aliases_that_differ_in_year(tmp_path):
     ).fetchall()
     assert aliases == [(canonical, "canone", None), (canonical, "kanon", 2010), (canonical, "kanon", 2020)]
     assert db.check_if_exists(None, None, title="Kanon", year=2020) == ("works", canonical, "alias_title")
+
+
+def _seed_marker_table(db):
+    db.conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS seed_candidates_in_corpus (
+          corpus_id INTEGER NOT NULL,
+          source_type TEXT NOT NULL,
+          source_key TEXT NOT NULL,
+          candidate_key TEXT NOT NULL,
+          work_id INTEGER,
+          marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
+        );
+        """
+    )
+
+
+def test_merge_retargets_seed_markers_and_search_results_so_unlink_can_clear_them(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    _seed_marker_table(db)
+    canonical = _work(db, "Canon", [2], doi="10.1/c")
+    dup = _work(db, "Canon draft", [1], metadata_status="in_progress")
+    db.conn.execute(
+        "INSERT INTO seed_candidates_in_corpus (corpus_id, source_type, source_key, candidate_key, work_id) "
+        "VALUES (1, 'pdf', 'src', 'cand', ?)",
+        (dup,),
+    )
+    db.conn.execute("INSERT INTO search_runs (id, query, status) VALUES (7, 'q', 'done')")
+    db.conn.execute("INSERT INTO search_results (search_run_id, title, work_id) VALUES (7, 'Canon draft', ?)", (dup,))
+    db.conn.commit()
+
+    wid, err = db.apply_enriched_metadata(dup, {"doi": "10.1/c", "title": "Canon", "year": 2020})
+
+    assert wid is None and "DUPLICATE_MERGED" in err
+    _assert_absorbed(db, canonical, dup)
+    assert db.conn.execute("SELECT work_id FROM seed_candidates_in_corpus").fetchall() == [(canonical,)]
+    assert db.conn.execute("SELECT work_id FROM search_results").fetchall() == [(canonical,)]
+    # The unlink route (app.js) clears the marker by (corpus_id, work_id) of the canonical work.
+    db.conn.execute("DELETE FROM seed_candidates_in_corpus WHERE corpus_id = 1 AND work_id = ?", (canonical,))
+    assert db.conn.execute("SELECT COUNT(*) FROM seed_candidates_in_corpus").fetchone()[0] == 0
+
+
+def test_merge_without_the_optional_seed_marker_table_still_works(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    assert not db._table_exists("seed_candidates_in_corpus")
+    canonical = _work(db, "Canon", [2], doi="10.1/c")
+    dup = _work(db, "Canon draft", [1], metadata_status="in_progress")
+
+    wid, err = db.apply_enriched_metadata(dup, {"doi": "10.1/c", "title": "Canon", "year": 2020})
+
+    assert wid is None and "DUPLICATE_MERGED" in err
+    _assert_absorbed(db, canonical, dup)

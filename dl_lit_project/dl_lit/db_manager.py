@@ -1140,6 +1140,12 @@ class DatabaseManager:
             "openalex_id": self._normalize_openalex_id(resolved.get("openalex_id")),
         }
 
+    def _table_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", (name,)
+        ).fetchone()
+        return row is not None
+
     def _absorb_duplicate(
         self,
         canonical_id: int,
@@ -1179,6 +1185,17 @@ class DatabaseManager:
             (canonical_id, duplicate_id),
         )
         cur.execute("DELETE FROM corpus_works WHERE work_id = ?", (duplicate_id,))
+        # Rows that reference the duplicate by work_id follow it to the canonical. The
+        # seed marker matters most: the unlink route clears markers by (corpus_id, work_id),
+        # so a marker left on the deleted id could never be cleared and the candidate would
+        # stay "in corpus" forever. seed_candidates_in_corpus is created by the web layer,
+        # so it may be absent. (citation_edges keep their row ids; not repointed here.)
+        if self._table_exists("seed_candidates_in_corpus"):
+            cur.execute(
+                "UPDATE seed_candidates_in_corpus SET work_id = ? WHERE work_id = ?",
+                (canonical_id, duplicate_id),
+            )
+        cur.execute("UPDATE search_results SET work_id = ? WHERE work_id = ?", (canonical_id, duplicate_id))
         cur.execute("DELETE FROM works WHERE id = ?", (duplicate_id,))
         cur.execute(
             """INSERT INTO merge_log
