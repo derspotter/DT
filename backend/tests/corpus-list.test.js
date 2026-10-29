@@ -379,9 +379,11 @@ describe('index-served default and added sorts', () => {
     }
   })
 
-  goldenTest('a REAL year takes the CASE path and matches the Python script', () => {
+  goldenTest('a REAL year takes the CASE path even for a large corpus, and matches the Python script', () => {
     // int(2005.5) is 2005, so work 7 ties with work 8 and the id tie-break puts
-    // 8 first; a raw `ORDER BY w.year` would put 7 first.
+    // 8 first; a raw `ORDER BY w.year` would put 7 first. smallCorpusLimit: 0
+    // skips the small-corpus JOIN branch so the year probe itself is what
+    // keeps the raw order off.
     const realPath = path.join(tempDir, 'real-year.db')
     const real = new Database(realPath)
     try {
@@ -390,10 +392,11 @@ describe('index-served default and added sorts', () => {
       expect(real.prepare('SELECT typeof(year) AS t FROM works WHERE id = 7').get().t).toBe('real')
       const page = capturePageQuery(real)
       for (const args of PAGES) {
-        expect(listCorpus(real, parseArgs(args, { corpusId: 1 }))).toEqual(viaScriptOn(realPath, ['--corpus-id', '1', ...args]))
+        expect(listCorpus(real, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(viaScriptOn(realPath, ['--corpus-id', '1', ...args]))
         expect(page.sql).toContain('dt_corpus_int')
       }
-      const ids = listCorpus(real, { corpusId: 1 }).items.map((i) => i.id)
+      expect(listCorpus(real, { corpusId: null })).toEqual(viaScriptOn(realPath, []))
+      const ids = listCorpus(real, { corpusId: 1, smallCorpusLimit: 0 }).items.map((i) => i.id)
       expect(ids.indexOf(8)).toBeLessThan(ids.indexOf(7))
     } finally {
       real.close()
