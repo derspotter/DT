@@ -901,6 +901,9 @@ export function ensureAuthSchema(db) {
   }
   if (tableExists(db, 'search_results')) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id);`);
+    // Duplicate merges repoint search_results.work_id; without this index each merge scans the table.
+    ensureColumn(db, 'search_results', 'work_id', 'INTEGER');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_results_work ON search_results(work_id);`);
   }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_kantropos_assignments_target ON corpus_kantropos_assignments(target_id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_runs_created ON scraper_runs(created_at DESC, id DESC);`);

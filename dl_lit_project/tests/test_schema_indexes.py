@@ -6,7 +6,7 @@ from dl_lit.db_manager import DatabaseManager
 
 SEED_PROMOTE = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "seed_promote.py"
 
-NEW = {"idx_works_state", "idx_works_year_id", "idx_corpus_works_added"}
+NEW = {"idx_works_state", "idx_works_year_id", "idx_corpus_works_added", "idx_search_results_work"}
 DROPPED = {
     "idx_corpus_works_lookup",
     "idx_corpus_works_corpus",
@@ -48,3 +48,20 @@ def test_seed_promote_bootstrap_does_not_recreate_dropped_lookup_index(monkeypat
     finally:
         db.conn.close()
     assert "idx_seed_candidates_in_corpus_lookup" not in names
+    assert "idx_seed_candidates_in_corpus_work" in names
+
+
+def test_old_search_results_table_gets_work_id_before_its_index(tmp_path):
+    path = str(tmp_path / "lit.db")
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE search_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT NOT NULL)")
+    c.execute("CREATE TABLE search_results (id INTEGER PRIMARY KEY AUTOINCREMENT, search_run_id INTEGER NOT NULL, openalex_id TEXT)")
+    c.commit()
+    c.close()
+    DatabaseManager(path).conn.close()
+    conn = sqlite3.connect(path)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(search_results)")]
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    conn.close()
+    assert "work_id" in cols
+    assert "idx_search_results_work" in names

@@ -619,6 +619,8 @@ export function ensureSeedSchema(db) {
       marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
     );
+    -- Duplicate merges repoint seed_candidates_in_corpus.work_id (db_manager._absorb_duplicate).
+    CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_work ON seed_candidates_in_corpus(work_id);
     CREATE INDEX IF NOT EXISTS idx_search_run_corpora_corpus ON search_run_corpora(corpus_id, created_at DESC);
     -- The *_lookup indexes duplicated the tables' PRIMARY KEY (or a prefix of it).
     DROP INDEX IF EXISTS idx_seed_sources_hidden_lookup;

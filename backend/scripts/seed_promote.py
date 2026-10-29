@@ -11,9 +11,10 @@ from dl_lit.db_manager import DatabaseManager  # noqa: E402
 
 
 def _ensure_seed_membership_schema(db: DatabaseManager) -> None:
-    # No secondary index: lookups by (corpus_id, source_type, source_key) are served by the
-    # PRIMARY KEY prefix. The legacy idx_seed_candidates_in_corpus_lookup is in
-    # db_manager.DROPPED_INDEXES, so recreating it here would rebuild it on every promotion.
+    # Same DDL as seed.js ensureSeedSchema. Lookups by (corpus_id, source_type, source_key)
+    # are served by the PRIMARY KEY prefix; the legacy idx_seed_candidates_in_corpus_lookup is
+    # in db_manager.DROPPED_INDEXES, so recreating it here would rebuild it on every promotion.
+    # The work_id index serves the repoint in db_manager._absorb_duplicate.
     cur = db.conn.cursor()
     cur.executescript(
         """
@@ -26,6 +27,7 @@ def _ensure_seed_membership_schema(db: DatabaseManager) -> None:
           marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
         );
+        CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_work ON seed_candidates_in_corpus(work_id);
         """
     )
     db.conn.commit()

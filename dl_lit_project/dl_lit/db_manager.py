@@ -30,6 +30,7 @@ WORKS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)",
     "CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)",
     "CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)",
+    "CREATE INDEX IF NOT EXISTS idx_search_results_work ON search_results(work_id)",
     "CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id)",
     "CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id)",
@@ -391,19 +392,13 @@ class DatabaseManager:
                 notes TEXT
             )
         """)
+        # An old search_results table may predate work_id, which idx_search_results_work covers.
+        if "work_id" not in [row[1] for row in cursor.execute("PRAGMA table_info(search_results)").fetchall()]:
+            cursor.execute("ALTER TABLE search_results ADD COLUMN work_id INTEGER")
         for ddl in WORKS_INDEXES:
             cursor.execute(ddl)
         for name in DROPPED_INDEXES:
             cursor.execute(f"DROP INDEX IF EXISTS {name}")
-
-        try:
-            has_search_results = cursor.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_results' LIMIT 1"
-            ).fetchone()
-            if has_search_results and "work_id" not in [row[1] for row in cursor.execute("PRAGMA table_info(search_results)").fetchall()]:
-                cursor.execute("ALTER TABLE search_results ADD COLUMN work_id INTEGER")
-        except sqlite3.Error:
-            pass
 
         meta_row = cursor.execute("SELECT value FROM app_meta WHERE key = 'works_schema_version'").fetchone()
         if not meta_row:
