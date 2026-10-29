@@ -11,6 +11,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_list import normalize_year  # noqa: E402  (the oracle's int(): text years -> 0)
+
 DEFAULT_DB = Path(__file__).resolve().parents[2] / "dl_lit_project/data/literature.db"
 
 WS = ("char(9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, "
@@ -42,7 +45,7 @@ def connect(db_path):
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=5)
             conn.execute("PRAGMA query_only = ON")
-            conn.create_function("dt_corpus_int", 1, lambda v: int(float(v)) if v not in (None, "") else 0)
+            conn.create_function("dt_corpus_int", 1, normalize_year)
             conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
             return conn
         except sqlite3.OperationalError as exc:
