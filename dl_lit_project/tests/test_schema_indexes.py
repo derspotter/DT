@@ -1,6 +1,10 @@
+import importlib.util
 import sqlite3
+from pathlib import Path
 
 from dl_lit.db_manager import DatabaseManager
+
+SEED_PROMOTE = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "seed_promote.py"
 
 NEW = {"idx_works_state", "idx_works_year_id", "idx_corpus_works_added"}
 DROPPED = {
@@ -30,3 +34,17 @@ def test_schema_ensure_creates_new_and_drops_duplicate_indexes_idempotently(tmp_
     conn.close()
     assert NEW <= names
     assert not (DROPPED & names)
+
+
+def test_seed_promote_bootstrap_does_not_recreate_dropped_lookup_index(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(SEED_PROMOTE.parent))
+    spec = importlib.util.spec_from_file_location("seed_promote_script", SEED_PROMOTE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    try:
+        mod._ensure_seed_membership_schema(db)
+        names = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    finally:
+        db.conn.close()
+    assert "idx_seed_candidates_in_corpus_lookup" not in names

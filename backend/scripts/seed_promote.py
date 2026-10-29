@@ -11,6 +11,9 @@ from dl_lit.db_manager import DatabaseManager  # noqa: E402
 
 
 def _ensure_seed_membership_schema(db: DatabaseManager) -> None:
+    # No secondary index: lookups by (corpus_id, source_type, source_key) are served by the
+    # PRIMARY KEY prefix. The legacy idx_seed_candidates_in_corpus_lookup is in
+    # db_manager.DROPPED_INDEXES, so recreating it here would rebuild it on every promotion.
     cur = db.conn.cursor()
     cur.executescript(
         """
@@ -23,8 +26,6 @@ def _ensure_seed_membership_schema(db: DatabaseManager) -> None:
           marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
         );
-        CREATE INDEX IF NOT EXISTS idx_seed_candidates_in_corpus_lookup
-          ON seed_candidates_in_corpus(corpus_id, source_type, source_key);
         """
     )
     db.conn.commit()
