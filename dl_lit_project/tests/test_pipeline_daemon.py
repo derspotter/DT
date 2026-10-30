@@ -124,3 +124,14 @@ def test_recover_stale_running_jobs_only_requeues_expired_work():
         (2, "running", "worker-live"),
         (3, "pending", None),
     ]
+
+
+def test_do_mark_returns_the_constant_shape_without_querying(monkeypatch):
+    conn = make_conn()
+    daemon = make_daemon(conn)
+
+    def forbidden():
+        raise AssertionError("do_mark must not query")
+
+    monkeypatch.setattr(daemon.db, "conn", SimpleNamespace(cursor=forbidden))
+    assert daemon.do_mark(None, 10) == {"requested": 10, "marked": 0, "available": None, "ids": []}

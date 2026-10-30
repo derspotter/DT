@@ -6,7 +6,7 @@
 // the script prints. Filtering, counting, sorting and paging happen in SQL;
 // labels are computed in JS for the returned page only, except for the `seed`
 // sort, whose key is the label itself.
-import { tableExists } from './pipelineReads.js'
+import { tableExists, readWorkStateCounts, bucketCounts, corpusIsSmall, memoised, noteCommittedState, SMALL_CORPUS_LIMIT } from './pipelineReads.js'
 
 export const CORPUS_SORT_KEYS = ['title', 'authors', 'year', 'added', 'source', 'seed', 'metadata', 'download']
 
@@ -159,6 +159,17 @@ const STATUS_SQL = `CASE
 // normalize_year without a JS call for the common integer/NULL cases.
 const YEAR_SQL = "CASE WHEN typeof(w.year) = 'integer' THEN w.year WHEN w.year IS NULL THEN 0 ELSE dt_corpus_int(w.year) END"
 
+// True when a raw `ORDER BY w.year DESC` orders like normalize_year: every year
+// is an integer or NULL, and none is <= 0 (normalize_year maps NULL to 0, so a
+// 0 or negative year must tie with / sort below NULL, which the raw order does
+// not do). The <= 0 test is a range seek on idx_works_year_id; the type test
+// scans works once per data change (memoised: a whole-table property).
+function rawYearOrderMatches(db) {
+  return memoised(db, 'raw-year-order', () => !db.prepare(`SELECT
+      EXISTS (SELECT 1 FROM works WHERE year <= 0)
+      OR EXISTS (SELECT 1 FROM works WHERE typeof(year) NOT IN ('integer', 'null')) AS bad`).get().bad)
+}
+
 function sortExpression(column, addedSql) {
   switch (column) {
     case 'title': return 'dt_corpus_lower(w.title)'
@@ -297,8 +308,14 @@ const readTransactions = new WeakMap()
 // One read transaction per listing: in WAL mode every statement inside sees the
 // same snapshot, so counts, ids and page rows cannot disagree when a worker or
 // a membership removal commits in between.
+//
+// options.smallCorpusLimit (default SMALL_CORPUS_LIMIT) is the member count up
+// to which a corpus is read through corpus_works instead of the works-wide
+// index paths; tests lower it to exercise the large-corpus branch on fixtures.
 export function listCorpus(db, options = {}) {
   registerFunctions(db)
+  // Lets the memoised reads inside the read transaction be stored.
+  noteCommittedState(db)
   let read = readTransactions.get(db)
   if (!read) {
     read = db.transaction(readCorpus)
@@ -307,7 +324,7 @@ export function listCorpus(db, options = {}) {
   return read(db, options)
 }
 
-function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort = '' } = {}) {
+function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort = '', smallCorpusLimit = SMALL_CORPUS_LIMIT } = {}) {
   const scoped = corpusId !== null && corpusId !== undefined
   const emptyCounts = {}
   if (!tableExists(db, 'works')) {
@@ -331,11 +348,18 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
   }
   const from = `FROM works w ${scoped ? 'JOIN corpus_works cw ON cw.work_id = w.id' : ''} ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`
 
-  const statusCounts = {}
+  let statusCounts = {}
   let total = 0
-  for (const row of db.prepare(`SELECT ${STATUS_SQL} AS status, COUNT(*) AS n ${from} GROUP BY 1`).all(...params)) {
-    statusCounts[row.status] = row.n
-    total += row.n
+  if (needle) {
+    // The q filter runs through the dt_corpus_search_text UDF on every row, so
+    // the filtered counts need their own GROUP BY over the filtered rows.
+    for (const row of db.prepare(`SELECT ${STATUS_SQL} AS status, COUNT(*) AS n ${from} GROUP BY 1`).all(...params)) {
+      statusCounts[row.status] = row.n
+      total += row.n
+    }
+  } else {
+    statusCounts = bucketCounts(readWorkStateCounts(db, scoped ? corpusId : null, { smallCorpusLimit })).status_counts
+    for (const n of Object.values(statusCounts)) total += n
   }
 
   const rawSort = pyStrip(strOrEmpty(sort)).toLowerCase()
@@ -380,10 +404,43 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
     }
   } else {
     const key = sortExpression(column, addedSql)
-    // Unknown/absent sort: newest year first, then newest id. Explicit sorts
-    // tie-break on id descending, as the script's two-pass stable sort does.
-    const orderBy = key ? `${key} ${reverse ? 'DESC' : 'ASC'}, w.id DESC` : `${YEAR_SQL} DESC, w.id DESC`
-    rows = db.prepare(`SELECT ${columns} ${from} ORDER BY ${orderBy} LIMIT ? OFFSET ?`).all(...params, pageLimit, pageOffset)
+    const dir = reverse ? 'DESC' : 'ASC'
+    const rest = needle ? ` AND ${where[where.length - 1]}` : ''
+    let sql
+    let args = params
+    if (!key && !(scoped && corpusIsSmall(db, corpusId, smallCorpusLimit)) && rawYearOrderMatches(db)) {
+      // Unknown/absent sort on a large corpus or all works: newest year
+      // first, then newest id. With only positive integer/NULL years,
+      // normalize_year orders as the value itself (NULL -> 0 sorts last in
+      // DESC, as NULL does), so idx_works_year_id yields rows in order and the
+      // scan stops after LIMIT; membership is an EXISTS probe and added_at a
+      // lookup for the returned rows only. Small corpora take the JOIN +
+      // YEAR_SQL sort below: sorting a few thousand members is cheaper than
+      // walking the works index past every non-member.
+      if (scoped) {
+        const member = 'FROM corpus_works cw WHERE cw.corpus_id = ? AND cw.work_id = w.id'
+        sql = `SELECT ${columns.replace(`${addedSql} AS added_at`, `(SELECT cw.added_at ${member}) AS added_at`)}
+          FROM works w WHERE EXISTS (SELECT 1 ${member})${rest}`
+        args = [corpusId, ...params]
+      } else {
+        sql = `SELECT ${columns} ${from}`
+      }
+      sql += ' ORDER BY w.year DESC, w.id DESC'
+    } else if (column === 'added' && scoped &&
+        !db.prepare("SELECT 1 FROM corpus_works WHERE corpus_id = ? AND added_at = '' LIMIT 1").get(corpusId)) {
+      // Raw added_at orders like str(added_at or "") for timestamp text: NULL
+      // sorts lowest as '' does, but raw order splits NULL from '', which the
+      // script ties, so a member with added_at = '' (an index-served probe)
+      // sends the sort to the CASE below. Driving from corpus_works lets
+      // idx_corpus_works_added serve the order; cw.work_id equals w.id.
+      sql = `SELECT ${columns} FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE ${where.join(' AND ')}
+        ORDER BY cw.added_at ${dir}, cw.work_id DESC`
+    } else {
+      // Text/REAL/BLOB years take dt_corpus_int via YEAR_SQL. Explicit sorts tie-break
+      // on id descending, as the script's two-pass stable sort does.
+      sql = `SELECT ${columns} ${from} ORDER BY ${key ? `${key} ${dir}` : `${YEAR_SQL} DESC`}, w.id DESC`
+    }
+    rows = db.prepare(`${sql} LIMIT ? OFFSET ?`).all(...args, pageLimit, pageOffset)
   }
 
   const items = rows.map((row) => {

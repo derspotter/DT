@@ -1,8 +1,13 @@
+import { jest } from '@jest/globals'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import Database from 'better-sqlite3'
-import { readIngestStats, listDownloads, listIngestRuns, tableExists } from '../src/pipelineReads.js'
+import { readIngestStats, readWorkStateCounts, workStatus, bucketCounts, resetWorkStateMemo, listDownloads, listIngestRuns, tableExists, corpusIsSmall, SMALL_CORPUS_LIMIT } from '../src/pipelineReads.js'
 
 let db
 beforeEach(() => {
+  resetWorkStateMemo()
   db = new Database(':memory:')
   db.exec(`
     CREATE TABLE works (id INTEGER PRIMARY KEY, title TEXT, metadata_status TEXT, download_status TEXT, download_attempt_count INTEGER, downloaded_at TEXT,
@@ -44,6 +49,204 @@ test('ingest stats for an empty corpus and for global scope return zeros / all w
   expect(readIngestStats(db, 999)).toEqual({ raw_pending: 0, matched: 0, queued_download: 0, enriching: 0, downloading: 0, downloaded: 0, enriching_live: 0, downloading_live: 0 })
   expect(readIngestStats(db, null).downloaded).toBe(2)
   expect(readIngestStats(db, 1).downloaded).toBe(1)
+})
+
+test('readWorkStateCounts groups by raw status pair with live-lease sums', () => {
+  seedStats()
+  const now = Math.floor(Date.now() / 1000)
+  addWork(8, 1, 'in_progress', null, { metaLease: now + 600 })
+  addWork(9, 1, 'matched', 'in_progress', { dlLease: now + 600 })
+  addWork(10, 2, 'matched', 'downloaded')
+  const byPair = (rows) => Object.fromEntries(rows.map((r) => [`${r.metadata_status}|${r.download_status}`, [r.n, r.live_meta, r.live_dl]]))
+  expect(byPair(readWorkStateCounts(db, 1, { nowSec: now }))).toEqual({
+    'pending|null': [1, 0, 0],
+    'in_progress|null': [2, 1, 0],
+    'matched|not_requested': [1, 0, 0],
+    'matched|queued': [1, 0, 0],
+    'matched|in_progress': [2, 0, 1],
+    'matched|downloaded': [1, 0, 0],
+    'failed|null': [1, 0, 0],
+  })
+  // Global scope has no corpus filter; a corpus without members has no rows.
+  expect(byPair(readWorkStateCounts(db, null, { nowSec: now }))['matched|downloaded']).toEqual([2, 0, 0])
+  expect(readWorkStateCounts(db, 999, { nowSec: now })).toEqual([])
+})
+
+test('bucketCounts derives every consumer\'s numbers from the grouped rows', () => {
+  seedStats()
+  addWork(8, 1, 'matched', 'failed')
+  expect(bucketCounts(readWorkStateCounts(db, 1))).toEqual({
+    status_counts: { raw: 1, enriching: 1, matched: 1, queued_download: 2, downloaded: 1, failed_enrichment: 1, failed_download: 1 },
+    raw_pending_total: 2, pending_only: 1, in_progress: 1, matched_not_requested: 1, queued: 1, downloading: 1,
+    downloaded: 1, failed_meta: 1, failed_dl: 1, enriching_live: 0, downloading_live: 0,
+  })
+})
+
+test('readIngestStats equals the old numbers, derived from the grouped read', () => {
+  seedStats()
+  expect(readIngestStats(db, 1)).toEqual({ raw_pending: 2, matched: 1, queued_download: 2, enriching: 1, downloading: 1, downloaded: 1, enriching_live: 0, downloading_live: 0 })
+})
+
+test('workStatus buckets like STATUS_SQL, including padded/odd-case values', () => {
+  expect(workStatus(' Matched ', 'not_requested')).toBe('matched')
+  expect(workStatus('x', ' downloaded ')).toBe('downloaded')
+  expect(workStatus('matched', '\u3000QUEUED\t')).toBe('queued_download')
+  expect(workStatus('matched', 'In_Progress')).toBe('queued_download')
+  expect(workStatus('matched', ' failed')).toBe('failed_download')
+  expect(workStatus('\xa0in_progress\n', null)).toBe('enriching')
+  expect(workStatus('FAILED', '')).toBe('failed_enrichment')
+  expect(workStatus(null, null)).toBe('raw')
+  expect(workStatus('pending', 'not_requested')).toBe('raw')
+  // U+FEFF is not in Python's whitespace set, so STATUS_SQL keeps it.
+  expect(workStatus('\ufeffmatched', 'not_requested')).toBe('raw')
+})
+
+test('the memo is per corpus, hits while nothing changed and misses right after a same-connection write', () => {
+  seedStats()
+  const grouped = []
+  const original = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    if (sql.includes('GROUP BY 1, 2')) grouped.push(sql)
+    return original(sql)
+  }
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  expect(grouped).toHaveLength(1)
+  addWork(8, 2, 'pending', null)
+  expect(readIngestStats(db, 2).raw_pending).toBe(1)
+  // A write on this same connection leaves data_version alone but bumps total_changes().
+  addWork(9, 1, 'pending', null)
+  expect(readIngestStats(db, 1).raw_pending).toBe(3)
+  db.prepare("DELETE FROM corpus_works WHERE work_id = 9").run()
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  db.prepare = original
+})
+
+test('the memo expires after 1 s even without writes (lease expiry changes the live counts)', () => {
+  const realNow = Date.now()
+  addWork(1, 1, 'in_progress', null, { metaLease: Math.floor(realNow / 1000) + 2 })
+  const clock = jest.spyOn(Date, 'now').mockReturnValue(realNow)
+  try {
+    expect(readIngestStats(db, 1).enriching_live).toBe(1)
+    clock.mockReturnValue(realNow + 999)
+    expect(readIngestStats(db, 1).enriching_live).toBe(1)
+    clock.mockReturnValue(realNow + 5000)
+    expect(readIngestStats(db, 1).enriching_live).toBe(0)
+  } finally {
+    clock.mockRestore()
+  }
+})
+
+test('the memo misses as soon as another connection commits', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-state-memo-'))
+  const file = path.join(dir, 'w.db')
+  const a = new Database(file)
+  const b = new Database(file)
+  try {
+    a.exec('CREATE TABLE works (id INTEGER PRIMARY KEY, metadata_status TEXT, download_status TEXT); CREATE TABLE corpus_works (corpus_id INTEGER, work_id INTEGER);')
+    a.prepare("INSERT INTO works VALUES (1, 'pending', 'not_requested')").run()
+    expect(readIngestStats(a, null).raw_pending).toBe(1)
+    b.prepare("INSERT INTO works VALUES (2, 'pending', 'not_requested')").run()
+    expect(readIngestStats(a, null).raw_pending).toBe(2)
+  } finally {
+    a.close()
+    b.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Records every grouped state-count statement prepared on `target`.
+function recordGrouped(target) {
+  const grouped = []
+  const original = target.prepare.bind(target)
+  target.prepare = (sql) => {
+    if (sql.includes('GROUP BY 1, 2')) grouped.push(sql)
+    return original(sql)
+  }
+  return { grouped, restore: () => { target.prepare = original } }
+}
+
+test('small corpora count through a corpus_works JOIN, large ones through EXISTS, with identical rows', () => {
+  seedStats()
+  const now = Math.floor(Date.now() / 1000)
+  addWork(8, 1, 'in_progress', null, { metaLease: now + 600 })
+  addWork(9, 2, 'matched', 'downloaded')
+  const { grouped, restore } = recordGrouped(db)
+  try {
+    const sorted = (rows) => [...rows].sort((a, b) => `${a.metadata_status}|${a.download_status}`.localeCompare(`${b.metadata_status}|${b.download_status}`))
+    const viaJoin = readWorkStateCounts(db, 1, { nowSec: now })
+    expect(grouped.pop()).toMatch(/FROM corpus_works cw JOIN works w ON w\.id = cw\.work_id WHERE cw\.corpus_id = \?/)
+    // 8 members: above a limit of 7, at or below a limit of 8.
+    const viaExists = readWorkStateCounts(db, 1, { nowSec: now, smallCorpusLimit: 7 })
+    const sql = grouped.pop()
+    expect(sql).toContain('WHERE EXISTS (SELECT 1 FROM corpus_works cw')
+    expect(sql).not.toContain('JOIN')
+    readWorkStateCounts(db, 1, { nowSec: now, smallCorpusLimit: 8 })
+    expect(grouped.pop()).toContain('JOIN works w')
+    expect(sorted(viaJoin)).toEqual(sorted(viaExists))
+    expect(viaJoin.reduce((n, r) => n + r.n, 0)).toBe(8)
+  } finally {
+    restore()
+  }
+})
+
+test('corpusIsSmall classifies by a bounded count and is memoised until a write', () => {
+  expect(SMALL_CORPUS_LIMIT).toBe(5000)
+  seedStats()
+  expect(corpusIsSmall(db, 1)).toBe(true)
+  expect(corpusIsSmall(db, 1, 6)).toBe(false)
+  expect(corpusIsSmall(db, 1, 7)).toBe(true)
+  expect(corpusIsSmall(db, 999, 0)).toBe(true)
+  const seen = []
+  const original = db.prepare.bind(db)
+  db.prepare = (sql) => {
+    if (sql.includes('LIMIT ?)')) seen.push(sql)
+    return original(sql)
+  }
+  try {
+    expect(corpusIsSmall(db, 1, 6)).toBe(false)
+    expect(seen).toHaveLength(0)
+    db.prepare('DELETE FROM corpus_works WHERE work_id = 7').run()
+    expect(corpusIsSmall(db, 1, 6)).toBe(true)
+    expect(seen).toHaveLength(1)
+  } finally {
+    db.prepare = original
+  }
+})
+
+test('a read inside a transaction that is rolled back is not served from the memo afterwards', () => {
+  seedStats()
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+  db.exec('BEGIN')
+  db.prepare("DELETE FROM works WHERE metadata_status = 'pending'").run()
+  expect(readIngestStats(db, 1).raw_pending).toBe(1)
+  db.exec('ROLLBACK')
+  // Neither data_version nor total_changes() moves on ROLLBACK.
+  expect(readIngestStats(db, 1).raw_pending).toBe(2)
+})
+
+test('a read-only transaction may store memo entries after the committed state was noted', () => {
+  seedStats()
+  readIngestStats(db, 1)
+  const { grouped, restore } = recordGrouped(db)
+  try {
+    db.exec('BEGIN')
+    readIngestStats(db, 2)
+    readIngestStats(db, 2)
+    db.exec('COMMIT')
+    readIngestStats(db, 2)
+    expect(grouped).toHaveLength(1)
+  } finally {
+    restore()
+  }
+})
+
+test('an explicit nowSec bypasses the memo', () => {
+  const now = Math.floor(Date.now() / 1000)
+  addWork(1, 1, 'in_progress', null, { metaLease: now + 10 })
+  expect(readIngestStats(db, 1).enriching_live).toBe(1)
+  expect(readWorkStateCounts(db, 1, { nowSec: now + 60 })[0].live_meta).toBe(0)
+  expect(readWorkStateCounts(db, 1, { nowSec: now })[0].live_meta).toBe(1)
 })
 
 function seedDownloads() {

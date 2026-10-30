@@ -13,7 +13,7 @@ import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
-import { listDownloads, listIngestRuns, readIngestStats } from './pipelineReads.js';
+import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
 import { listCorpus } from './corpusList.js';
 import {
   ensureSeedSchema,
@@ -644,7 +644,7 @@ function assertNoLegacyLibraryData(db) {
   );
 }
 
-function ensureAuthSchema(db) {
+export function ensureAuthSchema(db) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -877,7 +877,34 @@ function ensureAuthSchema(db) {
   ensureColumn(db, 'users', 'invited_by_user_id', 'INTEGER');
   ensureColumn(db, 'users', 'invited_at', 'TIMESTAMP');
   ensureColumn(db, 'users', 'password_set_at', 'TIMESTAMP');
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_lookup ON corpus_works(corpus_id, work_id);`);
+  // corpus_works' PRIMARY KEY (corpus_id, work_id) covers lookups by corpus_id and (corpus_id, work_id).
+  // An old works table may predate the lease columns idx_works_state covers.
+  ensureColumn(db, 'works', 'metadata_lease_expires_at', 'INTEGER');
+  ensureColumn(db, 'works', 'download_lease_expires_at', 'INTEGER');
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id);`);
+  for (const name of [
+    'idx_corpus_works_lookup',
+    'idx_corpus_works_corpus',
+    'idx_work_aliases_norm_title',
+    'idx_work_aliases_owner',
+    'idx_search_results_run',
+  ]) {
+    db.exec(`DROP INDEX IF EXISTS ${name};`);
+  }
+  // The indexes the dropped alias/search-result duplicates gave way to (same
+  // DDL as WORKS_INDEXES in db_manager.py); these tables belong to the Python side.
+  if (tableExists(db, 'work_aliases')) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id);`);
+  }
+  if (tableExists(db, 'search_results')) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id);`);
+    // Duplicate merges repoint search_results.work_id; without this index each merge scans the table.
+    ensureColumn(db, 'search_results', 'work_id', 'INTEGER');
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_search_results_work ON search_results(work_id);`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_kantropos_assignments_target ON corpus_kantropos_assignments(target_id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_runs_created ON scraper_runs(created_at DESC, id DESC);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_scraper_artifacts_run ON scraper_artifacts(run_id, id);`);
@@ -1293,18 +1320,6 @@ function listKantroposCorporaOverview(db) {
   });
 }
 
-function statusFromWorkRow(data) {
-  const metadata = String(data?.metadata_status || 'pending').trim().toLowerCase();
-  const download = String(data?.download_status || 'not_requested').trim().toLowerCase();
-  if (download === 'downloaded') return 'downloaded';
-  if (download === 'queued' || download === 'in_progress') return 'queued_download';
-  if (download === 'failed') return 'failed_download';
-  if (metadata === 'in_progress') return 'enriching';
-  if (metadata === 'failed') return 'failed_enrichment';
-  if (metadata === 'matched') return 'matched';
-  return 'raw';
-}
-
 function normalizeGraphOpenAlexId(value) {
   const text = String(value || '').trim();
   if (!text) return null;
@@ -1333,7 +1348,7 @@ function mapWorkRowToBrowserItem(data, extra = {}) {
     year: data?.year ?? null,
     type: data?.type || '',
     source: data?.origin_key || data?.source_pdf || data?.metadata_source || data?.source || '',
-    status: statusFromWorkRow(data),
+    status: workStatus(data?.metadata_status, data?.download_status),
     metadata_status: data?.metadata_status || '',
     download_status: data?.download_status || '',
     doi: data?.doi || null,
@@ -2610,7 +2625,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   fs.mkdirSync(BIB_OUTPUT_DIR, { recursive: true });
 
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  const authDb = new Database(DB_PATH, { timeout: 3_000 });
+  // 15 s: the first index build on a large works table takes seconds and may
+  // coincide with a worker holding the write lock.
+  const authDb = new Database(DB_PATH, { timeout: 15_000 });
   // spawnPythonJson is module-level but needs the settings table; hand it this
   // connection rather than reopening the DB on every spawn.
   appSettingsDb = authDb;
@@ -2622,7 +2639,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     // keep default journal mode if WAL is unavailable
   }
   try {
-    authDb.pragma('busy_timeout = 3000');
+    authDb.pragma('busy_timeout = 15000');
   } catch (error) {
     // timeout option already helps; pragma is best-effort
   }
@@ -2876,34 +2893,19 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0,
     };
     if (!tableExists(authDb, 'works')) return empty;
-    // Single pass with conditional aggregation. The previous version ran 8
-    // separate COUNT(*) queries, each scanning the (corpus's) works — slow on a
-    // 100k-row table and contended when the workers hold the DB lock.
-    const sums = `
-      SUM(CASE WHEN COALESCE(t.metadata_status, 'pending') = 'pending' THEN 1 ELSE 0 END) AS raw_pending,
-      SUM(CASE WHEN COALESCE(t.metadata_status, 'pending') = 'in_progress' THEN 1 ELSE 0 END) AS enriching,
-      SUM(CASE WHEN t.metadata_status = 'matched' AND COALESCE(t.download_status, 'not_requested') = 'not_requested' THEN 1 ELSE 0 END) AS matched,
-      SUM(CASE WHEN COALESCE(t.download_status, 'not_requested') = 'queued' THEN 1 ELSE 0 END) AS queued_download,
-      SUM(CASE WHEN COALESCE(t.download_status, 'not_requested') = 'in_progress' THEN 1 ELSE 0 END) AS downloading,
-      SUM(CASE WHEN t.download_status = 'downloaded' THEN 1 ELSE 0 END) AS downloaded,
-      SUM(CASE WHEN t.metadata_status = 'failed' THEN 1 ELSE 0 END) AS failed_enrichment,
-      SUM(CASE WHEN t.download_status = 'failed' THEN 1 ELSE 0 END) AS failed_download`;
     try {
-      const row = scopedCorpusId === null
-        ? authDb.prepare(`SELECT ${sums} FROM works t`).get()
-        : authDb.prepare(
-            `SELECT ${sums} FROM works t JOIN corpus_works cw ON cw.work_id = t.id WHERE cw.corpus_id = ?`
-          ).get(scopedCorpusId);
+      const c = bucketCounts(readWorkStateCounts(authDb, scopedCorpusId));
       return {
         corpus_id: scopedCorpusId,
-        raw_pending: Number(row?.raw_pending || 0),
-        enriching: Number(row?.enriching || 0),
-        matched: Number(row?.matched || 0),
-        queued_download: Number(row?.queued_download || 0),
-        downloading: Number(row?.downloading || 0),
-        downloaded: Number(row?.downloaded || 0),
-        failed_enrichment: Number(row?.failed_enrichment || 0),
-        failed_download: Number(row?.failed_download || 0),
+        // Backlog summary: raw_pending = pending only (ingest stats count pending + in_progress).
+        raw_pending: c.pending_only,
+        enriching: c.in_progress,
+        matched: c.matched_not_requested,
+        queued_download: c.queued,
+        downloading: c.downloading,
+        downloaded: c.downloaded,
+        failed_enrichment: c.failed_meta,
+        failed_download: c.failed_dl,
       };
     } catch (error) {
       return empty;
@@ -6120,8 +6122,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
            FROM works w
            JOIN corpus_works cw ON cw.work_id = w.id
            WHERE cw.corpus_id = ?
-             AND COALESCE(w.metadata_status, 'pending') IN ('pending', 'in_progress')
-             AND COALESCE(w.download_status, 'not_requested') = 'not_requested'`
+             AND w.metadata_status IN ('pending', 'in_progress')
+             AND w.download_status = 'not_requested'`
         )
         .get(req.corpusId);
       const marked = Number(markedRow?.count || 0);

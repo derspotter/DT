@@ -97,7 +97,6 @@ def log(msg: str):
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
     print(formatted_msg, flush=True)
-    
     # Also append to the same pipeline log file that Node.js uses, so the UI can read it
     log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
     log_file = os.path.join(log_dir, "backend-pipeline.log")
@@ -107,6 +106,17 @@ def log(msg: str):
             f.write(formatted_msg + "\n")
     except Exception as e:
         print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
+
+
+_EXPANSION_NOTICE_LOGGED = False
+
+
+def _note_expansion_disabled(fetch_refs: bool, fetch_cites: bool):
+    """Log once per process that requested expansion is ignored during enrichment."""
+    global _EXPANSION_NOTICE_LOGGED
+    if (fetch_refs or fetch_cites) and not _EXPANSION_NOTICE_LOGGED:
+        _EXPANSION_NOTICE_LOGGED = True
+        log("Expansion during enrichment is disabled: related works are not persisted; see the expansion plan")
 
 
 def parse_duplicate_merge_marker(message: str | None) -> dict | None:
@@ -565,32 +575,8 @@ class PipelineDaemon:
 
     # --- MARKING LOGIC ---
     def do_mark(self, corpus_id: int, limit: int):
-        cur = self.db.conn.cursor()
-        if corpus_id is None:
-            cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM works
-                WHERE COALESCE(metadata_status, 'pending') IN ('pending', 'in_progress')
-                  AND COALESCE(download_status, 'not_requested') = 'not_requested'
-                """
-            )
-            available = int(cur.fetchone()[0])
-        else:
-            cur.execute(
-                """
-                SELECT COUNT(*)
-                FROM works w
-                JOIN corpus_works cw ON cw.work_id = w.id
-                WHERE cw.corpus_id = ?
-                  AND COALESCE(w.metadata_status, 'pending') IN ('pending', 'in_progress')
-                  AND COALESCE(w.download_status, 'not_requested') = 'not_requested'
-                """, (corpus_id,)
-            )
-            available = int(cur.fetchone()[0])
-
         # Canonical works no longer require a separate raw-marking step.
-        return {"requested": limit, "marked": 0, "available": available, "ids": []}
+        return {"requested": limit, "marked": 0, "available": None, "ids": []}
 
     # --- ENRICHMENT LOGIC ---
     def _enrich_single(self, entry, fetch_refs, fetch_cites, max_cites, rel_down, rel_up, max_rel):
@@ -606,7 +592,7 @@ class PipelineDaemon:
             }
             enriched, diag = process_single_reference(
                 ref, self.searcher, self.rate_limiter,
-                fetch_references=fetch_refs, fetch_citations=fetch_cites,
+                fetch_references=False, fetch_citations=False,
                 max_citations=max_cites, related_depth=rel_down,
                 related_depth_upstream=rel_up, max_related_per_reference=max_rel, return_diagnostics=True
             )
@@ -720,6 +706,7 @@ class PipelineDaemon:
         fetch_cites = bool(expansion.get("includeUpstream", False)) and rel_up > 0
         max_cites = expansion.get("maxCitations", 100)
         max_rel = expansion.get("maxRelated", 30)
+        _note_expansion_disabled(fetch_refs, fetch_cites)
 
         wave_size_cfg = int(os.getenv("RAG_FEEDER_ENRICH_WAVE_SIZE", "2") or "2")
         wave_size = max(1, min(len(to_process), max(1, min(workers, 32)), wave_size_cfg))
@@ -760,9 +747,7 @@ class PipelineDaemon:
                         results.append(result_payload)
                         continue
 
-                    wid, err = self.db.apply_enriched_metadata(
-                        pending_work_id, enriched, expand_related=(rel_down > 1 and fetch_refs), max_related_per_source=max_rel
-                    )
+                    wid, err = self.db.apply_enriched_metadata(pending_work_id, enriched)
                     if not wid:
                         dup = parse_duplicate_merge_marker(err)
                         if dup:
@@ -788,8 +773,6 @@ class PipelineDaemon:
                             errors.append(err or f"Promotion failed for pending work {pending_work_id}")
                             self.db.reset_enrich_claim(pending_work_id, state="pending", error=err or "promotion_failed", selected=0)
                             results.append({"pending_work_id": pending_work_id, "action": "promotion_failed", "error": err})
-                        if dup:
-                            self.db.delete_work(pending_work_id)
                         continue
 
                     promoted += 1

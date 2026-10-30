@@ -14,6 +14,41 @@ BLUE = "\033[94m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
 
+WORKS_INDEXES = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''",
+    "CREATE INDEX IF NOT EXISTS idx_works_title_year ON works(normalized_title, year)",
+    "CREATE INDEX IF NOT EXISTS idx_works_authors ON works(normalized_authors)",
+    "CREATE INDEX IF NOT EXISTS idx_works_metadata_status ON works(metadata_status, metadata_lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_works_download_status ON works(download_status, download_lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_works_origin ON works(origin_type, origin_key)",
+    "CREATE INDEX IF NOT EXISTS idx_corpus_works_work ON corpus_works(work_id)",
+    "CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title)",
+    "CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id)",
+    "CREATE INDEX IF NOT EXISTS idx_duplicate_references_existing ON duplicate_references(existing_entry_table, existing_entry_id)",
+    "CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)",
+    "CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)",
+    "CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)",
+    "CREATE INDEX IF NOT EXISTS idx_search_results_work ON search_results(work_id)",
+    "CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id)",
+    "CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id)",
+]
+
+# Redundant: covered by a primary key or by the prefix of another index (or legacy, created by nothing).
+DROPPED_INDEXES = [
+    "idx_corpus_works_lookup",
+    "idx_corpus_works_corpus",
+    "idx_work_aliases_norm_title",
+    "idx_work_aliases_owner",
+    "idx_search_results_run",
+    "idx_seed_sources_hidden_lookup",
+    "idx_seed_candidates_dismissed_lookup",
+    "idx_seed_candidates_in_corpus_lookup",
+]
+
+
 class DatabaseManager:
     """Manages all SQLite database interactions for the literature management tool."""
 
@@ -357,32 +392,13 @@ class DatabaseManager:
                 notes TEXT
             )
         """)
-        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''")
-        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_title_year ON works(normalized_title, year)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_authors ON works(normalized_authors)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_metadata_status ON works(metadata_status, metadata_lease_expires_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_download_status ON works(download_status, download_lease_expires_at)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_works_origin ON works(origin_type, origin_key)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_works_corpus ON corpus_works(corpus_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_corpus_works_work ON corpus_works(work_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_title ON work_aliases(normalized_alias_title)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_work_aliases_work ON work_aliases(work_table, work_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_duplicate_references_existing ON duplicate_references(existing_entry_table, existing_entry_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_source ON citation_edges(source_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_citation_edges_target ON citation_edges(target_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_ingest_entries_source ON ingest_entries(ingest_source)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run ON search_results(search_run_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_results_run_openalex ON search_results(search_run_id, openalex_id)")
-
-        try:
-            has_search_results = cursor.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'search_results' LIMIT 1"
-            ).fetchone()
-            if has_search_results and "work_id" not in [row[1] for row in cursor.execute("PRAGMA table_info(search_results)").fetchall()]:
-                cursor.execute("ALTER TABLE search_results ADD COLUMN work_id INTEGER")
-        except sqlite3.Error:
-            pass
+        # An old search_results table may predate work_id, which idx_search_results_work covers.
+        if "work_id" not in [row[1] for row in cursor.execute("PRAGMA table_info(search_results)").fetchall()]:
+            cursor.execute("ALTER TABLE search_results ADD COLUMN work_id INTEGER")
+        for ddl in WORKS_INDEXES:
+            cursor.execute(ddl)
+        for name in DROPPED_INDEXES:
+            cursor.execute(f"DROP INDEX IF EXISTS {name}")
 
         meta_row = cursor.execute("SELECT value FROM app_meta WHERE key = 'works_schema_version'").fetchone()
         if not meta_row:
@@ -458,7 +474,7 @@ class DatabaseManager:
         normalized_doi = self._normalize_doi(doi)
         if normalized_doi:
             params = [normalized_doi]
-            query = "SELECT id FROM works WHERE normalized_doi = ?"
+            query = "SELECT id FROM works WHERE normalized_doi = ? AND normalized_doi != ''"
             if exclude_id:
                 query += " AND id != ?"
                 params.append(int(exclude_id))
@@ -468,7 +484,7 @@ class DatabaseManager:
         normalized_openalex = self._normalize_openalex_id(openalex_id)
         if normalized_openalex:
             params = [normalized_openalex]
-            query = "SELECT id FROM works WHERE openalex_id = ?"
+            query = "SELECT id FROM works WHERE openalex_id = ? AND openalex_id != ''"
             if exclude_id:
                 query += " AND id != ?"
                 params.append(int(exclude_id))
@@ -534,18 +550,26 @@ class DatabaseManager:
         assignments = ", ".join([f"{k} = ?" for k in payload.keys()]) + ", updated_at = CURRENT_TIMESTAMP"
         self.conn.cursor().execute(f"UPDATE works SET {assignments} WHERE id = ?", tuple(payload.values()) + (int(work_id),))
 
-    def _resolve_or_create_work(self, data: dict, *, allow_merge: bool = True, commit: bool = True) -> tuple[int, str | None]:
-        existing_id, matched_field = self._find_existing_work(
-            doi=data.get("doi"),
-            openalex_id=data.get("openalex_id"),
-            title=data.get("title"),
-            authors=data.get("authors"),
-            editors=data.get("editors"),
-            year=data.get("year"),
-        )
-        if existing_id:
-            existing = self.get_entry_by_id("works", existing_id) or {}
-            merged = self._apply_work_merge_priority(existing, data) if allow_merge else existing
+    def _resolve_or_create_work(self, data: dict, *, allow_merge: bool = True, commit: bool = True, existing: tuple[int | None, str | None] | None = None) -> tuple[int, str | None]:
+        # `existing` is a lookup result the caller already has ((None, None) = no match); it skips the
+        # lookup. If its row was deleted since, a fresh lookup replaces it.
+        def lookup():
+            return self._find_existing_work(
+                doi=data.get("doi"),
+                openalex_id=data.get("openalex_id"),
+                title=data.get("title"),
+                authors=data.get("authors"),
+                editors=data.get("editors"),
+                year=data.get("year"),
+            )
+
+        existing_id, matched_field = existing if existing is not None else lookup()
+        existing_row = self.get_entry_by_id("works", existing_id) if existing_id else None
+        if existing_id and existing_row is None and existing is not None:
+            existing_id, matched_field = lookup()
+            existing_row = self.get_entry_by_id("works", existing_id) if existing_id else None
+        if existing_row is not None:
+            merged = self._apply_work_merge_priority(existing_row, data) if allow_merge else existing_row
             self._update_work_record(existing_id, merged)
             if commit:
                 self.conn.commit()
@@ -903,8 +927,14 @@ class DatabaseManager:
         alias_year: int | str | None = None,
         alias_language: str | None = None,
         relationship_type: str | None = None,
+        *,
+        commit: bool = True,
     ) -> tuple[int | None, str | None]:
-        """Add an alternate title/translation for a work."""
+        """Add an alternate title/translation for a work.
+
+        With commit=False the insert joins the caller's transaction: nothing is
+        committed or rolled back here, and a database error propagates.
+        """
         if not alias_title:
             return None, "Alias title is required"
 
@@ -925,9 +955,12 @@ class DatabaseManager:
                     relationship_type,
                 ),
             )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
             return cur.lastrowid, None
         except sqlite3.Error as e:
+            if not commit:
+                raise
             self.conn.rollback()
             return None, str(e)
 
@@ -1102,6 +1135,70 @@ class DatabaseManager:
             "openalex_id": self._normalize_openalex_id(resolved.get("openalex_id")),
         }
 
+    def _table_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", (name,)
+        ).fetchone()
+        return row is not None
+
+    def _absorb_duplicate(
+        self,
+        canonical_id: int,
+        duplicate_id: int,
+        *,
+        match_field: str | None,
+        notes: str | None = None,
+        updates: dict | None = None,
+    ) -> None:
+        """Fold duplicate works row into canonical: corpus membership, aliases, delete, merge_log.
+
+        Runs inside the caller's transaction; never begins or commits.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """INSERT OR IGNORE INTO corpus_works (corpus_id, work_id, added_at)
+               SELECT corpus_id, ?, added_at FROM corpus_works WHERE work_id = ?""",
+            (canonical_id, duplicate_id),
+        )
+        # work_aliases has no unique constraint, so drop the duplicate's aliases the canonical
+        # already carries (same title, year, language and relationship) before moving the
+        # rest; otherwise the move would double them. IS compares NULLs as equal.
+        cur.execute(
+            """DELETE FROM work_aliases
+                WHERE work_table = 'works' AND work_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM work_aliases c
+                       WHERE c.work_table = 'works' AND c.work_id = ?
+                         AND c.normalized_alias_title IS work_aliases.normalized_alias_title
+                         AND c.alias_year IS work_aliases.alias_year
+                         AND c.alias_language IS work_aliases.alias_language
+                         AND c.relationship_type IS work_aliases.relationship_type)""",
+            (duplicate_id, canonical_id),
+        )
+        cur.execute(
+            "UPDATE work_aliases SET work_id = ? WHERE work_table = 'works' AND work_id = ?",
+            (canonical_id, duplicate_id),
+        )
+        cur.execute("DELETE FROM corpus_works WHERE work_id = ?", (duplicate_id,))
+        # Rows that reference the duplicate by work_id follow it to the canonical. The
+        # seed marker matters most: the unlink route clears markers by (corpus_id, work_id),
+        # so a marker left on the deleted id could never be cleared and the candidate would
+        # stay "in corpus" forever. seed_candidates_in_corpus is created by the web layer,
+        # so it may be absent. (citation_edges keep their row ids; not repointed here.)
+        if self._table_exists("seed_candidates_in_corpus"):
+            cur.execute(
+                "UPDATE seed_candidates_in_corpus SET work_id = ? WHERE work_id = ?",
+                (canonical_id, duplicate_id),
+            )
+        cur.execute("UPDATE search_results SET work_id = ? WHERE work_id = ?", (canonical_id, duplicate_id))
+        cur.execute("DELETE FROM works WHERE id = ?", (duplicate_id,))
+        cur.execute(
+            """INSERT INTO merge_log
+               (canonical_table, canonical_id, duplicate_table, duplicate_id, match_field, action, notes, updates_json)
+               VALUES ('works', ?, 'works', ?, ?, 'merged', ?, ?)""",
+            (canonical_id, duplicate_id, match_field, notes, json.dumps(updates) if updates else None),
+        )
+
     def _merge_records(
         self,
         canonical_table: str,
@@ -1175,6 +1272,12 @@ class DatabaseManager:
                     updates.get("editors", canonical.get("editors")),
                 )
 
+            absorb = canonical_table == "works" and duplicate_table == "works"
+            if absorb:
+                # Delete the duplicate before backfilling so values under unique indexes
+                # (normalized_doi, openalex_id) can move to the canonical row.
+                self._absorb_duplicate(canonical_id, duplicate_id, match_field=match_field, notes=notes, updates=updates)
+
             if updates:
                 set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
                 cur.execute(
@@ -1182,11 +1285,12 @@ class DatabaseManager:
                     list(updates.values()) + [canonical_id],
                 )
 
-            # Move aliases to canonical record
-            cur.execute(
-                "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
-                (canonical_table, canonical_id, duplicate_table, duplicate_id),
-            )
+            if not absorb:
+                # Move aliases to canonical record
+                cur.execute(
+                    "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
+                    (canonical_table, canonical_id, duplicate_table, duplicate_id),
+                )
 
             # Add duplicate title as alias if different
             duplicate_title = duplicate.get("title")
@@ -1207,15 +1311,9 @@ class DatabaseManager:
                         ),
                     )
 
-            if canonical_table == "works" and duplicate_table == "works":
-                cur.execute(
-                    """INSERT OR IGNORE INTO corpus_works (corpus_id, work_id, added_at)
-                       SELECT corpus_id, ?, CURRENT_TIMESTAMP
-                         FROM corpus_works
-                        WHERE work_id = ?""",
-                    (canonical_id, duplicate_id),
-                )
-                cur.execute("DELETE FROM corpus_works WHERE work_id = ?", (duplicate_id,))
+            if absorb:
+                cur.execute("COMMIT")
+                return True, None
 
             # Delete duplicate row
             cur.execute(f"DELETE FROM {duplicate_table} WHERE id = ?", (duplicate_id,))
@@ -1480,7 +1578,11 @@ class DatabaseManager:
 
         try:
             payload = self._build_raw_work_payload(ref)
-            new_id, _ = self._resolve_or_create_work(payload, allow_merge=True)
+            new_id, _ = self._resolve_or_create_work(
+                payload,
+                allow_merge=True,
+                existing=(int(eid), field) if tbl == "works" else (None, None),
+            )
             if corpus_id:
                 self.add_corpus_item(corpus_id, "works", int(new_id))
 
@@ -1541,7 +1643,7 @@ class DatabaseManager:
             """SELECT id
                FROM works
                WHERE metadata_status = 'matched'
-                 AND COALESCE(download_status, 'not_requested') = 'not_requested'
+                 AND download_status = 'not_requested'
                ORDER BY id
                LIMIT ?""",
             (limit,),
@@ -1619,9 +1721,6 @@ class DatabaseManager:
         self,
         work_id: int,
         enrichment: dict,
-        *,
-        expand_related: bool = False,
-        max_related_per_source: int = 40,
     ) -> tuple[int | None, str | None]:
         """Update a pending work with enriched metadata."""
         cur = self.conn.cursor()
@@ -1676,9 +1775,11 @@ class DatabaseManager:
             )
             if existing_id:
                 existing = self.get_entry_by_id("works", int(existing_id)) or {}
+                # Absorb first: the canonical may take over the duplicate's DOI/openalex id,
+                # which sit under unique indexes while the duplicate row exists.
+                self._absorb_duplicate(int(existing_id), int(work_id), match_field=field, notes="apply_enriched_metadata")
                 self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
-                self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"))
-                self.conn.execute("DELETE FROM works WHERE id = ?", (int(work_id),))
+                self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"), commit=False)
                 cur.execute("COMMIT")
                 marker = f"DUPLICATE_MERGED|table=works|id={existing_id}|field={field}|queued=0|queue_id=|queue_error="
                 return None, f"Entry already exists in works (ID {existing_id}) on {field} [{marker}]"
@@ -1761,7 +1862,7 @@ class DatabaseManager:
         lease_expires_at = now + int(max(1, lease_seconds))
         eligible_state_sql = """
             (
-              COALESCE(metadata_status, 'pending') = 'pending'
+              metadata_status = 'pending'
               OR (
                    metadata_status = 'in_progress'
                    AND metadata_lease_expires_at IS NOT NULL
@@ -1780,7 +1881,7 @@ class DatabaseManager:
             cur.execute("BEGIN IMMEDIATE")
             where_clauses = [eligible_state_sql]
             query_params: list = list(params)
-            where_clauses.append("COALESCE(nm.download_status, 'not_requested') = 'not_requested'")
+            where_clauses.append("nm.download_status = 'not_requested'")
 
             if corpus_id is not None:
                 where_clauses.append(
@@ -2092,8 +2193,9 @@ class DatabaseManager:
                     "normalized_title": normalized_title,
                     "normalized_authors": normalized_authors,
                 }
+                # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
+                self._absorb_duplicate(int(duplicate_id), int(source_id), match_field=duplicate_field, notes="mark_raw_work_downloaded")
                 self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
-                cursor.execute("DELETE FROM works WHERE id = ?", (int(source_id),))
                 self.conn.commit()
                 return int(duplicate_id), None
 
@@ -2897,8 +2999,9 @@ class DatabaseManager:
         duplicate = self.get_entry_by_id("works", int(queue_id)) or {}
         canonical = self.get_entry_by_id("works", int(existing_work_id)) or {}
         try:
+            # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
+            self._absorb_duplicate(int(existing_work_id), int(queue_id), match_field=matched_field, notes="merge_duplicate_queued_work")
             self._update_work_record(int(existing_work_id), self._apply_work_merge_priority(canonical, duplicate))
-            self.conn.execute("DELETE FROM works WHERE id = ?", (int(queue_id),))
             self.conn.commit()
         except sqlite3.Error as err:
             self.conn.rollback()
