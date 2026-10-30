@@ -65,3 +65,13 @@ def test_old_search_results_table_gets_work_id_before_its_index(tmp_path):
     conn.close()
     assert "work_id" in cols
     assert "idx_search_results_work" in names
+
+
+def test_busy_timeout_matches_the_connect_timeout(tmp_path):
+    # A 5 s busy_timeout crashed the enrich worker at boot while the download worker
+    # built the new indexes (production deploy of #74, 2026-10-30).
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    try:
+        assert db.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    finally:
+        db.conn.close()
