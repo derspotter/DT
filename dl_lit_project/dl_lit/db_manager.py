@@ -81,7 +81,9 @@ class DatabaseManager:
         try:
             self.conn.execute("PRAGMA journal_mode = WAL")
             self.conn.execute("PRAGMA synchronous = NORMAL")
-            self.conn.execute("PRAGMA busy_timeout = 5000")
+            # Match timeout=30.0 above: this pragma overrides it. Both workers rebuild new
+            # indexes at boot after a deploy; the second one must wait out the first.
+            self.conn.execute("PRAGMA busy_timeout = 30000")
         except sqlite3.Error:
             # Best effort only (e.g., in-memory DB can reject WAL mode).
             pass
