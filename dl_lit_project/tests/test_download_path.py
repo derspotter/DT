@@ -212,15 +212,11 @@ def test_cli_downloaded_count_ignores_the_duplicate_merge_result(mocker, tmp_pat
 # --- the daemon callers ---------------------------------------------------------
 
 def _worker_daemon(monkeypatch, tmp_path, enhancer):
-    import importlib.util
     import threading
-    from pathlib import Path
 
-    worker_path = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "daemon" / "worker.py"
-    monkeypatch.syspath_prepend(str(worker_path.parent))
-    spec = importlib.util.spec_from_file_location("dt_worker_download_path", worker_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    from tests._worker_import import load_worker
+
+    mod = load_worker("dt_worker_download_path", monkeypatch)
     assert mod.download_ref is download_ref
     daemon = object.__new__(mod.PipelineDaemon)
     daemon.db = DatabaseManager(str(tmp_path / "worker.db"))

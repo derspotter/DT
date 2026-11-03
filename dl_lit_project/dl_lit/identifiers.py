@@ -32,6 +32,7 @@ __all__ = [
     "inverted_index_to_text_last_wins",
     "inverted_index_to_text_lenient",
     "openalex_work_to_record",
+    "crossref_item_to_openalex_like",
 ]
 
 
@@ -189,4 +190,42 @@ def openalex_work_to_record(item: dict, *, run_id=None) -> dict:
         "openalex_json": item,
         "ingest_source": "keyword_search",
         "run_id": run_id,
+    }
+
+
+_CROSSREF_DATE_FIELDS = ("published-print", "published-online", "published")
+
+
+def crossref_item_to_openalex_like(item: dict) -> dict:
+    """Map a Crossref ``/works`` item into the OpenAlex-like shape the matcher scores.
+
+    The year comes from the first of ``published-print``, ``published-online``,
+    ``published`` that has one (``issued`` is not read).  Formerly two copies in
+    ``OpenAlexScraper``: step 8 of ``search()`` (this superset) and
+    ``search_crossref`` (``published-print`` only, without the four trailing keys).
+    An item with an empty ``title`` list still raises ``IndexError``, as both did.
+    """
+    pub_year = None
+    for date_field in _CROSSREF_DATE_FIELDS:
+        if date_parts := item.get(date_field, {}).get("date-parts", [[None]])[0]:
+            pub_year = date_parts[0]
+            if pub_year:
+                break
+
+    return {
+        "id": f"crossref:{item.get('DOI', '')}",
+        "doi": item.get("DOI"),
+        "display_name": item.get("title", [""])[0],
+        "publication_year": pub_year,
+        "type": item.get("type"),
+        "authorships": [
+            {"author": {"display_name": f"{author.get('given', '')} {author.get('family', '')}"}}
+            for author in item.get("author", [])
+        ],
+        "referenced_works": [],  # Crossref doesn't provide this directly
+        "abstract_inverted_index": None,  # Crossref doesn't provide this
+        "keywords": [],  # Crossref doesn't provide this
+        "cited_by_api_url": item.get("is-referenced-by-count", 0) > 0
+        and f"https://api.crossref.org/works/{item.get('DOI')}/references"
+        or None,
     }

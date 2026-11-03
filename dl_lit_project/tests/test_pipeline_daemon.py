@@ -1,14 +1,11 @@
-import importlib.util
 import sqlite3
-from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 
-WORKER_PATH = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "daemon" / "worker.py"
-SPEC = importlib.util.spec_from_file_location("dt_pipeline_worker", WORKER_PATH)
-WORKER_MODULE = importlib.util.module_from_spec(SPEC)
-assert SPEC and SPEC.loader
-SPEC.loader.exec_module(WORKER_MODULE)
+from tests._worker_import import load_worker
+
+WORKER_MODULE = load_worker("dt_pipeline_worker")
 PipelineDaemon = WORKER_MODULE.PipelineDaemon
 
 
@@ -135,3 +132,111 @@ def test_do_mark_returns_the_constant_shape_without_querying(monkeypatch):
 
     monkeypatch.setattr(daemon.db, "conn", SimpleNamespace(cursor=forbidden))
     assert daemon.do_mark(None, 10) == {"requested": 10, "marked": 0, "available": None, "ids": []}
+
+
+# --- one run() loop for every role (spec D8) ---------------------------------------------
+
+def _loop_daemon(role, monkeypatch, tmp_path):
+    worker = WORKER_MODULE
+    monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path))
+    daemon = worker.PipelineDaemon.__new__(worker.PipelineDaemon)
+    daemon.role = role
+    daemon.running = True
+    daemon.heartbeat_interval_seconds = 3600
+    events = []
+    jobs = [{"id": 1, "job_type": "enrich", "params": {}}]
+    direct_methods = {"enrich": "_run_direct_enrich_cycle", "download": "_run_direct_download_cycle"}
+    expected_direct = ["enrich", "download"] if role == "all" else [role]
+
+    daemon._install_signal_handlers = lambda: None
+    daemon._heartbeat = lambda status, details=None, force=False: events.append(("heartbeat", status, (details or {}).get("state")))
+    daemon.refresh_app_settings = lambda: events.append(("refresh",))
+
+    def fetch_next_job():
+        events.append(("fetch",))
+        if sum(1 for e in events if e == ("fetch",)) >= 5:  # a loop that never ends the test
+            daemon.running = False
+        return jobs.pop(0) if jobs else None
+
+    daemon.fetch_next_job = fetch_next_job
+    daemon._process_job = lambda job: events.append(("job", job["id"]))
+
+    def make_cycle(phase):
+        def cycle():
+            events.append(("direct", phase))
+            if phase == expected_direct[-1]:
+                daemon.running = False
+            return {"processed": 1, "promoted": 1}
+        return cycle
+
+    for phase, name in direct_methods.items():
+        setattr(daemon, name, make_cycle(phase))
+
+    started = []
+    real_start = daemon._start_direct_batch_heartbeat
+
+    def start(details):
+        started.append(details["phase"])
+        return real_start(details)
+
+    daemon._start_direct_batch_heartbeat = start
+    def sleep(seconds):
+        events.append(("sleep", seconds))
+        if sum(1 for e in events if e[0] == "sleep") >= 5:  # a loop that never ends the test
+            daemon.running = False
+
+    monkeypatch.setattr(worker.time, "sleep", sleep)
+    return daemon, events, started
+
+
+@pytest.mark.parametrize("role", ["all", "enrich", "download"])
+def test_one_loop_processes_a_job_then_a_direct_cycle(monkeypatch, tmp_path, role):
+    daemon, events, started = _loop_daemon(role, monkeypatch, tmp_path)
+    daemon.run()
+
+    phases = ["enrich", "download"] if role == "all" else [role]
+    assert events == [
+        ("heartbeat", "idle", "polling"),
+        ("refresh",),
+        ("fetch",),
+        ("job", 1),
+        ("heartbeat", "idle", "polling"),
+        ("refresh",),
+        ("fetch",),
+        *[("direct", phase) for phase in phases],
+        ("heartbeat", "running", "processed_batch"),
+    ]
+    assert started == phases
+
+
+def test_idle_loop_sleeps_five_seconds(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("all", monkeypatch, tmp_path)
+    daemon._run_direct_enrich_cycle = lambda: None
+
+    def idle_download():
+        daemon.running = False
+        return None
+
+    daemon._run_direct_download_cycle = idle_download
+    daemon.fetch_next_job = lambda: events.append(("fetch",)) or None
+    daemon.run()
+    assert events[-1] == ("sleep", 5)
+
+
+def test_loop_exception_and_keyboard_interrupt_branches(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("enrich", monkeypatch, tmp_path)
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("boom")
+        raise KeyboardInterrupt
+
+    daemon.fetch_next_job = fetch
+    daemon._release_own_running_jobs = lambda: events.append(("released",))
+    daemon.run()
+    assert ("heartbeat", "error", "loop_exception") in events
+    assert ("sleep", 10) in events
+    assert events[-2:] == [("released",), ("heartbeat", "stopped", "keyboard_interrupt")]
+    assert daemon.running is False

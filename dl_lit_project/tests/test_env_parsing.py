@@ -1,12 +1,8 @@
-import importlib.util
-from pathlib import Path
-
 import pytest
 
 from dl_lit import app_settings
 from dl_lit.utils import env_bool, env_float, env_int
-
-WORKER = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "daemon" / "worker.py"
+from tests._worker_import import load_worker
 
 
 @pytest.fixture(autouse=True)
@@ -74,10 +70,7 @@ def test_private_aliases_still_exported():
 
 
 def test_daemon_init_survives_env_typo(monkeypatch, tmp_path):
-    monkeypatch.syspath_prepend(str(WORKER.parent))
-    spec = importlib.util.spec_from_file_location("dt_worker_env", WORKER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    mod = load_worker("dt_worker_env", monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("RAG_FEEDER_LLM_PROVIDER", raising=False)
     monkeypatch.setattr(mod.PipelineDaemon, "_build_enhancer", lambda self, *a: object())

@@ -93,17 +93,61 @@ from reference_expansion import (
     DEFAULT_INCLUDE_UPSTREAM,
 )
 
+# One append handle per process for the pipeline log the UI reads (formerly one open() per line).
+# Keyed on the resolved path; reopened after an OSError, when RAG_FEEDER_LOG_DIR changes, and when
+# backend/src/index.js has rotated the file by renaming it (the path no longer names our inode).
+_LOG_STATE = {"handle": None, "path": None}
+_LOG_LOCK = threading.Lock()
+
+
+def _close_log_handle():
+    handle = _LOG_STATE["handle"]
+    _LOG_STATE["handle"] = None
+    _LOG_STATE["path"] = None
+    if handle is not None:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+def _log_handle_is_current(log_file: str) -> bool:
+    handle = _LOG_STATE["handle"]
+    if handle is None or _LOG_STATE["path"] != log_file:
+        return False
+    try:
+        return os.path.samestat(os.fstat(handle.fileno()), os.stat(log_file))
+    except (OSError, ValueError):
+        return False
+
+
+def _append_log_line(log_dir: str, line: str) -> None:
+    log_file = os.path.join(log_dir, "backend-pipeline.log")
+    with _LOG_LOCK:
+        for attempt in range(2):
+            try:
+                if not _log_handle_is_current(log_file):
+                    _close_log_handle()
+                    os.makedirs(log_dir, exist_ok=True)
+                    _LOG_STATE["handle"] = open(log_file, "a", encoding="utf-8")
+                    _LOG_STATE["path"] = log_file
+                _LOG_STATE["handle"].write(line + "\n")
+                _LOG_STATE["handle"].flush()
+                return
+            except OSError:
+                _close_log_handle()
+                if attempt:
+                    raise
+
+
 def log(msg: str):
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
     print(formatted_msg, flush=True)
     # Also append to the same pipeline log file that Node.js uses, so the UI can read it
     log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
-    log_file = os.path.join(log_dir, "backend-pipeline.log")
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(formatted_msg + "\n")
+        _append_log_line(log_dir, formatted_msg)
     except Exception as e:
         print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 
@@ -1112,79 +1156,57 @@ class PipelineDaemon:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1)
 
+    # Direct (job-less) batch cycles per role, run in turn when no job is pending.
+    DIRECT_CYCLES = {
+        "enrich": (("enrich", "_run_direct_enrich_cycle"),),
+        "download": (("download", "_run_direct_download_cycle"),),
+        "all": (("enrich", "_run_direct_enrich_cycle"), ("download", "_run_direct_download_cycle")),
+    }
+
+    def _run_direct_cycles(self) -> dict | None:
+        """Run this role's direct cycles, each under the direct-batch heartbeat thread.
+
+        Returns the summed counters when any cycle processed something, else None.
+        """
+        totals = None
+        for phase, method_name in self.DIRECT_CYCLES.get(self.role, ()):
+            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": phase})
+            try:
+                result = getattr(self, method_name)()
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
+            if result:
+                totals = totals or {}
+                for key in ("processed", "promoted", "queued", "downloaded", "failed"):
+                    totals[key] = totals.get(key, 0) + int(result.get(key, 0) or 0)
+        return totals
+
     def run(self):
         log(f"{self.role} daemon starting. Waiting for work...")
         self._install_signal_handlers()
-        if self.role in {"enrich", "download"}:
-            while self.running:
-                try:
-                    self._heartbeat("idle", {"state": "polling", "mode": "db-driven", "role": self.role})
-                    self.refresh_app_settings()  # before claiming: a failure must not claim a job
-                    job = self.fetch_next_job()
-                    if job:
-                        self._process_job(job)
-                        continue
-                    direct_result = None
-                    heartbeat_stop = None
-                    heartbeat_thread = None
-                    try:
-                        if self.role == "enrich":
-                            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "enrich"})
-                            direct_result = self._run_direct_enrich_cycle()
-                        elif self.role == "download":
-                            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "download"})
-                            direct_result = self._run_direct_download_cycle()
-                    finally:
-                        if heartbeat_stop:
-                            heartbeat_stop.set()
-                        if heartbeat_thread:
-                            heartbeat_thread.join(timeout=1)
-                    if direct_result:
-                        self._heartbeat(
-                            "running",
-                            {
-                                "state": "processed_batch",
-                                "mode": "db-driven",
-                                "role": self.role,
-                                "result": {
-                                    "processed": int(direct_result.get("processed", 0) or 0),
-                                    "promoted": int(direct_result.get("promoted", 0) or 0),
-                                    "queued": int(direct_result.get("queued", 0) or 0),
-                                    "downloaded": int(direct_result.get("downloaded", 0) or 0),
-                                    "failed": int(direct_result.get("failed", 0) or 0),
-                                },
-                            },
-                            force=True,
-                        )
-                        continue
-                    time.sleep(5)
-                except KeyboardInterrupt:
-                    log("Received shutdown signal. Exiting gracefully...")
-                    self.running = False
-                    self._release_own_running_jobs()
-                    self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
-                except Exception as e:
-                    log(f"Critical error in main loop: {e}")
-                    self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
-                    time.sleep(10)
-            return
-
         while self.running:
             try:
-                self._heartbeat("idle", {"state": "polling"})
+                self._heartbeat("idle", {"state": "polling", "mode": "db-driven", "role": self.role})
                 self.refresh_app_settings()  # before claiming: a failure must not claim a job
                 job = self.fetch_next_job()
-                if not job:
-                    direct_result = None
-                    if self.role == "enrich":
-                        direct_result = self._run_direct_enrich_cycle()
-                    elif self.role == "download":
-                        direct_result = self._run_direct_download_cycle()
-                    if not direct_result:
-                        time.sleep(5)
+                if job:
+                    self._process_job(job)
                     continue
-                self._process_job(job)
-                    
+                direct_result = self._run_direct_cycles()
+                if direct_result:
+                    self._heartbeat(
+                        "running",
+                        {
+                            "state": "processed_batch",
+                            "mode": "db-driven",
+                            "role": self.role,
+                            "result": direct_result,
+                        },
+                        force=True,
+                    )
+                    continue
+                time.sleep(5)
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")
                 self.running = False

@@ -1,0 +1,232 @@
+{
+  "items": [
+    {
+      "DOI": "10.1000/print",
+      "author": [
+        {
+          "family": "Lovelace",
+          "given": "Ada"
+        },
+        {
+          "family": "Babbage"
+        }
+      ],
+      "is-referenced-by-count": 3,
+      "issued": {
+        "date-parts": [
+          [
+            2018
+          ]
+        ]
+      },
+      "published-online": {
+        "date-parts": [
+          [
+            2018
+          ]
+        ]
+      },
+      "published-print": {
+        "date-parts": [
+          [
+            2019,
+            5
+          ]
+        ]
+      },
+      "title": [
+        "Printed Work"
+      ],
+      "type": "journal-article"
+    },
+    {
+      "DOI": "10.1000/online",
+      "author": [
+        {
+          "family": "Hopper",
+          "given": "Grace"
+        }
+      ],
+      "is-referenced-by-count": 0,
+      "issued": {
+        "date-parts": [
+          [
+            2021
+          ]
+        ]
+      },
+      "published-online": {
+        "date-parts": [
+          [
+            2021,
+            1,
+            2
+          ]
+        ]
+      },
+      "title": [
+        "Online Only"
+      ],
+      "type": "book-chapter"
+    },
+    {
+      "DOI": "10.1000/published",
+      "author": [],
+      "published": {
+        "date-parts": [
+          [
+            2015
+          ]
+        ]
+      },
+      "title": [
+        "Published Field"
+      ],
+      "type": "report"
+    },
+    {
+      "DOI": "10.1000/issued",
+      "is-referenced-by-count": 7,
+      "issued": {
+        "date-parts": [
+          [
+            2012
+          ]
+        ]
+      },
+      "title": [
+        "Issued Only"
+      ],
+      "type": "book"
+    },
+    {
+      "title": [],
+      "type": "other"
+    }
+  ],
+  "search_crossref": [
+    {
+      "authorships": [
+        {
+          "author": {
+            "display_name": "Ada Lovelace"
+          }
+        },
+        {
+          "author": {
+            "display_name": " Babbage"
+          }
+        }
+      ],
+      "display_name": "Printed Work",
+      "doi": "10.1000/print",
+      "id": "crossref:10.1000/print",
+      "publication_year": 2019,
+      "type": "journal-article"
+    },
+    {
+      "authorships": [
+        {
+          "author": {
+            "display_name": "Grace Hopper"
+          }
+        }
+      ],
+      "display_name": "Online Only",
+      "doi": "10.1000/online",
+      "id": "crossref:10.1000/online",
+      "publication_year": null,
+      "type": "book-chapter"
+    },
+    {
+      "authorships": [],
+      "display_name": "Published Field",
+      "doi": "10.1000/published",
+      "id": "crossref:10.1000/published",
+      "publication_year": null,
+      "type": "report"
+    },
+    {
+      "authorships": [],
+      "display_name": "Issued Only",
+      "doi": "10.1000/issued",
+      "id": "crossref:10.1000/issued",
+      "publication_year": null,
+      "type": "book"
+    },
+    null
+  ],
+  "search_step8": [
+    {
+      "abstract_inverted_index": null,
+      "authorships": [
+        {
+          "author": {
+            "display_name": "Ada Lovelace"
+          }
+        },
+        {
+          "author": {
+            "display_name": " Babbage"
+          }
+        }
+      ],
+      "cited_by_api_url": "https://api.crossref.org/works/10.1000/print/references",
+      "display_name": "Printed Work",
+      "doi": "10.1000/print",
+      "id": "crossref:10.1000/print",
+      "keywords": [],
+      "publication_year": 2019,
+      "referenced_works": [],
+      "type": "journal-article"
+    },
+    {
+      "abstract_inverted_index": null,
+      "authorships": [
+        {
+          "author": {
+            "display_name": "Grace Hopper"
+          }
+        }
+      ],
+      "cited_by_api_url": null,
+      "display_name": "Online Only",
+      "doi": "10.1000/online",
+      "id": "crossref:10.1000/online",
+      "keywords": [],
+      "publication_year": 2021,
+      "referenced_works": [],
+      "type": "book-chapter"
+    },
+    {
+      "abstract_inverted_index": null,
+      "authorships": [],
+      "cited_by_api_url": null,
+      "display_name": "Published Field",
+      "doi": "10.1000/published",
+      "id": "crossref:10.1000/published",
+      "keywords": [],
+      "publication_year": 2015,
+      "referenced_works": [],
+      "type": "report"
+    },
+    {
+      "abstract_inverted_index": null,
+      "authorships": [],
+      "cited_by_api_url": "https://api.crossref.org/works/10.1000/issued/references",
+      "display_name": "Issued Only",
+      "doi": "10.1000/issued",
+      "id": "crossref:10.1000/issued",
+      "keywords": [],
+      "publication_year": null,
+      "referenced_works": [],
+      "type": "book"
+    },
+    {
+      "error": "Unexpected Crossref error: list index out of range",
+      "results": [],
+      "step": 8,
+      "success": false
+    }
+  ]
+}
