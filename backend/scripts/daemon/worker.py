@@ -72,7 +72,6 @@ import signal
 import secrets
 import random
 import socket
-import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -83,6 +82,7 @@ from dl_lit.app_settings import apply_app_settings_env, effective_env, settings_
 from dl_lit.utils import env_int, get_global_rate_limiter, reset_global_rate_limiter, set_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
+from dl_lit.download_path import download_ref  # noqa: F401  (worker.download_ref)
 from dl_lit.scraper_lab import execute_scraper_job
 
 # Import constants
@@ -619,7 +619,7 @@ class PipelineDaemon:
             "openalex_json": None,
         }
         try:
-            result = self.enhancer.enhance_bibliography(ref, self.download_dir)
+            download_result, checksum, _trace = download_ref(self.enhancer, ref, self.download_dir)
         except Exception as exc:
             return False, {
                 "pending_work_id": pending_work_id,
@@ -628,23 +628,15 @@ class PipelineDaemon:
                 "failure_detail": str(exc),
             }
 
-        download_result = result if isinstance(result, dict) else ref
-        if not download_result or not download_result.get("downloaded_file"):
+        if download_result is None:
             return False, {
                 "pending_work_id": pending_work_id,
                 "action": "raw_download_failed",
-                "failure_category": download_result.get("download_failure_category") if isinstance(download_result, dict) else "download_failed",
-                "failure_detail": download_result.get("download_failure_detail") if isinstance(download_result, dict) else "download_failed",
+                "failure_category": ref.get("download_failure_category"),
+                "failure_detail": ref.get("download_failure_detail"),
             }
 
         fp = str(download_result["downloaded_file"])
-        checksum = ""
-        try:
-            with open(fp, "rb") as fh:
-                checksum = hashlib.sha256(fh.read()).hexdigest()
-        except Exception:
-            checksum = ""
-
         with self.db_lock:
             downloaded_id, move_error = self.db.mark_raw_work_downloaded(
                 pending_work_id,
@@ -817,8 +809,10 @@ class PipelineDaemon:
         authors_raw = row.get("authors")
         authors = []
         if isinstance(authors_raw, str):
-            try: authors = json.loads(authors_raw)
-            except: authors = [authors_raw]
+            try:
+                authors = json.loads(authors_raw)
+            except (json.JSONDecodeError, TypeError):
+                authors = [authors_raw]
         elif isinstance(authors_raw, list):
             authors = authors_raw
 
@@ -829,11 +823,11 @@ class PipelineDaemon:
                 doi=row.get("doi"), openalex_id=row.get("openalex_id"), title=row.get("title"),
                 authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="works"
             )
-        if dup_table == "works" and dup_id is not None:
-            existing = self.db.get_entry_by_id("works", int(dup_id)) or {}
-            if str(existing.get("download_status") or "").strip().lower() != "downloaded":
-                dup_table = None
-                dup_id = None
+            if dup_table == "works" and dup_id is not None:
+                existing = self.db.get_entry_by_id("works", int(dup_id)) or {}
+                if str(existing.get("download_status") or "").strip().lower() != "downloaded":
+                    dup_table = None
+                    dup_id = None
         if dup_table == "works" and dup_id is not None:
             with self.db_lock:
                 ok, msg = self.db.merge_duplicate_queued_work(qid, dup_table, dup_id, dup_field)
@@ -850,7 +844,7 @@ class PipelineDaemon:
         }
         
         try:
-            result = self.enhancer.enhance_bibliography(ref, self.download_dir)
+            result, checksum, trace = download_ref(self.enhancer, ref, self.download_dir)
         except Exception as exc:
             return "error", {
                 "queue_id": qid,
@@ -861,21 +855,14 @@ class PipelineDaemon:
                 "_trace": list(ref.get("download_trace") or []),
             }
 
-        download_result = result if isinstance(result, dict) else ref
-        trace = list(download_result.get("download_trace") or [])
         attempted_sources = []
         for event in trace:
             source_name = event.get("source")
             if source_name and source_name not in attempted_sources:
                 attempted_sources.append(source_name)
 
-        if result and result.get("downloaded_file"):
+        if result is not None:
             fp = str(result["downloaded_file"])
-            checksum = ""
-            try:
-                with open(fp, "rb") as fh: checksum = hashlib.sha256(fh.read()).hexdigest()
-            except: pass
-            
             with self.db_lock:
                 downloaded_id, move_error = self.db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
             if move_error or not downloaded_id:
@@ -899,8 +886,8 @@ class PipelineDaemon:
                 "_trace": trace,
             }
         else:
-            failure_category = download_result.get("download_failure_category") or "download_failed"
-            failure_detail = download_result.get("download_failure_detail") or download_result.get("download_reason") or "download_failed"
+            failure_category = ref.get("download_failure_category") or "download_failed"
+            failure_detail = ref.get("download_failure_detail") or ref.get("download_reason") or "download_failed"
             with self.db_lock:
                 self.db.mark_download_failed(qid, failure_category)
             return "failed", {

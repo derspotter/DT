@@ -24,9 +24,9 @@ def mock_enhancer(mocker):
 
 @pytest.fixture
 def mock_hashlib(mocker):
-    """Mocks the hashlib library to control checksum calculation."""
-    mock_hl = mocker.patch('dl_lit.cli.hashlib', autospec=True)
-    mock_hl.sha256.return_value.hexdigest.return_value = 'fake_checksum'
+    """Mocks hashlib in the shared download path to control the fallback checksum."""
+    mock_hl = mocker.patch('dl_lit.download_path.hashlib', autospec=True)
+    mock_hl.file_digest.return_value.hexdigest.return_value = 'fake_checksum'
     return mock_hl
 
 # Test cases
@@ -83,7 +83,8 @@ def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hash
     assert "Worker finished: 1 downloaded, 0 failed." in result.output
 
     mock_enhancer.enhance_bibliography.assert_called_once()
-    mock_hashlib.sha256.assert_called_once_with(b'pdf content')
+    mock_hashlib.file_digest.assert_called_once()
+    assert mock_hashlib.file_digest.call_args.args[1] == 'sha256'
     mock_db_manager.move_entry_to_downloaded.assert_called_once_with(
         1, enhancer_result, str(pdf_file), 'fake_checksum', 'mock_source'
     )

@@ -2132,6 +2132,63 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error moving entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
 
+    def _raw_download_fields(self, original: dict, download_result: dict) -> dict:
+        """Identity fields of a raw-download result over its source row (title, authors, ids, url)."""
+        authors = download_result.get('authors')
+        if authors is None:
+            authors = original.get('authors')
+        elif isinstance(authors, list):
+            authors = json.dumps(authors)
+        elif not isinstance(authors, str):
+            authors = json.dumps([str(authors)])
+        return {
+            'title': download_result.get('title') or original.get('title'),
+            'authors': authors,
+            'year': download_result.get('year') or original.get('year'),
+            'doi': download_result.get('doi') or original.get('doi'),
+            'openalex_id': download_result.get('openalex_id') or original.get('openalex_id'),
+        }
+
+    def _raw_download_payload(self, original: dict, download_result: dict, file_path: str, checksum: str, source: str) -> dict:
+        """The works row written by mark_raw_work_downloaded (both branches; the non-duplicate one adds 'type')."""
+        fields = self._raw_download_fields(original, download_result)
+        keywords = download_result.get('keywords')
+        now = datetime.now().isoformat()
+        return {
+            **original,
+            'title': fields['title'],
+            'authors': fields['authors'],
+            'year': fields['year'],
+            'doi': fields['doi'],
+            'normalized_doi': self._normalize_doi(fields['doi']),
+            'openalex_id': self._normalize_openalex_id(fields['openalex_id']),
+            'url': download_result.get('url') or download_result.get('open_access_url') or original.get('url'),
+            'file_path': file_path,
+            'abstract': download_result.get('abstract') or original.get('abstract'),
+            'keywords': json.dumps(keywords) if isinstance(keywords, list) else (keywords or original.get('keywords')),
+            'source': download_result.get('source') or original.get('source'),
+            'volume': download_result.get('volume') or original.get('volume'),
+            'issue': download_result.get('issue') or original.get('issue'),
+            'pages': download_result.get('pages') or original.get('pages'),
+            'publisher': download_result.get('publisher') or original.get('publisher'),
+            'metadata_source': 'raw_download_fallback',
+            'metadata_status': 'failed',
+            'metadata_error': 'Metadata fetch failed; raw download fallback succeeded',
+            'metadata_updated_at': now,
+            'metadata_claimed_by': None,
+            'metadata_claimed_at': None,
+            'metadata_lease_expires_at': None,
+            'bibtex_entry_json': json.dumps(download_result),
+            'status_notes': 'Downloaded after metadata enrichment failed',
+            'file_checksum': checksum,
+            'download_status': 'downloaded',
+            'download_source': source,
+            'download_error': None,
+            'downloaded_at': now,
+            'normalized_title': self._normalize_text(fields['title']),
+            'normalized_authors': self._normalize_contributor_fields(fields['authors'], original.get('editors')),
+        }
+
     def mark_raw_work_downloaded(
         self,
         source_id: int,
@@ -2141,115 +2198,33 @@ class DatabaseManager:
         source_of_download: str,
     ) -> tuple[int | None, str | None]:
         """Mark a raw work row as downloaded after raw-download fallback."""
-        cursor = self.conn.cursor()
         try:
             original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
                 raise sqlite3.Error(f"No entry found in works with ID {source_id}")
 
-            title = download_result.get('title') or original_entry.get('title')
-            authors = download_result.get('authors')
-            if authors is None:
-                authors = original_entry.get('authors')
-            elif isinstance(authors, list):
-                authors = json.dumps(authors)
-            elif not isinstance(authors, str):
-                authors = json.dumps([str(authors)])
-
-            doi = download_result.get('doi') or original_entry.get('doi')
-            openalex_id = download_result.get('openalex_id') or original_entry.get('openalex_id')
-            url_source = download_result.get('url') or download_result.get('open_access_url') or original_entry.get('url')
-            metadata_blob = json.dumps(download_result)
-            normalized_title = self._normalize_text(title)
-            normalized_authors = self._normalize_contributor_fields(authors, original_entry.get('editors'))
+            fields = self._raw_download_fields(original_entry, download_result)
+            payload = self._raw_download_payload(original_entry, download_result, file_path, checksum, source_of_download)
 
             duplicate_table, duplicate_id, duplicate_field = self.check_if_exists(
-                doi=doi,
-                openalex_id=openalex_id,
-                title=title,
-                authors=authors,
+                doi=fields['doi'],
+                openalex_id=fields['openalex_id'],
+                title=fields['title'],
+                authors=fields['authors'],
                 editors=original_entry.get('editors'),
-                year=download_result.get('year') or original_entry.get('year'),
+                year=fields['year'],
                 exclude_id=source_id,
                 exclude_table="works",
             )
             if duplicate_table == "works" and duplicate_id is not None:
                 existing = self.get_entry_by_id("works", int(duplicate_id)) or {}
-                payload = {
-                    **original_entry,
-                    "title": title,
-                    "authors": authors,
-                    "year": download_result.get('year') or original_entry.get('year'),
-                    "doi": doi,
-                    "normalized_doi": self._normalize_doi(doi),
-                    "openalex_id": self._normalize_openalex_id(openalex_id),
-                    "url": url_source,
-                    "file_path": file_path,
-                    "abstract": download_result.get('abstract') or original_entry.get('abstract'),
-                    "keywords": json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
-                    "source": download_result.get('source') or original_entry.get('source'),
-                    "volume": download_result.get('volume') or original_entry.get('volume'),
-                    "issue": download_result.get('issue') or original_entry.get('issue'),
-                    "pages": download_result.get('pages') or original_entry.get('pages'),
-                    "publisher": download_result.get('publisher') or original_entry.get('publisher'),
-                    "metadata_source": 'raw_download_fallback',
-                    "metadata_status": 'failed',
-                    "metadata_error": 'Metadata fetch failed; raw download fallback succeeded',
-                    "metadata_updated_at": datetime.now().isoformat(),
-                    "metadata_claimed_by": None,
-                    "metadata_claimed_at": None,
-                    "metadata_lease_expires_at": None,
-                    "bibtex_entry_json": metadata_blob,
-                    "status_notes": 'Downloaded after metadata enrichment failed',
-                    "file_checksum": checksum,
-                    "download_status": 'downloaded',
-                    "download_source": source_of_download,
-                    "download_error": None,
-                    "downloaded_at": datetime.now().isoformat(),
-                    "normalized_title": normalized_title,
-                    "normalized_authors": normalized_authors,
-                }
                 # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
                 self._absorb_duplicate(int(duplicate_id), int(source_id), match_field=duplicate_field, notes="mark_raw_work_downloaded")
                 self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
                 self.conn.commit()
                 return int(duplicate_id), None
 
-            payload = {
-                **original_entry,
-                'type': download_result.get('type') or original_entry.get('type'),
-                'title': title,
-                'authors': authors,
-                'year': download_result.get('year') or original_entry.get('year'),
-                'doi': doi,
-                'normalized_doi': self._normalize_doi(doi),
-                'openalex_id': self._normalize_openalex_id(openalex_id),
-                'url': url_source,
-                'file_path': file_path,
-                'abstract': download_result.get('abstract') or original_entry.get('abstract'),
-                'keywords': json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
-                'source': download_result.get('source') or original_entry.get('source'),
-                'volume': download_result.get('volume') or original_entry.get('volume'),
-                'issue': download_result.get('issue') or original_entry.get('issue'),
-                'pages': download_result.get('pages') or original_entry.get('pages'),
-                'publisher': download_result.get('publisher') or original_entry.get('publisher'),
-                'metadata_source': 'raw_download_fallback',
-                'metadata_status': 'failed',
-                'metadata_error': 'Metadata fetch failed; raw download fallback succeeded',
-                'metadata_updated_at': datetime.now().isoformat(),
-                'metadata_claimed_by': None,
-                'metadata_claimed_at': None,
-                'metadata_lease_expires_at': None,
-                'bibtex_entry_json': metadata_blob,
-                'status_notes': 'Downloaded after metadata enrichment failed',
-                'file_checksum': checksum,
-                'download_status': 'downloaded',
-                'download_source': source_of_download,
-                'download_error': None,
-                'downloaded_at': datetime.now().isoformat(),
-                'normalized_title': normalized_title,
-                'normalized_authors': normalized_authors,
-            }
+            payload['type'] = download_result.get('type') or original_entry.get('type')
             self._update_work_record(int(source_id), payload)
             self.conn.commit()
             return int(source_id), None
