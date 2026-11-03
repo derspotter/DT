@@ -303,3 +303,126 @@ test('a sign-in attempt that succeeds after a newer one won does not replace its
   await expect.poll(() => authHeaders.length).toBeGreaterThan(seenBefore)
   expect(authHeaders[seenBefore]).toBe('Bearer token-b')
 })
+
+test('signing out clears the search form and the admin settings draft', async ({ page }) => {
+  const sockets = { opened: 0, closed: 0 }
+  const adminA = { ...userA, is_admin: true }
+  const adminB = { ...userB, is_admin: true }
+  let settingsRequests = 0
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockSocket(page, sockets)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: adminB })
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? adminB : adminA, corpora: [corpus] })
+    }
+    if (path === '/api/admin/settings') {
+      settingsRequests += 1
+      return fulfil(route, { settings: { openalex_api_key: { is_set: false } } })
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  const author = page.locator('.seed-search-author input')
+  const yearFromInput = page.locator('input[type="number"][placeholder="Year"]').first()
+  await author.fill('Elinor Ostrom')
+  await yearFromInput.fill('1990')
+
+  await page.evaluate(() => { window.location.hash = '#/admin' })
+  const apiKey = page.locator('.admin-settings-form input[type="password"]').first()
+  await expect(apiKey).toBeVisible()
+  await apiKey.fill('draft-secret')
+  expect(settingsRequests).toBe(1)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  // The sign-in lands on the workspace once its loads are done (the log
+  // socket connects right before); open the Admin tab after that.
+  await expect.poll(() => sockets.opened).toBe(2)
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+
+  await page.getByRole('button', { name: 'Admin', exact: true }).click()
+  // The draft is gone and the Admin tab fetched the settings again.
+  await expect(apiKey).toBeVisible()
+  await expect(apiKey).toHaveValue('')
+  expect(settingsRequests).toBe(2)
+
+  await page.evaluate(() => { window.location.hash = '#/workspace' })
+  await expect(author).toBeVisible()
+  await expect(author).toHaveValue('')
+  await expect(yearFromInput).toHaveValue('')
+})
+
+test('a corpus switch whose /me answers after a re-login does not restore the old user', async ({ page }) => {
+  const sockets = { opened: 0, closed: 0 }
+  const corpusTwo = { id: 2, name: 'Second corpus', role: 'owner', owner_username: 'alice' }
+  let holdNextMe = false
+  let releaseHeldMe: () => void = () => {}
+  const heldMeReleased = new Promise<void>((resolve) => { releaseHeldMe = resolve })
+  let heldMeSeen = false
+  let heldMeAnswered = false
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockSocket(page, sockets)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (path === '/api/corpora/2/select') {
+      holdNextMe = true
+      return fulfil(route, {})
+    }
+    if (path === '/api/auth/me') {
+      if (auth.endsWith('token-b')) return fulfil(route, { user: userB, corpora: [corpus] })
+      if (holdNextMe) {
+        holdNextMe = false
+        heldMeSeen = true
+        await heldMeReleased
+        await fulfil(route, { user: { ...userA, last_corpus_id: 2 }, corpora: [corpus, corpusTwo] })
+        heldMeAnswered = true
+        return
+      }
+      return fulfil(route, { user: userA, corpora: [corpus, corpusTwo] })
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  await page.locator('.header-corpus-picker select').selectOption('2')
+  await expect.poll(() => heldMeSeen).toBe(true)
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await page.evaluate(() => {
+    const seen: string[] = []
+    ;(window as unknown as { __authUserSeen: string[] }).__authUserSeen = seen
+    new MutationObserver(() => {
+      const text = document.querySelector('[data-testid="auth-user"]')?.textContent || ''
+      if (seen[seen.length - 1] !== text) seen.push(text)
+    }).observe(document.body, { subtree: true, childList: true, characterData: true })
+  })
+
+  releaseHeldMe()
+  await expect.poll(() => heldMeAnswered).toBe(true)
+  await page.waitForTimeout(500)
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  const seen = await page.evaluate(() => (window as unknown as { __authUserSeen: string[] }).__authUserSeen)
+  expect(seen).not.toContain('alice')
+})

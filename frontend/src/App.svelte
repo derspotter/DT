@@ -399,8 +399,8 @@
   $: openalexQuotaView = formatOpenAlexQuota(openalexQuota)
 
   const CORPUS_PAGE_SIZE = 120
-  // The poll's follow-up reload of every loaded row is capped here.
-  const CORPUS_POLL_MAX_ROWS = 1000
+  // The poll's follow-up reload of every loaded row asks for pages this big.
+  const CORPUS_POLL_PAGE_ROWS = 1000
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
@@ -509,6 +509,9 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
+  // Bumped by resetLogState (type/filter change, corpus switch, sign-out): a
+  // tail or older-lines answer requested under an earlier scope is dropped.
+  let logsScopeEpoch = 0
   const REFRESH_ACTIVE_MS = 2000
   const REFRESH_IDLE_MS = 20000
   const REFRESH_TRAILING_MS = 1500
@@ -623,10 +626,12 @@
   }
 
   function resetLogState() {
+    logsScopeEpoch += 1
     clearLogBuffer()
     logs = []
     logsCursor = 0
     logsHasMore = false
+    logsLoadingOlder = false
     logsTailStatus = ''
   }
 
@@ -1786,7 +1791,7 @@
     corpora = []
     currentCorpusId = null
     loginPassword = ''
-    resetFrontendState()
+    resetFrontendState({ signOut: true })
   }
 
   // The tabs whose loads bootstrapAuth may start before the auth round trip:
@@ -1861,10 +1866,19 @@
       seedActionBusy: false,
       seedLastRunKey: '',
       seedFilterQuery: '',
+      seedWarningMessage: '',
       searchQuery: '',
+      searchField: 'default',
+      searchAuthor: '',
+      yearFrom: '',
+      yearTo: '',
       searchMaxResults: DEFAULT_SEARCH_MAX_RESULTS,
+      searchSort: 'relevance',
       searchStatus: '',
+      searchPreview: null,
+      searchWarning: false,
       startedSearchRunIds: new Set(),
+      uploads: [],
       corpusItems: [],
       corpusTotal: 0,
       corpusHasMore: false,
@@ -1875,6 +1889,11 @@
       downloads: [],
       downloadsSource: '',
       downloadsQuery: '',
+      workerBacklog: { raw_pending: 0, enriching: 0, matched: 0, queued_download: 0, downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 },
+      exportStatus: '',
+      shareUsername: '',
+      shareRole: 'viewer',
+      shareStatus: '',
       logs: [],
       logsCursor: 0,
       logsHasMore: false,
@@ -1884,13 +1903,17 @@
     }
   }
 
-  function resetFrontendState() {
+  // `signOut` also drops what belongs to the user rather than the corpus: the
+  // admin settings (and their unsaved draft, which may hold API keys), the
+  // invitation form, the instance-wide overview and the view choices (sorts,
+  // filters, promotion mode). A corpus switch keeps them.
+  function resetFrontendState({ signOut = false } = {}) {
     invalidateCorpusScopedRequests()
     clearTimeout(seedFilterDebounce)
     clearTimeout(corpusFilterDebounce)
     startedSearchRunMisses.clear()
     seedSortCache.clear()
-    clearLogBuffer()
+    resetLogState()
     ;({
       ingestStats,
       ingestStatsStatus,
@@ -1911,10 +1934,19 @@
       seedActionBusy,
       seedLastRunKey,
       seedFilterQuery,
+      seedWarningMessage,
       searchQuery,
+      searchField,
+      searchAuthor,
+      yearFrom,
+      yearTo,
       searchMaxResults,
+      searchSort,
       searchStatus,
+      searchPreview,
+      searchWarning,
       startedSearchRunIds,
+      uploads,
       corpusItems,
       corpusTotal,
       corpusHasMore,
@@ -1925,6 +1957,11 @@
       downloads,
       downloadsSource,
       downloadsQuery,
+      workerBacklog,
+      exportStatus,
+      shareUsername,
+      shareRole,
+      shareStatus,
       logs,
       logsCursor,
       logsHasMore,
@@ -1936,6 +1973,31 @@
     resetKantroposAssignmentState()
     resetUpstreamBrowseState()
     finishExtractionProgress()
+    if (signOut) {
+      // null makes the Admin tab fetch the settings again.
+      appSettings = null
+      appSettingsDraft = {}
+      appSettingsStatus = ''
+      appSettingsError = false
+      inviteUsername = ''
+      inviteEmail = ''
+      inviteStatus = ''
+      inviteError = false
+      globalIngestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
+      globalWorkerBacklog = { raw_pending: 0, enriching: 0, matched: 0, queued_download: 0, downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
+      kantroposTargets = []
+      selectedUpstreamTargetId = ''
+      openalexQuota = null
+      // The signed-out user's view choices.
+      relatedSort = 'most_cited'
+      promotionMode = 'new_seed'
+      corpusSort = ''
+      downloadsStatusFilter = 'all'
+      exportFilterStatus = 'all'
+      exportFilterYearFrom = ''
+      exportFilterYearTo = ''
+      exportFilterSource = ''
+    }
   }
 
   async function handleSelectCorpus(event) {
@@ -1943,19 +2005,23 @@
     corpusActionError = false
     const nextId = Number(event.target.value)
     if (!nextId) return
+    // An answer that arrives after a sign-out (or a newer sign-in) is dropped.
+    const epoch = sessionEpoch
     try {
       await selectCorpus(nextId)
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || nextId
       resetFrontendState()
       await refreshAll()
+      if (epoch !== sessionEpoch) return
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       corpusActionStatus = error.message || 'Failed to select corpus.'
       corpusActionError = true
     }
@@ -1968,21 +2034,24 @@
     const name = window.prompt('New corpus name')
     if (!name) return
     creatingCorpus = true
+    const epoch = sessionEpoch
     try {
       await createCorpus(name.trim())
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId
       resetFrontendState()
       await refreshAll()
+      if (epoch !== sessionEpoch) return
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
       corpusActionStatus = `Created corpus "${name.trim()}".`
       corpusActionError = false
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       corpusActionStatus = error.message || 'Failed to create corpus.'
       corpusActionError = true
     } finally {
@@ -2014,14 +2083,17 @@
     deletingCorpus = true
     corpusActionStatus = `Deleting "${corpusName}"...`
     corpusActionError = false
+    const epoch = sessionEpoch
     try {
       const payload = await deleteCorpusApi(currentCorpusId)
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || payload?.selected_corpus_id || corpora[0]?.id || null
       resetFrontendState()
       await refreshAll()
+      if (epoch !== sessionEpoch) return
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
@@ -2029,7 +2101,7 @@
       corpusActionStatus = `Deleted corpus "${deletedName}".`
       corpusActionError = false
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       corpusActionStatus = error.message || 'Failed to delete corpus.'
       corpusActionError = true
     } finally {
@@ -3418,12 +3490,14 @@
       const poll = !append && quiet && preserveSelection
       const query = { q: corpusFilterQuery, sort: corpusSort }
       let { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
-      const currentCorpusNumeric = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
       // answered for the token's corpus, which is the one fetchMe reports.
-      const switchedCorpus = requestCorpusId !== null && requestCorpusId !== currentCorpusNumeric
-      if (requestSeq !== corpusLoadRequestSeq || switchedCorpus) {
+      const corpusScopeChanged = () => {
+        const nowCorpus = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
+        return requestCorpusId !== null && requestCorpusId !== nowCorpus
+      }
+      if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) {
         return
       }
       // Committed only once the rows are replaced: a failed prefix reload
@@ -3434,14 +3508,26 @@
         if (poll && pageSignature === lastCorpusPageSignature) return
         // The first page changed while more pages are loaded: a fresh page in
         // front of the old tail would shift the offsets (rows lost or doubled
-        // on the next "Show more"), so reload everything loaded in one request.
+        // on the next "Show more"), so reload every loaded row, in sequential
+        // pages of at most CORPUS_POLL_PAGE_ROWS. The rows are replaced only
+        // once every page answered; a failed page throws and changes nothing.
         if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
-          ;({ data, total, source, stageTotals } = await fetchCorpus({
-            limit: Math.min(corpusItems.length, CORPUS_POLL_MAX_ROWS),
-            offset: 0,
-            ...query,
-          }))
-          if (requestSeq !== corpusLoadRequestSeq) return
+          const loadedRows = corpusItems.length
+          const prefix = []
+          for (let pageOffset = 0; pageOffset < loadedRows; pageOffset += CORPUS_POLL_PAGE_ROWS) {
+            const answer = await fetchCorpus({
+              limit: Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset),
+              offset: pageOffset,
+              ...query,
+            })
+            if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) return
+            const rows = Array.isArray(answer.data) ? answer.data : []
+            prefix.push(...rows)
+            ;({ total, source, stageTotals } = answer)
+            // The corpus ends before the loaded count (rows were removed).
+            if (rows.length < Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset)) break
+          }
+          data = prefix
         }
       }
       const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
@@ -3667,8 +3753,10 @@
 
   async function loadAppSettings() {
     if (!isAdmin) return
+    const epoch = sessionEpoch
     try {
       const payload = await fetchAppSettings()
+      if (epoch !== sessionEpoch) return
       appSettings = payload?.settings || null
       // Secrets are never returned, so their draft fields start blank and a
       // blank field means "leave unchanged" on save.
@@ -3768,6 +3856,7 @@
   // (Refresh from file, type/filter change) replace the view with the tail.
   async function hydrateLogsFromTail({ force = false } = {}) {
     if (!force && (logs.length > 0 || logBuffer.length > 0)) return
+    const epoch = logsScopeEpoch
     logsTailStatus = 'Loading recent logs...'
     try {
       const payload = await fetchLogsTail({
@@ -3777,6 +3866,7 @@
         cursor: 0,
         corpusId: getLogsCorpusId(),
       })
+      if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       // The tail replaces the view: pending lines are dropped, not appended
       // after it (the backend persists a line before broadcasting it, so the
@@ -3791,13 +3881,19 @@
       logsHasMore = Boolean(payload?.has_more)
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== logsScopeEpoch) return
       logsTailStatus = error?.message || 'Failed to load persisted logs.'
     }
   }
 
   async function loadOlderLogs() {
     if (logsLoadingOlder || !logsHasMore) return
+    // The cursor counts the newest lines already shown; buffered lines are
+    // in the file too, so they go into the view (and the cursor) first, or
+    // the page would repeat lines and skip as many older ones.
+    flushLogs()
+    const epoch = logsScopeEpoch
+    const cursorAtRequest = logsCursor
     logsLoadingOlder = true
     logsTailStatus = 'Loading older logs...'
     try {
@@ -3805,23 +3901,28 @@
         type: logsType,
         lines: maxLogs,
         includeRotated: true,
-        cursor: logsCursor,
+        cursor: cursorAtRequest,
         corpusId: getLogsCorpusId(),
       })
+      if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       if (entries.length > 0) {
         logs = [...toLogEntries(entries), ...logs].slice(-maxLogHistory)
       }
-      logsCursor = Number.isFinite(Number(payload?.next_cursor))
+      // Lines flushed while the request was pending advanced the cursor;
+      // keep that advance on top of the answer's.
+      const advanced = logsCursor - cursorAtRequest
+      const nextCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
-        : logsCursor + entries.length
+        : cursorAtRequest + entries.length
+      logsCursor = nextCursor + advanced
       logsHasMore = Boolean(payload?.has_more)
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} older log lines.` : 'No older logs found.'
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== logsScopeEpoch) return
       logsTailStatus = error?.message || 'Failed to load older logs.'
     } finally {
-      logsLoadingOlder = false
+      if (epoch === logsScopeEpoch) logsLoadingOlder = false
     }
   }
 
@@ -4206,9 +4307,12 @@
           </p>
         </div>
         <div class="header-stats">
-          <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
-          <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
-          <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+          <!-- The graph tab does not load these counts (resourcesFor), so it does not show them. -->
+          {#if activeTab !== 'graph'}
+            <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
+            <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
+            <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+          {/if}
           <span title="Whether the app's backend server answered the most recent request">backend <strong class:status-bad={apiStatus === 'offline'}>{backendStatusLabel}</strong></span>
         </div>
         <div class="header-main__top">

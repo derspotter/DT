@@ -12,12 +12,20 @@ const maxLogHistory = Number(
 
 type TailBody = { entries: string[]; next_cursor: number; has_more: boolean }
 
-async function boot(page: Page, hash: string) {
+// `file`, when given, is the persisted log: every tail request is answered
+// from it by offset (cursor = newest lines to skip), as the backend pages.
+async function boot(page: Page, hash: string, file: string[] | null = null) {
   const handle: { socket: WebSocketRoute | null; connects: number } = { socket: null, connects: 0 }
   const errors: string[] = []
   // `tail.answer`, when set, answers the next /api/logs/tail request (and is
   // then cleared); every tail request's cursor is recorded.
-  const tail: { answer: (() => Promise<TailBody>) | null; cursors: string[] } = { answer: null, cursors: [] }
+  // `tail.hold`, when set, delays the next file-backed answer until it resolves.
+  const tail: {
+    answer: (() => Promise<TailBody>) | null
+    cursors: string[]
+    file: string[] | null
+    hold: Promise<void> | null
+  } = { answer: null, cursors: [], file, hold: null }
   page.on('pageerror', (error) => errors.push(error.message))
   await mockLogSocket(page, (ws) => {
     handle.socket = ws
@@ -34,6 +42,17 @@ async function boot(page: Page, hash: string) {
     }
     if (path === '/api/logs/tail') {
       tail.cursors.push(url.searchParams.get('cursor') || '')
+      if (tail.file) {
+        const skip = Number(url.searchParams.get('cursor') || 0)
+        const lines = Number(url.searchParams.get('lines') || 200)
+        const end = Math.max(0, tail.file.length - skip)
+        const start = Math.max(0, end - lines)
+        const body = { entries: tail.file.slice(start, end), next_cursor: skip + (end - start), has_more: start > 0 }
+        const hold = tail.hold
+        tail.hold = null
+        if (hold) await hold
+        return fulfil(route, body)
+      }
       const answer = tail.answer
       tail.answer = null
       return fulfil(route, answer ? await answer() : { entries: [], next_cursor: 0, has_more: false })
@@ -171,4 +190,54 @@ test('Refresh from file replaces the rendered lines with the tail and continues 
   await page.getByRole('button', { name: 'Load older' }).click()
   await expect.poll(() => tail.cursors.length).toBe(3)
   expect(tail.cursors[2]).toBe('3')
+})
+
+test('Load older pages through the file without gaps or duplicates while lines arrive', async ({ page }) => {
+  const line = (n: number) => `[pipeline] file line ${n}`
+  const file = Array.from({ length: 450 }, (_, i) => line(i + 1))
+  const { handle, tail } = await boot(page, '#/logs', file)
+  await expect(panel(page)).toHaveAttribute('data-log-count', '200')
+  await expect(page.locator('.log-line').first()).toHaveText(line(251))
+
+  // Line 451 is persisted and broadcast; it is still buffered when
+  // "Load older" is clicked.
+  let release: () => void = () => {}
+  tail.hold = new Promise<void>((resolve) => { release = resolve })
+  file.push(line(451))
+  handle.socket!.send(line(451))
+  await page.getByRole('button', { name: 'Load older' }).click()
+  await expect.poll(() => tail.cursors.length).toBe(2)
+  // Line 452 arrives (and is flushed) while the older page is in flight.
+  file.push(line(452))
+  handle.socket!.send(line(452))
+  await page.waitForTimeout(500)
+  release()
+  await expect(panel(page)).toHaveAttribute('data-log-count', '402')
+
+  await page.getByRole('button', { name: 'Load older' }).click()
+  await expect(panel(page)).toHaveAttribute('data-log-count', '452')
+  await expect(page.getByRole('button', { name: 'Load older' })).toBeDisabled()
+
+  expect(tail.cursors).toEqual(['0', '201', '402'])
+  const texts = await page.locator('.log-line').allTextContents()
+  expect(texts).toEqual(Array.from({ length: 452 }, (_, i) => line(i + 1)))
+})
+
+test('a tail answer requested before a log type change is dropped', async ({ page }) => {
+  const { tail } = await boot(page, '#/logs')
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  tail.answer = async () => {
+    await held
+    return { entries: ['[pipeline] stale line'], next_cursor: 1, has_more: true }
+  }
+  await page.getByRole('button', { name: 'Refresh from file' }).click()
+  await expect.poll(() => tail.cursors.length).toBe(2)
+  await page.getByTestId('logs-type-select').selectOption('app')
+  await expect.poll(() => tail.cursors.length).toBe(3)
+  await page.waitForTimeout(200)
+  release()
+  await page.waitForTimeout(500)
+  await expect(page.getByText('[pipeline] stale line', { exact: true })).toHaveCount(0)
+  await expect(panel(page)).toHaveAttribute('data-log-count', '0')
 })

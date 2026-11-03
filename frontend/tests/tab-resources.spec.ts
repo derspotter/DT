@@ -32,6 +32,8 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     statsDownloaded: 1,
     // Answer the next multi-page reload from offset 0 with a 503.
     failPrefixReloads: 0,
+    // Answer the next corpus request at this offset with a 503.
+    failOffset: null as number | null,
   }
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -55,6 +57,10 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       if (delays.corpus) await new Promise((resolve) => setTimeout(resolve, delays.corpus))
       const limit = Number(url.searchParams.get('limit') || CORPUS_PAGE_SIZE)
       const offset = Number(url.searchParams.get('offset') || 0)
+      if (state.failOffset !== null && offset === state.failOffset) {
+        state.failOffset = null
+        return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'busy' }) })
+      }
       if (state.failPrefixReloads > 0 && offset === 0 && limit > CORPUS_PAGE_SIZE) {
         state.failPrefixReloads -= 1
         return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'busy' }) })
@@ -216,6 +222,12 @@ test('the header counts load on a tab that does not render them itself', async (
 
 test('the graph tab requests none of the header reads', async ({ page }) => {
   const { count } = await boot(page, { hash: '#/graph' })
+  // It does not render the counters it does not load.
+  const header = page.locator('.header-stats')
+  await expect(header).toContainText('backend')
+  for (const label of ['items found', 'items promoted', 'items downloaded']) {
+    await expect(header).not.toContainText(label)
+  }
   expect(count('/api/ingest/stats')).toBe(0)
   expect(count('/api/corpus')).toBe(0)
   expect(count('/api/seed/sources')).toBe(0)
@@ -268,5 +280,45 @@ test('a failed prefix reload is retried by the next poll', async ({ page }) => {
   expect(ids).toContain('1000')
   expect(ids.length).toBe(301)
   expect(new Set(ids).size).toBe(301)
+  expect(errors).toEqual([])
+})
+
+test('a changed first page reloads every loaded row in bounded pages', async ({ page }) => {
+  test.setTimeout(90_000)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(String(error)))
+  const { state, log, reset } = await boot(page, { corpusTotal: 1400 })
+  const panel = page.getByTestId('corpus-panel')
+  for (let loaded = CORPUS_PAGE_SIZE * 2; loaded <= 1320; loaded += CORPUS_PAGE_SIZE) {
+    await panel.getByRole('button', { name: 'Show more' }).click()
+    await expect(panel).toContainText(`Loaded ${loaded}/1400`)
+  }
+  const tableIds = () => panel.locator('.corpus-table').evaluate((table) =>
+    [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
+  )
+  const corpusRequests = () => log
+    .filter((e) => e.path === '/api/corpus')
+    .map((e) => `${e.search.get('limit')}@${e.search.get('offset')}`)
+
+  // A leading insert; the prefix reload's second page fails first.
+  state.corpusIds = [5000, ...state.corpusIds]
+  state.failOffset = 1000
+  reset()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '320@1000'])
+  await page.waitForTimeout(300)
+  // Rows and signature untouched: the old rows stay, the next poll retries.
+  await expect(panel).toContainText('Loaded 1320/1400')
+  expect((await tableIds())[0]).toBe('1')
+
+  reset()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '320@1000'])
+  await expect(panel).toContainText('Loaded 1320/1401')
+  const ids = await tableIds()
+  expect(ids.length).toBe(1320)
+  expect(new Set(ids).size).toBe(1320)
+  expect(ids[0]).toBe('5000')
+  expect(ids[1319]).toBe('1319')
   expect(errors).toEqual([])
 })
