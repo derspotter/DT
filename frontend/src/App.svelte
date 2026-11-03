@@ -256,16 +256,27 @@
   let expandedSeedSourceId = ''
   let seedCandidatesBySource = {}
   let seedCandidatesLoading = {}
-  let seedSelections = {}
-  let seedSelectionVersions = {}
+  // Shared stand-in for "nothing selected"; never mutated (selections are
+  // always replaced with a new Set).
+  const EMPTY_SET = Object.freeze(new Set())
+  const EMPTY_LIST = Object.freeze([])
+  let seedSelections = {}    // sourceId -> Set of candidate keys, replaced (never mutated) on change
+  // sortSeedCandidates memo, per source id on (candidates array reference,
+  // sort string): the seed list re-renders on every poll, and re-sorting
+  // every seed each time was wasted work. Candidate arrays are replaced,
+  // never mutated, on load.
+  const seedSortCache = new Map()
   let seedSorts = {}
   let seedPages = {}          // sourceId -> { total, offset, limit }
   let seedAllSelected = {}    // sourceId -> true when "All N items selected"
   let seedAppending = {}      // sourceId -> true while a "Show more" append is in flight
   const SEED_PAGE_SIZE = 200
 
-  function seedPage(source) {
-    return seedPages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
+  // Template callers pass `pages` (and the other trailing arguments of the
+  // seed helpers below) so Svelte tracks that state: in legacy mode a call in
+  // the markup only re-runs when one of its arguments changes.
+  function seedPage(source, pages = seedPages) {
+    return pages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
   }
   function seedSortParams(source) {
     const current = parseSort(seedSorts[seedSourceId(source)])
@@ -1811,6 +1822,7 @@
     clearTimeout(seedFilterDebounce)
     clearTimeout(corpusFilterDebounce)
     startedSearchRunMisses.clear()
+    seedSortCache.clear()
     ;({
       ingestStats,
       ingestStatsStatus,
@@ -2313,6 +2325,7 @@
       seedSelections = Object.fromEntries(
         Object.entries(seedSelections).filter(([key]) => key !== sourceId)
       )
+      seedSortCache.delete(sourceId)
       selectedSeedCandidateKeys = Object.fromEntries(
         Object.entries(selectedSeedCandidateKeys).filter(([key]) => key !== sourceId)
       )
@@ -2331,6 +2344,11 @@
         }
       }
     }
+    // A paged seed (e.g. a 70,000-item search) only has its first page(s)
+    // loaded: counting those would overwrite the server's totals. Recount
+    // client-side only once the seed is fully loaded.
+    const page = seedPages[sourceId]
+    if (page && nextCandidates.length < page.total) return
     const nextCounts = summarizeSeedCandidateStates(nextCandidates)
     seedSources = seedSources.map((source) => {
       if (seedSourceId(source) !== sourceId) return source
@@ -2381,9 +2399,6 @@
     return workState(candidate?.state) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
   }
 
-  // The seed tables render inside {#key ...} blocks, so selectability changes
-  // driven by the Promotion Settings need to appear in the key itself.
-  $: downstreamPromotesAll = includeDownstream && relatedDepthDownstream >= 1
   $: expansionEnabled = (includeDownstream && relatedDepthDownstream >= 1) || (includeUpstream && relatedDepthUpstream >= 1)
 
   // Debounced so typing does not fire a request per keystroke. Both reset to
@@ -2500,6 +2515,16 @@
   }
 
   function sortSeedCandidates(source, candidates, sorts = seedSorts) {
+    const sourceId = seedSourceId(source)
+    const sortKey = String(sorts[sourceId] || '')
+    const cached = seedSortCache.get(sourceId)
+    if (cached && cached.candidates === candidates && cached.sortKey === sortKey) return cached.sorted
+    const sorted = computeSortedSeedCandidates(source, candidates, sorts)
+    seedSortCache.set(sourceId, { candidates, sortKey, sorted })
+    return sorted
+  }
+
+  function computeSortedSeedCandidates(source, candidates, sorts) {
     // Search seeds are already sorted server-side across the full result set
     // (see toggleSeedSort); re-sorting the loaded page client-side would only
     // reorder what happens to be loaded, not the whole set. PDF seeds load in
@@ -2527,12 +2552,25 @@
   }
 
   function getSeedSelectionForSource(source) {
-    return seedSelections[seedSourceId(source)] || []
+    return seedSelections[seedSourceId(source)] || EMPTY_SET
+  }
+
+  // Keys of the loaded candidates that can currently be selected.
+  function loadedSelectableKeys(source) {
+    return getSeedCandidatesForSource(source)
+      .filter((candidate) => isSeedCandidateSelectable(candidate))
+      .map((candidate) => String(candidate?.candidate_key || ''))
+      .filter(Boolean)
   }
 
   function selectedSeedCount(source) {
     const sourceId = seedSourceId(source)
-    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).length
+    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).size
+  }
+
+  function isSeedFullySelected(source) {
+    const selectableCount = estimatedSelectableSeedCount(source)
+    return selectableCount > 0 && selectedSeedCount(source) === selectableCount
   }
 
   function getSelectedSeedCandidate(source) {
@@ -2544,21 +2582,23 @@
     ) || null
   }
 
-  function selectableSeedCount(source) {
-    return getSeedCandidatesForSource(source).filter((candidate) => isSeedCandidateSelectable(candidate)).length
+  function selectableSeedCount(source, loaded = getSeedCandidatesForSource(source), downstreamOn = includeDownstream, downstreamDepth = relatedDepthDownstream) {
+    return loaded.filter((candidate) => isSeedCandidateSelectable(candidate, downstreamOn, downstreamDepth)).length
   }
 
-  function estimatedSelectableSeedCount(source) {
-    const sourceId = seedSourceId(source)
-    const page = seedPages[sourceId]
-    const loaded = seedCandidatesBySource[sourceId]
+  function estimatedSelectableSeedCount(
+    source,
+    page = seedPages[seedSourceId(source)],
+    loaded = seedCandidatesBySource[seedSourceId(source)],
+    loadedSelectableCount = null,
+  ) {
     const total = page ? page.total : Number(source?.candidate_count || 0)
     // Once every row is actually loaded, count selectability exactly instead
     // of estimating — isSeedCandidateSelectable excludes more than just
     // in_corpus/downloaded (e.g. the includeDownstream override), so this is
     // strictly more accurate than any formula below.
     if (page && Array.isArray(loaded) && loaded.length >= total) {
-      return selectableSeedCount(source)
+      return loadedSelectableCount ?? selectableSeedCount(source, loaded)
     }
     // state_counts is not resolved server-side above the metadata/download
     // sort limit (Task 5) — in that case the total is the best estimate.
@@ -2570,10 +2610,6 @@
     const inCorpus = Number(stateCounts.in_corpus || 0)
     const downloaded = Number(stateCounts.downloaded || 0)
     return Math.max(0, total - inCorpus - downloaded)
-  }
-
-  function isSeedCandidateSelected(source, candidate) {
-    return getSeedSelectionForSource(source).includes(String(candidate?.candidate_key || ''))
   }
 
   function setSelectedSeedCandidate(source, candidate) {
@@ -2590,43 +2626,34 @@
     const sourceId = seedSourceId(source)
     const candidateKey = String(candidate?.candidate_key || '')
     if (!sourceId || !candidateKey || !isSeedCandidateSelectable(candidate)) return
-    const current = seedSelections[sourceId] || []
-    const isSelected = current.includes(candidateKey)
+    const current = getSeedSelectionForSource(source)
+    const isSelected = current.has(candidateKey)
     if (isSelected && seedAllSelected[sourceId]) {
       // Deselecting one row out of "all N selected" drops into explicit mode:
       // everything else that's loaded stays selected, just not this row.
       seedAllSelected = { ...seedAllSelected, [sourceId]: false }
-      const loadedSelectableKeys = getSeedCandidatesForSource(source)
-        .filter((entry) => isSeedCandidateSelectable(entry))
-        .map((entry) => String(entry?.candidate_key || ''))
-        .filter(Boolean)
-      seedSelections = { ...seedSelections, [sourceId]: loadedSelectableKeys.filter((key) => key !== candidateKey) }
-      seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+      const next = new Set(loadedSelectableKeys(source))
+      next.delete(candidateKey)
+      seedSelections = { ...seedSelections, [sourceId]: next }
       return
     }
-    seedSelections = isSelected
-      ? { ...seedSelections, [sourceId]: current.filter((value) => value !== candidateKey) }
-      : { ...seedSelections, [sourceId]: [...current, candidateKey] }
-    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+    const next = new Set(current)
+    if (isSelected) next.delete(candidateKey)
+    else next.add(candidateKey)
+    seedSelections = { ...seedSelections, [sourceId]: next }
   }
 
   function clearSeedSelection(source) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
-    seedSelections = { ...seedSelections, [sourceId]: [] }
+    seedSelections = { ...seedSelections, [sourceId]: new Set() }
     seedAllSelected = { ...seedAllSelected, [sourceId]: false }
-    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
   }
 
   function selectAllSeedCandidates(source) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
-    const keys = getSeedCandidatesForSource(source)
-      .filter((candidate) => isSeedCandidateSelectable(candidate))
-      .map((candidate) => String(candidate.candidate_key || ''))
-      .filter(Boolean)
-    seedSelections = { ...seedSelections, [sourceId]: keys }
-    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+    seedSelections = { ...seedSelections, [sourceId]: new Set(loadedSelectableKeys(source)) }
   }
 
   async function setAllSeedCandidatesSelected(source, checked) {
@@ -2668,6 +2695,9 @@
       seedSelections = Object.fromEntries(
         Object.entries(seedSelections).filter(([key]) => validSourceIds.has(key))
       )
+      for (const key of seedSortCache.keys()) {
+        if (!validSourceIds.has(key)) seedSortCache.delete(key)
+      }
       if (!quiet) {
         seedSourcesStatus = seedSources.length > 0
           ? `Loaded ${seedSources.length} seed${seedSources.length === 1 ? '' : 's'}.`
@@ -2769,16 +2799,14 @@
       if (nextCandidates.length === 0) {
         return
       }
-      const allowed = new Set(nextCandidates.map((candidate) => String(candidate.candidate_key || '')).filter(Boolean))
-      const selectable = new Set(
-        nextCandidates
-          .filter((candidate) => isSeedCandidateSelectable(candidate))
-          .map((candidate) => String(candidate.candidate_key || ''))
-          .filter(Boolean)
-      )
-      seedSelections = {
-        ...seedSelections,
-        [sourceId]: (seedSelections[sourceId] || []).filter((key) => allowed.has(key) && selectable.has(key)),
+      // Keep only selected keys that are still loaded and selectable.
+      const selectable = new Set(loadedSelectableKeys(source))
+      const current = getSeedSelectionForSource(source)
+      if ([...current].some((key) => !selectable.has(key))) {
+        seedSelections = {
+          ...seedSelections,
+          [sourceId]: new Set([...current].filter((key) => selectable.has(key))),
+        }
       }
       if (!quiet) {
         seedActionStatus = ''
@@ -2925,7 +2953,7 @@
       await handlePromoteWholeSeedSource(source)
       return
     }
-    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    const candidateKeys = [...getSeedSelectionForSource(source)]
     await promoteSeedCandidateKeys(source, candidateKeys, { clearSelection: true })
   }
 
@@ -3005,7 +3033,7 @@
   async function handleDismissSelectedSeed(source) {
     const sourceId = seedSourceId(source)
     const allSelected = Boolean(seedAllSelected[sourceId])
-    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    const candidateKeys = [...getSeedSelectionForSource(source)]
     if (!allSelected && candidateKeys.length === 0) {
       seedActionStatus = 'Select at least one seed candidate to dismiss.'
       return
@@ -3047,6 +3075,7 @@
       seedSelections = Object.fromEntries(
         Object.entries(seedSelections).filter(([key]) => key !== sourceId)
       )
+      seedSortCache.delete(sourceId)
       if (expandedSeedSourceId === sourceId) {
         expandedSeedSourceId = ''
       }
@@ -4439,8 +4468,14 @@
               {#each seedSources as source (seedSourceId(source))}
                 {@const sourceId = seedSourceId(source)}
                 {@const isExpanded = expandedSeedSourceId === sourceId}
-                {@const sourceCandidates = sortSeedCandidates(source, getSeedCandidatesForSource(source), seedSorts)}
-                {@const selectionVersion = seedSelectionVersions[sourceId] || 0}
+                {@const loaded = seedCandidatesBySource[sourceId]}
+                {@const sourceCandidates = sortSeedCandidates(source, loaded || EMPTY_LIST, seedSorts)}
+                {@const page = seedPage(source, seedPages)}
+                {@const selection = seedSelections[sourceId] || EMPTY_SET}
+                {@const selectedCount = seedAllSelected[sourceId] ? page.total : selection.size}
+                {@const loadedSelectableCount = selectableSeedCount(source, loaded || EMPTY_LIST, includeDownstream, relatedDepthDownstream)}
+                {@const selectableCount = estimatedSelectableSeedCount(source, seedPages[sourceId], loaded, loadedSelectableCount)}
+                {@const fullySelected = selectableCount > 0 && selectedCount === selectableCount}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
                     class="seed-source__summary"
@@ -4460,24 +4495,26 @@
                   >
                     <div class="seed-source__summary-main">
                       <div class="seed-source__heading">
-                        {#key `${sourceId}:summary-selection:${selectionVersion}`}
-                          <label
-                            class="seed-source__select"
-                            title={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)
-                              ? 'Clear all items in this seed'
-                              : 'Select all items in this seed'}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)}
-                              disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
-                              aria-label="Select all items in this seed"
-                              on:click|stopPropagation
-                              on:keydown|stopPropagation
-                              on:change|stopPropagation={(e) => setAllSeedCandidatesSelected(source, e.currentTarget.checked)}
-                            />
-                          </label>
-                        {/key}
+                        <label
+                          class="seed-source__select"
+                          title={fullySelected ? 'Clear all items in this seed' : 'Select all items in this seed'}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={fullySelected}
+                            disabled={seedActionBusy || selectableCount === 0}
+                            aria-label="Select all items in this seed"
+                            on:click|stopPropagation
+                            on:keydown|stopPropagation
+                            on:change|stopPropagation={async (e) => {
+                              const input = e.currentTarget
+                              await setAllSeedCandidatesSelected(source, input.checked)
+                              // The click flipped the DOM state; if the model did not follow
+                              // (nothing selectable loaded), put it back.
+                              input.checked = isSeedFullySelected(source)
+                            }}
+                          />
+                        </label>
                         {#if source.seed_kind === 'snowball'}
                           <span
                             class="tag snowball"
@@ -4502,30 +4539,28 @@
                       {/if}
                     </div>
                     <div class="seed-source__summary-side">
-                      {#key `${sourceId}:summary-actions:${selectionVersion}`}
-                        <div class="seed-source__summary-actions">
-                          <button
-                            class="seed-source__action seed-source__action--promote"
-                            type="button"
-                            disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
-                            title={estimatedSelectableSeedCount(source) === 0 ? 'No promotable items remain in this seed' : 'Promote all promotable items from this seed'}
-                            aria-label="Promote all promotable items"
-                            on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
-                          >
-                            →
-                          </button>
-                          <button
-                            class="seed-source__action seed-source__action--remove"
-                            type="button"
-                            disabled={seedActionBusy}
-                            title="Remove this seed and its items"
-                            aria-label="Remove seed"
-                            on:click|stopPropagation={() => handleRemoveSeedSource(source)}
-                          >
-                            ×
-                          </button>
-                        </div>
-                      {/key}
+                      <div class="seed-source__summary-actions">
+                        <button
+                          class="seed-source__action seed-source__action--promote"
+                          type="button"
+                          disabled={seedActionBusy || selectableCount === 0}
+                          title={selectableCount === 0 ? 'No promotable items remain in this seed' : 'Promote all promotable items from this seed'}
+                          aria-label="Promote all promotable items"
+                          on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
+                        >
+                          →
+                        </button>
+                        <button
+                          class="seed-source__action seed-source__action--remove"
+                          type="button"
+                          disabled={seedActionBusy}
+                          title="Remove this seed and its items"
+                          aria-label="Remove seed"
+                          on:click|stopPropagation={() => handleRemoveSeedSource(source)}
+                        >
+                          ×
+                        </button>
+                      </div>
                       <div class="pill-row">
                         <span class="pill" title="Total items found in this seed">{source.candidate_count} items</span>
                         {#if source.candidate_count - (source.state_counts?.in_corpus || 0) > 0}
@@ -4544,190 +4579,191 @@
 
                   {#if isExpanded}
                       <div class="seed-source__body">
-                        {#key `${sourceId}:toolbar:${selectionVersion}:${downstreamPromotesAll}`}
-                          <div class="table-toolbar">
-                            <div class="table-toolbar-left">
-                              <span class="muted">
-                                {#if seedAllSelected[sourceId]}
-                                  All {seedPage(source).total.toLocaleString('en-US')} items selected
-                                {:else}
-                                  Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable
-                                {/if}
-                              </span>
-                              <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
-                              <button class="secondary" type="button" on:click={() => setAllSeedCandidatesSelected(source, true)} disabled={seedActionBusy}>Select all</button>
-                              <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
-                            </div>
-                            <div class="table-toolbar-right">
-                              <div class="toolbar-actions">
-                                <button class="secondary" type="button" on:click={() => handleDismissSelectedSeed(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
-                                  Dismiss selected
-                                </button>
-                                <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
-                                  Promote to Corpus
-                                </button>
-                              </div>
+                        <div class="table-toolbar">
+                          <div class="table-toolbar-left">
+                            <span class="muted">
+                              {#if seedAllSelected[sourceId]}
+                                All {page.total.toLocaleString('en-US')} items selected
+                              {:else}
+                                Selected: {selectedCount} / {loadedSelectableCount} selectable
+                              {/if}
+                            </span>
+                            <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
+                            <button class="secondary" type="button" on:click={() => setAllSeedCandidatesSelected(source, true)} disabled={seedActionBusy}>Select all</button>
+                            <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
+                          </div>
+                          <div class="table-toolbar-right">
+                            <div class="toolbar-actions">
+                              <button class="secondary" type="button" on:click={() => handleDismissSelectedSeed(source)} disabled={seedActionBusy || selectedCount === 0}>
+                                Dismiss selected
+                              </button>
+                              <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedCount === 0}>
+                                Promote to Corpus
+                              </button>
                             </div>
                           </div>
-                        {/key}
+                        </div>
 
                         {#if seedCandidatesLoading[sourceId]}
                           <p class="muted">Loading items...</p>
                         {:else if sourceCandidates.length === 0}
                           <p class="muted">No active items remain in this seed.</p>
                         {:else}
-                          {#key `${sourceId}:selection:${selectionVersion}:${downstreamPromotesAll}`}
-                            <div class="table table-scroll seed-candidate-table">
-                              <div class="table-row header" style={seedGridStyle}>
-                                <span class="ingest-select-cell" aria-hidden="true"></span>
+                          <div class="table table-scroll seed-candidate-table">
+                            <div class="table-row header" style={seedGridStyle}>
+                              <span class="ingest-select-cell" aria-hidden="true"></span>
+                              {#each seedActiveColumns as column (column.key)}
+                                {@const sortDisabled = (column.key === 'metadata' || column.key === 'download') && source.source_type === 'search' && page.total > 2000}
+                                <span title={column.hint || ''}>
+                                  {#if column.sortable}
+                                    <button
+                                      class="table-sort"
+                                      type="button"
+                                      disabled={sortDisabled}
+                                      title={sortDisabled ? 'Sorting by state needs every item resolved; not available above 2,000 items' : ''}
+                                      on:click={() => toggleSeedSort(source, column.key)}
+                                    >
+                                      {column.label}{seedSortIndicator(source, column.key, seedSorts)}
+                                    </button>
+                                  {:else}
+                                    {column.label}
+                                  {/if}
+                                </span>
+                              {/each}
+                            </div>
+                            {#each sourceCandidates as candidate (candidate.candidate_key)}
+                              {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
+                              {@const candidateKey = String(candidate?.candidate_key || '')}
+                              {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
+                              {@const checked = selection.has(candidateKey)}
+                              {@const selectable = isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
+                              <div
+                                data-testid="seed-candidate-row"
+                                class={`table-row clickable ${checked ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                style={seedGridStyle}
+                                on:click={(e) => {
+                                  if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                                  setSelectedSeedCandidate(source, candidate);
+                                }}
+                                on:keydown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                                    e.preventDefault();
+                                    setSelectedSeedCandidate(source, candidate);
+                                  }
+                                }}
+                                role="button"
+                                aria-pressed={active}
+                                tabindex="0"
+                              >
+                                <span class="ingest-select-cell">
+                                  {#if selectable}
+                                    <input
+                                      type="checkbox"
+                                      {checked}
+                                      on:click|stopPropagation
+                                      on:change={(e) => {
+                                        setSelectedSeedCandidate(source, candidate);
+                                        toggleSeedCandidateSelection(source, candidate);
+                                        e.currentTarget.checked = getSeedSelectionForSource(source).has(candidateKey);
+                                      }}
+                                    />
+                                  {:else}
+                                    <input type="checkbox" disabled />
+                                  {/if}
+                                </span>
                                 {#each seedActiveColumns as column (column.key)}
-                                  {@const sortDisabled = (column.key === 'metadata' || column.key === 'download') && source.source_type === 'search' && seedPage(source).total > 2000}
-                                  <span title={column.hint || ''}>
-                                    {#if column.sortable}
+                                  {@const text = cellText(candidate, column.key, SEED_CELL)}
+                                  {#if column.key === 'corpus'}
+                                    <span class="seed-candidate__corpus-cell">
+                                      {#if isSeedCandidateInCorpus(candidate)}
+                                        <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                      {:else if selectable}
+                                        <button
+                                          class="seed-candidate__promote"
+                                          type="button"
+                                          title="Promote this item to the corpus using the current Promotion Settings"
+                                          aria-label={`Promote ${formatTitle(candidate)} to corpus`}
+                                          disabled={seedActionBusy}
+                                          on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                        >→ Promote</button>
+                                      {/if}
+                                    </span>
+                                  {:else if column.key === 'download' && canDownloadSeedCandidate(candidate)}
+                                    <span>
                                       <button
-                                        class="table-sort"
+                                        class="link seed-download-link"
                                         type="button"
-                                        disabled={sortDisabled}
-                                        title={sortDisabled ? 'Sorting by state needs every item resolved; not available above 2,000 items' : ''}
-                                        on:click={() => toggleSeedSort(source, column.key)}
-                                      >
-                                        {column.label}{seedSortIndicator(source, column.key, seedSorts)}
-                                      </button>
-                                    {:else}
-                                      {column.label}
-                                    {/if}
-                                  </span>
+                                        title={`Download the file from work ${candidate.downloaded_work_id}`}
+                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
+                                      >{text} ⤓</button>
+                                    </span>
+                                  {:else if column.key === 'authors'}
+                                    <span title={formatAuthors(candidate)}>{text}</span>
+                                  {:else}
+                                    <span title={text}>{text}</span>
+                                  {/if}
                                 {/each}
                               </div>
-                              {#each sourceCandidates as candidate (candidate.candidate_key)}
-                                {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
-                                {@const candidateKey = String(candidate?.candidate_key || '')}
-                                {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
-                                <div
-                                  class={`table-row clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
-                                  style={seedGridStyle}
-                                  on:click={(e) => {
-                                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                                    setSelectedSeedCandidate(source, candidate);
-                                  }}
-                                  on:keydown={(e) => {
-                                    if (e.key === 'Enter' || e.key === ' ') {
-                                      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                                      e.preventDefault();
-                                      setSelectedSeedCandidate(source, candidate);
-                                    }
-                                  }}
-                                  role="button"
-                                  aria-pressed={active}
-                                  tabindex="0"
-                                >
-                                  <span class="ingest-select-cell">
-                                    {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                      <input
-                                        type="checkbox"
-                                        checked={isSeedCandidateSelected(source, candidate)}
-                                        on:click|stopPropagation
-                                        on:change={() => {
-                                          setSelectedSeedCandidate(source, candidate);
-                                          toggleSeedCandidateSelection(source, candidate);
-                                        }}
-                                      />
-                                    {:else}
-                                      <input type="checkbox" disabled />
-                                    {/if}
-                                  </span>
-                                  {#each seedActiveColumns as column (column.key)}
-                                    {#if column.key === 'corpus'}
-                                      <span class="seed-candidate__corpus-cell">
-                                        {#if isSeedCandidateInCorpus(candidate)}
-                                          <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
-                                        {:else if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                          <button
-                                            class="seed-candidate__promote"
-                                            type="button"
-                                            title="Promote this item to the corpus using the current Promotion Settings"
-                                            aria-label={`Promote ${formatTitle(candidate)} to corpus`}
-                                            disabled={seedActionBusy}
-                                            on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
-                                          >→ Promote</button>
+                              {#if active}
+                                <div class="seed-inline-detail-row">
+                                  <div class="inline-detail-card">
+                                    <div class="inline-detail-main">
+                                      <div class="inline-detail-meta-row">
+                                        <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
+                                          Stage: {seedCandidateTag(candidate).label}
+                                        </span>
+                                        <span class="inline-detail-chip">Year: {candidate.year || '-'}</span>
+                                        <span class="inline-detail-chip">Author: {formatAuthors(candidate) || '-'}</span>
+                                        <span class="inline-detail-chip">Source: {candidate.source || candidate.publisher || '-'}</span>
+                                        <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
+                                          In Corpus: {isSeedCandidateInCorpus(candidate) ? 'Yes' : 'No'}
+                                        </span>
+                                        {#if candidate?.doi}
+                                          <a class="inline-detail-link" href={doiHref(candidate.doi)} target="_blank" rel="noreferrer">DOI</a>
                                         {/if}
-                                      </span>
-                                    {:else if column.key === 'download' && canDownloadSeedCandidate(candidate)}
-                                      <span>
-                                        <button
-                                          class="link seed-download-link"
-                                          type="button"
-                                          title={`Download the file from work ${candidate.downloaded_work_id}`}
-                                          on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
-                                        >{cellText(candidate, column.key, SEED_CELL)} ⤓</button>
-                                      </span>
-                                    {:else if column.key === 'authors'}
-                                      <span title={formatAuthors(candidate)}>{cellText(candidate, column.key, SEED_CELL)}</span>
-                                    {:else}
-                                      <span title={cellText(candidate, column.key, SEED_CELL)}>{cellText(candidate, column.key, SEED_CELL)}</span>
-                                    {/if}
-                                  {/each}
-                                </div>
-                                {#if active}
-                                  <div class="seed-inline-detail-row">
-                                    <div class="inline-detail-card">
-                                      <div class="inline-detail-main">
-                                        <div class="inline-detail-meta-row">
-                                          <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
-                                            Stage: {seedCandidateTag(candidate).label}
+                                        {#if candidate?.openalex_id}
+                                          <a class="inline-detail-link" href={openAlexHref(candidate.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
+                                        {/if}
+                                      </div>
+                                      <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
+                                        <span class="seed-refs-cell__down">↓ Refs: {cellText(candidate, 'refs', SEED_CELL)}</span>
+                                        <span class="seed-refs-cell__up">↑ Cited: {cellText(candidate, 'cited_by', SEED_CELL)}</span>
+                                      </div>
+                                      <div class="inline-detail-actions">
+                                        {#if selectable}
+                                          <button
+                                            class="primary"
+                                            type="button"
+                                            disabled={seedActionBusy}
+                                            title={expansionSummary
+                                              ? `Promote just this item (reference expansion is on: ${expansionSummary})`
+                                              : 'Promote just this item into the corpus'}
+                                            on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                          >
+                                            Promote this item
+                                          </button>
+                                          {#if expansionSummary}
+                                            <span class="muted small">Pulls in related works: {expansionSummary}, max {maxRelated}/paper.</span>
+                                          {/if}
+                                        {:else}
+                                          <span class="muted small">
+                                            {isSeedCandidateInCorpus(candidate) ? 'Already in this corpus.' : 'Already downloaded.'}
                                           </span>
-                                          <span class="inline-detail-chip">Year: {candidate.year || '-'}</span>
-                                          <span class="inline-detail-chip">Author: {formatAuthors(candidate) || '-'}</span>
-                                          <span class="inline-detail-chip">Source: {candidate.source || candidate.publisher || '-'}</span>
-                                          <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
-                                            In Corpus: {isSeedCandidateInCorpus(candidate) ? 'Yes' : 'No'}
-                                          </span>
-                                          {#if candidate?.doi}
-                                            <a class="inline-detail-link" href={doiHref(candidate.doi)} target="_blank" rel="noreferrer">DOI</a>
-                                          {/if}
-                                          {#if candidate?.openalex_id}
-                                            <a class="inline-detail-link" href={openAlexHref(candidate.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
-                                          {/if}
-                                        </div>
-                                        <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
-                                          <span class="seed-refs-cell__down">↓ Refs: {cellText(candidate, 'refs', SEED_CELL)}</span>
-                                          <span class="seed-refs-cell__up">↑ Cited: {cellText(candidate, 'cited_by', SEED_CELL)}</span>
-                                        </div>
-                                        <div class="inline-detail-actions">
-                                          {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                            <button
-                                              class="primary"
-                                              type="button"
-                                              disabled={seedActionBusy}
-                                              title={expansionSummary
-                                                ? `Promote just this item (reference expansion is on: ${expansionSummary})`
-                                                : 'Promote just this item into the corpus'}
-                                              on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
-                                            >
-                                              Promote this item
-                                            </button>
-                                            {#if expansionSummary}
-                                              <span class="muted small">Pulls in related works: {expansionSummary}, max {maxRelated}/paper.</span>
-                                            {/if}
-                                          {:else}
-                                            <span class="muted small">
-                                              {isSeedCandidateInCorpus(candidate) ? 'Already in this corpus.' : 'Already downloaded.'}
-                                            </span>
-                                          {/if}
-                                        </div>
+                                        {/if}
                                       </div>
                                     </div>
                                   </div>
-                                {/if}
-                              {/each}
+                                </div>
+                              {/if}
+                            {/each}
+                          </div>
+                          {#if page.total > sourceCandidates.length}
+                            <div class="seed-table-footer">
+                              <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {page.total.toLocaleString('en-US')}</span>
+                              <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId] || seedAppending[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
                             </div>
-                            {#if seedPage(source).total > sourceCandidates.length}
-                              <div class="seed-table-footer">
-                                <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {seedPage(source).total.toLocaleString('en-US')}</span>
-                                <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId] || seedAppending[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
-                              </div>
-                            {/if}
-                          {/key}
+                          {/if}
                         {/if}
                       </div>
                   {/if}
