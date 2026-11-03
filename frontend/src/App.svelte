@@ -3540,8 +3540,12 @@
 
   async function focusSeedSource(sourceType, sourceKey) {
     const nextSourceId = `${sourceType}:${sourceKey}`
+    // The seed belongs to the corpus current at entry; after a corpus reset
+    // during the reload, a same-named seed of the new corpus is not it.
+    const epoch = corpusScopeEpoch
     if (!seedSources.some((source) => seedSourceId(source) === nextSourceId)) {
       await loadSeedSources({ quiet: true })
+      if (epoch !== corpusScopeEpoch) return
     }
     const source = seedSources.find((entry) => seedSourceId(entry) === nextSourceId)
     if (!source) return

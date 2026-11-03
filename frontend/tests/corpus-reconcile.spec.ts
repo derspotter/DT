@@ -235,3 +235,69 @@ test('an extraction completion for corpus A does not act on corpus B after the s
   expect(candidateRequests).toEqual([])
   await expect(page.locator('.seed-intake-card--upload .tag.queued', { hasText: 'extracting' })).toHaveCount(0)
 })
+
+test('a corpus switch during the seed reload inside the completion focus does not expand B\'s seed', async ({ page }) => {
+  const state = { phase: 'A' as Phase }
+  let socket: WebSocketRoute | null = null
+  // 0: idle; 1: the completion's seed reload is next; 2: the nested reload in focusSeedSource is next.
+  let seedStage = 0
+  const seedHeld = deferred()
+  const releaseSeed = deferred()
+  const candidateRequests: string[] = []
+  await boot(
+    page,
+    state,
+    async (path, route) => {
+      if (path.startsWith('/api/seed/sources/pdf/paperA/candidates')) candidateRequests.push(path)
+      if (path === '/api/ingest/latest') {
+        seedStage = 1
+        await fulfil(route, { items: [{ id: 1, title: 'Entry in Alpha' }], seed_document: { title: 'Paper A' } })
+        return true
+      }
+      if (path === '/api/seed/sources' && seedStage === 1) {
+        // Corpus A's list does not show the seed yet, so focusSeedSource reloads.
+        seedStage = 2
+        await fulfil(route, { sources: [], total: 0, source: 'api' })
+        return true
+      }
+      if (path === '/api/seed/sources' && seedStage === 2) {
+        seedStage = 0
+        state.phase = 'B'
+        seedHeld.resolve()
+        await releaseSeed.promise
+        await fulfil(route, {
+          sources: [{ source_type: 'pdf', source_key: 'paperA', label: 'Seed in Beta', candidate_count: 1 }],
+          total: 1,
+          source: 'api',
+        })
+        return true
+      }
+      if (path === '/api/seed/sources' && state.phase === 'B') {
+        await fulfil(route, {
+          sources: [{ source_type: 'pdf', source_key: 'paperA', label: 'Seed in Beta', candidate_count: 1 }],
+          total: 1,
+          source: 'api',
+        })
+        return true
+      }
+      return false
+    },
+    (ws) => { socket = ws },
+  )
+  await expect(page.getByText('Item in Alpha')).toBeVisible()
+  await expect.poll(() => socket !== null).toBeTruthy()
+
+  const event = (extra: Record<string, unknown>) =>
+    JSON.stringify({ kind: 'extraction', corpus_id: 1, base_name: 'paperA', filename: 'paperA.pdf', ...extra })
+  socket!.send(event({ event: 'started' }))
+  socket!.send(event({ event: 'done', status: 'success' }))
+
+  await seedHeld.promise
+  await expect(picker(page)).toHaveValue('2', { timeout: 8000 })
+  await expect(page.getByText('Seed in Beta')).toBeVisible()
+
+  releaseSeed.resolve()
+  await page.waitForTimeout(1500)
+  expect(candidateRequests).toEqual([])
+  await expect(page.locator('.seed-source.expanded')).toHaveCount(0)
+})
