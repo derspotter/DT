@@ -612,6 +612,29 @@
     }
   }
 
+  // The backend persists a line before broadcasting it, so a tail snapshot can
+  // already hold the oldest buffered lines. Drop the buffered prefix that the
+  // tail ends with (the longest buffer prefix whose last lines equal the tail's
+  // last lines); the buffered lines after it are newer than the snapshot.
+  function dropBufferedTailOverlap(tailLines) {
+    const last = tailLines.length
+    if (logBuffer.length === 0 || last === 0) return
+    for (let j = logBuffer.length; j > 0; j -= 1) {
+      const overlap = Math.min(j, last)
+      let matches = true
+      for (let k = 1; k <= overlap; k += 1) {
+        if (logBuffer[j - k].text !== String(tailLines[last - k])) {
+          matches = false
+          break
+        }
+      }
+      if (matches) {
+        logBuffer = logBuffer.slice(j)
+        return
+      }
+    }
+  }
+
   function tryParseJson(data) {
     if (typeof data !== 'string') return null
     try {
@@ -3775,6 +3798,9 @@
         corpusId: getLogsCorpusId(),
       })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
+      // Buffered lines the tail already holds are not appended (or counted
+      // into the cursor) a second time by the next flush.
+      dropBufferedTailOverlap(entries)
       logs = toLogEntries(entries.slice(-maxLogHistory))
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
@@ -3936,8 +3962,10 @@
     hydrateLogsFromTail({ force: true })
   }
 
+  // Transport teardown only: buffered lines survive a reconnect. They are
+  // dropped with the log state (resetLogState, resetFrontendState on sign-out
+  // and corpus switch).
   function disconnectLogs() {
-    clearLogBuffer()
     if (logsReconnectTimer) {
       clearTimeout(logsReconnectTimer)
       logsReconnectTimer = null
@@ -4084,6 +4112,7 @@
       reducedMotionMediaQuery?.removeEventListener?.('change', onReducedMotionChange)
       reducedMotionMediaQuery = null
       disconnectLogs()
+      clearLogBuffer()
       refreshDisposed = true
       if (refreshTimer) {
         clearTimeout(refreshTimer)
