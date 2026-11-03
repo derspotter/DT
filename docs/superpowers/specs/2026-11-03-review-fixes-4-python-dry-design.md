@@ -95,7 +95,8 @@ dict` (the duplicated `openalex_result_to_record`), `crossref_item_to_openalex_l
 dict` (the superset: with the fallback date fields). Each former copy becomes a thin alias or
 an import; `db_manager._normalize_doi`/`_normalize_openalex_id` delegate. A pytest pins the
 outputs of every former copy against the shared function on a fixture list of DOIs/ids so the
-DB keys cannot drift.
+DB keys cannot drift. Non-string inputs are coerced with `str()` instead of raising (accepted
+behaviour change; the former copies raised `TypeError`/`AttributeError`).
 
 ### D3. `dl_lit/llm_common.py`
 `run_with_timeout(call, timeout_seconds, *, retries, backoff_seconds, label) -> result` (the

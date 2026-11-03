@@ -16,6 +16,7 @@ from dl_lit import identifiers
 from dl_lit.identifiers import (
     extract_doi_lower,
     inverted_index_to_text,
+    inverted_index_to_text_last_wins,
     inverted_index_to_text_lenient,
     normalize_doi,
     normalize_doi_lower,
@@ -77,26 +78,44 @@ OPENALEX_MAP = {
 
 INVERTED_MAP = {
     "dl_lit.db_manager.DatabaseManager._convert_inverted_index_to_text": (inverted_index_to_text, lambda db: db._convert_inverted_index_to_text),
-    "dl_lit.OpenAlexScraper.get_abstract": (inverted_index_to_text, lambda db: __import__("dl_lit.OpenAlexScraper", fromlist=["x"]).get_abstract),
+    "dl_lit.OpenAlexScraper.get_abstract": (inverted_index_to_text_last_wins, lambda db: __import__("dl_lit.OpenAlexScraper", fromlist=["x"]).get_abstract),
     # Returned "" instead of None for empty input: now ``inverted_index_to_text(idx) or ""``.
     "dl_lit.OpenAlexScraper.convert_inverted_index_to_text": (None, lambda db: __import__("dl_lit.OpenAlexScraper", fromlist=["x"]).convert_inverted_index_to_text),
     "dl_lit.new_dl.convert_inverted_index_to_text": (inverted_index_to_text_lenient, lambda db: __import__("dl_lit.new_dl", fromlist=["x"]).convert_inverted_index_to_text),
 }
 
 
+def _recorded_raise(expected):
+    return isinstance(expected, dict) and RAISES in expected
+
+
+def _is_coerced(category, shared, expected):
+    """Recorded raise of a copy now backed by a str()-coercing shared rule (see the coercion test)."""
+    return category in ("doi", "openalex_id") and shared is not None and _recorded_raise(expected)
+
+
 def _cases(category, mapping):
     for name, (shared, getter) in mapping.items():
         for raw_input, expected in FIXTURE[category][name].items():
+            if _is_coerced(category, shared, expected):
+                continue  # covered by test_non_string_inputs_are_coerced_not_raised
             yield pytest.param(name, shared, getter, raw_input, expected, id=f"{name}[{raw_input}]")
 
 
-def _assert_reproduces(fn, raw_input, expected, *, coerce_non_str):
+def _coerced_cases():
+    for category, mapping in (("doi", DOI_MAP), ("openalex_id", OPENALEX_MAP)):
+        for name, (shared, getter) in mapping.items():
+            for raw_input, expected in FIXTURE[category][name].items():
+                if _is_coerced(category, shared, expected):
+                    yield pytest.param(category, name, shared, getter, raw_input, expected, id=f"{name}[{raw_input}]")
+
+
+COERCED_CASES = list(_coerced_cases())
+
+
+def _assert_reproduces(fn, raw_input, expected):
     value = ast.literal_eval(raw_input)
-    if isinstance(expected, dict) and RAISES in expected:
-        if coerce_non_str and not isinstance(value, str):
-            # Deliberate widening: the old copy raised on a non-string; the new one coerces it.
-            assert fn(value) == fn(str(value))
-            return
+    if _recorded_raise(expected):
         with pytest.raises(Exception) as excinfo:
             fn(value)
         assert type(excinfo.value).__name__ == expected[RAISES]
@@ -118,22 +137,49 @@ def test_fixture_covers_every_former_copy():
 @pytest.mark.parametrize("name,shared,getter,raw_input,expected", list(_cases("doi", DOI_MAP)))
 def test_doi_copies(db, name, shared, getter, raw_input, expected):
     if shared is not None:
-        _assert_reproduces(shared, raw_input, expected, coerce_non_str=True)
-    _assert_reproduces(getter(db), raw_input, expected, coerce_non_str=shared is not None)
+        _assert_reproduces(shared, raw_input, expected)
+    _assert_reproduces(getter(db), raw_input, expected)
 
 
 @pytest.mark.parametrize("name,shared,getter,raw_input,expected", list(_cases("openalex_id", OPENALEX_MAP)))
 def test_openalex_id_copies(db, name, shared, getter, raw_input, expected):
     if shared is not None:
-        _assert_reproduces(shared, raw_input, expected, coerce_non_str=True)
-    _assert_reproduces(getter(db), raw_input, expected, coerce_non_str=shared is not None)
+        _assert_reproduces(shared, raw_input, expected)
+    _assert_reproduces(getter(db), raw_input, expected)
 
 
 @pytest.mark.parametrize("name,shared,getter,raw_input,expected", list(_cases("inverted_index", INVERTED_MAP)))
 def test_inverted_index_copies(db, name, shared, getter, raw_input, expected):
     if shared is not None:
-        _assert_reproduces(shared, raw_input, expected, coerce_non_str=False)
-    _assert_reproduces(getter(db), raw_input, expected, coerce_non_str=False)
+        _assert_reproduces(shared, raw_input, expected)
+    _assert_reproduces(getter(db), raw_input, expected)
+
+
+def test_coerced_cases_are_exactly_the_non_string_raises():
+    ids = {(name, raw) for _, name, _, _, raw, _ in (c.values for c in COERCED_CASES)}
+    assert ids == {
+        ("dl_lit.db_manager.DatabaseManager._normalize_doi", "123"),
+        ("dl_lit.OpenAlexScraper.normalize_doi", "123"),
+        ("dl_lit.db_manager.DatabaseManager._normalize_openalex_id", "123"),
+    }
+
+
+@pytest.mark.parametrize("category,name,shared,getter,raw_input,expected", COERCED_CASES)
+def test_non_string_inputs_are_coerced_not_raised(db, category, name, shared, getter, raw_input, expected):
+    """Accepted behaviour change (spec D2): a non-string input that the former copy rejected
+    with TypeError/AttributeError (recorded in the fixture) is now coerced with ``str()``.
+    No key the old code produced changes; an int DOI in a seed no longer crashes the insert.
+    """
+    value = ast.literal_eval(raw_input)
+    assert not isinstance(value, str)
+    assert expected[RAISES] in ("TypeError", "AttributeError")
+    for fn in (shared, getter(db)):
+        result = fn(value)
+        assert result == fn(str(value))
+        if category == "openalex_id":
+            assert result is None  # 123 is not a W-id
+        else:
+            assert result == "123"
 
 
 def test_call_sites_alias_the_shared_functions():
@@ -142,7 +188,7 @@ def test_call_sites_alias_the_shared_functions():
     import dl_lit.OpenAlexScraper as scraper
 
     assert scraper.normalize_doi is normalize_doi_lower
-    assert scraper.get_abstract is inverted_index_to_text
+    assert scraper.get_abstract is inverted_index_to_text_last_wins
     assert new_dl.convert_inverted_index_to_text is inverted_index_to_text_lenient
     assert dl_keyword_search.openalex_result_to_record is openalex_work_to_record
 
@@ -175,6 +221,14 @@ def test_private_doi_copies_differ_from_every_shared_rule():
                 not (isinstance(out, dict) and RAISES in out) and fn(ast.literal_eval(raw)) != out
                 for raw, out in recorded.items()
             ), name
+
+
+def test_inverted_index_collision_semantics():
+    collision = {"a": [0], "b": [0]}
+    assert inverted_index_to_text(collision) == "a b"  # join every word at the position
+    assert inverted_index_to_text_last_wins(collision) == "b"  # former get_abstract: last word wins
+    assert inverted_index_to_text_last_wins({"a": [1], "b": [0]}) == "b a"
+    assert inverted_index_to_text_last_wins({}) is None
 
 
 def test_inverted_index_to_text_basic():

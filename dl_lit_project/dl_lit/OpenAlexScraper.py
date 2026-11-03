@@ -8,7 +8,7 @@ from pathlib import Path
 import argparse
 import concurrent.futures
 import os
-from .identifiers import inverted_index_to_text, normalize_doi_lower
+from .identifiers import inverted_index_to_text, inverted_index_to_text_last_wins, normalize_doi_lower
 from .utils import OpenAlexRateLimitExceeded, env_bool, get_global_rate_limiter, openalex_request_json
 
 try:
@@ -900,7 +900,7 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
         json.dump(enriched_references, f, indent=2)
     print(f"Enriched data saved to {output_path}")
 
-get_abstract = inverted_index_to_text
+get_abstract = inverted_index_to_text_last_wins
 
 
 def _build_enrichment_payload(ref, best_result):

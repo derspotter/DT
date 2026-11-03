@@ -361,7 +361,8 @@
       "['a', 'b']": {
         "__raises__": "AttributeError"
       },
-      "{'a': [2], 'b': [0]}": "b  a"
+      "{'a': [2], 'b': [0]}": "b  a",
+      "{'a': [0], 'b': [0]}": "b"
     },
     "dl_lit.db_manager.DatabaseManager._convert_inverted_index_to_text": {
       "{'a': [0], 'b': [1]}": "a b",
@@ -371,7 +372,8 @@
       "['a', 'b']": {
         "__raises__": "AttributeError"
       },
-      "{'a': [2], 'b': [0]}": "b a"
+      "{'a': [2], 'b': [0]}": "b a",
+      "{'a': [0], 'b': [0]}": "a b"
     },
     "dl_lit.OpenAlexScraper.convert_inverted_index_to_text": {
       "{'a': [0], 'b': [1]}": "a b",
@@ -381,7 +383,8 @@
       "['a', 'b']": {
         "__raises__": "AttributeError"
       },
-      "{'a': [2], 'b': [0]}": "b a"
+      "{'a': [2], 'b': [0]}": "b a",
+      "{'a': [0], 'b': [0]}": "a b"
     },
     "dl_lit.OpenAlexScraper.get_abstract": {
       "{'a': [0], 'b': [1]}": "a b",
@@ -391,7 +394,8 @@
       "['a', 'b']": {
         "__raises__": "AttributeError"
       },
-      "{'a': [2], 'b': [0]}": "b a"
+      "{'a': [2], 'b': [0]}": "b a",
+      "{'a': [0], 'b': [0]}": "b"
     },
     "dl_lit.new_dl.convert_inverted_index_to_text": {
       "{'a': [0], 'b': [1]}": "a b",
@@ -399,7 +403,8 @@
       "{}": "",
       "None": null,
       "['a', 'b']": "",
-      "{'a': [2], 'b': [0]}": "b a"
+      "{'a': [2], 'b': [0]}": "b a",
+      "{'a': [0], 'b': [0]}": "a b"
     }
   }
 }

@@ -29,6 +29,7 @@ __all__ = [
     "normalize_openalex_id",
     "normalize_openalex_id_strict",
     "inverted_index_to_text",
+    "inverted_index_to_text_last_wins",
     "inverted_index_to_text_lenient",
     "openalex_work_to_record",
 ]
@@ -106,9 +107,9 @@ def normalize_openalex_id_strict(value) -> str | None:
 def inverted_index_to_text(idx) -> str | None:
     """OpenAlex ``abstract_inverted_index`` -> text, words ordered by position.
 
-    Empty or ``None`` -> ``None``.  Formerly the effective
-    ``DatabaseManager._convert_inverted_index_to_text`` and
-    ``OpenAlexScraper.get_abstract``.
+    Empty or ``None`` -> ``None``; words sharing a position are all kept, in
+    dict order.  Formerly the effective
+    ``DatabaseManager._convert_inverted_index_to_text``.
     """
     if not idx:
         return None
@@ -118,6 +119,20 @@ def inverted_index_to_text(idx) -> str | None:
             word_positions.append((word, position))
     word_positions.sort(key=lambda pair: pair[1])
     return " ".join(word for word, _ in word_positions)
+
+
+def inverted_index_to_text_last_wins(idx) -> str | None:
+    """Like :func:`inverted_index_to_text`, but one word per position: the last one wins.
+
+    Formerly ``OpenAlexScraper.get_abstract``.
+    """
+    if not idx:
+        return None
+    word_at = {}
+    for word, positions in idx.items():
+        for position in positions:
+            word_at[position] = word
+    return " ".join(word_at[position] for position in sorted(word_at))
 
 
 def inverted_index_to_text_lenient(idx) -> str | None:
