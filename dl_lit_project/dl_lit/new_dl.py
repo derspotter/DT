@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 
 from .db_manager import DatabaseManager
 from .pdf_downloader import PDFDownloader
-from .utils import ServiceRateLimiter, get_global_rate_limiter
+from .utils import ServiceRateLimiter, env_bool, env_int, get_global_rate_limiter
 try:
     # bibtexparser 1.x does not ship middlewares; keep optional so downloads can run without it.
     from bibtexparser.middlewares import SeparateCoAuthors, LatexEncodingMiddleware  # type: ignore
@@ -34,7 +34,7 @@ GREEN = colorama.Fore.GREEN
 RED = colorama.Fore.RED
 YELLOW = colorama.Fore.YELLOW
 RESET = colorama.Style.RESET_ALL # Use colorama's reset
-DOWNLOAD_DEBUG_ENABLED = os.getenv("RAG_FEEDER_DOWNLOAD_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+DOWNLOAD_DEBUG_ENABLED = env_bool("RAG_FEEDER_DOWNLOAD_DEBUG")
 
 
 def _download_log(message: str) -> None:
@@ -111,18 +111,18 @@ class BibliographyEnhancer:
             if token.strip()
         }
         self.vpn_mode = os.getenv("RAG_FEEDER_VPN_MODE", "fallback").strip().lower()
-        self.vpn_enforce_eduvpn = os.getenv("RAG_FEEDER_VPN_ENFORCE_EDUVPN", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.vpn_enforce_eduvpn = env_bool("RAG_FEEDER_VPN_ENFORCE_EDUVPN", True)
         self.vpn_status_cmd = (os.getenv("RAG_FEEDER_VPN_STATUS_CMD") or "").strip()
         self.vpn_connect_cmd = (os.getenv("RAG_FEEDER_VPN_CONNECT_CMD") or "").strip()
-        self.vpn_status_timeout_seconds = max(2, int(os.getenv("RAG_FEEDER_VPN_STATUS_TIMEOUT_SECONDS", "8") or "8"))
-        self.vpn_connect_timeout_seconds = max(5, int(os.getenv("RAG_FEEDER_VPN_CONNECT_TIMEOUT_SECONDS", "45") or "45"))
-        self.vpn_status_cache_ttl_seconds = max(1, int(os.getenv("RAG_FEEDER_VPN_STATUS_CACHE_SECONDS", "20") or "20"))
+        self.vpn_status_timeout_seconds = env_int("RAG_FEEDER_VPN_STATUS_TIMEOUT_SECONDS", 8, minimum=2)
+        self.vpn_connect_timeout_seconds = env_int("RAG_FEEDER_VPN_CONNECT_TIMEOUT_SECONDS", 45, minimum=5)
+        self.vpn_status_cache_ttl_seconds = env_int("RAG_FEEDER_VPN_STATUS_CACHE_SECONDS", 20, minimum=1)
         self._vpn_status_cache_until = 0.0
         self._vpn_status_cache_value = False
         self._vpn_warned_missing_status_cmd = False
-        self.enable_unpaywall = os.getenv("RAG_FEEDER_USE_UNPAYWALL", "1").strip().lower() in {"1", "true", "yes", "on"}
-        self.download_timeout = max(3, int(os.getenv("RAG_FEEDER_DOWNLOAD_TIMEOUT_SECONDS", "12") or "12"))
-        self.max_libgen_candidates = max(1, int(os.getenv("RAG_FEEDER_MAX_LIBGEN_CANDIDATES", "12") or "12"))
+        self.enable_unpaywall = env_bool("RAG_FEEDER_USE_UNPAYWALL", True)
+        self.download_timeout = env_int("RAG_FEEDER_DOWNLOAD_TIMEOUT_SECONDS", 12, minimum=3)
+        self.max_libgen_candidates = env_int("RAG_FEEDER_MAX_LIBGEN_CANDIDATES", 12, minimum=1)
         self.output_folder = Path(output_folder) if output_folder else None
         self._pdf_downloader = None
         # Legacy helper methods in this module still expect both names.

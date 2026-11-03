@@ -50,6 +50,7 @@ except Exception:  # pragma: no cover
     get_global_rate_limiter = None
 
 from dl_lit.llm_provider import get_client
+from dl_lit.utils import env_float, env_int
 
 
 MODEL_NAME = os.getenv("RAG_FEEDER_GEMINI_MODEL", "gemini-3-flash-preview")
@@ -57,30 +58,10 @@ MAX_PAGES_FOR_API = 50
 CHUNK_SIZE = 50
 
 
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return max(minimum, int(default))
-    try:
-        return max(minimum, int(raw))
-    except Exception:
-        return max(minimum, int(default))
-
-
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return max(minimum, float(default))
-    try:
-        return max(minimum, float(raw))
-    except Exception:
-        return max(minimum, float(default))
-
-
-GET_BIB_CHUNK_WORKERS = _env_int("RAG_FEEDER_GET_BIB_CHUNK_WORKERS", 6)
-GET_BIB_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_GET_BIB_TIMEOUT_SECONDS", 180)
-GET_BIB_TIMEOUT_RETRIES = _env_int("RAG_FEEDER_GET_BIB_TIMEOUT_RETRIES", 1, minimum=0)
-GET_BIB_RETRY_BACKOFF_SECONDS = _env_float("RAG_FEEDER_GET_BIB_RETRY_BACKOFF_SECONDS", 5.0, minimum=0.0)
+GET_BIB_CHUNK_WORKERS = env_int("RAG_FEEDER_GET_BIB_CHUNK_WORKERS", 6, minimum=1)
+GET_BIB_TIMEOUT_SECONDS = env_int("RAG_FEEDER_GET_BIB_TIMEOUT_SECONDS", 180, minimum=1)
+GET_BIB_TIMEOUT_RETRIES = env_int("RAG_FEEDER_GET_BIB_TIMEOUT_RETRIES", 1, minimum=0)
+GET_BIB_RETRY_BACKOFF_SECONDS = env_float("RAG_FEEDER_GET_BIB_RETRY_BACKOFF_SECONDS", 5.0, minimum=0.0)
 
 
 load_dotenv()

@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.llm_provider import get_client
-from dl_lit.utils import get_global_rate_limiter
+from dl_lit.utils import env_bool, env_float, env_int, get_global_rate_limiter
 try:
     from pydantic import BaseModel, ValidationError
     try:
@@ -54,36 +54,16 @@ DEFAULT_MODEL_NAME = os.getenv("RAG_FEEDER_API_EXTRACT_MODEL", "gemini-3.1-flash
 INLINE_MODEL_NAME = os.getenv("RAG_FEEDER_API_INLINE_MODEL", "gemini-3.1-pro-preview")
 
 
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return max(minimum, int(default))
-    try:
-        return max(minimum, int(raw))
-    except Exception:
-        return max(minimum, int(default))
-
-
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return max(minimum, float(default))
-    try:
-        return max(minimum, float(raw))
-    except Exception:
-        return max(minimum, float(default))
-
-
-DEFAULT_EXTRACT_WORKERS = _env_int("RAG_FEEDER_API_EXTRACT_WORKERS", 10)
-DEFAULT_INLINE_CHUNK_WORKERS = _env_int("RAG_FEEDER_INLINE_CHUNK_WORKERS", 4)
-DEFAULT_PAGE_BATCH_SIZE = _env_int("RAG_FEEDER_PAGE_BATCH_SIZE", 4)
-DEFAULT_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_API_TIMEOUT_SECONDS", 120)
-INLINE_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_API_INLINE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS)
-INLINE_CHUNK_TIMEOUT_SECONDS = _env_int("RAG_FEEDER_API_INLINE_CHUNK_TIMEOUT_SECONDS", INLINE_TIMEOUT_SECONDS)
-GEMINI_TIMEOUT_RETRIES = _env_int("RAG_FEEDER_GEMINI_TIMEOUT_RETRIES", 2, minimum=0)
-GEMINI_RETRY_BACKOFF_SECONDS = _env_float("RAG_FEEDER_GEMINI_RETRY_BACKOFF_SECONDS", 5.0, minimum=0.0)
-INLINE_CHUNK_FAILURE_RETRIES = _env_int("RAG_FEEDER_INLINE_CHUNK_FAILURE_RETRIES", 1, minimum=0)
-INLINE_CHUNK_RETRY_BACKOFF_SECONDS = _env_float(
+DEFAULT_EXTRACT_WORKERS = env_int("RAG_FEEDER_API_EXTRACT_WORKERS", 10, minimum=1)
+DEFAULT_INLINE_CHUNK_WORKERS = env_int("RAG_FEEDER_INLINE_CHUNK_WORKERS", 4, minimum=1)
+DEFAULT_PAGE_BATCH_SIZE = env_int("RAG_FEEDER_PAGE_BATCH_SIZE", 4, minimum=1)
+DEFAULT_TIMEOUT_SECONDS = env_int("RAG_FEEDER_API_TIMEOUT_SECONDS", 120, minimum=1)
+INLINE_TIMEOUT_SECONDS = env_int("RAG_FEEDER_API_INLINE_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS, minimum=1)
+INLINE_CHUNK_TIMEOUT_SECONDS = env_int("RAG_FEEDER_API_INLINE_CHUNK_TIMEOUT_SECONDS", INLINE_TIMEOUT_SECONDS, minimum=1)
+GEMINI_TIMEOUT_RETRIES = env_int("RAG_FEEDER_GEMINI_TIMEOUT_RETRIES", 2, minimum=0)
+GEMINI_RETRY_BACKOFF_SECONDS = env_float("RAG_FEEDER_GEMINI_RETRY_BACKOFF_SECONDS", 5.0, minimum=0.0)
+INLINE_CHUNK_FAILURE_RETRIES = env_int("RAG_FEEDER_INLINE_CHUNK_FAILURE_RETRIES", 1, minimum=0)
+INLINE_CHUNK_RETRY_BACKOFF_SECONDS = env_float(
     "RAG_FEEDER_INLINE_CHUNK_RETRY_BACKOFF_SECONDS",
     GEMINI_RETRY_BACKOFF_SECONDS,
     minimum=0.0,
@@ -840,7 +820,7 @@ def extract_json_from_text(text):
 
 def validate_bibliography_entries(entries):
     """Validate/normalize model output against the bibliography schema."""
-    if os.getenv("DISABLE_BIBLIO_PYDANTIC", "").lower() in {"1", "true", "yes"}:
+    if env_bool("DISABLE_BIBLIO_PYDANTIC"):
         print("[INFO] Pydantic validation disabled via DISABLE_BIBLIO_PYDANTIC.", flush=True)
         return entries
     if not BaseModel:

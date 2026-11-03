@@ -8,7 +8,7 @@ from pathlib import Path
 import argparse
 import concurrent.futures
 import os
-from .utils import OpenAlexRateLimitExceeded, get_global_rate_limiter, openalex_request_json
+from .utils import OpenAlexRateLimitExceeded, env_bool, get_global_rate_limiter, openalex_request_json
 
 try:
     from rapidfuzz import fuzz
@@ -510,7 +510,7 @@ class OpenAlexCrossrefSearcher:
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
         self.api_key = os.getenv('OPENALEX_API_KEY') or os.getenv('RAG_FEEDER_OPENALEX_API_KEY')
-        self.enable_openalex_fallback = os.getenv('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+        self.enable_openalex_fallback = env_bool('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK')
         global _missing_api_key_warned
         if not self.api_key and not _missing_api_key_warned:
             print(

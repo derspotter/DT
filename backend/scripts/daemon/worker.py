@@ -80,7 +80,7 @@ from pathlib import Path
 
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.app_settings import apply_app_settings_env, effective_env, settings_fingerprint
-from dl_lit.utils import get_global_rate_limiter, reset_global_rate_limiter, set_global_rate_limiter
+from dl_lit.utils import env_int, get_global_rate_limiter, reset_global_rate_limiter, set_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
 from dl_lit.scraper_lab import execute_scraper_job
@@ -203,13 +203,13 @@ class PipelineDaemon:
             "enrich": "enrich",
             "download": "download",
         }.get(self.role, "pipeline")
-        self.heartbeat_interval_seconds = max(1, int(os.getenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", "3") or "3"))
+        self.heartbeat_interval_seconds = env_int("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", 3, minimum=1)
         self._last_heartbeat_at = 0.0
         # hostname:pid repeats after an in-place container restart (same hostname,
         # PID 1 again), which would make a dead predecessor look like us; the
         # nonce keeps every process distinguishable.
         self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"
-        self.job_timeout_seconds = max(60, int(os.getenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "1800") or "1800"))
+        self.job_timeout_seconds = env_int("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", 1800, minimum=60)
         self._ensure_heartbeat_table()
         self._recover_stale_running_jobs()
         self._heartbeat("starting", {"worker_id": self.worker_id}, force=True)
@@ -708,7 +708,7 @@ class PipelineDaemon:
         max_rel = expansion.get("maxRelated", 30)
         _note_expansion_disabled(fetch_refs, fetch_cites)
 
-        wave_size_cfg = int(os.getenv("RAG_FEEDER_ENRICH_WAVE_SIZE", "2") or "2")
+        wave_size_cfg = env_int("RAG_FEEDER_ENRICH_WAVE_SIZE", 2, minimum=1)
         wave_size = max(1, min(len(to_process), max(1, min(workers, 32)), wave_size_cfg))
         remaining_entries = list(to_process)
         deferred_reason = None
@@ -916,8 +916,7 @@ class PipelineDaemon:
     def do_download(self, corpus_id: int, limit: int):
         # Prevent one very large queued job (e.g. batchSize=3000) from monopolizing
         # the single daemon loop for a long period.
-        per_job_max = int(os.getenv("RAG_FEEDER_DOWNLOAD_JOB_MAX", "150") or "150")
-        per_job_max = max(1, min(per_job_max, 5000))
+        per_job_max = env_int("RAG_FEEDER_DOWNLOAD_JOB_MAX", 150, minimum=1, maximum=5000)
         effective_limit = min(max(1, int(limit or 1)), per_job_max)
         if effective_limit != limit:
             log(f"Clamped download job batch from {limit} to {effective_limit} (RAG_FEEDER_DOWNLOAD_JOB_MAX={per_job_max})")
@@ -934,8 +933,7 @@ class PipelineDaemon:
         # Download multiple files concurrently. Be careful not to overwhelm the disk or rate limiters.
         # Max out at min(limit, configured cap) parallel downloads.
         # Keep env configurable so operators can tune throughput without code changes.
-        max_workers_cfg = int(os.getenv("RAG_FEEDER_DOWNLOAD_WORKERS", "16") or "16")
-        max_workers_cfg = max(1, min(max_workers_cfg, 128))
+        max_workers_cfg = env_int("RAG_FEEDER_DOWNLOAD_WORKERS", 16, minimum=1, maximum=128)
         max_download_workers = min(len(rows), max_workers_cfg)
         
         with ThreadPoolExecutor(max_workers=max_download_workers) as executor:
@@ -1002,14 +1000,14 @@ class PipelineDaemon:
 
     def _run_direct_enrich_cycle(self):
         # Settings were refreshed by run() right before fetch_next_job().
-        default_limit = max(1, int(os.getenv("RAG_FEEDER_ENRICH_BATCH_SIZE", "10") or "10"))
-        default_workers = max(1, int(os.getenv("RAG_FEEDER_ENRICH_WORKERS", "6") or "6"))
+        default_limit = env_int("RAG_FEEDER_ENRICH_BATCH_SIZE", 10, minimum=1)
+        default_workers = env_int("RAG_FEEDER_ENRICH_WORKERS", 6, minimum=1)
         result = self.do_enrich(None, default_limit, default_workers, {})
         return result if (result or {}).get("processed", 0) > 0 else None
 
     def _run_direct_download_cycle(self):
         # Settings were refreshed by run() right before fetch_next_job().
-        default_limit = max(1, int(os.getenv("RAG_FEEDER_DOWNLOAD_BATCH_SIZE", "50") or "50"))
+        default_limit = env_int("RAG_FEEDER_DOWNLOAD_BATCH_SIZE", 50, minimum=1)
         result = self.do_download(None, default_limit)
         return result if (result or {}).get("processed", 0) > 0 else None
 
