@@ -36,7 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.llm_provider import get_client
-from dl_lit.utils import env_bool, env_float, env_int, get_global_rate_limiter
+from dl_lit.llm_common import (
+    extract_total_tokens,
+    looks_like_location_label,
+    normalize_source_metadata,
+    run_with_timeout,
+    wait_rate_limit,
+)
+from dl_lit.utils import env_bool, env_float, env_int
 try:
     from pydantic import BaseModel, ValidationError
     try:
@@ -74,7 +81,6 @@ REF_PAGE_FILE_RE = re.compile(r"^(?P<prefix>.+?)_refs_physical_p(?P<page>\d+)\.p
 api_client = None
 
 # --- Rate Limiter --- (Shared global instance)
-rate_limiter = get_global_rate_limiter()
 
 # --- Bibliography Prompt ---
 BIBLIOGRAPHY_PROMPT = (
@@ -226,30 +232,6 @@ def configure_api_client():
         api_client = None
         return False
 
-def _wait_rate_limit(service_name: str, units: int = 1) -> None:
-    """Best-effort rate limiting without turning throttling issues into hard failures."""
-    try:
-        if rate_limiter:
-            rate_limiter.wait_if_needed(service_name, units=units)
-    except Exception:
-        return
-
-
-def _extract_total_tokens(response) -> int | None:
-    try:
-        usage = getattr(response, "usage_metadata", None)
-        if usage is None:
-            return None
-        for key in ("total_token_count", "total_tokens"):
-            value = getattr(usage, key, None)
-            if isinstance(value, (int, float)) and value > 0:
-                return int(value)
-            if isinstance(value, str) and value.strip().isdigit():
-                return int(value.strip())
-    except Exception:
-        return None
-    return None
-
 def _resolve_prompt(extract_mode: str) -> str:
     if extract_mode == "inline":
         return INLINE_CITATION_PROMPT
@@ -278,28 +260,15 @@ def _run_gemini_request(
     retry_backoff_seconds: float = GEMINI_RETRY_BACKOFF_SECONDS,
     action_label: str = "Gemini request",
 ):
-    max_attempts = max(1, int(timeout_retries) + 1)
-    for attempt in range(1, max_attempts + 1):
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(call_model)
-        try:
-            return future.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            if attempt >= max_attempts:
-                raise TimeoutError(
-                    f"Gemini request timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
-                ) from exc
-            delay = max(0.0, float(retry_backoff_seconds)) * attempt
-            print(
-                f"[WARNING] {action_label} timed out after {timeout_seconds}s "
-                f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s...",
-                flush=True,
-            )
-            if delay > 0:
-                time.sleep(delay)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+    """APIscraper defaults for ``llm_common.run_with_timeout``."""
+    return run_with_timeout(
+        call_model,
+        timeout_seconds,
+        retries=timeout_retries,
+        backoff_seconds=retry_backoff_seconds,
+        label=action_label,
+        sleep=time.sleep,
+    )
 
 
 def _run_generate_content(
@@ -329,9 +298,9 @@ def _run_generate_content(
         action_label=f"Gemini generate_content ({model_name})",
     )
 
-    token_count = _extract_total_tokens(response)
+    token_count = extract_total_tokens(response)
     if token_count:
-        _wait_rate_limit("gemini_tokens", units=token_count)
+        wait_rate_limit("gemini_tokens", units=token_count)
     return response
 
 
@@ -346,25 +315,11 @@ def _ascii_safe_pdf_name(filename: str) -> str:
     return sanitized
 
 
-LOCATION_LIKE_SOURCE_RE = re.compile(
-    r"^[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3},\s*(?:[A-Z]{2}|[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3})$"
-)
-
-
-def _looks_like_location_label(value) -> bool:
-    if not isinstance(value, str):
-        return False
-    candidate = " ".join(value.strip().split())
-    if not candidate or len(candidate) > 80:
-        return False
-    return bool(LOCATION_LIKE_SOURCE_RE.fullmatch(candidate))
-
-
 def _normalize_source_and_location_fields(data: dict) -> dict:
     if not isinstance(data, dict):
         return data
     source = data.get("source")
-    if not _looks_like_location_label(source):
+    if not looks_like_location_label(source):
         return data
     if not data.get("location"):
         data["location"] = source
@@ -394,10 +349,10 @@ def _parse_bibliography_response_text(response_text: str):
     try:
         parsed_data = json.loads(response_text)
         if isinstance(parsed_data, dict):
-            source_metadata = _normalize_source_metadata(parsed_data.get("source_metadata"))
+            source_metadata = normalize_source_metadata(parsed_data.get("source_metadata"))
             bibliography_data = parsed_data.get("items") or []
         elif isinstance(parsed_data, list) and len(parsed_data) == 1 and isinstance(parsed_data[0], dict):
-            source_metadata = _normalize_source_metadata(parsed_data[0].get("source_metadata"))
+            source_metadata = normalize_source_metadata(parsed_data[0].get("source_metadata"))
             bibliography_data = parsed_data[0].get("items") or []
         else:
             bibliography_data = parsed_data
@@ -472,8 +427,8 @@ def extract_inline_citations_from_text(
     text = _extract_pdf_text(pdf_path)
     prompt = f"{INLINE_TEXT_CITATION_PROMPT}\n\nArticle text:\n{text}"
     print(f"[INFO] Retrying inline extraction from extracted text for {pdf_path}.", flush=True)
-    _wait_rate_limit("gemini")
-    _wait_rate_limit("gemini_daily")
+    wait_rate_limit("gemini")
+    wait_rate_limit("gemini_daily")
     response = _run_generate_content(
         model_name,
         prompt,
@@ -488,39 +443,6 @@ def extract_inline_citations_from_text(
         "items": items,
         "source_metadata": source_metadata,
     }
-
-
-def _normalize_source_metadata(value):
-    if not isinstance(value, dict):
-        return None
-    metadata = {}
-    title = value.get("title")
-    if isinstance(title, str) and title.strip():
-        metadata["title"] = title.strip()
-    authors = value.get("authors")
-    if isinstance(authors, list):
-        cleaned = [str(a).strip() for a in authors if str(a).strip()]
-        if cleaned:
-            metadata["authors"] = cleaned
-    year = value.get("year")
-    if isinstance(year, (int, float)):
-        metadata["year"] = int(year)
-    elif isinstance(year, str):
-        cleaned_year = year.strip()
-        if cleaned_year:
-            metadata["year"] = cleaned_year
-    doi = value.get("doi")
-    if isinstance(doi, str) and doi.strip():
-        metadata["doi"] = doi.strip()
-    publisher = value.get("publisher")
-    if isinstance(publisher, str) and publisher.strip():
-        metadata["publisher"] = publisher.strip()
-    source = value.get("source")
-    if isinstance(source, str) and source.strip():
-        cleaned_source = source.strip()
-        if not _looks_like_location_label(cleaned_source):
-            metadata["source"] = cleaned_source
-    return metadata or None
 
 
 def _upsert_seed_document_metadata(
@@ -746,8 +668,8 @@ def upload_pdf_and_extract_bibliography(
         prompt = _resolve_prompt(extract_mode)
         model_name = _resolve_model_name(extract_mode)
         print(f"[INFO] Using model {model_name} for extract_mode={extract_mode}.", flush=True)
-        _wait_rate_limit("gemini")
-        _wait_rate_limit("gemini_daily")
+        wait_rate_limit("gemini")
+        wait_rate_limit("gemini_daily")
         response = _run_generate_content(
             model_name,
             [prompt, uploaded_file],

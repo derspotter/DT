@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 from dl_lit import APIscraper_v2 as scraper
 from dl_lit import get_bib_pages
+from dl_lit import llm_common
 
 
 class _FakeFuture:
@@ -44,12 +45,12 @@ def test_apiscraper_run_gemini_request_retries_timeout(monkeypatch):
     behaviors = [concurrent.futures.TimeoutError(), response]
 
     monkeypatch.setattr(
-        scraper.concurrent.futures,
+        llm_common.concurrent.futures,
         "ThreadPoolExecutor",
         lambda max_workers=1: _FakeExecutor(behaviors),
     )
     sleeps = []
-    monkeypatch.setattr(scraper.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(llm_common.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     result = scraper._run_gemini_request(
         lambda: response,
@@ -124,16 +125,16 @@ def test_get_bib_pages_retries_timeout(monkeypatch):
     behaviors = [concurrent.futures.TimeoutError(), response]
 
     monkeypatch.setattr(
-        get_bib_pages.concurrent.futures,
+        llm_common.concurrent.futures,
         "ThreadPoolExecutor",
         lambda max_workers=1: _FakeExecutor(behaviors),
     )
     monkeypatch.setattr(get_bib_pages, "GET_BIB_TIMEOUT_RETRIES", 1)
     sleeps = []
-    monkeypatch.setattr(get_bib_pages.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(llm_common.time, "sleep", lambda seconds: sleeps.append(seconds))
     monkeypatch.setattr(get_bib_pages, "api_client", MagicMock())
-    monkeypatch.setattr(get_bib_pages, "_rate_limiter_wait", lambda *args, **kwargs: None)
-    monkeypatch.setattr(get_bib_pages, "_extract_total_tokens", lambda response: None)
+    monkeypatch.setattr(get_bib_pages, "wait_rate_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(get_bib_pages, "extract_total_tokens", lambda response: None)
 
     sections, source_metadata = get_bib_pages._find_reference_section_pages(
         uploaded_pdf=object(),

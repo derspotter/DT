@@ -44,11 +44,12 @@ DL_LIT_PROJECT_DIR = Path(__file__).resolve().parent.parent
 if str(DL_LIT_PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT_DIR))
 
-try:
-    from dl_lit.utils import get_global_rate_limiter
-except Exception:  # pragma: no cover
-    get_global_rate_limiter = None
-
+from dl_lit.llm_common import (
+    extract_total_tokens,
+    normalize_source_metadata,
+    run_with_timeout,
+    wait_rate_limit,
+)
 from dl_lit.llm_provider import get_client
 from dl_lit.utils import env_float, env_int
 
@@ -70,9 +71,6 @@ api_client = get_client()
 
 SECTION_JSON_RE = re.compile(r"```json\s*([\s\S]*?)\s*```", re.IGNORECASE)
 SOURCE_METADATA_FILENAME = "source_metadata.json"
-LOCATION_LIKE_SOURCE_RE = re.compile(
-    r"^[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3},\s*(?:[A-Z]{2}|[A-Z][A-Za-z.'-]+(?: [A-Z][A-Za-z.'-]+){0,3})$"
-)
 
 
 def _clean_json_response(text: str) -> str:
@@ -89,15 +87,6 @@ def _clean_json_response(text: str) -> str:
     if text.endswith("```"):
         text = text[:-3]
     return text.strip()
-
-
-def _looks_like_location_label(value: str | None) -> bool:
-    if not isinstance(value, str):
-        return False
-    candidate = " ".join(value.strip().split())
-    if not candidate or len(candidate) > 80:
-        return False
-    return bool(LOCATION_LIKE_SOURCE_RE.fullmatch(candidate))
 
 
 def _normalize_sections(sections: list[dict], total_pages: int) -> list[dict]:
@@ -118,46 +107,6 @@ def _normalize_sections(sections: list[dict], total_pages: int) -> list[dict]:
             end_page = total_pages
         normalized.append({"start_page": start_page, "end_page": end_page})
     return normalized
-
-
-def _normalize_source_metadata(value: dict | None) -> dict | None:
-    if not isinstance(value, dict):
-        return None
-
-    normalized: dict = {}
-    title = value.get("title")
-    if isinstance(title, str) and title.strip():
-        normalized["title"] = title.strip()
-
-    authors = value.get("authors")
-    if isinstance(authors, list):
-        cleaned = [str(a).strip() for a in authors if str(a).strip()]
-        if cleaned:
-            normalized["authors"] = cleaned
-
-    year = value.get("year")
-    if isinstance(year, (int, float)):
-        normalized["year"] = int(year)
-    elif isinstance(year, str):
-        y = year.strip()
-        if y:
-            normalized["year"] = y
-
-    doi = value.get("doi")
-    if isinstance(doi, str) and doi.strip():
-        normalized["doi"] = doi.strip()
-
-    publisher = value.get("publisher")
-    if isinstance(publisher, str) and publisher.strip():
-        normalized["publisher"] = publisher.strip()
-
-    source = value.get("source")
-    if isinstance(source, str) and source.strip():
-        cleaned_source = source.strip()
-        if not _looks_like_location_label(cleaned_source):
-            normalized["source"] = cleaned_source
-
-    return normalized or None
 
 
 def _parse_section_and_source_payload(json_text: str) -> tuple[list[dict], dict | None]:
@@ -181,7 +130,7 @@ def _parse_section_and_source_payload(json_text: str) -> tuple[list[dict], dict 
     if not isinstance(sections, list):
         sections = []
 
-    source_metadata = _normalize_source_metadata(parsed.get("source_metadata"))
+    source_metadata = normalize_source_metadata(parsed.get("source_metadata"))
     return sections, source_metadata
 
 
@@ -190,33 +139,6 @@ def _write_source_metadata_file(output_dir: str, source_metadata: dict | None) -
     out_path = os.path.join(output_dir, SOURCE_METADATA_FILENAME)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
-
-
-def _rate_limiter_wait(kind: str, units: int = 1) -> None:
-    if not get_global_rate_limiter:
-        return
-    rl = get_global_rate_limiter()
-    try:
-        rl.wait_if_needed(kind, units=units)
-    except Exception:
-        # Rate limiter is best-effort; do not fail extraction because of it.
-        return
-
-
-def _extract_total_tokens(response) -> int | None:
-    try:
-        usage = getattr(response, "usage_metadata", None)
-        if usage is None:
-            return None
-        for key in ("total_token_count", "total_tokens"):
-            value = getattr(usage, key, None)
-            if isinstance(value, (int, float)) and value > 0:
-                return int(value)
-            if isinstance(value, str) and value.strip().isdigit():
-                return int(value.strip())
-    except Exception:
-        return None
-    return None
 
 
 def _find_reference_section_pages(
@@ -273,8 +195,8 @@ Rules:
 Document has {total_physical_pages} physical pages.
 """.strip()
 
-    _rate_limiter_wait("gemini")
-    _rate_limiter_wait("gemini_daily")
+    wait_rate_limit("gemini")
+    wait_rate_limit("gemini_daily")
 
     def _call():
         return api_client.models.generate_content(
@@ -286,31 +208,18 @@ Document has {total_physical_pages} physical pages.
             ),
         )
 
-    max_attempts = max(1, GET_BIB_TIMEOUT_RETRIES + 1)
-    for attempt in range(1, max_attempts + 1):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_call)
-            try:
-                resp = future.result(timeout=timeout_seconds)
-                break
-            except concurrent.futures.TimeoutError as exc:
-                future.cancel()
-                if attempt >= max_attempts:
-                    raise TimeoutError(
-                        f"Gemini request timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
-                    ) from exc
-                delay = GET_BIB_RETRY_BACKOFF_SECONDS * attempt
-                print(
-                    f"[WARNING] Gemini section detection timed out after {timeout_seconds}s "
-                    f"(attempt {attempt}/{max_attempts}). Retrying in {delay:.1f}s...",
-                    flush=True,
-                )
-                if delay > 0:
-                    time.sleep(delay)
+    resp = run_with_timeout(
+        _call,
+        timeout_seconds,
+        retries=GET_BIB_TIMEOUT_RETRIES,
+        backoff_seconds=GET_BIB_RETRY_BACKOFF_SECONDS,
+        label="Gemini section detection",
+        sleep=time.sleep,
+    )
 
-    token_count = _extract_total_tokens(resp)
+    token_count = extract_total_tokens(resp)
     if token_count:
-        _rate_limiter_wait("gemini_tokens", units=token_count)
+        wait_rate_limit("gemini_tokens", units=token_count)
 
     json_text = _clean_json_response(getattr(resp, "text", "") or "")
     return _parse_section_and_source_payload(json_text)
