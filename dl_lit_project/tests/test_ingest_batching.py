@@ -137,3 +137,82 @@ def test_create_pending_work_confidence_fields(tmp_path):
         assert not db.conn.in_transaction
     finally:
         db.close_connection()
+
+
+def test_resolution_lookups_run_outside_a_transaction(monkeypatch, tmp_path):
+    import dl_lit.OpenAlexScraper as scraper
+
+    db = DatabaseManager(tmp_path / "lit.db")
+    seen = []
+
+    def fake_process_single_reference(ref, searcher, rate_limiter, **kwargs):
+        seen.append(db.conn.in_transaction)
+        return {"doi": "10.1000/resolved", "openalex_id": None}
+
+    monkeypatch.setattr(scraper, "process_single_reference", fake_process_single_reference)
+    try:
+        db.create_pending_work({"title": "Shared Title", "year": 2000})
+        entries = [{"title": "Fresh Before", "year": 1990}, {"title": "Shared Title", "year": 2000}]
+        json_path = tmp_path / "refs.json"
+        json_path.write_text(json.dumps(entries), encoding="utf-8")
+
+        added, skipped, errors = db.add_pending_works_from_json(
+            json_path, searcher=object(), resolve_potential_duplicates=True
+        )
+
+        assert (added, skipped, errors) == (1, 1, [])
+        assert seen == [False, False]
+        assert not db.conn.in_transaction
+    finally:
+        db.close_connection()
+
+
+def test_transaction_takes_write_lock_before_first_read(tmp_path):
+    import sqlite3
+    import threading
+
+    db_path = tmp_path / "lit.db"
+    db = DatabaseManager(db_path)
+    db.conn.execute("PRAGMA busy_timeout = 2000")
+    other_done = threading.Event()
+    other_errors = []
+
+    def other_writer():
+        conn = sqlite3.connect(db_path, timeout=2.0)
+        try:
+            conn.execute("INSERT INTO works (title) VALUES ('from B')")
+            conn.commit()
+        except sqlite3.Error as exc:  # pragma: no cover - only on regression
+            other_errors.append(exc)
+        finally:
+            conn.close()
+            other_done.set()
+
+    try:
+        with db.transaction():
+            db.conn.execute("SELECT COUNT(*) FROM works").fetchone()
+            thread = threading.Thread(target=other_writer)
+            thread.start()
+            other_done.wait(0.5)  # with a deferred BEGIN, B commits here and A's write below fails
+            db._insert_work_record({"title": "from A"})
+        thread.join(5)
+        assert other_errors == []
+        titles = {row[0] for row in db.conn.execute("SELECT title FROM works")}
+        assert titles == {"from A", "from B"}
+    finally:
+        db.close_connection()
+
+
+def test_transaction_rolls_back_when_commit_fails(tmp_path):
+    import sqlite3
+
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            with db.transaction():
+                db.conn.execute("PRAGMA defer_foreign_keys = ON")
+                db.conn.execute("INSERT INTO search_results (search_run_id, title) VALUES (999, 'orphan')")
+        assert not db.conn.in_transaction
+        assert db.conn.execute("SELECT COUNT(*) FROM search_results").fetchone()[0] == 0
+    finally:
+        db.close_connection()

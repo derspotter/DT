@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 from datetime import datetime
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dl_lit.identifiers import inverted_index_to_text, normalize_doi, normalize_openalex_id
 from dl_lit.utils import parse_bibtex_file_field
 
@@ -125,23 +125,25 @@ class DatabaseManager:
     def transaction(self):
         """Run a block of writes as one transaction.
 
-        BEGINs unless a transaction is already open; COMMITs on normal exit and ROLLBACKs on an
-        exception (re-raised), but only when this call began it, so nested use is a passthrough.
-        Writers called inside must not commit themselves: pass them commit=False.
+        BEGIN IMMEDIATE unless a transaction is already open: the write lock is taken before the
+        first read, so a concurrent writer waits (busy_timeout) instead of invalidating this
+        snapshot (SQLITE_BUSY_SNAPSHOT on the first write). COMMITs on normal exit; if the body or
+        the COMMIT raises, ROLLBACKs and re-raises. Only the call that began the transaction
+        commits or rolls back, so nested use is a passthrough. Writers called inside must not
+        commit themselves: pass them commit=False. Keep network calls out of the block.
         """
         if self.conn.in_transaction:
             yield
             return
-        self.conn.execute("BEGIN")
+        self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield
+            if self.conn.in_transaction:
+                self.conn.commit()
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.rollback()
             raise
-        else:
-            if self.conn.in_transaction:
-                self.conn.commit()
 
     def close_connection(self):
         """Closes the database connection."""
@@ -831,7 +833,10 @@ class DatabaseManager:
         added_count = 0
         skipped_count = 0
         errors = []
-        with self.transaction():
+        # One transaction for the whole file, unless identifier resolution may make network calls:
+        # then each entry commits on its own so no write lock is held across a lookup.
+        resolving = bool(resolve_potential_duplicates and searcher)
+        with nullcontext() if resolving else self.transaction():
             for entry in entries:
                 entry = dict(entry)
                 if source_pdf:
@@ -842,7 +847,7 @@ class DatabaseManager:
                     searcher=searcher,
                     rate_limiter=rate_limiter,
                     resolve_potential_duplicates=resolve_potential_duplicates,
-                    commit=False,
+                    commit=resolving,
                 )
                 if row_id:
                     added_count += 1
