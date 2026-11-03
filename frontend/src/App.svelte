@@ -17,6 +17,7 @@
     saveCorpusKantroposAssignment,
     setAuthToken,
     getAuthToken,
+    onUnauthorized,
     uploadPdf,
     importSeed,
     extractBibliography,
@@ -1019,8 +1020,6 @@
       finishExtractionProgress()
     } catch (error) {
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         finishExtractionProgress()
         return
       }
@@ -1353,8 +1352,11 @@
 
   async function runCorpusReconcile() {
     const corpusIdAtRequest = currentCorpusId
+    const epoch = sessionEpoch
     try {
       const me = await fetchMe()
+      // Requested under an earlier session (sign-out, then a new sign-in).
+      if (epoch !== sessionEpoch) return false
       if (authStatus !== 'authenticated' || !me?.user) return false
       // The user switched corpus meanwhile; this answer may predate the switch.
       if (currentCorpusId !== corpusIdAtRequest) return false
@@ -1513,8 +1515,10 @@
     // auth round trip: start them now and let refreshAll collect them. A bad
     // token fails them with a 401 exactly as it fails fetchMe below.
     const inFlight = tabNeedsWorkspaceData(landingTab) ? startWorkspaceLoads() : null
+    const epoch = sessionEpoch
     try {
       const payload = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = payload.user
       corpora = payload.corpora || []
       currentCorpusId = authUser?.last_corpus_id || (corpora[0]?.id ?? null)
@@ -1524,12 +1528,16 @@
         authFlowToken = ''
       }
       await Promise.all([loadRecursionConfig(), refreshAll(landingTab, { inFlight })])
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (!preserveAuthFlow && navigationRevision === startupNavigationRevision) {
         const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
         setActiveTab(latestTab, { replace: true })
       }
     } catch (error) {
+      // A 401 already ran expireSession (state reset, token cleared).
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       authStatus = 'unauthenticated'
       authError = ''
       authUser = null
@@ -1545,11 +1553,14 @@
     authError = ''
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
+      sessionEpoch += 1
+      const epoch = sessionEpoch
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
       }
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1559,6 +1570,8 @@
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       await refreshAll()
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true })
@@ -1602,11 +1615,14 @@
     }
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
+      sessionEpoch += 1
+      const epoch = sessionEpoch
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
       }
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1616,6 +1632,8 @@
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       await refreshAll()
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true })
@@ -1643,11 +1661,14 @@
     }
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
+      sessionEpoch += 1
+      const epoch = sessionEpoch
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
       }
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1657,6 +1678,8 @@
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       await refreshAll()
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true })
@@ -1684,7 +1707,21 @@
     }
   }
 
+  // Bumped on every sign-out (handleLogout, which expireSession runs) and on
+  // every successful sign-in: an answer requested under an earlier session,
+  // such as a pending /me poll, is dropped.
+  let sessionEpoch = 0
+
+  // The one path for an expired session: api.js runs it on every 401. Several
+  // requests can fail together; once signed out, the rest change nothing.
+  function expireSession() {
+    if (authStatus === 'unauthenticated' && !getAuthToken()) return
+    handleLogout()
+  }
+  onUnauthorized(expireSession)
+
   function handleLogout() {
+    sessionEpoch += 1
     disconnectLogs()
     setAuthToken('')
     authStatus = 'unauthenticated'
@@ -1757,42 +1794,99 @@
     corpusLoadingMore = false
   }
 
+  // Every corpus- and session-scoped value the workspace starts from. A
+  // corpus switch or a sign-out goes back to exactly this.
+  function initialWorkspaceState() {
+    return {
+      ingestStats: { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 },
+      ingestStatsStatus: '',
+      ingestRuns: [],
+      ingestRunsStatus: '',
+      seedSources: [],
+      seedSourcesStatus: '',
+      expandedSeedSourceId: '',
+      seedCandidatesBySource: {},
+      seedCandidatesLoading: {},
+      seedSelections: {},
+      seedSorts: {},
+      selectedSeedCandidateKeys: {},
+      seedPages: {},
+      seedAllSelected: {},
+      seedAppending: {},
+      seedActionStatus: '',
+      seedActionBusy: false,
+      seedLastRunKey: '',
+      seedFilterQuery: '',
+      searchQuery: '',
+      searchMaxResults: DEFAULT_SEARCH_MAX_RESULTS,
+      searchStatus: '',
+      startedSearchRunIds: new Set(),
+      corpusItems: [],
+      corpusTotal: 0,
+      corpusHasMore: false,
+      corpusFilterQuery: '',
+      corpusLoadStatus: '',
+      corpusSource: '',
+      corpusStageTotals: { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 },
+      downloads: [],
+      downloadsSource: '',
+      downloadsQuery: '',
+      logs: [],
+      logsCursor: 0,
+      logsHasMore: false,
+      logsTailStatus: '',
+      corpusActionStatus: '',
+      corpusActionError: false,
+    }
+  }
+
   function resetFrontendState() {
     invalidateCorpusScopedRequests()
-    ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
-    ingestStatsStatus = ''
-    ingestRuns = []
-    ingestRunsStatus = ''
-    seedSources = []
-    seedSourcesStatus = ''
-    expandedSeedSourceId = ''
-    seedCandidatesBySource = {}
-    seedCandidatesLoading = {}
-    seedSelections = {}
-    seedPages = {}
-    seedAllSelected = {}
-    seedAppending = {}
-    seedActionStatus = ''
-    seedActionBusy = false
-    seedLastRunKey = ''
-    searchQuery = ''
-    searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
+    clearTimeout(seedFilterDebounce)
+    clearTimeout(corpusFilterDebounce)
+    startedSearchRunMisses.clear()
+    ;({
+      ingestStats,
+      ingestStatsStatus,
+      ingestRuns,
+      ingestRunsStatus,
+      seedSources,
+      seedSourcesStatus,
+      expandedSeedSourceId,
+      seedCandidatesBySource,
+      seedCandidatesLoading,
+      seedSelections,
+      seedSorts,
+      selectedSeedCandidateKeys,
+      seedPages,
+      seedAllSelected,
+      seedAppending,
+      seedActionStatus,
+      seedActionBusy,
+      seedLastRunKey,
+      seedFilterQuery,
+      searchQuery,
+      searchMaxResults,
+      searchStatus,
+      startedSearchRunIds,
+      corpusItems,
+      corpusTotal,
+      corpusHasMore,
+      corpusFilterQuery,
+      corpusLoadStatus,
+      corpusSource,
+      corpusStageTotals,
+      downloads,
+      downloadsSource,
+      downloadsQuery,
+      logs,
+      logsCursor,
+      logsHasMore,
+      logsTailStatus,
+      corpusActionStatus,
+      corpusActionError,
+    } = initialWorkspaceState())
     resetTopicSearch()
-    searchStatus = ''
-    corpusItems = []
-    corpusTotal = 0
-    corpusLoadStatus = ''
-    corpusSource = ''
-    corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
-    downloads = []
-    downloadsSource = ''
-    downloadsQuery = ''
-    logs = []
-    logsCursor = 0
-    logsHasMore = false
-    logsTailStatus = ''
-    corpusActionStatus = ''
-    corpusActionError = false
     resetKantroposAssignmentState()
     resetUpstreamBrowseState()
     finishExtractionProgress()
@@ -1815,7 +1909,9 @@
         handleLogsCorpusFilterChange()
       }
     } catch (error) {
-      authError = error.message || 'Failed to select corpus'
+      if (error?.status === 401) return
+      corpusActionStatus = error.message || 'Failed to select corpus.'
+      corpusActionError = true
     }
   }
 
@@ -1840,9 +1936,9 @@
       corpusActionStatus = `Created corpus "${name.trim()}".`
       corpusActionError = false
     } catch (error) {
+      if (error?.status === 401) return
       corpusActionStatus = error.message || 'Failed to create corpus.'
       corpusActionError = true
-      authError = error.message || 'Failed to create corpus'
     } finally {
       creatingCorpus = false
     }
@@ -1887,6 +1983,7 @@
       corpusActionStatus = `Deleted corpus "${deletedName}".`
       corpusActionError = false
     } catch (error) {
+      if (error?.status === 401) return
       corpusActionStatus = error.message || 'Failed to delete corpus.'
       corpusActionError = true
     } finally {
@@ -1910,6 +2007,7 @@
       shareStatus = `Shared with ${shareUsername.trim()} (${shareRole}).`
       shareUsername = ''
     } catch (error) {
+      if (error?.status === 401) return
       shareStatus = error.message || 'Failed to share corpus.'
     }
   }
@@ -1982,11 +2080,7 @@
         upstreamBrowseStatus = 'Loaded upstream corpus browser.'
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       if (!quiet) {
         upstreamBrowseStatus = error?.message || 'Failed to load upstream corpus browser.'
       }
@@ -2135,8 +2229,6 @@
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
       }
@@ -2162,8 +2254,6 @@
     } catch (error) {
       finishExtractionProgress()
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
       }
@@ -2181,10 +2271,7 @@
       pruneExtractedUploads()
       ingestRunsStatus = ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401) return
       if (epoch !== corpusScopeEpoch) return
       ingestRunsStatus = 'Failed to load ingest runs.'
     }
@@ -2204,10 +2291,7 @@
       if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401) return
       if (!global) handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
       apiStatus = error?.status === 403 ? 'online' : 'offline'
@@ -2393,11 +2477,7 @@
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       corpusLoadStatus = error?.message || 'Failed to remove the item from this corpus.'
     }
   }
@@ -2421,11 +2501,7 @@
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       corpusLoadStatus = error?.message || 'Failed to remove the selected items.'
     }
   }
@@ -2742,11 +2818,7 @@
         }
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       handleCorpusPollForbidden(error)
       if (token !== seedSourcesRequestToken) return
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
@@ -2846,10 +2918,7 @@
         seedActionStatus = ''
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId) && epoch === corpusScopeEpoch) {
+      if (error?.status !== 401 && !quiet && token === seedCandidatesRequestTokens.get(sourceId) && epoch === corpusScopeEpoch) {
         seedActionStatus = error?.message || 'Failed to load seed candidates.'
       }
     } finally {
@@ -2976,11 +3045,7 @@
       seedActionStatus = status.text
       seedWarningMessage = status.warning ? status.text : ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
@@ -3056,11 +3121,7 @@
       seedActionStatus = status.text
       seedWarningMessage = status.warning ? status.text : ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       // estimatedSelectableSeedCount is just that — an estimate. When it
       // undercounts already-excluded items (e.g. state_counts unresolved
       // above the summarization limit) the backend can still come back with
@@ -3102,11 +3163,7 @@
       }
       seedActionStatus = `Removed ${dismissLabel} candidate(s) from Seed.`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to dismiss seed candidates.'
     } finally {
       seedActionBusy = false
@@ -3129,11 +3186,7 @@
       }
       seedActionStatus = `Removed ${source.label} from Seed.`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to remove seed source.'
     } finally {
       seedActionBusy = false
@@ -3225,7 +3278,7 @@
         topicActiveIndex = topicSuggestions.length > 0 ? 0 : -1
       } catch (error) {
         if (token !== topicLookupToken) return
-        if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
+        if (error?.status === 401) return
         topicSuggestions = []
       }
     }, 250)
@@ -3335,7 +3388,7 @@
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
       searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
-      if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
+      if (error?.status === 401) return
       searchStatus = error?.message || 'Search failed.'
     }
   }
@@ -3408,21 +3461,13 @@
           failed_download: Number(stageTotals.failed_download || 0),
         }
       }
-      if (corpusSource === 'sample') {
-        if (!quiet) corpusLoadStatus = 'Showing sample corpus data.'
-      } else {
-        if (!quiet) {
-          corpusLoadStatus = corpusHasMore
-            ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
-            : `Showing ${corpusItems.length} entries.`
-        }
+      if (!quiet) {
+        corpusLoadStatus = corpusHasMore
+          ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
+          : `Showing ${corpusItems.length} entries.`
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       handleCorpusPollForbidden(error)
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
@@ -3443,10 +3488,8 @@
       downloads = data
       downloadsSource = source
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
+      downloadsSource = 'error'
     }
   }
 
@@ -3457,11 +3500,7 @@
       downloadWorker = payload
       if (!quiet) downloadWorkerStatus = ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       if (!quiet) downloadWorkerStatus = error?.message || 'Failed to load worker status.'
     }
   }
@@ -3504,11 +3543,7 @@
       }
       if (!quiet) pipelineWorkerStatus = ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load worker status.'
     }
   }
@@ -3522,11 +3557,7 @@
       await loadPipelineWorkerStatus()
       pipelineWorkerStatus = 'Pipeline paused.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       pipelineWorkerStatus = error?.message || 'Failed to pause pipeline.'
     } finally {
       pipelineWorkerBusy = false
@@ -3546,11 +3577,7 @@
         downloadWorkerStatus = 'Worker started (auto throughput mode).'
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       downloadWorkerStatus = error?.message || 'Failed to start worker.'
     } finally {
       downloadWorkerBusy = false
@@ -3566,11 +3593,7 @@
       await loadDownloadWorkerStatus()
       downloadWorkerStatus = 'Worker stopped.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       downloadWorkerStatus = error?.message || 'Failed to stop worker.'
     } finally {
       downloadWorkerBusy = false
@@ -3587,11 +3610,7 @@
       await loadDownloads()
       downloadWorkerStatus = 'Batch completed (auto throughput mode).'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       downloadWorkerStatus = error?.message || 'Batch failed.'
     } finally {
       downloadWorkerBusy = false
@@ -3621,8 +3640,6 @@
       exportStatus = `${label} export downloaded.`
     } catch (error) {
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         exportStatus = 'Session expired. Please sign in again.'
         return
       }
@@ -3645,11 +3662,7 @@
       link.remove()
       corpusLoadStatus = 'Download started.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       corpusLoadStatus = error?.message || 'Failed to download file.'
     }
   }
@@ -3674,11 +3687,7 @@
         gemini_model: appSettings?.gemini_model?.value || '',
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       appSettingsStatus = error?.message || 'Failed to load settings.'
       appSettingsError = true
     }
@@ -3698,11 +3707,7 @@
       appSettingsStatus = 'Settings saved. New values apply to the next pipeline run.'
       await loadAppSettings()
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       appSettingsStatus = error?.message || 'Failed to save settings.'
       appSettingsError = true
     }
@@ -3722,11 +3727,7 @@
       link.click()
       link.remove()
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       ingestRunsStatus = error?.message || 'Failed to download the seed document.'
     } finally {
       if (objectUrl) URL.revokeObjectURL(objectUrl)
@@ -3751,11 +3752,7 @@
       URL.revokeObjectURL(url)
       seedActionStatus = `Downloaded ${filename}.`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to download seed candidate file.'
     }
   }
@@ -3787,11 +3784,7 @@
       logsHasMore = Boolean(payload?.has_more)
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       logsTailStatus = error?.message || 'Failed to load persisted logs.'
     }
   }
@@ -3818,11 +3811,7 @@
       logsHasMore = Boolean(payload?.has_more)
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} older log lines.` : 'No older logs found.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       logsTailStatus = error?.message || 'Failed to load older logs.'
     } finally {
       logsLoadingOlder = false
@@ -4157,7 +4146,7 @@
       {:else}
         <h1>Sign in</h1>
         <p class="subtitle">Use your username and password to access corpora.</p>
-        <form class="login-form" on:submit={handleLogin}>
+        <form class="login-form" data-testid="login-form" on:submit={handleLogin}>
           <label>
             Username
             <input type="text" bind:value={loginUsername} autocomplete="username" required />
@@ -4210,7 +4199,7 @@
           </label>
           <div class="header-user header-user--compact">
             <span class="eyebrow">Signed in</span>
-            <strong>{authUser?.username}</strong>
+            <strong data-testid="auth-user">{authUser?.username}</strong>
             <button class="secondary logout-button" type="button" on:click={handleLogout}>
               Log out
             </button>
@@ -5010,8 +4999,8 @@
               Live download activity from API.
             {:else if downloadsSource === 'stub'}
               Stub download activity from API.
-            {:else if downloadsSource === 'sample'}
-              Sample download activity.
+            {:else if downloadsSource === 'error'}
+              Failed to load download activity.
             {:else}
               Download activity loaded ({downloadsSource}).
             {/if}

@@ -152,21 +152,32 @@ for (const action of ['reset', 'clear', 'escape', 'blur', 'workspace'] as const)
   })
 }
 
+// Any 401 for the token in use signs out (api.js runs the one sign-out
+// path); a 401 answering a request sent under the previous session's token
+// must not end the session that replaced it.
 test('a stale unauthorized topic response cannot log out the current session', async ({ page }) => {
   const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
   await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
+  await page.routeWebSocket('**/api/ws', () => {})
   await page.route('**/api/**', route => mockApi(route, state))
   let pending: Route | undefined
-  await page.route('**/api/openalex/topics?*', route => { pending = route })
+  await page.route('**/api/openalex/topics?*', route => {
+    if (pending) return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ topics: [] }) })
+    pending = route
+  })
   await page.goto('/#/workspace')
   const card = page.locator('.seed-intake-card--search')
   await card.getByRole('combobox', { name: /^Topic/ }).fill('labor')
   await expect.poll(() => Boolean(pending)).toBe(true)
-  await card.getByRole('button', { name: 'Reset', exact: true }).click()
+  await page.getByRole('button', { name: 'Log out', exact: true }).click()
+  await page.getByLabel('Username', { exact: true }).fill('admin')
+  await page.getByLabel('Password', { exact: true }).fill('test-password')
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+  await expect(card).toBeVisible()
   await json(pending!, { error: 'old request unauthorized' }, 401)
   await page.waitForTimeout(250)
   await expect(card).toBeVisible()
-  expect(await page.evaluate(() => localStorage.getItem('rag_feeder_token'))).toBe('playwright-token')
+  expect(await page.evaluate(() => localStorage.getItem('rag_feeder_token'))).toBe('new-session-token')
 })
 
 for (const action of ['workspace', 'logout'] as const) {
