@@ -68,6 +68,19 @@
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
   import { seedActivity, seedPromotionStatus } from './lib/seedStatus'
+  import {
+    workState,
+    metadataLabel,
+    downloadLabel,
+    parseAuthors,
+    formatAuthors,
+    formatTitle,
+    normalizeWorkItem,
+    cellText,
+    nextSort,
+    parseSort,
+    sortIndicator,
+  } from './lib/works'
 
   const userTabGroups = [
     {
@@ -255,7 +268,7 @@
     return seedPages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
   }
   function seedSortParams(source) {
-    const current = seedSorts[seedSourceId(source)]
+    const current = parseSort(seedSorts[seedSourceId(source)])
     return current ? { sort: current.column, dir: current.direction } : { sort: '', dir: 'asc' }
   }
   let seedColumnVisibility = loadColumnVisibility('seed')
@@ -706,83 +719,17 @@
     }
   }
 
-  function formatAuthors(entry) {
-    if (!entry) return ''
-    if (Array.isArray(entry.authors)) return entry.authors.join(', ')
-    if (typeof entry.authors === 'string') {
-      try {
-        const parsed = JSON.parse(entry.authors)
-        if (Array.isArray(parsed)) return parsed.join(', ')
-      } catch (error) {
-        // fall through
-      }
-    }
-    if (Array.isArray(entry.author)) return entry.author.join(', ')
-    return entry.authors || entry.author || ''
-  }
-
-  function formatAuthorsList(entry) {
-    if (!entry) return []
-    if (Array.isArray(entry.authors)) return entry.authors
-    if (typeof entry.authors === 'string') {
-      try {
-        const parsed = JSON.parse(entry.authors)
-        if (Array.isArray(parsed)) return parsed
-      } catch (error) {
-        // fall through
-      }
-    }
-    if (Array.isArray(entry.author)) return entry.author
-    const raw = String(entry.authors || entry.author || '').trim()
-    return raw ? raw.split(',').map((name) => name.trim()).filter(Boolean) : []
-  }
-
-  // Table cells show at most `cap` authors; the full list stays in the expanded
-  // detail card and on hover. formatAuthors itself must keep returning the full
-  // string — the corpus search filter matches against it.
-  function formatAuthorsShort(entry, cap = 3) {
-    const list = formatAuthorsList(entry)
-    if (list.length === 0) return formatAuthors(entry)
-    if (list.length <= cap) return list.join(', ')
-    return `${list.slice(0, cap).join(', ')} et al.`
-  }
-
   function normalizeCorpusItem(entry) {
-    if (!entry || typeof entry !== 'object') return entry
-    return {
-      ...entry,
-      authors_display: formatAuthors(entry),
-    }
+    return normalizeWorkItem(entry)
   }
 
   function normalizeUpstreamBrowseItem(entry) {
     if (!entry || typeof entry !== 'object') return entry
     return {
-      ...entry,
-      authors_display: formatAuthors(entry),
+      ...normalizeWorkItem(entry),
       source_corpora: Array.isArray(entry.source_corpora) ? entry.source_corpora : [],
       source_corpus_ids: Array.isArray(entry.source_corpus_ids) ? entry.source_corpus_ids : [],
     }
-  }
-
-  function formatTitle(entry) {
-    return entry?.title || entry?.source || entry?.url || 'Untitled'
-  }
-
-  function parseAuthorsValue(value) {
-    if (Array.isArray(value)) return value.map((v) => String(v || '').trim()).filter(Boolean)
-    if (typeof value === 'string') {
-      const raw = value.trim()
-      if (!raw) return []
-      try {
-        const parsed = JSON.parse(raw)
-        if (Array.isArray(parsed)) return parsed.map((v) => String(v || '').trim()).filter(Boolean)
-      } catch (error) {
-        // fall through
-      }
-      return raw.split(';').map((v) => v.trim()).filter(Boolean)
-    }
-    return []
   }
 
   function formatSeedDocumentLabel(meta, fallback = '') {
@@ -798,7 +745,7 @@
 
   function formatSeedDocumentDetails(meta) {
     if (!meta || typeof meta !== 'object') return ''
-    const authors = parseAuthorsValue(meta.authors)
+    const authors = parseAuthors(meta.authors)
     if (authors.length > 0) return authors.join(', ')
     const source = String(meta.source || '').trim()
     const publisher = String(meta.publisher || '').trim()
@@ -2322,25 +2269,6 @@
     return String(source.id || `${source.source_type}:${source.source_key}`)
   }
 
-  function seedCandidateState(candidate) {
-    const state = String(candidate?.state || '').trim().toLowerCase()
-    if ([
-      'added',
-      'pending',
-      'staged_raw',
-      'queued_enrichment',
-      'enriched',
-      'queued_download',
-      'downloaded',
-      'downloaded_elsewhere',
-      'failed_enrichment',
-      'failed_download',
-    ].includes(state)) {
-      return state
-    }
-    return 'pending'
-  }
-
   function isSeedCandidateInCorpus(candidate) {
     return Boolean(candidate?.in_corpus)
   }
@@ -2365,7 +2293,7 @@
       if (isSeedCandidateInCorpus(candidate)) {
         counts.in_corpus += 1
       }
-      const state = seedCandidateState(candidate)
+      const state = workState(candidate?.state)
       counts[state] = (counts[state] || 0) + 1
       if (state === 'downloaded_elsewhere') {
         if (candidate?.file_available === true) {
@@ -2415,7 +2343,7 @@
   }
 
   function seedCandidateTag(candidate) {
-    switch (seedCandidateState(candidate)) {
+    switch (workState(candidate?.state)) {
       case 'downloaded':
         return {
           label: candidate?.file_available === false ? 'File missing' : 'PDF downloaded',
@@ -2450,7 +2378,7 @@
   // Downstream checkbox re-evaluates every row.
   function isSeedCandidateSelectable(candidate, downstreamOn = includeDownstream, downstreamDepth = relatedDepthDownstream) {
     if (downstreamOn && downstreamDepth >= 1) return true
-    return seedCandidateState(candidate) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
+    return workState(candidate?.state) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
   }
 
   // The seed tables render inside {#key ...} blocks, so selectability changes
@@ -2526,16 +2454,8 @@
   }
 
   function toggleCorpusSort(column) {
-    const [currentColumn, currentDirection] = String(corpusSort || '').split(':')
-    const direction = currentColumn === column && currentDirection === 'asc' ? 'desc' : 'asc'
-    corpusSort = `${column}:${direction}`
+    corpusSort = nextSort(corpusSort, column)
     loadCorpus({ quiet: true })
-  }
-
-  function corpusSortIndicator(column, sort = corpusSort) {
-    const [currentColumn, currentDirection] = String(sort || '').split(':')
-    if (currentColumn !== column) return ''
-    return currentDirection === 'asc' ? ' ▲' : ' ▼'
   }
 
   function getSeedCandidatesForSource(source) {
@@ -2546,8 +2466,8 @@
   // applies to PDF seeds — those load in full. Search seeds page server-side
   // and sort server-side too (see toggleSeedSort / sortSeedCandidates).
   const SEED_SORT_ACCESSORS = {
-    metadata: (candidate) => seedMetadataLabel(candidate),
-    download: (candidate) => seedDownloadLabel(candidate),
+    metadata: (candidate) => metadataLabel(candidate),
+    download: (candidate) => downloadLabel(candidate),
     title: (candidate) => formatTitle(candidate),
     authors: (candidate) => formatAuthors(candidate),
     year: (candidate) => candidate?.year,
@@ -2557,85 +2477,10 @@
     cited_by: (candidate) => candidate?.cited_by_count,
   }
 
-  // Spec line 16: show the metadata and download axes separately. The derived
-  // `state` still drives every behaviour — only the display splits.
-  const SEED_METADATA_LABELS = {
-    pending: 'Pending',
-    enriching: 'Enriching',
-    matched: 'Confirmed',
-    failed_enrichment: 'Metadata not confirmed',
-  }
-  const SEED_DOWNLOAD_LABELS = {
-    not_requested: 'Not requested',
-    queued: 'Queued',
-    in_progress: 'Downloading',
-    downloaded: 'Downloaded',
-    failed: 'Not retrievable',
-    failed_download: 'Not retrievable',
-  }
-
-  // Search candidates carry no metadata_status of their own, so the column
-  // falls back to the resolved state (what the old row tag used to say).
-  const SEED_METADATA_BY_STATE = {
-    enriched: 'Confirmed',
-    added: 'Confirmed',
-    downloaded: 'Confirmed',
-    downloaded_elsewhere: 'Confirmed',
-    queued_download: 'Confirmed',
-    failed_download: 'Confirmed',
-    queued_enrichment: 'Enriching',
-    staged_raw: 'Pending',
-    pending: 'Pending',
-  }
-
-  function seedMetadataLabel(candidate) {
-    const state = seedCandidateState(candidate)
-    if (state === 'failed_enrichment') return SEED_METADATA_LABELS.failed_enrichment
-    const raw = String(candidate?.metadata_status || '').trim().toLowerCase()
-    if (SEED_METADATA_LABELS[raw]) return SEED_METADATA_LABELS[raw]
-    if (raw) return raw.replace(/_/g, ' ')
-    return SEED_METADATA_BY_STATE[state] || '-'
-  }
-
-  function seedDownloadLabel(candidate) {
-    const state = seedCandidateState(candidate)
-    if (state === 'failed_download') return SEED_DOWNLOAD_LABELS.failed_download
-    const raw = String(candidate?.download_status || '').trim().toLowerCase()
-    if (SEED_DOWNLOAD_LABELS[raw]) return SEED_DOWNLOAD_LABELS[raw]
-    if (raw) return raw.replace(/_/g, ' ')
-    if (state === 'downloaded') return candidate?.file_available === false ? 'File missing' : 'Downloaded'
-    if (state === 'downloaded_elsewhere') return candidate?.file_available === true ? 'Downloaded' : 'Stale record'
-    if (state === 'queued_download') return SEED_DOWNLOAD_LABELS.queued
-    return '-'
-  }
-
-  function seedCellText(candidate, key) {
-    switch (key) {
-      case 'metadata': return seedMetadataLabel(candidate)
-      case 'download': return seedDownloadLabel(candidate)
-      case 'title': return formatTitle(candidate)
-      case 'authors': return formatAuthorsShort(candidate)
-      case 'year': return candidate?.year || ''
-      case 'refs': return candidate?.refs_count ?? '–'
-      case 'cited_by': return candidate?.cited_by_count ?? '–'
-      case 'source': return candidate?.source || ''
-      case 'doi': return candidate?.doi || ''
-      case 'publisher': return candidate?.publisher || ''
-      case 'type': return candidate?.type || ''
-      case 'openalex': return candidate?.openalex_id || ''
-      case 'pages': return candidate?.pages || ''
-      case 'open_access': return candidate?.open_access_url ? 'Yes' : 'No'
-      case 'file': return candidate?.file_available ? 'Yes' : 'No'
-      default: return ''
-    }
-  }
-
   function toggleSeedSort(source, column) {
     if (!SEED_SORT_ACCESSORS[column]) return
     const sourceId = seedSourceId(source)
-    const current = seedSorts[sourceId]
-    const direction = current && current.column === column && current.direction === 'asc' ? 'desc' : 'asc'
-    seedSorts = { ...seedSorts, [sourceId]: { column, direction } }
+    seedSorts = { ...seedSorts, [sourceId]: nextSort(seedSorts[sourceId], column) }
     // Search seeds sort server-side (the metadata/download axes require every
     // row resolved, which the client only has for the loaded page) — reload
     // page one under the new sort. PDF seeds keep the client-side sort below.
@@ -2647,9 +2492,7 @@
   // `sorts` is passed in from the template rather than read off the module
   // binding so Svelte tracks seedSorts as a dependency of the markup.
   function seedSortIndicator(source, column, sorts = seedSorts) {
-    const current = sorts[seedSourceId(source)]
-    if (!current || current.column !== column) return ''
-    return current.direction === 'asc' ? ' ▲' : ' ▼'
+    return sortIndicator(sorts[seedSourceId(source)], column)
   }
 
   function sortSeedCandidates(source, candidates, sorts = seedSorts) {
@@ -2658,7 +2501,7 @@
     // reorder what happens to be loaded, not the whole set. PDF seeds load in
     // full, so the client-side sort below still gives a correct order.
     if (source.source_type === 'search') return candidates
-    const current = sorts[seedSourceId(source)]
+    const current = parseSort(sorts[seedSourceId(source)])
     const accessor = current && SEED_SORT_ACCESSORS[current.column]
     if (!accessor) return candidates
     const factor = current.direction === 'desc' ? -1 : 1
@@ -3777,7 +3620,7 @@
   }
 
   function canDownloadSeedCandidate(candidate) {
-    const state = seedCandidateState(candidate)
+    const state = workState(candidate?.state)
     const workId = Number(candidate?.downloaded_work_id)
     return (state === 'downloaded' || state === 'downloaded_elsewhere') &&
       Number.isFinite(workId) &&
@@ -4812,12 +4655,12 @@
                                           type="button"
                                           title={`Download the file from work ${candidate.downloaded_work_id}`}
                                           on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
-                                        >{seedCellText(candidate, column.key)} ⤓</button>
+                                        >{cellText(candidate, column.key, { blank: '' })} ⤓</button>
                                       </span>
                                     {:else if column.key === 'authors'}
-                                      <span title={formatAuthors(candidate)}>{seedCellText(candidate, column.key)}</span>
+                                      <span title={formatAuthors(candidate)}>{cellText(candidate, column.key, { blank: '' })}</span>
                                     {:else}
-                                      <span title={seedCellText(candidate, column.key)}>{seedCellText(candidate, column.key)}</span>
+                                      <span title={cellText(candidate, column.key, { blank: '' })}>{cellText(candidate, column.key, { blank: '' })}</span>
                                     {/if}
                                   {/each}
                                 </div>
@@ -4843,8 +4686,8 @@
                                           {/if}
                                         </div>
                                         <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
-                                          <span class="seed-refs-cell__down">↓ Refs: {seedCellText(candidate, 'refs')}</span>
-                                          <span class="seed-refs-cell__up">↑ Cited: {seedCellText(candidate, 'cited_by')}</span>
+                                          <span class="seed-refs-cell__down">↓ Refs: {cellText(candidate, 'refs', { blank: '' })}</span>
+                                          <span class="seed-refs-cell__up">↑ Cited: {cellText(candidate, 'cited_by', { blank: '' })}</span>
                                         </div>
                                         <div class="inline-detail-actions">
                                           {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
@@ -4903,14 +4746,11 @@
                 {failedEnrichmentTotal}
                 {failedDownloadTotal}
                 {bucketLabel}
-                {formatAuthors}
-                {formatAuthorsShort}
                 {corpusFilterQuery}
                 {handleCorpusFilterInput}
                 {handleRemoveCorpusWork}
                 {handleRemoveSelectedCorpusWorks}
                 {toggleCorpusSort}
-                {corpusSortIndicator}
                 {corpusSort}
                 {doiHref}
                 {openAlexHref}
@@ -4966,7 +4806,6 @@
           browse={upstreamBrowse}
           selectedAssignedCorpusId={selectedUpstreamAssignedCorpusId}
           toggleAssignedCorpus={handleToggleUpstreamAssignedCorpus}
-          {formatAuthors}
           {doiHref}
           {openAlexHref}
         />

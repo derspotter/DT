@@ -1,4 +1,16 @@
 <script>
+  import {
+    RAW_STATUSES,
+    METADATA_STATUSES,
+    FAILED_ENRICHMENT_STATUSES,
+    FAILED_DOWNLOAD_STATUSES,
+    DOWNLOADED_STATUSES,
+    bucketForStatus,
+    formatAuthors,
+    workSource,
+    cellText,
+    sortIndicator,
+  } from '../lib/works';
   export let corpusSource;
   export let corpusTotal;
   export let corpusItems;
@@ -9,8 +21,6 @@
   export let failedDownloadTotal;
   
   export let bucketLabel;
-  export let formatAuthors;
-  export let formatAuthorsShort = (entry) => formatAuthors(entry);
   export let doiHref;
   export let openAlexHref;
   export let handleDownloadedCorpusFile;
@@ -27,7 +37,6 @@
   export let corpusFilterQuery = '';
   export let handleCorpusFilterInput = () => {};
   export let toggleCorpusSort = () => {};
-  export let corpusSortIndicator = () => '';
   export let corpusSort = '';
   export let handleRemoveCorpusWork = () => {};
 
@@ -103,11 +112,6 @@
   }
   let stageFilter = 'all';
   let activeCorpusKey = '';
-  const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending']);
-  const METADATA_STATUSES = new Set(['enriching', 'matched', 'queued_download']);
-  const FAILED_ENRICHMENT_STATUSES = new Set(['failed_enrichment']);
-  const FAILED_DOWNLOAD_STATUSES = new Set(['failed_download']);
-  const DOWNLOADED_STATUSES = new Set(['downloaded']);
 
   $: filteredItems = corpusItems.filter(item => {
     if (stageFilter === 'raw') {
@@ -126,11 +130,7 @@
   });
 
   function getBucketForItem(item) {
-    if (!item.status || RAW_STATUSES.has(item.status)) return 'raw';
-    if (METADATA_STATUSES.has(item.status)) return 'metadata';
-    if (FAILED_ENRICHMENT_STATUSES.has(item.status) || FAILED_DOWNLOAD_STATUSES.has(item.status)) return 'failed';
-    if (DOWNLOADED_STATUSES.has(item.status)) return 'downloaded';
-    return 'raw';
+    return bucketForStatus(item?.status);
   }
 
   function itemStageLabel(item, bucket = getBucketForItem(item)) {
@@ -162,99 +162,11 @@
     return `${bucket}:${item.id}`
   }
 
-  // Spec line 8: cells show at most three authors; the full list stays on hover
-  // and in the expanded detail card.
-  function corpusItemAuthors(item) {
-    if (!item) return ''
-    if (typeof item.authors_display === 'string' && item.authors_display.trim()) {
-      return formatAuthorsShort({ authors: item.authors_display.split(',').map((name) => name.trim()) })
-    }
-    return formatAuthorsShort(item)
-  }
-
+  // Spec line 8: cells show at most three authors (authors_short, via
+  // cellText); the full list stays on hover and in the expanded detail card.
+  // Both come from normalizeWorkItem — never re-split authors_display.
   function corpusItemAuthorsFull(item) {
-    if (!item) return ''
-    if (typeof item.authors_display === 'string' && item.authors_display.trim()) return item.authors_display
     return formatAuthors(item)
-  }
-
-  // Spec line 19: "Source" is the article's venue in both tables. Provenance
-  // moved to its own "Seed" column below.
-  function corpusItemSource(item) {
-    return String(item?.source || '').trim()
-  }
-
-  // Spec C2 + line 19: where the item came from — the search query, or the
-  // seed document's title and author.
-  function corpusItemSeed(item) {
-    const label = String(item?.source_label || '').trim()
-    if (label) return label
-    const raw = String(item?.origin || '').trim()
-    if (!raw) return ''
-    if (raw.endsWith('/metadata.bib')) return 'Upstream metadata.bib'
-    if (raw.startsWith('search:')) return `Search #${raw.slice('search:'.length)}`
-    return raw
-  }
-
-  const METADATA_LABELS = {
-    pending: 'Pending',
-    enriching: 'Enriching',
-    matched: 'Confirmed',
-    failed_enrichment: 'Metadata not confirmed',
-  }
-  const DOWNLOAD_LABELS = {
-    not_requested: 'Not requested',
-    queued: 'Queued',
-    in_progress: 'Downloading',
-    downloaded: 'Downloaded',
-    failed: 'Not retrievable',
-    failed_download: 'Not retrievable',
-  }
-
-  // Spec line 16: display the two axes separately. The collapsed `status` is
-  // still what every behaviour (selection, stage filter, colours) keys off —
-  // only the presentation splits.
-  function metadataLabel(item) {
-    if (FAILED_ENRICHMENT_STATUSES.has(item?.status)) return METADATA_LABELS.failed_enrichment
-    const raw = String(item?.metadata_status || '').trim().toLowerCase()
-    return METADATA_LABELS[raw] || (raw ? raw.replace(/_/g, ' ') : '-')
-  }
-
-  function downloadLabel(item) {
-    if (FAILED_DOWNLOAD_STATUSES.has(item?.status)) return DOWNLOAD_LABELS.failed_download
-    const raw = String(item?.download_status || '').trim().toLowerCase()
-    return DOWNLOAD_LABELS[raw] || (raw ? raw.replace(/_/g, ' ') : '-')
-  }
-
-  // SQLite CURRENT_TIMESTAMP is UTC "YYYY-MM-DD HH:MM:SS"; show the day only.
-  function formatDateAdded(value) {
-    const raw = String(value || '').trim()
-    if (!raw) return '-'
-    const match = raw.match(/^(\d{4}-\d{2}-\d{2})/)
-    if (match) return match[1]
-    const parsed = new Date(raw)
-    return Number.isNaN(parsed.getTime()) ? raw : parsed.toISOString().slice(0, 10)
-  }
-
-  function cellText(item, key, bucket) {
-    switch (key) {
-      case 'metadata': return metadataLabel(item)
-      case 'download': return downloadLabel(item)
-      case 'title': return item?.title || 'Untitled'
-      case 'authors': return corpusItemAuthors(item)
-      case 'year': return item?.year || '-'
-      case 'added': return formatDateAdded(item?.added_at)
-      case 'source': return corpusItemSource(item) || '-'
-      case 'seed': return corpusItemSeed(item) || '-'
-      case 'doi': return item?.doi || '-'
-      case 'publisher': return item?.publisher || '-'
-      case 'type': return item?.type || '-'
-      case 'openalex': return item?.openalex_id || '-'
-      case 'pages': return item?.pages || '-'
-      case 'open_access': return item?.open_access_url ? 'Yes' : 'No'
-      case 'file': return item?.file_path ? 'Yes' : 'No'
-      default: return itemStageLabel(item, bucket)
-    }
   }
 
   function toggleCorpusItemSelection(item, bucket) {
@@ -347,7 +259,7 @@
           <span>
             {#if column.sortable}
               <button class="table-sort" type="button" on:click={() => toggleCorpusSort(column.key)}>
-                {column.label}{corpusSortIndicator(column.key, corpusSort)}
+                {column.label}{sortIndicator(corpusSort, column.key)}
               </button>
             {:else}
               {column.label}
@@ -397,10 +309,10 @@
                 </span>
               </span>
             {:else if column.key === 'authors'}
-              <span class="muted small line-clamp-2" title={corpusItemAuthorsFull(item)}>{cellText(item, column.key, bucket)}</span>
+              <span class="muted small line-clamp-2" title={corpusItemAuthorsFull(item)}>{cellText(item, column.key)}</span>
             {:else}
-              <span class="muted small line-clamp-2 corpus-cell" title={cellText(item, column.key, bucket)}>
-                {cellText(item, column.key, bucket)}
+              <span class="muted small line-clamp-2 corpus-cell" title={cellText(item, column.key)}>
+                {cellText(item, column.key)}
               </span>
             {/if}
           {/each}
@@ -432,7 +344,7 @@
                     <span class="inline-detail-chip">Stage: {itemStageLabel(item, bucket)}</span>
                   {/if}
                   <span class="inline-detail-chip">Year: {item.year || '-'}</span>
-                  <span class="inline-detail-chip">Source: {corpusItemSource(item) || '-'}</span>
+                  <span class="inline-detail-chip">Source: {workSource(item) || '-'}</span>
                   <span class="inline-detail-chip">Author: {corpusItemAuthorsFull(item) || '-'}</span>
                   {#if item.doi}
                     <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI</a>

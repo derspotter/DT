@@ -1,6 +1,7 @@
 <script>
   import UpstreamCorpusMap from './UpstreamCorpusMap.svelte'
   import { createUpstreamCorpusItemDownloadUrl } from '../lib/api'
+  import { formatAuthors } from '../lib/works'
 
   export let corpora = []
   export let currentCorpus = null
@@ -43,7 +44,6 @@
   export let toggleAssignedCorpus = () => {}
   export let loadMoreCurrent = () => {}
   export let loadMorePending = () => {}
-  export let formatAuthors = () => ''
   export let doiHref = () => ''
   export let openAlexHref = () => ''
 
@@ -59,9 +59,11 @@
     return `${prefix}:${item.id}`
   }
 
+  // Items arrive normalised (normalizeWorkItem in App.svelte); the fallback
+  // only covers a row that skipped normalisation.
   function itemAuthors(item) {
     if (!item) return ''
-    if (typeof item.authors_display === 'string' && item.authors_display.trim()) return item.authors_display
+    if (typeof item.authors_display === 'string') return item.authors_display
     return formatAuthors(item)
   }
 
