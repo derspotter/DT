@@ -8,13 +8,13 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
 import zlib from 'zlib';
-import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
 import { listCorpus } from './corpusList.js';
+import { createPythonRunner } from './pythonProcess.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -165,6 +165,9 @@ const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_s
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
 const SEED_EXPAND_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_expand.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
+const PDF_PAGE_COUNT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'pdf_page_count.py');
+const LLM_UPLOAD_PDF_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'llm_upload_pdf.py');
+const LLM_DELETE_UPLOAD_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'llm_delete_upload.py');
 const LOCAL_VENV_PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || (fs.existsSync(LOCAL_VENV_PYTHON) ? LOCAL_VENV_PYTHON : 'python');
 const KANTROPOS_CORPORA_ROOT =
@@ -184,7 +187,7 @@ function isStubMode() {
   return process.env.RAG_FEEDER_STUB === '1';
 }
 
-function resolveAuthConfig() {
+export function resolveAuthConfig() {
   if (isStubMode()) {
     return {
       jwtSecret: 'stub-jwt-secret',
@@ -411,7 +414,7 @@ function graph3dScriptArgs(options, extraArgs = []) {
   return args;
 }
 
-function graph3dSnapshotKey(options) {
+export function graph3dSnapshotKey(options) {
   // Intentionally excludes the DB modification time: the enrich/download workers
   // touch the DB constantly, so keying on mtime made nearly every open a cold
   // ~30s rebuild. A param set now maps to one stable cache dir, refreshed in the
@@ -434,6 +437,48 @@ function graph3dSnapshotPath(key, fileName = '') {
   return path.join(GRAPH_3D_SNAPSHOT_DIR, key, fileName);
 }
 
+// scope.json records which corpus a snapshot was built for (null = the
+// admin-only merged view), so the key-addressed cluster/file routes can check
+// access without trusting a client-supplied corpus.
+export function graph3dScopePath(key) {
+  return graph3dSnapshotPath(key, 'scope.json');
+}
+
+export function writeGraph3dScope(key, corpusId, dir = graph3dSnapshotPath(key)) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'scope.json'), JSON.stringify({ corpusId: corpusId ?? null }));
+}
+
+// Returns { corpusId } or null when the sidecar is missing or malformed
+// (pre-sidecar caches stay admin-only until their TTL rebuild writes one).
+export function readGraph3dScope(key) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(graph3dScopePath(key), 'utf-8'));
+    const corpusId = parsed?.corpusId;
+    if (corpusId === null) return { corpusId: null };
+    return Number.isInteger(corpusId) && corpusId > 0 ? { corpusId } : null;
+  } catch {
+    return null;
+  }
+}
+
+// The admin reads every work; anyone else only works in a corpus they belong to.
+export function workReadableByUser(db, user, workId, authConfig = resolveAuthConfig()) {
+  if (isAdminUser(user, authConfig)) return true;
+  if (!user?.id) return false;
+  return Boolean(
+    db
+      .prepare(
+        `SELECT EXISTS (
+           SELECT 1 FROM corpus_works cw
+           JOIN user_corpora uc ON uc.corpus_id = cw.corpus_id
+           WHERE cw.work_id = ? AND uc.user_id = ?
+         ) AS readable`
+      )
+      .get(workId, user.id)?.readable
+  );
+}
+
 // Build a snapshot into a temp dir, then swap it into place, so readers never
 // see a half-written snapshot. Concurrent callers for the same key share one
 // build. Returns the manifest object.
@@ -444,6 +489,8 @@ function buildGraph3dSnapshot(options, key) {
   const promise = (async () => {
     try {
       fs.mkdirSync(buildDir, { recursive: true });
+      // Written into the build dir so it is swapped in together with the snapshot.
+      writeGraph3dScope(key, options.corpusId, buildDir);
       await runPythonJson(
         GRAPH_3D_EXPORT_SCRIPT,
         graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
@@ -1108,6 +1155,40 @@ function getCorpusRoleForUser(db, userId, corpusId) {
     .get(userId, corpusId)?.role;
 }
 
+// Positive integer corpus id (numeric strings accepted, as route params arrive
+// as strings), else null.
+function normalizeCorpusId(corpusId) {
+  if (typeof corpusId === 'string' && !/^\d+$/.test(corpusId.trim())) return null;
+  const n = Number(corpusId);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// The one corpus-access rule: the admin passes every check on an existing
+// corpus, everyone else needs a current user_corpora row. Invalid ids never pass.
+export function resolveCorpusRole(db, user, corpusId, authConfig = resolveAuthConfig()) {
+  const id = normalizeCorpusId(corpusId);
+  if (!user || !id) return null;
+  if (isAdminUser(user, authConfig)) {
+    return db.prepare('SELECT 1 FROM corpora WHERE id = ?').get(id) ? 'admin' : null;
+  }
+  return getCorpusRoleForUser(db, user.id, id) || null;
+}
+
+// Re-validates users.last_corpus_id against current membership: keeps it while
+// it is still accessible, else falls back to the newest membership, else null.
+// A changed value is persisted.
+export function ensureLastCorpus(db, user, authConfig = resolveAuthConfig()) {
+  const stored = user?.last_corpus_id || null;
+  if (stored && resolveCorpusRole(db, user, stored, authConfig)) return stored;
+  const next = db
+    .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC, corpus_id DESC LIMIT 1')
+    .get(user.id)?.corpus_id || null;
+  if (next !== stored) {
+    db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(next, user.id);
+  }
+  return next;
+}
+
 function canConfigureCorpus(role) {
   return role === 'owner' || role === 'editor';
 }
@@ -1704,7 +1785,7 @@ function getCorpusKantroposAssignment(db, corpusId) {
   };
 }
 
-function getUserById(db, userId) {
+export function getUserById(db, userId) {
   return db
     .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
     .get(userId);
@@ -1816,7 +1897,7 @@ function authUserPayload(user, lastCorpusId = null, authConfig = resolveAuthConf
   };
 }
 
-function isAdminUser(user, authConfig = resolveAuthConfig()) {
+export function isAdminUser(user, authConfig = resolveAuthConfig()) {
   return String(user?.username || '') === authConfig.adminUsername;
 }
 
@@ -1838,55 +1919,14 @@ function requireAuth(db, authConfig = resolveAuthConfig()) {
       if (!user) {
         return res.status(401).json({ error: 'Unknown user' });
       }
-      req.user = user;
-      req.corpusId = user.last_corpus_id || null;
+      req.corpusId = ensureLastCorpus(db, user, authConfig);
+      req.corpusRole = req.corpusId ? resolveCorpusRole(db, user, req.corpusId, authConfig) : null;
+      req.user = { ...user, last_corpus_id: req.corpusId };
       return next();
     } catch (error) {
       return res.status(401).json({ error: 'Invalid token' });
     }
   };
-}
-
-function parseJsonFromOutput(output) {
-  const lines = String(output || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const tryParse = (text) => {
-    if (!text) return null;
-    try {
-      return JSON.parse(text);
-    } catch {
-      return null;
-    }
-  };
-
-  // Fast path: find a valid JSON line near the bottom while skipping log lines
-  // such as "[DB Manager] ...", which are not JSON arrays.
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    const bracketIndex = line.search(/[\[{]/);
-    if (bracketIndex < 0) continue;
-    const inlineCandidate = line.slice(bracketIndex).trim();
-    const parsedInline = tryParse(inlineCandidate);
-    if (parsedInline !== null) return parsedInline;
-  }
-
-  // Fallback: recover pretty-printed/multiline JSON blocks from stdout.
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    const bracketIndex = line.search(/[\[{]/);
-    if (bracketIndex < 0) continue;
-    for (let j = lines.length; j > i; j -= 1) {
-      const segment = lines.slice(i, j);
-      segment[0] = segment[0].slice(bracketIndex);
-      const parsedSegment = tryParse(segment.join('\n'));
-      if (parsedSegment !== null) return parsedSegment;
-    }
-  }
-
-  throw new Error(`No valid JSON output from python. Output was: ${output}`);
 }
 
 function resolveDownloadedFilePath(storedPath, context = {}) {
@@ -2262,88 +2302,16 @@ function appSettingsEnv() {
   return env;
 }
 
-function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {}) {
-  const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority });
-  return done;
-}
-
-function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine, lowPriority } = {}) {
-  const env = {
-    ...process.env,
-    // Admin-managed settings win over the process environment, so changing a
-    // key or model in the UI takes effect on the next script run (spec 13/14).
-    ...appSettingsEnv(),
-    PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-    RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
-  };
-
-  const finalArgs = [...args];
-  if (corpusId !== undefined && corpusId !== null) {
-    finalArgs.push('--corpus-id', String(corpusId));
-  }
-
-  const child = spawn(PYTHON_EXEC, [scriptPath, ...finalArgs], { env });
-  if (lowPriority && child.pid) {
-    // Background jobs (e.g. the ~60s graph layout rebuild) shouldn't starve the
-    // API: drop their CPU priority so interactive requests stay fast while they
-    // run. Best-effort — ignore if the platform/permissions disallow it.
-    try { os.setPriority(child.pid, 15); } catch { /* noop */ }
-  }
-  let stdout = '';
-  let stderr = '';
-  let stdoutBuf = '';
-  let stderrBuf = '';
-
-  const flushLines = (buffer, handler, flushPartial = false) => {
-    if (typeof handler !== 'function') {
-      return buffer;
-    }
-    const parts = String(buffer).split(/\r?\n/);
-    const pending = parts.pop() ?? '';
-    parts
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .forEach((line) => handler(line));
-    if (flushPartial && pending.trim()) {
-      handler(pending.trim());
-      return '';
-    }
-    return pending;
-  };
-
-  child.stdout.on('data', (data) => {
-    const text = data.toString();
-    stdout += text;
-    stdoutBuf += text;
-    stdoutBuf = flushLines(stdoutBuf, onStdoutLine);
-  });
-
-  child.stderr.on('data', (data) => {
-    const text = data.toString();
-    stderr += text;
-    stderrBuf += text;
-    stderrBuf = flushLines(stderrBuf, onStderrLine);
-  });
-
-  const done = new Promise((resolve, reject) => {
-    child.on('close', (code) => {
-      stdoutBuf = flushLines(stdoutBuf, onStdoutLine, true);
-      stderrBuf = flushLines(stderrBuf, onStderrLine, true);
-      if (code !== 0) {
-        return reject(new Error(`Python script failed (${code}): ${stderr || stdout}`));
-      }
-      try {
-        const payload = parseJsonFromOutput(stdout);
-        return resolve(payload);
-      } catch (error) {
-        return reject(error);
-      }
-    });
-  });
-
-  return { child, done };
-}
+// Every Python child is spawned through this runner, so all of them get the
+// same PYTHONPATH and the Admin-tab settings (see pythonProcess.js).
+const pythonRunner = createPythonRunner({
+  pythonExec: PYTHON_EXEC,
+  dlLitProjectDir: DL_LIT_PROJECT_DIR,
+  repoRoot: REPO_ROOT,
+  dbPath: DB_PATH,
+  appSettingsEnv,
+});
+const { pythonEnv, spawnPython, runPythonJson, parseJsonFromOutput } = pythonRunner;
 
 function coerceInt(value, fallback = null) {
   if (value === undefined || value === null || value === '') {
@@ -2506,106 +2474,34 @@ function readLogWindow(
   };
 }
 
-function getPdfPageCountSync(pdfPath) {
+async function getPdfPageCount(pdfPath) {
   if (!pdfPath || !fs.existsSync(pdfPath)) return null;
-  const probeCode = [
-    'import sys',
-    'import pikepdf',
-    'pdf = pikepdf.Pdf.open(sys.argv[1])',
-    'print(len(pdf.pages))',
-    'pdf.close()',
-  ].join('; ');
   try {
-    const result = spawnSync(PYTHON_EXEC, ['-c', probeCode, pdfPath], {
-      env: {
-        ...process.env,
-        PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-      },
-      encoding: 'utf8',
-    });
-    if (result.status !== 0) {
-      console.warn(`[/api/extract-bibliography] Could not read page count for ${pdfPath}: ${result.stderr || result.stdout}`);
-      return null;
-    }
-    const parsed = Number.parseInt(String(result.stdout || '').trim(), 10);
+    const { stdout } = await spawnPython(PDF_PAGE_COUNT_SCRIPT, [pdfPath]).done;
+    const parsed = Number.parseInt(String(stdout || '').trim(), 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   } catch (error) {
-    console.warn(`[/api/extract-bibliography] Page count probe failed for ${pdfPath}: ${error?.message || error}`);
+    console.warn(`[/api/extract-bibliography] Could not read page count for ${pdfPath}: ${error?.message || error}`);
     return null;
   }
 }
 
-function llmUploadPdfSync(pdfPath) {
-  const code = [
-    'import json',
-    'import os',
-    'import shutil',
-    'import sys',
-    'import tempfile',
-    'import unicodedata',
-    'from dl_lit.llm_provider import OpenAICompatClient, get_client',
-    'client = get_client(required=True)',
-    'pdf_path = sys.argv[1]',
-    'base = os.path.basename(pdf_path)',
-    'if isinstance(client, OpenAICompatClient):',
-    '    # Local handles must reference a persistent path; no remote upload happens.',
-    '    f = client.files.upload(file=pdf_path, config={"mime_type":"application/pdf","display_name":base})',
-    '    print(json.dumps({"name": f.name}))',
-    '    sys.exit(0)',
-    'norm = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")',
-    'safe = "".join((c if (c.isalnum() or c in "._-") else "_") for c in norm).strip("._") or "upload"',
-    'if not safe.lower().endswith(".pdf"):',
-    '    safe += ".pdf"',
-    'is_ascii = all(ord(c) < 128 for c in pdf_path) and all(ord(c) < 128 for c in base)',
-    'tmpdir = None',
-    'upload_path = pdf_path',
-    'display_name = base',
-    'if not is_ascii:',
-    '    tmpdir = tempfile.mkdtemp(prefix="gemini_upload_")',
-    '    upload_path = os.path.join(tmpdir, safe)',
-    '    shutil.copy2(pdf_path, upload_path)',
-    '    display_name = safe',
-    'f = client.files.upload(file=upload_path, config={"mime_type":"application/pdf","display_name":display_name})',
-    'print(json.dumps({"name": f.name}))',
-    'if tmpdir:',
-    '    shutil.rmtree(tmpdir, ignore_errors=True)',
-  ].join('\n');
-  const result = spawnSync(PYTHON_EXEC, ['-c', code, pdfPath], {
-    env: {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    },
-    encoding: 'utf8',
-  });
-  if (result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || 'Gemini upload failed').trim());
-  }
-  const parsed = parseJsonFromOutput(result.stdout || '');
+async function llmUploadPdf(pdfPath) {
+  const { stdout } = await spawnPython(LLM_UPLOAD_PDF_SCRIPT, [pdfPath], { label: 'llm_upload_pdf' }).done;
+  const parsed = parseJsonFromOutput(stdout || '');
   if (!parsed?.name) {
-    throw new Error(`Gemini upload returned invalid payload: ${result.stdout}`);
+    throw new Error(`Gemini upload returned invalid payload: ${stdout}`);
   }
   return parsed.name;
 }
 
-function llmDeleteUploadedSync(uploadedFileName) {
+async function llmDeleteUploaded(uploadedFileName) {
   if (!uploadedFileName) return;
-  const code = [
-    'import sys',
-    'from dl_lit.llm_provider import get_client',
-    'client = get_client(required=True)',
-    'client.files.delete(name=sys.argv[1])',
-    'print("ok")',
-  ].join('; ');
-  const result = spawnSync(PYTHON_EXEC, ['-c', code, uploadedFileName], {
-    env: {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    },
-    encoding: 'utf8',
-  });
-  if (result.status !== 0) {
+  try {
+    await spawnPython(LLM_DELETE_UPLOAD_SCRIPT, [uploadedFileName], { label: 'llm_delete_upload' }).done;
+  } catch (error) {
     console.warn(
-      `[/api/extract-bibliography] Failed to delete uploaded LLM file ${uploadedFileName}: ${result.stderr || result.stdout}`
+      `[/api/extract-bibliography] Failed to delete uploaded LLM file ${uploadedFileName}: ${error?.message || error}`
     );
   }
 }
@@ -2614,8 +2510,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const app = express();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
-  const downloadWorkers = new Map(); // corpusId -> state
-  const pipelineWorkers = new Map(); // corpusId -> state
   const corpusDownloadTickets = new Map(); // token -> { userId, corpusId, itemId, expiresAt }
   const upstreamDownloadTickets = new Map(); // token -> { userId, targetId, itemId, expiresAt }
   const authConfig = resolveAuthConfig();
@@ -2628,7 +2522,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   // 15 s: the first index build on a large works table takes seconds and may
   // coincide with a worker holding the write lock.
   const authDb = new Database(DB_PATH, { timeout: 15_000 });
-  // spawnPythonJson is module-level but needs the settings table; hand it this
+  // pythonRunner is module-level but needs the settings table; hand it this
   // connection rather than reopening the DB on every spawn.
   appSettingsDb = authDb;
   // Test suites spin up multiple app instances in parallel; these settings
@@ -2696,8 +2590,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       corpusDownloadTickets.delete(token);
       return res.status(401).json({ error: 'Unknown user' });
     }
+    const corpusId = ticket.corpusId ?? ensureLastCorpus(authDb, user, authConfig);
+    const corpusRole = resolveCorpusRole(authDb, user, corpusId, authConfig);
+    if (!corpusRole) {
+      return res.status(403).json({ error: 'No access to this corpus' });
+    }
     req.user = user;
-    req.corpusId = ticket.corpusId || user.last_corpus_id || null;
+    req.corpusId = corpusId;
+    req.corpusRole = corpusRole;
     return next();
   };
   const pruneUpstreamDownloadTickets = () => {
@@ -2741,8 +2641,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   };
   const hasWorkerAccess = (req) => {
     if (isStubMode()) return true;
-    const role = getCorpusRoleForUser(authDb, req.user?.id, req.corpusId);
-    return role === 'owner' || role === 'editor';
+    const role = resolveCorpusRole(authDb, req.user, req.corpusId, authConfig);
+    return role === 'admin' || role === 'owner' || role === 'editor';
   };
   const hasAdminWorkerAccess = (req) => {
     if (isStubMode()) return true;
@@ -2758,54 +2658,104 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     return next();
   };
+  // Corpus-scoped readers treat a null corpusId as "all corpora", so every
+  // read route that hands them req.corpusId needs a resolved, accessible corpus.
+  // Resolves the caller's role on getCorpusId(req) and sets req.corpusRole;
+  // on failure sends the 403 itself and returns null.
+  const resolveRequestCorpusRole = (req, res, getCorpusId) => {
+    const corpusId = getCorpusId(req);
+    if (corpusId === null || corpusId === undefined) {
+      res.status(403).json({ error: 'Select a corpus first' });
+      return null;
+    }
+    const corpusRole = resolveCorpusRole(authDb, req.user, corpusId, authConfig);
+    if (!corpusRole) {
+      res.status(403).json({ error: 'No access to this corpus' });
+      return null;
+    }
+    req.corpusRole = corpusRole;
+    return corpusRole;
+  };
+  const requireCorpusMember = (getCorpusId = (req) => req.corpusId) => (req, res, next) => {
+    if (isStubMode()) return next();
+    if (!resolveRequestCorpusRole(req, res, getCorpusId)) return undefined;
+    return next();
+  };
+  // Like requireCorpusMember, but the member's role must also be in `roles`
+  // (the admin always passes); `forbiddenError` is the body for a member
+  // whose role does not qualify.
+  const requireCorpusRole = (
+    roles,
+    getCorpusId = (req) => req.corpusId,
+    { forbiddenError = 'No access to this corpus' } = {}
+  ) => (req, res, next) => {
+    if (isStubMode()) return next();
+    const corpusRole = resolveRequestCorpusRole(req, res, getCorpusId);
+    if (!corpusRole) return undefined;
+    if (corpusRole !== 'admin' && !roles.includes(corpusRole)) {
+      return res.status(403).json({ error: forbiddenError });
+    }
+    return next();
+  };
+  // A Kantropos target is usable by the admin, or by a member holding one of
+  // `roles` on a corpus currently assigned to that target.
+  const canUseKantroposTarget = (user, targetId, { roles }) => {
+    if (isStubMode()) return true;
+    if (isAdminUser(user, authConfig)) return true;
+    if (!user?.id || !targetId || !Array.isArray(roles) || roles.length === 0) return false;
+    const placeholders = roles.map(() => '?').join(', ');
+    return Boolean(
+      authDb
+        .prepare(
+          `SELECT 1 FROM user_corpora uc
+           JOIN corpus_kantropos_assignments a ON a.corpus_id = uc.corpus_id
+           WHERE uc.user_id = ? AND a.target_id = ? AND uc.role IN (${placeholders})
+           LIMIT 1`
+        )
+        .get(user.id, String(targetId), ...roles)
+    );
+  };
+  const corpusIdFromParams = (req) => Number(req.params.id);
+  const requireCurrentCorpusMember = requireCorpusMember();
+  // Snapshot keys are client-addressable, so the cluster/file routes decide
+  // from the snapshot's own scope.json: no sidecar or the merged (null) view
+  // is admin only, a corpus snapshot needs membership of that corpus.
+  const canReadGraph3dScope = (req, scope) => {
+    if (isStubMode()) return true;
+    if (!scope || scope.corpusId === null) return isAdminUser(req.user, authConfig);
+    return Boolean(resolveCorpusRole(authDb, req.user, scope.corpusId, authConfig));
+  };
+  const requireGraph3dScopeAccess = (req, res, next) => {
+    const key = String(req.params.snapshotKey || '').trim();
+    if (!/^[a-f0-9]{20}$/.test(key)) return next();
+    const scope = readGraph3dScope(key);
+    if (!canReadGraph3dScope(req, scope)) {
+      // Admin-only scopes (merged view, no sidecar) vs. a specific foreign corpus.
+      const adminOnly = !scope || scope.corpusId === null;
+      return res.status(403).json({ error: adminOnly ? 'Admin access required' : 'No access to this corpus' });
+    }
+    return next();
+  };
+  // The snapshot route's effective corpus: an explicit corpus_id needs a role
+  // on it; 'all'/absent is the merged view for the admin and the current
+  // corpus for everyone else. Sends the 403 itself and returns undefined.
+  const resolveGraph3dCorpusId = (req, res, requestedCorpusId) => {
+    if (requestedCorpusId === null && isAdminUser(req.user, authConfig)) return null;
+    const getCorpusId = requestedCorpusId === null ? (r) => r.corpusId : () => requestedCorpusId;
+    if (!resolveRequestCorpusRole(req, res, getCorpusId)) return undefined;
+    return getCorpusId(req);
+  };
+  // ?global=1 is admin-gated inside the handler and reads every corpus on
+  // purpose; every other request is scoped to the current corpus.
+  const requireCorpusMemberUnlessGlobal = (req, res, next) => {
+    if (String(req.query?.global || '').trim() === '1') return next();
+    return requireCurrentCorpusMember(req, res, next);
+  };
 
   // Ensure uploads directory exists (already present, keeping for clarity)
   const uploadDir = UPLOADS_DIR;
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
-  }
-
-  function getOrInitWorkerState(corpusId) {
-    const key = corpusId || 0;
-    if (!downloadWorkers.has(key)) {
-      downloadWorkers.set(key, {
-        running: false,
-        intervalId: null,
-        inFlight: false,
-        child: null,
-        startedAt: null,
-        lastTickAt: null,
-        lastResult: null,
-        lastError: null,
-        config: { intervalSeconds: 60, batchSize: 3 },
-      });
-    }
-    return downloadWorkers.get(key);
-  }
-
-  function getOrInitPipelineWorkerState(corpusId) {
-    const key = corpusId || 0;
-    if (!pipelineWorkers.has(key)) {
-      pipelineWorkers.set(key, {
-        running: false,
-        intervalId: null,
-        inFlight: false,
-        children: [],
-        startedAt: null,
-        lastTickAt: null,
-        lastResult: null,
-        lastError: null,
-        resolvedDownloadWorkers: 0,
-        config: {
-          intervalSeconds: 15,
-          promoteBatchSize: 25,
-          promoteWorkers: 6,
-          downloadBatchSize: 5,
-          downloadWorkers: 0, // 0 = auto
-        },
-      });
-    }
-    return pipelineWorkers.get(key);
   }
 
   function parseSqliteTimestampToMs(value) {
@@ -2885,6 +2835,35 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     };
   }
 
+  // Heartbeat details are global and may name another corpus's job (job id,
+  // corpus id, raw exception text). Non-admins keep the health fields and the
+  // details of jobs in their own corpora; any other details shrink to `state`.
+  function daemonStatusForRequest(req) {
+    const status = readPipelineDaemonStatus();
+    if (isStubMode() || isAdminUser(req.user, authConfig) || !status.workers) return status;
+    const memberCorpusIds = new Set(
+      authDb
+        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ?')
+        .all(req.user?.id)
+        .map((row) => Number(row.corpus_id))
+    );
+    const redact = (details) => {
+      if (!details || typeof details !== 'object') return null;
+      const corpusId = Number(details.corpus_id);
+      if (Number.isFinite(corpusId) && memberCorpusIds.has(corpusId)) return details;
+      return details.state ? { state: details.state } : null;
+    };
+    const workers = {};
+    let latestWorker = null;
+    for (const [name, worker] of Object.entries(status.workers)) {
+      workers[name] = { ...worker, details: redact(worker.details) };
+      if (!latestWorker || String(worker.last_seen_at || '') > String(latestWorker.last_seen_at || '')) {
+        latestWorker = workers[name];
+      }
+    }
+    return { ...status, details: latestWorker?.details || null, workers };
+  }
+
   function readWorkerBacklogSummary(corpusId) {
     const scopedCorpusId = corpusId ?? null;
     const empty = {
@@ -2909,25 +2888,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       };
     } catch (error) {
       return empty;
-    }
-  }
-
-  function tickDownloadWorker(corpusId) {
-    const state = getOrInitWorkerState(corpusId);
-    if (!state.running || state.inFlight) return;
-    state.inFlight = true;
-    state.lastTickAt = new Date().toISOString();
-    state.lastError = null;
-    const { batchSize } = state.config;
-    const corpusTag = corpusId || 'none';
-    
-    try {
-      enqueuePipelineJob(corpusId, 'download', { batchSize }, { dedupeStatuses: ['pending', 'running'] });
-    } catch (error) {
-      state.lastError = error?.message || String(error);
-      console.error(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
-    } finally {
-      state.inFlight = false;
     }
   }
 
@@ -3014,436 +2974,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     state.tail = run;
     return { queued, queuePosition };
-  }
-
-  function startDownloadWorker(corpusId, config = {}) {
-    const state = getOrInitWorkerState(corpusId);
-    const intervalSeconds = coerceInt(config.intervalSeconds, state.config.intervalSeconds) || state.config.intervalSeconds;
-    const batchSize = coerceInt(config.batchSize, state.config.batchSize) || state.config.batchSize;
-
-    state.config = { intervalSeconds, batchSize };
-    if (state.running) return state;
-
-    state.running = true;
-    state.startedAt = new Date().toISOString();
-    // Kick once immediately, then on interval.
-    tickDownloadWorker(corpusId);
-    state.intervalId = setInterval(() => tickDownloadWorker(corpusId), intervalSeconds * 1000);
-    return state;
-  }
-
-  function stopDownloadWorker(corpusId, { force = false } = {}) {
-    const state = getOrInitWorkerState(corpusId);
-    state.running = false;
-    if (state.intervalId) {
-      clearInterval(state.intervalId);
-      state.intervalId = null;
-    }
-    return state;
-  }
-
-  function cancelDownloadJobs(corpusId, { includeRunning = true, reason = 'stopped_by_user' } = {}) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    const resultPayload = JSON.stringify({
-      cancelled: true,
-      reason: String(reason || 'stopped_by_user'),
-      at: new Date().toISOString(),
-    });
-    let pending = 0;
-    let running = 0;
-    try {
-      pending = Number(
-        authDb
-          .prepare(
-            `UPDATE pipeline_jobs
-             SET status = 'cancelled',
-                 finished_at = CURRENT_TIMESTAMP,
-                 result_json = COALESCE(result_json, ?)
-             WHERE job_type = 'download'
-               AND status = 'pending'
-               AND corpus_id IS ?`
-          )
-          .run(resultPayload, corpusId ?? null).changes || 0
-      );
-      if (includeRunning) {
-        running = Number(
-          authDb
-            .prepare(
-              `UPDATE pipeline_jobs
-               SET status = 'cancelled',
-                   finished_at = CURRENT_TIMESTAMP,
-                   result_json = COALESCE(result_json, ?)
-               WHERE job_type = 'download'
-                 AND status = 'running'
-                 AND corpus_id IS ?`
-            )
-            .run(resultPayload, corpusId ?? null).changes || 0
-        );
-      }
-    } catch (error) {
-      console.warn(`[download-worker] Failed to cancel download jobs for corpus=${corpusId ?? 'none'}: ${error?.message || error}`);
-    }
-    return { pending, running };
-  }
-
-  function cancelAllDownloadJobs({ includeRunning = true, reason = 'stopped_by_user' } = {}) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    const resultPayload = JSON.stringify({
-      cancelled: true,
-      reason: String(reason || 'stopped_by_user'),
-      at: new Date().toISOString(),
-    });
-    let pending = 0;
-    let running = 0;
-    try {
-      pending = Number(
-        authDb
-          .prepare(
-            `UPDATE pipeline_jobs
-             SET status = 'cancelled',
-                 finished_at = CURRENT_TIMESTAMP,
-                 result_json = COALESCE(result_json, ?)
-             WHERE job_type = 'download'
-               AND status = 'pending'`
-          )
-          .run(resultPayload).changes || 0
-      );
-      if (includeRunning) {
-        running = Number(
-          authDb
-            .prepare(
-              `UPDATE pipeline_jobs
-               SET status = 'cancelled',
-                   finished_at = CURRENT_TIMESTAMP,
-                   result_json = COALESCE(result_json, ?)
-               WHERE job_type = 'download'
-                 AND status = 'running'`
-            )
-            .run(resultPayload).changes || 0
-        );
-      }
-    } catch (error) {
-      console.warn(`[download-worker] Failed to cancel all download jobs: ${error?.message || error}`);
-    }
-    return { pending, running };
-  }
-
-  function countDownloadPipelineJobs(corpusId) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    try {
-      const pending = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'download'
-               AND status = 'pending'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      const running = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'download'
-               AND status = 'running'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      return { pending, running };
-    } catch (error) {
-      return { pending: 0, running: 0 };
-    }
-  }
-
-  function countPipelineTickJobs(corpusId) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    try {
-      const pending = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'pipeline_tick'
-               AND status = 'pending'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      const running = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'pipeline_tick'
-               AND status = 'running'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      return { pending, running };
-    } catch (error) {
-      return { pending: 0, running: 0 };
-    }
-  }
-
-  function countQueuedDownloads(corpusId) {
-    try {
-      if (corpusId !== undefined && corpusId !== null) {
-        const row = authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM works w
-             JOIN corpus_works cw ON cw.work_id = w.id
-             WHERE cw.corpus_id = ?
-               AND w.download_status IN ('queued', 'in_progress')`
-          )
-          .get(corpusId);
-        return Number(row?.count || 0);
-      }
-      const row = authDb
-        .prepare("SELECT COUNT(*) AS count FROM works WHERE download_status IN ('queued', 'in_progress')")
-        .get();
-      return Number(row?.count || 0);
-    } catch (error) {
-      return 0;
-    }
-  }
-
-  function resolveAutoDownloadBatchSize(corpusId) {
-    const queued = countQueuedDownloads(corpusId);
-    const minBatch = 25;
-    const maxBatch = Math.max(minBatch, coerceInt(process.env.RAG_FEEDER_DOWNLOAD_BATCH_MAX, 200) || 200);
-    if (queued <= 0) return minBatch;
-    return Math.max(minBatch, Math.min(maxBatch, queued));
-  }
-
-  function resolveDownloadWorkerCount({ corpusId, requestedWorkers = 0, batchSize = 3 }) {
-    const cpuCount = Math.max(1, Number(os.cpus()?.length || 1));
-    const maxRecommended = Math.max(1, Math.min(6, cpuCount));
-    const minBatch = Math.max(1, Number(batchSize || 1));
-    if (Number(requestedWorkers) > 0) {
-      return Math.max(1, Math.min(12, Number(requestedWorkers)));
-    }
-    const queued = countQueuedDownloads(corpusId);
-    if (queued <= 0) {
-      return 1;
-    }
-    const estimated = Math.ceil(queued / (minBatch * 2));
-    return Math.max(1, Math.min(maxRecommended, estimated));
-  }
-
-  function aggregateDownloadPayloads(payloads) {
-    const summary = {
-      processed: 0,
-      downloaded: 0,
-      failed: 0,
-      skipped: 0,
-      errors: [],
-      runs: payloads.length,
-    };
-    payloads.forEach((payload) => {
-      summary.processed += Number(payload?.processed || 0);
-      summary.downloaded += Number(payload?.downloaded || 0);
-      summary.failed += Number(payload?.failed || 0);
-      summary.skipped += Number(payload?.skipped || 0);
-      if (Array.isArray(payload?.errors) && payload.errors.length) {
-        summary.errors.push(...payload.errors);
-      }
-    });
-    return summary;
-  }
-
-  function emitPromotionEvent({
-    corpusId,
-    transition,
-    fromStage,
-    toStage,
-    itemId,
-    destItemId = null,
-    title = null,
-  }) {
-    const sourceId = Number(itemId);
-    if (!Number.isFinite(sourceId)) return;
-    const targetId = Number(destItemId);
-    sendEvent({
-      kind: 'promotion',
-      corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
-      transition,
-      from_stage: fromStage,
-      to_stage: toStage,
-      item_id: sourceId,
-      dest_item_id: Number.isFinite(targetId) ? targetId : null,
-      title: title ? String(title) : null,
-      ts: new Date().toISOString(),
-    });
-  }
-
-  async function tickPipelineWorker(corpusId) {
-    const state = getOrInitPipelineWorkerState(corpusId);
-    if (!state.running || state.inFlight) return;
-    state.inFlight = true;
-    const corpusTag = corpusId || 'none';
-    state.lastTickAt = new Date().toISOString();
-    state.lastError = null;
-    
-    try {
-      const outstanding = countPipelineTickJobs(corpusId);
-      if (Number(outstanding.pending || 0) > 0 || Number(outstanding.running || 0) > 0) {
-        state.inFlight = false;
-        return;
-      }
-      enqueuePipelineJob(corpusId, 'pipeline_tick', { config: state.config }, { dedupeStatuses: ['pending', 'running'] });
-    } catch (error) {
-      state.lastError = error?.message || String(error);
-      console.error(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
-    } finally {
-      state.inFlight = false;
-    }
-  }
-
-  function startPipelineWorker(corpusId, config = {}) {
-    const state = getOrInitPipelineWorkerState(corpusId);
-    const intervalSeconds = coerceInt(config.intervalSeconds, state.config.intervalSeconds) || state.config.intervalSeconds;
-    const promoteBatchSize = coerceInt(config.promoteBatchSize, state.config.promoteBatchSize) || state.config.promoteBatchSize;
-    const promoteWorkers =
-      coerceInt(config.promoteWorkers, state.config.promoteWorkers ?? 6) || state.config.promoteWorkers || 6;
-    const downloadBatchSize = coerceInt(config.downloadBatchSize, state.config.downloadBatchSize) || state.config.downloadBatchSize;
-    const downloadWorkersRequested = Math.max(0, coerceInt(config.downloadWorkers, state.config.downloadWorkers) || 0);
-
-    state.config = {
-      intervalSeconds: Math.max(10, intervalSeconds),
-      promoteBatchSize: Math.max(1, promoteBatchSize),
-      promoteWorkers: Math.max(1, Math.min(32, promoteWorkers)),
-      downloadBatchSize: Math.max(1, downloadBatchSize),
-      downloadWorkers: downloadWorkersRequested,
-    };
-
-    // Avoid running legacy download-only worker alongside the orchestration worker.
-    const legacy = getOrInitWorkerState(corpusId);
-    if (legacy.running || legacy.inFlight) {
-      stopDownloadWorker(corpusId, { force: false });
-    }
-
-    if (state.running) return state;
-    state.running = true;
-    state.startedAt = new Date().toISOString();
-    tickPipelineWorker(corpusId);
-    state.intervalId = setInterval(() => tickPipelineWorker(corpusId), state.config.intervalSeconds * 1000);
-    return state;
-  }
-
-  function pausePipelineWorker(corpusId, { force = false } = {}) {
-    const state = getOrInitPipelineWorkerState(corpusId);
-    state.running = false;
-    if (state.intervalId) {
-      clearInterval(state.intervalId);
-      state.intervalId = null;
-    }
-    return state;
-  }
-
-  function pauseAllPipelineWorkers({ force = false } = {}) {
-    const result = {
-      requestedForce: Boolean(force),
-      stopped: 0,
-      inFlight: 0,
-      wasRunning: 0,
-      states: {},
-    };
-    for (const [key, state] of pipelineWorkers.entries()) {
-      const hadInFlight = Boolean(state.inFlight);
-      const hadRunning = Boolean(state.running);
-      state.running = false;
-      if (state.intervalId) {
-        clearInterval(state.intervalId);
-        state.intervalId = null;
-      }
-      if (force && Array.isArray(state.children)) {
-        state.children.forEach((child) => {
-          try {
-            child.kill('SIGTERM');
-          } catch (error) {
-            // ignore
-          }
-        });
-      }
-      if (force) {
-        state.inFlight = false;
-        state.children = [];
-      }
-      const keyLabel = key === 0 ? 'none' : String(key);
-      result.states[keyLabel] = {
-        running: state.running,
-        inFlight: state.inFlight,
-      };
-      if (hadRunning) {
-        result.wasRunning += 1;
-      }
-      if (hadInFlight) {
-        result.inFlight += 1;
-      }
-      if (hadRunning || hadInFlight) {
-        result.stopped += 1;
-      }
-    }
-    return result;
-  }
-
-  function stopAllDownloadWorkers({ force = false } = {}) {
-    const result = {
-      requestedForce: Boolean(force),
-      stopped: 0,
-      inFlight: 0,
-      wasRunning: 0,
-      states: {},
-    };
-    for (const [key, state] of downloadWorkers.entries()) {
-      const hadInFlight = Boolean(state.inFlight);
-      const hadRunning = Boolean(state.running);
-      state.running = false;
-      if (state.intervalId) {
-        clearInterval(state.intervalId);
-        state.intervalId = null;
-      }
-      if (force && state.child) {
-        try {
-          state.child.kill('SIGTERM');
-        } catch (error) {
-          // ignore
-        }
-      }
-      if (force) {
-        state.inFlight = false;
-        state.child = null;
-      }
-      const keyLabel = key === 0 ? 'none' : String(key);
-      result.states[keyLabel] = {
-        running: state.running,
-        inFlight: state.inFlight,
-      };
-      if (hadRunning) {
-        result.wasRunning += 1;
-      }
-      if (hadInFlight) {
-        result.inFlight += 1;
-      }
-      if (hadRunning || hadInFlight) {
-        result.stopped += 1;
-      }
-    }
-    return result;
   }
 
   // Middleware
@@ -3567,14 +3097,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    let lastCorpusId = user.last_corpus_id;
-    if (!lastCorpusId) {
-      const corpus = authDb
-        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
-        .get(user.id);
-      lastCorpusId = corpus?.corpus_id || defaultCorpusId;
-      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
-    }
+    const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       token: issueAuthToken(user, authConfig),
       user: authUserPayload(user, lastCorpusId, authConfig),
@@ -3780,13 +3303,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const user = authDb
       .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
       .get(tokenRow.user_id);
-    let lastCorpusId = user.last_corpus_id;
-    if (!lastCorpusId) {
-      lastCorpusId = authDb
-        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
-        .get(user.id)?.corpus_id || defaultCorpusId;
-      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
-    }
+    const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       accepted: true,
       token: issueAuthToken(user, authConfig),
@@ -3846,13 +3363,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const user = authDb
       .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
       .get(tokenRow.user_id);
-    let lastCorpusId = user.last_corpus_id;
-    if (!lastCorpusId) {
-      lastCorpusId = authDb
-        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
-        .get(user.id)?.corpus_id || defaultCorpusId;
-      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
-    }
+    const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       reset: true,
       token: issueAuthToken(user, authConfig),
@@ -4066,6 +3577,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.post('/api/scraper/apply', requireAuthMiddleware, (req, res) => {
     try {
       const targetId = String(req.body?.targetId || req.body?.target_id || '').trim();
+      if (!canUseKantroposTarget(req.user, targetId, { roles: ['owner', 'editor'] })) {
+        return res.status(403).json({ error: 'No access to this Kantropos corpus' });
+      }
       const target = getKantroposTargetById(targetId);
       if (!target) return res.status(400).json({ error: 'Unknown Kantropos corpus target' });
 
@@ -4232,8 +3746,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(400).json({ error: 'Invalid apply event id' });
       }
       const row = authDb
-        .prepare('SELECT generated_bib_path FROM scraper_apply_events WHERE id = ?')
+        .prepare('SELECT generated_bib_path, target_id, user_id FROM scraper_apply_events WHERE id = ?')
         .get(eventId);
+      if (!row) {
+        return res.status(404).json({ error: 'Generated metadata.bib draft not found' });
+      }
+      const isApplier = row.user_id !== null && Number(row.user_id) === Number(req.user?.id);
+      if (!isApplier && !canUseKantroposTarget(req.user, row.target_id, { roles: ['owner', 'editor'] })) {
+        return res.status(403).json({ error: 'No access to this Kantropos corpus' });
+      }
       const generatedBibPath = String(row?.generated_bib_path || '').trim();
       if (!generatedBibPath) {
         return res.status(404).json({ error: 'Generated metadata.bib draft not found' });
@@ -4265,19 +3786,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.status(201).json({ id: corpusId, name });
   });
 
-  app.post('/api/corpora/:id/select', requireAuthMiddleware, (req, res) => {
+  app.post('/api/corpora/:id/select', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
     const corpusId = Number(req.params.id);
-    const access = authDb
-      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
-      .get(req.user.id, corpusId);
-    if (!access) {
-      return res.status(403).json({ error: 'No access to corpus' });
-    }
     authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusId, req.user.id);
     return res.json({ selected: corpusId });
   });
 
-  app.post('/api/corpora/:id/share', requireAuthMiddleware, (req, res) => {
+  const requireCorpusOwnerToShare = requireCorpusRole(['owner'], corpusIdFromParams, {
+    forbiddenError: 'Only owners can share corpora',
+  });
+  app.post('/api/corpora/:id/share', requireAuthMiddleware, requireCorpusOwnerToShare, (req, res) => {
     const corpusId = Number(req.params.id);
     const { username, role = 'viewer' } = req.body || {};
     const normalizedRole = String(role || 'viewer').trim().toLowerCase();
@@ -4286,12 +3804,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     if (!['viewer', 'editor'].includes(normalizedRole)) {
       return res.status(400).json({ error: 'Role must be viewer or editor' });
-    }
-    const access = authDb
-      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
-      .get(req.user.id, corpusId);
-    if (!access || access.role !== 'owner') {
-      return res.status(403).json({ error: 'Only owners can share corpora' });
     }
     const target = authDb.prepare('SELECT id FROM users WHERE username = ?').get(username);
     if (!target) {
@@ -4306,29 +3818,22 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.json({ shared: true });
   });
 
-  app.get('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, (req, res) => {
+  app.get('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
     const corpusId = Number(req.params.id);
-    const role = getCorpusRoleForUser(authDb, req.user.id, corpusId);
-    if (!role) {
-      return res.status(403).json({ error: 'No access to corpus' });
-    }
+    const role = req.corpusRole;
     return res.json({
       assignment: getCorpusKantroposAssignment(authDb, corpusId),
       corpora: KANTROPOS_TARGETS,
       root_path: KANTROPOS_CORPORA_ROOT,
-      can_edit: canConfigureCorpus(role) || isAdminUser(req.user, authConfig),
+      can_edit: canConfigureCorpus(role) || role === 'admin',
     });
   });
 
-  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, (req, res) => {
+  const requireCorpusConfigurer = requireCorpusRole(['owner', 'editor'], corpusIdFromParams, {
+    forbiddenError: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus',
+  });
+  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusConfigurer, (req, res) => {
     const corpusId = Number(req.params.id);
-    const role = getCorpusRoleForUser(authDb, req.user.id, corpusId);
-    if (!role) {
-      return res.status(403).json({ error: 'No access to corpus' });
-    }
-    if (!(canConfigureCorpus(role) || isAdminUser(req.user, authConfig))) {
-      return res.status(403).json({ error: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus' });
-    }
     const nextTargetIdRaw = req.body?.targetId;
     const nextTargetId = nextTargetIdRaw === null || nextTargetIdRaw === undefined || nextTargetIdRaw === ''
       ? null
@@ -4364,18 +3869,17 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     });
   });
 
-  app.delete('/api/corpora/:id', requireAuthMiddleware, (req, res) => {
+  const requireCorpusOwnerToDelete = requireCorpusRole(['owner'], corpusIdFromParams, {
+    forbiddenError: 'Only owners can delete corpora',
+  });
+  app.delete('/api/corpora/:id', requireAuthMiddleware, (req, res, next) => {
     const corpusId = Number(req.params.id);
     if (!Number.isFinite(corpusId) || corpusId <= 0) {
       return res.status(400).json({ error: 'Invalid corpus id' });
     }
-
-    const access = authDb
-      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
-      .get(req.user.id, corpusId);
-    if (!access || access.role !== 'owner') {
-      return res.status(403).json({ error: 'Only owners can delete corpora' });
-    }
+    return next();
+  }, requireCorpusOwnerToDelete, (req, res) => {
+    const corpusId = Number(req.params.id);
 
     const corpus = authDb
       .prepare('SELECT id, name FROM corpora WHERE id = ?')
@@ -4383,12 +3887,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!corpus) {
       return res.status(404).json({ error: 'Corpus not found' });
     }
-
-    // Stop in-memory schedulers first so they do not keep queueing jobs for a deleted corpus.
-    pausePipelineWorker(corpusId, { force: false });
-    stopDownloadWorker(corpusId, { force: false });
-    pipelineWorkers.delete(corpusId);
-    downloadWorkers.delete(corpusId);
 
     try {
       const result = authDb.transaction(() => {
@@ -4652,17 +4150,20 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             reason: reason || null,
           });
         };
-        const cleanupSharedUpload = () => {
+        const cleanupSharedUpload = async () => {
           if (!sharedUploadedFileName) return;
           const toDelete = sharedUploadedFileName;
           sharedUploadedFileName = null;
-          llmDeleteUploadedSync(toDelete);
+          await llmDeleteUploaded(toDelete);
         };
 
+        // Async so the page count and shared upload don't block the event loop;
+        // the catch below still sees every setup error.
+        void (async () => {
         try {
           sendExtractionStarted();
 
-          const inputPageCount = inputExists ? getPdfPageCountSync(inputPdfPath) : null;
+          const inputPageCount = inputExists ? await getPdfPageCount(inputPdfPath) : null;
           if (inputPageCount) {
             console.log(`[/api/extract-bibliography] PDF page count: ${inputPageCount}`);
           }
@@ -4671,7 +4172,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           // get_bib_pages and inline fallback to avoid a second upload.
           if (inputExists && inputPageCount && inputPageCount <= 50) {
             try {
-              sharedUploadedFileName = llmUploadPdfSync(inputPdfPath);
+              sharedUploadedFileName = await llmUploadPdf(inputPdfPath);
               console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
               send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
             } catch (uploadErr) {
@@ -4680,7 +4181,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
               sharedUploadedFileName = null;
             }
           }
-          const runApiScraper = ({
+          const runApiScraper = async ({
             inputDir = null,
             inputPdf = null,
             extractMode = 'page',
@@ -4691,53 +4192,43 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             extractModelOverride = null,
             label = 'APIscraper',
           }) => {
-            return new Promise((resolve) => {
-              const dbPath = DB_PATH;
-              const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
-              if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
-              if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
-              if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
-              if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
-              scrapeApiArgs.push('--seed-only');
-              if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
+            const dbPath = DB_PATH;
+            const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
+            if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
+            if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
+            if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
+            if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
+            scrapeApiArgs.push('--seed-only');
+            if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
 
-              console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
-              send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
-              const child = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
-                env: {
-                  ...process.env,
-                  ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
-                  ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
-                  ...(extractModelOverride ? { RAG_FEEDER_API_EXTRACT_MODEL: extractModelOverride } : {}),
-                  PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-                  RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-                  RAG_FEEDER_DB_PATH: DB_PATH,
-                },
-              });
-
-              child.stdout.on('data', (data) => {
-                const message = data.toString();
-                console.log(`[${label} stdout]: ${message}`);
-                send(`[${label}] [corpus=${corpusTag}] ${message}`);
-              });
-
-              child.stderr.on('data', (data) => {
-                const message = data.toString();
-                console.error(`[${label} stderr]: ${message}`);
-                send(`[${label} ERROR] [corpus=${corpusTag}] ${message}`);
-              });
-
-              child.on('close', (code) => {
-                if (code !== 0) {
-                  console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
-                  send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
-                  resolve(false);
-                  return;
-                }
-                console.log(`[/api/extract-bibliography] Finished ${label}.`);
-                resolve(true);
-              });
+            console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
+            const { done } = spawnPython(API_SCRAPER_SCRIPT, scrapeApiArgs, {
+              label,
+              env: {
+                ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
+                ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
+                ...(extractModelOverride ? { RAG_FEEDER_API_EXTRACT_MODEL: extractModelOverride } : {}),
+              },
+              onStdoutLine: (line) => {
+                console.log(`[${label} stdout]: ${line}`);
+                send(`[${label}] [corpus=${corpusTag}] ${line}`);
+              },
+              onStderrLine: (line) => {
+                console.error(`[${label} stderr]: ${line}`);
+                send(`[${label} ERROR] [corpus=${corpusTag}] ${line}`);
+              },
             });
+            try {
+              await done;
+            } catch (error) {
+              const code = error?.exitCode ?? error?.message ?? error;
+              console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
+              return false;
+            }
+            console.log(`[/api/extract-bibliography] Finished ${label}.`);
+            return true;
           };
 
           const runInlineFallback = async (reason) => {
@@ -4804,8 +4295,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                 console.error(`[/api/extract-bibliography] Reused-page extraction failed for ${filename}:`, error);
                 sendExtractionSignal({ status: 'failed', mode: 'page_reuse', reason: 'page_reuse_error' });
               })
-              .finally(() => {
-                cleanupSharedUpload();
+              .finally(async () => {
+                await cleanupSharedUpload();
                 finishTask();
               });
             return;
@@ -4821,28 +4312,21 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           }
 
           console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
-          const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], {
-            env: {
-              ...process.env,
-              PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-              RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-              RAG_FEEDER_DB_PATH: DB_PATH,
+          const { done: getPagesDone } = spawnPython(GET_BIB_PAGES_SCRIPT, getPagesArgs, {
+            label: 'get_bib_pages',
+            onStdoutLine: (line) => {
+              console.log(`[get_bib_pages stdout]: ${line}`);
+              send(`[get_bib_pages][corpus=${corpusTag}] ${line}`);
+            },
+            onStderrLine: (line) => {
+              console.error(`[get_bib_pages stderr]: ${line}`);
+              send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${line}`);
             },
           });
 
-          getPagesProcess.stdout.on('data', (data) => {
-            const message = data.toString();
-            console.log(`[get_bib_pages stdout]: ${message}`);
-            send(`[get_bib_pages][corpus=${corpusTag}] ${message}`);
-          });
-
-          getPagesProcess.stderr.on('data', (data) => {
-            const message = data.toString();
-            console.error(`[get_bib_pages stderr]: ${message}`);
-            send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${message}`);
-          });
-
-          getPagesProcess.on('close', (code) => {
+          // Exit code 0 on success; on failure the runner's exitCode (-1 when the
+          // process could not be spawned at all).
+          getPagesDone.then(() => 0, (error) => error?.exitCode ?? -1).then((code) => {
             void (async () => {
               try {
                 console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
@@ -4981,17 +4465,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                 console.error(`[/api/extract-bibliography] Unexpected post-processing error for ${filename}:`, error);
                 sendExtractionSignal({ status: 'failed', reason: 'post_process_error' });
               } finally {
-                cleanupSharedUpload();
+                await cleanupSharedUpload();
                 finishTask();
               }
             })();
           });
         } catch (error) {
-          console.error(`[/api/extract-bibliography] Synchronous error setting up processing for ${filename}:`, error);
-          cleanupSharedUpload();
+          console.error(`[/api/extract-bibliography] Error setting up processing for ${filename}:`, error);
+          await cleanupSharedUpload();
           sendExtractionSignal({ status: 'failed', reason: 'setup_error' });
           finishTask();
         }
+        })();
       });
     });
 
@@ -5046,7 +4531,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     let responded = false;
     let createdRunId = null;
-    const { child, done } = spawnPythonJson(KEYWORD_SEARCH_SCRIPT, built.args, {
+    const { child, done: spawned } = spawnPython(KEYWORD_SEARCH_SCRIPT, built.args, {
       dbPath: DB_PATH,
       corpusId: req.corpusId,
       onStdoutLine: (line) => {
@@ -5077,6 +4562,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         res.status(202).json({ runId, status: 'running' });
       },
     });
+    // As before, a run that exits 0 without a JSON summary counts as failed.
+    const done = spawned.then(({ stdout }) => parseJsonFromOutput(stdout));
     done
       .then(
         () => null,
@@ -5571,7 +5058,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/corpus', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/corpus', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.corpus, total: STUB_RESULTS.corpus.length, source: 'stub' });
     }
@@ -5769,7 +5256,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     });
   });
 
-  app.get('/api/downloads', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/downloads', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.downloads, total: STUB_RESULTS.downloads.length, source: 'stub' });
     }
@@ -5783,7 +5270,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/exports/:format', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/exports/:format', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     const rawFormat = String(req.params?.format || '').toLowerCase();
     const formatMap = { json: 'json', bibtex: 'bibtex', pdfs: 'pdfs_zip', bundle: 'bundle_zip' };
     const selectedFormat = formatMap[rawFormat];
@@ -5869,7 +5356,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json(stubGraph3dManifest());
     }
 
-    const options = buildGraph3dRequest(req);
+    const requested = buildGraph3dRequest(req);
+    const corpusId = resolveGraph3dCorpusId(req, res, requested.corpusId);
+    if (corpusId === undefined) return undefined;
+    const options = { ...requested, corpusId };
     const key = graph3dSnapshotKey(options);
     const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
     const refresh = req.query?.refresh === '1' || req.query?.refresh === 'true';
@@ -5942,7 +5432,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           ? [Number.isFinite(numericId) ? numericId : -1, nodeId, nodeId]
           : [Number.isFinite(numericId) ? numericId : -1];
         const row = db.prepare(query).get(...params);
-        if (!row) {
+        // 404 rather than 403 so node ids do not reveal works in foreign corpora.
+        if (!row || !workReadableByUser(authDb, req.user, row.id, authConfig)) {
           return res.status(404).json({ error: 'Node not found' });
         }
         return res.json({
@@ -5961,7 +5452,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, requireGraph3dScopeAccess, async (req, res) => {
     const key = String(req.params.snapshotKey || '').trim();
     const clusterId = Number(req.params.clusterId);
     if (!/^[a-f0-9]{20}$/.test(key) || !Number.isFinite(clusterId)) {
@@ -5981,7 +5472,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/graph/3d/snapshot/:snapshotKey/:fileName', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/graph/3d/snapshot/:snapshotKey/:fileName', requireAuthMiddleware, requireGraph3dScopeAccess, async (req, res) => {
     const key = String(req.params.snapshotKey || '').trim();
     const fileName = String(req.params.fileName || '').trim();
     const allowedFiles = new Set(['manifest.json', 'nodes.bin', 'edges.bin', 'nodes_meta.json', 'clusters.json']);
@@ -6027,7 +5518,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.sendFile(filePath);
   });
 
-  app.get('/api/ingest/latest', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/ingest/latest', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     const baseName = req.query?.baseName || '';
     const limit = coerceInt(req.query?.limit, 200);
     const dbPath = DB_PATH;
@@ -6166,7 +5657,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/ingest/runs', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/ingest/runs', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     const limit = coerceInt(req.query?.limit, 20);
     try {
       const { runs, total } = listIngestRuns(authDb, { corpusId: req.corpusId, limit });
@@ -6177,7 +5668,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/ingest/stats', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/ingest/stats', requireAuthMiddleware, requireCorpusMemberUnlessGlobal, async (req, res) => {
     const globalScope = String(req.query?.global || '').trim() === '1';
     if (globalScope && !isAdminUser(req.user, authConfig)) {
       return res.status(403).json({ error: 'Admin access required for global ingest stats' });
@@ -6191,7 +5682,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/pipeline/daemon/status', requireAuthMiddleware, (req, res) => {
+  app.get('/api/pipeline/daemon/status', requireAuthMiddleware, requireCorpusMemberUnlessGlobal, (req, res) => {
     try {
       const globalScope = String(req.query?.global || '').trim() === '1';
       if (globalScope && !isAdminUser(req.user, authConfig)) {
@@ -6199,7 +5690,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       }
       return res.json({
         source: 'db',
-        daemon: readPipelineDaemonStatus(),
+        daemon: daemonStatusForRequest(req),
         backlog: readWorkerBacklogSummary(globalScope ? null : req.corpusId),
       });
     } catch (error) {
@@ -6208,7 +5699,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/pipeline/jobs/summary', requireAuthMiddleware, (req, res) => {
+  app.get('/api/pipeline/jobs/summary', requireAuthMiddleware, requireCurrentCorpusMember, (req, res) => {
     try {
       if (!tableExists(authDb, 'pipeline_jobs')) {
         return res.json({
@@ -6223,7 +5714,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             total: 0,
           },
           jobs: [],
-          daemon: readPipelineDaemonStatus(),
+          daemon: daemonStatusForRequest(req),
         });
       }
 
@@ -6322,7 +5813,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           limit,
         },
         jobs,
-        daemon: readPipelineDaemonStatus(),
+        daemon: daemonStatusForRequest(req),
       });
     } catch (error) {
       console.error('[/api/pipeline/jobs/summary] Error:', error);
@@ -6353,6 +5844,23 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(400).json({ error: "Invalid log type. Use 'pipeline' or 'app'." });
       }
 
+      // App logs span every corpus: admin only. Pipeline logs are filtered to
+      // one corpus the caller belongs to (?corpus_id, else the current corpus).
+      let logCorpusId = Number.isFinite(parsedCorpusId) ? parsedCorpusId : null;
+      if (!isStubMode()) {
+        if (type === 'app') {
+          if (!isAdminUser(req.user, authConfig)) {
+            return res.status(403).json({ error: 'Admin access required' });
+          }
+        } else {
+          if (corpusIdRaw !== undefined && corpusIdRaw !== null && String(corpusIdRaw).trim() !== '' && logCorpusId === null) {
+            return res.status(400).json({ error: 'Invalid corpus_id' });
+          }
+          logCorpusId = logCorpusId ?? req.corpusId ?? null;
+          if (!resolveRequestCorpusRole(req, res, () => logCorpusId)) return undefined;
+        }
+      }
+
       if (!fs.existsSync(logDir)) {
         return res.json({
           type,
@@ -6374,7 +5882,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         cursor,
         includeRotated,
         maxFiles,
-        corpusId: type === 'pipeline' && Number.isFinite(parsedCorpusId) ? parsedCorpusId : null,
+        corpusId: type === 'pipeline' ? logCorpusId : null,
       });
       return res.json({
         type,
@@ -6395,36 +5903,46 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
+  // Enrich/download work runs in the Python daemon (pipeline_jobs); the app only
+  // reports the daemon's heartbeat for that worker. Stub mode returns the fixed
+  // snapshot the frontend expects without touching the daemon status file.
+  function dbDrivenWorkerStatus(kind) {
+    if (isStubMode()) {
+      return kind === 'pipeline'
+        ? {
+          running: false,
+          in_flight: false,
+          started_at: null,
+          last_tick_at: null,
+          last_result: null,
+          last_error: null,
+          resolved_download_workers: 1,
+          config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
+        }
+        : { running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } };
+    }
+    const workers = readPipelineDaemonStatus()?.workers || {};
+    const worker = (kind === 'pipeline' ? workers.enrich : workers.download) || {};
+    return {
+      running: Boolean(worker.online),
+      in_flight: String(worker.status || '').toLowerCase() === 'running',
+      started_at: worker.last_seen_at || null,
+      last_tick_at: worker.last_seen_at || null,
+      last_result: worker.details || null,
+      last_error: worker.status === 'error' ? JSON.stringify(worker.details || {}) : null,
+      ...(kind === 'pipeline' ? { resolved_download_workers: Boolean((workers.download || {}).online) ? 1 : 0 } : {}),
+      config: { mode: 'db-driven' },
+    };
+  }
+
   app.get('/api/pipeline/worker/status', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({
-        running: false,
-        in_flight: false,
-        started_at: null,
-        last_tick_at: null,
-        last_result: null,
-        last_error: null,
-        resolved_download_workers: 1,
-        config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
-      });
+    if (isStubMode()) {
+      return res.json(dbDrivenWorkerStatus('pipeline'));
     }
     if (!hasAdminWorkerAccess(req)) {
       return res.status(403).json({ error: 'Admin access required for diagnostics worker status' });
     }
-    const daemon = readPipelineDaemonStatus();
-    const enrich = daemon?.workers?.enrich || {};
-    const backlog = readWorkerBacklogSummary(req.corpusId);
-    return res.json({
-      running: Boolean(enrich.online),
-      in_flight: String(enrich.status || '').toLowerCase() === 'running',
-      started_at: enrich.last_seen_at || null,
-      last_tick_at: enrich.last_seen_at || null,
-      last_result: enrich.details || null,
-      last_error: enrich.status === 'error' ? JSON.stringify(enrich.details || {}) : null,
-      resolved_download_workers: Boolean((daemon?.workers?.download || {}).online) ? 1 : 0,
-      config: { mode: 'db-driven' },
-      backlog,
-    });
+    return res.json({ ...dbDrivenWorkerStatus('pipeline'), backlog: readWorkerBacklogSummary(req.corpusId) });
   });
 
   app.post('/api/pipeline/worker/start', requireAuthMiddleware, (req, res) => {
@@ -6458,23 +5976,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.get('/api/downloads/worker/status', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } });
+    if (isStubMode()) {
+      return res.json(dbDrivenWorkerStatus('download'));
     }
     if (!hasAdminWorkerAccess(req)) {
       return res.status(403).json({ error: 'Admin access required for diagnostics worker status' });
     }
-    const daemon = readPipelineDaemonStatus();
-    const download = daemon?.workers?.download || {};
     const backlog = readWorkerBacklogSummary(req.corpusId);
     return res.json({
-      running: Boolean(download.online),
-      in_flight: String(download.status || '').toLowerCase() === 'running',
-      started_at: download.last_seen_at || null,
-      last_tick_at: download.last_seen_at || null,
-      last_result: download.details || null,
-      last_error: download.status === 'error' ? JSON.stringify(download.details || {}) : null,
-      config: { mode: 'db-driven' },
+      ...dbDrivenWorkerStatus('download'),
       queued_jobs: Number(backlog.queued_download || 0),
       running_jobs: Number(backlog.downloading || 0),
       queued_download_items: Number(backlog.queued_download || 0),
@@ -6530,6 +6040,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   }
 
   app.warmGraph3dSnapshot = warmGraph3dSnapshot;
+  // index.js hands these to attachLogSocket (logSocket.js) after listen().
+  app.authDb = authDb;
+  app.authConfig = authConfig;
 
   return app;
 }

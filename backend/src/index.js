@@ -1,12 +1,11 @@
-import { WebSocketServer } from 'ws';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import util from 'node:util';
 import { createApp } from './app.js';
+import { attachLogSocket } from './logSocket.js';
 
 const port = process.env.PORT || 4000;
-const clients = new Set();
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
 const logDir = process.env.RAG_FEEDER_LOG_DIR || path.join(repoRoot, 'logs');
@@ -81,25 +80,22 @@ patchConsoleForFileLogs();
 logWithTimestamp(appLogFile, 'INFO', `Persistent logging enabled: ${appLogFile}`);
 logWithTimestamp(pipelineLogFile, 'INFO', `Pipeline logging enabled: ${pipelineLogFile}`);
 
+// The log socket needs the HTTP server and app.authDb, both of which exist
+// only after createApp(); these forwarders are handed to createApp first and
+// delegate once attachLogSocket has run (right after listen(), before any
+// request can arrive). A line broadcast before that is still written to file.
+let logSocket = null;
+
 function broadcast(message) {
-  const timestamp = new Date().toISOString();
-  const formattedMessage = `[${timestamp}] ${message}`;
-  appendLogLine(pipelineLogFile, formattedMessage);
-  clients.forEach((client) => {
-    if (client.readyState === client.OPEN) {
-      client.send(formattedMessage);
-    }
-  });
+  if (logSocket) {
+    logSocket.broadcast(message);
+    return;
+  }
+  appendLogLine(pipelineLogFile, `[${new Date().toISOString()}] ${message}`);
 }
 
 function broadcastEvent(payload) {
-  if (!payload || typeof payload !== 'object') return;
-  const serialized = JSON.stringify(payload);
-  clients.forEach((client) => {
-    if (client.readyState === client.OPEN) {
-      client.send(serialized);
-    }
-  });
+  logSocket?.broadcastEvent(payload);
 }
 
 const app = createApp({ broadcast, broadcastEvent });
@@ -115,24 +111,8 @@ const server = app.listen(port, () => {
 });
 server.on('close', () => clearTimeout(seedWarmupTimer));
 
-const wss = new WebSocketServer({ server, path: '/api/ws' });
-
-wss.on('connection', (ws) => {
-  console.log('Client connected via WebSocket');
-  clients.add(ws);
-
-  ws.on('message', (message) => {
-    console.log('Received message from client:', message);
-  });
-
-  ws.on('close', () => {
-    console.log('Client disconnected');
-    clients.delete(ws);
-  });
-
-  ws.on('error', (error) => {
-    console.error('WebSocket error:', error);
-    clients.delete(ws);
-  });
-
+logSocket = attachLogSocket(server, {
+  authDb: app.authDb,
+  authConfig: app.authConfig,
+  appendLogLine: (line) => appendLogLine(pipelineLogFile, line),
 });

@@ -25,6 +25,15 @@ Supported daemon job types in current code:
 - `download`
 - `pipeline_tick` (mark -> enrich -> download)
 
+### Access model
+
+- Read access to a corpus needs any `user_corpora` row for it or the global admin (`RAG_ADMIN_USER`). Configuring a corpus (share, delete) needs the owner or admin; Kantropos assignment needs owner/editor or admin. Admin passes every check.
+- Each request re-validates the user's current corpus (`last_corpus_id`) against current membership. A revoked member falls back to their newest remaining corpus, or to none; corpus-scoped reads then answer 403 `Select a corpus first`.
+- Non-member access to an explicit corpus answers 403 `No access to this corpus`; admin-only routes answer 403 `Admin access required`. The app log (`/api/logs/tail?type=app`) and the merged all-corpora graph are admin-only; graph nodes outside the user's corpora answer 404.
+- Scraper apply into a Kantropos target needs admin or owner/editor of a corpus assigned to it. Kantropos browsing is open to all logged-in users.
+- Log WebSocket `/api/ws`: the browser sends the JWT as the second `Sec-WebSocket-Protocol` entry (`['bearer', <token>]`). The upgrade always completes (unauthenticated probes still get 101); the server then closes with 4401 `unauthorized` for a missing or invalid token, and the frontend signs out instead of reconnecting. Clients only receive lines tagged with a corpus they may read; untagged lines go to admins. Stub mode (`RAG_FEEDER_STUB=1`) skips socket auth and delivers everything.
+- Python children (extraction, page count, LLM upload/delete, exports) run through `backend/src/pythonProcess.js`, which applies the Admin-tab settings (`appSettingsEnv`) to each.
+
 ## Data Model
 
 Primary runtime tables:

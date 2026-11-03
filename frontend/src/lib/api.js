@@ -386,7 +386,9 @@ export async function fetchIngestStats({ global = false } = {}) {
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
-    throw new Error(payload || 'Failed to load ingest stats')
+    const error = new Error(payload || 'Failed to load ingest stats')
+    error.status = response.status
+    throw error
   }
   return response.json()
 }
@@ -409,7 +411,9 @@ export async function fetchSeedSources(limit = 100, { q = '' } = {}) {
   await throwIfUnauthorized(response)
   if (!response.ok) {
     const payload = await response.text()
-    throw new Error(payload || 'Failed to load seed sources')
+    const error = new Error(payload || 'Failed to load seed sources')
+    error.status = response.status
+    throw error
   }
   return response.json()
 }
@@ -718,7 +722,9 @@ export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' }
   const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
   await throwIfUnauthorized(response)
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`)
+    const error = new Error(`HTTP ${response.status}`)
+    error.status = response.status
+    throw error
   }
   const payload = await response.json()
   const data = Array.isArray(payload) ? payload : payload.items || []

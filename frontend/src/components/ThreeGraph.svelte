@@ -16,6 +16,9 @@
   // default so the graph opens on what the user is actually working in.
   export let corpora = []
   export let selectedGraphCorpusId = 'all'
+  // Only the admin gets a merged view; for anyone else the backend scopes 'all'
+  // to the current corpus, so the option would be misleading.
+  export let allowAllCorpora = false
 
   let THREE
   let OrbitControls
@@ -1868,7 +1871,11 @@
     <label>
       <span class="muted small">Corpus</span>
       <select bind:value={selectedGraphCorpusId} on:change={load3DGraph} disabled={graphLoading}>
-        <option value="all">All corpora</option>
+        {#if allowAllCorpora}
+          <option value="all">All corpora</option>
+        {:else if selectedGraphCorpusId === 'all'}
+          <option value="all" disabled>Select a corpus</option>
+        {/if}
         {#each corpora as corpus (corpus.id)}
           <option value={String(corpus.id)}>{corpus.name || `Corpus ${corpus.id}`}</option>
         {/each}

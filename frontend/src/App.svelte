@@ -16,6 +16,7 @@
     fetchCorpusKantroposAssignment,
     saveCorpusKantroposAssignment,
     setAuthToken,
+    getAuthToken,
     uploadPdf,
     importSeed,
     extractBibliography,
@@ -565,8 +566,8 @@
   let corpusActionStatus = ''
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
-  // The graph opens scoped to the workspace corpus; "All corpora" in its own
-  // dropdown restores the previous global view (spec line 22).
+  // The graph opens scoped to the workspace corpus; for the admin, "All corpora"
+  // in its own dropdown restores the previous global view (spec line 22).
   $: graphCorpusId = Number.isFinite(Number(currentCorpusId)) && currentCorpusId ? String(currentCorpusId) : 'all'
   // Load settings the first time an admin opens the Admin tab.
   $: if (activeTab === 'admin' && isAdmin && appSettings === null) loadAppSettings()
@@ -1251,11 +1252,15 @@
     if (!runId || extractionCompletionCheckRunId === runId) return
     extractionCompletionCheckRunId = runId
     const baseName = String(latestEntriesBase || extractionProgress.baseName || '').trim()
+    // A corpus reset also ends the run (finishExtractionProgress); the epoch
+    // check keeps the post-await steps from acting on the new corpus as well.
+    const epoch = corpusScopeEpoch
+    const stale = () => epoch !== corpusScopeEpoch || !extractionProgress.active || extractionProgress.runId !== runId
 
     try {
       if (baseName) {
         const payload = await fetchBibliographyEntries(baseName)
-        if (!extractionProgress.active || extractionProgress.runId !== runId) return
+        if (stale()) return
         const items = payload.items || []
         if (payload.seed_document) {
           latestSeedDocument = payload.seed_document
@@ -1273,10 +1278,16 @@
           percent: 100,
           indeterminate: false,
         })
+        // Only a corpus change stops these; the run itself may end meanwhile
+        // (e.g. the entries view is closed) without skipping the follow-up.
         await loadSeedSources({ quiet: true })
+        if (epoch !== corpusScopeEpoch) return
         await focusSeedSource('pdf', baseName)
+        if (epoch !== corpusScopeEpoch) return
         await loadIngestStats()
+        if (epoch !== corpusScopeEpoch) return
         await loadIngestRuns()
+        if (epoch !== corpusScopeEpoch) return
         const completedRunId = extractionProgress.runId
         setTimeout(() => {
           if (extractionProgress.active && extractionProgress.runId === completedRunId) {
@@ -1286,7 +1297,7 @@
         return
       }
 
-      if (!extractionProgress.active || extractionProgress.runId !== runId) return
+      if (stale()) return
       latestEntries = []
       latestSelection = []
       latestEntriesStatus = detail
@@ -1304,7 +1315,7 @@
         finishExtractionProgress()
         return
       }
-      if (!extractionProgress.active || extractionProgress.runId !== runId) return
+      if (stale()) return
       latestEntriesStatus = detail
       updateExtractionProgress({
         phase: 'completed',
@@ -1622,6 +1633,63 @@
     return activeTab === 'workspace' || activeTab === 'dashboard' || activeTab === 'downloads'
   }
 
+  // The backend re-validates the selected corpus on every request and falls
+  // back to another membership (or none) after a revocation. Polls fetch
+  // /api/auth/me and follow that choice, so the UI never shows corpus A while
+  // reads and writes already go to B. No select POST: the backend persisted it.
+  // The pending reconciliation, shared by every caller: a refresh cycle that
+  // starts while one (e.g. from handleCorpusPollForbidden) is pending waits
+  // for it instead of starting scoped loads under the old corpus.
+  let corpusReconcilePromise = null
+  // Resolves true when it switched (or cleared) the workspace corpus.
+  function reconcileCorpusWithBackend() {
+    if (corpusReconcilePromise) return corpusReconcilePromise
+    if (authStatus !== 'authenticated') return Promise.resolve(false)
+    const pending = runCorpusReconcile()
+    corpusReconcilePromise = pending
+    pending.finally(() => {
+      if (corpusReconcilePromise === pending) corpusReconcilePromise = null
+    })
+    return pending
+  }
+
+  // True when a pending reconciliation switched the corpus (it reloads the
+  // workspace itself, so the caller skips its own scoped loads).
+  async function awaitPendingCorpusReconcile() {
+    return corpusReconcilePromise ? corpusReconcilePromise : false
+  }
+
+  async function runCorpusReconcile() {
+    const corpusIdAtRequest = currentCorpusId
+    try {
+      const me = await fetchMe()
+      if (authStatus !== 'authenticated' || !me?.user) return false
+      // The user switched corpus meanwhile; this answer may predate the switch.
+      if (currentCorpusId !== corpusIdAtRequest) return false
+      const nextCorpusId = me.user.last_corpus_id || null
+      const nextCorpora = me.corpora || []
+      if (JSON.stringify(nextCorpora) !== JSON.stringify(corpora)) corpora = nextCorpora
+      if (JSON.stringify(me.user) !== JSON.stringify(authUser)) authUser = me.user
+      if (Number(nextCorpusId || 0) === Number(currentCorpusId || 0)) return false
+      currentCorpusId = nextCorpusId
+      resetFrontendState()
+      if (nextCorpusId) {
+        await refreshAll()
+        if (logsType === 'pipeline') handleLogsCorpusFilterChange()
+      }
+      return true
+    } catch (error) {
+      // A failed /me poll changes nothing; the next cycle retries.
+      return false
+    }
+  }
+
+  // A corpus-scoped poll answered 403 (e.g. "Select a corpus first"): the
+  // backend no longer serves the corpus the UI shows.
+  function handleCorpusPollForbidden(error) {
+    if (error?.status === 403) void reconcileCorpusWithBackend()
+  }
+
   async function runLiveRefreshCycle() {
     try {
       await runLiveRefreshCycleOnce()
@@ -1649,6 +1717,7 @@
       }
       pipelineRefreshInFlight = true
       try {
+        if (await awaitPendingCorpusReconcile()) return
         const tasks = []
         if (anySearchRunning) tasks.push(loadSeedSources({ quiet: true }))
         if (dirty) {
@@ -1673,6 +1742,8 @@
     }
     pipelineRefreshInFlight = true
     try {
+      // A corpus switch reloads the workspace itself; skip this cycle's loads.
+      if (await reconcileCorpusWithBackend()) return
       const tasks = [
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
@@ -1707,6 +1778,7 @@
     lastTabRefreshAt = now
     pipelineRefreshInFlight = true
     try {
+      if (await awaitPendingCorpusReconcile()) return
       // The graph tab renders none of the pipeline/ingest counts, so skip the
       // ingest-stats query there (completes #35's "don't load workspace data on
       // the graph tab" — refreshAll already skips it; this is the per-tab path).
@@ -1979,7 +2051,22 @@
     lastTabRefreshAt = Date.now()
   }
 
+  // Bumped whenever the workspace corpus changes (or clears): a corpus-scoped
+  // loader drops a response that was requested under an older epoch, so a
+  // slow answer for corpus A cannot repopulate the workspace after a switch.
+  let corpusScopeEpoch = 0
+  function invalidateCorpusScopedRequests() {
+    corpusScopeEpoch += 1
+    seedSourcesRequestToken += 1
+    // The stale loadCorpus no longer owns the loading flags (its finally
+    // checks the sequence), so release them for the next corpus's load.
+    corpusLoadRequestSeq += 1
+    corpusLoading = false
+    corpusLoadingMore = false
+  }
+
   function resetFrontendState() {
+    invalidateCorpusScopedRequests()
     ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
     ingestStatsStatus = ''
     latestEntries = []
@@ -2324,6 +2411,8 @@
       finishExtractionProgress()
     }
     const waitRunId = waitForExtraction ? extractionProgress.runId : 0
+    // Entries are corpus-scoped: a corpus reset ends this load.
+    const epoch = corpusScopeEpoch
     latestEntriesBase = baseName
     latestSeedDocument = null
     latestEntriesStatus = waitForExtraction ? 'Waiting for extracted entries...' : 'Loading extracted entries...'
@@ -2339,6 +2428,7 @@
       }
       try {
         const payload = await fetchBibliographyEntries(baseName)
+        if (epoch !== corpusScopeEpoch) return
         const items = payload.items || []
         if (payload.seed_document) {
           latestSeedDocument = payload.seed_document
@@ -2381,6 +2471,7 @@
           finishExtractionProgress()
           return
         }
+        if (epoch !== corpusScopeEpoch) return
         if (!waitForExtraction) {
           latestEntriesStatus = 'Failed to load extracted entries.'
           return
@@ -2398,6 +2489,7 @@
         latestEntriesStatus = 'Loading extracted entries...'
       }
       await sleep(pollIntervalMs)
+      if (epoch !== corpusScopeEpoch) return
     }
 
     if (waitForExtraction) {
@@ -2710,8 +2802,10 @@
 
   async function loadIngestRuns() {
     ingestRunsStatus = 'Loading ingest runs...'
+    const epoch = corpusScopeEpoch
     try {
       const payload = await fetchIngestRuns(20)
+      if (epoch !== corpusScopeEpoch) return
       ingestRuns = payload.runs || []
       pruneExtractedUploads()
       ingestRunsStatus = ''
@@ -2720,14 +2814,17 @@
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
+      if (epoch !== corpusScopeEpoch) return
       ingestRunsStatus = 'Failed to load ingest runs.'
     }
   }
 
   async function loadIngestStats({ quiet = false, global = false } = {}) {
     if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
+    const epoch = corpusScopeEpoch
     try {
       const payload = await fetchIngestStats({ global })
+      if (!global && epoch !== corpusScopeEpoch) return
       if (global) {
         globalIngestStats = payload.stats || globalIngestStats
       } else {
@@ -2740,8 +2837,9 @@
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
+      if (!global) handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
-      apiStatus = 'offline'
+      apiStatus = error?.status === 403 ? 'online' : 'offline'
     }
   }
 
@@ -3278,6 +3376,7 @@
         setAuthToken('')
         return
       }
+      handleCorpusPollForbidden(error)
       if (token !== seedSourcesRequestToken) return
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
@@ -3313,6 +3412,7 @@
     if (!sourceId) return
     const token = (seedCandidatesRequestTokens.get(sourceId) || 0) + 1
     seedCandidatesRequestTokens.set(sourceId, token)
+    const epoch = corpusScopeEpoch
     const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
     const showLoadingState = !background || !hasCachedCandidates
     if (showLoadingState) {
@@ -3332,7 +3432,7 @@
         // counts saves a full-seed resolution per poll.
         lightSummary: background,
       })
-      if (token !== seedCandidatesRequestTokens.get(sourceId)) return
+      if (token !== seedCandidatesRequestTokens.get(sourceId) || epoch !== corpusScopeEpoch) return
       const incoming = payload.candidates || []
       // A run still filling in shifts rows down under `sr.id DESC`, so the
       // page at offset=loaded.length can overlap what is already on screen.
@@ -3378,11 +3478,11 @@
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
-      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId)) {
+      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId) && epoch === corpusScopeEpoch) {
         seedActionStatus = error?.message || 'Failed to load seed candidates.'
       }
     } finally {
-      if (showLoadingState) {
+      if (showLoadingState && epoch === corpusScopeEpoch) {
         seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: false }
       }
     }
@@ -3440,8 +3540,12 @@
 
   async function focusSeedSource(sourceType, sourceKey) {
     const nextSourceId = `${sourceType}:${sourceKey}`
+    // The seed belongs to the corpus current at entry; after a corpus reset
+    // during the reload, a same-named seed of the new corpus is not it.
+    const epoch = corpusScopeEpoch
     if (!seedSources.some((source) => seedSourceId(source) === nextSourceId)) {
       await loadSeedSources({ quiet: true })
+      if (epoch !== corpusScopeEpoch) return
     }
     const source = seedSources.find((entry) => seedSourceId(entry) === nextSourceId)
     if (!source) return
@@ -4119,6 +4223,7 @@
         setAuthToken('')
         return
       }
+      handleCorpusPollForbidden(error)
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
       }
@@ -4131,8 +4236,10 @@
   }
 
   async function loadDownloads() {
+    const epoch = corpusScopeEpoch
     try {
       const { data, source } = await fetchDownloadQueue()
+      if (epoch !== corpusScopeEpoch) return
       downloads = data
       downloadsSource = source
     } catch (error) {
@@ -4161,12 +4268,16 @@
 
   async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
+    const epoch = corpusScopeEpoch
     try {
       const payload = await fetchPipelineDaemonStatus({ global })
       if (global) {
         globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
         return
       }
+      // The backlog is corpus-scoped. A stale response leaves the status
+      // alone: it may already show the newer corpus's request.
+      if (epoch !== corpusScopeEpoch) return
       daemonStatus = payload?.daemon || daemonStatus
       workerBacklog = payload?.backlog || workerBacklog
       const enrich = daemonStatus?.workers?.enrich || {}
@@ -4564,7 +4675,9 @@
       } catch (error) {
         // fall back to localhost default
       }
-      const ws = new WebSocket(wsUrl)
+      // The log socket authenticates via Sec-WebSocket-Protocol: ['bearer', <jwt>].
+      const token = getAuthToken()
+      const ws = token ? new WebSocket(wsUrl, ['bearer', token]) : new WebSocket(wsUrl)
       logsSocket = ws
       const scheduleReconnect = () => {
         if (authStatus !== 'authenticated') return
@@ -4645,11 +4758,17 @@
           requestRefreshSoon(isWorkerTick ? REFRESH_WORKER_TICK_MS : REFRESH_TRAILING_MS)
         }
       }
-      ws.onclose = () => {
-        if (logsSocket === ws) {
-          logsSocket = null
-          scheduleReconnect()
+      ws.onclose = (event) => {
+        if (logsSocket !== ws) return
+        logsSocket = null
+        if (event?.code === 4401) {
+          // Token rejected by the server: full sign-out, no reconnect. The
+          // status is set after handleLogout() so disconnectLogs() keeps it.
+          handleLogout()
+          logsStatus = 'unauthorized'
+          return
         }
+        scheduleReconnect()
       }
       ws.onerror = () => {
         if (logsSocket === ws) {
@@ -4945,6 +5064,9 @@
           <label class="header-corpus-picker">
             <span class="eyebrow">Corpus Workspace</span>
             <select value={currentCorpusId || ''} on:change={handleSelectCorpus}>
+              {#if !currentCorpusId}
+                <option value="" disabled>Select a corpus</option>
+              {/if}
               {#each corpora as corpus}
                 <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
               {/each}
@@ -6327,7 +6449,7 @@
       {/if}
 
       {#if activeTab === 'graph'}
-        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} />
+        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
       {/if}
     </section>
   </div>

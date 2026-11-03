@@ -35,5 +35,12 @@
     "jest": "^30.2.0",
     "nodemon": "^3.1.10",
     "supertest": "^7.2.2"
+  },
+  "jest": {
+    "globalSetup": "<rootDir>/tests/global-setup.js",
+    "globalTeardown": "<rootDir>/tests/global-teardown.js",
+    "setupFiles": [
+      "<rootDir>/tests/setup-env.js"
+    ]
   }
 }
