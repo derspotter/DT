@@ -1155,12 +1155,23 @@ function getCorpusRoleForUser(db, userId, corpusId) {
     .get(userId, corpusId)?.role;
 }
 
-// The one corpus-access rule: the admin passes every corpus check, everyone
-// else needs a current user_corpora row.
+// Positive integer corpus id (numeric strings accepted, as route params arrive
+// as strings), else null.
+function normalizeCorpusId(corpusId) {
+  if (typeof corpusId === 'string' && !/^\d+$/.test(corpusId.trim())) return null;
+  const n = Number(corpusId);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+// The one corpus-access rule: the admin passes every check on an existing
+// corpus, everyone else needs a current user_corpora row. Invalid ids never pass.
 export function resolveCorpusRole(db, user, corpusId, authConfig = resolveAuthConfig()) {
-  if (!user || !corpusId) return null;
-  if (isAdminUser(user, authConfig)) return 'admin';
-  return getCorpusRoleForUser(db, user.id, corpusId) || null;
+  const id = normalizeCorpusId(corpusId);
+  if (!user || !id) return null;
+  if (isAdminUser(user, authConfig)) {
+    return db.prepare('SELECT 1 FROM corpora WHERE id = ?').get(id) ? 'admin' : null;
+  }
+  return getCorpusRoleForUser(db, user.id, id) || null;
 }
 
 // Re-validates users.last_corpus_id against current membership: keeps it while

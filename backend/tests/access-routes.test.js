@@ -363,4 +363,42 @@ describe('explicit-corpus routes enforce corpus roles', () => {
     expect(viewerWrite.status).toBe(403)
     expect(viewerWrite.body).toEqual({ error: 'Only corpus owners or editors can change corpus data' })
   })
+
+  test('admin bypass covers only existing corpora; invalid ids never pass', async () => {
+    const adminId = withDb((db) => db.prepare('SELECT id FROM users WHERE username = ?').get(adminUsername).id)
+    const lastCorpus = () =>
+      withDb((db) => db.prepare('SELECT last_corpus_id FROM users WHERE id = ?').get(adminId).last_corpus_id)
+    expect((await request(app).post(`/api/corpora/${ids.A}/select`).set(as('admin'))).status).toBe(200)
+    expect(lastCorpus()).toBe(ids.A)
+
+    for (const bad of ['999999', '-1', '1.5', 'abc', '0']) {
+      const res = await request(app).post(`/api/corpora/${bad}/select`).set(as('admin'))
+      expect([bad, res.status]).toEqual([bad, 403])
+      expect(['Select a corpus first', 'No access to this corpus']).toContain(res.body.error)
+      expect(lastCorpus()).toBe(ids.A)
+    }
+    const missing = await request(app).post('/api/corpora/999999/select').set(as('admin'))
+    expect(missing.body.error).toBe('No access to this corpus')
+
+    const userCorporaRows = () =>
+      withDb((db) => db.prepare('SELECT COUNT(*) AS n FROM user_corpora WHERE corpus_id IN (999999, -1)').get().n)
+    for (const bad of ['999999', '-1']) {
+      const share = await request(app)
+        .post(`/api/corpora/${bad}/share`)
+        .set(as('admin'))
+        .send({ username: 'outsider5', role: 'viewer' })
+      expect(share.status).toBe(403)
+      const assign = await request(app)
+        .put(`/api/corpora/${bad}/kantropos-assignment`)
+        .set(as('admin'))
+        .send({ targetId: 'target-b' })
+      expect(assign.status).toBe(403)
+    }
+    expect(userCorporaRows()).toBe(0)
+    expect(
+      withDb((db) =>
+        db.prepare('SELECT COUNT(*) AS n FROM corpus_kantropos_assignments WHERE corpus_id IN (999999, -1)').get().n
+      )
+    ).toBe(0)
+  })
 })
