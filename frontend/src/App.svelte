@@ -1559,6 +1559,7 @@
       if (epoch !== sessionEpoch) return
       sessionEpoch += 1
       epoch = sessionEpoch
+      if (payload?.token) setAuthToken(payload.token)
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
@@ -1627,6 +1628,7 @@
       if (epoch !== sessionEpoch) return
       sessionEpoch += 1
       epoch = sessionEpoch
+      if (payload?.token) setAuthToken(payload.token)
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
@@ -1678,6 +1680,7 @@
       if (epoch !== sessionEpoch) return
       sessionEpoch += 1
       epoch = sessionEpoch
+      if (payload?.token) setAuthToken(payload.token)
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null

@@ -253,3 +253,56 @@ test('a failed sign-in attempt that lost the session to a newer one changes noth
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
   expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBe('token-b')
 })
+
+test('a sign-in attempt that succeeds after a newer one won does not replace its token', async ({ page }) => {
+  const sockets = { opened: 0, closed: 0 }
+  let releaseLoginA: () => void = () => {}
+  const loginAReleased = new Promise<void>((resolve) => { releaseLoginA = resolve })
+  let loginASeen = false
+  let loginAAnswered = false
+  const authHeaders: string[] = []
+  await mockSocket(page, sockets)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      const { username } = JSON.parse(request.postData() || '{}')
+      if (username === 'alice') {
+        // Attempt A's auth call answers late, after B completed.
+        loginASeen = true
+        await loginAReleased
+        await fulfil(route, { token: 'token-a', user: userA })
+        loginAAnswered = true
+        return
+      }
+      return fulfil(route, { token: 'token-b', user: userB })
+    }
+    authHeaders.push(auth)
+    if (path === '/api/auth/me') {
+      if (auth.endsWith('token-b')) return fulfil(route, { user: userB, corpora: [corpus] })
+      if (auth.endsWith('token-a')) return fulfil(route, { user: userA, corpora: [corpus] })
+      return fulfil(route, { error: 'Unauthorized' }, 401)
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  await expect.poll(() => loginASeen).toBe(true)
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+
+  releaseLoginA()
+  await expect.poll(() => loginAAnswered).toBe(true)
+  await page.waitForTimeout(300)
+  expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBe('token-b')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+
+  // The next request after A's late answer still carries B's token.
+  const seenBefore = authHeaders.length
+  await page.waitForTimeout(600)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect.poll(() => authHeaders.length).toBeGreaterThan(seenBefore)
+  expect(authHeaders[seenBefore]).toBe('Bearer token-b')
+})

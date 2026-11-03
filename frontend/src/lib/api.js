@@ -112,17 +112,15 @@ function dispositionFilename(response) {
   return ''
 }
 
+// The sign-in calls return the payload and leave the token to the caller: only
+// the attempt that still owns the session may store it.
 export async function login({ username, password }) {
-  const payload = await requestJson('/api/auth/login', {
+  return requestJson('/api/auth/login', {
     method: 'POST',
     body: { username, password },
     errorMessage: 'Login failed',
     notifyUnauthorized: false,
   })
-  if (payload.token) {
-    setAuthToken(payload.token)
-  }
-  return payload
 }
 
 export async function fetchMe() {
@@ -139,29 +137,21 @@ export async function requestPasswordReset(email) {
 }
 
 export async function acceptInvite({ token, password }) {
-  const payload = await requestJson('/api/auth/accept-invite', {
+  return requestJson('/api/auth/accept-invite', {
     method: 'POST',
     body: { token, password },
     errorMessage: 'Failed to accept invite',
     notifyUnauthorized: false,
   })
-  if (payload.token) {
-    setAuthToken(payload.token)
-  }
-  return payload
 }
 
 export async function resetPassword({ token, password }) {
-  const payload = await requestJson('/api/auth/reset-password', {
+  return requestJson('/api/auth/reset-password', {
     method: 'POST',
     body: { token, password },
     errorMessage: 'Failed to reset password',
     notifyUnauthorized: false,
   })
-  if (payload.token) {
-    setAuthToken(payload.token)
-  }
-  return payload
 }
 
 export async function createUserInvitation({ username, email }) {
