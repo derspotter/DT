@@ -116,3 +116,27 @@ def test_download_paper_parses_the_landing_page_it_already_fetched(tmp_path, mon
     assert transport.calls[pdf] == 1
     assert parsed == [landing]
     assert target.read_bytes() == PDF_BYTES
+
+
+# --- fix round 1 ------------------------------------------------------------
+
+def test_openalex_session_honours_the_environment_but_downloads_do_not(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://corp-proxy:3128")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/ssl/certs/corp.pem")
+    assert utils.get_openalex_session().trust_env is True
+    assert utils.get_thread_session("download").trust_env is False
+
+
+def test_searcher_openalex_session_has_no_urllib3_retry_crossref_and_s2_keep_theirs():
+    from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher
+
+    searcher = OpenAlexCrossrefSearcher(rate_limiter=object())
+    for scheme in ("https://", "http://"):
+        adapter = searcher.openalex_session.get_adapter(scheme + "api.openalex.org/")
+        assert adapter.max_retries.total == 0
+        assert adapter._pool_maxsize == 64
+        assert adapter._pool_connections == 64
+    for session in (searcher.crossref_session, searcher.semantic_scholar_session):
+        retry = session.get_adapter("https://api.crossref.org/").max_retries
+        assert retry.total == 5
+        assert 429 in retry.status_forcelist

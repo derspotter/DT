@@ -507,7 +507,12 @@ class OpenAlexCrossrefSearcher:
         self.openalex_timeout = float(os.getenv('RAG_FEEDER_OPENALEX_TIMEOUT', '20'))
         self.crossref_timeout = float(os.getenv('RAG_FEEDER_CROSSREF_TIMEOUT', '20'))
         self.semantic_scholar_timeout = float(os.getenv('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', '20'))
-        self.openalex_session = _build_retry_session(pool_maxsize=64)
+        # No urllib3 Retry here: openalex_request_json does its own 429/5xx and
+        # quota handling, and a stacked Retry would sleep through Retry-After uncapped.
+        self.openalex_session = requests.Session()
+        openalex_adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+        self.openalex_session.mount("https://", openalex_adapter)
+        self.openalex_session.mount("http://", openalex_adapter)
         self.crossref_session = _build_retry_session()
         self.semantic_scholar_session = _build_retry_session()
 

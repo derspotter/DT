@@ -561,8 +561,12 @@ def get_thread_session(
 
 
 def get_openalex_session() -> requests.Session:
-    """Return this thread's shared requests.Session for OpenAlex calls."""
-    return get_thread_session('openalex', pool_maxsize=64)
+    """Return this thread's shared requests.Session for OpenAlex calls.
+
+    Unlike the download kinds it honours the environment (proxies,
+    REQUESTS_CA_BUNDLE, .netrc), as the former plain session did.
+    """
+    return get_thread_session('openalex', trust_env=True, pool_maxsize=64)
 
 
 def reset_global_rate_limiter():
