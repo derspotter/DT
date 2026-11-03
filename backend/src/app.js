@@ -2788,6 +2788,28 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     return next();
   };
+  // Corpus-scoped readers treat a null corpusId as "all corpora", so every
+  // read route that hands them req.corpusId needs a resolved, accessible corpus.
+  const requireCorpusMember = (getCorpusId = (req) => req.corpusId) => (req, res, next) => {
+    if (isStubMode()) return next();
+    const corpusId = getCorpusId(req);
+    if (corpusId === null || corpusId === undefined) {
+      return res.status(403).json({ error: 'Select a corpus first' });
+    }
+    const corpusRole = resolveCorpusRole(authDb, req.user, corpusId, authConfig);
+    if (!corpusRole) {
+      return res.status(403).json({ error: 'No access to this corpus' });
+    }
+    req.corpusRole = corpusRole;
+    return next();
+  };
+  const requireCurrentCorpusMember = requireCorpusMember();
+  // ?global=1 is admin-gated inside the handler and reads every corpus on
+  // purpose; every other request is scoped to the current corpus.
+  const requireCorpusMemberUnlessGlobal = (req, res, next) => {
+    if (String(req.query?.global || '').trim() === '1') return next();
+    return requireCurrentCorpusMember(req, res, next);
+  };
 
   // Ensure uploads directory exists (already present, keeping for clarity)
   const uploadDir = UPLOADS_DIR;
@@ -5582,7 +5604,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/corpus', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/corpus', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.corpus, total: STUB_RESULTS.corpus.length, source: 'stub' });
     }
@@ -5590,10 +5612,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
-    // A null corpusId lists every work unscoped; only the admin may see that.
-    if (req.corpusId == null && !isAdminUser(req.user, authConfig)) {
-      return res.status(403).json({ error: 'Select a corpus first' });
-    }
     try {
       // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
       return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort }));
@@ -5784,7 +5802,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     });
   });
 
-  app.get('/api/downloads', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/downloads', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.downloads, total: STUB_RESULTS.downloads.length, source: 'stub' });
     }
@@ -5798,7 +5816,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/exports/:format', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/exports/:format', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     const rawFormat = String(req.params?.format || '').toLowerCase();
     const formatMap = { json: 'json', bibtex: 'bibtex', pdfs: 'pdfs_zip', bundle: 'bundle_zip' };
     const selectedFormat = formatMap[rawFormat];
@@ -6042,7 +6060,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.sendFile(filePath);
   });
 
-  app.get('/api/ingest/latest', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/ingest/latest', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     const baseName = req.query?.baseName || '';
     const limit = coerceInt(req.query?.limit, 200);
     const dbPath = DB_PATH;
@@ -6181,7 +6199,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/ingest/runs', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/ingest/runs', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     const limit = coerceInt(req.query?.limit, 20);
     try {
       const { runs, total } = listIngestRuns(authDb, { corpusId: req.corpusId, limit });
@@ -6192,7 +6210,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/ingest/stats', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/ingest/stats', requireAuthMiddleware, requireCorpusMemberUnlessGlobal, async (req, res) => {
     const globalScope = String(req.query?.global || '').trim() === '1';
     if (globalScope && !isAdminUser(req.user, authConfig)) {
       return res.status(403).json({ error: 'Admin access required for global ingest stats' });
@@ -6206,7 +6224,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/pipeline/daemon/status', requireAuthMiddleware, (req, res) => {
+  app.get('/api/pipeline/daemon/status', requireAuthMiddleware, requireCorpusMemberUnlessGlobal, (req, res) => {
     try {
       const globalScope = String(req.query?.global || '').trim() === '1';
       if (globalScope && !isAdminUser(req.user, authConfig)) {
@@ -6223,7 +6241,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/pipeline/jobs/summary', requireAuthMiddleware, (req, res) => {
+  app.get('/api/pipeline/jobs/summary', requireAuthMiddleware, requireCurrentCorpusMember, (req, res) => {
     try {
       if (!tableExists(authDb, 'pipeline_jobs')) {
         return res.json({

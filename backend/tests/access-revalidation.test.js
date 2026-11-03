@@ -85,6 +85,8 @@ describe('requireAuth re-validates corpus membership', () => {
       return workId
     })
 
+  const corpusReadRoutes = ['/api/corpus', '/api/downloads', '/api/ingest/runs', '/api/ingest/stats']
+
   const revoke = (userId, corpusId) =>
     withDb((db) => db.prepare('DELETE FROM user_corpora WHERE user_id = ? AND corpus_id = ?').run(userId, corpusId))
 
@@ -133,14 +135,32 @@ describe('requireAuth re-validates corpus membership', () => {
     revoke(memberId, corpusA)
     revoke(memberId, corpusB)
 
-    const corpusRes = await request(app).get('/api/corpus').set('Authorization', `Bearer ${memberToken}`)
-    // A null corpusId must not fall through to the unscoped all-works listing.
-    expect(corpusRes.status).toBe(403)
-    expect(corpusRes.body).toEqual({ error: 'Select a corpus first' })
-    expect(JSON.stringify(corpusRes.body)).not.toMatch(/sentinel/)
+    // A null corpusId must not fall through to the unscoped all-corpora readers.
+    for (const route of corpusReadRoutes) {
+      const res = await request(app).get(route).set('Authorization', `Bearer ${memberToken}`)
+      expect([route, res.status, res.body]).toEqual([route, 403, { error: 'Select a corpus first' }])
+    }
 
     const stored = withDb((db) => db.prepare('SELECT last_corpus_id FROM users WHERE id = ?').get(memberId))
     expect(stored.last_corpus_id).toBeNull()
+  })
+
+  test('a member keeps reading their own corpus on every guarded route', async () => {
+    const { corpusB, memberId, memberToken } = await setupSharedCorpus('own')
+    withDb((db) => db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusB, memberId))
+
+    for (const route of corpusReadRoutes) {
+      const res = await request(app).get(route).set('Authorization', `Bearer ${memberToken}`)
+      expect([route, res.status]).toEqual([route, 200])
+    }
+  })
+
+  test('admin with last_corpus_id NULL still reads /api/corpus', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    withDb((db) => db.prepare('UPDATE users SET last_corpus_id = NULL WHERE id = ?').run(admin.user.id))
+
+    const res = await request(app).get('/api/corpus').set('Authorization', `Bearer ${admin.token}`)
+    expect(res.status).toBe(200)
   })
 
   test('admin keeps a last_corpus_id they are not a member of', async () => {
