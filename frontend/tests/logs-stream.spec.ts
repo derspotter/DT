@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
-import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
-import { mockLogSocket } from './helpers/mockApi'
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test'
+import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
 
 // The log socket's lines are buffered and flushed into `logs` at most once per
 // 250 ms; JSON frames are parsed once (extraction events drive the extraction
@@ -9,10 +9,6 @@ import { mockLogSocket } from './helpers/mockApi'
 const maxLogHistory = Number(
   readFileSync(new URL('../src/App.svelte', import.meta.url), 'utf8').match(/const maxLogHistory = (\d+)/)![1]
 )
-
-function fulfil(route: Route, body: unknown) {
-  return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 type TailBody = { entries: string[]; next_cursor: number; has_more: boolean }
 
@@ -34,10 +30,7 @@ async function boot(page: Page, hash: string) {
     const url = new URL(route.request().url())
     const path = url.pathname
     if (path === '/api/auth/me') {
-      return fulfil(route, {
-        user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
-        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
-      })
+      return fulfil(route, mePayload())
     }
     if (path === '/api/logs/tail') {
       tail.cursors.push(url.searchParams.get('cursor') || '')

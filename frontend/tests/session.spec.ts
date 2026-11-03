@@ -1,12 +1,9 @@
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
+import { fulfil, mockLogSocket } from './helpers/mockApi'
 
 // One sign-out path: a 401 from any request runs the full logout (socket
 // closed, token cleared, workspace state reset), and a /me answer requested
 // under an earlier session never lands in the next one.
-
-function fulfil(route: Route, body: unknown, status = 200) {
-  return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 const corpus = { id: 1, name: 'Shared corpus', role: 'owner', owner_username: 'alice' }
 const userA = { id: 1, username: 'alice', last_corpus_id: 1, is_admin: false }
@@ -40,7 +37,7 @@ function workspaceDefaults(path: string, route: Route) {
 }
 
 async function mockSocket(page: Page, sockets: { opened: number; closed: number }) {
-  await page.routeWebSocket('**/api/ws', (ws: WebSocketRoute) => {
+  await mockLogSocket(page, (ws: WebSocketRoute) => {
     sockets.opened += 1
     ws.onClose(() => { sockets.closed += 1 })
   })

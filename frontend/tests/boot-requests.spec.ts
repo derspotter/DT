@@ -1,13 +1,9 @@
 import { expect, test, type Route } from '@playwright/test'
-import { mockLogSocket } from './helpers/mockApi'
+import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
 
 // Boot cost: the workspace data (seeds, corpus, counts) must be requested
 // exactly once per page load, and must not queue behind the auth round trip —
 // the backend scopes those requests to the token's corpus on its own.
-
-function fulfil(route: Route, body: unknown) {
-  return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 function mockApi(route: Route, log: { path: string; at: number }[], authDelayMs: number, done: { auth: number }) {
   const path = new URL(route.request().url()).pathname
@@ -15,10 +11,7 @@ function mockApi(route: Route, log: { path: string; at: number }[], authDelayMs:
   if (path === '/api/auth/me') {
     return new Promise<void>((resolve) => setTimeout(resolve, authDelayMs)).then(() => {
       done.auth = Date.now()
-      return fulfil(route, {
-        user: { id: 1, username: 'reader', last_corpus_id: 1, is_admin: false },
-        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
-      })
+      return fulfil(route, mePayload({ username: 'reader', admin: false }))
     })
   }
   if (path === '/api/corpus') return fulfil(route, { items: [{ id: 7, work_id: 7, title: 'Boot item', authors: 'A. Author', year: 2024 }], total: 1, source: 'api', stage_totals: {} })

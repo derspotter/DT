@@ -34,6 +34,15 @@ Supported daemon job types in current code:
 - Log WebSocket `/api/ws`: the browser sends the JWT as the second `Sec-WebSocket-Protocol` entry (`['bearer', <token>]`). The upgrade always completes (unauthenticated probes still get 101); the server then closes with 4401 `unauthorized` for a missing or invalid token, and the frontend signs out instead of reconnecting. Clients only receive lines tagged with a corpus they may read; untagged lines go to admins. Stub mode (`RAG_FEEDER_STUB=1`) skips socket auth and delivers everything.
 - Python children (extraction, page count, LLM upload/delete, exports) run through `backend/src/pythonProcess.js`, which applies the Admin-tab settings (`appSettingsEnv`) to each.
 
+### Frontend refresh model
+
+- `frontend/src/App.svelte` declares what each tab loads in `TAB_RESOURCES` (workspace: stats, corpus, seeds, runs; dashboard: stats, corpus, runs; upstream: upstream; the others nothing). `ADMIN_RESOURCES` adds the admin-only reads (dashboard: downloads, daemon, globalStats, globalDaemon; downloads: downloads, daemon; workspace: daemon), and `HEADER_RESOURCES` (stats, corpus, seeds) loads on every tab but the graph for the shared header counts. Boot, a tab switch and the poll all read these tables through `resourcesFor`.
+- Each resource has at most one request in flight (`resourcesInFlight`): a second request for it joins the pending one. A corpus switch or sign-out clears the map, so a new corpus never joins the previous corpus's load.
+- One timer drives the poll: every 2 s while a search or worker is active, every 20 s idle, nothing while the page is hidden or signed out. Worker log lines mark the data dirty and coalesce into one trailing run (1.5 s), also on tabs without a cadence.
+- Every 401 goes through `api.js`'s single `onUnauthorized` hook to `expireSession`, which signs out once (`handleLogout`: session epoch bumped, log socket closed, token and state cleared); a log-socket close 4401 signs out the same way without reconnecting.
+- Log socket lines are buffered and flushed into the Logs view at most once per 250 ms while the Logs tab is open; on other tabs the buffer is a ring of the last 5000 lines, flushed when the tab opens.
+- Mocked Playwright specs run against a fresh vite (`E2E_FRONTEND_PORT=5190`, no backend) and call `mockLogSocket(page)` from `frontend/tests/helpers/mockApi.ts` whenever they fake a token; `fulfil` and `mePayload` there are the shared response helpers.
+
 ## Data Model
 
 Primary runtime tables:

@@ -1,13 +1,10 @@
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
+import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
 
 // Guards the removal of the unreachable ingest/search tabs: their hashes land
 // on the workspace, and a finished PDF extraction reports from the pdf seed's
 // candidate count instead of fetching the bibliography entries the dead
 // ingest tab used to render (GET /api/ingest/latest).
-
-function fulfil(route: Route, body: unknown, status = 200) {
-  return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 function deferred() {
   let resolve!: () => void
@@ -30,10 +27,7 @@ async function mockBackend(page: Page, counters: { latest: number }, hook: Hook 
       return fulfil(route, { items: [] })
     }
     if (path === '/api/auth/me') {
-      return fulfil(route, {
-        user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
-        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
-      })
+      return fulfil(route, mePayload())
     }
     if (path === '/api/process_pdf' && method === 'POST') {
       return fulfil(route, { message: 'File uploaded successfully.', filename: 'paper.pdf' })
@@ -59,7 +53,7 @@ async function mockBackend(page: Page, counters: { latest: number }, hook: Hook 
 
 async function openSocket(page: Page) {
   const handle: { socket: WebSocketRoute | null } = { socket: null }
-  await page.routeWebSocket('**/api/ws', (ws) => {
+  await mockLogSocket(page, (ws) => {
     handle.socket = ws
   })
   return handle
@@ -69,7 +63,7 @@ const frame = (base: string, extra: Record<string, unknown>) =>
   JSON.stringify({ kind: 'extraction', corpus_id: 1, base_name: base, filename: `${base}.pdf`, ...extra })
 
 test('#/ingest and #/search land on the workspace', async ({ page }) => {
-  await page.routeWebSocket('**/api/ws', () => {})
+  await mockLogSocket(page)
   await mockBackend(page, { latest: 0 })
   // Each hash is a fresh deep link: a same-document hash change to an unknown
   // tab is left alone once signed in, so the second check reloads the page.

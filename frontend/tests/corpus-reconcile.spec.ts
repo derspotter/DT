@@ -1,12 +1,9 @@
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
+import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
 
 // After a revocation the backend falls back to another corpus (or none) for
 // every request. The live poll must follow /api/auth/me so the workspace never
 // shows corpus A while the backend already serves B.
-
-function fulfil(route: Route, body: unknown, status = 200) {
-  return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 const corpusA = { id: 1, name: 'Corpus Alpha', role: 'owner', owner_username: 'reader' }
 const corpusB = { id: 2, name: 'Corpus Beta', role: 'editor', owner_username: 'other' }
@@ -25,7 +22,7 @@ async function boot(
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
-  await page.routeWebSocket('**/api/ws', onSocket)
+  await mockLogSocket(page, onSocket)
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (await hook(path, route)) return
@@ -33,7 +30,7 @@ async function boot(
     if (path === '/api/auth/me') {
       const lastCorpusId = phase === 'A' ? 1 : phase === 'B' ? 2 : null
       const corpora = phase === 'A' ? [corpusA, corpusB] : phase === 'B' ? [corpusB] : []
-      return fulfil(route, { user: { id: 1, username: 'reader', last_corpus_id: lastCorpusId, is_admin: false }, corpora })
+      return fulfil(route, mePayload({ username: 'reader', admin: false, corpusId: lastCorpusId, corpora }))
     }
     if (path === '/api/corpora/1/select' || path === '/api/corpora/2/select') {
       throw new Error('reconcile must not POST select')

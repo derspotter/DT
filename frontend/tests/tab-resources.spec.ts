@@ -1,15 +1,11 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
-import { mockLogSocket } from './helpers/mockApi'
+import { expect, test, type Page } from '@playwright/test'
+import { fulfil, mockLogSocket } from './helpers/mockApi'
 
 // One tab→resources table with per-resource in-flight dedupe: every tab loads
 // exactly what it renders, a resource in flight is joined rather than
 // re-requested, and the corpus poll asks for one page.
 
 const CORPUS_PAGE_SIZE = 120
-
-function fulfil(route: Route, body: unknown) {
-  return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 function corpusRow(id: number) {
   return { id, work_id: id, title: `Work ${id}`, authors: 'A. Author', year: 2024, status: 'downloaded' }

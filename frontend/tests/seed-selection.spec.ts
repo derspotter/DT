@@ -1,12 +1,8 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
-import { mockLogSocket } from './helpers/mockApi'
+import { expect, test, type Page } from '@playwright/test'
+import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
 
 // Seed selection behaviour with the backend mocked: one search seed holding
 // 70,000 items of which only the first page (3 rows) is loaded.
-
-function fulfil(route: Route, body: unknown, status = 200) {
-  return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 const corpusA = { id: 1, name: 'Corpus Alpha', role: 'owner', owner_username: 'reader' }
 const corpusB = { id: 2, name: 'Corpus Beta', role: 'owner', owner_username: 'reader' }
@@ -50,10 +46,7 @@ async function boot(page: Page, state: State) {
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (path === '/api/auth/me') {
-      return fulfil(route, {
-        user: { id: 1, username: 'reader', last_corpus_id: state.corpusId, is_admin: false },
-        corpora: [corpusA, corpusB],
-      })
+      return fulfil(route, mePayload({ username: 'reader', admin: false, corpusId: state.corpusId, corpora: [corpusA, corpusB] }))
     }
     if (path === '/api/corpora/2/select') {
       state.corpusId = 2

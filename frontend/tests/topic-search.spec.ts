@@ -1,4 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
+import { mockLogSocket } from './helpers/mockApi'
 
 // The Topic field: type-ahead against the (mocked) topics proxy, chips for the
 // chosen topics, and a topic-only run that is priced at 1 credit a page.
@@ -55,6 +56,7 @@ function mockApi(route: Route, state: { searchBody: any; previewBody: any; topic
 test('topics are picked from the type-ahead and a topic-only run is priced at 1 credit a page', async ({ page }) => {
   const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
   await page.addInitScript(() => { window.localStorage.setItem('rag_feeder_token', 'playwright-token') })
+  await mockLogSocket(page)
   await page.route('**/api/**', (route) => mockApi(route, state))
   await page.goto('/#/workspace')
 
@@ -103,6 +105,7 @@ test('topics are picked from the type-ahead and a topic-only run is priced at 1 
 test('a chip can be removed and Reset clears the topics', async ({ page }) => {
   const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
   await page.addInitScript(() => { window.localStorage.setItem('rag_feeder_token', 'playwright-token') })
+  await mockLogSocket(page)
   await page.route('**/api/**', (route) => mockApi(route, state))
   await page.goto('/#/workspace')
   const card = page.locator('.seed-intake-card--search')
@@ -128,6 +131,7 @@ for (const action of ['reset', 'clear', 'escape', 'blur', 'workspace'] as const)
   test(`a late topic response cannot reopen suggestions after ${action}`, async ({ page }) => {
     const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
     await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
+    await mockLogSocket(page)
     await page.route('**/api/**', route => mockApi(route, state))
     let pending: Route | undefined
     await page.route('**/api/openalex/topics?*', route => { pending = route })
@@ -158,7 +162,7 @@ for (const action of ['reset', 'clear', 'escape', 'blur', 'workspace'] as const)
 test('a stale unauthorized topic response cannot log out the current session', async ({ page }) => {
   const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
   await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
-  await page.routeWebSocket('**/api/ws', () => {})
+  await mockLogSocket(page)
   await page.route('**/api/**', route => mockApi(route, state))
   let pending: Route | undefined
   await page.route('**/api/openalex/topics?*', route => {
@@ -184,6 +188,7 @@ for (const action of ['workspace', 'logout'] as const) {
   test(`topic selection is cleared on ${action}`, async ({ page }) => {
     const state = { searchBody: null as any, previewBody: null as any, topicQueries: [] as string[] }
     await page.addInitScript(() => localStorage.setItem('rag_feeder_token', 'playwright-token'))
+    await mockLogSocket(page)
     await page.route('**/api/**', route => mockApi(route, state))
     await page.goto('/#/workspace')
     const card = page.locator('.seed-intake-card--search')
