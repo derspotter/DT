@@ -59,8 +59,10 @@ export const DOWNLOAD_LABELS = {
 }
 
 // Search candidates carry no metadata_status of their own, so the column
-// falls back to the resolved state (what the old row tag used to say). Only
-// rows that carry a `state` (seed candidates) fall back; corpus rows show '-'.
+// falls back to the resolved state (what the old row tag used to say). Seed
+// callers pass `{ seed: true }`: a missing/null state then resolves to
+// 'pending' (the old seedCandidateState rule). Without it, only rows that
+// carry a `state` fall back; corpus rows (status, no state) show '-'.
 const METADATA_BY_STATE = {
   enriched: 'Confirmed',
   added: 'Confirmed',
@@ -73,12 +75,13 @@ const METADATA_BY_STATE = {
   pending: 'Pending',
 }
 
-function resolvedState(item) {
+function resolvedState(item, seed) {
+  if (seed) return workState(item?.state)
   return item?.state === undefined || item?.state === null ? null : workState(item.state)
 }
 
-export function metadataLabel(item) {
-  const state = resolvedState(item)
+export function metadataLabel(item, { seed = false } = {}) {
+  const state = resolvedState(item, seed)
   if (state === 'failed_enrichment' || FAILED_ENRICHMENT_STATUSES.has(item?.status)) {
     return METADATA_LABELS.failed_enrichment
   }
@@ -89,8 +92,8 @@ export function metadataLabel(item) {
   return '-'
 }
 
-export function downloadLabel(item) {
-  const state = resolvedState(item)
+export function downloadLabel(item, { seed = false } = {}) {
+  const state = resolvedState(item, seed)
   if (state === 'failed_download' || FAILED_DOWNLOAD_STATUSES.has(item?.status)) {
     return DOWNLOAD_LABELS.failed_download
   }
@@ -189,7 +192,8 @@ export function workSeed(item) {
 }
 
 // Union of the old seedCellText (App.svelte, blank '') and Corpus cellText
-// (blank '-'); the blank is passed by the caller. Where the two switches
+// (blank '-'); the blank is passed by the caller, and the seed table also
+// passes `seed: true` (see metadataLabel). Where the two switches
 // differed on the same key beyond the blank, both behaviours are kept:
 //   - title: the seed chain (title → source → url → 'Untitled'); the corpus
 //     table renders its own title cell and never read this key;
@@ -197,10 +201,10 @@ export function workSeed(item) {
 //     have no `file_available`) from `file_path`;
 //   - refs / cited_by: seed-only, keep the en-dash placeholder whatever the
 //     blank is ('added' and 'seed' are corpus-only).
-export function cellText(item, key, { blank = '-' } = {}) {
+export function cellText(item, key, { blank = '-', seed = false } = {}) {
   switch (key) {
-    case 'metadata': return metadataLabel(item)
-    case 'download': return downloadLabel(item)
+    case 'metadata': return metadataLabel(item, { seed })
+    case 'download': return downloadLabel(item, { seed })
     case 'title': return formatTitle(item)
     case 'authors': return typeof item?.authors_short === 'string' ? item.authors_short : formatAuthorsShort(item)
     case 'year': return item?.year || blank

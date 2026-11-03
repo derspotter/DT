@@ -2462,12 +2462,16 @@
     return seedCandidatesBySource[seedSourceId(source)] || []
   }
 
+  // Seed cells keep their '' blank, and a candidate without a state reads as
+  // pending (see metadataLabel in lib/works).
+  const SEED_CELL = { blank: '', seed: true }
+
   // Accessors used by the client-side sort (sortSeedCandidates), which only
   // applies to PDF seeds — those load in full. Search seeds page server-side
   // and sort server-side too (see toggleSeedSort / sortSeedCandidates).
   const SEED_SORT_ACCESSORS = {
-    metadata: (candidate) => metadataLabel(candidate),
-    download: (candidate) => downloadLabel(candidate),
+    metadata: (candidate) => metadataLabel(candidate, SEED_CELL),
+    download: (candidate) => downloadLabel(candidate, SEED_CELL),
     title: (candidate) => formatTitle(candidate),
     authors: (candidate) => formatAuthors(candidate),
     year: (candidate) => candidate?.year,
@@ -4655,12 +4659,12 @@
                                           type="button"
                                           title={`Download the file from work ${candidate.downloaded_work_id}`}
                                           on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
-                                        >{cellText(candidate, column.key, { blank: '' })} ⤓</button>
+                                        >{cellText(candidate, column.key, SEED_CELL)} ⤓</button>
                                       </span>
                                     {:else if column.key === 'authors'}
-                                      <span title={formatAuthors(candidate)}>{cellText(candidate, column.key, { blank: '' })}</span>
+                                      <span title={formatAuthors(candidate)}>{cellText(candidate, column.key, SEED_CELL)}</span>
                                     {:else}
-                                      <span title={cellText(candidate, column.key, { blank: '' })}>{cellText(candidate, column.key, { blank: '' })}</span>
+                                      <span title={cellText(candidate, column.key, SEED_CELL)}>{cellText(candidate, column.key, SEED_CELL)}</span>
                                     {/if}
                                   {/each}
                                 </div>
@@ -4686,8 +4690,8 @@
                                           {/if}
                                         </div>
                                         <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
-                                          <span class="seed-refs-cell__down">↓ Refs: {cellText(candidate, 'refs', { blank: '' })}</span>
-                                          <span class="seed-refs-cell__up">↑ Cited: {cellText(candidate, 'cited_by', { blank: '' })}</span>
+                                          <span class="seed-refs-cell__down">↓ Refs: {cellText(candidate, 'refs', SEED_CELL)}</span>
+                                          <span class="seed-refs-cell__up">↑ Cited: {cellText(candidate, 'cited_by', SEED_CELL)}</span>
                                         </div>
                                         <div class="inline-detail-actions">
                                           {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}

@@ -113,3 +113,18 @@ test('bucketForStatus and labels match the tables', () => {
   expect(downloadLabel({ state: 'enriched', download_status: 'in_progress' })).toBe('Downloading')
   expect(downloadLabel({ state: 'enriched' })).toBe('-')
 })
+
+test('seed candidates without a state label as pending; corpus rows without a status keep "-"', () => {
+  // Seed context: a missing/null state normalises to 'pending', as seedCandidateState did.
+  expect(metadataLabel({ state: undefined }, { seed: true })).toBe('Pending')
+  expect(metadataLabel({ state: null }, { seed: true })).toBe('Pending')
+  expect(metadataLabel({}, { seed: true })).toBe('Pending')
+  expect(downloadLabel({ state: null }, { seed: true })).toBe('-')
+  expect(cellText({ state: undefined }, 'metadata', { blank: '', seed: true })).toBe('Pending')
+  expect(cellText({ state: null }, 'metadata', { blank: '', seed: true })).toBe('Pending')
+  // Corpus rows (no seed context): no status and no state stays '-'.
+  expect(metadataLabel({})).toBe('-')
+  expect(downloadLabel({})).toBe('-')
+  expect(cellText({}, 'metadata')).toBe('-')
+  expect(cellText({}, 'download')).toBe('-')
+})
