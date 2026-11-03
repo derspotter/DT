@@ -2630,8 +2630,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   };
   const hasWorkerAccess = (req) => {
     if (isStubMode()) return true;
-    const role = getCorpusRoleForUser(authDb, req.user?.id, req.corpusId);
-    return role === 'owner' || role === 'editor';
+    const role = resolveCorpusRole(authDb, req.user, req.corpusId, authConfig);
+    return role === 'admin' || role === 'owner' || role === 'editor';
   };
   const hasAdminWorkerAccess = (req) => {
     if (isStubMode()) return true;
@@ -2822,6 +2822,35 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       workers,
       stale_after_seconds: staleAfterSeconds,
     };
+  }
+
+  // Heartbeat details are global and may name another corpus's job (job id,
+  // corpus id, raw exception text). Non-admins keep the health fields and the
+  // details of jobs in their own corpora; any other details shrink to `state`.
+  function daemonStatusForRequest(req) {
+    const status = readPipelineDaemonStatus();
+    if (isStubMode() || isAdminUser(req.user, authConfig) || !status.workers) return status;
+    const memberCorpusIds = new Set(
+      authDb
+        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ?')
+        .all(req.user?.id)
+        .map((row) => Number(row.corpus_id))
+    );
+    const redact = (details) => {
+      if (!details || typeof details !== 'object') return null;
+      const corpusId = Number(details.corpus_id);
+      if (Number.isFinite(corpusId) && memberCorpusIds.has(corpusId)) return details;
+      return details.state ? { state: details.state } : null;
+    };
+    const workers = {};
+    let latestWorker = null;
+    for (const [name, worker] of Object.entries(status.workers)) {
+      workers[name] = { ...worker, details: redact(worker.details) };
+      if (!latestWorker || String(worker.last_seen_at || '') > String(latestWorker.last_seen_at || '')) {
+        latestWorker = workers[name];
+      }
+    }
+    return { ...status, details: latestWorker?.details || null, workers };
   }
 
   function readWorkerBacklogSummary(corpusId) {
@@ -5650,7 +5679,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       }
       return res.json({
         source: 'db',
-        daemon: readPipelineDaemonStatus(),
+        daemon: daemonStatusForRequest(req),
         backlog: readWorkerBacklogSummary(globalScope ? null : req.corpusId),
       });
     } catch (error) {
@@ -5674,7 +5703,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             total: 0,
           },
           jobs: [],
-          daemon: readPipelineDaemonStatus(),
+          daemon: daemonStatusForRequest(req),
         });
       }
 
@@ -5773,7 +5802,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           limit,
         },
         jobs,
-        daemon: readPipelineDaemonStatus(),
+        daemon: daemonStatusForRequest(req),
       });
     } catch (error) {
       console.error('[/api/pipeline/jobs/summary] Error:', error);

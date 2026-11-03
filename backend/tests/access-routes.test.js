@@ -314,4 +314,53 @@ describe('explicit-corpus routes enforce corpus roles', () => {
     expect(applier.text).toContain('outsider_draft')
     expect((await request(app).get(ownUrl).set(as('owner1'))).status).toBe(403)
   })
+
+  test('daemon status: non-admins see no foreign corpus job details; admin sees all', async () => {
+    withDb((db) => {
+      const upsert = db.prepare(
+        `INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, details_json, last_seen_at, updated_at)
+         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         ON CONFLICT(daemon_name) DO UPDATE SET worker_id = excluded.worker_id, status = excluded.status,
+           details_json = excluded.details_json, last_seen_at = excluded.last_seen_at`
+      )
+      upsert.run('enrich', 'worker-enrich', 'error', JSON.stringify({
+        state: 'job_failed', job_id: 98765, job_type: 'enrich', corpus_id: ids.B, error: 'secret-corpus-b-failure',
+      }))
+      upsert.run('download', 'worker-download', 'running', JSON.stringify({
+        state: 'running_job', job_id: 4321, job_type: 'download', corpus_id: ids.A,
+      }))
+    })
+    const urls = ['/api/pipeline/daemon/status', '/api/pipeline/jobs/summary']
+    for (const url of urls) {
+      const member = await request(app).get(url).set(as('owner1'))
+      expect(member.status).toBe(200)
+      const text = JSON.stringify(member.body.daemon)
+      expect(text).not.toContain('secret-corpus-b-failure')
+      expect(text).not.toContain('98765')
+      // Health fields stay for the daemon display.
+      expect(member.body.daemon.workers.enrich).toMatchObject({ online: true, status: 'error', worker_id: 'worker-enrich' })
+      expect(member.body.daemon.workers.enrich.details).toEqual({ state: 'job_failed' })
+      // The member's own corpus job keeps its details.
+      expect(member.body.daemon.workers.download.details).toMatchObject({ job_id: 4321, corpus_id: ids.A })
+
+      const admin = await request(app).get(url).set(as('admin'))
+      expect(admin.status).toBe(200)
+      expect(admin.body.daemon.workers.enrich.details).toMatchObject({
+        job_id: 98765, corpus_id: ids.B, error: 'secret-corpus-b-failure',
+      })
+    }
+  })
+
+  test('corpus writes: admin passes on a non-member corpus, a viewer still gets 403', async () => {
+    const select = await request(app).post(`/api/corpora/${ids.C}/select`).set(as('admin'))
+    expect(select.status).toBe(200)
+    const adminWrite = await request(app).post('/api/corpus/works/remove').set(as('admin')).send({ workIds: [999999] })
+    expect(adminWrite.status).toBe(200)
+    expect(adminWrite.body).toMatchObject({ removed: 0, skipped_work_ids: [999999] })
+
+    expect((await request(app).post(`/api/corpora/${ids.A}/select`).set(as('viewer3'))).status).toBe(200)
+    const viewerWrite = await request(app).post('/api/corpus/works/remove').set(as('viewer3')).send({ workIds: [999999] })
+    expect(viewerWrite.status).toBe(403)
+    expect(viewerWrite.body).toEqual({ error: 'Only corpus owners or editors can change corpus data' })
+  })
 })
