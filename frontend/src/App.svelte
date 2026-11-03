@@ -2591,6 +2591,8 @@
     page = seedPages[seedSourceId(source)],
     loaded = seedCandidatesBySource[seedSourceId(source)],
     loadedSelectableCount = null,
+    downstreamOn = includeDownstream,
+    downstreamDepth = relatedDepthDownstream,
   ) {
     const total = page ? page.total : Number(source?.candidate_count || 0)
     // Once every row is actually loaded, count selectability exactly instead
@@ -2598,8 +2600,11 @@
     // in_corpus/downloaded (e.g. the includeDownstream override), so this is
     // strictly more accurate than any formula below.
     if (page && Array.isArray(loaded) && loaded.length >= total) {
-      return loadedSelectableCount ?? selectableSeedCount(source, loaded)
+      return loadedSelectableCount ?? selectableSeedCount(source, loaded, downstreamOn, downstreamDepth)
     }
+    // Downstream expansion makes every item selectable (see
+    // isSeedCandidateSelectable), including the rows not loaded yet.
+    if (downstreamOn && downstreamDepth >= 1) return total
     // state_counts is not resolved server-side above the metadata/download
     // sort limit (Task 5) — in that case the total is the best estimate.
     const stateCounts = source?.state_counts
@@ -4474,7 +4479,7 @@
                 {@const selection = seedSelections[sourceId] || EMPTY_SET}
                 {@const selectedCount = seedAllSelected[sourceId] ? page.total : selection.size}
                 {@const loadedSelectableCount = selectableSeedCount(source, loaded || EMPTY_LIST, includeDownstream, relatedDepthDownstream)}
-                {@const selectableCount = estimatedSelectableSeedCount(source, seedPages[sourceId], loaded, loadedSelectableCount)}
+                {@const selectableCount = estimatedSelectableSeedCount(source, seedPages[sourceId], loaded, loadedSelectableCount, includeDownstream, relatedDepthDownstream)}
                 {@const fullySelected = selectableCount > 0 && selectedCount === selectableCount}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div

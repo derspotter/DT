@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
+import { mockLogSocket } from './helpers/mockApi'
 
 // Seed selection behaviour with the backend mocked: one search seed holding
 // 70,000 items of which only the first page (3 rows) is loaded.
@@ -34,11 +35,18 @@ const candidates = [0, 1, 2].map((n) => ({
   cited_by_count: n,
 }))
 
-type State = { corpusId: number, promoteBody: any, holdPromote: Promise<void> | null }
+type State = {
+  corpusId: number
+  promoteBody: any
+  holdPromote: Promise<void> | null
+  source?: typeof seedSource
+  keywordConfig?: Record<string, unknown>
+}
 
 async function boot(page: Page, state: State) {
+  const source = state.source || seedSource
   await page.addInitScript(() => window.localStorage.setItem('rag_feeder_token', 'playwright-token'))
-  await page.routeWebSocket('**/api/ws', () => {})
+  await mockLogSocket(page)
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (path === '/api/auth/me') {
@@ -51,9 +59,9 @@ async function boot(page: Page, state: State) {
       state.corpusId = 2
       return fulfil(route, { success: true })
     }
-    if (path === '/api/seed/sources') return fulfil(route, { sources: [seedSource], total: 1, source: 'api' })
+    if (path === '/api/seed/sources') return fulfil(route, { sources: [source], total: 1, source: 'api' })
     if (path === '/api/seed/sources/search/70/candidates') {
-      return fulfil(route, { candidates, total: 70000, offset: 0, limit: 200, source_summary: seedSource })
+      return fulfil(route, { candidates, total: 70000, offset: 0, limit: 200, source_summary: source })
     }
     if (path === '/api/seed/sources/search/70/promote') {
       state.promoteBody = route.request().postDataJSON()
@@ -61,7 +69,7 @@ async function boot(page: Page, state: State) {
       return fulfil(route, { success: true, message: 'Promoted.' })
     }
     if (path === '/api/corpus') return fulfil(route, { items: [], total: 0, source: 'api', stage_totals: {} })
-    if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
+    if (path === '/api/recursion-config') return fulfil(route, { keyword: state.keywordConfig || {} })
     if (path === '/api/openalex/quota') return fulfil(route, { available: false })
     if (path === '/api/ingest/runs') return fulfil(route, { runs: [], total: 0, source: 'api' })
     if (path === '/api/ingest/stats') return fulfil(route, { stats: {} })
@@ -71,13 +79,9 @@ async function boot(page: Page, state: State) {
   await expect(page.getByTestId('seed-panel')).toBeVisible()
 }
 
-// The mocked log socket never opens; the app closing it on reconnect raises
-// this browser-level error, which is not a selection error.
 function collectPageErrors(page: Page) {
   const errors: string[] = []
-  page.on('pageerror', (error) => {
-    if (error.message !== 'WebSocket closed without opened.') errors.push(error.message)
-  })
+  page.on('pageerror', (error) => errors.push(error.message))
   return errors
 }
 
@@ -151,4 +155,32 @@ test('a corpus switch clears selections', async ({ page }) => {
   await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('Selected: 0 / 3 selectable')
   for (const index of [0, 1, 2]) await expect(rowCheckbox(page, index)).not.toBeChecked()
   expect(errors).toEqual([])
+})
+
+test('downstream expansion makes every item of a paged seed promotable', async ({ page }) => {
+  let release!: () => void
+  const state: State = {
+    corpusId: 1,
+    promoteBody: null,
+    holdPromote: new Promise<void>((r) => { release = r }),
+    // Without the override nothing would be left: 69,990 in corpus + 10 downloaded.
+    source: { ...seedSource, state_counts: { in_corpus: 69990, downloaded: 10 } },
+    keywordConfig: { includeDownstream: true, relatedDepthDownstream: 1 },
+  }
+  await boot(page, state)
+  await expandSeed(page)
+  const promoteAll = page.getByRole('button', { name: 'Promote all promotable items', exact: true })
+  await expect(promoteAll).toBeEnabled()
+
+  // Turning the override off leaves nothing promotable in the unloaded rest.
+  const downstream = page.locator('.seed-expansion-pill', { hasText: 'Downstream' }).locator('input[type="checkbox"]')
+  await downstream.uncheck()
+  await expect(promoteAll).toBeDisabled()
+  await downstream.check()
+  await expect(promoteAll).toBeEnabled()
+
+  await promoteAll.click()
+  await expect(page.getByText('Promoting 70,000 candidate(s) into the corpus...')).toBeVisible()
+  await expect.poll(() => state.promoteBody?.downloadBatchSize).toBe(70000)
+  release()
 })
