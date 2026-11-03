@@ -426,3 +426,57 @@ test('a corpus switch whose /me answers after a re-login does not restore the ol
   const seen = await page.evaluate(() => (window as unknown as { __authUserSeen: string[] }).__authUserSeen)
   expect(seen).not.toContain('alice')
 })
+
+test('a settings load that fails after a sign-out does not show its error to the next user', async ({ page }) => {
+  const sockets = { opened: 0, closed: 0 }
+  const adminA = { ...userA, is_admin: true }
+  const adminB = { ...userB, is_admin: true }
+  let releaseHeld: () => void = () => {}
+  const held = new Promise<void>((resolve) => { releaseHeld = resolve })
+  let heldSeen = false
+  let heldAnswered = false
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockSocket(page, sockets)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: adminB })
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? adminB : adminA, corpora: [corpus] })
+    }
+    if (path === '/api/admin/settings') {
+      if (auth.endsWith('token-a')) {
+        heldSeen = true
+        await held
+        await fulfil(route, { error: 'Stale settings failure' }, 500)
+        heldAnswered = true
+        return
+      }
+      return fulfil(route, { settings: { openalex_api_key: { is_set: false } } })
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/admin')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  await expect.poll(() => heldSeen).toBe(true)
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await expect.poll(() => sockets.opened).toBe(2)
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+
+  releaseHeld()
+  await expect.poll(() => heldAnswered).toBe(true)
+  await page.waitForTimeout(300)
+  await page.getByRole('button', { name: 'Admin', exact: true }).click()
+  await expect(page.locator('.admin-settings-form')).toBeVisible()
+  await expect(page.getByText('Stale settings failure')).toHaveCount(0)
+  await expect(page.getByText('Failed to load settings')).toHaveCount(0)
+})

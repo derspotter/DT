@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { fulfil, mockLogSocket } from './helpers/mockApi'
 
 // One tab→resources table with per-resource in-flight dedupe: every tab loads
@@ -34,6 +34,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     failPrefixReloads: 0,
     // Answer the next corpus request at this offset with a 503.
     failOffset: null as number | null,
+    // Ids prepended, one each, right after a prefix-reload page at offset 0
+    // (limit > one page) is answered: a leading insert between two pages.
+    insertAfterPrefixStart: [] as number[],
   }
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -67,7 +70,11 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       }
       const items = state.corpusIds.slice(offset, offset + limit).map(corpusRow)
       const total = state.corpusIds.length
-      return fulfil(route, { items, total, source: 'api', stage_totals: { downloaded: total } })
+      await fulfil(route, { items, total, source: 'api', stage_totals: { downloaded: total } })
+      if (offset === 0 && limit > CORPUS_PAGE_SIZE && state.insertAfterPrefixStart.length > 0) {
+        state.corpusIds = [state.insertAfterPrefixStart.shift()!, ...state.corpusIds]
+      }
+      return
     }
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
     if (path === '/api/openalex/quota') return fulfil(route, { available: false })
@@ -283,16 +290,27 @@ test('a failed prefix reload is retried by the next poll', async ({ page }) => {
   expect(errors).toEqual([])
 })
 
+// Clicks "Show more" until `rows` of `total` are loaded. A click while any
+// corpus load (such as the idle poll) is in flight is ignored by the app,
+// so each step retries its click.
+async function showMoreUntil(panel: Locator, rows: number, total: number) {
+  for (let loaded = CORPUS_PAGE_SIZE * 2; loaded <= rows; loaded += CORPUS_PAGE_SIZE) {
+    await expect(async () => {
+      if (!(await panel.textContent())?.includes(`Loaded ${loaded}/${total}`)) {
+        await panel.getByRole('button', { name: 'Show more' }).click()
+      }
+      await expect(panel).toContainText(`Loaded ${loaded}/${total}`, { timeout: 1500 })
+    }).toPass({ timeout: 15_000 })
+  }
+}
+
 test('a changed first page reloads every loaded row in bounded pages', async ({ page }) => {
   test.setTimeout(90_000)
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(String(error)))
   const { state, log, reset } = await boot(page, { corpusTotal: 1400 })
   const panel = page.getByTestId('corpus-panel')
-  for (let loaded = CORPUS_PAGE_SIZE * 2; loaded <= 1320; loaded += CORPUS_PAGE_SIZE) {
-    await panel.getByRole('button', { name: 'Show more' }).click()
-    await expect(panel).toContainText(`Loaded ${loaded}/1400`)
-  }
+  await showMoreUntil(panel, 1320, 1400)
   const tableIds = () => panel.locator('.corpus-table').evaluate((table) =>
     [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
   )
@@ -320,5 +338,47 @@ test('a changed first page reloads every loaded row in bounded pages', async ({ 
   expect(new Set(ids).size).toBe(1320)
   expect(ids[0]).toBe('5000')
   expect(ids[1319]).toBe('1319')
+  expect(errors).toEqual([])
+})
+
+test('a prefix reload whose pages disagree is retried once, then left alone', async ({ page }) => {
+  test.setTimeout(90_000)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(String(error)))
+  const { state, log, reset } = await boot(page, { corpusTotal: 1400 })
+  const panel = page.getByTestId('corpus-panel')
+  await showMoreUntil(panel, 1320, 1400)
+  const tableIds = () => panel.locator('.corpus-table').evaluate((table) =>
+    [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
+  )
+  const corpusRequests = () => log
+    .filter((e) => e.path === '/api/corpus')
+    .map((e) => `${e.search.get('limit')}@${e.search.get('offset')}`)
+  const prefixRequests = [`${CORPUS_PAGE_SIZE}@0`, '1000@0', '320@1000', '1000@0', '320@1000']
+
+  // A row lands in front between the pages of the reload and again during
+  // its retry: both attempts are inconsistent, so nothing changes.
+  state.corpusIds = [5000, ...state.corpusIds]
+  state.insertAfterPrefixStart = [6000, 7000]
+  reset()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(corpusRequests).toEqual(prefixRequests)
+  await page.waitForTimeout(300)
+  await expect(panel).toContainText('Loaded 1320/1400')
+  expect((await tableIds())[0]).toBe('1')
+  expect(errors).toEqual([])
+
+  // The signature stayed: the next poll reloads again. One insert between
+  // its pages; the retry is consistent and replaces the rows.
+  state.insertAfterPrefixStart = [8000]
+  reset()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(corpusRequests).toEqual(prefixRequests)
+  await expect(panel).toContainText('Loaded 1320/1404')
+  const ids = await tableIds()
+  expect(ids.length).toBe(1320)
+  expect(new Set(ids).size).toBe(1320)
+  expect(ids.slice(0, 4)).toEqual(['8000', '7000', '6000', '5000'])
+  expect(ids[1319]).toBe('1316')
   expect(errors).toEqual([])
 })

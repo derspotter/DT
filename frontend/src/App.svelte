@@ -3511,22 +3511,35 @@
         // on the next "Show more"), so reload every loaded row, in sequential
         // pages of at most CORPUS_POLL_PAGE_ROWS. The rows are replaced only
         // once every page answered; a failed page throws and changes nothing.
+        // A write between two pages shifts the offsets (a row doubled or
+        // skipped at the boundary): such an attempt is retried once, and a
+        // second inconsistent one leaves rows and signature for the next poll.
         if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
           const loadedRows = corpusItems.length
-          const prefix = []
-          for (let pageOffset = 0; pageOffset < loadedRows; pageOffset += CORPUS_POLL_PAGE_ROWS) {
-            const answer = await fetchCorpus({
-              limit: Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset),
-              offset: pageOffset,
-              ...query,
-            })
-            if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) return
-            const rows = Array.isArray(answer.data) ? answer.data : []
-            prefix.push(...rows)
-            ;({ total, source, stageTotals } = answer)
-            // The corpus ends before the loaded count (rows were removed).
-            if (rows.length < Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset)) break
+          let prefix = null
+          for (let attempt = 0; attempt < 2 && !prefix; attempt += 1) {
+            const rows = []
+            const totals = new Set()
+            let last = null
+            for (let pageOffset = 0; pageOffset < loadedRows; pageOffset += CORPUS_POLL_PAGE_ROWS) {
+              const pageLimit = Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset)
+              const answer = await fetchCorpus({ limit: pageLimit, offset: pageOffset, ...query })
+              if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) return
+              const pageRows = Array.isArray(answer.data) ? answer.data : []
+              rows.push(...pageRows)
+              totals.add(Number(answer.total))
+              last = answer
+              // The corpus ends before the loaded count (rows were removed).
+              if (pageRows.length < pageLimit) break
+            }
+            // Corpus keys its rows by id.
+            const ids = rows.map((row) => row?.id)
+            if (totals.size === 1 && new Set(ids).size === ids.length) {
+              prefix = rows
+              ;({ total, source, stageTotals } = last)
+            }
           }
+          if (!prefix) return
           data = prefix
         }
       }
@@ -3773,7 +3786,7 @@
         gemini_model: appSettings?.gemini_model?.value || '',
       }
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       appSettingsStatus = error?.message || 'Failed to load settings.'
       appSettingsError = true
     }
