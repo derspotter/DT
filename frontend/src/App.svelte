@@ -1551,10 +1551,14 @@
   async function handleLogin(event) {
     event?.preventDefault?.()
     authError = ''
+    // The session this attempt owns: the one current at submit, then the one
+    // its own success starts. A newer sign-in or a sign-out takes it over.
+    let epoch = sessionEpoch
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
+      if (epoch !== sessionEpoch) return
       sessionEpoch += 1
-      const epoch = sessionEpoch
+      epoch = sessionEpoch
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
@@ -1577,6 +1581,8 @@
         setActiveTab('workspace', { replace: true })
       }
     } catch (error) {
+      // Only the attempt that still owns the session may clear it.
+      if (epoch !== sessionEpoch) return
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
@@ -1613,10 +1619,14 @@
       authError = 'Passwords do not match.'
       return
     }
+    // The session this attempt owns: the one current at submit, then the one
+    // its own success starts. A newer sign-in or a sign-out takes it over.
+    let epoch = sessionEpoch
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
+      if (epoch !== sessionEpoch) return
       sessionEpoch += 1
-      const epoch = sessionEpoch
+      epoch = sessionEpoch
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
@@ -1639,6 +1649,7 @@
         setActiveTab('workspace', { replace: true })
       }
     } catch (error) {
+      if (epoch !== sessionEpoch) return
       authError = error.message || 'Failed to accept invite'
     }
   }
@@ -1659,10 +1670,14 @@
       authError = 'Passwords do not match.'
       return
     }
+    // The session this attempt owns: the one current at submit, then the one
+    // its own success starts. A newer sign-in or a sign-out takes it over.
+    let epoch = sessionEpoch
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
+      if (epoch !== sessionEpoch) return
       sessionEpoch += 1
-      const epoch = sessionEpoch
+      epoch = sessionEpoch
       if (payload?.user) {
         authUser = payload.user
         currentCorpusId = payload.user.last_corpus_id || null
@@ -1685,6 +1700,7 @@
         setActiveTab('workspace', { replace: true })
       }
     } catch (error) {
+      if (epoch !== sessionEpoch) return
       authError = error.message || 'Failed to reset password'
     }
   }
@@ -3199,7 +3215,7 @@
       topics: searchTopics.map(({ id, label }) => ({ id, label })),
       maxResults: searchResultCap(maxResults), sort: searchSort,
       includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
-      maxRelated: 30, fallbackToSample: false,
+      maxRelated: 30,
     }
   }
 

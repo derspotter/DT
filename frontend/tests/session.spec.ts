@@ -207,3 +207,49 @@ test('corpus action errors show in the corpus action status, not the auth error'
   await expect(page.locator('.upstream-management-form__status')).toHaveText('Name taken')
   await expect(page.getByTestId('login-form')).toHaveCount(0)
 })
+
+test('a failed sign-in attempt that lost the session to a newer one changes nothing', async ({ page }) => {
+  const sockets = { opened: 0, closed: 0 }
+  let releaseHeldMe: () => void = () => {}
+  const heldMeReleased = new Promise<void>((resolve) => { releaseHeldMe = resolve })
+  let heldMeSeen = false
+  let heldMeAnswered = false
+  await mockSocket(page, sockets)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      const { username } = JSON.parse(request.postData() || '{}')
+      return username === 'alice'
+        ? fulfil(route, { token: 'token-a', user: userA })
+        : fulfil(route, { token: 'token-b', user: userB })
+    }
+    if (path === '/api/auth/me') {
+      if (auth.endsWith('token-a')) {
+        // Attempt A's /me is slow and finally answers 401 for A's token.
+        heldMeSeen = true
+        await heldMeReleased
+        await fulfil(route, { error: 'Unauthorized' }, 401)
+        heldMeAnswered = true
+        return
+      }
+      if (auth.endsWith('token-b')) return fulfil(route, { user: userB, corpora: [corpus] })
+      return fulfil(route, { error: 'Unauthorized' }, 401)
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  await expect.poll(() => heldMeSeen).toBe(true)
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+
+  releaseHeldMe()
+  await expect.poll(() => heldMeAnswered).toBe(true)
+  await page.waitForTimeout(300)
+  await expect(page.getByTestId('login-form')).toHaveCount(0)
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBe('token-b')
+})
