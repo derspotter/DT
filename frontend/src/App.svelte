@@ -399,6 +399,8 @@
   $: openalexQuotaView = formatOpenAlexQuota(openalexQuota)
 
   const CORPUS_PAGE_SIZE = 120
+  // The poll's follow-up reload of every loaded row is capped here.
+  const CORPUS_POLL_MAX_ROWS = 1000
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
@@ -1294,6 +1296,9 @@
   // starts while one (e.g. from handleCorpusPollForbidden) is pending waits
   // for it instead of starting scoped loads under the old corpus.
   let corpusReconcilePromise = null
+  // The tab the last switching reconciliation reloaded (null: it cleared the
+  // corpus and loaded nothing). A tab opened meanwhile loads its own resources.
+  let corpusReconcileLoadedTab = null
   // Resolves true when it switched (or cleared) the workspace corpus.
   function reconcileCorpusWithBackend() {
     if (corpusReconcilePromise) return corpusReconcilePromise
@@ -1329,8 +1334,9 @@
       if (Number(nextCorpusId || 0) === Number(currentCorpusId || 0)) return false
       currentCorpusId = nextCorpusId
       resetFrontendState()
+      corpusReconcileLoadedTab = nextCorpusId ? activeTab : null
       if (nextCorpusId) {
-        await refreshAll()
+        await refreshAll(corpusReconcileLoadedTab)
         if (logsType === 'pipeline') handleLogsCorpusFilterChange()
       }
       return true
@@ -1365,9 +1371,21 @@
     workspace: ['daemon'],
   }
 
+  // The shared header (.header-stats) shows items found / promoted /
+  // downloaded on every tab, so every tab loads them on entry. Not the graph:
+  // it loads its own snapshot and must not hit the pipeline reads. Polling
+  // them is still up to the cadence (shouldRunLiveRefresh).
+  const HEADER_RESOURCES = ['stats', 'corpus', 'seeds']
+
   function resourcesFor(tab, { admin = false } = {}) {
     const tabId = normalizeTab(tab)
-    return [...(TAB_RESOURCES[tabId] || []), ...(admin ? ADMIN_RESOURCES[tabId] || [] : [])]
+    return [
+      ...new Set([
+        ...(tabId === 'graph' ? [] : HEADER_RESOURCES),
+        ...(TAB_RESOURCES[tabId] || []),
+        ...(admin ? ADMIN_RESOURCES[tabId] || [] : []),
+      ]),
+    ]
   }
 
   // `quiet` is false only for refreshAll (boot, sign-in, corpus switch),
@@ -1459,7 +1477,12 @@
 
   async function refreshForActiveTab(tabId) {
     if (authStatus !== 'authenticated') return
-    if (await awaitPendingCorpusReconcile()) return
+    if (await awaitPendingCorpusReconcile()) {
+      // The switch reloaded the tab that was active when it started; another
+      // tab opened since still needs its own loads (shared ones are joined).
+      if (corpusReconcileLoadedTab === null || normalizeTab(corpusReconcileLoadedTab) === normalizeTab(tabId)) return
+      if (authStatus !== 'authenticated') return
+    }
     await refreshResources(resourcesFor(tabId, { admin: diagnosticsEnabled }))
   }
 
@@ -3340,12 +3363,8 @@
       const offset = append ? corpusItems.length : 0
       // The poll asks for the first page only, also when more rows are loaded.
       const poll = !append && quiet && preserveSelection
-      const { data, total, source, stageTotals } = await fetchCorpus({
-        limit: CORPUS_PAGE_SIZE,
-        offset,
-        q: corpusFilterQuery,
-        sort: corpusSort,
-      })
+      const query = { q: corpusFilterQuery, sort: corpusSort }
+      let { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
       const currentCorpusNumeric = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
@@ -3354,23 +3373,24 @@
       if (requestSeq !== corpusLoadRequestSeq || switchedCorpus) {
         return
       }
-      const pageData = Array.isArray(data) ? data : []
       if (!append) {
-        const signature = corpusPageSignature(pageData, total, stageTotals)
+        const signature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
         if (poll && signature === lastCorpusPageSignature) return
         lastCorpusPageSignature = signature
+        // The first page changed while more pages are loaded: a fresh page in
+        // front of the old tail would shift the offsets (rows lost or doubled
+        // on the next "Show more"), so reload everything loaded in one request.
+        if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
+          ;({ data, total, source, stageTotals } = await fetchCorpus({
+            limit: Math.min(corpusItems.length, CORPUS_POLL_MAX_ROWS),
+            offset: 0,
+            ...query,
+          }))
+          if (requestSeq !== corpusLoadRequestSeq) return
+        }
       }
-      const incoming = pageData.map((item) => normalizeCorpusItem(item))
-      if (append) {
-        corpusItems = [...corpusItems, ...incoming]
-      } else if (poll && incoming.length === CORPUS_PAGE_SIZE && corpusItems.length > CORPUS_PAGE_SIZE) {
-        // Replace the first page in place and keep the rows loaded after it
-        // (minus any the new first page now holds).
-        const firstPageIds = new Set(incoming.map((item) => item.id))
-        corpusItems = [...incoming, ...corpusItems.slice(CORPUS_PAGE_SIZE).filter((item) => !firstPageIds.has(item.id))]
-      } else {
-        corpusItems = incoming
-      }
+      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      corpusItems = append ? [...corpusItems, ...incoming] : incoming
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
       corpusHasMore = corpusItems.length < corpusTotal
       corpusSource = source

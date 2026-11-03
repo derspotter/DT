@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
+import { mockLogSocket } from './helpers/mockApi'
 
 // One adaptive refresh scheduler: 2 s while a search runs, 20 s idle, nothing
 // while hidden, and a single trailing run per burst of worker log lines.
@@ -19,6 +20,7 @@ async function boot(
   } = {},
 ) {
   const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0, ingestRuns: 0, seeds: 0 }
+  await mockLogSocket(page)
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })

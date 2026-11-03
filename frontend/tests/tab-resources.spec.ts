@@ -22,11 +22,19 @@ type Options = {
   corpusDelayMs?: number
   seedsDelayMs?: number
   corpusTotal?: number
+  setup?: (state: any) => void
 }
 
-async function boot(page: Page, { hash = '#/workspace', admin = false, running = false, corpusDelayMs = 0, seedsDelayMs = 0, corpusTotal = 1 }: Options = {}) {
+async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspace', admin = false, running = false, corpusDelayMs = 0, seedsDelayMs = 0, corpusTotal = 1 }: Options = {}) {
   const log: { path: string; search: URLSearchParams }[] = []
-  const delays = { corpus: corpusDelayMs, seeds: seedsDelayMs }
+  const delays = { corpus: corpusDelayMs, seeds: seedsDelayMs, me: 0 }
+  // Mutable server state: the corpus rows (ids, in order) and the corpus /me reports.
+  const state = {
+    corpusIds: Array.from({ length: corpusTotal }, (_, i) => i + 1),
+    lastCorpusId: 1,
+    seedCandidates: 0,
+    statsDownloaded: 1,
+  }
   await mockLogSocket(page)
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
@@ -36,18 +44,22 @@ async function boot(page: Page, { hash = '#/workspace', admin = false, running =
     const path = url.pathname
     log.push({ path, search: url.searchParams })
     if (path === '/api/auth/me') {
+      if (delays.me) await new Promise((resolve) => setTimeout(resolve, delays.me))
       return fulfil(route, {
-        user: { id: 1, username: admin ? 'admin' : 'reader', last_corpus_id: 1, is_admin: admin },
-        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
+        user: { id: 1, username: admin ? 'admin' : 'reader', last_corpus_id: state.lastCorpusId, is_admin: admin },
+        corpora: [
+          { id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' },
+          { id: 2, name: 'Second corpus', role: 'owner', owner_username: 'admin' },
+        ],
       })
     }
     if (path === '/api/corpus') {
       if (delays.corpus) await new Promise((resolve) => setTimeout(resolve, delays.corpus))
       const limit = Number(url.searchParams.get('limit') || CORPUS_PAGE_SIZE)
       const offset = Number(url.searchParams.get('offset') || 0)
-      const items = []
-      for (let i = offset; i < Math.min(offset + limit, corpusTotal); i += 1) items.push(corpusRow(i + 1))
-      return fulfil(route, { items, total: corpusTotal, source: 'api', stage_totals: { downloaded: corpusTotal } })
+      const items = state.corpusIds.slice(offset, offset + limit).map(corpusRow)
+      const total = state.corpusIds.length
+      return fulfil(route, { items, total, source: 'api', stage_totals: { downloaded: total } })
     }
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
     if (path === '/api/openalex/quota') return fulfil(route, { available: false })
@@ -55,12 +67,14 @@ async function boot(page: Page, { hash = '#/workspace', admin = false, running =
       if (delays.seeds) await new Promise((resolve) => setTimeout(resolve, delays.seeds))
       const sources = running
         ? [{ id: 1, title: 'Seed', name: 'Seed', run: { id: 5, status: 'running' }, status: 'running' }]
-        : []
+        : state.seedCandidates
+          ? [{ id: 1, source_type: 'search', source_key: '1', title: 'Seed', name: 'Seed', candidate_count: state.seedCandidates }]
+          : []
       return fulfil(route, { sources, total: sources.length, source: 'api' })
     }
     if (path === '/api/ingest/runs') return fulfil(route, { runs: [], total: 0, source: 'api' })
     if (path === '/api/ingest/stats') {
-      return fulfil(route, { stats: url.searchParams.get('global') === '1' ? { downloaded: 42 } : { downloaded: 1 } })
+      return fulfil(route, { stats: url.searchParams.get('global') === '1' ? { downloaded: 42 } : { downloaded: state.statsDownloaded } })
     }
     if (path === '/api/pipeline/daemon/status') {
       return fulfil(route, { daemon: { workers: {} }, backlog: url.searchParams.get('global') === '1' ? { downloading: 3 } : {} })
@@ -71,18 +85,19 @@ async function boot(page: Page, { hash = '#/workspace', admin = false, running =
     if (path === '/api/kantropos/corpora/k1/browse') {
       return fulfil(route, { target: { id: 'k1', name: 'Kantropos One' }, summary: {}, assigned_corpora: [], current_items: [], pending_items: [] })
     }
-    if (path === '/api/corpora/1/kantropos-assignment') {
+    if (path === '/api/corpora/1/kantropos-assignment' || path === '/api/corpora/2/kantropos-assignment') {
       return fulfil(route, { assignment: null, corpora: [{ id: 'k1', name: 'Kantropos One' }], can_edit: true })
     }
     return fulfil(route, {})
   })
+  setup(state)
   await page.goto(`/${hash}`)
   if (hash === '#/workspace') await expect(page.getByTestId('seed-panel')).toBeVisible()
   // Let the boot loads (and any post-bootstrap tab refresh) settle.
   await page.waitForTimeout(1500)
   const count = (path: string, global: boolean | null = null) =>
     log.filter((entry) => entry.path === path && (global === null || (entry.search.get('global') === '1') === global)).length
-  return { log, count, delays, reset: () => { log.length = 0 } }
+  return { log, count, delays, state, reset: () => { log.length = 0 } }
 }
 
 test('switching to Korpus Management during a slow corpus poll still loads the browse', async ({ page }) => {
@@ -161,4 +176,66 @@ test('the corpus poll asks for one page and skips unchanged pages', async ({ pag
   }
   // The appended rows survive the poll.
   await expect(panel).toContainText(`Loaded ${CORPUS_PAGE_SIZE * 2}/300`)
+})
+
+test('opening Korpus Management while a corpus switch is reloading still loads the browse', async ({ page }) => {
+  const { count, delays, state, reset } = await boot(page, { admin: true })
+  // The backend moved this user to corpus 2; the switch's reload is slow.
+  state.lastCorpusId = 2
+  delays.me = 300
+  delays.corpus = 2000
+  reset()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  // The reconcile answered and its workspace reload is in flight...
+  await expect.poll(() => count('/api/corpus')).toBeGreaterThanOrEqual(1)
+  // ...when Korpus Management opens.
+  await page.evaluate(() => { window.location.hash = '#/upstream' })
+  await expect.poll(() => count('/api/kantropos/corpora/k1/browse'), { timeout: 4000 }).toBe(1)
+  await expect.poll(() => count('/api/corpora/2/kantropos-assignment')).toBe(1)
+  await page.waitForTimeout(2500)
+  expect(count('/api/kantropos/corpora/k1/browse')).toBe(1)
+})
+
+test('the header counts load on a tab that does not render them itself', async ({ page }) => {
+  await boot(page, {
+    admin: true,
+    hash: '#/downloads',
+    corpusTotal: 5,
+    setup: (state) => {
+      state.seedCandidates = 9
+      state.statsDownloaded = 4
+    },
+  })
+  const header = page.locator('.header-stats')
+  await expect(header).toContainText('9 items found')
+  await expect(header).toContainText('5 items promoted')
+  await expect(header).toContainText('4 items downloaded')
+})
+
+test('the graph tab requests none of the header reads', async ({ page }) => {
+  const { count } = await boot(page, { hash: '#/graph' })
+  expect(count('/api/ingest/stats')).toBe(0)
+  expect(count('/api/corpus')).toBe(0)
+  expect(count('/api/seed/sources')).toBe(0)
+})
+
+test('a row inserted at the top does not duplicate rows when more are loaded after the poll', async ({ page }) => {
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(String(error)))
+  const { state } = await boot(page, { corpusTotal: 300 })
+  const panel = page.getByTestId('corpus-panel')
+  await panel.getByRole('button', { name: 'Show more' }).click()
+  await expect(panel).toContainText(`Loaded ${CORPUS_PAGE_SIZE * 2}/300`)
+  // A new work lands at the top of the sort order; the next poll sees it.
+  state.corpusIds = [1000, ...state.corpusIds]
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect(panel).toContainText(/Loaded \d+\/301/)
+  await panel.getByRole('button', { name: 'Show more' }).click()
+  await expect(panel).toContainText('Loaded 301/301')
+  const titles = await panel.locator('.corpus-table').evaluate((table) =>
+    [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
+  )
+  expect(titles.length).toBe(301)
+  expect(new Set(titles).size).toBe(301)
+  expect(errors).toEqual([])
 })

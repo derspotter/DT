@@ -1,4 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
+import { mockLogSocket } from './helpers/mockApi'
 
 // Boot cost: the workspace data (seeds, corpus, counts) must be requested
 // exactly once per page load, and must not queue behind the auth round trip —
@@ -32,6 +33,7 @@ function mockApi(route: Route, log: { path: string; at: number }[], authDelayMs:
 test('boot requests each workspace resource once and does not wait for the auth check', async ({ page }) => {
   const log: { path: string; at: number }[] = []
   const done = { auth: 0 }
+  await mockLogSocket(page)
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
