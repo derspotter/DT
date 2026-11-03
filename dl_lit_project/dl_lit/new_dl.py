@@ -20,6 +20,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .db_manager import DatabaseManager
+from .identifiers import inverted_index_to_text_lenient
 from .pdf_downloader import PDFDownloader
 from .utils import ServiceRateLimiter, env_bool, env_int, get_global_rate_limiter
 try:
@@ -2237,28 +2238,7 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
 # ----------------------------------------------------------------------
 # Helper to convert OpenAlex abstract format
 # ----------------------------------------------------------------------
-def convert_inverted_index_to_text(inverted_index: dict | None) -> str | None:
-    """Convert OpenAlex abstract_inverted_index dict to continuous text, or return None if input is None."""
-    if inverted_index is None:
-        return None
-    if not isinstance(inverted_index, dict):
-        return "" # Return empty string for invalid format
-        
-    # Collect (position, term) tuples
-    pos_terms: list[tuple[int, str]] = []
-    for term, positions in inverted_index.items():
-        if not isinstance(positions, list):
-            continue # Skip invalid term entries
-        for pos in positions:
-            if isinstance(pos, int):
-                 pos_terms.append((pos, term))
-                 
-    if not pos_terms:
-        return "" # Return empty string if no valid terms/positions found
-        
-    pos_terms.sort(key=lambda x: x[0]) # Sort by position
-    # Join terms based on sorted positions
-    return " ".join(term for _, term in pos_terms)
+convert_inverted_index_to_text = inverted_index_to_text_lenient
 
 # ----------------------------------------------------------------------
 # Ingest JSON files & referenced works into DB

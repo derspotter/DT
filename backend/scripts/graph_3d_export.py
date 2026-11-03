@@ -9,6 +9,12 @@ import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
+from _bootstrap import ensure_import_paths
+
+ensure_import_paths(__file__)
+
+from dl_lit.identifiers import normalize_doi as _normalize_doi, normalize_openalex_id  # noqa: E402
+
 try:
     import igraph
     import numpy as np
@@ -134,20 +140,9 @@ REGION_KEYWORDS = [
 ]
 
 
-def normalize_openalex_id(value):
-    if not value:
-        return None
-    match = re.search(r"(W\d+)", str(value), re.IGNORECASE)
-    return match.group(1).upper() if match else None
-
-
 def normalize_doi(value):
-    if not value:
-        return None
-    match = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", str(value), re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    return str(value).strip().upper() or None
+    """The DB ``normalized_doi`` rule on the trimmed input (a blank value gives ``None``)."""
+    return _normalize_doi(str(value).strip()) if value else None
 
 
 def derive_node_id(row):

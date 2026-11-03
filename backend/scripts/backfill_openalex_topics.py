@@ -29,6 +29,7 @@ DL_LIT_PROJECT = ROOT / "dl_lit_project"
 if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 
+from dl_lit.identifiers import normalize_openalex_id  # noqa: E402
 from dl_lit.utils import (  # noqa: E402
     OpenAlexRateLimitExceeded,
     get_openalex_mailto,
@@ -51,14 +52,11 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def normalize_openalex_id(value):
-    if not value:
-        return None
-    match = re.search(r"(W\d+)", str(value), re.IGNORECASE)
-    return match.group(1).upper() if match else None
+def _normalize_doi(value):
+    """Lowercase and drop an http(s) doi.org prefix only (no ``doi:`` strip, no trim).
 
-
-def normalize_doi(value):
+    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
+    """
     if not value:
         return None
     text = str(value).strip()
@@ -245,14 +243,14 @@ def main():
             ORDER BY id{limit_clause}
             """
         ):
-            token = normalize_doi(row["doi"])
+            token = _normalize_doi(row["doi"])
             if token:
                 doi_rows.append((row["id"], token))
         log(f"Pass 2 (by doi): {len(doi_rows)} works")
         run_pass(
             conn,
             doi_rows,
-            key=lambda work: normalize_doi(work.get("doi")),
+            key=lambda work: _normalize_doi(work.get("doi")),
             build_filter=lambda tokens: "doi:" + "|".join(tokens),
             mailto=mailto,
             batch_size=batch_size,

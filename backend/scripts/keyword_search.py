@@ -3,7 +3,6 @@ import contextlib
 import io
 import json
 import os
-import re
 import signal
 import sys
 from collections import deque
@@ -23,6 +22,11 @@ from dl_lit.OpenAlexScraper import (
     fetch_referenced_work_details,
 )
 from dl_lit.db_manager import DatabaseManager
+from dl_lit.identifiers import (
+    extract_doi_lower,
+    normalize_openalex_id_strict,
+    openalex_work_to_record,
+)
 from dl_lit.keyword_search import (
     normalize_topic_ids,
     search_credits_per_page,
@@ -72,29 +76,9 @@ OPENALEX_SELECT = (
     'abstract_inverted_index,keywords,primary_location,open_access,biblio,'
     'referenced_works,cited_by_api_url,referenced_works_count,cited_by_count'
 )
-OPENALEX_ID_RE = re.compile(r'^W\d+$', re.IGNORECASE)
-DOI_RE = re.compile(r'10\.\d{4,9}/\S+', re.IGNORECASE)
-
-
-def normalize_openalex_id(value):
-    if not value:
-        return None
-    raw = str(value).strip()
-    if raw.startswith('http'):
-        raw = raw.rstrip('/').split('/')[-1]
-    if OPENALEX_ID_RE.match(raw):
-        return raw.upper()
-    return None
-
-
-def normalize_doi(value):
-    if not value:
-        return None
-    raw = str(value).strip().lower()
-    raw = raw.replace('https://doi.org/', '').replace('http://doi.org/', '')
-    raw = raw.replace('doi:', '')
-    match = DOI_RE.search(raw)
-    return match.group(0) if match else None
+normalize_openalex_id = normalize_openalex_id_strict
+normalize_doi = extract_doi_lower
+openalex_result_to_record = openalex_work_to_record  # former name; seed_expand imports it
 
 
 def _normalize_candidate_id(value):
@@ -173,38 +157,6 @@ def _to_openalex_like(work):
         'cited_by_count': work.get('cited_by_count'),
     }
     return out
-
-
-def openalex_result_to_record(item, run_id=None):
-    biblio = item.get('biblio') or {}
-    primary_location = item.get('primary_location') or {}
-    source_info = primary_location.get('source') or {}
-    authors = [a.get('author', {}).get('display_name') for a in item.get('authorships', [])]
-
-    first_page = biblio.get('first_page')
-    last_page = biblio.get('last_page')
-    pages = f'{first_page}--{last_page}' if first_page and last_page else None
-
-    return {
-        'openalex_id': item.get('id'),
-        'doi': item.get('doi'),
-        'title': item.get('display_name'),
-        'year': item.get('publication_year'),
-        'authors': authors,
-        'abstract': item.get('abstract_inverted_index'),
-        'keywords': [kw.get('display_name') for kw in item.get('keywords', []) if kw.get('display_name')],
-        'source': source_info.get('display_name'),
-        'volume': biblio.get('volume'),
-        'issue': biblio.get('issue'),
-        'pages': pages,
-        'publisher': source_info.get('publisher'),
-        'type': item.get('type'),
-        'url': item.get('id'),
-        'open_access_url': item.get('open_access', {}).get('oa_url'),
-        'openalex_json': item,
-        'ingest_source': 'keyword_search',
-        'run_id': run_id,
-    }
 
 
 def _dedupe_openalex_items(items):

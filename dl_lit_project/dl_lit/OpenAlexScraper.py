@@ -8,6 +8,7 @@ from pathlib import Path
 import argparse
 import concurrent.futures
 import os
+from .identifiers import inverted_index_to_text, normalize_doi_lower
 from .utils import OpenAlexRateLimitExceeded, env_bool, get_global_rate_limiter, openalex_request_json
 
 try:
@@ -52,22 +53,8 @@ def clean_search_term(term):
     return ' '.join(term.replace(',', ' ').split())
 
 def convert_inverted_index_to_text(inverted_index):
-    """Convert an abstract_inverted_index to readable text"""
-    if not inverted_index:
-        return ""
-
-    # Create a list of (word, position) tuples
-    word_positions = []
-    for word, positions in inverted_index.items():
-        for position in positions:
-            word_positions.append((word, position))
-
-    # Sort by position
-    word_positions.sort(key=lambda x: x[1])
-
-    # Join words
-    text = " ".join(word for word, _ in word_positions)
-    return text
+    """Like :func:`dl_lit.identifiers.inverted_index_to_text`, but ``""`` for empty input."""
+    return inverted_index_to_text(inverted_index) or ""
 
 def fetch_citing_work_ids(
     cited_by_url,
@@ -834,15 +821,7 @@ class OpenAlexCrossrefSearcher:
             except Exception as e:
                 return {"step": step, "results": [], "success": False, "error": f"Unexpected OpenAlex error: {str(e)}"}
 
-def normalize_doi(raw_doi: str | None) -> str | None:
-    """Normalize DOI strings to a bare, lowercase form."""
-    if not raw_doi:
-        return None
-    doi = raw_doi.strip().lower()
-    doi = re.sub(r'^(https?://)?(dx\.)?doi\.org/', '', doi)
-    doi = re.sub(r'^doi:\s*', '', doi)
-    doi = doi.strip().strip(' .;,')
-    return doi or None
+normalize_doi = normalize_doi_lower  # lowercase rule; the DB key uses identifiers.normalize_doi
 
 
 def coerce_year_int(value):
@@ -921,19 +900,8 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
         json.dump(enriched_references, f, indent=2)
     print(f"Enriched data saved to {output_path}")
 
-def get_abstract(inverted_index):
-    """Converts an OpenAlex inverted index to a string."""
-    if not inverted_index:
-        return None
-    
-    word_positions = {}
-    for word, positions in inverted_index.items():
-        for pos in positions:
-            word_positions[pos] = word
-            
-    # Sort by position and join the words
-    sorted_words = [word_positions[i] for i in sorted(word_positions.keys())]
-    return " ".join(sorted_words)
+get_abstract = inverted_index_to_text
+
 
 def _build_enrichment_payload(ref, best_result):
     """Build a consistent enrichment payload for downstream consumers."""
@@ -1256,6 +1224,10 @@ def process_single_reference(
     return None
 
 def _normalize_openalex_id(value: str | None) -> str | None:
+    """Last segment of an http URL, else the value unchanged (no case or W-check).
+
+    Deliberately not identifiers.normalize_openalex_id: it differs on e.g. ``w123``, ``A123``, ``" W123 "``.
+    """
     if not value:
         return None
     if value.startswith("http"):

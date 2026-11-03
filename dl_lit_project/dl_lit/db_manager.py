@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 from datetime import datetime
 import time
+from dl_lit.identifiers import inverted_index_to_text, normalize_doi, normalize_openalex_id
 from dl_lit.utils import parse_bibtex_file_field
 
 # ANSI escape codes for colors
@@ -674,37 +675,12 @@ class DatabaseManager:
         return value
 
     def _normalize_doi(self, doi: str | None) -> str | None:
-        """Normalizes a DOI by extracting the core identifier from a URL if present."""
-        if not doi:
-            return None
-        # This regex is designed to find a DOI pattern, which typically starts with '10.'.
-        # It handles cases with a 'https://doi.org/' prefix or other URL variations.
-        match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', doi, re.IGNORECASE)
-        if match:
-            # Return the matched DOI, standardized to uppercase for consistency.
-            normalized = match.group(1).upper()
-            return normalized
-        # If no URL-like structure is found, assume it might be a bare DOI already.
-        # We still standardize it to uppercase.
-        if doi: # Ensure doi is not None before calling upper()
-            normalized = doi.upper() # Ensure even bare DOIs are uppercased for consistency
-            return normalized
-        return None
+        """The ``normalized_doi`` key; see :func:`dl_lit.identifiers.normalize_doi`."""
+        return normalize_doi(doi)
 
     def _normalize_openalex_id(self, openalex_id: str | None) -> str | None:
-        """Normalizes an OpenAlex ID by extracting the core identifier (e.g., W123456789)."""
-        if not openalex_id:
-            return None
-        
-        # Regex to find 'W' followed by digits, possibly at the end of a URL
-        # Example: https://openalex.org/W123456789 -> W123456789
-        # Example: W123456789 -> W123456789
-        match = re.search(r'(W\d+)', openalex_id, re.IGNORECASE)
-        if match:
-            normalized = match.group(1).upper() # Ensure 'W' is uppercase
-            return normalized
-        
-        return None
+        """The ``openalex_id`` key; see :func:`dl_lit.identifiers.normalize_openalex_id`."""
+        return normalize_openalex_id(openalex_id)
 
     def _make_node_id(self, openalex_id: str | None, doi: str | None, table: str | None, row_id: int | None) -> str | None:
         normalized_openalex = self._normalize_openalex_id(openalex_id)
@@ -2039,25 +2015,8 @@ class DatabaseManager:
         return [dict(row) for row in rows]
 
     def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
-        """Convert OpenAlex abstract_inverted_index dict to continuous text, or return None if input is None."""
-        if not inverted_index:
-            return None
-        
-        max_index = -1
-        for indices in inverted_index.values():
-            if indices:
-                max_index = max(max_index, *indices)
-        
-        if max_index == -1:
-            return ""
-
-        word_list = [''] * (max_index + 1)
-        
-        for word, indices in inverted_index.items():
-            for index in indices:
-                word_list[index] = word
-                
-        return ' '.join(word_list)
+        """See :func:`dl_lit.identifiers.inverted_index_to_text`."""
+        return inverted_index_to_text(inverted_index)
 
     def move_entry_to_downloaded(self, source_id: int, enriched_metadata: dict, file_path: str, checksum: str, source_of_download: str):
         """Mark a matched work as downloaded."""
@@ -2962,17 +2921,6 @@ class DatabaseManager:
             except Exception:
                 pass
             return []
-
-    def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
-        """Converts an OpenAlex abstract_inverted_index to readable text."""
-        if not inverted_index:
-            return None
-        word_positions = []
-        for word, positions in inverted_index.items():
-            for position in positions:
-                word_positions.append((word, position))
-        word_positions.sort(key=lambda x: x[1])
-        return " ".join(word for word, _ in word_positions)
 
     def mark_downloaded_work(self, queue_id: int, enriched_data: dict, file_path: str, checksum: str) -> tuple[int | None, str | None]:
         """Mark a queued work as downloaded."""

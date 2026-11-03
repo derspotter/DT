@@ -4,6 +4,12 @@ import re
 import sqlite3
 from pathlib import Path
 
+from _bootstrap import ensure_import_paths
+
+ensure_import_paths(__file__)
+
+from dl_lit.identifiers import normalize_doi as _normalize_doi, normalize_openalex_id  # noqa: E402
+
 
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -17,19 +23,8 @@ def normalize_text(text):
 
 
 def normalize_doi(doi):
-    if not doi:
-        return None
-    match = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", str(doi), re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    return str(doi).strip().upper() or None
-
-
-def normalize_openalex_id(value):
-    if not value:
-        return None
-    match = re.search(r"(W\d+)", str(value), re.IGNORECASE)
-    return match.group(1).upper() if match else None
+    """The DB ``normalized_doi`` rule on the trimmed input (a blank value gives ``None``)."""
+    return _normalize_doi(str(doi).strip()) if doi else None
 
 
 def parse_name_list(value):

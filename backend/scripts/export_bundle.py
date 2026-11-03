@@ -19,7 +19,11 @@ VALID_STATUSES = {
 }
 
 
-def normalize_doi(value):
+def _normalize_doi(value):
+    """Lowercase, drop an http(s) doi.org URL or ``doi:`` prefix; no trim of ``.;,``.
+
+    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
+    """
     if not value:
         return None
     text = str(value).strip().lower()
@@ -121,7 +125,7 @@ def load_items(conn: sqlite3.Connection, corpus_id: int | None):
             "authors": parse_authors(data.get("authors")),
             "year": data.get("year"),
             "doi": data.get("doi"),
-            "normalized_doi": normalize_doi(data.get("doi") or data.get("normalized_doi")),
+            "normalized_doi": _normalize_doi(data.get("doi") or data.get("normalized_doi")),
             "openalex_id": data.get("openalex_id"),
             "source": build_source(data),
             "entry_type": data.get("type") or "misc",

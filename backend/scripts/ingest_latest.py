@@ -3,6 +3,12 @@ import json
 import re
 import sqlite3
 
+from _bootstrap import ensure_import_paths
+
+ensure_import_paths(__file__)
+
+from dl_lit.identifiers import normalize_doi  # noqa: E402
+
 
 def parse_maybe_json_list(value):
     if value is None:
@@ -38,15 +44,6 @@ def normalize_text(text):
     if not text:
         return None
     return re.sub(r"[^a-z0-9\s]", "", str(text).lower()).strip() or None
-
-
-def normalize_doi(doi):
-    if not doi:
-        return None
-    match = re.search(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", str(doi), re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-    return str(doi).upper()
 
 
 def normalize_contributors(authors):
