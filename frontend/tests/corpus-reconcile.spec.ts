@@ -189,12 +189,6 @@ test('an extraction completion for corpus A does not act on corpus B after the s
     state,
     async (path, route) => {
       if (path.startsWith('/api/seed/sources/pdf/paperA/candidates')) candidateRequests.push(path)
-      if (path === '/api/ingest/latest') {
-        // The completion's entries for corpus A; its follow-up seed reload is held next.
-        holdNextSeed = true
-        await fulfil(route, { items: [{ id: 1, title: 'Entry in Alpha' }], seed_document: { title: 'Paper A' } })
-        return true
-      }
       if (path === '/api/seed/sources' && holdNextSeed) {
         holdNextSeed = false
         // The backend drops corpus A while the completion is still awaiting.
@@ -223,6 +217,8 @@ test('an extraction completion for corpus A does not act on corpus B after the s
   const event = (extra: Record<string, unknown>) =>
     JSON.stringify({ kind: 'extraction', corpus_id: 1, base_name: 'paperA', filename: 'paperA.pdf', ...extra })
   socket!.send(event({ event: 'started' }))
+  // The completion's seed reload for corpus A is held next.
+  holdNextSeed = true
   socket!.send(event({ event: 'done', status: 'success' }))
 
   await seedHeld.promise
@@ -249,11 +245,6 @@ test('a corpus switch during the seed reload inside the completion focus does no
     state,
     async (path, route) => {
       if (path.startsWith('/api/seed/sources/pdf/paperA/candidates')) candidateRequests.push(path)
-      if (path === '/api/ingest/latest') {
-        seedStage = 1
-        await fulfil(route, { items: [{ id: 1, title: 'Entry in Alpha' }], seed_document: { title: 'Paper A' } })
-        return true
-      }
       if (path === '/api/seed/sources' && seedStage === 1) {
         // Corpus A's list does not show the seed yet, so focusSeedSource reloads.
         seedStage = 2
@@ -290,6 +281,8 @@ test('a corpus switch during the seed reload inside the completion focus does no
   const event = (extra: Record<string, unknown>) =>
     JSON.stringify({ kind: 'extraction', corpus_id: 1, base_name: 'paperA', filename: 'paperA.pdf', ...extra })
   socket!.send(event({ event: 'started' }))
+  // The completion's seed reload is next.
+  seedStage = 1
   socket!.send(event({ event: 'done', status: 'success' }))
 
   await seedHeld.promise
