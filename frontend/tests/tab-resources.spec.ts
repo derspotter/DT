@@ -34,6 +34,8 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     lastCorpusId: 1,
     seedCandidates: 0,
     statsDownloaded: 1,
+    // Answer the next multi-page reload from offset 0 with a 503.
+    failPrefixReloads: 0,
   }
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -57,6 +59,10 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       if (delays.corpus) await new Promise((resolve) => setTimeout(resolve, delays.corpus))
       const limit = Number(url.searchParams.get('limit') || CORPUS_PAGE_SIZE)
       const offset = Number(url.searchParams.get('offset') || 0)
+      if (state.failPrefixReloads > 0 && offset === 0 && limit > CORPUS_PAGE_SIZE) {
+        state.failPrefixReloads -= 1
+        return route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'busy' }) })
+      }
       const items = state.corpusIds.slice(offset, offset + limit).map(corpusRow)
       const total = state.corpusIds.length
       return fulfil(route, { items, total, source: 'api', stage_totals: { downloaded: total } })
@@ -237,5 +243,34 @@ test('a row inserted at the top does not duplicate rows when more are loaded aft
   )
   expect(titles.length).toBe(301)
   expect(new Set(titles).size).toBe(301)
+  expect(errors).toEqual([])
+})
+
+test('a failed prefix reload is retried by the next poll', async ({ page }) => {
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(String(error)))
+  const { state, log } = await boot(page, { corpusTotal: 300 })
+  const panel = page.getByTestId('corpus-panel')
+  await panel.getByRole('button', { name: 'Show more' }).click()
+  await expect(panel).toContainText(`Loaded ${CORPUS_PAGE_SIZE * 2}/300`)
+  state.corpusIds = [1000, ...state.corpusIds]
+  state.failPrefixReloads = 1
+  const prefixReloads = () => log.filter((e) => e.path === '/api/corpus' && Number(e.search.get('limit')) > CORPUS_PAGE_SIZE).length
+  // First poll: the first page changed, its prefix reload answers 503.
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(prefixReloads).toBe(1)
+  await page.waitForTimeout(300)
+  // Second, identical poll: retries the reload, which now succeeds.
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(prefixReloads).toBe(2)
+  await expect(panel).toContainText(/Loaded \d+\/301/)
+  await panel.getByRole('button', { name: 'Show more' }).click()
+  await expect(panel).toContainText('Loaded 301/301')
+  const ids = await panel.locator('.corpus-table').evaluate((table) =>
+    [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
+  )
+  expect(ids).toContain('1000')
+  expect(ids.length).toBe(301)
+  expect(new Set(ids).size).toBe(301)
   expect(errors).toEqual([])
 })

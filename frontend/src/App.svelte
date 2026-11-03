@@ -3373,10 +3373,12 @@
       if (requestSeq !== corpusLoadRequestSeq || switchedCorpus) {
         return
       }
+      // Committed only once the rows are replaced: a failed prefix reload
+      // keeps the old signature (and rows), so the next poll retries it.
+      let pageSignature = null
       if (!append) {
-        const signature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
-        if (poll && signature === lastCorpusPageSignature) return
-        lastCorpusPageSignature = signature
+        pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
+        if (poll && pageSignature === lastCorpusPageSignature) return
         // The first page changed while more pages are loaded: a fresh page in
         // front of the old tail would shift the offsets (rows lost or doubled
         // on the next "Show more"), so reload everything loaded in one request.
@@ -3391,6 +3393,7 @@
       }
       const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
+      if (pageSignature !== null) lastCorpusPageSignature = pageSignature
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
       corpusHasMore = corpusItems.length < corpusTotal
       corpusSource = source
