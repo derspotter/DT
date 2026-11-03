@@ -100,6 +100,15 @@ describe('worker routes (stub) keep their frozen responses', () => {
   })
 })
 
+describe('test database isolation', () => {
+  test('RAG_FEEDER_DB_PATH points at a temp DB, never dl_lit_project/data', () => {
+    const dbPath = process.env.RAG_FEEDER_DB_PATH
+    expect(dbPath).toBeTruthy()
+    const realDataDir = path.resolve(here, '../../dl_lit_project/data')
+    expect(path.resolve(dbPath).startsWith(realDataDir + path.sep)).toBe(false)
+  })
+})
+
 describe('dead in-memory scheduler is gone', () => {
   test('app.js has no scheduler symbols', () => {
     // The frozen pipeline status body carries a `downloadWorkers` config key;
