@@ -82,29 +82,32 @@ export function attachLogSocket(
   });
 
   wss.on('connection', (ws, req) => {
-    let record;
-    if (isStub()) {
-      record = { ws, userId: 0, isAdmin: true, corpusIds: new Set(), loadedAt: Date.now(), stub: true };
-    } else {
-      const token = tokenFromRequest(req);
-      let userId = null;
-      try {
-        userId = token ? jwt.verify(token, authConfig.jwtSecret)?.sub : null;
-      } catch {
-        userId = null;
-      }
-      record = { ws, userId, isAdmin: false, corpusIds: new Set(), loadedAt: 0 };
-      if (userId === null || userId === undefined || !loadAccess(record)) {
-        ws.close(4401, 'unauthorized');
-        return;
-      }
-    }
-    clients.add(record);
+    const record = { ws, userId: null, isAdmin: false, corpusIds: new Set(), loadedAt: 0 };
+    // Listeners first: a rejected peer can still send (malformed) frames while
+    // the 4401 close handshake runs, and an unhandled 'error' would crash.
     ws.on('close', () => clients.delete(record));
     ws.on('error', (error) => {
       console.error('WebSocket error:', error);
       clients.delete(record);
     });
+
+    if (isStub()) {
+      record.isAdmin = true;
+      record.stub = true;
+      record.loadedAt = Date.now();
+    } else {
+      const token = tokenFromRequest(req);
+      try {
+        record.userId = token ? jwt.verify(token, authConfig.jwtSecret)?.sub ?? null : null;
+      } catch {
+        record.userId = null;
+      }
+      if (record.userId === null || !loadAccess(record)) {
+        ws.close(4401, 'unauthorized');
+        return;
+      }
+    }
+    clients.add(record);
   });
 
   return {

@@ -5,6 +5,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import jwt from 'jsonwebtoken'
 import WebSocket from 'ws'
+import { jest } from '@jest/globals'
 
 const authConfig = { jwtSecret: 's', adminUsername: 'admin' }
 const sign = (userId, opts = {}) => jwt.sign({ sub: userId, username: 'x' }, authConfig.jwtSecret, opts)
@@ -110,6 +111,30 @@ describe('log WebSocket', () => {
     const client = connect(url)
     await client.opened
     expect(await client.closed).toBe(4401)
+  })
+
+  test('rejected peer sending a malformed frame does not crash the server', async () => {
+    const { url, logSocket } = await start()
+    // Without a server-side 'error' listener the receiver error is emitted
+    // unhandled and fails this test (and would crash the backend process).
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const client = connect(url)
+    client.ws.on('error', () => {})
+    // Write synchronously on 'open', before the client has processed the
+    // server's 4401 close frame. An unmasked text frame is an invalid
+    // client->server frame and triggers a server-side receiver error.
+    client.ws.on('open', () => client.ws._socket.write(Buffer.from([0x81, 0x01, 0x78])))
+    try {
+      expect([4401, 1002, 1006]).toContain(await client.closed)
+      expect(consoleError).toHaveBeenCalledWith('WebSocket error:', expect.any(RangeError))
+    } finally {
+      consoleError.mockRestore()
+    }
+
+    const next = connect(url, ['bearer', sign(ids.admin)])
+    await next.opened
+    logSocket.broadcastEvent(SENTINEL(null))
+    await next.waitFor(isSentinel)
   })
 
   test('invalid or expired token -> close 4401', async () => {

@@ -4652,10 +4652,10 @@
         if (logsSocket !== ws) return
         logsSocket = null
         if (event?.code === 4401) {
-          // Token rejected by the server: sign out like a 401, no reconnect.
+          // Token rejected by the server: full sign-out, no reconnect. The
+          // status is set after handleLogout() so disconnectLogs() keeps it.
+          handleLogout()
           logsStatus = 'unauthorized'
-          setAuthToken('')
-          authStatus = 'unauthenticated'
           return
         }
         scheduleReconnect()
