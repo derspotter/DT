@@ -1627,11 +1627,29 @@
   // back to another membership (or none) after a revocation. Polls fetch
   // /api/auth/me and follow that choice, so the UI never shows corpus A while
   // reads and writes already go to B. No select POST: the backend persisted it.
-  let corpusReconcileInFlight = false
+  // The pending reconciliation, shared by every caller: a refresh cycle that
+  // starts while one (e.g. from handleCorpusPollForbidden) is pending waits
+  // for it instead of starting scoped loads under the old corpus.
+  let corpusReconcilePromise = null
   // Resolves true when it switched (or cleared) the workspace corpus.
-  async function reconcileCorpusWithBackend() {
-    if (corpusReconcileInFlight || authStatus !== 'authenticated') return false
-    corpusReconcileInFlight = true
+  function reconcileCorpusWithBackend() {
+    if (corpusReconcilePromise) return corpusReconcilePromise
+    if (authStatus !== 'authenticated') return Promise.resolve(false)
+    const pending = runCorpusReconcile()
+    corpusReconcilePromise = pending
+    pending.finally(() => {
+      if (corpusReconcilePromise === pending) corpusReconcilePromise = null
+    })
+    return pending
+  }
+
+  // True when a pending reconciliation switched the corpus (it reloads the
+  // workspace itself, so the caller skips its own scoped loads).
+  async function awaitPendingCorpusReconcile() {
+    return corpusReconcilePromise ? corpusReconcilePromise : false
+  }
+
+  async function runCorpusReconcile() {
     const corpusIdAtRequest = currentCorpusId
     try {
       const me = await fetchMe()
@@ -1653,8 +1671,6 @@
     } catch (error) {
       // A failed /me poll changes nothing; the next cycle retries.
       return false
-    } finally {
-      corpusReconcileInFlight = false
     }
   }
 
@@ -1691,6 +1707,7 @@
       }
       pipelineRefreshInFlight = true
       try {
+        if (await awaitPendingCorpusReconcile()) return
         const tasks = []
         if (anySearchRunning) tasks.push(loadSeedSources({ quiet: true }))
         if (dirty) {
@@ -1751,6 +1768,7 @@
     lastTabRefreshAt = now
     pipelineRefreshInFlight = true
     try {
+      if (await awaitPendingCorpusReconcile()) return
       // The graph tab renders none of the pipeline/ingest counts, so skip the
       // ingest-stats query there (completes #35's "don't load workspace data on
       // the graph tab" — refreshAll already skips it; this is the per-tab path).
@@ -2023,7 +2041,22 @@
     lastTabRefreshAt = Date.now()
   }
 
+  // Bumped whenever the workspace corpus changes (or clears): a corpus-scoped
+  // loader drops a response that was requested under an older epoch, so a
+  // slow answer for corpus A cannot repopulate the workspace after a switch.
+  let corpusScopeEpoch = 0
+  function invalidateCorpusScopedRequests() {
+    corpusScopeEpoch += 1
+    seedSourcesRequestToken += 1
+    // The stale loadCorpus no longer owns the loading flags (its finally
+    // checks the sequence), so release them for the next corpus's load.
+    corpusLoadRequestSeq += 1
+    corpusLoading = false
+    corpusLoadingMore = false
+  }
+
   function resetFrontendState() {
+    invalidateCorpusScopedRequests()
     ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
     ingestStatsStatus = ''
     latestEntries = []
@@ -2754,8 +2787,10 @@
 
   async function loadIngestRuns() {
     ingestRunsStatus = 'Loading ingest runs...'
+    const epoch = corpusScopeEpoch
     try {
       const payload = await fetchIngestRuns(20)
+      if (epoch !== corpusScopeEpoch) return
       ingestRuns = payload.runs || []
       pruneExtractedUploads()
       ingestRunsStatus = ''
@@ -2764,14 +2799,17 @@
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
+      if (epoch !== corpusScopeEpoch) return
       ingestRunsStatus = 'Failed to load ingest runs.'
     }
   }
 
   async function loadIngestStats({ quiet = false, global = false } = {}) {
     if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
+    const epoch = corpusScopeEpoch
     try {
       const payload = await fetchIngestStats({ global })
+      if (!global && epoch !== corpusScopeEpoch) return
       if (global) {
         globalIngestStats = payload.stats || globalIngestStats
       } else {
@@ -3359,6 +3397,7 @@
     if (!sourceId) return
     const token = (seedCandidatesRequestTokens.get(sourceId) || 0) + 1
     seedCandidatesRequestTokens.set(sourceId, token)
+    const epoch = corpusScopeEpoch
     const hasCachedCandidates = Array.isArray(seedCandidatesBySource[sourceId])
     const showLoadingState = !background || !hasCachedCandidates
     if (showLoadingState) {
@@ -3378,7 +3417,7 @@
         // counts saves a full-seed resolution per poll.
         lightSummary: background,
       })
-      if (token !== seedCandidatesRequestTokens.get(sourceId)) return
+      if (token !== seedCandidatesRequestTokens.get(sourceId) || epoch !== corpusScopeEpoch) return
       const incoming = payload.candidates || []
       // A run still filling in shifts rows down under `sr.id DESC`, so the
       // page at offset=loaded.length can overlap what is already on screen.
@@ -3424,11 +3463,11 @@
       if (error?.status === 401) {
         authStatus = 'unauthenticated'
         setAuthToken('')
-      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId)) {
+      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId) && epoch === corpusScopeEpoch) {
         seedActionStatus = error?.message || 'Failed to load seed candidates.'
       }
     } finally {
-      if (showLoadingState) {
+      if (showLoadingState && epoch === corpusScopeEpoch) {
         seedCandidatesLoading = { ...seedCandidatesLoading, [sourceId]: false }
       }
     }
@@ -4178,8 +4217,10 @@
   }
 
   async function loadDownloads() {
+    const epoch = corpusScopeEpoch
     try {
       const { data, source } = await fetchDownloadQueue()
+      if (epoch !== corpusScopeEpoch) return
       downloads = data
       downloadsSource = source
     } catch (error) {
@@ -4208,10 +4249,16 @@
 
   async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
+    const epoch = corpusScopeEpoch
     try {
       const payload = await fetchPipelineDaemonStatus({ global })
       if (global) {
         globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
+        return
+      }
+      // The backlog is corpus-scoped.
+      if (epoch !== corpusScopeEpoch) {
+        if (!quiet) pipelineWorkerStatus = ''
         return
       }
       daemonStatus = payload?.daemon || daemonStatus

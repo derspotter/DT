@@ -13,13 +13,17 @@ const corpusB = { id: 2, name: 'Corpus Beta', role: 'editor', owner_username: 'o
 
 type Phase = 'A' | 'B' | 'none'
 
-async function boot(page: Page, state: { phase: Phase }) {
+type Hook = (path: string, route: Route) => Promise<boolean> | boolean
+
+// `hook` sees every API request first; returning true means it handled it.
+async function boot(page: Page, state: { phase: Phase }, hook: Hook = () => false) {
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
   await page.routeWebSocket('**/api/ws', () => {})
-  await page.route('**/api/**', (route) => {
+  await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
+    if (await hook(path, route)) return
     const { phase } = state
     if (path === '/api/auth/me') {
       const lastCorpusId = phase === 'A' ? 1 : phase === 'B' ? 2 : null
@@ -72,4 +76,98 @@ test('poll clears corpus-scoped state when no corpus is left', async ({ page }) 
   await expect(picker(page).locator('option:checked')).toHaveText('Select a corpus')
   await expect(page.getByText('Item in Alpha')).toHaveCount(0)
   await expect(page.locator('.corpus-select-row')).toHaveCount(0)
+})
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => { resolve = r })
+  return { promise, resolve }
+}
+
+const scopedPaths = ['/api/corpus', '/api/seed/sources', '/api/ingest/stats', '/api/ingest/runs']
+
+test('a slow seed list for corpus A does not repopulate the workspace after the corpus cleared', async ({ page }) => {
+  const state = { phase: 'A' as Phase }
+  let trap = false
+  const seedHeld = deferred()
+  const releaseSeed = deferred()
+  let seedAnswered = false
+  await boot(page, state, async (path, route) => {
+    if (!trap) return false
+    if (path === '/api/seed/sources' && state.phase === 'A') {
+      // Captured under corpus A; the backend then drops the membership.
+      state.phase = 'none'
+      seedHeld.resolve()
+      await releaseSeed.promise
+      await fulfil(route, {
+        sources: [{ id: 'kw:alpha', source_type: 'keyword', source_key: 'alpha', label: 'Seed in Alpha', candidate_count: 1 }],
+        total: 1,
+        source: 'api',
+      })
+      seedAnswered = true
+      return true
+    }
+    if (path === '/api/ingest/stats') {
+      // Answers after the seed request is held, i.e. with the 403 that starts
+      // the reconciliation while the seed list is still pending.
+      await seedHeld.promise
+      return false
+    }
+    return false
+  })
+  await expect(page.getByText('Item in Alpha')).toBeVisible()
+
+  trap = true
+  await seedHeld.promise
+  await expect(picker(page)).toHaveValue('', { timeout: 8000 })
+  await expect(page.getByText('Item in Alpha')).toHaveCount(0)
+
+  releaseSeed.resolve()
+  await expect.poll(() => seedAnswered).toBeTruthy()
+  await page.waitForTimeout(500)
+  await expect(page.getByText('Seed in Alpha')).toHaveCount(0)
+  await expect(picker(page)).toHaveValue('')
+})
+
+test('a pending reconciliation holds back the next refresh tick', async ({ page }) => {
+  const state = { phase: 'A' as Phase }
+  let forbidOnce = false
+  let holdMe = false
+  const meHeld = deferred()
+  const releaseMe = deferred()
+  let heldAt = 0
+  const scopedAfterHold: string[] = []
+  await boot(page, state, async (path, route) => {
+    if (heldAt && scopedPaths.includes(path) && Date.now() - heldAt > 300) scopedAfterHold.push(path)
+    if (path === '/api/ingest/stats' && forbidOnce) {
+      forbidOnce = false
+      holdMe = true
+      await fulfil(route, { error: 'Select a corpus first' }, 403)
+      return true
+    }
+    if (path === '/api/auth/me' && holdMe) {
+      // The reconciliation the 403 started: hold it while the backend has
+      // already fallen back to B.
+      holdMe = false
+      state.phase = 'B'
+      heldAt = Date.now()
+      meHeld.resolve()
+      await releaseMe.promise
+      return false
+    }
+    return false
+  })
+  await expect(page.getByText('Item in Alpha')).toBeVisible()
+
+  forbidOnce = true
+  await meHeld.promise
+  // Longer than one 2 s refresh tick.
+  await page.waitForTimeout(3500)
+  expect(scopedAfterHold).toEqual([])
+  await expect(picker(page)).toHaveValue('1')
+
+  releaseMe.resolve()
+  await expect(picker(page)).toHaveValue('2', { timeout: 8000 })
+  await expect(page.getByText('Item in Beta')).toBeVisible()
+  await expect(page.getByText('Item in Alpha')).toHaveCount(0)
 })
