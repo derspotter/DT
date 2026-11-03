@@ -1,13 +1,19 @@
 """Import a BibTeX or JSON seed file into the corpus (web-upload ingest path).
 
 Routes uploaded `.bib`/`.json` seed documents into the canonical `works` table
-as pending works and links each new work to the current corpus. Inserts go
+as pending works and links each work — new or already present — to the
+current corpus (create_pending_work links duplicates too). Inserts go
 directly to the on-disk DB via DatabaseManager.create_pending_work (which
 returns the new row id), so this is safe to run while the enrich/download
 workers are writing — unlike the in-memory rewrite used by the `import-bib`
 CLI command.
 
-Prints a JSON summary: {added, skipped, corpus_linked, total, errors}.
+All entries are written in one transaction.
+
+Prints a JSON summary: {added, skipped, corpus_linked, total, errors}. `added`
+counts new works; `corpus_linked` counts entries (new or duplicate) linked to
+--corpus-id; `skipped` counts entries that could not be imported (non-object
+entries, missing titles, errors).
 """
 
 import argparse
@@ -73,14 +79,14 @@ def load_json_entries(path):
     return data if isinstance(data, list) else []
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
     parser.add_argument("--file", required=True)
     parser.add_argument("--kind", choices=["bib", "json"], required=True)
     parser.add_argument("--corpus-id", type=int, default=None)
     parser.add_argument("--source-label", default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
         entries = (
@@ -97,33 +103,35 @@ def main():
     added = skipped = linked = 0
     errors = []
     try:
-        for raw in entries:
-            if not isinstance(raw, dict):
-                skipped += 1
-                errors.append(f"Skipped non-object entry: {type(raw).__name__}")
-                continue
-            entry = dict(raw)
-            if args.source_label and not entry.get("source"):
-                entry["source"] = args.source_label
-            try:
-                row_id, err = db.create_pending_work(entry)
-            except Exception as exc:
-                skipped += 1
-                errors.append(str(exc))
-                continue
-            if row_id:
-                added += 1
+        with db.transaction():
+            for raw in entries:
+                if not isinstance(raw, dict):
+                    skipped += 1
+                    errors.append(f"Skipped non-object entry: {type(raw).__name__}")
+                    continue
+                entry = dict(raw)
+                if args.source_label and not entry.get("source"):
+                    entry["source"] = args.source_label
                 if args.corpus_id is not None:
-                    db.add_corpus_item(args.corpus_id, "works", int(row_id))
-                    linked += 1
-            else:
-                skipped += 1
-                if err and "Duplicate" not in err and "Title is required" not in err:
-                    errors.append(err)
-        try:
-            db.conn.commit()
-        except Exception:
-            pass
+                    entry["corpus_id"] = args.corpus_id
+                try:
+                    row_id, err = db.create_pending_work(entry, commit=False)
+                except Exception as exc:
+                    skipped += 1
+                    errors.append(str(exc))
+                    continue
+                if row_id:
+                    added += 1
+                    if args.corpus_id is not None:
+                        linked += 1
+                elif err and "Duplicate" in err:
+                    # create_pending_work linked the existing work to the corpus.
+                    if args.corpus_id is not None:
+                        linked += 1
+                else:
+                    skipped += 1
+                    if err and "Title is required" not in err:
+                        errors.append(err)
     finally:
         try:
             db.close_connection()

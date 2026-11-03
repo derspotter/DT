@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 from datetime import datetime
 import time
+from contextlib import contextmanager
 from dl_lit.identifiers import inverted_index_to_text, normalize_doi, normalize_openalex_id
 from dl_lit.utils import parse_bibtex_file_field
 
@@ -119,6 +120,28 @@ class DatabaseManager:
         self._ensure_column("search_runs", "expected_count", "INTEGER")
         self._ensure_column("search_runs", "error", "TEXT")
         self._ensure_column("search_runs", "finished_at", "TIMESTAMP")
+
+    @contextmanager
+    def transaction(self):
+        """Run a block of writes as one transaction.
+
+        BEGINs unless a transaction is already open; COMMITs on normal exit and ROLLBACKs on an
+        exception (re-raised), but only when this call began it, so nested use is a passthrough.
+        Writers called inside must not commit themselves: pass them commit=False.
+        """
+        if self.conn.in_transaction:
+            yield
+            return
+        self.conn.execute("BEGIN")
+        try:
+            yield
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        else:
+            if self.conn.in_transaction:
+                self.conn.commit()
 
     def close_connection(self):
         """Closes the database connection."""
@@ -808,23 +831,25 @@ class DatabaseManager:
         added_count = 0
         skipped_count = 0
         errors = []
-        for entry in entries:
-            entry = dict(entry)
-            if source_pdf:
-                entry["source_pdf"] = source_pdf
+        with self.transaction():
+            for entry in entries:
+                entry = dict(entry)
+                if source_pdf:
+                    entry["source_pdf"] = source_pdf
 
-            row_id, err = self.create_pending_work(
-                entry,
-                searcher=searcher,
-                rate_limiter=rate_limiter,
-                resolve_potential_duplicates=resolve_potential_duplicates,
-            )
-            if row_id:
-                added_count += 1
-            else:
-                skipped_count += 1
-                if err and "Duplicate already exists" not in err and "Title is required" not in err:
-                    errors.append(err)
+                row_id, err = self.create_pending_work(
+                    entry,
+                    searcher=searcher,
+                    rate_limiter=rate_limiter,
+                    resolve_potential_duplicates=resolve_potential_duplicates,
+                    commit=False,
+                )
+                if row_id:
+                    added_count += 1
+                else:
+                    skipped_count += 1
+                    if err and "Duplicate already exists" not in err and "Title is required" not in err:
+                        errors.append(err)
 
         return added_count, skipped_count, errors
 
@@ -976,8 +1001,13 @@ class DatabaseManager:
         action: str,
         notes: str | None = None,
         updates: dict | None = None,
+        *,
+        commit: bool = True,
     ) -> None:
-        """Record a dedupe/merge decision."""
+        """Record a dedupe/merge decision.
+
+        With commit=False the insert joins the caller's transaction and a database error propagates.
+        """
         cur = self.conn.cursor()
         try:
             cur.execute(
@@ -995,8 +1025,11 @@ class DatabaseManager:
                     json.dumps(updates) if updates else None,
                 ),
             )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
         except sqlite3.Error:
+            if not commit:
+                raise
             self.conn.rollback()
 
     def _fetch_record_dict(self, table: str, record_id: int) -> dict | None:
@@ -1009,8 +1042,11 @@ class DatabaseManager:
         columns = [d[0] for d in cur.description]
         return dict(zip(columns, row))
 
-    def add_corpus_item(self, corpus_id: int, table_name: str, row_id: int) -> None:
-        """Associate a work with a corpus using the canonical join table."""
+    def add_corpus_item(self, corpus_id: int, table_name: str, row_id: int, *, commit: bool = True) -> None:
+        """Associate a work with a corpus using the canonical join table.
+
+        With commit=False the insert joins the caller's transaction and a database error propagates.
+        """
         if not corpus_id or not row_id:
             return
         work_id = None
@@ -1030,8 +1066,11 @@ class DatabaseManager:
                    VALUES (?, ?, CURRENT_TIMESTAMP)""",
                 (int(corpus_id), int(work_id)),
             )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
         except sqlite3.Error as e:
+            if not commit:
+                raise
             print(f"{YELLOW}[DB Manager] Warning: failed to add corpus work: {e}{RESET}")
             self.conn.rollback()
 
@@ -1450,9 +1489,14 @@ class DatabaseManager:
         *,
         searcher=None,
         rate_limiter=None,
-        resolve_potential_duplicates: bool = False
+        resolve_potential_duplicates: bool = False,
+        commit: bool = True,
     ) -> tuple[int | None, str | None]:
-        """Insert or merge a raw reference into the canonical works table."""
+        """Insert or merge a raw reference into the canonical works table.
+
+        With commit=False nothing is committed here: the writes join the caller's transaction
+        (see transaction()).
+        """
         title = ref.get("title")
         if not title:
             return None, "Title is required"
@@ -1474,7 +1518,7 @@ class DatabaseManager:
             year=ref.get("year")
         )
         if tbl:
-            high_confidence = field in {"normalized_doi", "openalex_id", "title_authors_year", "alias_title_year"}
+            high_confidence = field in {"normalized_doi", "openalex_id", "title_authors_year", "alias_title"}
             incoming_ref_for_merge = {
                 **ref,
                 "authors": json.dumps(authors_raw) if authors_raw else None,
@@ -1486,7 +1530,7 @@ class DatabaseManager:
             }
             resolved_conflict = False
             # If potential duplicate and both are missing identifiers, resolve both.
-            if resolve_potential_duplicates and searcher and field not in {"doi", "openalex_id"}:
+            if resolve_potential_duplicates and searcher and field not in {"normalized_doi", "openalex_id"}:
                 existing = self._fetch_record_dict(tbl, eid)
                 incoming_missing_id = not norm_doi and not self._normalize_openalex_id(ref.get("openalex_id"))
                 existing_missing_id = existing and not self._normalize_doi(existing.get("doi")) and not self._normalize_openalex_id(existing.get("openalex_id"))
@@ -1510,11 +1554,12 @@ class DatabaseManager:
                             if incoming_resolved.get("openalex_id"):
                                 incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
                             if corpus_id:
-                                self.add_corpus_item(corpus_id, tbl, eid)
+                                self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
                             work_row = self.get_entry_by_id("works", int(eid)) or {}
                             merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
                             self._update_work_record(int(eid), merged)
-                            self.conn.commit()
+                            if commit:
+                                self.conn.commit()
                             return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
                         else:
                             # Resolved IDs disagree; keep both and log.
@@ -1527,6 +1572,7 @@ class DatabaseManager:
                                 action="conflict",
                                 notes="resolved_ids_conflict",
                                 updates=None,
+                                commit=commit,
                             )
                             resolved_conflict = True
                     else:
@@ -1535,14 +1581,16 @@ class DatabaseManager:
 
             if high_confidence and not resolved_conflict:
                 if corpus_id:
-                    self.add_corpus_item(corpus_id, tbl, eid)
+                    self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
                 work_row = self.get_entry_by_id("works", int(eid)) or {}
                 merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
                 self._update_work_record(int(eid), merged)
-                self.conn.commit()
+                if commit:
+                    self.conn.commit()
                 return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
 
-            # Low-confidence duplicates are logged but allowed to insert.
+            # Low-confidence matches (title_authors, title_year, or a resolved-ids conflict) are
+            # logged and then merged into the matched work by _resolve_or_create_work below.
             self._log_merge(
                 canonical_table=tbl,
                 canonical_id=eid,
@@ -1550,8 +1598,9 @@ class DatabaseManager:
                 duplicate_id=None,
                 match_field=field,
                 action="possible_duplicate",
-                notes="low_confidence_match_inserted",
+                notes="low_confidence_match_merged",
                 updates=None,
+                commit=commit,
             )
 
         try:
@@ -1559,10 +1608,11 @@ class DatabaseManager:
             new_id, _ = self._resolve_or_create_work(
                 payload,
                 allow_merge=True,
+                commit=commit,
                 existing=(int(eid), field) if tbl == "works" else (None, None),
             )
             if corpus_id:
-                self.add_corpus_item(corpus_id, "works", int(new_id))
+                self.add_corpus_item(corpus_id, "works", int(new_id), commit=commit)
 
             translated_title = ref.get("translated_title")
             if translated_title:
@@ -1573,10 +1623,10 @@ class DatabaseManager:
                     alias_year=ref.get("translated_year"),
                     alias_language=ref.get("translated_language"),
                     relationship_type=ref.get("translation_relationship") or "translation",
+                    commit=commit,
                 )
 
             return new_id, None
-            return int(new_id), None
         except sqlite3.IntegrityError as e:
             return None, f"IntegrityError inserting into works: {e}"
 
