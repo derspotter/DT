@@ -115,15 +115,18 @@ export function createPythonRunner({ pythonExec, dlLitProjectDir, repoRoot, dbPa
     let stdoutBuf = '';
     let stderrBuf = '';
 
-    child.stdout.on('data', (data) => {
-      const text = data.toString();
+    // Decode with a stream decoder so a multi-byte character split across two
+    // chunks is not turned into U+FFFD.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+
+    child.stdout.on('data', (text) => {
       stdout += text;
       stdoutBuf += text;
       stdoutBuf = flushLines(stdoutBuf, onStdoutLine);
     });
 
-    child.stderr.on('data', (data) => {
-      const text = data.toString();
+    child.stderr.on('data', (text) => {
       stderr += text;
       stderrBuf += text;
       stderrBuf = flushLines(stderrBuf, onStderrLine);
@@ -144,9 +147,9 @@ export function createPythonRunner({ pythonExec, dlLitProjectDir, repoRoot, dbPa
         stdoutBuf = flushLines(stdoutBuf, onStdoutLine, true);
         stderrBuf = flushLines(stderrBuf, onStderrLine, true);
         if (code !== 0) {
-          const where = label ? ` [${label}]` : '';
-          const error = new Error(`Python script failed (${code})${where}: ${stderr || stdout}`);
+          const error = new Error(`Python script failed (${code}): ${stderr || stdout}`);
           error.exitCode = code;
+          if (label) error.label = label;
           error.stdout = stdout;
           error.stderr = stderr;
           fail(error);

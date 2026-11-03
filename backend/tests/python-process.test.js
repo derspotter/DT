@@ -91,12 +91,27 @@ test('spawnPython rejects once on non-zero exit with the partial line still forw
   let error = null
   await done.catch((e) => { caught += 1; error = e })
   expect(caught).toBe(1)
-  expect(error.message).toMatch(/^Python script failed \(3\)/)
-  expect(error.message).toContain('failer')
-  expect(error.message).toContain('boom')
+  expect(error.message).toBe('Python script failed (3): boom')
+  expect(error.label).toBe('failer')
   expect(error.exitCode).toBe(3)
   expect(out).toEqual(['done-ish'])
   expect(err).toEqual(['boom'])
+})
+
+test('spawnPython keeps a multi-byte character split across two chunks intact', async () => {
+  const script = writeScript('split_utf8.py', [
+    'import sys, time',
+    'sys.stdout.buffer.write(b"\\xc3")',
+    'sys.stdout.buffer.flush()',
+    'time.sleep(0.2)',
+    'sys.stdout.buffer.write(b"\\xa4\\n")',
+    'sys.stdout.buffer.flush()',
+  ].join('\n'))
+  const out = []
+  const { done } = makeRunner().spawnPython(script, [], { onStdoutLine: (line) => out.push(line) })
+  const result = await done
+  expect(out).toEqual(['ä'])
+  expect(result.stdout).toBe('ä\n')
 })
 
 test('runPythonJson parses the last JSON line', async () => {
