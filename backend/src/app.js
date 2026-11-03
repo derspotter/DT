@@ -1108,6 +1108,29 @@ function getCorpusRoleForUser(db, userId, corpusId) {
     .get(userId, corpusId)?.role;
 }
 
+// The one corpus-access rule: the admin passes every corpus check, everyone
+// else needs a current user_corpora row.
+export function resolveCorpusRole(db, user, corpusId, authConfig = resolveAuthConfig()) {
+  if (!user || !corpusId) return null;
+  if (isAdminUser(user, authConfig)) return 'admin';
+  return getCorpusRoleForUser(db, user.id, corpusId) || null;
+}
+
+// Re-validates users.last_corpus_id against current membership: keeps it while
+// it is still accessible, else falls back to the newest membership, else null.
+// A changed value is persisted.
+export function ensureLastCorpus(db, user, authConfig = resolveAuthConfig()) {
+  const stored = user?.last_corpus_id || null;
+  if (stored && resolveCorpusRole(db, user, stored, authConfig)) return stored;
+  const next = db
+    .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC, corpus_id DESC LIMIT 1')
+    .get(user.id)?.corpus_id || null;
+  if (next !== stored) {
+    db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(next, user.id);
+  }
+  return next;
+}
+
 function canConfigureCorpus(role) {
   return role === 'owner' || role === 'editor';
 }
@@ -1838,8 +1861,9 @@ function requireAuth(db, authConfig = resolveAuthConfig()) {
       if (!user) {
         return res.status(401).json({ error: 'Unknown user' });
       }
-      req.user = user;
-      req.corpusId = user.last_corpus_id || null;
+      req.corpusId = ensureLastCorpus(db, user, authConfig);
+      req.corpusRole = req.corpusId ? resolveCorpusRole(db, user, req.corpusId, authConfig) : null;
+      req.user = { ...user, last_corpus_id: req.corpusId };
       return next();
     } catch (error) {
       return res.status(401).json({ error: 'Invalid token' });
@@ -2696,8 +2720,14 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       corpusDownloadTickets.delete(token);
       return res.status(401).json({ error: 'Unknown user' });
     }
+    const corpusId = ticket.corpusId ?? ensureLastCorpus(authDb, user, authConfig);
+    const corpusRole = resolveCorpusRole(authDb, user, corpusId, authConfig);
+    if (!corpusRole) {
+      return res.status(403).json({ error: 'No access to this corpus' });
+    }
     req.user = user;
-    req.corpusId = ticket.corpusId || user.last_corpus_id || null;
+    req.corpusId = corpusId;
+    req.corpusRole = corpusRole;
     return next();
   };
   const pruneUpstreamDownloadTickets = () => {
@@ -3567,14 +3597,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
-    let lastCorpusId = user.last_corpus_id;
-    if (!lastCorpusId) {
-      const corpus = authDb
-        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
-        .get(user.id);
-      lastCorpusId = corpus?.corpus_id || defaultCorpusId;
-      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
-    }
+    const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       token: issueAuthToken(user, authConfig),
       user: authUserPayload(user, lastCorpusId, authConfig),
@@ -3780,13 +3803,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const user = authDb
       .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
       .get(tokenRow.user_id);
-    let lastCorpusId = user.last_corpus_id;
-    if (!lastCorpusId) {
-      lastCorpusId = authDb
-        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
-        .get(user.id)?.corpus_id || defaultCorpusId;
-      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
-    }
+    const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       accepted: true,
       token: issueAuthToken(user, authConfig),
@@ -3846,13 +3863,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const user = authDb
       .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
       .get(tokenRow.user_id);
-    let lastCorpusId = user.last_corpus_id;
-    if (!lastCorpusId) {
-      lastCorpusId = authDb
-        .prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ? ORDER BY created_at DESC LIMIT 1')
-        .get(user.id)?.corpus_id || defaultCorpusId;
-      authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(lastCorpusId, user.id);
-    }
+    const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       reset: true,
       token: issueAuthToken(user, authConfig),
@@ -5579,6 +5590,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
+    // A null corpusId lists every work unscoped; only the admin may see that.
+    if (req.corpusId == null && !isAdminUser(req.user, authConfig)) {
+      return res.status(403).json({ error: 'Select a corpus first' });
+    }
     try {
       // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
       return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort }));
