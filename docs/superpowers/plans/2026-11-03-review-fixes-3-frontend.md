@@ -15,7 +15,7 @@
 - Svelte 5 compat/legacy syntax only: `export let` props, `$:` statements, `on:click` handlers, `{@const}` inside `{#each}`/`{#if}`. No runes (`$state`, `$derived`, `$props`).
 - 2-space indentation; no reformatting of untouched lines; no broad rewrites of `App.svelte` beyond the task's lines.
 - No user-visible behaviour change beyond the bugs the spec names (tab-switch refresh drop, author re-split, Dashboard global overview zeros, paged seed count, 401 partial sign-out, stale `/me` after re-login, sample-data rows).
-- Every task runs `npx vite build` (must print `✓ built`) and its named specs; the always-on regression set is `tests/seed-upload.spec.ts tests/app.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts` (all mocked, no backend). Command, from `frontend/`: `npx playwright test <files> --workers=2`.
+- Every task runs `npx vite build` (must print `✓ built`) and its named specs; the always-on regression set is `tests/seed-upload.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts tests/dead-code.spec.ts` (all mocked). Specs run against a fresh vite with no backend, never the dev stack's :5175 (whose backend closes unmocked sockets with 4401). Command, from `frontend/`: `E2E_FRONTEND_PORT=5190 npx playwright test <files> --workers=2`. `app.spec.ts` is a live spec and is not part of any task's run.
 - A mocked spec that fakes a token must also mock the log socket: `page.routeWebSocket('**/api/ws', () => {})` (Task 7 centralises this; earlier tasks add the line to the specs they create).
 - Backend code (`backend/`, `dl_lit_project/`) is not modified. `.github/workflows/ci.yml` and `README.md` only in Task 7.
 - Secrets stay in `.env`; nothing from it goes into specs, docs or commits.
@@ -89,7 +89,7 @@ Remove the `tab-ingest` click (and any assertions that depended on the ingest ta
 
 - [ ] **Step 7: Run the specs and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/dead-code.spec.ts tests/seed-upload.spec.ts tests/app.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/dead-code.spec.ts tests/seed-upload.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts --workers=2`
 Expected: `✓ built`, all passed.
 
 - [ ] **Step 8: Commit**
@@ -172,7 +172,7 @@ Add `let sessionEpoch = 0`; `function expireSession() { sessionEpoch += 1; handl
 
 - [ ] **Step 6: Run the specs and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/session.spec.ts tests/dead-code.spec.ts tests/seed-upload.spec.ts tests/app.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/session.spec.ts tests/dead-code.spec.ts tests/seed-upload.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts --workers=2`
 Expected: `✓ built`, all passed. `grep -c "authStatus = 'unauthenticated'" src/App.svelte` ≤ 3 (bootstrap catch, handleLogout, and at most one auth-form path).
 
 - [ ] **Step 7: Commit**
@@ -238,7 +238,7 @@ Move the existing tables and functions (exact strings) from `App.svelte`/`Corpus
 
 - [ ] **Step 5: Run the specs and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/works-lib.spec.ts tests/seed-upload.spec.ts tests/app.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts tests/upstream-metadata.spec.ts tests/table-columns.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/works-lib.spec.ts tests/seed-upload.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts tests/upstream-metadata.spec.ts tests/table-columns.spec.ts --workers=2`
 Expected: `✓ built`, all passed. `grep -n "split(','" src/components/Corpus.svelte` returns nothing.
 
 - [ ] **Step 6: Commit**
@@ -294,7 +294,7 @@ Replace array selections with Sets (immutably replaced), delete `seedSelectionVe
 
 - [ ] **Step 5: Run the specs and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/seed-selection.spec.ts tests/seed-upload.spec.ts tests/app.spec.ts tests/search-scale.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/seed-selection.spec.ts tests/seed-upload.spec.ts tests/search-scale.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts --workers=2`
 Expected: `✓ built`, all passed. `grep -c '{#key' src/App.svelte` = 0 (or only keys unrelated to seeds, listed in the report).
 
 - [ ] **Step 6: Commit**
@@ -357,7 +357,7 @@ Remove `loadDownloadWorkerStatus` from every refresh path (grep; keep the three 
 
 - [ ] **Step 5: Run the specs and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/tab-resources.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts tests/seed-upload.spec.ts tests/app.spec.ts tests/navigation.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/tab-resources.spec.ts tests/refresh-scheduler.spec.ts tests/boot-requests.spec.ts tests/corpus-reconcile.spec.ts tests/seed-upload.spec.ts tests/navigation.spec.ts --workers=2`
 Expected: `✓ built`, all passed. `grep -c pipelineRefreshInFlight src/App.svelte` = 0.
 
 - [ ] **Step 6: Commit**
@@ -407,7 +407,7 @@ A non-reactive `let logBuffer = []`, `let logFlushTimer = null`, `let logSeq = 0
 
 - [ ] **Step 4: Run the specs and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/logs-stream.spec.ts tests/refresh-scheduler.spec.ts tests/corpus-reconcile.spec.ts tests/seed-upload.spec.ts tests/app.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/logs-stream.spec.ts tests/refresh-scheduler.spec.ts tests/corpus-reconcile.spec.ts tests/seed-upload.spec.ts --workers=2`
 Expected: `✓ built`, all passed.
 
 - [ ] **Step 5: Commit**
@@ -444,7 +444,7 @@ Under "Current Runtime Architecture" add "### Frontend refresh model": the `TAB_
 
 - [ ] **Step 4: Run the whole CI list and the build**
 
-Run: `cd frontend && npx vite build && npx playwright test tests/graph-3d.spec.ts tests/seed-upload.spec.ts tests/boot-requests.spec.ts tests/search-scale.spec.ts tests/topic-search.spec.ts tests/table-columns.spec.ts tests/corpus-reconcile.spec.ts tests/dead-code.spec.ts tests/session.spec.ts tests/works-lib.spec.ts tests/seed-selection.spec.ts tests/tab-resources.spec.ts tests/logs-stream.spec.ts tests/refresh-scheduler.spec.ts tests/app.spec.ts tests/navigation.spec.ts tests/upstream-metadata.spec.ts --workers=2`
+Run: `cd frontend && npx vite build && npx playwright test tests/graph-3d.spec.ts tests/seed-upload.spec.ts tests/boot-requests.spec.ts tests/search-scale.spec.ts tests/topic-search.spec.ts tests/table-columns.spec.ts tests/corpus-reconcile.spec.ts tests/dead-code.spec.ts tests/session.spec.ts tests/works-lib.spec.ts tests/seed-selection.spec.ts tests/tab-resources.spec.ts tests/logs-stream.spec.ts tests/refresh-scheduler.spec.ts tests/navigation.spec.ts tests/upstream-metadata.spec.ts --workers=2`
 Expected: `✓ built`, all passed.
 
 - [ ] **Step 5: Commit**
