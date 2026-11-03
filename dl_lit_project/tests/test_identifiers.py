@@ -276,3 +276,17 @@ def test_openalex_work_to_record_matches_former_mapping():
     minimal = openalex_work_to_record({"id": "W2"})
     assert minimal["pages"] is None and minimal["run_id"] is None and minimal["authors"] == []
     assert identifiers.__all__  # module exports are declared
+
+
+@pytest.mark.parametrize("count, expected", [
+    (None, None),
+    (0, None),
+    (3, "https://api.crossref.org/works/10.1/c/references"),
+])
+def test_crossref_item_referenced_by_count(count, expected):
+    item = {"DOI": "10.1/c", "title": ["T"], "is-referenced-by-count": count}
+    assert identifiers.crossref_item_to_openalex_like(item)["cited_by_api_url"] == expected
+
+
+def test_crossref_item_without_referenced_by_count():
+    assert identifiers.crossref_item_to_openalex_like({"DOI": "10.1/c", "title": ["T"]})["cited_by_api_url"] is None

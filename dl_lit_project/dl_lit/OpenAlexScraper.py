@@ -50,15 +50,18 @@ def _build_retry_session(
 _missing_api_key_warned = False
 
 
-_API_KEY_QUERY_RE = re.compile(r"([?&])api_key=[^&\s'\"]*&?")
+_API_KEY_VALUE = r"[^&#\s'\"]*"
+# Two passes, neither consuming the separator the next match needs: first every "&api_key=..."
+# (adjacent ones each start at their own "&"), then a leading "?api_key=..." with the "&" after
+# it, so "?api_key=a&page=2" -> "?page=2" and a lone "?api_key=a" -> "".
+_API_KEY_AMP_RE = re.compile(r"&api_key=" + _API_KEY_VALUE)
+_API_KEY_QMARK_RE = re.compile(r"\?api_key=" + _API_KEY_VALUE + r"(&?)")
 
 
 def _redact_api_key(text) -> str:
     """Drop every ``api_key=...`` query parameter from a printed URL or message."""
-    def _strip(match):
-        sep, tail = match.group(1), match.group(0).endswith("&")
-        return sep if tail else ""
-    return _API_KEY_QUERY_RE.sub(_strip, str(text))
+    text = _API_KEY_AMP_RE.sub("", str(text))
+    return _API_KEY_QMARK_RE.sub(lambda m: "?" if m.group(1) else "", text)
 
 
 def _redacted_params(params) -> dict:

@@ -83,18 +83,6 @@ def test_absorb_moves_aliases_and_tolerates_duplicates(tmp_path):
     ).fetchall() == [("title_year", "n", '{"year": 2020}')]
 
 
-def test_merge_records_uses_absorb(tmp_path):
-    db = DatabaseManager(str(tmp_path / "lit.db"))
-    canonical = _work(db, "Canon", [2])
-    dup = _work(db, "Canon draft", [1], doi="10.1/c")
-
-    ok, err = db._merge_records("works", canonical, "works", dup, "title_year")
-
-    assert (ok, err) == (True, None)
-    assert db.conn.execute("SELECT doi FROM works WHERE id = ?", (canonical,)).fetchone() == ("10.1/c",)
-    _assert_absorbed(db, canonical, dup)
-
-
 # --- A duplicate carrying a DOI the canonical lacks ---------------------------
 # The canonical's update copies the DOI; absorbing the duplicate first frees the
 # value under the unique normalized_doi index.

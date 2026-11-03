@@ -158,13 +158,62 @@ def test_citing_works_error_prints_the_url_without_the_api_key(monkeypatch, caps
     assert "sekret-key-123" not in out
 
 
-def test_redact_api_key_strips_the_parameter_from_urls():
+REDACTION_CASES = [
+    ("https://x/works?api_key=abc&page=2", "https://x/works?page=2"),  # first
+    ("https://x/works?page=2&api_key=abc", "https://x/works?page=2"),  # last
+    ("https://x/works?a=1&api_key=abc&b=2 tail", "https://x/works?a=1&b=2 tail"),  # middle
+    ("https://x/works?api_key=a&api_key=b", "https://x/works"),  # adjacent, nothing else
+    ("https://x/works?api_key=a&api_key=b&page=2", "https://x/works?page=2"),  # adjacent first
+    ("https://x/works?a=1&api_key=a&api_key=b&b=2", "https://x/works?a=1&b=2"),  # adjacent middle
+    ("https://x/works?a=1&api_key=a&api_key=b", "https://x/works?a=1"),  # adjacent last
+    ("https://x/works?api_key=a#frag", "https://x/works#frag"),
+    ("url: https://x/w?api_key=k next https://y/w?p=1&api_key=k", "url: https://x/w next https://y/w?p=1"),
+    ("https://x/works?page=2&b=3", "https://x/works?page=2&b=3"),  # no key: unchanged
+    ("no key here?", "no key here?"),
+]
+
+
+@pytest.mark.parametrize("text, expected", REDACTION_CASES)
+def test_redact_api_key_strips_every_occurrence(text, expected):
     from dl_lit.OpenAlexScraper import _redact_api_key
 
-    assert _redact_api_key("https://x/works?api_key=abc&page=2") == "https://x/works?page=2"
-    assert _redact_api_key("https://x/works?page=2&api_key=abc") == "https://x/works?page=2"
-    assert _redact_api_key("https://x/works?a=1&api_key=abc&b=2 tail") == "https://x/works?a=1&b=2 tail"
-    assert _redact_api_key("no key here") == "no key here"
+    assert _redact_api_key(text) == expected
+
+
+ADJACENT = "https://api.openalex.org/works?api_key=sekret-a&api_key=sekret-b&filter=x"
+
+
+def test_printed_citing_url_drops_adjacent_keys(monkeypatch, capsys):
+    import requests
+
+    from dl_lit import OpenAlexScraper
+
+    def failing_request(**kwargs):
+        raise requests.exceptions.HTTPError(f"500 Server Error for url: {ADJACENT}")
+
+    monkeypatch.setattr(OpenAlexScraper, "openalex_request_json", failing_request)
+    capsys.readouterr()
+    OpenAlexScraper.fetch_citing_work_ids(ADJACENT, _NoRateLimit(), api_key="sekret-c")
+    out = capsys.readouterr().out
+    assert "api_key" not in out and "sekret" not in out
+    assert "https://api.openalex.org/works?filter=x" in out
+
+
+@pytest.mark.parametrize("step", [0, 1, 7])
+def test_returned_search_error_drops_adjacent_keys(monkeypatch, step):
+    import requests
+
+    from dl_lit import OpenAlexScraper
+
+    def failing_request(**kwargs):
+        raise requests.exceptions.HTTPError(f"500 Server Error for url: {ADJACENT}")
+
+    monkeypatch.setattr(OpenAlexScraper, "openalex_request_json", failing_request)
+    searcher = OpenAlexScraper.OpenAlexCrossrefSearcher(rate_limiter=_NoRateLimit())
+    result = searcher.search("Some title", 2020, None, None, None, step, doi="10.1/x")
+    assert result["success"] is False
+    assert "api_key" not in result["error"] and "sekret" not in result["error"]
+    assert "https://api.openalex.org/works?filter=x" in result["error"]
 
 
 def _candidate(title, year=2020):
@@ -309,6 +358,24 @@ class _FakeCrossrefSession:
     def get(self, *args, **kwargs):
         items = self.items
         return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"message": {"items": items}})
+
+
+def test_null_referenced_by_count_is_kept_at_both_call_sites():
+    """search_crossref never read the count (item kept); step 8 raised TypeError on None and lost
+    the whole batch. A null count now maps like 0: the item stays, cited_by_api_url is None."""
+    from dl_lit import OpenAlexScraper
+
+    item = {"DOI": "10.1/null", "title": ["Null count"], "is-referenced-by-count": None,
+            "published-print": {"date-parts": [[2001]]}}
+    other = {"DOI": "10.1/ok", "title": ["Counted"], "is-referenced-by-count": 2}
+    searcher = OpenAlexScraper.OpenAlexCrossrefSearcher(rate_limiter=_NoRateLimit())
+    searcher.crossref_session = _FakeCrossrefSession([item, other])
+    via_crossref = searcher.search_crossref("t", ["a"], 2000)
+    via_step8 = searcher.search("t", 2000, None, None, None, 8)
+    assert [r["doi"] for r in via_crossref] == ["10.1/null", "10.1/ok"]
+    assert via_step8["success"] is True and via_step8["results"] == via_crossref
+    assert via_crossref[0]["cited_by_api_url"] is None
+    assert via_crossref[1]["cited_by_api_url"] == "https://api.crossref.org/works/10.1/ok/references"
 
 
 def test_both_crossref_call_sites_use_the_shared_mapping(monkeypatch):

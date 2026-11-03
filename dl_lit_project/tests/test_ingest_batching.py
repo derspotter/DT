@@ -110,6 +110,10 @@ def _merge_notes(db):
     return [tuple(r) for r in db.conn.execute("SELECT match_field, action, notes FROM merge_log ORDER BY id")]
 
 
+def _corpus_ids(db, work_id):
+    return [row[0] for row in db.conn.execute("SELECT corpus_id FROM corpus_works WHERE work_id = ?", (work_id,))]
+
+
 def test_create_pending_work_confidence_fields(tmp_path):
     db = DatabaseManager(tmp_path / "lit.db")
     try:
@@ -117,7 +121,7 @@ def test_create_pending_work_confidence_fields(tmp_path):
         doi_id, _ = db.create_pending_work({"title": "Doi Work", "doi": "10.1000/xyz", "year": 2001})
         row_id, err = db.create_pending_work({"title": "Different", "doi": "https://doi.org/10.1000/XYZ", "corpus_id": 4})
         assert row_id is None and err.endswith("on normalized_doi")
-        assert db._get_corpus_ids_for_item("works", doi_id) == [4]
+        assert _corpus_ids(db, doi_id) == [4]
 
         # alias_title match: high confidence as well.
         alias_owner, _ = db.create_pending_work({"title": "Original Title", "year": 1999, "translated_title": "Translated Title"})
@@ -132,7 +136,7 @@ def test_create_pending_work_confidence_fields(tmp_path):
         assert (row_id, err) == (ty_id, None)
         assert db.conn.execute("SELECT COUNT(*) FROM works WHERE normalized_title = ?", (db._normalize_text("Year Only"),)).fetchone()[0] == 1
         assert json.loads(db.get_entry_by_id("works", ty_id)["authors"]) == ["Doe, Jane"]
-        assert db._get_corpus_ids_for_item("works", ty_id) == [9]
+        assert _corpus_ids(db, ty_id) == [9]
         assert _merge_notes(db) == [("title_year", "possible_duplicate", "low_confidence_match_merged")]
         assert not db.conn.in_transaction
     finally:

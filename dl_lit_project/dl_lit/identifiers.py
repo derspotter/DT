@@ -203,7 +203,8 @@ def crossref_item_to_openalex_like(item: dict) -> dict:
     ``published`` that has one (``issued`` is not read).  Formerly two copies in
     ``OpenAlexScraper``: step 8 of ``search()`` (this superset) and
     ``search_crossref`` (``published-print`` only, without the four trailing keys).
-    An item with an empty ``title`` list still raises ``IndexError``, as both did.
+    An item with an empty ``title`` list still raises ``IndexError``, as both did; a null
+    ``is-referenced-by-count`` counts as 0.
     """
     pub_year = None
     for date_field in _CROSSREF_DATE_FIELDS:
@@ -225,7 +226,8 @@ def crossref_item_to_openalex_like(item: dict) -> dict:
         "referenced_works": [],  # Crossref doesn't provide this directly
         "abstract_inverted_index": None,  # Crossref doesn't provide this
         "keywords": [],  # Crossref doesn't provide this
-        "cited_by_api_url": item.get("is-referenced-by-count", 0) > 0
+        # A null count maps like 0 (step 8 used to raise TypeError on it and lose the batch).
+        "cited_by_api_url": (item.get("is-referenced-by-count") or 0) > 0
         and f"https://api.crossref.org/works/{item.get('DOI')}/references"
         or None,
     }
