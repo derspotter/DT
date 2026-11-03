@@ -156,7 +156,7 @@ export function bucketCounts(rows) {
   return out
 }
 
-// Counts mirror ingest_stats.py. The *_live counts are extra: in_progress rows
+// Counts compare raw status values (see bucketCounts). The *_live counts are extra: in_progress rows
 // whose worker lease has not expired, i.e. work that is being done right now.
 // A claim abandoned by a killed worker stays in_progress until it is requeued,
 // so the plain enriching/downloading counts cannot tell activity from debris.

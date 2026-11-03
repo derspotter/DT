@@ -2499,8 +2499,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   const app = express();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
-  const downloadWorkers = new Map(); // corpusId -> state
-  const pipelineWorkers = new Map(); // corpusId -> state
   const corpusDownloadTickets = new Map(); // token -> { userId, corpusId, itemId, expiresAt }
   const upstreamDownloadTickets = new Map(); // token -> { userId, targetId, itemId, expiresAt }
   const authConfig = resolveAuthConfig();
@@ -2749,49 +2747,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     fs.mkdirSync(uploadDir, { recursive: true });
   }
 
-  function getOrInitWorkerState(corpusId) {
-    const key = corpusId || 0;
-    if (!downloadWorkers.has(key)) {
-      downloadWorkers.set(key, {
-        running: false,
-        intervalId: null,
-        inFlight: false,
-        child: null,
-        startedAt: null,
-        lastTickAt: null,
-        lastResult: null,
-        lastError: null,
-        config: { intervalSeconds: 60, batchSize: 3 },
-      });
-    }
-    return downloadWorkers.get(key);
-  }
-
-  function getOrInitPipelineWorkerState(corpusId) {
-    const key = corpusId || 0;
-    if (!pipelineWorkers.has(key)) {
-      pipelineWorkers.set(key, {
-        running: false,
-        intervalId: null,
-        inFlight: false,
-        children: [],
-        startedAt: null,
-        lastTickAt: null,
-        lastResult: null,
-        lastError: null,
-        resolvedDownloadWorkers: 0,
-        config: {
-          intervalSeconds: 15,
-          promoteBatchSize: 25,
-          promoteWorkers: 6,
-          downloadBatchSize: 5,
-          downloadWorkers: 0, // 0 = auto
-        },
-      });
-    }
-    return pipelineWorkers.get(key);
-  }
-
   function parseSqliteTimestampToMs(value) {
     const text = String(value || '').trim();
     if (!text) return null;
@@ -2896,25 +2851,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   }
 
-  function tickDownloadWorker(corpusId) {
-    const state = getOrInitWorkerState(corpusId);
-    if (!state.running || state.inFlight) return;
-    state.inFlight = true;
-    state.lastTickAt = new Date().toISOString();
-    state.lastError = null;
-    const { batchSize } = state.config;
-    const corpusTag = corpusId || 'none';
-    
-    try {
-      enqueuePipelineJob(corpusId, 'download', { batchSize }, { dedupeStatuses: ['pending', 'running'] });
-    } catch (error) {
-      state.lastError = error?.message || String(error);
-      console.error(`[download-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
-    } finally {
-      state.inFlight = false;
-    }
-  }
-
   function findExistingPipelineJob(jobType, corpusId, statuses = ['pending', 'running']) {
     if (!statuses.length) return null;
     const placeholders = statuses.map(() => '?').join(', ');
@@ -2998,436 +2934,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
     state.tail = run;
     return { queued, queuePosition };
-  }
-
-  function startDownloadWorker(corpusId, config = {}) {
-    const state = getOrInitWorkerState(corpusId);
-    const intervalSeconds = coerceInt(config.intervalSeconds, state.config.intervalSeconds) || state.config.intervalSeconds;
-    const batchSize = coerceInt(config.batchSize, state.config.batchSize) || state.config.batchSize;
-
-    state.config = { intervalSeconds, batchSize };
-    if (state.running) return state;
-
-    state.running = true;
-    state.startedAt = new Date().toISOString();
-    // Kick once immediately, then on interval.
-    tickDownloadWorker(corpusId);
-    state.intervalId = setInterval(() => tickDownloadWorker(corpusId), intervalSeconds * 1000);
-    return state;
-  }
-
-  function stopDownloadWorker(corpusId, { force = false } = {}) {
-    const state = getOrInitWorkerState(corpusId);
-    state.running = false;
-    if (state.intervalId) {
-      clearInterval(state.intervalId);
-      state.intervalId = null;
-    }
-    return state;
-  }
-
-  function cancelDownloadJobs(corpusId, { includeRunning = true, reason = 'stopped_by_user' } = {}) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    const resultPayload = JSON.stringify({
-      cancelled: true,
-      reason: String(reason || 'stopped_by_user'),
-      at: new Date().toISOString(),
-    });
-    let pending = 0;
-    let running = 0;
-    try {
-      pending = Number(
-        authDb
-          .prepare(
-            `UPDATE pipeline_jobs
-             SET status = 'cancelled',
-                 finished_at = CURRENT_TIMESTAMP,
-                 result_json = COALESCE(result_json, ?)
-             WHERE job_type = 'download'
-               AND status = 'pending'
-               AND corpus_id IS ?`
-          )
-          .run(resultPayload, corpusId ?? null).changes || 0
-      );
-      if (includeRunning) {
-        running = Number(
-          authDb
-            .prepare(
-              `UPDATE pipeline_jobs
-               SET status = 'cancelled',
-                   finished_at = CURRENT_TIMESTAMP,
-                   result_json = COALESCE(result_json, ?)
-               WHERE job_type = 'download'
-                 AND status = 'running'
-                 AND corpus_id IS ?`
-            )
-            .run(resultPayload, corpusId ?? null).changes || 0
-        );
-      }
-    } catch (error) {
-      console.warn(`[download-worker] Failed to cancel download jobs for corpus=${corpusId ?? 'none'}: ${error?.message || error}`);
-    }
-    return { pending, running };
-  }
-
-  function cancelAllDownloadJobs({ includeRunning = true, reason = 'stopped_by_user' } = {}) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    const resultPayload = JSON.stringify({
-      cancelled: true,
-      reason: String(reason || 'stopped_by_user'),
-      at: new Date().toISOString(),
-    });
-    let pending = 0;
-    let running = 0;
-    try {
-      pending = Number(
-        authDb
-          .prepare(
-            `UPDATE pipeline_jobs
-             SET status = 'cancelled',
-                 finished_at = CURRENT_TIMESTAMP,
-                 result_json = COALESCE(result_json, ?)
-             WHERE job_type = 'download'
-               AND status = 'pending'`
-          )
-          .run(resultPayload).changes || 0
-      );
-      if (includeRunning) {
-        running = Number(
-          authDb
-            .prepare(
-              `UPDATE pipeline_jobs
-               SET status = 'cancelled',
-                   finished_at = CURRENT_TIMESTAMP,
-                   result_json = COALESCE(result_json, ?)
-               WHERE job_type = 'download'
-                 AND status = 'running'`
-            )
-            .run(resultPayload).changes || 0
-        );
-      }
-    } catch (error) {
-      console.warn(`[download-worker] Failed to cancel all download jobs: ${error?.message || error}`);
-    }
-    return { pending, running };
-  }
-
-  function countDownloadPipelineJobs(corpusId) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    try {
-      const pending = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'download'
-               AND status = 'pending'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      const running = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'download'
-               AND status = 'running'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      return { pending, running };
-    } catch (error) {
-      return { pending: 0, running: 0 };
-    }
-  }
-
-  function countPipelineTickJobs(corpusId) {
-    if (!tableExists(authDb, 'pipeline_jobs')) {
-      return { pending: 0, running: 0 };
-    }
-    try {
-      const pending = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'pipeline_tick'
-               AND status = 'pending'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      const running = Number(
-        authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM pipeline_jobs
-             WHERE job_type = 'pipeline_tick'
-               AND status = 'running'
-               AND corpus_id IS ?`
-          )
-          .get(corpusId ?? null)?.count || 0
-      );
-      return { pending, running };
-    } catch (error) {
-      return { pending: 0, running: 0 };
-    }
-  }
-
-  function countQueuedDownloads(corpusId) {
-    try {
-      if (corpusId !== undefined && corpusId !== null) {
-        const row = authDb
-          .prepare(
-            `SELECT COUNT(*) AS count
-             FROM works w
-             JOIN corpus_works cw ON cw.work_id = w.id
-             WHERE cw.corpus_id = ?
-               AND w.download_status IN ('queued', 'in_progress')`
-          )
-          .get(corpusId);
-        return Number(row?.count || 0);
-      }
-      const row = authDb
-        .prepare("SELECT COUNT(*) AS count FROM works WHERE download_status IN ('queued', 'in_progress')")
-        .get();
-      return Number(row?.count || 0);
-    } catch (error) {
-      return 0;
-    }
-  }
-
-  function resolveAutoDownloadBatchSize(corpusId) {
-    const queued = countQueuedDownloads(corpusId);
-    const minBatch = 25;
-    const maxBatch = Math.max(minBatch, coerceInt(process.env.RAG_FEEDER_DOWNLOAD_BATCH_MAX, 200) || 200);
-    if (queued <= 0) return minBatch;
-    return Math.max(minBatch, Math.min(maxBatch, queued));
-  }
-
-  function resolveDownloadWorkerCount({ corpusId, requestedWorkers = 0, batchSize = 3 }) {
-    const cpuCount = Math.max(1, Number(os.cpus()?.length || 1));
-    const maxRecommended = Math.max(1, Math.min(6, cpuCount));
-    const minBatch = Math.max(1, Number(batchSize || 1));
-    if (Number(requestedWorkers) > 0) {
-      return Math.max(1, Math.min(12, Number(requestedWorkers)));
-    }
-    const queued = countQueuedDownloads(corpusId);
-    if (queued <= 0) {
-      return 1;
-    }
-    const estimated = Math.ceil(queued / (minBatch * 2));
-    return Math.max(1, Math.min(maxRecommended, estimated));
-  }
-
-  function aggregateDownloadPayloads(payloads) {
-    const summary = {
-      processed: 0,
-      downloaded: 0,
-      failed: 0,
-      skipped: 0,
-      errors: [],
-      runs: payloads.length,
-    };
-    payloads.forEach((payload) => {
-      summary.processed += Number(payload?.processed || 0);
-      summary.downloaded += Number(payload?.downloaded || 0);
-      summary.failed += Number(payload?.failed || 0);
-      summary.skipped += Number(payload?.skipped || 0);
-      if (Array.isArray(payload?.errors) && payload.errors.length) {
-        summary.errors.push(...payload.errors);
-      }
-    });
-    return summary;
-  }
-
-  function emitPromotionEvent({
-    corpusId,
-    transition,
-    fromStage,
-    toStage,
-    itemId,
-    destItemId = null,
-    title = null,
-  }) {
-    const sourceId = Number(itemId);
-    if (!Number.isFinite(sourceId)) return;
-    const targetId = Number(destItemId);
-    sendEvent({
-      kind: 'promotion',
-      corpus_id: Number.isFinite(Number(corpusId)) ? Number(corpusId) : null,
-      transition,
-      from_stage: fromStage,
-      to_stage: toStage,
-      item_id: sourceId,
-      dest_item_id: Number.isFinite(targetId) ? targetId : null,
-      title: title ? String(title) : null,
-      ts: new Date().toISOString(),
-    });
-  }
-
-  async function tickPipelineWorker(corpusId) {
-    const state = getOrInitPipelineWorkerState(corpusId);
-    if (!state.running || state.inFlight) return;
-    state.inFlight = true;
-    const corpusTag = corpusId || 'none';
-    state.lastTickAt = new Date().toISOString();
-    state.lastError = null;
-    
-    try {
-      const outstanding = countPipelineTickJobs(corpusId);
-      if (Number(outstanding.pending || 0) > 0 || Number(outstanding.running || 0) > 0) {
-        state.inFlight = false;
-        return;
-      }
-      enqueuePipelineJob(corpusId, 'pipeline_tick', { config: state.config }, { dedupeStatuses: ['pending', 'running'] });
-    } catch (error) {
-      state.lastError = error?.message || String(error);
-      console.error(`[pipeline-worker ERROR] corpus=${corpusTag} ${state.lastError}`);
-    } finally {
-      state.inFlight = false;
-    }
-  }
-
-  function startPipelineWorker(corpusId, config = {}) {
-    const state = getOrInitPipelineWorkerState(corpusId);
-    const intervalSeconds = coerceInt(config.intervalSeconds, state.config.intervalSeconds) || state.config.intervalSeconds;
-    const promoteBatchSize = coerceInt(config.promoteBatchSize, state.config.promoteBatchSize) || state.config.promoteBatchSize;
-    const promoteWorkers =
-      coerceInt(config.promoteWorkers, state.config.promoteWorkers ?? 6) || state.config.promoteWorkers || 6;
-    const downloadBatchSize = coerceInt(config.downloadBatchSize, state.config.downloadBatchSize) || state.config.downloadBatchSize;
-    const downloadWorkersRequested = Math.max(0, coerceInt(config.downloadWorkers, state.config.downloadWorkers) || 0);
-
-    state.config = {
-      intervalSeconds: Math.max(10, intervalSeconds),
-      promoteBatchSize: Math.max(1, promoteBatchSize),
-      promoteWorkers: Math.max(1, Math.min(32, promoteWorkers)),
-      downloadBatchSize: Math.max(1, downloadBatchSize),
-      downloadWorkers: downloadWorkersRequested,
-    };
-
-    // Avoid running legacy download-only worker alongside the orchestration worker.
-    const legacy = getOrInitWorkerState(corpusId);
-    if (legacy.running || legacy.inFlight) {
-      stopDownloadWorker(corpusId, { force: false });
-    }
-
-    if (state.running) return state;
-    state.running = true;
-    state.startedAt = new Date().toISOString();
-    tickPipelineWorker(corpusId);
-    state.intervalId = setInterval(() => tickPipelineWorker(corpusId), state.config.intervalSeconds * 1000);
-    return state;
-  }
-
-  function pausePipelineWorker(corpusId, { force = false } = {}) {
-    const state = getOrInitPipelineWorkerState(corpusId);
-    state.running = false;
-    if (state.intervalId) {
-      clearInterval(state.intervalId);
-      state.intervalId = null;
-    }
-    return state;
-  }
-
-  function pauseAllPipelineWorkers({ force = false } = {}) {
-    const result = {
-      requestedForce: Boolean(force),
-      stopped: 0,
-      inFlight: 0,
-      wasRunning: 0,
-      states: {},
-    };
-    for (const [key, state] of pipelineWorkers.entries()) {
-      const hadInFlight = Boolean(state.inFlight);
-      const hadRunning = Boolean(state.running);
-      state.running = false;
-      if (state.intervalId) {
-        clearInterval(state.intervalId);
-        state.intervalId = null;
-      }
-      if (force && Array.isArray(state.children)) {
-        state.children.forEach((child) => {
-          try {
-            child.kill('SIGTERM');
-          } catch (error) {
-            // ignore
-          }
-        });
-      }
-      if (force) {
-        state.inFlight = false;
-        state.children = [];
-      }
-      const keyLabel = key === 0 ? 'none' : String(key);
-      result.states[keyLabel] = {
-        running: state.running,
-        inFlight: state.inFlight,
-      };
-      if (hadRunning) {
-        result.wasRunning += 1;
-      }
-      if (hadInFlight) {
-        result.inFlight += 1;
-      }
-      if (hadRunning || hadInFlight) {
-        result.stopped += 1;
-      }
-    }
-    return result;
-  }
-
-  function stopAllDownloadWorkers({ force = false } = {}) {
-    const result = {
-      requestedForce: Boolean(force),
-      stopped: 0,
-      inFlight: 0,
-      wasRunning: 0,
-      states: {},
-    };
-    for (const [key, state] of downloadWorkers.entries()) {
-      const hadInFlight = Boolean(state.inFlight);
-      const hadRunning = Boolean(state.running);
-      state.running = false;
-      if (state.intervalId) {
-        clearInterval(state.intervalId);
-        state.intervalId = null;
-      }
-      if (force && state.child) {
-        try {
-          state.child.kill('SIGTERM');
-        } catch (error) {
-          // ignore
-        }
-      }
-      if (force) {
-        state.inFlight = false;
-        state.child = null;
-      }
-      const keyLabel = key === 0 ? 'none' : String(key);
-      result.states[keyLabel] = {
-        running: state.running,
-        inFlight: state.inFlight,
-      };
-      if (hadRunning) {
-        result.wasRunning += 1;
-      }
-      if (hadInFlight) {
-        result.inFlight += 1;
-      }
-      if (hadRunning || hadInFlight) {
-        result.stopped += 1;
-      }
-    }
-    return result;
   }
 
   // Middleware
@@ -4341,12 +3847,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!corpus) {
       return res.status(404).json({ error: 'Corpus not found' });
     }
-
-    // Stop in-memory schedulers first so they do not keep queueing jobs for a deleted corpus.
-    pausePipelineWorker(corpusId, { force: false });
-    stopDownloadWorker(corpusId, { force: false });
-    pipelineWorkers.delete(corpusId);
-    downloadWorkers.delete(corpusId);
 
     try {
       const result = authDb.transaction(() => {
@@ -6363,36 +5863,46 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
+  // Enrich/download work runs in the Python daemon (pipeline_jobs); the app only
+  // reports the daemon's heartbeat for that worker. Stub mode returns the fixed
+  // snapshot the frontend expects without touching the daemon status file.
+  function dbDrivenWorkerStatus(kind) {
+    if (isStubMode()) {
+      return kind === 'pipeline'
+        ? {
+          running: false,
+          in_flight: false,
+          started_at: null,
+          last_tick_at: null,
+          last_result: null,
+          last_error: null,
+          resolved_download_workers: 1,
+          config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
+        }
+        : { running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } };
+    }
+    const workers = readPipelineDaemonStatus()?.workers || {};
+    const worker = (kind === 'pipeline' ? workers.enrich : workers.download) || {};
+    return {
+      running: Boolean(worker.online),
+      in_flight: String(worker.status || '').toLowerCase() === 'running',
+      started_at: worker.last_seen_at || null,
+      last_tick_at: worker.last_seen_at || null,
+      last_result: worker.details || null,
+      last_error: worker.status === 'error' ? JSON.stringify(worker.details || {}) : null,
+      ...(kind === 'pipeline' ? { resolved_download_workers: Boolean((workers.download || {}).online) ? 1 : 0 } : {}),
+      config: { mode: 'db-driven' },
+    };
+  }
+
   app.get('/api/pipeline/worker/status', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({
-        running: false,
-        in_flight: false,
-        started_at: null,
-        last_tick_at: null,
-        last_result: null,
-        last_error: null,
-        resolved_download_workers: 1,
-        config: { intervalSeconds: 15, promoteBatchSize: 25, promoteWorkers: 6, downloadBatchSize: 5, downloadWorkers: 0 },
-      });
+    if (isStubMode()) {
+      return res.json(dbDrivenWorkerStatus('pipeline'));
     }
     if (!hasAdminWorkerAccess(req)) {
       return res.status(403).json({ error: 'Admin access required for diagnostics worker status' });
     }
-    const daemon = readPipelineDaemonStatus();
-    const enrich = daemon?.workers?.enrich || {};
-    const backlog = readWorkerBacklogSummary(req.corpusId);
-    return res.json({
-      running: Boolean(enrich.online),
-      in_flight: String(enrich.status || '').toLowerCase() === 'running',
-      started_at: enrich.last_seen_at || null,
-      last_tick_at: enrich.last_seen_at || null,
-      last_result: enrich.details || null,
-      last_error: enrich.status === 'error' ? JSON.stringify(enrich.details || {}) : null,
-      resolved_download_workers: Boolean((daemon?.workers?.download || {}).online) ? 1 : 0,
-      config: { mode: 'db-driven' },
-      backlog,
-    });
+    return res.json({ ...dbDrivenWorkerStatus('pipeline'), backlog: readWorkerBacklogSummary(req.corpusId) });
   });
 
   app.post('/api/pipeline/worker/start', requireAuthMiddleware, (req, res) => {
@@ -6426,23 +5936,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   });
 
   app.get('/api/downloads/worker/status', requireAuthMiddleware, (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ running: false, in_flight: false, last_result: null, last_error: null, config: { intervalSeconds: 60, batchSize: 3 } });
+    if (isStubMode()) {
+      return res.json(dbDrivenWorkerStatus('download'));
     }
     if (!hasAdminWorkerAccess(req)) {
       return res.status(403).json({ error: 'Admin access required for diagnostics worker status' });
     }
-    const daemon = readPipelineDaemonStatus();
-    const download = daemon?.workers?.download || {};
     const backlog = readWorkerBacklogSummary(req.corpusId);
     return res.json({
-      running: Boolean(download.online),
-      in_flight: String(download.status || '').toLowerCase() === 'running',
-      started_at: download.last_seen_at || null,
-      last_tick_at: download.last_seen_at || null,
-      last_result: download.details || null,
-      last_error: download.status === 'error' ? JSON.stringify(download.details || {}) : null,
-      config: { mode: 'db-driven' },
+      ...dbDrivenWorkerStatus('download'),
       queued_jobs: Number(backlog.queued_download || 0),
       running_jobs: Number(backlog.downloading || 0),
       queued_download_items: Number(backlog.queued_download || 0),
