@@ -565,7 +565,65 @@
   const maxLogs = 200
   const maxLogHistory = 5000
 
+  // Live socket lines are buffered here (not reactive) and flushed into `logs`
+  // at most once per 250 ms while the logs tab is open; on other tabs the
+  // buffer is a ring capped at maxLogHistory, flushed when the tab opens.
+  // Every entry is { seq, text }; seq comes from one increasing counter and
+  // only keys the rows (older lines loaded later get higher numbers too).
+  const LOG_FLUSH_MS = 250
+  let logBuffer = []
+  let logFlushTimer = null
+  let logSeq = 0
+
+  function toLogEntries(lines) {
+    return lines.map((text) => ({ seq: ++logSeq, text }))
+  }
+
+  function clearLogBuffer() {
+    if (logFlushTimer) {
+      clearTimeout(logFlushTimer)
+      logFlushTimer = null
+    }
+    logBuffer = []
+  }
+
+  function pushLogLine(text) {
+    logBuffer.push({ seq: ++logSeq, text })
+    if (logBuffer.length > maxLogHistory) logBuffer.splice(0, logBuffer.length - maxLogHistory)
+    if (activeTab === 'logs' && !logFlushTimer) logFlushTimer = setTimeout(flushLogs, LOG_FLUSH_MS)
+  }
+
+  function flushLogs() {
+    if (logFlushTimer) {
+      clearTimeout(logFlushTimer)
+      logFlushTimer = null
+    }
+    const count = logBuffer.length
+    if (count === 0) return
+    const hadLines = logs.length > 0
+    logs = [...logs, ...logBuffer].slice(-maxLogHistory)
+    logBuffer = []
+    // Same per-line rule as before batching: an established cursor grows by
+    // one per line (capped); a first line into an empty view starts it.
+    if (logsCursor > 0) {
+      logsCursor = Math.min(maxLogHistory, logsCursor + count)
+    } else if (!hadLines) {
+      logsCursor = Math.min(maxLogHistory, count)
+    }
+  }
+
+  function tryParseJson(data) {
+    if (typeof data !== 'string') return null
+    try {
+      const parsed = JSON.parse(data)
+      return parsed && typeof parsed === 'object' ? parsed : null
+    } catch (error) {
+      return null
+    }
+  }
+
   function resetLogState() {
+    clearLogBuffer()
     logs = []
     logsCursor = 0
     logsHasMore = false
@@ -770,23 +828,17 @@
     return source || publisher || ''
   }
 
-  function parseExtractionEventMessage(raw) {
-    if (typeof raw !== 'string' || !raw.startsWith('{')) return null
-    try {
-      const parsed = JSON.parse(raw)
-      const event = String(parsed?.event || '').trim().toLowerCase()
-      if (!parsed || parsed.kind !== 'extraction' || !['started', 'done'].includes(event)) return null
-      return {
-        event,
-        corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
-        baseName: String(parsed.base_name || '').trim(),
-        filename: String(parsed.filename || '').trim(),
-        status: String(parsed.status || 'success').trim().toLowerCase(),
-        mode: String(parsed.mode || '').trim().toLowerCase(),
-        reason: String(parsed.reason || '').trim(),
-      }
-    } catch (error) {
-      return null
+  function extractionEventFromObject(parsed) {
+    const event = String(parsed?.event || '').trim().toLowerCase()
+    if (!parsed || parsed.kind !== 'extraction' || !['started', 'done'].includes(event)) return null
+    return {
+      event,
+      corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
+      baseName: String(parsed.base_name || '').trim(),
+      filename: String(parsed.filename || '').trim(),
+      status: String(parsed.status || 'success').trim().toLowerCase(),
+      mode: String(parsed.mode || '').trim().toLowerCase(),
+      reason: String(parsed.reason || '').trim(),
     }
   }
 
@@ -1838,6 +1890,7 @@
     clearTimeout(corpusFilterDebounce)
     startedSearchRunMisses.clear()
     seedSortCache.clear()
+    clearLogBuffer()
     ;({
       ingestStats,
       ingestStatsStatus,
@@ -3722,7 +3775,7 @@
         corpusId: getLogsCorpusId(),
       })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
-      logs = entries.slice(-maxLogHistory)
+      logs = toLogEntries(entries.slice(-maxLogHistory))
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
         : logs.length
@@ -3748,7 +3801,7 @@
       })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       if (entries.length > 0) {
-        logs = [...entries, ...logs].slice(-maxLogHistory)
+        logs = [...toLogEntries(entries), ...logs].slice(-maxLogHistory)
       }
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
@@ -3760,6 +3813,46 @@
       logsTailStatus = error?.message || 'Failed to load older logs.'
     } finally {
       logsLoadingOlder = false
+    }
+  }
+
+  function handleExtractionFrame(frame) {
+    const extractionEvent = extractionEventFromObject(frame)
+    if (!extractionEvent) return
+    const currentCorpus = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+    const corpusMatches = extractionEvent.corpusId === null || currentCorpus === null || extractionEvent.corpusId === currentCorpus
+    if (extractionEvent.event === 'started') {
+      updateUploadByBackendFilename(extractionEvent.filename, {
+        status: 'extracting',
+        message: 'Extracting bibliography',
+      })
+      if (corpusMatches) {
+        ensureExtractionRunActive(extractionEvent.baseName, extractionEvent.filename)
+      }
+      return
+    }
+
+    updateUploadByBackendFilename(
+      extractionEvent.filename,
+      extractionEvent.status === 'success'
+        ? { status: 'extracted', message: 'Extraction complete' }
+        : { status: 'failed', message: 'Extraction failed' }
+    )
+    const baseMatches = extractionProgress.baseName && extractionEvent.baseName === extractionProgress.baseName
+    const fileMatches = extractionProgress.backendFilename && extractionEvent.filename === extractionProgress.backendFilename
+    if (extractionProgress.active && corpusMatches && (baseMatches || fileMatches)) {
+      updateExtractionProgress({
+        phase: extractionEvent.status === 'success' ? 'finalizing' : 'completed',
+        detail: extractionEvent.status === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
+        percent: extractionEvent.status === 'success' ? 98 : 100,
+        indeterminate: false,
+        backendDone: true,
+      })
+      if (extractionEvent.status === 'success') {
+        void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
+      } else {
+        finishExtractionProgress()
+      }
     }
   }
 
@@ -3796,58 +3889,20 @@
       }
       ws.onmessage = (event) => {
         if (logsSocket !== ws) return
-        const extractionEvent = parseExtractionEventMessage(event.data)
-        if (extractionEvent) {
-          const currentCorpus = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
-          const corpusMatches = extractionEvent.corpusId === null || currentCorpus === null || extractionEvent.corpusId === currentCorpus
-          if (extractionEvent.event === 'started') {
-            updateUploadByBackendFilename(extractionEvent.filename, {
-              status: 'extracting',
-              message: 'Extracting bibliography',
-            })
-            if (corpusMatches) {
-              ensureExtractionRunActive(extractionEvent.baseName, extractionEvent.filename)
-            }
-            return
-          }
-
-          updateUploadByBackendFilename(
-            extractionEvent.filename,
-            extractionEvent.status === 'success'
-              ? { status: 'extracted', message: 'Extraction complete' }
-              : { status: 'failed', message: 'Extraction failed' }
-          )
-          const baseMatches = extractionProgress.baseName && extractionEvent.baseName === extractionProgress.baseName
-          const fileMatches = extractionProgress.backendFilename && extractionEvent.filename === extractionProgress.backendFilename
-          if (extractionProgress.active && corpusMatches && (baseMatches || fileMatches)) {
-            updateExtractionProgress({
-              phase: extractionEvent.status === 'success' ? 'finalizing' : 'completed',
-              detail: extractionEvent.status === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
-              percent: extractionEvent.status === 'success' ? 98 : 100,
-              indeterminate: false,
-              backendDone: true,
-            })
-            if (extractionEvent.status === 'success') {
-              void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
-            } else {
-              finishExtractionProgress()
-            }
-          }
+        const line = event.data
+        // JSON frames are parsed once: extraction events drive the extraction
+        // card, every other JSON frame is ignored and never becomes a log row.
+        const msg = typeof line === 'string' && line.startsWith('{') ? tryParseJson(line) : null
+        if (msg) {
+          if (msg.kind === 'extraction') handleExtractionFrame(msg)
           return
         }
-        const line = event.data
         if (typeof line === 'string' && line.startsWith('{')) return
         if (typeof line === 'string' && line.startsWith('WebSocket connection established')) return
         if (!isLogLineForCurrentCorpus(line)) return
         updateExtractionProgressFromLog(line)
         if (logsType !== 'pipeline') return
-        const hadLines = logs.length > 0
-        logs = [...logs, line].slice(-maxLogHistory)
-        if (logsCursor > 0) {
-          logsCursor = Math.min(maxLogHistory, logsCursor + 1)
-        } else if (!hadLines) {
-          logsCursor = logs.length
-        }
+        pushLogLine(line)
         if (shouldTriggerPipelineRefresh(line)) {
           const isWorkerTick =
             String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
@@ -3882,6 +3937,7 @@
   }
 
   function disconnectLogs() {
+    clearLogBuffer()
     if (logsReconnectTimer) {
       clearTimeout(logsReconnectTimer)
       logsReconnectTimer = null
@@ -3938,6 +3994,7 @@
     const safeTab = tabIds.has(normalized) ? normalized : 'workspace'
     navigationRevision += 1
     activeTab = safeTab
+    if (safeTab === 'logs') flushLogs()
     updateHash(safeTab, replace)
     if (loadedTab === null || normalizeTab(loadedTab) !== safeTab) void refreshForActiveTab(safeTab)
     // The cadence depends on the tab (e.g. corpus has none, workspace is idle-polled).

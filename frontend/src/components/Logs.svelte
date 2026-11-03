@@ -13,7 +13,7 @@
   export let hydrateLogsFromTail;
 </script>
 
-<div class="card" data-testid="logs-panel">
+<div class="card" data-testid="logs-panel" data-log-count={logs.length}>
   <h2>Logs</h2>
   <p class="muted">WebSocket status: {logsStatus}</p>
   <div class="log-toolbar">
@@ -57,8 +57,8 @@
     {#if logs.length === 0}
       <p class="muted">Waiting for pipeline output...</p>
     {:else}
-      {#each logs as entry}
-        <div class="log-line">{entry}</div>
+      {#each logs as entry (entry.seq)}
+        <div class="log-line">{entry.text}</div>
       {/each}
     {/if}
   </div>

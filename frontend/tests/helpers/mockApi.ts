@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test'
+import type { Page, WebSocketRoute } from '@playwright/test'
 
 // Mocks the page's two WebSockets so a mocked spec never reaches a live server.
 //
@@ -12,8 +12,10 @@ import type { Page } from '@playwright/test'
 //   "WebSocket closed without opened." page error.
 //
 // Both mocks stay open and silent: no server connection, no close.
-export async function mockLogSocket(page: Page) {
-  await page.routeWebSocket('**/api/ws', () => {})
+// `onLogSocket` receives the log socket's route, so a spec can push frames
+// with `ws.send(...)`.
+export async function mockLogSocket(page: Page, onLogSocket: (ws: WebSocketRoute) => void = () => {}) {
+  await page.routeWebSocket('**/api/ws', onLogSocket)
   await page.routeWebSocket(
     (url) => url.pathname === '/' && url.searchParams.has('token'),
     () => {},
