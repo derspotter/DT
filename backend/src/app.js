@@ -8,13 +8,13 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
 import zlib from 'zlib';
-import { spawn, spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
 import { listCorpus } from './corpusList.js';
+import { createPythonRunner } from './pythonProcess.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -165,6 +165,9 @@ const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_s
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
 const SEED_EXPAND_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_expand.py');
 const EXPORT_BUNDLE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'export_bundle.py');
+const PDF_PAGE_COUNT_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'pdf_page_count.py');
+const LLM_UPLOAD_PDF_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'llm_upload_pdf.py');
+const LLM_DELETE_UPLOAD_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'llm_delete_upload.py');
 const LOCAL_VENV_PYTHON = path.join(REPO_ROOT, '.venv', 'bin', 'python');
 const PYTHON_EXEC = process.env.RAG_FEEDER_PYTHON || (fs.existsSync(LOCAL_VENV_PYTHON) ? LOCAL_VENV_PYTHON : 'python');
 const KANTROPOS_CORPORA_ROOT =
@@ -1915,48 +1918,6 @@ function requireAuth(db, authConfig = resolveAuthConfig()) {
   };
 }
 
-function parseJsonFromOutput(output) {
-  const lines = String(output || '')
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const tryParse = (text) => {
-    if (!text) return null;
-    try {
-      return JSON.parse(text);
-    } catch {
-      return null;
-    }
-  };
-
-  // Fast path: find a valid JSON line near the bottom while skipping log lines
-  // such as "[DB Manager] ...", which are not JSON arrays.
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    const bracketIndex = line.search(/[\[{]/);
-    if (bracketIndex < 0) continue;
-    const inlineCandidate = line.slice(bracketIndex).trim();
-    const parsedInline = tryParse(inlineCandidate);
-    if (parsedInline !== null) return parsedInline;
-  }
-
-  // Fallback: recover pretty-printed/multiline JSON blocks from stdout.
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    const bracketIndex = line.search(/[\[{]/);
-    if (bracketIndex < 0) continue;
-    for (let j = lines.length; j > i; j -= 1) {
-      const segment = lines.slice(i, j);
-      segment[0] = segment[0].slice(bracketIndex);
-      const parsedSegment = tryParse(segment.join('\n'));
-      if (parsedSegment !== null) return parsedSegment;
-    }
-  }
-
-  throw new Error(`No valid JSON output from python. Output was: ${output}`);
-}
-
 function resolveDownloadedFilePath(storedPath, context = {}) {
   const rawPath = String(storedPath || '').trim();
   if (!rawPath) return null;
@@ -2330,88 +2291,16 @@ function appSettingsEnv() {
   return env;
 }
 
-function runPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority } = {}) {
-  const { done } = spawnPythonJson(scriptPath, args, { dbPath, corpusId, lowPriority });
-  return done;
-}
-
-function spawnPythonJson(scriptPath, args, { dbPath, corpusId, onStdoutLine, onStderrLine, lowPriority } = {}) {
-  const env = {
-    ...process.env,
-    // Admin-managed settings win over the process environment, so changing a
-    // key or model in the UI takes effect on the next script run (spec 13/14).
-    ...appSettingsEnv(),
-    PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-    RAG_FEEDER_DB_PATH: dbPath || DB_PATH,
-  };
-
-  const finalArgs = [...args];
-  if (corpusId !== undefined && corpusId !== null) {
-    finalArgs.push('--corpus-id', String(corpusId));
-  }
-
-  const child = spawn(PYTHON_EXEC, [scriptPath, ...finalArgs], { env });
-  if (lowPriority && child.pid) {
-    // Background jobs (e.g. the ~60s graph layout rebuild) shouldn't starve the
-    // API: drop their CPU priority so interactive requests stay fast while they
-    // run. Best-effort — ignore if the platform/permissions disallow it.
-    try { os.setPriority(child.pid, 15); } catch { /* noop */ }
-  }
-  let stdout = '';
-  let stderr = '';
-  let stdoutBuf = '';
-  let stderrBuf = '';
-
-  const flushLines = (buffer, handler, flushPartial = false) => {
-    if (typeof handler !== 'function') {
-      return buffer;
-    }
-    const parts = String(buffer).split(/\r?\n/);
-    const pending = parts.pop() ?? '';
-    parts
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .forEach((line) => handler(line));
-    if (flushPartial && pending.trim()) {
-      handler(pending.trim());
-      return '';
-    }
-    return pending;
-  };
-
-  child.stdout.on('data', (data) => {
-    const text = data.toString();
-    stdout += text;
-    stdoutBuf += text;
-    stdoutBuf = flushLines(stdoutBuf, onStdoutLine);
-  });
-
-  child.stderr.on('data', (data) => {
-    const text = data.toString();
-    stderr += text;
-    stderrBuf += text;
-    stderrBuf = flushLines(stderrBuf, onStderrLine);
-  });
-
-  const done = new Promise((resolve, reject) => {
-    child.on('close', (code) => {
-      stdoutBuf = flushLines(stdoutBuf, onStdoutLine, true);
-      stderrBuf = flushLines(stderrBuf, onStderrLine, true);
-      if (code !== 0) {
-        return reject(new Error(`Python script failed (${code}): ${stderr || stdout}`));
-      }
-      try {
-        const payload = parseJsonFromOutput(stdout);
-        return resolve(payload);
-      } catch (error) {
-        return reject(error);
-      }
-    });
-  });
-
-  return { child, done };
-}
+// Every Python child is spawned through this runner, so all of them get the
+// same PYTHONPATH and the Admin-tab settings (see pythonProcess.js).
+const pythonRunner = createPythonRunner({
+  pythonExec: PYTHON_EXEC,
+  dlLitProjectDir: DL_LIT_PROJECT_DIR,
+  repoRoot: REPO_ROOT,
+  dbPath: DB_PATH,
+  appSettingsEnv,
+});
+const { pythonEnv, spawnPython, runPythonJson, parseJsonFromOutput } = pythonRunner;
 
 function coerceInt(value, fallback = null) {
   if (value === undefined || value === null || value === '') {
@@ -2574,106 +2463,34 @@ function readLogWindow(
   };
 }
 
-function getPdfPageCountSync(pdfPath) {
+async function getPdfPageCount(pdfPath) {
   if (!pdfPath || !fs.existsSync(pdfPath)) return null;
-  const probeCode = [
-    'import sys',
-    'import pikepdf',
-    'pdf = pikepdf.Pdf.open(sys.argv[1])',
-    'print(len(pdf.pages))',
-    'pdf.close()',
-  ].join('; ');
   try {
-    const result = spawnSync(PYTHON_EXEC, ['-c', probeCode, pdfPath], {
-      env: {
-        ...process.env,
-        PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-      },
-      encoding: 'utf8',
-    });
-    if (result.status !== 0) {
-      console.warn(`[/api/extract-bibliography] Could not read page count for ${pdfPath}: ${result.stderr || result.stdout}`);
-      return null;
-    }
-    const parsed = Number.parseInt(String(result.stdout || '').trim(), 10);
+    const { stdout } = await spawnPython(PDF_PAGE_COUNT_SCRIPT, [pdfPath]).done;
+    const parsed = Number.parseInt(String(stdout || '').trim(), 10);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   } catch (error) {
-    console.warn(`[/api/extract-bibliography] Page count probe failed for ${pdfPath}: ${error?.message || error}`);
+    console.warn(`[/api/extract-bibliography] Could not read page count for ${pdfPath}: ${error?.message || error}`);
     return null;
   }
 }
 
-function llmUploadPdfSync(pdfPath) {
-  const code = [
-    'import json',
-    'import os',
-    'import shutil',
-    'import sys',
-    'import tempfile',
-    'import unicodedata',
-    'from dl_lit.llm_provider import OpenAICompatClient, get_client',
-    'client = get_client(required=True)',
-    'pdf_path = sys.argv[1]',
-    'base = os.path.basename(pdf_path)',
-    'if isinstance(client, OpenAICompatClient):',
-    '    # Local handles must reference a persistent path; no remote upload happens.',
-    '    f = client.files.upload(file=pdf_path, config={"mime_type":"application/pdf","display_name":base})',
-    '    print(json.dumps({"name": f.name}))',
-    '    sys.exit(0)',
-    'norm = unicodedata.normalize("NFKD", base).encode("ascii", "ignore").decode("ascii")',
-    'safe = "".join((c if (c.isalnum() or c in "._-") else "_") for c in norm).strip("._") or "upload"',
-    'if not safe.lower().endswith(".pdf"):',
-    '    safe += ".pdf"',
-    'is_ascii = all(ord(c) < 128 for c in pdf_path) and all(ord(c) < 128 for c in base)',
-    'tmpdir = None',
-    'upload_path = pdf_path',
-    'display_name = base',
-    'if not is_ascii:',
-    '    tmpdir = tempfile.mkdtemp(prefix="gemini_upload_")',
-    '    upload_path = os.path.join(tmpdir, safe)',
-    '    shutil.copy2(pdf_path, upload_path)',
-    '    display_name = safe',
-    'f = client.files.upload(file=upload_path, config={"mime_type":"application/pdf","display_name":display_name})',
-    'print(json.dumps({"name": f.name}))',
-    'if tmpdir:',
-    '    shutil.rmtree(tmpdir, ignore_errors=True)',
-  ].join('\n');
-  const result = spawnSync(PYTHON_EXEC, ['-c', code, pdfPath], {
-    env: {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    },
-    encoding: 'utf8',
-  });
-  if (result.status !== 0) {
-    throw new Error((result.stderr || result.stdout || 'Gemini upload failed').trim());
-  }
-  const parsed = parseJsonFromOutput(result.stdout || '');
+async function llmUploadPdf(pdfPath) {
+  const { stdout } = await spawnPython(LLM_UPLOAD_PDF_SCRIPT, [pdfPath], { label: 'llm_upload_pdf' }).done;
+  const parsed = parseJsonFromOutput(stdout || '');
   if (!parsed?.name) {
-    throw new Error(`Gemini upload returned invalid payload: ${result.stdout}`);
+    throw new Error(`Gemini upload returned invalid payload: ${stdout}`);
   }
   return parsed.name;
 }
 
-function llmDeleteUploadedSync(uploadedFileName) {
+async function llmDeleteUploaded(uploadedFileName) {
   if (!uploadedFileName) return;
-  const code = [
-    'import sys',
-    'from dl_lit.llm_provider import get_client',
-    'client = get_client(required=True)',
-    'client.files.delete(name=sys.argv[1])',
-    'print("ok")',
-  ].join('; ');
-  const result = spawnSync(PYTHON_EXEC, ['-c', code, uploadedFileName], {
-    env: {
-      ...process.env,
-      PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-    },
-    encoding: 'utf8',
-  });
-  if (result.status !== 0) {
+  try {
+    await spawnPython(LLM_DELETE_UPLOAD_SCRIPT, [uploadedFileName], { label: 'llm_delete_upload' }).done;
+  } catch (error) {
     console.warn(
-      `[/api/extract-bibliography] Failed to delete uploaded LLM file ${uploadedFileName}: ${result.stderr || result.stdout}`
+      `[/api/extract-bibliography] Failed to delete uploaded LLM file ${uploadedFileName}: ${error?.message || error}`
     );
   }
 }
@@ -2696,7 +2513,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   // 15 s: the first index build on a large works table takes seconds and may
   // coincide with a worker holding the write lock.
   const authDb = new Database(DB_PATH, { timeout: 15_000 });
-  // spawnPythonJson is module-level but needs the settings table; hand it this
+  // pythonRunner is module-level but needs the settings table; hand it this
   // connection rather than reopening the DB on every spawn.
   appSettingsDb = authDb;
   // Test suites spin up multiple app instances in parallel; these settings
@@ -4793,17 +4610,20 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             reason: reason || null,
           });
         };
-        const cleanupSharedUpload = () => {
+        const cleanupSharedUpload = async () => {
           if (!sharedUploadedFileName) return;
           const toDelete = sharedUploadedFileName;
           sharedUploadedFileName = null;
-          llmDeleteUploadedSync(toDelete);
+          await llmDeleteUploaded(toDelete);
         };
 
+        // Async so the page count and shared upload don't block the event loop;
+        // the catch below still sees every setup error.
+        void (async () => {
         try {
           sendExtractionStarted();
 
-          const inputPageCount = inputExists ? getPdfPageCountSync(inputPdfPath) : null;
+          const inputPageCount = inputExists ? await getPdfPageCount(inputPdfPath) : null;
           if (inputPageCount) {
             console.log(`[/api/extract-bibliography] PDF page count: ${inputPageCount}`);
           }
@@ -4812,7 +4632,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           // get_bib_pages and inline fallback to avoid a second upload.
           if (inputExists && inputPageCount && inputPageCount <= 50) {
             try {
-              sharedUploadedFileName = llmUploadPdfSync(inputPdfPath);
+              sharedUploadedFileName = await llmUploadPdf(inputPdfPath);
               console.log(`[/api/extract-bibliography] Reusing uploaded Gemini file: ${sharedUploadedFileName}`);
               send(`[/api/extract-bibliography][corpus=${corpusTag}] Uploaded once for reuse: ${sharedUploadedFileName}`);
             } catch (uploadErr) {
@@ -4821,7 +4641,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
               sharedUploadedFileName = null;
             }
           }
-          const runApiScraper = ({
+          const runApiScraper = async ({
             inputDir = null,
             inputPdf = null,
             extractMode = 'page',
@@ -4832,53 +4652,43 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             extractModelOverride = null,
             label = 'APIscraper',
           }) => {
-            return new Promise((resolve) => {
-              const dbPath = DB_PATH;
-              const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
-              if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
-              if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
-              if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
-              if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
-              scrapeApiArgs.push('--seed-only');
-              if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
+            const dbPath = DB_PATH;
+            const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
+            if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
+            if (inputPdf) scrapeApiArgs.push('--input-pdf', inputPdf);
+            if (chunkPages && Number(chunkPages) > 0) scrapeApiArgs.push('--chunk-pages', String(chunkPages));
+            if (uploadedFileName) scrapeApiArgs.push('--uploaded-file-name', uploadedFileName);
+            scrapeApiArgs.push('--seed-only');
+            if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
 
-              console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
-              send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
-              const child = spawn(PYTHON_EXEC, [API_SCRAPER_SCRIPT, ...scrapeApiArgs], {
-                env: {
-                  ...process.env,
-                  ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
-                  ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
-                  ...(extractModelOverride ? { RAG_FEEDER_API_EXTRACT_MODEL: extractModelOverride } : {}),
-                  PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-                  RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-                  RAG_FEEDER_DB_PATH: DB_PATH,
-                },
-              });
-
-              child.stdout.on('data', (data) => {
-                const message = data.toString();
-                console.log(`[${label} stdout]: ${message}`);
-                send(`[${label}] [corpus=${corpusTag}] ${message}`);
-              });
-
-              child.stderr.on('data', (data) => {
-                const message = data.toString();
-                console.error(`[${label} stderr]: ${message}`);
-                send(`[${label} ERROR] [corpus=${corpusTag}] ${message}`);
-              });
-
-              child.on('close', (code) => {
-                if (code !== 0) {
-                  console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
-                  send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
-                  resolve(false);
-                  return;
-                }
-                console.log(`[/api/extract-bibliography] Finished ${label}.`);
-                resolve(true);
-              });
+            console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
+            const { done } = spawnPython(API_SCRAPER_SCRIPT, scrapeApiArgs, {
+              label,
+              env: {
+                ...(modelOverride ? { RAG_FEEDER_GEMINI_MODEL: modelOverride } : {}),
+                ...(inlineModelOverride ? { RAG_FEEDER_API_INLINE_MODEL: inlineModelOverride } : {}),
+                ...(extractModelOverride ? { RAG_FEEDER_API_EXTRACT_MODEL: extractModelOverride } : {}),
+              },
+              onStdoutLine: (line) => {
+                console.log(`[${label} stdout]: ${line}`);
+                send(`[${label}] [corpus=${corpusTag}] ${line}`);
+              },
+              onStderrLine: (line) => {
+                console.error(`[${label} stderr]: ${line}`);
+                send(`[${label} ERROR] [corpus=${corpusTag}] ${line}`);
+              },
             });
+            try {
+              await done;
+            } catch (error) {
+              const code = error?.exitCode ?? error?.message ?? error;
+              console.error(`[/api/extract-bibliography] ${label} exited with code ${code}`);
+              send(`[/api/extract-bibliography][corpus=${corpusTag}] ${label} failed with code ${code}`);
+              return false;
+            }
+            console.log(`[/api/extract-bibliography] Finished ${label}.`);
+            return true;
           };
 
           const runInlineFallback = async (reason) => {
@@ -4945,8 +4755,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                 console.error(`[/api/extract-bibliography] Reused-page extraction failed for ${filename}:`, error);
                 sendExtractionSignal({ status: 'failed', mode: 'page_reuse', reason: 'page_reuse_error' });
               })
-              .finally(() => {
-                cleanupSharedUpload();
+              .finally(async () => {
+                await cleanupSharedUpload();
                 finishTask();
               });
             return;
@@ -4962,28 +4772,21 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           }
 
           console.log(`[/api/extract-bibliography] Spawning: python ${GET_BIB_PAGES_SCRIPT} ${getPagesArgs.join(' ')}`);
-          const getPagesProcess = spawn(PYTHON_EXEC, [GET_BIB_PAGES_SCRIPT, ...getPagesArgs], {
-            env: {
-              ...process.env,
-              PYTHONPATH: [DL_LIT_PROJECT_DIR, REPO_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter),
-              RAG_FEEDER_DL_LIT_PROJECT_DIR: DL_LIT_PROJECT_DIR,
-              RAG_FEEDER_DB_PATH: DB_PATH,
+          const { done: getPagesDone } = spawnPython(GET_BIB_PAGES_SCRIPT, getPagesArgs, {
+            label: 'get_bib_pages',
+            onStdoutLine: (line) => {
+              console.log(`[get_bib_pages stdout]: ${line}`);
+              send(`[get_bib_pages][corpus=${corpusTag}] ${line}`);
+            },
+            onStderrLine: (line) => {
+              console.error(`[get_bib_pages stderr]: ${line}`);
+              send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${line}`);
             },
           });
 
-          getPagesProcess.stdout.on('data', (data) => {
-            const message = data.toString();
-            console.log(`[get_bib_pages stdout]: ${message}`);
-            send(`[get_bib_pages][corpus=${corpusTag}] ${message}`);
-          });
-
-          getPagesProcess.stderr.on('data', (data) => {
-            const message = data.toString();
-            console.error(`[get_bib_pages stderr]: ${message}`);
-            send(`[get_bib_pages ERROR][corpus=${corpusTag}] ${message}`);
-          });
-
-          getPagesProcess.on('close', (code) => {
+          // Exit code 0 on success; on failure the runner's exitCode (-1 when the
+          // process could not be spawned at all).
+          getPagesDone.then(() => 0, (error) => error?.exitCode ?? -1).then((code) => {
             void (async () => {
               try {
                 console.log(`[/api/extract-bibliography] ${GET_BIB_PAGES_SCRIPT} exited with code ${code}`);
@@ -5122,17 +4925,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                 console.error(`[/api/extract-bibliography] Unexpected post-processing error for ${filename}:`, error);
                 sendExtractionSignal({ status: 'failed', reason: 'post_process_error' });
               } finally {
-                cleanupSharedUpload();
+                await cleanupSharedUpload();
                 finishTask();
               }
             })();
           });
         } catch (error) {
-          console.error(`[/api/extract-bibliography] Synchronous error setting up processing for ${filename}:`, error);
-          cleanupSharedUpload();
+          console.error(`[/api/extract-bibliography] Error setting up processing for ${filename}:`, error);
+          await cleanupSharedUpload();
           sendExtractionSignal({ status: 'failed', reason: 'setup_error' });
           finishTask();
         }
+        })();
       });
     });
 
@@ -5187,7 +4991,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     let responded = false;
     let createdRunId = null;
-    const { child, done } = spawnPythonJson(KEYWORD_SEARCH_SCRIPT, built.args, {
+    const { child, done: spawned } = spawnPython(KEYWORD_SEARCH_SCRIPT, built.args, {
       dbPath: DB_PATH,
       corpusId: req.corpusId,
       onStdoutLine: (line) => {
@@ -5218,6 +5022,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         res.status(202).json({ runId, status: 'running' });
       },
     });
+    // As before, a run that exits 0 without a JSON summary counts as failed.
+    const done = spawned.then(({ stdout }) => parseJsonFromOutput(stdout));
     done
       .then(
         () => null,
