@@ -121,44 +121,60 @@ test('a JSON extraction frame drives the extraction card and a promotion frame i
   expect(errors).toEqual([])
 })
 
-test('lines buffered before a socket reconnect survive it', async ({ page }) => {
-  const { handle } = await boot(page, '#/workspace')
-  for (const n of [1, 2, 3]) handle.socket!.send(`[pipeline] kept line ${n}`)
-  await page.waitForTimeout(300)
+async function reconnect(page: Page, handle: { socket: WebSocketRoute | null; connects: number }) {
+  const before = handle.connects
   // The server drops the connection; the app reconnects after 3 s.
   handle.socket!.close({ code: 4000, reason: 'transient' })
-  await expect.poll(() => handle.connects, { timeout: 8000 }).toBe(2)
+  await expect.poll(() => handle.connects, { timeout: 8000 }).toBe(before + 1)
   await page.waitForTimeout(300)
+}
+
+test('lines buffered before a socket reconnect survive it and are not re-hydrated', async ({ page }) => {
+  const { handle, tail } = await boot(page, '#/workspace')
+  for (const n of [1, 2, 3]) handle.socket!.send(`[pipeline] kept line ${n}`)
+  await page.waitForTimeout(300)
+  await reconnect(page, handle)
+  // Only the first connect hydrated: the reconnect found buffered content.
+  expect(tail.cursors).toHaveLength(1)
   await page.evaluate(() => { window.location.hash = '#/logs' })
   await expect(panel(page)).toHaveAttribute('data-log-count', '3')
   for (const n of [1, 2, 3]) {
     await expect(page.getByText(`[pipeline] kept line ${n}`, { exact: true })).toHaveCount(1)
   }
+  expect(tail.cursors).toHaveLength(1)
 })
 
-test('a tail refresh that already holds a buffered line shows it once and keeps the cursor', async ({ page }) => {
-  const { handle, tail } = await boot(page, '#/logs')
-  let release!: () => void
-  const released = new Promise<void>((resolve) => { release = resolve })
-  tail.answer = async () => {
-    await released
-    // The backend persists a line before broadcasting it: the tail has it.
-    return { entries: ['[pipeline] old a', '[pipeline] old b', '[pipeline] live line'], next_cursor: 3, has_more: true }
-  }
-  await page.getByRole('button', { name: 'Refresh from file' }).click()
-  await expect.poll(() => tail.cursors.length).toBe(2)
-  // While the refresh is in flight the logs tab closes, so the live line stays buffered.
-  await page.evaluate(() => { window.location.hash = '#/workspace' })
-  handle.socket!.send('[pipeline] live line')
-  await page.waitForTimeout(300)
-  const answered = page.waitForResponse((res) => new URL(res.url()).pathname === '/api/logs/tail')
-  release()
-  await answered
-  await page.waitForTimeout(100)
+test('500 buffered lines survive a reconnect whole', async ({ page }) => {
+  const { handle, tail } = await boot(page, '#/workspace')
+  for (let i = 1; i <= 500; i += 1) handle.socket!.send(`[pipeline] buffered ${i}`)
+  await page.waitForTimeout(500)
+  // A tail answer, if one were requested, would be the last 200 file lines.
+  tail.answer = async () => ({
+    entries: Array.from({ length: 200 }, (_, i) => `[pipeline] buffered ${301 + i}`),
+    next_cursor: 200,
+    has_more: true,
+  })
+  await reconnect(page, handle)
   await page.evaluate(() => { window.location.hash = '#/logs' })
+  await expect(panel(page)).toHaveAttribute('data-log-count', '500')
+  await expect(page.locator('.log-line').first()).toHaveText('[pipeline] buffered 1')
+  await expect(page.locator('.log-line').last()).toHaveText('[pipeline] buffered 500')
+  expect(tail.cursors).toHaveLength(1)
+})
+
+test('Refresh from file replaces the rendered lines with the tail and continues from its cursor', async ({ page }) => {
+  const { handle, tail } = await boot(page, '#/logs')
+  handle.socket!.send('[pipeline] live line')
+  await expect(panel(page)).toHaveAttribute('data-log-count', '1')
+  // The backend persists a line before broadcasting it: the tail has it.
+  tail.answer = async () => ({
+    entries: ['[pipeline] old a', '[pipeline] old b', '[pipeline] live line'],
+    next_cursor: 3,
+    has_more: true,
+  })
+  await page.getByRole('button', { name: 'Refresh from file' }).click()
   await expect(panel(page)).toHaveAttribute('data-log-count', '3')
   await expect(page.getByText('[pipeline] live line', { exact: true })).toHaveCount(1)
-  // "Load older" continues from the tail's cursor: no line was counted twice.
   await page.getByRole('button', { name: 'Load older' }).click()
   await expect.poll(() => tail.cursors.length).toBe(3)
   expect(tail.cursors[2]).toBe('3')

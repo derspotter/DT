@@ -612,29 +612,6 @@
     }
   }
 
-  // The backend persists a line before broadcasting it, so a tail snapshot can
-  // already hold the oldest buffered lines. Drop the buffered prefix that the
-  // tail ends with (the longest buffer prefix whose last lines equal the tail's
-  // last lines); the buffered lines after it are newer than the snapshot.
-  function dropBufferedTailOverlap(tailLines) {
-    const last = tailLines.length
-    if (logBuffer.length === 0 || last === 0) return
-    for (let j = logBuffer.length; j > 0; j -= 1) {
-      const overlap = Math.min(j, last)
-      let matches = true
-      for (let k = 1; k <= overlap; k += 1) {
-        if (logBuffer[j - k].text !== String(tailLines[last - k])) {
-          matches = false
-          break
-        }
-      }
-      if (matches) {
-        logBuffer = logBuffer.slice(j)
-        return
-      }
-    }
-  }
-
   function tryParseJson(data) {
     if (typeof data !== 'string') return null
     try {
@@ -3786,8 +3763,11 @@
       workId > 0 &&
       candidate?.file_available === true
   }
+  // A reconnect (force = false) never hydrates over content, rendered or
+  // buffered; only the first connect with nothing and the explicit refreshes
+  // (Refresh from file, type/filter change) replace the view with the tail.
   async function hydrateLogsFromTail({ force = false } = {}) {
-    if (!force && logs.length > 0) return
+    if (!force && (logs.length > 0 || logBuffer.length > 0)) return
     logsTailStatus = 'Loading recent logs...'
     try {
       const payload = await fetchLogsTail({
@@ -3798,9 +3778,12 @@
         corpusId: getLogsCorpusId(),
       })
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
-      // Buffered lines the tail already holds are not appended (or counted
-      // into the cursor) a second time by the next flush.
-      dropBufferedTailOverlap(entries)
+      // The tail replaces the view: pending lines are dropped, not appended
+      // after it (the backend persists a line before broadcasting it, so the
+      // tail may hold them). A line that arrived between the request and this
+      // answer is dropped from the view as before batching; it is in the file
+      // and the next refresh shows it.
+      clearLogBuffer()
       logs = toLogEntries(entries.slice(-maxLogHistory))
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
