@@ -16,6 +16,7 @@
     fetchCorpusKantroposAssignment,
     saveCorpusKantroposAssignment,
     setAuthToken,
+    getAuthToken,
     uploadPdf,
     importSeed,
     extractBibliography,
@@ -4564,7 +4565,9 @@
       } catch (error) {
         // fall back to localhost default
       }
-      const ws = new WebSocket(wsUrl)
+      // The log socket authenticates via Sec-WebSocket-Protocol: ['bearer', <jwt>].
+      const token = getAuthToken()
+      const ws = token ? new WebSocket(wsUrl, ['bearer', token]) : new WebSocket(wsUrl)
       logsSocket = ws
       const scheduleReconnect = () => {
         if (authStatus !== 'authenticated') return
@@ -4645,11 +4648,17 @@
           requestRefreshSoon(isWorkerTick ? REFRESH_WORKER_TICK_MS : REFRESH_TRAILING_MS)
         }
       }
-      ws.onclose = () => {
-        if (logsSocket === ws) {
-          logsSocket = null
-          scheduleReconnect()
+      ws.onclose = (event) => {
+        if (logsSocket !== ws) return
+        logsSocket = null
+        if (event?.code === 4401) {
+          // Token rejected by the server: sign out like a 401, no reconnect.
+          logsStatus = 'unauthorized'
+          setAuthToken('')
+          authStatus = 'unauthenticated'
+          return
         }
+        scheduleReconnect()
       }
       ws.onerror = () => {
         if (logsSocket === ws) {

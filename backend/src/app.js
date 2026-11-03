@@ -184,7 +184,7 @@ function isStubMode() {
   return process.env.RAG_FEEDER_STUB === '1';
 }
 
-function resolveAuthConfig() {
+export function resolveAuthConfig() {
   if (isStubMode()) {
     return {
       jwtSecret: 'stub-jwt-secret',
@@ -1771,7 +1771,7 @@ function getCorpusKantroposAssignment(db, corpusId) {
   };
 }
 
-function getUserById(db, userId) {
+export function getUserById(db, userId) {
   return db
     .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
     .get(userId);
@@ -1883,7 +1883,7 @@ function authUserPayload(user, lastCorpusId = null, authConfig = resolveAuthConf
   };
 }
 
-function isAdminUser(user, authConfig = resolveAuthConfig()) {
+export function isAdminUser(user, authConfig = resolveAuthConfig()) {
   return String(user?.username || '') === authConfig.adminUsername;
 }
 
@@ -6692,6 +6692,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   }
 
   app.warmGraph3dSnapshot = warmGraph3dSnapshot;
+  // index.js hands these to attachLogSocket (logSocket.js) after listen().
+  app.authDb = authDb;
+  app.authConfig = authConfig;
 
   return app;
 }
