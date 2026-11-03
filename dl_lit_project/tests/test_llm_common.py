@@ -4,7 +4,11 @@ The location-label and source-metadata cases were pinned against both former
 copies (APIscraper_v2 and get_bib_pages) before they were unified; both agreed
 on every case below.
 """
+import subprocess
+import sys
+import textwrap
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +86,59 @@ def test_run_with_timeout_message_names_label(capsys):
         )
     out = capsys.readouterr().out
     assert "[WARNING] my label timed out after 0.05s (attempt 1/2)" in out
+
+
+def test_hung_call_does_not_keep_the_process_alive():
+    """The abandoned attempt must not be joined at interpreter exit."""
+    script = textwrap.dedent(
+        """
+        import time
+        from dl_lit.llm_common import run_with_timeout
+        try:
+            run_with_timeout(lambda: time.sleep(3), 0.2)
+        except TimeoutError:
+            pass
+        """
+    )
+    project_dir = Path(__file__).resolve().parent.parent
+    start = time.perf_counter()
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    elapsed = time.perf_counter() - start
+    print(f"subprocess exit after: {elapsed:.3f}s")
+    assert proc.returncode == 0, proc.stderr
+    assert elapsed < 1.5
+
+
+def test_timeout_error_raised_by_call_propagates_unchanged():
+    calls = []
+    original = TimeoutError("socket read timed out")
+
+    def call():
+        calls.append(1)
+        raise original
+
+    sleeps = []
+    with pytest.raises(TimeoutError) as excinfo:
+        llm_common.run_with_timeout(call, 1, retries=2, backoff_seconds=1, sleep=sleeps.append)
+    assert excinfo.value is original
+    assert len(calls) == 1
+    assert sleeps == []
+
+
+def test_returns_none_result_and_base_exceptions_propagate():
+    assert llm_common.run_with_timeout(lambda: None, 1) is None
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        llm_common.run_with_timeout(interrupted, 1, retries=1, sleep=lambda s: None)
 
 
 # --- extract_total_tokens ---------------------------------------------------

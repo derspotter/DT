@@ -1,8 +1,8 @@
 """Shared LLM helpers for the extraction modules (APIscraper_v2, get_bib_pages).
 
 - ``run_with_timeout``: run a blocking LLM call with a per-attempt timeout and retries.
-  Each attempt gets its own single-worker executor that is shut down with
-  ``wait=False`` so a hung call never delays the retry or the final ``TimeoutError``.
+  Each attempt runs on its own daemon thread that is abandoned on timeout, so a hung
+  call never delays the retry, the final ``TimeoutError`` or interpreter exit.
 - ``extract_total_tokens``: total token count from a Gemini response's usage metadata.
 - ``looks_like_location_label`` / ``normalize_source_metadata``: clean the
   ``source_metadata`` block the model returns (a place such as "Cambridge, MA" is
@@ -11,8 +11,8 @@
 """
 from __future__ import annotations
 
-import concurrent.futures
 import re
+import threading
 import time
 
 from dl_lit.utils import get_global_rate_limiter
@@ -32,6 +32,36 @@ LOCATION_LIKE_SOURCE_RE = re.compile(
 )
 
 
+class _AttemptTimedOut(Exception):
+    """One attempt exceeded its timeout (kept apart from a TimeoutError raised by the call)."""
+
+
+def _run_attempt(call, timeout_seconds):
+    """Run ``call()`` on a daemon thread; raise ``_AttemptTimedOut`` if it outlives the timeout.
+
+    A ``concurrent.futures`` executor is not used on purpose: its worker threads are
+    joined at interpreter exit, so a hung call would keep the process alive. The
+    abandoned daemon thread is simply left to finish (or die with the process).
+    """
+    outcome = []
+
+    def _target():
+        try:
+            outcome.append((True, call()))
+        except BaseException as exc:  # re-raised in the caller's thread
+            outcome.append((False, exc))
+
+    thread = threading.Thread(target=_target, name="llm-call", daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if not outcome:
+        raise _AttemptTimedOut()
+    ok, value = outcome[0]
+    if ok:
+        return value
+    raise value
+
+
 def run_with_timeout(
     call,
     timeout_seconds,
@@ -44,16 +74,14 @@ def run_with_timeout(
     """Return ``call()``; retry ``retries`` times on timeout, then raise ``TimeoutError``.
 
     The delay before retry ``n`` is ``backoff_seconds * n``. Exceptions raised by
-    ``call`` itself propagate unchanged and are not retried.
+    ``call`` itself (including its own ``TimeoutError``) propagate unchanged and are
+    not retried; only the per-attempt timeout enforced here is retried.
     """
     max_attempts = max(1, int(retries) + 1)
     for attempt in range(1, max_attempts + 1):
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(call)
         try:
-            return future.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
+            return _run_attempt(call, timeout_seconds)
+        except _AttemptTimedOut as exc:
             if attempt >= max_attempts:
                 raise TimeoutError(
                     f"Gemini request timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
@@ -66,8 +94,6 @@ def run_with_timeout(
             )
             if delay > 0:
                 sleep(delay)
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def extract_total_tokens(response) -> int | None:
