@@ -120,7 +120,7 @@ describe('graph routes are scoped to readable corpora', () => {
     writeSnapshot(fx.k1, { corpusId: fx.corpusA })
     writeSnapshot(fx.k2, { corpusId: null })
     writeSnapshot(fx.k3)
-  })
+  }, 30_000) // four bcrypt hashes plus four logins: slow on a loaded host
 
   afterAll(() => {
     delete process.env.RAG_FEEDER_DB_PATH
@@ -197,7 +197,7 @@ describe('graph routes are scoped to readable corpora', () => {
       for (const url of [`/api/graph/3d/cluster/${key}/1`, `/api/graph/3d/snapshot/${key}/clusters.json`]) {
         const member = await get(url, fx.viewer3Token)
         expect([url, member.status]).toEqual([url, memberStatus])
-        if (memberStatus === 403) expect(member.body).toEqual({ error: 'No access to this corpus' })
+        if (memberStatus === 403) expect(member.body).toEqual({ error: 'Admin access required' })
         const admin = await get(url, fx.adminToken)
         expect([url, admin.status]).toEqual([url, adminStatus])
       }
@@ -205,9 +205,11 @@ describe('graph routes are scoped to readable corpora', () => {
     // A user who is not a member of k1's corpus is refused as well.
     const lonely = await get(`/api/graph/3d/cluster/${fx.k1}/1`, fx.lonelyToken)
     expect(lonely.status).toBe(403)
+    expect(lonely.body).toEqual({ error: 'No access to this corpus' })
     // A client-supplied corpus never widens access.
     const spoofed = await get(`/api/graph/3d/snapshot/${fx.k2}/manifest.json?corpus_id=${fx.corpusA}`, fx.viewer3Token)
     expect(spoofed.status).toBe(403)
+    expect(spoofed.body).toEqual({ error: 'Admin access required' })
   })
 
   test('writeGraph3dScope / readGraph3dScope round-trip, and a missing sidecar reads as null', () => {

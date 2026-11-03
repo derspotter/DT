@@ -2901,8 +2901,12 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   };
   const requireGraph3dScopeAccess = (req, res, next) => {
     const key = String(req.params.snapshotKey || '').trim();
-    if (/^[a-f0-9]{20}$/.test(key) && !canReadGraph3dScope(req, readGraph3dScope(key))) {
-      return res.status(403).json({ error: 'No access to this corpus' });
+    if (!/^[a-f0-9]{20}$/.test(key)) return next();
+    const scope = readGraph3dScope(key);
+    if (!canReadGraph3dScope(req, scope)) {
+      // Admin-only scopes (merged view, no sidecar) vs. a specific foreign corpus.
+      const adminOnly = !scope || scope.corpusId === null;
+      return res.status(403).json({ error: adminOnly ? 'Admin access required' : 'No access to this corpus' });
     }
     return next();
   };
