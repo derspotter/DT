@@ -1,4 +1,5 @@
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import request from 'supertest'
@@ -106,6 +107,7 @@ describe('test database isolation', () => {
     expect(dbPath).toBeTruthy()
     const realDataDir = path.resolve(here, '../../dl_lit_project/data')
     expect(path.resolve(dbPath).startsWith(realDataDir + path.sep)).toBe(false)
+    expect(path.resolve(dbPath).startsWith(path.resolve(os.tmpdir()) + path.sep)).toBe(true)
   })
 })
 
