@@ -981,31 +981,28 @@
 
     try {
       if (baseName) {
-        // Only a corpus change stops these; the run itself may end meanwhile
-        // without skipping the follow-up.
+        // A corpus change or a newer run supersedes this completion: it must
+        // neither report on nor finish the run that replaced it.
         await loadSeedSources({ quiet: true })
-        if (epoch !== corpusScopeEpoch) return
-        if (!stale()) {
-          // The pdf seed's candidate count says whether the extraction found
-          // entries; same match as focusSeedSource('pdf', baseName).
-          const seedId = `pdf:${baseName}`
-          const seed = seedSources.find((entry) => seedSourceId(entry) === seedId)
-          updateExtractionProgress({
-            phase: 'completed',
-            detail: seed && Number(seed.candidate_count) > 0 ? 'Extraction complete.' : detail,
-            percent: 100,
-            indeterminate: false,
-          })
-        }
+        if (stale()) return
+        // The pdf seed's candidate count says whether the extraction found
+        // entries; same match as focusSeedSource('pdf', baseName).
+        const seedId = `pdf:${baseName}`
+        const seed = seedSources.find((entry) => seedSourceId(entry) === seedId)
+        updateExtractionProgress({
+          phase: 'completed',
+          detail: seed && Number(seed.candidate_count) > 0 ? 'Extraction complete.' : detail,
+          percent: 100,
+          indeterminate: false,
+        })
         await focusSeedSource('pdf', baseName)
-        if (epoch !== corpusScopeEpoch) return
+        if (stale()) return
         await loadIngestStats()
-        if (epoch !== corpusScopeEpoch) return
+        if (stale()) return
         await loadIngestRuns()
-        if (epoch !== corpusScopeEpoch) return
-        const completedRunId = extractionProgress.runId
+        if (stale()) return
         setTimeout(() => {
-          if (extractionProgress.active && extractionProgress.runId === completedRunId) {
+          if (extractionProgress.active && extractionProgress.runId === runId) {
             finishExtractionProgress()
           }
         }, 1200)

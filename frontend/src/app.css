@@ -2717,30 +2717,6 @@ button.danger:disabled {
   outline-offset: 1px;
 }
 
-@keyframes corpusPromotionSlide {
-  from {
-    transform: translate(var(--promotion-dx, 0), var(--promotion-dy, 0));
-    opacity: 0.72;
-  }
-
-  to {
-    transform: translate(0, 0);
-    opacity: 1;
-  }
-}
-
-@keyframes corpusPromotionFlash {
-  0% {
-    background: rgba(var(--accent-rgb), 0.26);
-    border-color: rgba(var(--accent-rgb), 0.42);
-  }
-
-  100% {
-    background: rgba(var(--accent-rgb), 0.08);
-    border-color: rgba(var(--accent-rgb), 0.16);
-  }
-}
-
 .opacity-50 {
   opacity: 0.5;
 }
