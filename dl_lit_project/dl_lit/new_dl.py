@@ -22,7 +22,14 @@ from bs4 import BeautifulSoup
 from .db_manager import DatabaseManager
 from .identifiers import inverted_index_to_text_lenient
 from .pdf_downloader import PDFDownloader
-from .utils import ServiceRateLimiter, env_bool, env_int, get_global_rate_limiter
+from .utils import (
+    ServiceRateLimiter,
+    env_bool,
+    env_int,
+    get_global_rate_limiter,
+    get_openalex_session,
+    get_thread_session,
+)
 try:
     # bibtexparser 1.x does not ship middlewares; keep optional so downloads can run without it.
     from bibtexparser.middlewares import SeparateCoAuthors, LatexEncodingMiddleware  # type: ignore
@@ -375,9 +382,7 @@ class BibliographyEnhancer:
         return status_code in {401, 402, 403, 407, 451, 500, 502, 503, 504}
 
     def _request_get_direct(self, url: str, **kwargs) -> requests.Response:
-        with requests.Session() as session:
-            session.trust_env = False
-            return session.get(url, **kwargs)
+        return get_thread_session("download").get(url, **kwargs)
 
     def _request_get_vpn(self, url: str, **kwargs) -> requests.Response:
         if not self.proxies:
@@ -386,10 +391,7 @@ class BibliographyEnhancer:
             raise requests.exceptions.RequestException(
                 "eduVPN not connected (or could not be verified); refusing desktop proxy route"
             )
-        with requests.Session() as session:
-            session.trust_env = False
-            session.proxies.update(self.proxies)
-            return session.get(url, **kwargs)
+        return get_thread_session("download-vpn", proxies=self.proxies).get(url, **kwargs)
 
     @staticmethod
     def _run_shell_cmd(command: str, timeout_seconds: int) -> tuple[bool, str]:
@@ -1121,12 +1123,9 @@ class BibliographyEnhancer:
                 
                 # If it seems to be HTML, try extracting PDF link
                 if 'text/html' in response.headers.get('Content-Type', '').lower():
-                    pdf_url = self.try_extract_pdf_link(
-                        url,
-                        source=source_label,
-                        allow_vpn_fallback=(route_used == "direct"),
-                        force_vpn=(route_used == "vpn"),
-                    )
+                    # Parse the landing page already in hand (relative links resolve
+                    # against response.url) instead of fetching it a second time.
+                    pdf_url = self._extract_pdf_link_from_response(response)
                     if pdf_url and pdf_url != url:
                         return self.download_paper(pdf_url, filename, ref_type)
             
@@ -2214,7 +2213,7 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
 
         try:
             print(f"  [OpenAlex] Fetching Batch {current_batch_num}/{total_batches} ({len(batch_ids)} IDs)...")
-            resp = requests.get(url, headers={"User-Agent": f"ReferenceIngestor/1.0 ({email})"}, timeout=60)
+            resp = get_openalex_session().get(url, headers={"User-Agent": f"ReferenceIngestor/1.0 ({email})"}, timeout=60)
             resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             data = resp.json()
             batch_res = data.get("results", [])

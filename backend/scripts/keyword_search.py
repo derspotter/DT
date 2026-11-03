@@ -39,6 +39,7 @@ from dl_lit.keyword_search import (
 from dl_lit.utils import (
     OpenAlexRateLimitExceeded,
     get_global_rate_limiter,
+    get_openalex_session,
     openalex_request_json,
 )
 from reference_expansion import (
@@ -95,6 +96,7 @@ def _openalex_get(params, mailto=None, retries=3):
         params=request_params,
         headers={'Accept': 'application/json'},
         timeout=30,
+        session=get_openalex_session(),
         rate_limiter=get_global_rate_limiter(),
         retries=retries,
     )

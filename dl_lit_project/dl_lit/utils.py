@@ -11,6 +11,7 @@ import os
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 
 
 OPENALEX_BASE_URL = 'https://api.openalex.org'
@@ -524,20 +525,44 @@ def openalex_request_json(
     raise RuntimeError('OpenAlex request failed after retries')
 
 
-_openalex_session_local = threading.local()
+_thread_sessions_local = threading.local()
+
+
+def get_thread_session(
+    kind: str,
+    *,
+    proxies: dict | None = None,
+    trust_env: bool = False,
+    pool_maxsize: int = 16,
+) -> requests.Session:
+    """Return this thread's keep-alive requests.Session for ``kind`` (and ``proxies``).
+
+    requests.Session is not guaranteed thread-safe, so sessions are never shared
+    across threads; within a thread the connection pool is reused across calls.
+    The cache key is ``(kind, proxies)``; ``trust_env`` and ``pool_maxsize`` apply
+    when the session is first created for that key.
+    """
+    cache = getattr(_thread_sessions_local, 'sessions', None)
+    if cache is None:
+        cache = {}
+        _thread_sessions_local.sessions = cache
+    key = (kind, tuple(sorted(proxies.items())) if proxies else None)
+    session = cache.get(key)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = trust_env
+        if proxies:
+            session.proxies.update(proxies)
+        adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        cache[key] = session
+    return session
 
 
 def get_openalex_session() -> requests.Session:
-    """Return this thread's shared requests.Session for OpenAlex calls.
-
-    requests.Session is not guaranteed thread-safe, so each thread gets its own
-    instance; within a thread the connection pool is reused across pages.
-    """
-    session = getattr(_openalex_session_local, 'session', None)
-    if session is None:
-        session = requests.Session()
-        _openalex_session_local.session = session
-    return session
+    """Return this thread's shared requests.Session for OpenAlex calls."""
+    return get_thread_session('openalex', pool_maxsize=64)
 
 
 def reset_global_rate_limiter():

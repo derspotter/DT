@@ -1,7 +1,7 @@
 import requests
 import hashlib
 from pathlib import Path
-from .utils import ServiceRateLimiter
+from .utils import ServiceRateLimiter, get_thread_session
 try:
     import fitz  # PyMuPDF
     PYMUPDF_AVAILABLE = True
@@ -104,9 +104,9 @@ class PDFDownloader:
             print(f"[Downloader] Attempting to download from {source}: {pdf_url}")
             # Use a generic rate limit for downloads, as we don't know the host in advance
             self.rate_limiter.wait_if_needed('default') 
-            with requests.Session() as session:
-                session.trust_env = False
-                response = session.get(pdf_url, headers=self.headers, timeout=60, allow_redirects=True)
+            response = get_thread_session("download").get(
+                pdf_url, headers=self.headers, timeout=60, allow_redirects=True
+            )
             response.raise_for_status()
 
             pdf_content = response.content
