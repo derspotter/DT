@@ -2790,19 +2790,62 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   };
   // Corpus-scoped readers treat a null corpusId as "all corpora", so every
   // read route that hands them req.corpusId needs a resolved, accessible corpus.
-  const requireCorpusMember = (getCorpusId = (req) => req.corpusId) => (req, res, next) => {
-    if (isStubMode()) return next();
+  // Resolves the caller's role on getCorpusId(req) and sets req.corpusRole;
+  // on failure sends the 403 itself and returns null.
+  const resolveRequestCorpusRole = (req, res, getCorpusId) => {
     const corpusId = getCorpusId(req);
     if (corpusId === null || corpusId === undefined) {
-      return res.status(403).json({ error: 'Select a corpus first' });
+      res.status(403).json({ error: 'Select a corpus first' });
+      return null;
     }
     const corpusRole = resolveCorpusRole(authDb, req.user, corpusId, authConfig);
     if (!corpusRole) {
-      return res.status(403).json({ error: 'No access to this corpus' });
+      res.status(403).json({ error: 'No access to this corpus' });
+      return null;
     }
     req.corpusRole = corpusRole;
+    return corpusRole;
+  };
+  const requireCorpusMember = (getCorpusId = (req) => req.corpusId) => (req, res, next) => {
+    if (isStubMode()) return next();
+    if (!resolveRequestCorpusRole(req, res, getCorpusId)) return undefined;
     return next();
   };
+  // Like requireCorpusMember, but the member's role must also be in `roles`
+  // (the admin always passes); `forbiddenError` is the body for a member
+  // whose role does not qualify.
+  const requireCorpusRole = (
+    roles,
+    getCorpusId = (req) => req.corpusId,
+    { forbiddenError = 'No access to this corpus' } = {}
+  ) => (req, res, next) => {
+    if (isStubMode()) return next();
+    const corpusRole = resolveRequestCorpusRole(req, res, getCorpusId);
+    if (!corpusRole) return undefined;
+    if (corpusRole !== 'admin' && !roles.includes(corpusRole)) {
+      return res.status(403).json({ error: forbiddenError });
+    }
+    return next();
+  };
+  // A Kantropos target is usable by the admin, or by a member holding one of
+  // `roles` on a corpus currently assigned to that target.
+  const canUseKantroposTarget = (user, targetId, { roles }) => {
+    if (isStubMode()) return true;
+    if (isAdminUser(user, authConfig)) return true;
+    if (!user?.id || !targetId || !Array.isArray(roles) || roles.length === 0) return false;
+    const placeholders = roles.map(() => '?').join(', ');
+    return Boolean(
+      authDb
+        .prepare(
+          `SELECT 1 FROM user_corpora uc
+           JOIN corpus_kantropos_assignments a ON a.corpus_id = uc.corpus_id
+           WHERE uc.user_id = ? AND a.target_id = ? AND uc.role IN (${placeholders})
+           LIMIT 1`
+        )
+        .get(user.id, String(targetId), ...roles)
+    );
+  };
+  const corpusIdFromParams = (req) => Number(req.params.id);
   const requireCurrentCorpusMember = requireCorpusMember();
   // ?global=1 is admin-gated inside the handler and reads every corpus on
   // purpose; every other request is scoped to the current corpus.
@@ -4099,6 +4142,9 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.post('/api/scraper/apply', requireAuthMiddleware, (req, res) => {
     try {
       const targetId = String(req.body?.targetId || req.body?.target_id || '').trim();
+      if (!canUseKantroposTarget(req.user, targetId, { roles: ['owner', 'editor'] })) {
+        return res.status(403).json({ error: 'No access to this Kantropos corpus' });
+      }
       const target = getKantroposTargetById(targetId);
       if (!target) return res.status(400).json({ error: 'Unknown Kantropos corpus target' });
 
@@ -4265,8 +4311,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(400).json({ error: 'Invalid apply event id' });
       }
       const row = authDb
-        .prepare('SELECT generated_bib_path FROM scraper_apply_events WHERE id = ?')
+        .prepare('SELECT generated_bib_path, target_id, user_id FROM scraper_apply_events WHERE id = ?')
         .get(eventId);
+      if (!row) {
+        return res.status(404).json({ error: 'Generated metadata.bib draft not found' });
+      }
+      const isApplier = row.user_id !== null && Number(row.user_id) === Number(req.user?.id);
+      if (!isApplier && !canUseKantroposTarget(req.user, row.target_id, { roles: ['owner', 'editor'] })) {
+        return res.status(403).json({ error: 'No access to this Kantropos corpus' });
+      }
       const generatedBibPath = String(row?.generated_bib_path || '').trim();
       if (!generatedBibPath) {
         return res.status(404).json({ error: 'Generated metadata.bib draft not found' });
@@ -4298,19 +4351,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.status(201).json({ id: corpusId, name });
   });
 
-  app.post('/api/corpora/:id/select', requireAuthMiddleware, (req, res) => {
+  app.post('/api/corpora/:id/select', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
     const corpusId = Number(req.params.id);
-    const access = authDb
-      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
-      .get(req.user.id, corpusId);
-    if (!access) {
-      return res.status(403).json({ error: 'No access to corpus' });
-    }
     authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusId, req.user.id);
     return res.json({ selected: corpusId });
   });
 
-  app.post('/api/corpora/:id/share', requireAuthMiddleware, (req, res) => {
+  const requireCorpusOwnerToShare = requireCorpusRole(['owner'], corpusIdFromParams, {
+    forbiddenError: 'Only owners can share corpora',
+  });
+  app.post('/api/corpora/:id/share', requireAuthMiddleware, requireCorpusOwnerToShare, (req, res) => {
     const corpusId = Number(req.params.id);
     const { username, role = 'viewer' } = req.body || {};
     const normalizedRole = String(role || 'viewer').trim().toLowerCase();
@@ -4319,12 +4369,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
     if (!['viewer', 'editor'].includes(normalizedRole)) {
       return res.status(400).json({ error: 'Role must be viewer or editor' });
-    }
-    const access = authDb
-      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
-      .get(req.user.id, corpusId);
-    if (!access || access.role !== 'owner') {
-      return res.status(403).json({ error: 'Only owners can share corpora' });
     }
     const target = authDb.prepare('SELECT id FROM users WHERE username = ?').get(username);
     if (!target) {
@@ -4339,29 +4383,22 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     return res.json({ shared: true });
   });
 
-  app.get('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, (req, res) => {
+  app.get('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
     const corpusId = Number(req.params.id);
-    const role = getCorpusRoleForUser(authDb, req.user.id, corpusId);
-    if (!role) {
-      return res.status(403).json({ error: 'No access to corpus' });
-    }
+    const role = req.corpusRole;
     return res.json({
       assignment: getCorpusKantroposAssignment(authDb, corpusId),
       corpora: KANTROPOS_TARGETS,
       root_path: KANTROPOS_CORPORA_ROOT,
-      can_edit: canConfigureCorpus(role) || isAdminUser(req.user, authConfig),
+      can_edit: canConfigureCorpus(role) || role === 'admin',
     });
   });
 
-  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, (req, res) => {
+  const requireCorpusConfigurer = requireCorpusRole(['owner', 'editor'], corpusIdFromParams, {
+    forbiddenError: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus',
+  });
+  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusConfigurer, (req, res) => {
     const corpusId = Number(req.params.id);
-    const role = getCorpusRoleForUser(authDb, req.user.id, corpusId);
-    if (!role) {
-      return res.status(403).json({ error: 'No access to corpus' });
-    }
-    if (!(canConfigureCorpus(role) || isAdminUser(req.user, authConfig))) {
-      return res.status(403).json({ error: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus' });
-    }
     const nextTargetIdRaw = req.body?.targetId;
     const nextTargetId = nextTargetIdRaw === null || nextTargetIdRaw === undefined || nextTargetIdRaw === ''
       ? null
@@ -4397,18 +4434,17 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     });
   });
 
-  app.delete('/api/corpora/:id', requireAuthMiddleware, (req, res) => {
+  const requireCorpusOwnerToDelete = requireCorpusRole(['owner'], corpusIdFromParams, {
+    forbiddenError: 'Only owners can delete corpora',
+  });
+  app.delete('/api/corpora/:id', requireAuthMiddleware, (req, res, next) => {
     const corpusId = Number(req.params.id);
     if (!Number.isFinite(corpusId) || corpusId <= 0) {
       return res.status(400).json({ error: 'Invalid corpus id' });
     }
-
-    const access = authDb
-      .prepare('SELECT role FROM user_corpora WHERE user_id = ? AND corpus_id = ?')
-      .get(req.user.id, corpusId);
-    if (!access || access.role !== 'owner') {
-      return res.status(403).json({ error: 'Only owners can delete corpora' });
-    }
+    return next();
+  }, requireCorpusOwnerToDelete, (req, res) => {
+    const corpusId = Number(req.params.id);
 
     const corpus = authDb
       .prepare('SELECT id, name FROM corpora WHERE id = ?')
@@ -6386,6 +6422,23 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         return res.status(400).json({ error: "Invalid log type. Use 'pipeline' or 'app'." });
       }
 
+      // App logs span every corpus: admin only. Pipeline logs are filtered to
+      // one corpus the caller belongs to (?corpus_id, else the current corpus).
+      let logCorpusId = Number.isFinite(parsedCorpusId) ? parsedCorpusId : null;
+      if (!isStubMode()) {
+        if (type === 'app') {
+          if (!isAdminUser(req.user, authConfig)) {
+            return res.status(403).json({ error: 'Admin access required' });
+          }
+        } else {
+          if (corpusIdRaw !== undefined && corpusIdRaw !== null && String(corpusIdRaw).trim() !== '' && logCorpusId === null) {
+            return res.status(400).json({ error: 'Invalid corpus_id' });
+          }
+          logCorpusId = logCorpusId ?? req.corpusId ?? null;
+          if (!resolveRequestCorpusRole(req, res, () => logCorpusId)) return undefined;
+        }
+      }
+
       if (!fs.existsSync(logDir)) {
         return res.json({
           type,
@@ -6407,7 +6460,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         cursor,
         includeRotated,
         maxFiles,
-        corpusId: type === 'pipeline' && Number.isFinite(parsedCorpusId) ? parsedCorpusId : null,
+        corpusId: type === 'pipeline' ? logCorpusId : null,
       });
       return res.json({
         type,
