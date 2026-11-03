@@ -415,6 +415,9 @@
   let corpusFilterDebounce = null
   let corpusSort = ''
   let corpusLoading = false
+  // The first page as the poll last applied it (rows, totals, filter, sort):
+  // an identical answer leaves corpusItems alone, so the table does not re-render.
+  let lastCorpusPageSignature = ''
   let corpusLoadingMore = false
   let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
@@ -504,7 +507,6 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
-  let pipelineRefreshInFlight = false
   const REFRESH_ACTIVE_MS = 2000
   const REFRESH_IDLE_MS = 20000
   const REFRESH_TRAILING_MS = 1500
@@ -513,7 +515,6 @@
   let refreshTimerDueAt = 0
   let refreshDirty = false
   let refreshDisposed = false
-  let lastTabRefreshAt = 0
   let creatingCorpus = false
   let deletingCorpus = false
   let corpusActionStatus = ''
@@ -541,6 +542,8 @@
   let kantroposAssignmentLoading = false
   let kantroposAssignmentSaving = false
   let kantroposAssignmentRequestSeq = 0
+  // The corpus the loaded assignment belongs to (null: not loaded).
+  let kantroposAssignmentCorpusId = null
   let selectedUpstreamTargetId = ''
   let selectedUpstreamAssignedCorpusId = null
   let upstreamBrowse = {
@@ -569,6 +572,7 @@
 
   function resetKantroposAssignmentState() {
     kantroposAssignment = null
+    kantroposAssignmentCorpusId = null
     selectedKantroposTargetId = ''
     kantroposAssignmentStatus = ''
     kantroposAssignmentError = false
@@ -1342,6 +1346,78 @@
     if (error?.status === 403) void reconcileCorpusWithBackend()
   }
 
+  // What each tab renders, and therefore loads: boot (refreshAll), a tab
+  // switch (refreshForActiveTab) and the cadence (runLiveRefreshCycleOnce)
+  // all read this one table. The admin-only resources are added on top.
+  const TAB_RESOURCES = {
+    workspace: ['stats', 'corpus', 'seeds', 'runs'],
+    dashboard: ['stats', 'corpus', 'runs'],
+    downloads: [],
+    upstream: ['upstream'],
+    graph: [],
+    scraper: [],
+    logs: [],
+    admin: [],
+  }
+  const ADMIN_RESOURCES = {
+    dashboard: ['downloads', 'daemon', 'globalStats', 'globalDaemon'],
+    downloads: ['downloads', 'daemon'],
+    workspace: ['daemon'],
+  }
+
+  function resourcesFor(tab, { admin = false } = {}) {
+    const tabId = normalizeTab(tab)
+    return [...(TAB_RESOURCES[tabId] || []), ...(admin ? ADMIN_RESOURCES[tabId] || [] : [])]
+  }
+
+  // `quiet` is false only for refreshAll (boot, sign-in, corpus switch),
+  // which shows the loading/result status lines; tab switches and polls do not.
+  const loaders = {
+    stats: ({ quiet }) => loadIngestStats({ quiet }),
+    corpus: ({ quiet }) => (quiet ? loadCorpus({ preserveSelection: true, quiet: true }) : loadCorpus()),
+    seeds: ({ quiet }) => loadSeedSources({ quiet }),
+    runs: () => loadIngestRuns(),
+    upstream: ({ quiet }) => loadUpstreamBrowse({ quiet }),
+    downloads: () => loadDownloads(),
+    daemon: ({ quiet }) => loadPipelineWorkerStatus({ quiet }),
+    globalStats: () => loadIngestStats({ quiet: true, global: true }),
+    globalDaemon: () => loadPipelineWorkerStatus({ quiet: true, global: true }),
+    quota: () => loadOpenAlexQuota(),
+  }
+
+  // One promise per resource in flight: a second request for the same
+  // resource joins it instead of fetching again. Cleared on a corpus switch or
+  // sign-out (invalidateCorpusScopedRequests), so the next corpus never joins
+  // a load that was requested for the previous one.
+  const resourcesInFlight = new Map()
+
+  function startResource(name, quiet) {
+    let result
+    try {
+      result = loaders[name]({ quiet })
+    } catch (error) {
+      result = Promise.reject(error)
+    }
+    // Loaders report their own failures; one that throws anyway must neither
+    // reject the other loads nor leave its name stuck in the map.
+    const pending = Promise.resolve(result)
+      .catch((error) => console.error(`Refreshing "${name}" failed`, error))
+      .finally(() => {
+        if (resourcesInFlight.get(name) === pending) resourcesInFlight.delete(name)
+      })
+    resourcesInFlight.set(name, pending)
+    return pending
+  }
+
+  async function refreshResources(names, { quiet = true } = {}) {
+    const unique = [...new Set(names)].filter((name) => loaders[name])
+    await Promise.all(unique.map((name) => resourcesInFlight.get(name) || startResource(name, quiet)))
+  }
+
+  function refreshQuota() {
+    return refreshResources(['quota'])
+  }
+
   async function runLiveRefreshCycle() {
     try {
       await runLiveRefreshCycleOnce()
@@ -1355,111 +1431,36 @@
     const dirty = refreshDirty
     refreshDirty = false
     if (authStatus !== 'authenticated') return
-    if (!shouldRunLiveRefresh()) {
-      // The Admin panel shows the OpenAlex budget too; keep it current there
-      // without the full workspace refresh.
-      if (activeTab === 'admin') void loadOpenAlexQuota()
-      // A running search run is what keeps the 2 s cadence going here; its
-      // terminal status has to be discoverable from any tab, or the cadence
-      // never ends and the run shows as running until the workspace is opened.
-      if (!dirty && !anySearchRunning) return
-      if (pipelineRefreshInFlight) {
-        if (dirty) refreshDirty = true
-        return
-      }
-      pipelineRefreshInFlight = true
-      try {
-        if (await awaitPendingCorpusReconcile()) return
-        const tasks = []
-        if (anySearchRunning) tasks.push(loadSeedSources({ quiet: true }))
-        if (dirty) {
-          tasks.push(loadIngestStats({ quiet: true }), loadIngestRuns())
-          // Discover a worker started elsewhere, so refreshReason() can go active.
-          if (diagnosticsEnabled) {
-            tasks.push(
-              loadPipelineWorkerStatus({ quiet: true }),
-              loadDownloadWorkerStatus({ quiet: true }),
-            )
-          }
-        }
-        await Promise.all(tasks)
-      } finally {
-        pipelineRefreshInFlight = false
-      }
-      return
+    const admin = diagnosticsEnabled
+    // Off the polling tabs only a search run (its terminal status has to be
+    // discoverable from any tab, or the cadence never ends) or dirty data
+    // (log lines) load anything; the tab's own resources are not refreshed.
+    const tabCycle = shouldRunLiveRefresh()
+    const names = tabCycle ? resourcesFor(activeTab, { admin }) : []
+    if (anySearchRunning) names.push('seeds')
+    if (dirty) {
+      names.push('runs')
+      if (!tabCycle) names.push('stats')
     }
-    if (pipelineRefreshInFlight) {
-      if (dirty) refreshDirty = true
-      return
-    }
-    pipelineRefreshInFlight = true
-    try {
-      // A corpus switch reloads the workspace itself; skip this cycle's loads.
-      if (await reconcileCorpusWithBackend()) return
-      const tasks = [
-        loadIngestStats({ quiet: true }),
-        loadCorpus({ preserveSelection: true, quiet: true }),
-        loadOpenAlexQuota(),
-      ]
-      if (dirty) tasks.push(loadIngestRuns())
-      // Not only while a run is known to be running: the workspace is where
-      // seeds live, and a run started elsewhere (or one this tab has not seen
-      // yet) has to be able to show up on its own.
-      if (anySearchRunning || activeTab === 'workspace') {
-        tasks.push(loadSeedSources({ quiet: true }))
-      }
-      if (diagnosticsEnabled) {
-        tasks.push(
-          loadDownloads(),
-          loadDownloadWorkerStatus({ quiet: true }),
-          loadPipelineWorkerStatus({ quiet: true }),
-        )
-      }
-      await Promise.all(tasks)
-    } finally {
-      pipelineRefreshInFlight = false
-    }
+    // Discover a worker started elsewhere, so refreshReason() can go active,
+    // and keep polling a busy one, so it can go idle again.
+    if (admin && (dirty || workerBusy(pipelineWorker) || workerBusy(downloadWorker))) names.push('daemon')
+    // The OpenAlex budget (workspace search panel, Admin settings row) moves
+    // only with searches and promotions, which refresh it themselves.
+    if (refreshReason() === 'idle' && (activeTab === 'admin' || activeTab === 'workspace')) names.push('quota')
+    if (names.length === 0) return
+    // A corpus switch reloads the workspace itself; skip this cycle's loads.
+    if (tabCycle ? await reconcileCorpusWithBackend() : await awaitPendingCorpusReconcile()) return
+    // A load already in flight was requested before these log lines: join it,
+    // but keep the data dirty so the trailing run fetches it fresh.
+    if (dirty && names.some((name) => resourcesInFlight.has(name))) refreshDirty = true
+    await refreshResources(names)
   }
 
   async function refreshForActiveTab(tabId) {
     if (authStatus !== 'authenticated') return
-    const now = Date.now()
-    // Avoid duplicate refreshes from rapid tab/hash updates.
-    if (now - lastTabRefreshAt < 800) return
-    if (pipelineRefreshInFlight) return
-    lastTabRefreshAt = now
-    pipelineRefreshInFlight = true
-    try {
-      if (await awaitPendingCorpusReconcile()) return
-      // The graph tab renders none of the pipeline/ingest counts, so skip the
-      // ingest-stats query there (completes #35's "don't load workspace data on
-      // the graph tab" — refreshAll already skips it; this is the per-tab path).
-      const tasks = []
-      if (tabId !== 'graph') {
-        tasks.push(loadIngestStats({ quiet: true }))
-      }
-      if (diagnosticsEnabled) {
-        tasks.push(
-          loadPipelineWorkerStatus({ quiet: true }),
-          loadDownloadWorkerStatus({ quiet: true }),
-        )
-      }
-      if (tabId === 'workspace') {
-        tasks.push(loadSeedSources({ quiet: true }))
-      }
-      if (tabId === 'dashboard' || tabId === 'workspace') {
-        tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
-      }
-      if (tabId === 'upstream') {
-        tasks.push(loadUpstreamBrowse({ quiet: true }))
-      }
-      if (diagnosticsEnabled && (tabId === 'dashboard' || tabId === 'downloads')) {
-        tasks.push(loadDownloads())
-      }
-      await Promise.all(tasks)
-    } finally {
-      pipelineRefreshInFlight = false
-    }
+    if (await awaitPendingCorpusReconcile()) return
+    await refreshResources(resourcesFor(tabId, { admin: diagnosticsEnabled }))
   }
 
   async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
@@ -1472,7 +1473,7 @@
     // the seed list, corpus table and counts do not have to wait for the
     // auth round trip: start them now and let refreshAll collect them. A bad
     // token fails them with a 401 exactly as it fails fetchMe below.
-    const inFlight = tabNeedsWorkspaceData(landingTab) ? startWorkspaceLoads() : null
+    const inFlight = tabNeedsWorkspaceData(landingTab) ? startWorkspaceLoads(landingTab) : null
     const epoch = sessionEpoch
     try {
       const payload = await fetchMe()
@@ -1491,7 +1492,7 @@
       connectLogs()
       if (!preserveAuthFlow && navigationRevision === startupNavigationRevision) {
         const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
-        setActiveTab(latestTab, { replace: true })
+        setActiveTab(latestTab, { replace: true, loadedTab: landingTab })
       }
     } catch (error) {
       // A 401 already ran expireSession (state reset, token cleared).
@@ -1532,12 +1533,13 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
-      await refreshAll()
+      const refreshedTab = activeTab
+      await refreshAll(refreshedTab)
       // A 401 during the loads signed the session out already.
       if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
       // Only the attempt that still owns the session may clear it.
@@ -1601,12 +1603,13 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
-      await refreshAll()
+      const refreshedTab = activeTab
+      await refreshAll(refreshedTab)
       // A 401 during the loads signed the session out already.
       if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
       if (epoch !== sessionEpoch) return
@@ -1653,12 +1656,13 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
-      await refreshAll()
+      const refreshedTab = activeTab
+      await refreshAll(refreshedTab)
       // A 401 during the loads signed the session out already.
       if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
       if (epoch !== sessionEpoch) return
@@ -1710,51 +1714,37 @@
     resetFrontendState()
   }
 
-  // Only the workspace/dashboard/downloads tabs render the pipeline + corpus
-  // data. For other landing tabs (notably the graph, which loads its own
-  // snapshot) these are several synchronous DB queries that can stall the
-  // backend while the workers hold the SQLite lock — so skip them and let
-  // setActiveTab()/refreshForActiveTab() load exactly what the tab needs.
+  // The tabs whose loads bootstrapAuth may start before the auth round trip:
+  // all of them are scoped by the token alone. The Korpus Management loads
+  // need the corpus id from the auth payload, so they wait for refreshAll.
   function tabNeedsWorkspaceData(tabId) {
     return tabId === 'workspace' || tabId === 'dashboard' || tabId === 'downloads'
   }
 
-  // The loads that need nothing from the auth payload: the backend scopes
-  // them to the token's corpus itself. bootstrapAuth starts these before
-  // fetchMe returns; refreshAll starts them itself on every later refresh.
-  function startWorkspaceLoads() {
-    return [
-      loadSeedSources(),
-      loadIngestStats(),
-      loadIngestRuns(),
-      loadCorpus(),
-    ]
+  // The tab's loads that need nothing from the auth payload (the admin ones
+  // wait for it): the backend scopes them to the token's corpus itself.
+  // bootstrapAuth starts these before fetchMe returns and hands them to the
+  // refreshAll that follows, which does not request them again (they may
+  // have finished, and left the in-flight map, before the auth answer).
+  function startWorkspaceLoads(tabId) {
+    const names = resourcesFor(tabId)
+    return { names, done: refreshResources(names, { quiet: false }) }
   }
 
   async function refreshAll(targetTab = activeTab, { inFlight = null } = {}) {
     restoreStoredUploads()
     // The OpenAlex quota pill is shown on both the workspace search panel
     // and the admin settings row, so it needs to load once after every
-    // authentication regardless of which tab the user lands on (notably
-    // #/admin, which the workspace-only tasks below never touch).
-    void loadOpenAlexQuota()
-    if (!tabNeedsWorkspaceData(targetTab)) return
-    const tasks = inFlight ? [...inFlight] : startWorkspaceLoads()
-    tasks.push(loadKantroposAssignment())
+    // authentication regardless of which tab the user lands on.
+    void refreshQuota()
     // Not `diagnosticsEnabled`: bootstrapAuth calls this right after assigning
     // authUser, before Svelte has flushed the `$:` derivations, so the reactive
     // flag is still false for an admin on the first refresh.
-    if (userIsAdmin(authUser)) {
-      tasks.push(
-        loadDownloads(),
-        loadDownloadWorkerStatus(),
-        loadPipelineWorkerStatus(),
-      )
-    }
-    await Promise.all(tasks)
-    // Everything a tab refresh would fetch is fresh now. Stamp it so the
-    // setActiveTab() that follows a bootstrap does not fetch it all again.
-    lastTabRefreshAt = Date.now()
+    const names = resourcesFor(targetTab, { admin: userIsAdmin(authUser) })
+    await Promise.all([
+      inFlight?.done,
+      refreshResources(inFlight ? names.filter((name) => !inFlight.names.includes(name)) : names, { quiet: false }),
+    ])
   }
 
   // Bumped whenever the workspace corpus changes (or clears): a corpus-scoped
@@ -1769,6 +1759,8 @@
     corpusLoadRequestSeq += 1
     corpusLoading = false
     corpusLoadingMore = false
+    lastCorpusPageSignature = ''
+    resourcesInFlight.clear()
   }
 
   // Every corpus- and session-scoped value the workspace starts from. A
@@ -1990,7 +1982,19 @@
     }
   }
 
-  async function loadKantroposTargets() {
+  // One request for the target list at a time: the browse and the assignment
+  // load both need it and may ask together.
+  let kantroposTargetsPromise = null
+  function loadKantroposTargets() {
+    if (!kantroposTargetsPromise) {
+      kantroposTargetsPromise = fetchKantroposTargets().finally(() => {
+        kantroposTargetsPromise = null
+      })
+    }
+    return kantroposTargetsPromise
+  }
+
+  async function fetchKantroposTargets() {
     try {
       const payload = await fetchKantroposCorpora()
       kantroposTargets = payload?.corpora || []
@@ -2018,6 +2022,12 @@
     try {
       if (kantroposTargets.length === 0) {
         await loadKantroposTargets()
+      }
+      // The assignment card lives on this tab only: load it with the browse
+      // (once per corpus for the quiet refreshes, so the card does not blink).
+      if (!appendCurrent && !appendPending && (!quiet || kantroposAssignmentCorpusId !== Number(currentCorpusId))) {
+        await loadKantroposAssignment()
+        if (requestSeq !== upstreamBrowseRequestSeq) return
       }
       const targetId = String(selectedUpstreamTargetId || kantroposAssignment?.target_id || kantroposTargets[0]?.id || '').trim()
       if (!targetId) {
@@ -2104,6 +2114,7 @@
       if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
       kantroposTargets = payload?.corpora || kantroposTargets
       kantroposAssignment = payload?.assignment || null
+      kantroposAssignmentCorpusId = corpusId
       selectedKantroposTargetId = payload?.assignment?.target_id || ''
       if (!payload?.can_edit && currentCorpus?.role !== 'viewer') {
         // no-op; backend truth is enough, UI editability still derives from current corpus role
@@ -2270,6 +2281,8 @@
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) return
+      // Requested for a corpus the workspace has left: change nothing.
+      if (!global && epoch !== corpusScopeEpoch) return
       if (!global) handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
       apiStatus = error?.status === 403 ? 'online' : 'offline'
@@ -2929,12 +2942,8 @@
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
       ]
-      if (diagnosticsEnabled) {
-        refreshTasks.push(
-          loadDownloads(),
-          loadDownloadWorkerStatus({ quiet: true }),
-        )
-      }
+      // The daemon status also fills the download worker card.
+      if (diagnosticsEnabled) refreshTasks.push(loadPipelineWorkerStatus({ quiet: true }))
       await Promise.all(refreshTasks)
       const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
       if (refreshedSource) {
@@ -2948,7 +2957,7 @@
       seedActionStatus = error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
-      loadOpenAlexQuota()
+      void refreshQuota()
     }
   }
 
@@ -3005,12 +3014,8 @@
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
       ]
-      if (diagnosticsEnabled) {
-        refreshTasks.push(
-          loadDownloads(),
-          loadDownloadWorkerStatus({ quiet: true }),
-        )
-      }
+      // The daemon status also fills the download worker card.
+      if (diagnosticsEnabled) refreshTasks.push(loadPipelineWorkerStatus({ quiet: true }))
       await Promise.all(refreshTasks)
       const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
       if (refreshedSource) {
@@ -3031,7 +3036,7 @@
         : error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
-      loadOpenAlexQuota()
+      void refreshQuota()
     }
   }
 
@@ -3255,6 +3260,8 @@
       searchPreview = null
     } finally {
       searchPreviewBusy = false
+      // The preview costs OpenAlex credits too.
+      void refreshQuota()
     }
     const cap = searchResultCap(searchMaxResults)
     if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
@@ -3271,7 +3278,7 @@
     searchStatus = 'Starting search...'
     try {
       const { data, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
-      loadOpenAlexQuota()
+      void refreshQuota()
       if (runId && running) {
         // Start polling on the 202 itself; the seed list may not report this
         // run for another poll or two (or at all, if registration lagged).
@@ -3307,6 +3314,10 @@
     searchWarning = false
   }
 
+  function corpusPageSignature(data, total, stageTotals) {
+    return JSON.stringify([corpusFilterQuery, corpusSort, total, stageTotals, data])
+  }
+
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
     if (!append && corpusLoading) return
     if (!append && quiet && corpusLoadingMore) return
@@ -3327,19 +3338,14 @@
     }
     try {
       const offset = append ? corpusItems.length : 0
-      const requestedLimit =
-        append
-          ? CORPUS_PAGE_SIZE
-          : quiet && preserveSelection
-            ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
-            : CORPUS_PAGE_SIZE
+      // The poll asks for the first page only, also when more rows are loaded.
+      const poll = !append && quiet && preserveSelection
       const { data, total, source, stageTotals } = await fetchCorpus({
-        limit: requestedLimit,
+        limit: CORPUS_PAGE_SIZE,
         offset,
         q: corpusFilterQuery,
         sort: corpusSort,
       })
-      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       const currentCorpusNumeric = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
@@ -3348,7 +3354,23 @@
       if (requestSeq !== corpusLoadRequestSeq || switchedCorpus) {
         return
       }
-      corpusItems = append ? [...corpusItems, ...incoming] : incoming
+      const pageData = Array.isArray(data) ? data : []
+      if (!append) {
+        const signature = corpusPageSignature(pageData, total, stageTotals)
+        if (poll && signature === lastCorpusPageSignature) return
+        lastCorpusPageSignature = signature
+      }
+      const incoming = pageData.map((item) => normalizeCorpusItem(item))
+      if (append) {
+        corpusItems = [...corpusItems, ...incoming]
+      } else if (poll && incoming.length === CORPUS_PAGE_SIZE && corpusItems.length > CORPUS_PAGE_SIZE) {
+        // Replace the first page in place and keep the rows loaded after it
+        // (minus any the new first page now holds).
+        const firstPageIds = new Set(incoming.map((item) => item.id))
+        corpusItems = [...incoming, ...corpusItems.slice(CORPUS_PAGE_SIZE).filter((item) => !firstPageIds.has(item.id))]
+      } else {
+        corpusItems = incoming
+      }
       corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
       corpusHasMore = corpusItems.length < corpusTotal
       corpusSource = source
@@ -3886,13 +3908,15 @@
     }
   }
 
-  function setActiveTab(tabId, { replace = false } = {}) {
+  // `loadedTab`: the tab a refreshAll just loaded (sign-in, boot); landing on
+  // it again does not fetch everything a second time.
+  function setActiveTab(tabId, { replace = false, loadedTab = null } = {}) {
     const normalized = normalizeTab(tabId)
     const safeTab = tabIds.has(normalized) ? normalized : 'workspace'
     navigationRevision += 1
     activeTab = safeTab
     updateHash(safeTab, replace)
-    refreshForActiveTab(safeTab)
+    if (loadedTab === null || normalizeTab(loadedTab) !== safeTab) void refreshForActiveTab(safeTab)
     // The cadence depends on the tab (e.g. corpus has none, workspace is idle-polled).
     scheduleRefresh()
   }
@@ -3933,15 +3957,24 @@
     }
     window.addEventListener('hashchange', onHashChange)
 
+    // `focus` and `visibilitychange` usually fire together: one refresh per
+    // 250 ms window.
+    let focusRefreshTimer = null
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'hidden') {
+        if (focusRefreshTimer) clearTimeout(focusRefreshTimer)
+        focusRefreshTimer = null
         scheduleRefresh()
         return
       }
-      // Becoming visible refreshes once; the regular cadence resumes afterwards.
-      // Log lines that arrived while hidden left the data dirty: run their
-      // trailing refresh now instead of at the next regular cycle.
-      void refreshForActiveTab(activeTab).finally(() => scheduleRefresh({ delayMs: refreshDirty ? REFRESH_TRAILING_MS : null }))
+      if (focusRefreshTimer) return
+      focusRefreshTimer = setTimeout(() => {
+        focusRefreshTimer = null
+        // Becoming visible refreshes once; the regular cadence resumes afterwards.
+        // Log lines that arrived while hidden left the data dirty: run their
+        // trailing refresh now instead of at the next regular cycle.
+        void refreshForActiveTab(activeTab).finally(() => scheduleRefresh({ delayMs: refreshDirty ? REFRESH_TRAILING_MS : null }))
+      }, 250)
     }
     window.addEventListener('focus', onFocusOrVisible)
     document.addEventListener('visibilitychange', onFocusOrVisible)
@@ -3967,6 +4000,7 @@
       window.removeEventListener('hashchange', onHashChange)
       window.removeEventListener('focus', onFocusOrVisible)
       document.removeEventListener('visibilitychange', onFocusOrVisible)
+      if (focusRefreshTimer) clearTimeout(focusRefreshTimer)
       reducedMotionMediaQuery?.removeEventListener?.('change', onReducedMotionChange)
       reducedMotionMediaQuery = null
       disconnectLogs()

@@ -158,7 +158,9 @@ test('a log-triggered refresh on a non-polling tab discovers worker status (admi
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(300))
   await page.waitForTimeout(1500)
   expect(counts.pipelineStatus).toBeGreaterThanOrEqual(1)
-  expect(counts.downloadStatus).toBeGreaterThanOrEqual(1)
+  // The daemon status fills the download worker card too; the separate
+  // download-worker status is requested only by the worker buttons.
+  expect(counts.downloadStatus).toBe(0)
 })
 
 test('a re-arm on a non-polling tab keeps the pending trailing refresh for dirty data', async ({ page }) => {
