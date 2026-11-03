@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 
 // After a revocation the backend falls back to another corpus (or none) for
 // every request. The live poll must follow /api/auth/me so the workspace never
@@ -16,11 +16,16 @@ type Phase = 'A' | 'B' | 'none'
 type Hook = (path: string, route: Route) => Promise<boolean> | boolean
 
 // `hook` sees every API request first; returning true means it handled it.
-async function boot(page: Page, state: { phase: Phase }, hook: Hook = () => false) {
+async function boot(
+  page: Page,
+  state: { phase: Phase },
+  hook: Hook = () => false,
+  onSocket: (ws: WebSocketRoute) => void = () => {},
+) {
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
-  await page.routeWebSocket('**/api/ws', () => {})
+  await page.routeWebSocket('**/api/ws', onSocket)
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (await hook(path, route)) return
@@ -170,4 +175,63 @@ test('a pending reconciliation holds back the next refresh tick', async ({ page 
   await expect(picker(page)).toHaveValue('2', { timeout: 8000 })
   await expect(page.getByText('Item in Beta')).toBeVisible()
   await expect(page.getByText('Item in Alpha')).toHaveCount(0)
+})
+
+test('an extraction completion for corpus A does not act on corpus B after the switch', async ({ page }) => {
+  const state = { phase: 'A' as Phase }
+  let socket: WebSocketRoute | null = null
+  let holdNextSeed = false
+  const seedHeld = deferred()
+  const releaseSeed = deferred()
+  const candidateRequests: string[] = []
+  await boot(
+    page,
+    state,
+    async (path, route) => {
+      if (path.startsWith('/api/seed/sources/pdf/paperA/candidates')) candidateRequests.push(path)
+      if (path === '/api/ingest/latest') {
+        // The completion's entries for corpus A; its follow-up seed reload is held next.
+        holdNextSeed = true
+        await fulfil(route, { items: [{ id: 1, title: 'Entry in Alpha' }], seed_document: { title: 'Paper A' } })
+        return true
+      }
+      if (path === '/api/seed/sources' && holdNextSeed) {
+        holdNextSeed = false
+        // The backend drops corpus A while the completion is still awaiting.
+        state.phase = 'B'
+        seedHeld.resolve()
+        await releaseSeed.promise
+        await fulfil(route, { sources: [], total: 0, source: 'api' })
+        return true
+      }
+      if (path === '/api/seed/sources' && state.phase === 'B') {
+        // Corpus B happens to hold a seed for the same PDF name.
+        await fulfil(route, {
+          sources: [{ source_type: 'pdf', source_key: 'paperA', label: 'Seed in Beta', candidate_count: 1 }],
+          total: 1,
+          source: 'api',
+        })
+        return true
+      }
+      return false
+    },
+    (ws) => { socket = ws },
+  )
+  await expect(page.getByText('Item in Alpha')).toBeVisible()
+  await expect.poll(() => socket !== null).toBeTruthy()
+
+  const event = (extra: Record<string, unknown>) =>
+    JSON.stringify({ kind: 'extraction', corpus_id: 1, base_name: 'paperA', filename: 'paperA.pdf', ...extra })
+  socket!.send(event({ event: 'started' }))
+  socket!.send(event({ event: 'done', status: 'success' }))
+
+  await seedHeld.promise
+  await expect(picker(page)).toHaveValue('2', { timeout: 8000 })
+  await expect(page.getByText('Seed in Beta')).toBeVisible()
+
+  releaseSeed.resolve()
+  await page.waitForTimeout(1500)
+  // Without the epoch check the completion would focus (expand and load) B's seed.
+  expect(candidateRequests).toEqual([])
+  await expect(page.locator('.seed-intake-card--upload .tag.queued', { hasText: 'extracting' })).toHaveCount(0)
 })

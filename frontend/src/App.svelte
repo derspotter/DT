@@ -1252,11 +1252,15 @@
     if (!runId || extractionCompletionCheckRunId === runId) return
     extractionCompletionCheckRunId = runId
     const baseName = String(latestEntriesBase || extractionProgress.baseName || '').trim()
+    // A corpus reset also ends the run (finishExtractionProgress); the epoch
+    // check keeps the post-await steps from acting on the new corpus as well.
+    const epoch = corpusScopeEpoch
+    const stale = () => epoch !== corpusScopeEpoch || !extractionProgress.active || extractionProgress.runId !== runId
 
     try {
       if (baseName) {
         const payload = await fetchBibliographyEntries(baseName)
-        if (!extractionProgress.active || extractionProgress.runId !== runId) return
+        if (stale()) return
         const items = payload.items || []
         if (payload.seed_document) {
           latestSeedDocument = payload.seed_document
@@ -1274,10 +1278,16 @@
           percent: 100,
           indeterminate: false,
         })
+        // Only a corpus change stops these; the run itself may end meanwhile
+        // (e.g. the entries view is closed) without skipping the follow-up.
         await loadSeedSources({ quiet: true })
+        if (epoch !== corpusScopeEpoch) return
         await focusSeedSource('pdf', baseName)
+        if (epoch !== corpusScopeEpoch) return
         await loadIngestStats()
+        if (epoch !== corpusScopeEpoch) return
         await loadIngestRuns()
+        if (epoch !== corpusScopeEpoch) return
         const completedRunId = extractionProgress.runId
         setTimeout(() => {
           if (extractionProgress.active && extractionProgress.runId === completedRunId) {
@@ -1287,7 +1297,7 @@
         return
       }
 
-      if (!extractionProgress.active || extractionProgress.runId !== runId) return
+      if (stale()) return
       latestEntries = []
       latestSelection = []
       latestEntriesStatus = detail
@@ -1305,7 +1315,7 @@
         finishExtractionProgress()
         return
       }
-      if (!extractionProgress.active || extractionProgress.runId !== runId) return
+      if (stale()) return
       latestEntriesStatus = detail
       updateExtractionProgress({
         phase: 'completed',
@@ -2401,6 +2411,8 @@
       finishExtractionProgress()
     }
     const waitRunId = waitForExtraction ? extractionProgress.runId : 0
+    // Entries are corpus-scoped: a corpus reset ends this load.
+    const epoch = corpusScopeEpoch
     latestEntriesBase = baseName
     latestSeedDocument = null
     latestEntriesStatus = waitForExtraction ? 'Waiting for extracted entries...' : 'Loading extracted entries...'
@@ -2416,6 +2428,7 @@
       }
       try {
         const payload = await fetchBibliographyEntries(baseName)
+        if (epoch !== corpusScopeEpoch) return
         const items = payload.items || []
         if (payload.seed_document) {
           latestSeedDocument = payload.seed_document
@@ -2458,6 +2471,7 @@
           finishExtractionProgress()
           return
         }
+        if (epoch !== corpusScopeEpoch) return
         if (!waitForExtraction) {
           latestEntriesStatus = 'Failed to load extracted entries.'
           return
@@ -2475,6 +2489,7 @@
         latestEntriesStatus = 'Loading extracted entries...'
       }
       await sleep(pollIntervalMs)
+      if (epoch !== corpusScopeEpoch) return
     }
 
     if (waitForExtraction) {
@@ -4256,11 +4271,9 @@
         globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
         return
       }
-      // The backlog is corpus-scoped.
-      if (epoch !== corpusScopeEpoch) {
-        if (!quiet) pipelineWorkerStatus = ''
-        return
-      }
+      // The backlog is corpus-scoped. A stale response leaves the status
+      // alone: it may already show the newer corpus's request.
+      if (epoch !== corpusScopeEpoch) return
       daemonStatus = payload?.daemon || daemonStatus
       workerBacklog = payload?.backlog || workerBacklog
       const enrich = daemonStatus?.workers?.enrich || {}
