@@ -130,10 +130,10 @@ def test_create_pending_work_confidence_fields(tmp_path):
         assert db.get_entry_by_id("works", alias_owner)["publisher"] == "Pub"
         assert _merge_notes(db) == []
 
-        # title_year match: low confidence; still merges, logged as merged.
+        # title_year match: low confidence; still merges, logged as merged, reported as a duplicate.
         ty_id, _ = db.create_pending_work({"title": "Year Only", "year": 2005})
         row_id, err = db.create_pending_work({"title": "Year Only", "year": 2005, "authors": ["Doe, Jane"], "corpus_id": 9})
-        assert (row_id, err) == (ty_id, None)
+        assert (row_id, err) == (None, f"Duplicate already exists in works (ID {ty_id}) on title_year")
         assert db.conn.execute("SELECT COUNT(*) FROM works WHERE normalized_title = ?", (db._normalize_text("Year Only"),)).fetchone()[0] == 1
         assert json.loads(db.get_entry_by_id("works", ty_id)["authors"]) == ["Doe, Jane"]
         assert _corpus_ids(db, ty_id) == [9]
@@ -218,5 +218,132 @@ def test_transaction_rolls_back_when_commit_fails(tmp_path):
                 db.conn.execute("INSERT INTO search_results (search_run_id, title) VALUES (999, 'orphan')")
         assert not db.conn.in_transaction
         assert db.conn.execute("SELECT COUNT(*) FROM search_results").fetchone()[0] == 0
+    finally:
+        db.close_connection()
+
+
+# --- final wave: chunked commits (I2), per-entry savepoints (I3), merge counters (M1) ----------
+
+def _commits(statements):
+    return [s for s in statements if s.strip().upper().startswith(("COMMIT", "END"))]
+
+
+def test_add_pending_works_from_json_commits_every_chunk(tmp_path):
+    from dl_lit.db_manager import INGEST_COMMIT_CHUNK
+
+    assert INGEST_COMMIT_CHUNK == 500
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        entries = [{"title": f"Work {i}", "year": 2000, "corpus_id": 1} for i in range(1200)]
+        json_path = tmp_path / "refs.json"
+        json_path.write_text(json.dumps(entries), encoding="utf-8")
+        statements = _count_commits(db)
+        added, skipped, errors = db.add_pending_works_from_json(json_path)
+        db.conn.set_trace_callback(None)
+        assert (added, skipped, errors) == (1200, 0, [])
+        assert len(_commits(statements)) == 3
+        assert not db.conn.in_transaction
+    finally:
+        db.close_connection()
+
+
+def _tracing_import_script(monkeypatch, statements):
+    mod = _load_import_script(monkeypatch)
+    real = mod.DatabaseManager
+
+    class Tracing(real):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.conn.set_trace_callback(statements.append)
+
+    monkeypatch.setattr(mod, "DatabaseManager", Tracing)
+    return mod
+
+
+def test_import_seed_commits_every_chunk(monkeypatch, tmp_path, capsys):
+    statements = []
+    mod = _tracing_import_script(monkeypatch, statements)
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps([{"title": f"Work {i}", "year": 2000} for i in range(1200)]), encoding="utf-8")
+    del statements[:]
+    mod.main(["--db-path", str(tmp_path / "lit.db"), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
+    summary = _last_json(capsys.readouterr().out)
+    assert summary == {"added": 1200, "skipped": 0, "corpus_linked": 1200, "total": 1200, "errors": []}
+    assert len(_commits(statements)) == 3
+
+
+BAD_BATCH = [
+    {"title": "Good One", "year": 2001},
+    {"title": "Bad Entry", "year": 2002, "translated_title": {"de": "Schlechter Eintrag"}},
+    {"title": "Good Two", "year": 2003},
+]
+
+
+def test_add_pending_works_from_json_rolls_back_a_failed_entry(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        json_path = tmp_path / "refs.json"
+        json_path.write_text(json.dumps([dict(e, corpus_id=1) for e in BAD_BATCH]), encoding="utf-8")
+        added, skipped, errors = db.add_pending_works_from_json(json_path)
+        assert (added, skipped, len(errors)) == (2, 1, 1)
+        titles = [r[0] for r in db.conn.execute("SELECT title FROM works ORDER BY id")]
+        assert titles == ["Good One", "Good Two"]
+        assert db.conn.execute("SELECT COUNT(*) FROM corpus_works").fetchone()[0] == 2
+        assert not db.conn.in_transaction
+    finally:
+        db.close_connection()
+
+
+def test_import_seed_rolls_back_a_failed_entry(monkeypatch, tmp_path, capsys):
+    mod = _load_import_script(monkeypatch)
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps(BAD_BATCH), encoding="utf-8")
+    mod.main(["--db-path", str(tmp_path / "lit.db"), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
+    summary = _last_json(capsys.readouterr().out)
+    assert (summary["added"], summary["skipped"], summary["corpus_linked"]) == (2, 1, 2)
+    assert len(summary["errors"]) == 1
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        titles = [r[0] for r in db.conn.execute("SELECT title FROM works ORDER BY id")]
+        assert titles == ["Good One", "Good Two"]
+        assert db.conn.execute("SELECT COUNT(*) FROM corpus_works").fetchone()[0] == 2
+        assert db.conn.execute("SELECT COUNT(*) FROM work_aliases").fetchone()[0] == 0
+    finally:
+        db.close_connection()
+
+
+def test_savepoint_rolls_back_only_its_block(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        with db.transaction():
+            db._insert_work_record({"title": "kept"})
+            with pytest.raises(RuntimeError):
+                with db.savepoint():
+                    db._insert_work_record({"title": "dropped"})
+                    raise RuntimeError("boom")
+            with db.savepoint():
+                db._insert_work_record({"title": "kept too"})
+        assert [r[0] for r in db.conn.execute("SELECT title FROM works ORDER BY id")] == ["kept", "kept too"]
+        assert not db.conn.in_transaction
+    finally:
+        db.close_connection()
+
+
+def test_reimport_with_a_low_confidence_match_links_without_adding(monkeypatch, tmp_path, capsys):
+    mod = _load_import_script(monkeypatch)
+    first = tmp_path / "first.json"
+    first.write_text(json.dumps([{"title": "Year Only", "year": 2005}]), encoding="utf-8")
+    second = tmp_path / "second.json"
+    second.write_text(json.dumps([{"title": "Year Only", "year": 2005, "authors": ["Doe, Jane"]}]), encoding="utf-8")
+    base = ["--db-path", str(tmp_path / "lit.db"), "--kind", "json"]
+    mod.main(base + ["--file", str(first), "--corpus-id", "1"])
+    capsys.readouterr()
+    mod.main(base + ["--file", str(second), "--corpus-id", "2"])
+    summary = _last_json(capsys.readouterr().out)
+    assert summary == {"added": 0, "skipped": 0, "corpus_linked": 1, "total": 1, "errors": []}
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        assert db.conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 1
+        assert dict(db.conn.execute("SELECT corpus_id, COUNT(*) FROM corpus_works GROUP BY corpus_id").fetchall()) == {1: 1, 2: 1}
     finally:
         db.close_connection()

@@ -430,6 +430,40 @@ def _apply_openalex_response_limits(
     return wait_seconds
 
 
+_API_KEY_VALUE = r"[^&#\s'\"]*"
+# Two passes, neither consuming the separator the next match needs: first every "&api_key=..."
+# (adjacent ones each start at their own "&"), then a leading "?api_key=..." with the "&" after
+# it, so "?api_key=a&page=2" -> "?page=2" and a lone "?api_key=a" -> "".
+_API_KEY_AMP_RE = re.compile(r"&api_key=" + _API_KEY_VALUE)
+_API_KEY_QMARK_RE = re.compile(r"\?api_key=" + _API_KEY_VALUE + r"(&?)")
+
+
+def redact_openalex_key(text) -> str:
+    """Drop every ``api_key=...`` query parameter from a printed URL or message."""
+    text = _API_KEY_AMP_RE.sub("", str(text))
+    return _API_KEY_QMARK_RE.sub(lambda m: "?" if m.group(1) else "", text)
+
+
+def redact_openalex_request_error(exc: requests.RequestException) -> requests.RequestException:
+    """``exc`` with the api key dropped from its message: same type, ``response``/``request`` kept.
+
+    requests puts the prepared URL (query string and all) into HTTPError / ConnectionError /
+    Timeout messages. Returns ``exc`` itself when its message carries no key.
+    """
+    message = redact_openalex_key(str(exc))
+    if message == str(exc) and "api_key=" not in repr(exc):
+        return exc
+    kwargs = {}
+    if getattr(exc, 'response', None) is not None:
+        kwargs['response'] = exc.response
+    if getattr(exc, 'request', None) is not None:
+        kwargs['request'] = exc.request
+    try:
+        return type(exc)(message, **kwargs)
+    except TypeError:  # a subclass with its own constructor signature
+        return requests.RequestException(message, **kwargs)
+
+
 def openalex_request_json(
     *,
     endpoint: str | None = None,
@@ -517,11 +551,12 @@ def openalex_request_json(
         except requests.RequestException as exc:
             last_error = exc
             if attempt == retries - 1:
-                raise
+                # The message holds the request URL, api_key included: never let that escape.
+                raise redact_openalex_request_error(exc) from None
             time.sleep(2 ** attempt)
 
     if last_error is not None:
-        raise last_error
+        raise redact_openalex_request_error(last_error) from None
     raise RuntimeError('OpenAlex request failed after retries')
 
 

@@ -435,3 +435,202 @@ def test_worker_import_leaves_the_process_streams_alone():
     mod = load_worker("dt_worker_streams")
     assert (sys.stdout, sys.stderr) == before
     assert not isinstance(sys.stdout, mod._LockedTextStream)
+
+
+# --- final wave I1: an identifier conflict survives enrichment ------------------------------
+
+def _conflicting_pair(tmp_path, monkeypatch):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    searcher = _ResolvingSearcher({"Alice Smith": "10.1/first", "Bob Jones": "10.1/second"})
+    monkeypatch.setattr(db, "_resolve_identifiers_for_ref", lambda ref, s, rl: s.resolve(ref))
+    first_id, _ = db.create_pending_work(
+        {"title": "Migration and the European Union", "authors": ["Alice Smith"], "year": 2020, "corpus_id": 1}
+    )
+    second_id, err = db.create_pending_work(
+        {"title": "Migration and the European Union", "authors": ["Bob Jones"], "year": 2020, "corpus_id": 2},
+        searcher=searcher,
+        resolve_potential_duplicates=True,
+    )
+    assert err is None
+    return db, first_id, second_id
+
+
+def test_resolved_conflict_stores_the_resolved_identifiers_on_the_new_record(tmp_path, monkeypatch):
+    db, _, second_id = _conflicting_pair(tmp_path, monkeypatch)
+    row = db.get_entry_by_id("works", second_id)
+    assert (row["doi"], row["normalized_doi"]) == ("10.1/second", db._normalize_doi("10.1/second"))
+
+
+def test_enrichment_does_not_absorb_a_record_with_a_different_doi(tmp_path, monkeypatch):
+    db, first_id, second_id = _conflicting_pair(tmp_path, monkeypatch)
+
+    result = db.apply_enriched_metadata(
+        first_id,
+        {"title": "Migration and the European Union", "authors": ["Alice Smith"], "year": 2020, "doi": "10.1/first"},
+    )
+
+    assert result == (first_id, None)
+    rows = db.conn.execute("SELECT id, authors, normalized_doi FROM works ORDER BY id").fetchall()
+    norm = db._normalize_doi
+    assert rows == [(first_id, '["Alice Smith"]', norm("10.1/first")), (second_id, '["Bob Jones"]', norm("10.1/second"))]
+    corpora = db.conn.execute("SELECT corpus_id, work_id FROM corpus_works ORDER BY corpus_id").fetchall()
+    assert corpora == [(1, first_id), (2, second_id)]
+
+
+def test_enrichment_does_not_absorb_a_record_with_a_different_openalex_id(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    a = db._insert_work_record({"title": "Same Title", "normalized_title": db._normalize_text("Same Title"), "year": 2020})
+    b = db._insert_work_record(
+        {"title": "Same Title", "normalized_title": db._normalize_text("Same Title"), "year": 2020, "openalex_id": "W2"}
+    )
+    db.conn.commit()
+    assert db.apply_enriched_metadata(a, {"title": "Same Title", "year": 2020, "openalex_id": "W1"}) == (a, None)
+    assert db.conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 2
+    # an alias of the other record is no match either
+    db.add_work_alias("works", b, "Alias Title", alias_year=2020)
+    assert db._find_existing_work(title="Alias Title", year=2020, openalex_id="W9") == (None, None)
+    assert db._find_existing_work(title="Alias Title", year=2020) == (b, "alias_title")
+
+
+@pytest.mark.parametrize("candidate_doi", [None, "10.1/shared"])
+def test_title_year_match_without_conflicting_identifiers_still_merges(tmp_path, candidate_doi):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    norm = db._normalize_text("Same Title")
+    a = db._insert_work_record({"title": "Same Title", "normalized_title": norm, "year": 2020})
+    extra = {"doi": candidate_doi, "normalized_doi": candidate_doi} if candidate_doi else {}
+    b = db._insert_work_record({"title": "Same Title", "normalized_title": norm, "year": 2020, **extra})
+    db.conn.commit()
+
+    work_id, err = db.apply_enriched_metadata(a, {"title": "Same Title", "year": 2020})
+
+    assert work_id is None and f"(ID {b}) on title_year" in err
+    assert [r[0] for r in db.conn.execute("SELECT id FROM works")] == [b]
+
+
+# --- final wave I4: request exceptions never carry the api key ------------------------------
+
+class _FiveHundredSession:
+    def get(self, url, headers=None, params=None, timeout=None):
+        import requests
+
+        resp = requests.Response()
+        resp.status_code = 500
+        resp.reason = "Server Error"
+        resp.url = requests.Request("GET", url, params=params).prepare().url
+        return resp
+
+
+class _DownSession:
+    def __init__(self, exc_type):
+        self.exc_type = exc_type
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        import requests
+
+        full = requests.Request("GET", url, params=params).prepare().url
+        raise self.exc_type(f"HTTPSConnectionPool: Max retries exceeded with url: {full}")
+
+
+class _FreeLimiter:
+    def remaining_block_seconds(self, *args):
+        return 0.0
+
+    def wait_if_needed(self, *args, **kwargs):
+        return True
+
+    def impose_block(self, *args, **kwargs):
+        pass
+
+
+@pytest.fixture
+def keyed_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENALEX_API_KEY", "sekret-key-987")
+    monkeypatch.setenv("RAG_FEEDER_OPENALEX_QUOTA_PATH", str(tmp_path / "quota.json"))
+    from dl_lit import utils
+
+    monkeypatch.setattr(utils.time, "sleep", lambda s: None)
+    return utils
+
+
+def _assert_redacted(exc):
+    assert "sekret-key-987" not in str(exc) and "api_key" not in str(exc)
+    assert "sekret-key-987" not in repr(exc) and "api_key" not in repr(exc)
+
+
+def test_redact_openalex_key_is_shared():
+    from dl_lit import OpenAlexScraper, utils
+
+    assert utils.redact_openalex_key("https://x/w?api_key=k&p=1") == "https://x/w?p=1"
+    assert OpenAlexScraper._redact_api_key is utils.redact_openalex_key
+
+
+def test_openalex_request_json_http_error_is_redacted(keyed_env):
+    import requests
+
+    with pytest.raises(requests.exceptions.HTTPError) as info:
+        keyed_env.openalex_request_json(
+            url="https://api.openalex.org/works", params={"filter": "doi:x"},
+            session=_FiveHundredSession(), rate_limiter=_FreeLimiter(), retries=1,
+        )
+    _assert_redacted(info.value)
+    assert "https://api.openalex.org/works?filter=doi%3Ax" in str(info.value)
+    assert info.value.response is not None and info.value.response.status_code == 500
+
+
+@pytest.mark.parametrize("exc_name", ["ConnectionError", "Timeout"])
+def test_openalex_request_json_transport_error_is_redacted(keyed_env, exc_name):
+    import requests
+
+    exc_type = getattr(requests.exceptions, exc_name)
+    with pytest.raises(exc_type) as info:
+        keyed_env.openalex_request_json(
+            url="https://api.openalex.org/works", params={"filter": "doi:x"},
+            session=_DownSession(exc_type), rate_limiter=_FreeLimiter(), retries=2,
+        )
+    _assert_redacted(info.value)
+
+
+def test_keyword_search_script_openalex_get_is_redacted(keyed_env, monkeypatch):
+    import requests
+
+    mod = _load_keyword_search_script(monkeypatch, "keyword_search_script_i4")
+    monkeypatch.setattr(mod, "get_openalex_session", lambda: _FiveHundredSession())
+    monkeypatch.setattr(mod, "get_global_rate_limiter", lambda: _FreeLimiter())
+
+    with pytest.raises(requests.exceptions.HTTPError) as info:
+        mod._openalex_get({"filter": "doi:x"}, retries=1)
+    _assert_redacted(info.value)
+    assert info.value.response.status_code == 500
+
+
+def _load_keyword_search_script(monkeypatch, name):
+    import importlib.util
+
+    scripts = Path(__file__).resolve().parents[2] / "backend" / "scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location(name, scripts / "keyword_search.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_keyword_search_script_error_path_redacts(monkeypatch, tmp_path, capsys):
+    import sys
+
+    mod = _load_keyword_search_script(monkeypatch, "keyword_search_script_i4_main")
+    leaked = "boom for url: https://api.openalex.org/works?api_key=sekret-key-987&page=2"
+
+    def boom(**kwargs):
+        raise RuntimeError(leaked)
+
+    monkeypatch.setattr(mod, "search_openalex", boom)
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "q"])
+    with pytest.raises(SystemExit) as info:
+        mod.run_cli()
+    assert info.value.code == 1
+    err = capsys.readouterr().err
+    assert "RuntimeError" in err and "https://api.openalex.org/works?page=2" in err
+    assert "sekret-key-987" not in err and "api_key" not in err
+    db = DatabaseManager(str(tmp_path / "t.db"))
+    stored = db.conn.execute("SELECT status, error FROM search_runs").fetchone()
+    assert stored[0] == "failed" and "sekret" not in stored[1] and "api_key" not in stored[1]

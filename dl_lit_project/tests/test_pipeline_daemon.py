@@ -240,3 +240,83 @@ def test_loop_exception_and_keyboard_interrupt_branches(monkeypatch, tmp_path):
     assert ("sleep", 10) in events
     assert events[-2:] == [("released",), ("heartbeat", "stopped", "keyboard_interrupt")]
     assert daemon.running is False
+
+
+# --- final wave I2: a held write lock never kills the heartbeat or the loop -----------------
+
+def _heartbeat_daemon(db_path):
+    import threading
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE daemon_heartbeat (daemon_name TEXT PRIMARY KEY, worker_id TEXT, status TEXT,"
+        " details_json TEXT, last_seen_at TIMESTAMP, updated_at TIMESTAMP)"
+    )
+    conn.commit()
+    conn.close()
+    daemon = PipelineDaemon.__new__(PipelineDaemon)
+    daemon.heartbeat_conn = sqlite3.connect(db_path, timeout=3.0, check_same_thread=False)
+    daemon.heartbeat_conn.execute("PRAGMA journal_mode=WAL")
+    daemon.heartbeat_conn.execute("PRAGMA busy_timeout = 3000")
+    daemon.heartbeat_lock = threading.RLock()
+    daemon.daemon_name = "enrich"
+    daemon.worker_id = "worker-hb"
+    daemon.heartbeat_interval_seconds = 3
+    daemon._last_heartbeat_at = 0.0
+    return daemon
+
+
+def test_heartbeat_skips_the_beat_while_another_connection_holds_the_write_lock(tmp_path):
+    import threading
+    import time
+
+    db_path = tmp_path / "lit.db"
+    daemon = _heartbeat_daemon(db_path)
+    locked, release = threading.Event(), threading.Event()
+
+    def hold_lock():
+        other = sqlite3.connect(db_path)
+        other.execute("BEGIN IMMEDIATE")
+        locked.set()
+        release.wait(4)
+        other.rollback()
+        other.close()
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    try:
+        assert locked.wait(2)
+        started = time.monotonic()
+        daemon._heartbeat("running", {"state": "x"}, force=True)  # must not raise
+        assert time.monotonic() - started < 3.5
+    finally:
+        release.set()
+        holder.join(5)
+    assert not daemon.heartbeat_conn.in_transaction
+    daemon._heartbeat("running", {"state": "y"}, force=True)
+    row = daemon.heartbeat_conn.execute("SELECT status, details_json FROM daemon_heartbeat").fetchone()
+    assert row == ("running", '{"state": "y"}')
+
+
+def test_a_failing_error_heartbeat_does_not_end_the_loop(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("enrich", monkeypatch, tmp_path)
+    calls = {"fetch": 0}
+
+    def fetch():
+        calls["fetch"] += 1
+        if calls["fetch"] < 3:
+            raise RuntimeError("boom")
+        daemon.running = False
+        return None
+
+    def heartbeat(status, details=None, force=False):
+        events.append(("heartbeat", status, (details or {}).get("state")))
+        if status == "error":
+            raise sqlite3.OperationalError("database is locked")
+
+    daemon.fetch_next_job = fetch
+    daemon._heartbeat = heartbeat
+    daemon._run_direct_enrich_cycle = lambda: None
+    daemon.run()
+    assert calls["fetch"] == 3
+    assert [e for e in events if e[0] == "sleep"][:2] == [("sleep", 10), ("sleep", 10)]

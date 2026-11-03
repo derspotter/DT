@@ -16,6 +16,10 @@ BLUE = "\033[94m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
 
+# Bulk imports commit every this many entries, so no write lock is held for a whole file
+# (the workers' heartbeats and claims wait at most one chunk).
+INGEST_COMMIT_CHUNK = 500
+
 WORKS_INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''",
@@ -155,6 +159,25 @@ class DatabaseManager:
             if self.conn.in_transaction:
                 self.conn.rollback()
             raise
+
+    @contextmanager
+    def savepoint(self):
+        """Run a block inside a SAVEPOINT: on an exception only the block's writes are undone.
+
+        RELEASEs on normal exit; on an exception ROLLBACK TO + RELEASE, then re-raises. Use it
+        inside transaction(); the block must not commit (pass commit=False to writers).
+        """
+        self._savepoint_seq = getattr(self, "_savepoint_seq", 0) + 1
+        name = f"sp_{self._savepoint_seq}"
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute(f"ROLLBACK TO {name}")
+                self.conn.execute(f"RELEASE {name}")
+            raise
+        self.conn.execute(f"RELEASE {name}")
 
     def close_connection(self):
         """Closes the database connection."""
@@ -540,43 +563,60 @@ class DatabaseManager:
         normalized_title = self._normalize_text(title)
         year_str = str(year).strip() if year is not None and str(year).strip() else None
         if normalized_title:
-            if year_str and normalized_contributors:
-                params = [normalized_title, normalized_contributors, year_str]
-                query = "SELECT id FROM works WHERE normalized_title = ? AND normalized_authors = ? AND CAST(year AS TEXT) = ?"
+            # A title-based candidate whose identifier differs from the incoming one is another
+            # work (a resolved-identifier conflict): such candidates are never returned.
+            def identity_guard(prefix=""):
+                sql, guard_params = "", []
+                if normalized_doi:
+                    sql += f" AND ({prefix}normalized_doi IS NULL OR {prefix}normalized_doi = '' OR {prefix}normalized_doi = ?)"
+                    guard_params.append(normalized_doi)
+                if normalized_openalex:
+                    sql += f" AND ({prefix}openalex_id IS NULL OR {prefix}openalex_id = '' OR {prefix}openalex_id = ?)"
+                    guard_params.append(normalized_openalex)
                 if exclude_id:
-                    query += " AND id != ?"
-                    params.append(int(exclude_id))
-                found_id, field = _one(query, params, "title_authors_year")
+                    sql += f" AND {prefix}id != ?"
+                    guard_params.append(int(exclude_id))
+                return sql, guard_params
+
+            def title_lookup(where, params, field):
+                guard_sql, guard_params = identity_guard()
+                return _one(f"SELECT id FROM works WHERE {where}{guard_sql}", [*params, *guard_params], field)
+
+            if year_str and normalized_contributors:
+                found_id, field = title_lookup(
+                    "normalized_title = ? AND normalized_authors = ? AND CAST(year AS TEXT) = ?",
+                    [normalized_title, normalized_contributors, year_str],
+                    "title_authors_year",
+                )
                 if found_id:
                     return found_id, field
             if normalized_contributors:
-                params = [normalized_title, normalized_contributors]
-                query = "SELECT id FROM works WHERE normalized_title = ? AND normalized_authors = ?"
-                if exclude_id:
-                    query += " AND id != ?"
-                    params.append(int(exclude_id))
-                found_id, field = _one(query, params, "title_authors")
+                found_id, field = title_lookup(
+                    "normalized_title = ? AND normalized_authors = ?",
+                    [normalized_title, normalized_contributors],
+                    "title_authors",
+                )
                 if found_id:
                     return found_id, field
             if year_str:
-                params = [normalized_title, year_str]
-                query = "SELECT id FROM works WHERE normalized_title = ? AND CAST(year AS TEXT) = ?"
-                if exclude_id:
-                    query += " AND id != ?"
-                    params.append(int(exclude_id))
-                found_id, field = _one(query, params, "title_year")
+                found_id, field = title_lookup(
+                    "normalized_title = ? AND CAST(year AS TEXT) = ?", [normalized_title, year_str], "title_year"
+                )
                 if found_id:
                     return found_id, field
             # alias fallback
             params = [normalized_title]
-            query = "SELECT work_id FROM work_aliases WHERE work_table = 'works' AND normalized_alias_title = ?"
+            query = (
+                "SELECT a.work_id FROM work_aliases a JOIN works w ON w.id = a.work_id"
+                " WHERE a.work_table = 'works' AND a.normalized_alias_title = ?"
+            )
             if year_str and year_str.isdigit():
-                query += " AND (alias_year IS NULL OR alias_year BETWEEN ? AND ?)"
+                query += " AND (a.alias_year IS NULL OR a.alias_year BETWEEN ? AND ?)"
                 params.extend([int(year_str) - 1, int(year_str) + 1])
-            cur.execute(query, params)
-            row = cur.fetchone()
-            if row and (exclude_id is None or int(row[0]) != int(exclude_id)):
-                return int(row[0]), "alias_title"
+            guard_sql, guard_params = identity_guard("w.")
+            found_id, field = _one(query + guard_sql, [*params, *guard_params], "alias_title")
+            if found_id:
+                return found_id, field
         return None, None
 
     def _insert_work_record(self, data: dict) -> int:
@@ -811,28 +851,38 @@ class DatabaseManager:
         added_count = 0
         skipped_count = 0
         errors = []
-        # One transaction for the whole file, unless identifier resolution may make network calls:
-        # then each entry commits on its own so no write lock is held across a lookup.
+        # One transaction per INGEST_COMMIT_CHUNK entries, each entry in its own savepoint so a
+        # failing entry leaves no rows. With identifier resolution (network calls) each entry
+        # commits on its own instead, so no write lock is held across a lookup.
         resolving = bool(resolve_potential_duplicates and searcher)
-        with nullcontext() if resolving else self.transaction():
-            for entry in entries:
-                entry = dict(entry)
-                if source_pdf:
-                    entry["source_pdf"] = source_pdf
+        step = 1 if resolving else INGEST_COMMIT_CHUNK
+        for chunk_start in range(0, len(entries), step):
+            with nullcontext() if resolving else self.transaction():
+                for entry in entries[chunk_start:chunk_start + step]:
+                    entry = dict(entry)
+                    if source_pdf:
+                        entry["source_pdf"] = source_pdf
 
-                row_id, err = self.create_pending_work(
-                    entry,
-                    searcher=searcher,
-                    rate_limiter=rate_limiter,
-                    resolve_potential_duplicates=resolve_potential_duplicates,
-                    commit=resolving,
-                )
-                if row_id:
-                    added_count += 1
-                else:
-                    skipped_count += 1
-                    if err and "Duplicate already exists" not in err and "Title is required" not in err:
-                        errors.append(err)
+                    if resolving:
+                        row_id, err = self.create_pending_work(
+                            entry,
+                            searcher=searcher,
+                            rate_limiter=rate_limiter,
+                            resolve_potential_duplicates=resolve_potential_duplicates,
+                            commit=True,
+                        )
+                    else:
+                        try:
+                            with self.savepoint():
+                                row_id, err = self.create_pending_work(entry, commit=False)
+                        except Exception as exc:
+                            row_id, err = None, f"Skipped entry {entry.get('title')!r}: {exc}"
+                    if row_id:
+                        added_count += 1
+                    else:
+                        skipped_count += 1
+                        if err and "Duplicate already exists" not in err and "Title is required" not in err:
+                            errors.append(err)
 
         return added_count, skipped_count, errors
 
@@ -1294,12 +1344,14 @@ class DatabaseManager:
             payload = self._build_raw_work_payload(ref)
             if resolved_conflict:
                 # Resolved ids disagree: a separate work. (None, None) skips the lookup, which
-                # would find the matched row again; the new row is inserted as is.
+                # would find the matched row again; the new row is inserted with its resolved
+                # identifiers, so later title-based lookups (enrichment) keep the two apart.
                 existing_match, allow_merge = (None, None), False
+                payload.update(self._unclaimed_resolved_identifiers(incoming_resolved))
             else:
                 existing_match = (int(eid), field) if tbl == "works" else (None, None)
                 allow_merge = True
-            new_id, _ = self._resolve_or_create_work(
+            new_id, merged_on = self._resolve_or_create_work(
                 payload,
                 allow_merge=allow_merge,
                 commit=commit,
@@ -1320,9 +1372,28 @@ class DatabaseManager:
                     commit=commit,
                 )
 
+            if merged_on:
+                # A low-confidence merge: reported like any other duplicate (no new work).
+                return None, f"Duplicate already exists in works (ID {new_id}) on {merged_on}"
             return new_id, None
         except sqlite3.IntegrityError as e:
             return None, f"IntegrityError inserting into works: {e}"
+
+    def _unclaimed_resolved_identifiers(self, resolved: dict) -> dict:
+        """The doi/normalized_doi/openalex_id of ``resolved`` that no works row holds yet.
+
+        An identifier another row already carries sits under a unique index; it is left out
+        rather than failing the insert.
+        """
+        out = {}
+        cur = self.conn.cursor()
+        norm_doi = self._normalize_doi(resolved.get("doi"))
+        if norm_doi and not cur.execute("SELECT 1 FROM works WHERE normalized_doi = ?", (norm_doi,)).fetchone():
+            out.update(doi=resolved.get("doi"), normalized_doi=norm_doi)
+        openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
+        if openalex and not cur.execute("SELECT 1 FROM works WHERE openalex_id = ?", (openalex,)).fetchone():
+            out["openalex_id"] = openalex
+        return out
 
     def insert_ingest_entry(self, ref: dict, ingest_source: str | None = None) -> None:
         """Insert raw extracted entry for UI display, without dedupe enforcement."""

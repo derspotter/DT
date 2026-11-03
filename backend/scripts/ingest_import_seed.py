@@ -8,7 +8,9 @@ returns the new row id), so this is safe to run while the enrich/download
 workers are writing — unlike the in-memory rewrite used by the `import-bib`
 CLI command.
 
-All entries are written in one transaction.
+Entries are written in transactions of INGEST_COMMIT_CHUNK entries (so no write lock
+is held for the whole file), each entry inside its own savepoint: an entry that
+raises leaves no rows behind and counts as skipped.
 
 Prints a JSON summary: {added, skipped, corpus_linked, total, errors}. `added`
 counts new works; `corpus_linked` counts entries (new or duplicate) linked to
@@ -29,7 +31,7 @@ DL_LIT_PROJECT = ROOT / "dl_lit_project"
 if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 
-from dl_lit.db_manager import DatabaseManager  # noqa: E402
+from dl_lit.db_manager import INGEST_COMMIT_CHUNK, DatabaseManager  # noqa: E402
 
 
 def _field(entry, *names):
@@ -103,35 +105,37 @@ def main(argv=None):
     added = skipped = linked = 0
     errors = []
     try:
-        with db.transaction():
-            for raw in entries:
-                if not isinstance(raw, dict):
-                    skipped += 1
-                    errors.append(f"Skipped non-object entry: {type(raw).__name__}")
-                    continue
-                entry = dict(raw)
-                if args.source_label and not entry.get("source"):
-                    entry["source"] = args.source_label
-                if args.corpus_id is not None:
-                    entry["corpus_id"] = args.corpus_id
-                try:
-                    row_id, err = db.create_pending_work(entry, commit=False)
-                except Exception as exc:
-                    skipped += 1
-                    errors.append(str(exc))
-                    continue
-                if row_id:
-                    added += 1
+        for chunk_start in range(0, len(entries), INGEST_COMMIT_CHUNK):
+            with db.transaction():
+                for raw in entries[chunk_start:chunk_start + INGEST_COMMIT_CHUNK]:
+                    if not isinstance(raw, dict):
+                        skipped += 1
+                        errors.append(f"Skipped non-object entry: {type(raw).__name__}")
+                        continue
+                    entry = dict(raw)
+                    if args.source_label and not entry.get("source"):
+                        entry["source"] = args.source_label
                     if args.corpus_id is not None:
-                        linked += 1
-                elif err and "Duplicate" in err:
-                    # create_pending_work linked the existing work to the corpus.
-                    if args.corpus_id is not None:
-                        linked += 1
-                else:
-                    skipped += 1
-                    if err and "Title is required" not in err:
-                        errors.append(err)
+                        entry["corpus_id"] = args.corpus_id
+                    try:
+                        with db.savepoint():
+                            row_id, err = db.create_pending_work(entry, commit=False)
+                    except Exception as exc:
+                        skipped += 1
+                        errors.append(str(exc))
+                        continue
+                    if row_id:
+                        added += 1
+                        if args.corpus_id is not None:
+                            linked += 1
+                    elif err and "Duplicate" in err:
+                        # create_pending_work linked the existing work to the corpus.
+                        if args.corpus_id is not None:
+                            linked += 1
+                    else:
+                        skipped += 1
+                        if err and "Title is required" not in err:
+                            errors.append(err)
     finally:
         try:
             db.close_connection()

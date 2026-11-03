@@ -14,7 +14,13 @@ from .identifiers import (
     inverted_index_to_text_last_wins,
     normalize_doi_lower,
 )
-from .utils import OpenAlexRateLimitExceeded, env_bool, get_global_rate_limiter, openalex_request_json
+from .utils import (
+    OpenAlexRateLimitExceeded,
+    env_bool,
+    get_global_rate_limiter,
+    openalex_request_json,
+    redact_openalex_key,
+)
 
 try:
     from rapidfuzz import fuzz
@@ -50,18 +56,7 @@ def _build_retry_session(
 _missing_api_key_warned = False
 
 
-_API_KEY_VALUE = r"[^&#\s'\"]*"
-# Two passes, neither consuming the separator the next match needs: first every "&api_key=..."
-# (adjacent ones each start at their own "&"), then a leading "?api_key=..." with the "&" after
-# it, so "?api_key=a&page=2" -> "?page=2" and a lone "?api_key=a" -> "".
-_API_KEY_AMP_RE = re.compile(r"&api_key=" + _API_KEY_VALUE)
-_API_KEY_QMARK_RE = re.compile(r"\?api_key=" + _API_KEY_VALUE + r"(&?)")
-
-
-def _redact_api_key(text) -> str:
-    """Drop every ``api_key=...`` query parameter from a printed URL or message."""
-    text = _API_KEY_AMP_RE.sub("", str(text))
-    return _API_KEY_QMARK_RE.sub(lambda m: "?" if m.group(1) else "", text)
+_redact_api_key = redact_openalex_key  # former name
 
 
 def _redacted_params(params) -> dict:

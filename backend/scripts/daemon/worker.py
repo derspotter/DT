@@ -277,30 +277,47 @@ class PipelineDaemon:
             self.heartbeat_conn.commit()
 
     def _heartbeat(self, status: str, details: dict | None = None, force: bool = False):
+        """Upsert this daemon's heartbeat row. Never raises on a busy database.
+
+        If another connection holds the write lock past the busy timeout the beat is skipped
+        (the next one retries) and logged at most once a minute, so neither a heartbeat thread
+        nor the main loop dies of a long import.
+        """
         now = time.time()
         if not force and (now - self._last_heartbeat_at) < self.heartbeat_interval_seconds:
             return
         with self.heartbeat_lock:
-            cur = self.heartbeat_conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, details_json, last_seen_at, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT(daemon_name) DO UPDATE SET
-                    worker_id = excluded.worker_id,
-                    status = excluded.status,
-                    details_json = excluded.details_json,
-                    last_seen_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    self.daemon_name,
-                    self.worker_id,
-                    str(status or "idle"),
-                    json.dumps(details or {}),
-                ),
-            )
-            self.heartbeat_conn.commit()
+            try:
+                cur = self.heartbeat_conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, details_json, last_seen_at, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(daemon_name) DO UPDATE SET
+                        worker_id = excluded.worker_id,
+                        status = excluded.status,
+                        details_json = excluded.details_json,
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        self.daemon_name,
+                        self.worker_id,
+                        str(status or "idle"),
+                        json.dumps(details or {}),
+                    ),
+                )
+                self.heartbeat_conn.commit()
+            except sqlite3.OperationalError as exc:
+                try:
+                    if self.heartbeat_conn.in_transaction:
+                        self.heartbeat_conn.rollback()
+                except sqlite3.Error:
+                    pass
+                if now - getattr(self, "_heartbeat_error_logged_at", 0.0) >= 60:
+                    self._heartbeat_error_logged_at = now
+                    log(f"Heartbeat skipped (database busy): {exc}")
+                return
         self._last_heartbeat_at = now
 
     def _start_job_heartbeat(self, job: dict):
@@ -1214,7 +1231,10 @@ class PipelineDaemon:
                 self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
             except Exception as e:
                 log(f"Critical error in main loop: {e}")
-                self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
+                try:
+                    self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
+                except Exception as beat_error:  # the loop must survive a failing error beat
+                    log(f"Error heartbeat failed: {beat_error}")
                 time.sleep(10)
 
 if __name__ == "__main__":

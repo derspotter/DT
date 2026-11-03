@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import sys
+import traceback
 from collections import deque
 from pathlib import Path
 from _bootstrap import ensure_import_paths
@@ -41,6 +42,8 @@ from dl_lit.utils import (
     get_global_rate_limiter,
     get_openalex_session,
     openalex_request_json,
+    redact_openalex_key,
+    redact_openalex_request_error,
 )
 from reference_expansion import (
     DEFAULT_INCLUDE_DOWNSTREAM,
@@ -91,15 +94,18 @@ def _openalex_get(params, mailto=None, retries=3):
     request_params = dict(params)
     if mailto:
         request_params['mailto'] = mailto
-    return openalex_request_json(
-        url=OPENALEX_WORKS_URL,
-        params=request_params,
-        headers={'Accept': 'application/json'},
-        timeout=30,
-        session=get_openalex_session(),
-        rate_limiter=get_global_rate_limiter(),
-        retries=retries,
-    )
+    try:
+        return openalex_request_json(
+            url=OPENALEX_WORKS_URL,
+            params=request_params,
+            headers={'Accept': 'application/json'},
+            timeout=30,
+            session=get_openalex_session(),
+            rate_limiter=get_global_rate_limiter(),
+            retries=retries,
+        )
+    except requests.RequestException as exc:
+        raise redact_openalex_request_error(exc) from None
 
 
 def fetch_work_by_openalex_id(openalex_id, mailto=None):
@@ -821,7 +827,7 @@ def main():
             raise
         except Exception as exc:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            db.finish_search_run(run_id, 'failed', error=str(exc)[:500])
+            db.finish_search_run(run_id, 'failed', error=redact_openalex_key(exc)[:500])
             db.close_connection()
             raise
         db.close_connection()
@@ -838,5 +844,15 @@ def main():
     print(json.dumps(payload))
 
 
+def run_cli():
+    """Entry point: an uncaught error is printed to stderr (exit 1) with any api_key dropped."""
+    try:
+        main()
+    except Exception:  # noqa: BLE001 - every error path goes through the redaction
+        sys.stderr.write(redact_openalex_key(traceback.format_exc()))
+        sys.stderr.flush()
+        sys.exit(1)
+
+
 if __name__ == '__main__':
-    main()
+    run_cli()

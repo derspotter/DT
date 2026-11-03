@@ -65,7 +65,7 @@ def test_create_pending_work_low_confidence_match_resolves_into_the_found_work(t
 
     new_id, err = db.create_pending_work({"title": "Same Title", "year": 2020, "publisher": "Pub"})
 
-    assert (new_id, err) == (first, None)
+    assert (new_id, err) == (None, f"Duplicate already exists in works (ID {first}) on title_year")
     assert len(lookups) == 1
     assert resolves[0][1]["existing"] == (first, "title_year")
     assert resolves[0][2] == (first, "title_year")
