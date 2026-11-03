@@ -566,8 +566,8 @@
   let corpusActionStatus = ''
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
-  // The graph opens scoped to the workspace corpus; "All corpora" in its own
-  // dropdown restores the previous global view (spec line 22).
+  // The graph opens scoped to the workspace corpus; for the admin, "All corpora"
+  // in its own dropdown restores the previous global view (spec line 22).
   $: graphCorpusId = Number.isFinite(Number(currentCorpusId)) && currentCorpusId ? String(currentCorpusId) : 'all'
   // Load settings the first time an admin opens the Admin tab.
   $: if (activeTab === 'admin' && isAdmin && appSettings === null) loadAppSettings()
@@ -1623,6 +1623,47 @@
     return activeTab === 'workspace' || activeTab === 'dashboard' || activeTab === 'downloads'
   }
 
+  // The backend re-validates the selected corpus on every request and falls
+  // back to another membership (or none) after a revocation. Polls fetch
+  // /api/auth/me and follow that choice, so the UI never shows corpus A while
+  // reads and writes already go to B. No select POST: the backend persisted it.
+  let corpusReconcileInFlight = false
+  // Resolves true when it switched (or cleared) the workspace corpus.
+  async function reconcileCorpusWithBackend() {
+    if (corpusReconcileInFlight || authStatus !== 'authenticated') return false
+    corpusReconcileInFlight = true
+    const corpusIdAtRequest = currentCorpusId
+    try {
+      const me = await fetchMe()
+      if (authStatus !== 'authenticated' || !me?.user) return false
+      // The user switched corpus meanwhile; this answer may predate the switch.
+      if (currentCorpusId !== corpusIdAtRequest) return false
+      const nextCorpusId = me.user.last_corpus_id || null
+      const nextCorpora = me.corpora || []
+      if (JSON.stringify(nextCorpora) !== JSON.stringify(corpora)) corpora = nextCorpora
+      if (JSON.stringify(me.user) !== JSON.stringify(authUser)) authUser = me.user
+      if (Number(nextCorpusId || 0) === Number(currentCorpusId || 0)) return false
+      currentCorpusId = nextCorpusId
+      resetFrontendState()
+      if (nextCorpusId) {
+        await refreshAll()
+        if (logsType === 'pipeline') handleLogsCorpusFilterChange()
+      }
+      return true
+    } catch (error) {
+      // A failed /me poll changes nothing; the next cycle retries.
+      return false
+    } finally {
+      corpusReconcileInFlight = false
+    }
+  }
+
+  // A corpus-scoped poll answered 403 (e.g. "Select a corpus first"): the
+  // backend no longer serves the corpus the UI shows.
+  function handleCorpusPollForbidden(error) {
+    if (error?.status === 403) void reconcileCorpusWithBackend()
+  }
+
   async function runLiveRefreshCycle() {
     try {
       await runLiveRefreshCycleOnce()
@@ -1674,6 +1715,8 @@
     }
     pipelineRefreshInFlight = true
     try {
+      // A corpus switch reloads the workspace itself; skip this cycle's loads.
+      if (await reconcileCorpusWithBackend()) return
       const tasks = [
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
@@ -2741,8 +2784,9 @@
         authStatus = 'unauthenticated'
         setAuthToken('')
       }
+      if (!global) handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
-      apiStatus = 'offline'
+      apiStatus = error?.status === 403 ? 'online' : 'offline'
     }
   }
 
@@ -3279,6 +3323,7 @@
         setAuthToken('')
         return
       }
+      handleCorpusPollForbidden(error)
       if (token !== seedSourcesRequestToken) return
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
@@ -4120,6 +4165,7 @@
         setAuthToken('')
         return
       }
+      handleCorpusPollForbidden(error)
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
       }
@@ -4954,6 +5000,9 @@
           <label class="header-corpus-picker">
             <span class="eyebrow">Corpus Workspace</span>
             <select value={currentCorpusId || ''} on:change={handleSelectCorpus}>
+              {#if !currentCorpusId}
+                <option value="" disabled>Select a corpus</option>
+              {/if}
               {#each corpora as corpus}
                 <option value={corpus.id}>{corpusOptionLabel(corpus)}</option>
               {/each}
@@ -6336,7 +6385,7 @@
       {/if}
 
       {#if activeTab === 'graph'}
-        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} />
+        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
       {/if}
     </section>
   </div>
