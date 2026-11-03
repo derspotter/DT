@@ -1311,6 +1311,23 @@ class DatabaseManager:
                                 commit=commit,
                             )
                             resolved_conflict = True
+                            # The existing record keeps its own resolved identity (it has none
+                            # yet), so later title-based lookups keep the two records apart.
+                            existing_ids = self._unclaimed_resolved_identifiers(existing_resolved)
+                            if existing_ids:
+                                self._update_work_record(int(eid), existing_ids)
+                            # An identifier another row already owns is a high-confidence match
+                            # with that row: link and merge there, no new row.
+                            owner_id, owner_field = self._resolved_identifier_owner(incoming_resolved)
+                            if owner_id:
+                                if corpus_id:
+                                    self.add_corpus_item(corpus_id, "works", owner_id, commit=commit)
+                                owner_row = self.get_entry_by_id("works", owner_id) or {}
+                                merged = self._apply_work_merge_priority(owner_row, self._build_raw_work_payload(ref))
+                                self._update_work_record(owner_id, merged)
+                                if commit:
+                                    self.conn.commit()
+                                return None, f"Duplicate already exists in works (ID {owner_id}) on {owner_field}"
                     else:
                         # Resolution failed; fall through to high-confidence check.
                         pass
@@ -1379,11 +1396,27 @@ class DatabaseManager:
         except sqlite3.IntegrityError as e:
             return None, f"IntegrityError inserting into works: {e}"
 
+    def _resolved_identifier_owner(self, resolved: dict) -> tuple[int | None, str | None]:
+        """The works row that already holds ``resolved``'s DOI (first) or OpenAlex id."""
+        cur = self.conn.cursor()
+        norm_doi = self._normalize_doi(resolved.get("doi"))
+        if norm_doi:
+            row = cur.execute("SELECT id FROM works WHERE normalized_doi = ?", (norm_doi,)).fetchone()
+            if row:
+                return int(row[0]), "normalized_doi"
+        openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
+        if openalex:
+            row = cur.execute("SELECT id FROM works WHERE openalex_id = ?", (openalex,)).fetchone()
+            if row:
+                return int(row[0]), "openalex_id"
+        return None, None
+
     def _unclaimed_resolved_identifiers(self, resolved: dict) -> dict:
         """The doi/normalized_doi/openalex_id of ``resolved`` that no works row holds yet.
 
         An identifier another row already carries sits under a unique index; it is left out
-        rather than failing the insert.
+        rather than failing the write (for the incoming record such an owner is matched first,
+        see _resolved_identifier_owner).
         """
         out = {}
         cur = self.conn.cursor()

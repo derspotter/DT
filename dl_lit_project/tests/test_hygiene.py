@@ -634,3 +634,62 @@ def test_keyword_search_script_error_path_redacts(monkeypatch, tmp_path, capsys)
     db = DatabaseManager(str(tmp_path / "t.db"))
     stored = db.conn.execute("SELECT status, error FROM search_runs").fetchone()
     assert stored[0] == "failed" and "sekret" not in stored[1] and "api_key" not in stored[1]
+
+
+# --- final wave round 2: I1b (the existing record keeps its resolved id), I1c (owned ids match) --
+
+def test_resolved_conflict_stores_the_existing_records_identifier(tmp_path, monkeypatch):
+    db, first_id, _ = _conflicting_pair(tmp_path, monkeypatch)
+    row = db.get_entry_by_id("works", first_id)
+    assert (row["doi"], row["normalized_doi"]) == ("10.1/first", db._normalize_doi("10.1/first"))
+
+
+def test_enriching_the_new_record_without_a_doi_keeps_both(tmp_path, monkeypatch):
+    db, first_id, second_id = _conflicting_pair(tmp_path, monkeypatch)
+
+    result = db.apply_enriched_metadata(
+        second_id, {"title": "Migration and the European Union", "authors": ["Bob Jones"], "year": 2020}
+    )
+
+    assert result == (second_id, None)
+    rows = db.conn.execute("SELECT id, authors FROM works ORDER BY id").fetchall()
+    assert rows == [(first_id, '["Alice Smith"]'), (second_id, '["Bob Jones"]')]
+    corpora = db.conn.execute("SELECT corpus_id, work_id FROM corpus_works ORDER BY corpus_id").fetchall()
+    assert corpora == [(1, first_id), (2, second_id)]
+
+
+def test_existing_records_identifier_owned_elsewhere_is_not_stored(tmp_path, monkeypatch):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    searcher = _ResolvingSearcher({"Carol King": "10.1/owned", "Bob Jones": "10.1/new"})
+    monkeypatch.setattr(db, "_resolve_identifiers_for_ref", lambda ref, s, rl: s.resolve(ref))
+    owner, _ = db.create_pending_work({"title": "Another Work", "doi": "10.1/owned", "year": 2001})
+    c_id, _ = db.create_pending_work({"title": "Shared Title", "authors": ["Carol King"], "year": 2020})
+    b_id, err = db.create_pending_work(
+        {"title": "Shared Title", "authors": ["Bob Jones"], "year": 2020},
+        searcher=searcher, resolve_potential_duplicates=True,
+    )
+    assert err is None and b_id not in (owner, c_id)
+    assert db.get_entry_by_id("works", c_id)["normalized_doi"] in (None, "")
+    assert db.get_entry_by_id("works", owner)["normalized_doi"] == db._normalize_doi("10.1/owned")
+
+
+def test_a_resolved_identifier_owned_by_another_row_links_to_that_row(tmp_path, monkeypatch):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    searcher = _ResolvingSearcher({"Bob Jones": "10.1/x", "Carol King": "10.1/c"})
+    monkeypatch.setattr(db, "_resolve_identifiers_for_ref", lambda ref, s, rl: s.resolve(ref))
+    a_id, _ = db.create_pending_work({"title": "Original Work", "doi": "10.1/x", "year": 2020, "corpus_id": 1})
+    c_id, _ = db.create_pending_work({"title": "Shared Title", "authors": ["Carol King"], "year": 2020, "corpus_id": 1})
+
+    row_id, err = db.create_pending_work(
+        {"title": "Shared Title", "authors": ["Bob Jones"], "year": 2020, "publisher": "Pub B", "corpus_id": 2},
+        searcher=searcher,
+        resolve_potential_duplicates=True,
+    )
+
+    assert (row_id, err) == (None, f"Duplicate already exists in works (ID {a_id}) on normalized_doi")
+    assert [r[0] for r in db.conn.execute("SELECT id FROM works ORDER BY id")] == [a_id, c_id]
+    assert db.get_entry_by_id("works", a_id)["publisher"] == "Pub B"
+    assert db.get_entry_by_id("works", a_id)["title"] == "Original Work"
+    corpora = db.conn.execute("SELECT corpus_id, work_id FROM corpus_works ORDER BY corpus_id, work_id").fetchall()
+    assert corpora == [(1, a_id), (1, c_id), (2, a_id)]
+    assert db.get_entry_by_id("works", c_id)["normalized_doi"] == db._normalize_doi("10.1/c")
