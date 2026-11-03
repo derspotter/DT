@@ -411,7 +411,7 @@ function graph3dScriptArgs(options, extraArgs = []) {
   return args;
 }
 
-function graph3dSnapshotKey(options) {
+export function graph3dSnapshotKey(options) {
   // Intentionally excludes the DB modification time: the enrich/download workers
   // touch the DB constantly, so keying on mtime made nearly every open a cold
   // ~30s rebuild. A param set now maps to one stable cache dir, refreshed in the
@@ -434,6 +434,48 @@ function graph3dSnapshotPath(key, fileName = '') {
   return path.join(GRAPH_3D_SNAPSHOT_DIR, key, fileName);
 }
 
+// scope.json records which corpus a snapshot was built for (null = the
+// admin-only merged view), so the key-addressed cluster/file routes can check
+// access without trusting a client-supplied corpus.
+export function graph3dScopePath(key) {
+  return graph3dSnapshotPath(key, 'scope.json');
+}
+
+export function writeGraph3dScope(key, corpusId, dir = graph3dSnapshotPath(key)) {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'scope.json'), JSON.stringify({ corpusId: corpusId ?? null }));
+}
+
+// Returns { corpusId } or null when the sidecar is missing or malformed
+// (pre-sidecar caches stay admin-only until their TTL rebuild writes one).
+export function readGraph3dScope(key) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(graph3dScopePath(key), 'utf-8'));
+    const corpusId = parsed?.corpusId;
+    if (corpusId === null) return { corpusId: null };
+    return Number.isInteger(corpusId) && corpusId > 0 ? { corpusId } : null;
+  } catch {
+    return null;
+  }
+}
+
+// The admin reads every work; anyone else only works in a corpus they belong to.
+export function workReadableByUser(db, user, workId, authConfig = resolveAuthConfig()) {
+  if (isAdminUser(user, authConfig)) return true;
+  if (!user?.id) return false;
+  return Boolean(
+    db
+      .prepare(
+        `SELECT EXISTS (
+           SELECT 1 FROM corpus_works cw
+           JOIN user_corpora uc ON uc.corpus_id = cw.corpus_id
+           WHERE cw.work_id = ? AND uc.user_id = ?
+         ) AS readable`
+      )
+      .get(workId, user.id)?.readable
+  );
+}
+
 // Build a snapshot into a temp dir, then swap it into place, so readers never
 // see a half-written snapshot. Concurrent callers for the same key share one
 // build. Returns the manifest object.
@@ -444,6 +486,8 @@ function buildGraph3dSnapshot(options, key) {
   const promise = (async () => {
     try {
       fs.mkdirSync(buildDir, { recursive: true });
+      // Written into the build dir so it is swapped in together with the snapshot.
+      writeGraph3dScope(key, options.corpusId, buildDir);
       await runPythonJson(
         GRAPH_3D_EXPORT_SCRIPT,
         graph3dScriptArgs(options, ['--snapshot-dir', buildDir]),
@@ -2847,6 +2891,30 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   };
   const corpusIdFromParams = (req) => Number(req.params.id);
   const requireCurrentCorpusMember = requireCorpusMember();
+  // Snapshot keys are client-addressable, so the cluster/file routes decide
+  // from the snapshot's own scope.json: no sidecar or the merged (null) view
+  // is admin only, a corpus snapshot needs membership of that corpus.
+  const canReadGraph3dScope = (req, scope) => {
+    if (isStubMode()) return true;
+    if (!scope || scope.corpusId === null) return isAdminUser(req.user, authConfig);
+    return Boolean(resolveCorpusRole(authDb, req.user, scope.corpusId, authConfig));
+  };
+  const requireGraph3dScopeAccess = (req, res, next) => {
+    const key = String(req.params.snapshotKey || '').trim();
+    if (/^[a-f0-9]{20}$/.test(key) && !canReadGraph3dScope(req, readGraph3dScope(key))) {
+      return res.status(403).json({ error: 'No access to this corpus' });
+    }
+    return next();
+  };
+  // The snapshot route's effective corpus: an explicit corpus_id needs a role
+  // on it; 'all'/absent is the merged view for the admin and the current
+  // corpus for everyone else. Sends the 403 itself and returns undefined.
+  const resolveGraph3dCorpusId = (req, res, requestedCorpusId) => {
+    if (requestedCorpusId === null && isAdminUser(req.user, authConfig)) return null;
+    const getCorpusId = requestedCorpusId === null ? (r) => r.corpusId : () => requestedCorpusId;
+    if (!resolveRequestCorpusRole(req, res, getCorpusId)) return undefined;
+    return getCorpusId(req);
+  };
   // ?global=1 is admin-gated inside the handler and reads every corpus on
   // purpose; every other request is scoped to the current corpus.
   const requireCorpusMemberUnlessGlobal = (req, res, next) => {
@@ -5938,7 +6006,10 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.json(stubGraph3dManifest());
     }
 
-    const options = buildGraph3dRequest(req);
+    const requested = buildGraph3dRequest(req);
+    const corpusId = resolveGraph3dCorpusId(req, res, requested.corpusId);
+    if (corpusId === undefined) return undefined;
+    const options = { ...requested, corpusId };
     const key = graph3dSnapshotKey(options);
     const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
     const refresh = req.query?.refresh === '1' || req.query?.refresh === 'true';
@@ -6011,7 +6082,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
           ? [Number.isFinite(numericId) ? numericId : -1, nodeId, nodeId]
           : [Number.isFinite(numericId) ? numericId : -1];
         const row = db.prepare(query).get(...params);
-        if (!row) {
+        // 404 rather than 403 so node ids do not reveal works in foreign corpora.
+        if (!row || !workReadableByUser(authDb, req.user, row.id, authConfig)) {
           return res.status(404).json({ error: 'Node not found' });
         }
         return res.json({
@@ -6030,7 +6102,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, requireGraph3dScopeAccess, async (req, res) => {
     const key = String(req.params.snapshotKey || '').trim();
     const clusterId = Number(req.params.clusterId);
     if (!/^[a-f0-9]{20}$/.test(key) || !Number.isFinite(clusterId)) {
@@ -6050,7 +6122,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.get('/api/graph/3d/snapshot/:snapshotKey/:fileName', requireAuthMiddleware, async (req, res) => {
+  app.get('/api/graph/3d/snapshot/:snapshotKey/:fileName', requireAuthMiddleware, requireGraph3dScopeAccess, async (req, res) => {
     const key = String(req.params.snapshotKey || '').trim();
     const fileName = String(req.params.fileName || '').trim();
     const allowedFiles = new Set(['manifest.json', 'nodes.bin', 'edges.bin', 'nodes_meta.json', 'clusters.json']);
