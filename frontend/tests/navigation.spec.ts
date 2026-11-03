@@ -1,4 +1,5 @@
 import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test'
+import { mockLogSocket } from './helpers/mockApi'
 
 async function ensureSignedIn(page: Page, request: APIRequestContext) {
   await page.goto('/')
@@ -45,6 +46,7 @@ test('does not snap back to workspace when navigating during post-login load', a
     })
   }
 
+  await mockLogSocket(page)
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     const path = url.pathname
@@ -105,6 +107,9 @@ test('does not snap back to workspace when navigating during post-login load', a
 })
 
 test('sticky bar jumps to the corpus section', async ({ page, request }) => {
+  const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
+  const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
+  test.skip(!username || !password, 'Live backend credentials not set (E2E_USERNAME/E2E_PASSWORD or RAG_ADMIN_USER/RAG_ADMIN_PASSWORD)')
   await ensureSignedIn(page, request)
   const bar = page.getByTestId('workspace-sticky-bar')
   await expect(bar).toBeVisible()
