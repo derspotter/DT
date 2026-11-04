@@ -883,3 +883,40 @@ test('an invitation that answers 401 leaves no status for the next admin', async
   await expect(page.locator('.admin-invite-form')).toBeVisible()
   await expect(page.locator('.admin-invite-form__status')).toHaveCount(0)
 })
+
+test('the log type and corpus filter go back to their defaults on sign-out', async ({ page }) => {
+  const adminA = { ...userA, is_admin: true }
+  const adminB = { ...userB, is_admin: true }
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: adminB })
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? adminB : adminA, corpora: [corpus] })
+    }
+    if (path === '/api/logs/tail') return fulfil(route, { lines: [] })
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/logs')
+  const type = page.getByTestId('logs-type-select')
+  const currentCorpus = page.getByRole('checkbox', { name: 'Current corpus only' })
+  await type.selectOption('app')
+  await currentCorpus.uncheck()
+  await expect(type).toHaveValue('app')
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await page.evaluate(() => { window.location.hash = '#/logs' })
+  await expect(type).toHaveValue('pipeline')
+  await expect(currentCorpus).toBeChecked()
+})

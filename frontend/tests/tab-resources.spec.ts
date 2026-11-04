@@ -56,6 +56,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // Daemon workers; a running batch puts an admin on the 2 s cadence.
     workers: {} as Record<string, unknown>,
     ingestRuns: [] as Record<string, unknown>[],
+    // The Kantropos target list, and whether its route answers 503.
+    targets: [{ id: 'k1', name: 'Kantropos One' }],
+    failTargets: false,
   }
   const scripted = async (route: Route, steps: Step[]) => {
     const step = steps.shift()
@@ -138,13 +141,16 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     }
     if (path === '/api/downloads') return fulfil(route, { items: [], source: 'api' })
     if (path === '/api/downloads/worker/status') return fulfil(route, {})
-    if (path === '/api/kantropos/corpora') return fulfil(route, { corpora: [{ id: 'k1', name: 'Kantropos One' }] })
+    if (path === '/api/kantropos/corpora') {
+      if (state.failTargets) return fulfil(route, { error: 'targets down' }, 503)
+      return fulfil(route, { corpora: state.targets })
+    }
     if (path === '/api/kantropos/corpora/k1/browse') {
       if (await scripted(route, state.browseSteps)) return
       return fulfil(route, { target: { id: 'k1', name: 'Kantropos One' }, summary: {}, assigned_corpora: [], current_items: [], pending_items: [] })
     }
     if (path === '/api/corpora/1/kantropos-assignment' || path === '/api/corpora/2/kantropos-assignment') {
-      return fulfil(route, { assignment: null, corpora: [{ id: 'k1', name: 'Kantropos One' }], can_edit: true })
+      return fulfil(route, { assignment: null, corpora: state.failTargets ? null : state.targets, can_edit: true })
     }
     return fulfil(route, {})
   })
@@ -648,4 +654,15 @@ test('Korpus Management does not poll the browse while a worker is busy', async 
   // The explicit refresh still loads it.
   await page.getByRole('button', { name: 'Refresh', exact: true }).click()
   await expect.poll(() => count('/api/kantropos/corpora/k1/browse')).toBe(1)
+})
+
+test('an empty target list is fetched once per load', async ({ page }) => {
+  const { count } = await boot(page, { hash: '#/upstream', setup: (state) => { state.targets = [] } })
+  expect(count('/api/kantropos/corpora')).toBe(1)
+})
+
+test('a failed target list is fetched once per load and its error stays', async ({ page }) => {
+  const { count } = await boot(page, { hash: '#/upstream', setup: (state) => { state.failTargets = true } })
+  expect(count('/api/kantropos/corpora')).toBe(1)
+  await expect(page.getByText('targets down')).toBeVisible()
 })

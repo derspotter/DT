@@ -2024,6 +2024,8 @@
       selectedUpstreamTargetId = ''
       openalexQuota = null
       // The signed-out user's view choices.
+      logsType = 'pipeline'
+      logsFilterCurrentCorpus = true
       searchField = 'default'
       searchAuthor = ''
       yearFrom = ''
@@ -2215,14 +2217,17 @@
     }
     upstreamBrowseLoading = true
     try {
-      if (kantroposTargets.length === 0) {
-        await loadKantroposTargets()
-      }
       // The assignment card lives on this tab only: load it with the browse
       // (once per corpus for the quiet refreshes, so the card does not blink).
+      // It asks for the target list itself; an empty or failed list is not
+      // asked for twice in one load.
+      let targetsChecked = false
       if (!appendCurrent && !appendPending && (!quiet || kantroposAssignmentCorpusId !== Number(currentCorpusId))) {
-        await loadKantroposAssignment()
+        targetsChecked = await loadKantroposAssignment()
         if (requestSeq !== upstreamBrowseRequestSeq) return
+      }
+      if (!targetsChecked && kantroposTargets.length === 0) {
+        await loadKantroposTargets()
       }
       const targetId = String(selectedUpstreamTargetId || kantroposAssignment?.target_id || kantroposTargets[0]?.id || '').trim()
       if (!targetId) {
@@ -2295,18 +2300,20 @@
     selectedUpstreamAssignedCorpusId = Number(selectedUpstreamAssignedCorpusId) === normalized ? null : normalized
   }
 
+  // True once the target list was checked (with no corpus there is nothing to
+  // load, so the caller still has to).
   async function loadKantroposAssignment() {
     const corpusId = Number(currentCorpusId)
     const requestSeq = ++kantroposAssignmentRequestSeq
     resetKantroposAssignmentState()
-    if (!Number.isFinite(corpusId) || corpusId <= 0) return
+    if (!Number.isFinite(corpusId) || corpusId <= 0) return false
     kantroposAssignmentLoading = true
     try {
       if (kantroposTargets.length === 0) {
         await loadKantroposTargets()
       }
       const payload = await fetchCorpusKantroposAssignment(corpusId)
-      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return true
       kantroposTargets = payload?.corpora || kantroposTargets
       kantroposAssignment = payload?.assignment || null
       kantroposAssignmentCorpusId = corpusId
@@ -2315,7 +2322,7 @@
         // no-op; backend truth is enough, UI editability still derives from current corpus role
       }
     } catch (error) {
-      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return true
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos assignment.'
       kantroposAssignmentError = true
     } finally {
@@ -2323,6 +2330,7 @@
         kantroposAssignmentLoading = false
       }
     }
+    return true
   }
 
   async function handleSaveKantroposAssignment() {
