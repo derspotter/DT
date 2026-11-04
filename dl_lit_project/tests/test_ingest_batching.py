@@ -1,9 +1,11 @@
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+import dl_lit.db_manager as db_manager_module
 from dl_lit.db_manager import DatabaseManager
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "backend" / "scripts"
@@ -345,5 +347,81 @@ def test_reimport_with_a_low_confidence_match_links_without_adding(monkeypatch, 
     try:
         assert db.conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 1
         assert dict(db.conn.execute("SELECT corpus_id, COUNT(*) FROM corpus_works GROUP BY corpus_id").fetchall()) == {1: 1, 2: 1}
+    finally:
+        db.close_connection()
+
+
+# --- second pass: a transaction SQLite rolled back whole fails visibly ----------------------
+FILLER_ENTRIES = [{"title": f"Entry {i}", "abstract": "y" * 3000} for i in range(40)]
+
+
+class _SmallDatabase(DatabaseManager):
+    """Writes hit SQLITE_FULL a few pages in, which rolls back the whole transaction."""
+
+    def _create_schema(self):
+        super()._create_schema()
+        pages = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        self.conn.execute(f"PRAGMA max_page_count={pages + 12}")
+
+
+def _work_count(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM works").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_add_pending_works_from_json_raises_when_sqlite_drops_the_transaction(tmp_path):
+    db_path = tmp_path / "lit.db"
+    db = _SmallDatabase(db_path)
+    json_path = tmp_path / "refs.json"
+    json_path.write_text(json.dumps(FILLER_ENTRIES), encoding="utf-8")
+    try:
+        with pytest.raises(sqlite3.Error):
+            db.add_pending_works_from_json(json_path)
+        assert not db.conn.in_transaction
+    finally:
+        db.close_connection()
+    assert _work_count(db_path) == 0  # the chunk is gone as a whole, entries after it never ran
+
+
+def test_add_pending_works_from_json_counts_never_exceed_the_rows_of_committed_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(db_manager_module, "INGEST_COMMIT_CHUNK", 5)
+    db_path = tmp_path / "lit.db"
+    db = _SmallDatabase(db_path)
+    json_path = tmp_path / "refs.json"
+    json_path.write_text(json.dumps(FILLER_ENTRIES), encoding="utf-8")
+    try:
+        with pytest.raises(sqlite3.Error):
+            db.add_pending_works_from_json(json_path)
+    finally:
+        db.close_connection()
+    rows = _work_count(db_path)
+    assert rows > 0 and rows % 5 == 0  # earlier chunks stay, the failing one is gone whole
+
+
+def test_import_seed_fails_when_sqlite_drops_the_transaction(monkeypatch, tmp_path, capsys):
+    mod = _load_import_script(monkeypatch)
+    monkeypatch.setattr(mod, "DatabaseManager", _SmallDatabase)
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps(FILLER_ENTRIES), encoding="utf-8")
+    db_path = tmp_path / "lit.db"
+    with pytest.raises(sqlite3.Error):
+        mod.main(["--db-path", str(db_path), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
+    assert '"added"' not in capsys.readouterr().out  # no summary claims rows that are gone
+    assert _work_count(db_path) == 0
+
+
+def test_transaction_raises_when_the_transaction_it_opened_is_gone(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="transaction"):
+            with db.transaction():
+                db.conn.rollback()
+        with db.transaction():  # the connection stays usable
+            with db.transaction():  # nested: this call opened nothing, so it checks nothing
+                pass
+        assert not db.conn.in_transaction
     finally:
         db.close_connection()

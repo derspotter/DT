@@ -146,6 +146,11 @@ class DatabaseManager:
         the COMMIT raises, ROLLBACKs and re-raises. Only the call that began the transaction
         commits or rolls back, so nested use is a passthrough. Writers called inside must not
         commit themselves: pass them commit=False. Keep network calls out of the block.
+
+        SQLite rolls back the whole transaction on some errors (SQLITE_FULL, I/O errors). If the
+        transaction this call opened is gone on normal exit, the block's writes are lost and
+        OperationalError is raised. A per-entry handler inside the block must re-raise when
+        ``conn.in_transaction`` is False: the entries before it are gone with the transaction.
         """
         if self.conn.in_transaction:
             yield
@@ -153,8 +158,9 @@ class DatabaseManager:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield
-            if self.conn.in_transaction:
-                self.conn.commit()
+            if not self.conn.in_transaction:
+                raise sqlite3.OperationalError("transaction was lost before COMMIT; its writes are gone")
+            self.conn.commit()
         except BaseException:
             if self.conn.in_transaction:
                 self.conn.rollback()
@@ -876,6 +882,8 @@ class DatabaseManager:
                             with self.savepoint():
                                 row_id, err = self.create_pending_work(entry, commit=False)
                         except Exception as exc:
+                            if not self.conn.in_transaction:
+                                raise  # SQLite dropped the transaction: the whole chunk is lost
                             row_id, err = None, f"Skipped entry {entry.get('title')!r}: {exc}"
                     if row_id:
                         added_count += 1

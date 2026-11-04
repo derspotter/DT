@@ -10,7 +10,9 @@ CLI command.
 
 Entries are written in transactions of INGEST_COMMIT_CHUNK entries (so no write lock
 is held for the whole file), each entry inside its own savepoint: an entry that
-raises leaves no rows behind and counts as skipped.
+raises leaves no rows behind and counts as skipped. If SQLite rolls back the whole
+transaction (a full disk, an I/O error), the script fails with a non-zero exit and no
+summary: earlier chunks stay committed, and a rerun is safe because duplicates merge.
 
 Prints a JSON summary: {added, skipped, corpus_linked, total, errors}. `added`
 counts new works; `corpus_linked` counts entries (new or duplicate) linked to
@@ -121,6 +123,8 @@ def main(argv=None):
                         with db.savepoint():
                             row_id, err = db.create_pending_work(entry, commit=False)
                     except Exception as exc:
+                        if not db.conn.in_transaction:
+                            raise  # SQLite dropped the transaction: the whole chunk is lost
                         skipped += 1
                         errors.append(str(exc))
                         continue
