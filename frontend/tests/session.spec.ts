@@ -1,3 +1,5 @@
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
 import { fulfil, mockLogSocket } from './helpers/mockApi'
 
@@ -479,4 +481,59 @@ test('a settings load that fails after a sign-out does not show its error to the
   await expect(page.locator('.admin-settings-form')).toBeVisible()
   await expect(page.getByText('Stale settings failure')).toHaveCount(0)
   await expect(page.getByText('Failed to load settings')).toHaveCount(0)
+})
+
+test('a network failure and a timeout reach the login form as readable text', async ({ page }) => {
+  let mode: 'network' | 'hang' = 'network'
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/login') {
+      if (mode === 'network') return route.abort('connectionfailed')
+      return // Never answered: the request timeout has to end it.
+    }
+    return fulfil(route, { error: 'Unauthorized' }, 401)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  const error = page.getByTestId('login-form').locator('.error')
+  await expect(error).toHaveText('Could not reach the server.')
+
+  mode = 'hang'
+  await logIn(page, 'alice')
+  await expect(error).toHaveText('The server did not answer in time.', { timeout: 10_000 })
+})
+
+test('the request timeout also covers reading the response body', async ({ page }) => {
+  // A real stall: the headers and half a body arrive, the rest never does.
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+    response.write('{"corpora":')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const stallUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/stall`
+  try {
+    await mockLogSocket(page)
+    await page.route('**/api/**', (route) => fulfil(route, { error: 'Unauthorized' }, 401))
+    await page.goto('/#/workspace')
+    await expect(page.getByTestId('login-form')).toBeVisible()
+    const outcome = await page.evaluate(async (url) => {
+      const realFetch = window.fetch
+      window.fetch = (_input, options) => realFetch(url, options)
+      try {
+        const api = await import('/src/lib/api.js' as string)
+        await api.fetchCorpora()
+        return 'resolved'
+      } catch (error) {
+        return (error as Error).message
+      } finally {
+        window.fetch = realFetch
+      }
+    }, stallUrl)
+    expect(outcome).toBe('The server did not answer in time.')
+  } finally {
+    server.closeAllConnections()
+    server.close()
+  }
 })

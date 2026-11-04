@@ -26,7 +26,19 @@ export function onUnauthorized(handler) {
   unauthorizedHandler = typeof handler === 'function' ? handler : null
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
+// `fetch` rejects with text meant for developers ("signal is aborted without
+// reason", "Failed to fetch"). HTTP errors (they carry a status) and anything
+// else, such as a body that is not JSON, pass through.
+function transportError(error, timedOut) {
+  if (error?.status !== undefined) return error
+  if (timedOut) return new Error('The server did not answer in time.', { cause: error })
+  if (error instanceof TypeError) return new Error('Could not reach the server.', { cause: error })
+  return error
+}
+
+// `read` runs while the timer is armed, so a body that stalls after the
+// headers is aborted too. A `raw` caller reads its own body after this returns.
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT, read = (response) => response) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -35,7 +47,9 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) 
       headers.Authorization = `Bearer ${authToken}`
     }
     const response = await fetch(url, { cache: 'no-store', ...options, headers, signal: controller.signal })
-    return response
+    return await read(response)
+  } catch (error) {
+    throw transportError(error, controller.signal.aborted)
   } finally {
     clearTimeout(timeout)
   }
@@ -75,19 +89,20 @@ async function requestJson(path, {
     }
   }
   const sentToken = authToken
-  const response = await fetchWithTimeout(apiUrl(path), options, timeout)
-  if (response.status === 401) {
-    const text = await response.text().catch(() => '')
-    // A 401 for a token that is no longer current (signed out, or signed in
-    // again meanwhile) says nothing about the session in use now.
-    if (notifyUnauthorized && sentToken === authToken) unauthorizedHandler?.()
-    throw Object.assign(new Error(errorText(text) || 'Unauthorized'), { status: 401 })
-  }
-  if (!response.ok) {
-    const text = await response.text().catch(() => '')
-    throw Object.assign(new Error(errorText(text) || errorMessage), { status: response.status })
-  }
-  return raw ? response : response.json()
+  return fetchWithTimeout(apiUrl(path), options, timeout, async (response) => {
+    if (response.status === 401) {
+      const text = await response.text().catch(() => '')
+      // A 401 for a token that is no longer current (signed out, or signed in
+      // again meanwhile) says nothing about the session in use now.
+      if (notifyUnauthorized && sentToken === authToken) unauthorizedHandler?.()
+      throw Object.assign(new Error(errorText(text) || 'Unauthorized'), { status: 401 })
+    }
+    if (!response.ok) {
+      const text = await response.text().catch(() => '')
+      throw Object.assign(new Error(errorText(text) || errorMessage), { status: response.status })
+    }
+    return raw ? response : response.json()
+  })
 }
 
 // The backend answers errors as { error: '...' }; show that string, not the
