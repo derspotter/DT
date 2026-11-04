@@ -84,7 +84,7 @@ def run_with_timeout(
         except _AttemptTimedOut as exc:
             if attempt >= max_attempts:
                 raise TimeoutError(
-                    f"Gemini request timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
+                    f"{label} timed out after {timeout_seconds}s after {max_attempts} attempt(s)"
                 ) from exc
             delay = max(0.0, float(backoff_seconds)) * attempt
             print(

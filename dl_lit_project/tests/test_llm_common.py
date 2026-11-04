@@ -80,7 +80,7 @@ def test_run_with_timeout_no_retries_and_errors_propagate():
 
 
 def test_run_with_timeout_message_names_label(capsys):
-    with pytest.raises(TimeoutError):
+    with pytest.raises(TimeoutError, match=r"^my label timed out after 0\.05s after 2 attempt\(s\)$"):
         llm_common.run_with_timeout(
             lambda: time.sleep(0.5), 0.05, retries=1, label="my label", sleep=lambda s: None
         )
