@@ -470,3 +470,72 @@ def test_raw_download_does_not_absorb_a_record_with_a_different_doi(tmp_path):
         assert db.get_entry_by_id("works", second)["download_status"] != "downloaded"
     finally:
         db.close_connection()
+
+
+# --- second pass: one non-object entry is skipped, its neighbours survive --------------------
+@pytest.mark.parametrize("bad", [5, "oops", None])
+def test_add_pending_works_from_json_skips_a_non_object_entry(tmp_path, bad):
+    db = DatabaseManager(tmp_path / "lit.db")
+    json_path = tmp_path / "refs.json"
+    json_path.write_text(json.dumps([{"title": "Good One"}, bad, {"title": "Good Two"}]), encoding="utf-8")
+    try:
+        added, skipped, errors = db.add_pending_works_from_json(json_path, source_pdf="x.pdf")
+        assert (added, skipped) == (2, 1)
+        assert len(errors) == 1 and type(bad).__name__ in errors[0]
+        assert [r[0] for r in db.conn.execute("SELECT title FROM works ORDER BY id")] == ["Good One", "Good Two"]
+    finally:
+        db.close_connection()
+
+
+# --- second pass: a duplicate carrying an identifier owned by another row is still linked ----
+def _split_records(db):
+    a, _ = db.create_pending_work({"title": "Row A", "authors": ["A"], "year": 2001, "doi": "10.1/a"})
+    b, _ = db.create_pending_work({"title": "Row B", "authors": ["B"], "year": 2002, "openalex_id": "W42"})
+    return a, b
+
+
+SPLIT_ENTRY = {"title": "Row A", "authors": ["A"], "year": 2001, "doi": "10.1/a", "openalex_id": "W42"}
+
+
+def test_import_seed_links_a_duplicate_whose_openalex_id_belongs_to_another_row(monkeypatch, tmp_path, capsys):
+    mod = _load_import_script(monkeypatch)
+    db_path = tmp_path / "lit.db"
+    db = DatabaseManager(db_path)
+    a, b = _split_records(db)
+    db.close_connection()
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps([SPLIT_ENTRY]), encoding="utf-8")
+
+    mod.main(["--db-path", str(db_path), "--file", str(seed), "--kind", "json", "--corpus-id", "5"])
+
+    summary = _last_json(capsys.readouterr().out)
+    assert summary == {"added": 0, "skipped": 0, "corpus_linked": 1, "total": 1, "errors": []}
+    db = DatabaseManager(db_path)
+    try:
+        assert _corpus_ids(db, a) == [5]
+        assert db.get_entry_by_id("works", a)["openalex_id"] in (None, "")
+        assert db.get_entry_by_id("works", b)["openalex_id"] == "W42"
+    finally:
+        db.close_connection()
+
+
+def test_commit_true_merge_leaves_no_open_transaction_on_a_foreign_identifier(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        a, _ = _split_records(db)
+        row_id, err = db.create_pending_work({**SPLIT_ENTRY, "corpus_id": 5, "publisher": "Filled In"})
+        assert row_id is None and f"(ID {a}) on normalized_doi" in err
+        assert _corpus_ids(db, a) == [5]
+        assert not db.conn.in_transaction
+    finally:
+        db.close_connection()
+
+
+def test_merge_keeps_an_identifier_no_other_row_owns(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    try:
+        a, _ = db.create_pending_work({"title": "Row A", "authors": ["A"], "year": 2001, "doi": "10.1/a"})
+        db.create_pending_work({"title": "Row A", "authors": ["A"], "year": 2001, "doi": "10.1/a", "openalex_id": "W7"})
+        assert db.get_entry_by_id("works", a)["openalex_id"] == "W7"
+    finally:
+        db.close_connection()

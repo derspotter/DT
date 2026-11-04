@@ -869,8 +869,13 @@ class DatabaseManager:
         step = 1 if resolving else INGEST_COMMIT_CHUNK
         for chunk_start in range(0, len(entries), step):
             with nullcontext() if resolving else self.transaction():
-                for entry in entries[chunk_start:chunk_start + step]:
-                    entry = dict(entry)
+                for raw_entry in entries[chunk_start:chunk_start + step]:
+                    try:
+                        entry = dict(raw_entry)
+                    except (TypeError, ValueError):
+                        skipped_count += 1
+                        errors.append(f"Skipped non-object entry: {type(raw_entry).__name__}")
+                        continue
                     if source_pdf:
                         entry["source_pdf"] = source_pdf
 
@@ -1355,7 +1360,8 @@ class DatabaseManager:
                 if corpus_id:
                     self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
                 work_row = self.get_entry_by_id("works", int(eid)) or {}
-                merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
+                incoming = self._without_identifiers_of_other_rows(int(eid), self._build_raw_work_payload(ref))
+                merged = self._apply_work_merge_priority(work_row, incoming)
                 self._update_work_record(int(eid), merged)
                 if commit:
                     self.conn.commit()
@@ -1445,6 +1451,27 @@ class DatabaseManager:
         openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
         if openalex and not cur.execute("SELECT 1 FROM works WHERE openalex_id = ?", (openalex,)).fetchone():
             out["openalex_id"] = openalex
+        return out
+
+    def _without_identifiers_of_other_rows(self, work_id: int, payload: dict) -> dict:
+        """``payload`` minus the DOI/OpenAlex id another works row holds (unique indexes).
+
+        Merging such an identifier into ``work_id`` would fail the write; the duplicate is still
+        linked, and the split records stay as they are.
+        """
+        out = dict(payload)
+        cur = self.conn.cursor()
+        norm_doi = self._normalize_doi(out.get("doi"))
+        if norm_doi and cur.execute(
+            "SELECT 1 FROM works WHERE normalized_doi = ? AND id != ?", (norm_doi, work_id)
+        ).fetchone():
+            out.pop("doi", None)
+            out.pop("normalized_doi", None)
+        openalex = self._normalize_openalex_id(out.get("openalex_id"))
+        if openalex and cur.execute(
+            "SELECT 1 FROM works WHERE openalex_id = ? AND id != ?", (openalex, work_id)
+        ).fetchone():
+            out.pop("openalex_id", None)
         return out
 
     def insert_ingest_entry(self, ref: dict, ingest_source: str | None = None) -> None:
