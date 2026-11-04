@@ -1590,19 +1590,16 @@
   async function handleLogin(event) {
     event?.preventDefault?.()
     authError = ''
-    // The session this attempt owns: the one current at submit, then the one
-    // its own success starts. A newer sign-in or a sign-out takes it over.
+    // A newer sign-in or a sign-out takes this attempt over; an expired token
+    // does not (signInEpoch). Its success starts the session `epoch` watches.
+    let attempt = signInEpoch
     let epoch = sessionEpoch
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
-      if (epoch !== sessionEpoch) return
-      sessionEpoch += 1
+      if (attempt !== signInEpoch) return
+      enterSession(payload)
+      attempt = signInEpoch
       epoch = sessionEpoch
-      if (payload?.token) setAuthToken(payload.token)
-      if (payload?.user) {
-        authUser = payload.user
-        currentCorpusId = payload.user.last_corpus_id || null
-      }
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -1622,8 +1619,9 @@
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
-      // Only the attempt that still owns the session may clear it.
-      if (epoch !== sessionEpoch) return
+      // Only the attempt still in charge may report or clear. That includes a
+      // 401 from its own /me, which already ran expireSession.
+      if (attempt !== signInEpoch) return
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
@@ -1660,19 +1658,16 @@
       authError = 'Passwords do not match.'
       return
     }
-    // The session this attempt owns: the one current at submit, then the one
-    // its own success starts. A newer sign-in or a sign-out takes it over.
+    // A newer sign-in or a sign-out takes this attempt over; an expired token
+    // does not (signInEpoch). Its success starts the session `epoch` watches.
+    let attempt = signInEpoch
     let epoch = sessionEpoch
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
-      if (epoch !== sessionEpoch) return
-      sessionEpoch += 1
+      if (attempt !== signInEpoch) return
+      enterSession(payload)
+      attempt = signInEpoch
       epoch = sessionEpoch
-      if (payload?.token) setAuthToken(payload.token)
-      if (payload?.user) {
-        authUser = payload.user
-        currentCorpusId = payload.user.last_corpus_id || null
-      }
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -1692,7 +1687,7 @@
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
-      if (epoch !== sessionEpoch) return
+      if (attempt !== signInEpoch) return
       authError = error.message || 'Failed to accept invite'
     }
   }
@@ -1713,19 +1708,16 @@
       authError = 'Passwords do not match.'
       return
     }
-    // The session this attempt owns: the one current at submit, then the one
-    // its own success starts. A newer sign-in or a sign-out takes it over.
+    // A newer sign-in or a sign-out takes this attempt over; an expired token
+    // does not (signInEpoch). Its success starts the session `epoch` watches.
+    let attempt = signInEpoch
     let epoch = sessionEpoch
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
-      if (epoch !== sessionEpoch) return
-      sessionEpoch += 1
+      if (attempt !== signInEpoch) return
+      enterSession(payload)
+      attempt = signInEpoch
       epoch = sessionEpoch
-      if (payload?.token) setAuthToken(payload.token)
-      if (payload?.user) {
-        authUser = payload.user
-        currentCorpusId = payload.user.last_corpus_id || null
-      }
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -1745,7 +1737,7 @@
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
-      if (epoch !== sessionEpoch) return
+      if (attempt !== signInEpoch) return
       authError = error.message || 'Failed to reset password'
     }
   }
@@ -1768,30 +1760,55 @@
     }
   }
 
-  // Bumped on every sign-out (handleLogout, which expireSession runs) and on
-  // every successful sign-in: an answer requested under an earlier session,
-  // such as a pending /me poll, is dropped.
+  // Bumped on every sign-out and on every successful sign-in: an answer
+  // requested under an earlier session, such as a pending /me poll, is dropped.
   let sessionEpoch = 0
+  // What a sign-in attempt in flight answers to: a newer sign-in that succeeded
+  // or a deliberate sign-out. Not an expired token: a boot 401 landing during
+  // the submit must not cost the attempt its outcome.
+  let signInEpoch = 0
 
   // The one path for an expired session: api.js runs it on every 401. Several
   // requests can fail together; once signed out, the rest change nothing.
   function expireSession() {
     if (authStatus === 'unauthenticated' && !getAuthToken()) return
-    handleLogout()
+    endSession()
   }
   onUnauthorized(expireSession)
 
   function handleLogout() {
+    signInEpoch += 1
+    endSession()
+  }
+
+  function endSession() {
+    // During boot the sign-in forms are already up, so an error on screen is
+    // the outcome of a submit, not of the session that is ending.
+    const keepError = authStatus === 'loading'
     sessionEpoch += 1
     disconnectLogs()
     setAuthToken('')
     authStatus = 'unauthenticated'
-    authError = ''
+    if (!keepError) authError = ''
     authUser = null
     corpora = []
     currentCorpusId = null
     loginPassword = ''
     resetFrontendState({ signOut: true })
+  }
+
+  // A sign-in answered: whatever session is still open ends here, such as a
+  // live one under an invite or reset link, so nothing of it reaches the new
+  // user.
+  function enterSession(payload) {
+    if (getAuthToken()) endSession()
+    signInEpoch += 1
+    sessionEpoch += 1
+    if (payload?.token) setAuthToken(payload.token)
+    if (payload?.user) {
+      authUser = payload.user
+      currentCorpusId = payload.user.last_corpus_id || null
+    }
   }
 
   // The tabs whose loads bootstrapAuth may start before the auth round trip:

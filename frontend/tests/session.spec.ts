@@ -82,8 +82,6 @@ test('a 401 on a scoped request signs out completely', async ({ page }) => {
   await expect.poll(() => sockets.opened).toBe(1)
 
   expired = true
-  // refreshForActiveTab skips a refresh within 800 ms of the previous one.
-  await page.waitForTimeout(900)
   await page.evaluate(() => window.dispatchEvent(new Event('focus')))
   await expect(page.getByTestId('login-form')).toBeVisible()
   await expect.poll(() => sockets.closed).toBe(1)
@@ -108,6 +106,14 @@ test('expired token at boot renders the login form after one unauthorized handli
   let meRequests = 0
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'expired-token')
+    // Every run of the sign-out path clears the token exactly once.
+    const removeItem = Storage.prototype.removeItem
+    const counter = window as unknown as { __tokenClears: number }
+    counter.__tokenClears = 0
+    Storage.prototype.removeItem = function (key: string) {
+      if (key === 'rag_feeder_token') counter.__tokenClears += 1
+      return removeItem.call(this, key)
+    }
   })
   await mockSocket(page, sockets)
   await page.route('**/api/**', async (route) => {
@@ -123,6 +129,8 @@ test('expired token at boot renders the login form after one unauthorized handli
   expect(meRequests).toBe(1)
   expect(sockets.opened).toBe(0)
   expect(pageErrors).toEqual([])
+  // /me and the parallel workspace loads all answered 401: one handling.
+  expect(await page.evaluate(() => (window as unknown as { __tokenClears: number }).__tokenClears)).toBe(1)
   expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBeNull()
 })
 
@@ -536,4 +544,223 @@ test('the request timeout also covers reading the response body', async ({ page 
     server.closeAllConnections()
     server.close()
   }
+})
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((r) => { resolve = r })
+  return { promise, resolve }
+}
+
+const signInLinks = [
+  { flow: 'accept-invite', endpoint: '/api/auth/accept-invite', button: 'Activate account' },
+  { flow: 'reset-password', endpoint: '/api/auth/reset-password', button: 'Save password' },
+]
+
+async function submitPassword(page: Page, button: string) {
+  await page.getByLabel('New password').fill('secret-password')
+  await page.getByLabel('Confirm password').fill('secret-password')
+  await page.getByRole('button', { name: button }).click()
+}
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`${flow} completed over a live session runs the full sign-out reset`, async ({ page }) => {
+    const sockets = { opened: 0, closed: 0 }
+    const logSockets: WebSocketRoute[] = []
+    const heldSeeds = deferred()
+    const seedAnswerReleased = deferred()
+    let holdSeedsForA = false
+    let seedsHeld = false
+    let seedRequestsForB = 0
+    const bobSeed = { ...seedSource, id: 'keyword:bob', source_key: 'bob', label: 'Bob Seed' }
+    await page.addInitScript(() => {
+      if (!window.sessionStorage.getItem('booted')) {
+        window.sessionStorage.setItem('booted', '1')
+        window.localStorage.setItem('rag_feeder_token', 'token-a')
+      }
+    })
+    await mockLogSocket(page, (ws) => {
+      sockets.opened += 1
+      logSockets.push(ws)
+      ws.onClose(() => { sockets.closed += 1 })
+    })
+    await page.route('**/api/**', async (route) => {
+      const request = route.request()
+      const path = new URL(request.url()).pathname
+      const auth = request.headers().authorization || ''
+      if (path === endpoint) return fulfil(route, { token: 'token-b', user: userB })
+      if (path === '/api/auth/me') {
+        return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+      }
+      if (path === '/api/seed/sources') {
+        if (auth.endsWith('token-b')) {
+          seedRequestsForB += 1
+          return fulfil(route, { sources: [bobSeed], total: 1, source: 'api' })
+        }
+        if (holdSeedsForA) {
+          seedsHeld = true
+          heldSeeds.resolve()
+          await seedAnswerReleased.promise
+        }
+      }
+      return workspaceDefaults(path, route)
+    })
+
+    await page.goto('/#/workspace')
+    await expect(page.getByTestId('auth-user')).toHaveText('alice')
+    await page.getByText('Seed One').click()
+    await expect(page.getByText('Candidate Alpha')).toBeVisible()
+    await expect.poll(() => sockets.opened).toBe(1)
+    logSockets[0].send('[worker] line of alice')
+
+    // A's seed load is in flight when the link for B completes.
+    holdSeedsForA = true
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+    await heldSeeds.promise
+    expect(seedsHeld).toBe(true)
+    await page.evaluate((hash) => { window.location.hash = hash }, `#/${flow}?token=one-time`)
+    await submitPassword(page, button)
+
+    await expect(page.getByTestId('auth-user')).toHaveText('bob')
+    // B's load started fresh instead of joining A's.
+    await expect.poll(() => seedRequestsForB).toBeGreaterThanOrEqual(1)
+    await expect(page.getByText('Bob Seed')).toBeVisible()
+    seedAnswerReleased.resolve()
+    await page.waitForTimeout(300)
+    await expect(page.getByText('Bob Seed')).toBeVisible()
+    await expect(page.getByText('Seed One')).toHaveCount(0)
+    await expect(page.getByText('Candidate Alpha')).toHaveCount(0)
+    // A's socket was closed and B has its own, with A's lines gone.
+    await expect.poll(() => sockets.closed).toBe(1)
+    await expect.poll(() => sockets.opened).toBe(2)
+    await page.evaluate(() => { window.location.hash = '#/logs' })
+    await expect(page.getByText('line of alice')).toHaveCount(0)
+  })
+}
+
+test('a sign-in whose own /me answers 401 shows the error on the login form', async ({ page }) => {
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-x', user: userA })
+    return fulfil(route, { error: 'Unknown user' }, 401)
+  })
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  await expect(page.getByTestId('login-form').locator('.error')).toHaveText('Unknown user')
+  expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBeNull()
+})
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`${flow} whose own /me answers 401 shows the error on the form`, async ({ page }) => {
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === endpoint) return fulfil(route, { token: 'token-x', user: userA })
+      return fulfil(route, { error: 'Unknown user' }, 401)
+    })
+    await page.goto(`/#/${flow}?token=one-time`)
+    await submitPassword(page, button)
+    await expect(page.locator('.login-form .error')).toHaveText('Unknown user')
+  })
+
+  test(`a stale-token 401 at boot does not discard an in-flight ${flow}`, async ({ page }) => {
+    const bootAnswer = deferred()
+    const linkAnswer = deferred()
+    let linkSeen = false
+    await page.addInitScript(() => {
+      if (!window.sessionStorage.getItem('booted')) {
+        window.sessionStorage.setItem('booted', '1')
+        window.localStorage.setItem('rag_feeder_token', 'stale-token')
+      }
+    })
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const request = route.request()
+      const path = new URL(request.url()).pathname
+      const auth = request.headers().authorization || ''
+      if (path === endpoint) {
+        linkSeen = true
+        await linkAnswer.promise
+        return fulfil(route, { token: 'token-b', user: userB })
+      }
+      if (auth.endsWith('stale-token')) {
+        await bootAnswer.promise
+        return fulfil(route, { error: 'Invalid token' }, 401)
+      }
+      if (path === '/api/auth/me') return fulfil(route, { user: userB, corpora: [corpus] })
+      return workspaceDefaults(path, route)
+    })
+
+    await page.goto(`/#/${flow}?token=one-time`)
+    await submitPassword(page, button)
+    await expect.poll(() => linkSeen).toBe(true)
+    // The expired token's 401 lands while the submit is in flight.
+    bootAnswer.resolve()
+    await page.waitForFunction(() => !window.localStorage.getItem('rag_feeder_token'))
+    linkAnswer.resolve()
+    await expect(page.getByTestId('auth-user')).toHaveText('bob')
+    expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBe('token-b')
+  })
+
+  test(`a stale-token 401 at boot leaves the failure of ${flow} on the form`, async ({ page }) => {
+    const bootAnswer = deferred()
+    await page.addInitScript(() => {
+      window.localStorage.setItem('rag_feeder_token', 'stale-token')
+    })
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === endpoint) return fulfil(route, { error: 'Link is invalid or expired' }, 400)
+      await bootAnswer.promise
+      return fulfil(route, { error: 'Invalid token' }, 401)
+    })
+
+    await page.goto(`/#/${flow}?token=one-time`)
+    await submitPassword(page, button)
+    const error = page.locator('.login-form .error')
+    await expect(error).toHaveText('Link is invalid or expired')
+    bootAnswer.resolve()
+    await page.waitForFunction(() => !window.localStorage.getItem('rag_feeder_token'))
+    await page.waitForTimeout(100)
+    await expect(error).toHaveText('Link is invalid or expired')
+  })
+}
+
+test('a stale-token 401 at boot does not discard an in-flight login', async ({ page }) => {
+  const bootAnswer = deferred()
+  const loginAnswer = deferred()
+  let loginSeen = false
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'stale-token')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      loginSeen = true
+      await loginAnswer.promise
+      return fulfil(route, { token: 'token-b', user: userB })
+    }
+    if (auth.endsWith('stale-token')) {
+      await bootAnswer.promise
+      return fulfil(route, { error: 'Invalid token' }, 401)
+    }
+    if (path === '/api/auth/me') return fulfil(route, { user: userB, corpora: [corpus] })
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'bob')
+  await expect.poll(() => loginSeen).toBe(true)
+  bootAnswer.resolve()
+  await page.waitForFunction(() => !window.localStorage.getItem('rag_feeder_token'))
+  loginAnswer.resolve()
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBe('token-b')
 })
