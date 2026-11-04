@@ -525,6 +525,9 @@
   let creatingCorpus = false
   let deletingCorpus = false
   let corpusActionStatus = ''
+  // A failed switch from a picker. corpusActionStatus renders on Korpus
+  // Management only; this one shows in the shell on every other tab.
+  let corpusSwitchError = ''
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
   // The graph opens scoped to the workspace corpus; for the admin, "All corpora"
@@ -1887,12 +1890,7 @@
       seedFilterQuery: '',
       seedWarningMessage: '',
       searchQuery: '',
-      searchField: 'default',
-      searchAuthor: '',
-      yearFrom: '',
-      yearTo: '',
       searchMaxResults: DEFAULT_SEARCH_MAX_RESULTS,
-      searchSort: 'relevance',
       searchStatus: '',
       searchPreview: null,
       searchWarning: false,
@@ -1920,6 +1918,7 @@
       logsTailStatus: '',
       corpusActionStatus: '',
       corpusActionError: false,
+      corpusSwitchError: '',
     }
   }
 
@@ -1956,12 +1955,7 @@
       seedFilterQuery,
       seedWarningMessage,
       searchQuery,
-      searchField,
-      searchAuthor,
-      yearFrom,
-      yearTo,
       searchMaxResults,
-      searchSort,
       searchStatus,
       searchPreview,
       searchWarning,
@@ -1989,6 +1983,7 @@
       logsTailStatus,
       corpusActionStatus,
       corpusActionError,
+      corpusSwitchError,
     } = initialWorkspaceState())
     resetTopicSearch()
     resetKantroposAssignmentState()
@@ -2010,6 +2005,11 @@
       selectedUpstreamTargetId = ''
       openalexQuota = null
       // The signed-out user's view choices.
+      searchField = 'default'
+      searchAuthor = ''
+      yearFrom = ''
+      yearTo = ''
+      searchSort = 'relevance'
       relatedSort = 'most_cited'
       promotionMode = 'new_seed'
       corpusSort = ''
@@ -2024,7 +2024,9 @@
   async function handleSelectCorpus(event) {
     corpusActionStatus = ''
     corpusActionError = false
-    const nextId = Number(event.target.value)
+    corpusSwitchError = ''
+    const picker = event.target
+    const nextId = Number(picker.value)
     if (!nextId) return
     // An answer that arrives after a sign-out (or a newer sign-in) is dropped.
     const epoch = sessionEpoch
@@ -2045,6 +2047,9 @@
       if (error?.status === 401 || epoch !== sessionEpoch) return
       corpusActionStatus = error.message || 'Failed to select corpus.'
       corpusActionError = true
+      corpusSwitchError = corpusActionStatus
+      // The select's value is one-way: put it back on the corpus still active.
+      picker.value = String(currentCorpusId || '')
     }
   }
 
@@ -4395,6 +4400,9 @@
             </button>
           </div>
         </div>
+        {#if corpusSwitchError && activeTab !== 'upstream'}
+          <p class="error small" role="alert" data-testid="corpus-switch-error">{corpusSwitchError}</p>
+        {/if}
       </div>
     </header>
 

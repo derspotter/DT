@@ -41,6 +41,8 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // Same trigger: the row at `from` moves to the very end, past the loaded
     // rows, so the reload's next page starts one row later than asked.
     moveAfterPrefixStart: [] as number[],
+    // Answer corpus selects with this error instead of switching.
+    selectError: null as string | null,
   }
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -83,6 +85,12 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
         state.corpusIds.push(moved)
       }
       return
+    }
+    const select = path.match(/^\/api\/corpora\/(\d+)\/select$/)
+    if (select) {
+      if (state.selectError) return fulfil(route, { error: state.selectError }, 403)
+      state.lastCorpusId = Number(select[1])
+      return fulfil(route, {})
     }
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
     if (path === '/api/openalex/quota') return fulfil(route, { available: false })
@@ -455,4 +463,55 @@ test('a failed first-page poll does not claim a live corpus', async ({ page }) =
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect(panel).toContainText('Live corpus from API.')
   await expect(panel).not.toContainText(STALE_CORPUS_NOTE)
+})
+
+test('a failed corpus switch shows on every tab and the picker returns to the active corpus', async ({ page }) => {
+  const { state } = await boot(page, { admin: true })
+  state.selectError = 'No access to this corpus'
+  const picker = page.locator('.header-corpus-picker select')
+  const error = page.getByTestId('corpus-switch-error')
+  await expect(picker).toHaveValue('1')
+
+  await picker.selectOption('2')
+  await expect(error).toHaveText('No access to this corpus')
+  await expect(picker).toHaveValue('1')
+
+  for (const tab of ['dashboard', 'downloads', 'graph', 'logs', 'admin']) {
+    await page.evaluate((hash) => { window.location.hash = hash }, `#/${tab}`)
+    await expect(page).toHaveURL(new RegExp(`#/${tab}$`))
+    await expect(error).toHaveText('No access to this corpus')
+  }
+
+  // Once, on the tab that has its own corpus status line.
+  await page.evaluate(() => { window.location.hash = '#/upstream' })
+  await expect(page.locator('.upstream-management-form__status')).toHaveText('No access to this corpus')
+  await expect(error).toHaveCount(0)
+
+  // A switch that works clears it.
+  state.selectError = null
+  await page.evaluate(() => { window.location.hash = '#/workspace' })
+  await picker.selectOption('2')
+  await expect(picker).toHaveValue('2')
+  await expect(error).toHaveCount(0)
+})
+
+test('a corpus switch keeps the search form choices', async ({ page }) => {
+  await boot(page)
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('combobox', { name: 'Field' }).selectOption('title')
+  await card.getByRole('textbox', { name: 'Author' }).fill('Elinor Ostrom')
+  await card.getByRole('spinbutton', { name: 'From' }).fill('1990')
+  await card.getByRole('spinbutton', { name: 'To' }).fill('2000')
+  await card.getByRole('combobox', { name: 'Sort' }).selectOption('newest')
+  await card.getByRole('textbox', { name: 'Query' }).fill('commons')
+
+  await page.locator('.header-corpus-picker select').selectOption('2')
+  await expect(page.locator('.header-corpus-picker select')).toHaveValue('2')
+  // The query is per corpus, as on master.
+  await expect(card.getByRole('textbox', { name: 'Query' })).toHaveValue('')
+  await expect(card.getByRole('combobox', { name: 'Field' })).toHaveValue('title')
+  await expect(card.getByRole('textbox', { name: 'Author' })).toHaveValue('Elinor Ostrom')
+  await expect(card.getByRole('spinbutton', { name: 'From' })).toHaveValue('1990')
+  await expect(card.getByRole('spinbutton', { name: 'To' })).toHaveValue('2000')
+  await expect(card.getByRole('combobox', { name: 'Sort' })).toHaveValue('newest')
 })
