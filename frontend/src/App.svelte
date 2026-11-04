@@ -1013,12 +1013,25 @@
         await loadSeedSources({ quiet: true })
         if (stale()) return
         // The pdf seed's candidate count says whether the extraction found
-        // entries; same match as focusSeedSource('pdf', baseName).
+        // entries; same match as focusSeedSource('pdf', baseName). The list
+        // may not show it: a seed filter hides it, or a newer reload dropped
+        // this one's answer. Only the seed itself can say it has no entries.
         const seedId = `pdf:${baseName}`
         const seed = seedSources.find((entry) => seedSourceId(entry) === seedId)
+        let outcome = 'Extraction complete.'
+        if (!(Number(seed?.candidate_count) > 0)) {
+          try {
+            const page = await fetchSeedCandidates('pdf', baseName, { limit: 1, lightSummary: true })
+            if (!(Number(page?.total) > 0)) outcome = detail
+          } catch (error) {
+            if (error?.status === 401) throw error
+            outcome = 'Extraction finished.'
+          }
+          if (stale()) return
+        }
         updateExtractionProgress({
           phase: 'completed',
-          detail: seed && Number(seed.candidate_count) > 0 ? 'Extraction complete.' : detail,
+          detail: outcome,
           percent: 100,
           indeterminate: false,
         })

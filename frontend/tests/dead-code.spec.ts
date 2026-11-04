@@ -146,3 +146,116 @@ test('a superseded extraction completion does not finish the next extraction', a
   await expect(page.getByText('Extraction queued...')).toBeVisible()
   await expect(page.getByText('Extraction complete.')).toHaveCount(0)
 })
+
+// Runs a pdf extraction to its success frame on the workspace.
+async function finishExtraction(page: Page, ws: { socket: WebSocketRoute | null }, base = 'paper') {
+  await page.goto('/#/workspace')
+  await expect.poll(() => ws.socket !== null).toBe(true)
+  ws.socket!.send(frame(base, { event: 'started' }))
+  await expect(page.getByRole('progressbar', { name: 'Extraction progress' })).toBeVisible()
+}
+
+const pdfSeed = (candidateCount: number) => ({
+  sources: [{ source_type: 'pdf', source_key: 'paper', candidate_count: candidateCount, state_counts: {} }],
+  total: 1,
+  source: 'api',
+})
+
+test('extraction completion reports no entries only when the seed really has none', async ({ page }) => {
+  const ws = await openSocket(page)
+  await mockBackend(page, { latest: 0 }, async (path, route) => {
+    if (path === '/api/seed/sources') {
+      await fulfil(route, pdfSeed(0))
+      return true
+    }
+    if (path === '/api/seed/sources/pdf/paper/candidates') {
+      await fulfil(route, { candidates: [], total: 0, limit: 1 })
+      return true
+    }
+    return false
+  })
+  await finishExtraction(page, ws)
+  ws.socket!.send(frame('paper', { event: 'done', status: 'success' }))
+  await expect(page.getByText('No bibliography entries found in this PDF.')).toBeVisible()
+  await expect(page.getByText('Extraction complete.')).toHaveCount(0)
+})
+
+test('extraction completion is not misreported when a seed filter hides the seed', async ({ page }) => {
+  const ws = await openSocket(page)
+  await mockBackend(page, { latest: 0 }, async (path, route) => {
+    if (path === '/api/seed/sources') {
+      const filtered = new URL(route.request().url()).searchParams.has('q')
+      await fulfil(route, filtered ? { sources: [], total: 0, source: 'api' } : pdfSeed(3))
+      return true
+    }
+    if (path === '/api/seed/sources/pdf/paper/candidates') {
+      await fulfil(route, { candidates: [{ candidate_key: 'c1', title: 'Entry' }], total: 3, limit: 1 })
+      return true
+    }
+    return false
+  })
+  await finishExtraction(page, ws)
+  await page.getByLabel('Filter seed items by title, author or publication').fill('nothing like it')
+  await page.waitForResponse((response) => new URL(response.url()).searchParams.get('q') === 'nothing like it')
+
+  ws.socket!.send(frame('paper', { event: 'done', status: 'success' }))
+  await expect(page.getByText('Extraction complete.')).toBeVisible()
+  await expect(page.getByText('No bibliography entries found in this PDF.')).toHaveCount(0)
+})
+
+test('extraction completion is not misreported when a newer seed reload supersedes its own', async ({ page }) => {
+  const ws = await openSocket(page)
+  let holdNextSeed = false
+  const seedHeld = deferred()
+  const releaseSeed = deferred()
+  let listSeed = false
+  await mockBackend(page, { latest: 0 }, async (path, route) => {
+    if (path === '/api/seed/sources') {
+      if (holdNextSeed) {
+        holdNextSeed = false
+        seedHeld.resolve()
+        await releaseSeed.promise
+        await fulfil(route, pdfSeed(3))
+        return true
+      }
+      await fulfil(route, listSeed ? pdfSeed(3) : { sources: [], total: 0, source: 'api' })
+      return true
+    }
+    if (path === '/api/seed/sources/pdf/paper/candidates') {
+      await fulfil(route, { candidates: [{ candidate_key: 'c1', title: 'Entry' }], total: 3, limit: 1 })
+      return true
+    }
+    return false
+  })
+  await finishExtraction(page, ws)
+  holdNextSeed = true
+  ws.socket!.send(frame('paper', { event: 'done', status: 'success' }))
+  await seedHeld.promise
+  // A focus refresh requests the seed list after the completion's own request
+  // and answers first, so the completion's answer is dropped when it lands.
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await page.waitForTimeout(500)
+  listSeed = true
+  releaseSeed.resolve()
+  await expect(page.getByText('Extraction complete.')).toBeVisible()
+  await expect(page.getByText('No bibliography entries found in this PDF.')).toHaveCount(0)
+})
+
+test('a failed count check after the extraction does not report an empty PDF', async ({ page }) => {
+  const ws = await openSocket(page)
+  await mockBackend(page, { latest: 0 }, async (path, route) => {
+    if (path === '/api/seed/sources') {
+      await fulfil(route, { sources: [], total: 0, source: 'api' })
+      return true
+    }
+    if (path === '/api/seed/sources/pdf/paper/candidates') {
+      await fulfil(route, { error: 'busy' }, 503)
+      return true
+    }
+    return false
+  })
+  await finishExtraction(page, ws)
+  ws.socket!.send(frame('paper', { event: 'done', status: 'success' }))
+  await expect(page.getByText('Extraction finished.')).toBeVisible()
+  await expect(page.getByText('No bibliography entries found in this PDF.')).toHaveCount(0)
+})
