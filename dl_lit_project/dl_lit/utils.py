@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import sys
 import tempfile
@@ -192,19 +193,39 @@ def env_int(name: str, default: int, *, minimum: int | None = None, maximum: int
 
 
 def env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
-    """Read a float env var; unset/empty -> default, invalid -> stderr warning + default, then clamp."""
-    return float(_env_number(name, float(default), float, "float", minimum, maximum))
+    """Read a float env var; unset/empty -> default, invalid or non-finite -> stderr warning + default, then clamp."""
+    return float(_env_number(name, float(default), _finite_float, "float", minimum, maximum))
+
+
+def _finite_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"not finite: {raw}")
+    return value
 
 
 _TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+_env_bool_warned = set()  # (name, raw): env_bool also runs in per-candidate paths
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    """Unset -> default; otherwise True only for 1/true/yes/on (case-insensitive, stripped)."""
+    """Read a bool env var: 1/true/yes/on and 0/false/no/off (case-insensitive, stripped).
+
+    Unset/empty -> default; anything else -> one stderr warning per name and value + default.
+    """
     raw = os.getenv(name)
-    if raw is None:
+    value = raw.strip().lower() if raw is not None else ""
+    if not value:
         return bool(default)
-    return raw.strip().lower() in _TRUTHY
+    if value in _TRUTHY:
+        return True
+    if value in _FALSY:
+        return False
+    if (name, raw) not in _env_bool_warned:
+        _env_bool_warned.add((name, raw))
+        print(f"[env] {name}={raw} is not a valid bool; using {bool(default)}", file=sys.stderr)
+    return bool(default)
 
 
 # Private names kept as aliases for one release.

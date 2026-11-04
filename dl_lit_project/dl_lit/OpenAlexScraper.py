@@ -17,6 +17,7 @@ from .identifiers import (
 from .utils import (
     OpenAlexRateLimitExceeded,
     env_bool,
+    env_float,
     get_global_rate_limiter,
     openalex_request_json,
     redact_openalex_key,
@@ -525,9 +526,9 @@ class OpenAlexCrossrefSearcher:
                 "[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key."
             )
             _missing_api_key_warned = True
-        self.openalex_timeout = float(os.getenv('RAG_FEEDER_OPENALEX_TIMEOUT', '20'))
-        self.crossref_timeout = float(os.getenv('RAG_FEEDER_CROSSREF_TIMEOUT', '20'))
-        self.semantic_scholar_timeout = float(os.getenv('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', '20'))
+        self.openalex_timeout = env_float('RAG_FEEDER_OPENALEX_TIMEOUT', 20.0)
+        self.crossref_timeout = env_float('RAG_FEEDER_CROSSREF_TIMEOUT', 20.0)
+        self.semantic_scholar_timeout = env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', 20.0)
         # No urllib3 Retry here: openalex_request_json does its own 429/5xx and
         # quota handling, and a stacked Retry would sleep through Retry-After uncapped.
         self.openalex_session = requests.Session()

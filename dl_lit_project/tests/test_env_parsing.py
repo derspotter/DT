@@ -1,8 +1,15 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from dl_lit import app_settings
 from dl_lit.utils import env_bool, env_float, env_int
 from tests._worker_import import load_worker
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(autouse=True)
@@ -93,3 +100,61 @@ def test_enhancer_init_survives_env_typo(monkeypatch):
     assert enhancer.download_timeout == 12
     assert enhancer.vpn_status_timeout_seconds == 2
     assert enhancer.enable_unpaywall is False
+
+
+# --- second pass: env_bool warns on an invalid value, env_float rejects nan/inf ---------------
+def test_env_bool_blank_means_the_default(monkeypatch, capsys):
+    for raw in ("", "   "):
+        monkeypatch.setenv("X_B_BLANK", raw)
+        assert env_bool("X_B_BLANK", True) is True
+        assert env_bool("X_B_BLANK", False) is False
+    assert capsys.readouterr().err == ""
+
+
+def test_env_bool_invalid_value_warns_once_and_gives_the_default(monkeypatch, capsys):
+    monkeypatch.setenv("X_B_TYPO", "ture")
+    assert env_bool("X_B_TYPO", True) is True
+    assert env_bool("X_B_TYPO", True) is True
+    assert env_bool("X_B_TYPO", False) is False
+    err = capsys.readouterr().err
+    assert err.count("X_B_TYPO") == 1 and "ture" in err
+    monkeypatch.setenv("X_B_TYPO", "tru")  # another value is another mistake
+    assert env_bool("X_B_TYPO", True) is True
+    assert capsys.readouterr().err.count("X_B_TYPO") == 1
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "No", " OFF "])
+def test_env_bool_falsy_values_override_a_true_default_silently(monkeypatch, capsys, raw):
+    monkeypatch.setenv("X_B_OFF", raw)
+    assert env_bool("X_B_OFF", True) is False
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "-inf", "Infinity", "1e999"])
+def test_env_float_treats_non_finite_values_as_invalid(monkeypatch, capsys, raw):
+    monkeypatch.setenv("X_F_NF", raw)
+    assert env_float("X_F_NF", 0.4, minimum=0.0) == 0.4
+    assert "X_F_NF" in capsys.readouterr().err
+
+
+# --- second pass: no inline float(os.getenv(...)) crash sites left ----------------------------
+def test_searcher_timeouts_survive_a_typo(monkeypatch, capsys):
+    from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher
+
+    monkeypatch.setenv("RAG_FEEDER_OPENALEX_TIMEOUT", "2o")
+    monkeypatch.setenv("RAG_FEEDER_CROSSREF_TIMEOUT", "7.5")
+    monkeypatch.delenv("RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT", raising=False)
+    searcher = OpenAlexCrossrefSearcher()
+    assert (searcher.openalex_timeout, searcher.crossref_timeout, searcher.semantic_scholar_timeout) == (20.0, 7.5, 20.0)
+    assert "RAG_FEEDER_OPENALEX_TIMEOUT" in capsys.readouterr().err
+
+
+def test_llm_provider_import_survives_a_typo():
+    env = {**os.environ, "RAG_FEEDER_OPENAI_HTTP_TIMEOUT_SECONDS": "6oo", "PYTHONPATH": str(PROJECT_ROOT)}
+    proc = subprocess.run(
+        [sys.executable, "-c", "from dl_lit import llm_provider as p; print(p.HTTP_TIMEOUT_SECONDS)"],
+        env=env, cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines()[-1] == "600.0"
+    assert "RAG_FEEDER_OPENAI_HTTP_TIMEOUT_SECONDS" in proc.stderr

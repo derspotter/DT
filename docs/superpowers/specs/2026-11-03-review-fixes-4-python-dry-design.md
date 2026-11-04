@@ -82,8 +82,9 @@ design questions; scope calls are the controller's and marked.
 
 ### D1. `utils.env_int / env_float / env_bool`
 Public `env_int(name, default, *, minimum=None, maximum=None)`, `env_float(...)`,
-`env_bool(name, default=False)` (truthy set `{"1","true","yes","on"}`); invalid values log one
-warning to stderr and return the default. Every `_env_int`/`_env_float` copy and every inline
+`env_bool(name, default=False)` (truthy set `{"1","true","yes","on"}`, falsy set
+`{"0","false","no","off"}`); unset or blank means the default; invalid values, including a
+non-finite float, log one warning to stderr and return the default. Every `_env_int`/`_env_float` copy and every inline
 `int(os.getenv(...))` call uses them; `reference_expansion.py` imports from `dl_lit.utils`.
 
 ### D2. `dl_lit/identifiers.py`

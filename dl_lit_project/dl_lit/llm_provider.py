@@ -30,10 +30,12 @@ import requests
 from dotenv import load_dotenv
 from google import genai
 
+from dl_lit.utils import env_float
+
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 LOCAL_HANDLE_PREFIX = "local:"
 # Socket-level guard only; caller-side timeout/retry wrappers stay in charge.
-HTTP_TIMEOUT_SECONDS = float(os.getenv("RAG_FEEDER_OPENAI_HTTP_TIMEOUT_SECONDS", "600"))
+HTTP_TIMEOUT_SECONDS = env_float("RAG_FEEDER_OPENAI_HTTP_TIMEOUT_SECONDS", 600.0)
 
 
 @dataclass
