@@ -140,3 +140,47 @@ def test_searcher_openalex_session_has_no_urllib3_retry_crossref_and_s2_keep_the
         retry = session.get_adapter("https://api.crossref.org/").max_retries
         assert retry.total == 5
         assert 429 in retry.status_forcelist
+
+
+# --- second pass: the routes really use their sessions ---------------------------------------
+
+class _RecordingTransport(_FakeTransport):
+    """Also records the proxies each request is sent with."""
+
+    def __init__(self, routes):
+        super().__init__(routes)
+        self.proxies = []
+
+    def send(self, request, **kwargs):
+        self.proxies.append(kwargs.get("proxies"))
+        return super().send(request, **kwargs)
+
+
+def test_vpn_route_sends_through_the_proxy(monkeypatch):
+    url = "http://example.test/paper.pdf"
+    proxies = {"http": "http://proxy.test:3128", "https": "http://proxy.test:3128"}
+    transport = _RecordingTransport({url: (200, "application/pdf", b"%PDF-")})
+    enhancer = new_dl.BibliographyEnhancer.__new__(new_dl.BibliographyEnhancer)
+    enhancer.proxies = proxies
+    monkeypatch.setattr(enhancer, "_is_eduvpn_connected", lambda *a, **k: True)
+    utils.get_thread_session("download-vpn", proxies=proxies).mount("http://", transport)
+
+    enhancer._request_get_vpn(url, timeout=1)
+
+    assert transport.calls[url] == 1
+    assert transport.proxies[0]["http"] == proxies["http"]
+
+
+def test_pdf_downloader_downloads_through_the_thread_session(tmp_path, monkeypatch):
+    url = "http://example.test/paper.pdf"
+    transport = _RecordingTransport({url: (200, "application/pdf", b"%PDF-1.4 body")})
+    utils.get_thread_session("download").mount("http://", transport)
+    monkeypatch.setattr(PDFDownloader, "validate_pdf", lambda self, content, ref_type=None: True)
+    monkeypatch.setattr(requests, "get", lambda *a, **k: pytest.fail("bare requests.get"))
+    limiter = type("Limiter", (), {"wait_if_needed": lambda self, service: None})()
+    downloader = PDFDownloader(tmp_path, limiter)
+
+    path, checksum, error, _ = downloader._download_and_save(url, "paper.pdf", "direct")
+
+    assert error is None and path is not None and checksum
+    assert transport.calls[url] == 1

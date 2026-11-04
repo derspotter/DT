@@ -83,6 +83,15 @@ def test_download_ref_unreadable_file_gives_an_empty_checksum(tmp_path):
     assert result is not None and checksum == ""
 
 
+def test_download_ref_unreadable_file_logs_the_oserror(tmp_path, capsys):
+    missing = tmp_path / "missing.pdf"
+
+    download_ref(_Enhancer({"downloaded_file": str(missing)}), {"title": "T"}, tmp_path)
+
+    err = capsys.readouterr().err
+    assert "checksum" in err and str(missing) in err and "No such file" in err
+
+
 # --- (b) mark_raw_work_downloaded payloads ----------------------------------
 # Snapshotted at a0e411d (before _raw_download_payload) with the same inputs and
 # a frozen clock; the refactor must reproduce them exactly.
@@ -240,6 +249,26 @@ def test_worker_download_single_marks_downloaded_with_the_downloader_checksum(tm
     assert enhancer.calls[0][0]["authors"] == ["not json"]
     row = daemon.db.get_entry_by_id("works", qid)
     assert (row["download_status"], row["file_checksum"]) == ("downloaded", "abc")
+
+
+def test_worker_download_single_reads_the_duplicate_row_under_db_lock(tmp_path, monkeypatch):
+    daemon = _worker_daemon(monkeypatch, tmp_path, _Enhancer({"downloaded_file": ""}))
+    qid = _insert_work(daemon.db, "Queued", year=2020, doi="10.1/queued", download_status="queued")
+    row = daemon.db.get_entry_by_id("works", qid)
+    other = _insert_work(daemon.db, "Queued", year=2020, doi="10.1/other", download_status="queued")
+    monkeypatch.setattr(daemon.db, "check_if_exists", lambda **kwargs: ("works", other, "title_year"))
+    held = []
+    read = daemon.db.get_entry_by_id
+
+    def spying_read(table, entry_id):
+        held.append((entry_id, daemon.db_lock._is_owned()))
+        return read(table, entry_id)
+
+    monkeypatch.setattr(daemon.db, "get_entry_by_id", spying_read)
+
+    daemon._download_single(row)
+
+    assert (other, True) in held
 
 
 def test_worker_raw_download_failure_reports_the_refs_failure_fields(tmp_path, monkeypatch):
