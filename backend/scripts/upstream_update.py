@@ -231,7 +231,11 @@ def parse_existing_bib_keys(text: str) -> set[str]:
     return set(re.findall(r"@\w+\s*\{\s*([^,\s]+)", text or ""))
 
 
-def normalize_doi(value: object) -> str:
+def _normalize_doi(value: object) -> str:
+    """Lowercase, drop an http(s) doi.org URL or ``doi:`` prefix, ``""`` for empty; no trim of ``.;,``.
+
+    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
+    """
     if not value:
         return ""
     text = str(value).strip().lower()
@@ -300,7 +304,7 @@ def make_bibtex_key(row: sqlite3.Row, metadata: dict, used_keys: set[str]) -> st
     candidates = []
     if explicit:
         candidates.append(simple_key_part(explicit, "ref"))
-    doi = normalize_doi(row["doi"] or metadata.get("doi"))
+    doi = _normalize_doi(row["doi"] or metadata.get("doi"))
     if doi:
         candidates.append(f"doi_{simple_key_part(doi, 'doi')}")
     authors = parse_authors(row["authors"] or metadata.get("authors") or metadata.get("author"))
@@ -372,7 +376,7 @@ def render_bibtex_entry(row: sqlite3.Row, pdf_name: str, used_keys: set[str]) ->
     abstract = row["abstract"] or metadata.get("abstract")
     if abstract:
         fields["abstract"] = abstract
-    doi = normalize_doi(row["doi"] or metadata.get("doi"))
+    doi = _normalize_doi(row["doi"] or metadata.get("doi"))
     if doi:
         fields["doi"] = doi
     source = row["source"] or metadata.get("source") or metadata.get("journal") or metadata.get("container")
@@ -824,7 +828,7 @@ def command_draft(args: argparse.Namespace) -> None:
             "work_id": row["id"],
             "title": row["title"],
             "year": row["year"],
-            "doi": normalize_doi(row["doi"]),
+            "doi": _normalize_doi(row["doi"]),
             "source_file_path": str(source_path),
             "staged_file": str(staged_path.relative_to(draft_dir)),
             "target_file": pdf_name,

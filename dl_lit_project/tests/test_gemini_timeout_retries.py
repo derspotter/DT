@@ -1,55 +1,31 @@
-import concurrent.futures
-import types
 from unittest.mock import MagicMock
 
 from dl_lit import APIscraper_v2 as scraper
 from dl_lit import get_bib_pages
+from dl_lit import llm_common
 
 
-class _FakeFuture:
-    def __init__(self, behavior):
-        self._behavior = behavior
-        self.cancelled = False
+def _fake_attempts(behaviors, seen_timeouts):
+    """Stand-in for llm_common._run_attempt: each attempt pops one scripted outcome."""
 
-    def result(self, timeout=None):
-        if isinstance(self._behavior, BaseException):
-            raise self._behavior
-        if isinstance(self._behavior, (types.FunctionType, types.MethodType)):
-            return self._behavior(timeout)
-        return self._behavior
+    def _run_attempt(_call, timeout_seconds):
+        seen_timeouts.append(timeout_seconds)
+        behavior = behaviors.pop(0)
+        if isinstance(behavior, BaseException):
+            raise behavior
+        return behavior
 
-    def cancel(self):
-        self.cancelled = True
-
-
-class _FakeExecutor:
-    def __init__(self, behaviors):
-        self._behaviors = behaviors
-
-    def submit(self, _fn):
-        return _FakeFuture(self._behaviors.pop(0))
-
-    def shutdown(self, wait=False, cancel_futures=False):
-        return None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+    return _run_attempt
 
 
 def test_apiscraper_run_gemini_request_retries_timeout(monkeypatch):
     response = MagicMock()
-    behaviors = [concurrent.futures.TimeoutError(), response]
+    behaviors = [llm_common._AttemptTimedOut(), response]
+    seen_timeouts = []
 
-    monkeypatch.setattr(
-        scraper.concurrent.futures,
-        "ThreadPoolExecutor",
-        lambda max_workers=1: _FakeExecutor(behaviors),
-    )
+    monkeypatch.setattr(llm_common, "_run_attempt", _fake_attempts(behaviors, seen_timeouts))
     sleeps = []
-    monkeypatch.setattr(scraper.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(llm_common.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     result = scraper._run_gemini_request(
         lambda: response,
@@ -61,6 +37,7 @@ def test_apiscraper_run_gemini_request_retries_timeout(monkeypatch):
 
     assert result is response
     assert sleeps == [0.25]
+    assert seen_timeouts == [12, 12]
 
 
 def test_process_single_pdf_chunked_retries_only_timeout_failures(monkeypatch):
@@ -121,19 +98,16 @@ def test_process_single_pdf_chunked_retries_only_timeout_failures(monkeypatch):
 def test_get_bib_pages_retries_timeout(monkeypatch):
     response = MagicMock()
     response.text = '{"reference_sections": [{"start_page": 1, "end_page": 2}]}'
-    behaviors = [concurrent.futures.TimeoutError(), response]
+    behaviors = [llm_common._AttemptTimedOut(), response]
+    seen_timeouts = []
 
-    monkeypatch.setattr(
-        get_bib_pages.concurrent.futures,
-        "ThreadPoolExecutor",
-        lambda max_workers=1: _FakeExecutor(behaviors),
-    )
+    monkeypatch.setattr(llm_common, "_run_attempt", _fake_attempts(behaviors, seen_timeouts))
     monkeypatch.setattr(get_bib_pages, "GET_BIB_TIMEOUT_RETRIES", 1)
     sleeps = []
-    monkeypatch.setattr(get_bib_pages.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(llm_common.time, "sleep", lambda seconds: sleeps.append(seconds))
     monkeypatch.setattr(get_bib_pages, "api_client", MagicMock())
-    monkeypatch.setattr(get_bib_pages, "_rate_limiter_wait", lambda *args, **kwargs: None)
-    monkeypatch.setattr(get_bib_pages, "_extract_total_tokens", lambda response: None)
+    monkeypatch.setattr(get_bib_pages, "wait_rate_limit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(get_bib_pages, "extract_total_tokens", lambda response: None)
 
     sections, source_metadata = get_bib_pages._find_reference_section_pages(
         uploaded_pdf=object(),
@@ -145,3 +119,4 @@ def test_get_bib_pages_retries_timeout(monkeypatch):
     assert sections == [{"start_page": 1, "end_page": 2}]
     assert source_metadata is None
     assert sleeps == [get_bib_pages.GET_BIB_RETRY_BACKOFF_SECONDS]
+    assert seen_timeouts == [15, 15]

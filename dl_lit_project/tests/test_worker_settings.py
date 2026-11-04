@@ -1,12 +1,9 @@
-import importlib.util
 import sqlite3
-from pathlib import Path
 
 import pytest
 
 from dl_lit import app_settings
-
-WORKER = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "daemon" / "worker.py"
+from tests._worker_import import load_worker
 
 
 @pytest.fixture(autouse=True)
@@ -21,11 +18,7 @@ def _reset_snapshot():
 
 
 def _load(monkeypatch):
-    monkeypatch.syspath_prepend(str(WORKER.parent))
-    spec = importlib.util.spec_from_file_location("dt_worker", WORKER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return load_worker("dt_worker", monkeypatch)
 
 
 def _set_setting(path, key, value):

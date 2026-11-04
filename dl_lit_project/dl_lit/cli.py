@@ -6,7 +6,6 @@ from pathlib import Path
 import pprint
 import copy
 from threading import Lock
-import hashlib
 import bibtexparser
 
 # Local application imports
@@ -20,6 +19,7 @@ from .OpenAlexScraper import (
     process_single_reference,
 )
 from .new_dl import BibliographyEnhancer
+from .download_path import download_ref
 from .utils import get_global_rate_limiter
 from .bibtex_formatter import BibTeXFormatter
 from .APIscraper_v2 import process_directory_v2, process_single_pdf
@@ -721,7 +721,7 @@ def download_pdfs_command(db_path, limit, download_dir):
             exclude_table='works'
         )
         if dup_table == 'works' and dup_id is not None:
-            ok, msg = db.merge_duplicate_queued_work(row['id'], dup_table, dup_id, dup_field)
+            merged, msg = db.merge_duplicate_queued_work(row['id'], dup_table, dup_id, dup_field)
             click.echo(f"  ↺ duplicate detected: {msg}")
             continue
 
@@ -740,15 +740,9 @@ def download_pdfs_command(db_path, limit, download_dir):
             'openalex_json': row.get('openalex_json'),
         }
 
-        result = enhancer.enhance_bibliography(copy.deepcopy(ref), download_dir)
-        if result and result.get('downloaded_file'):
+        result, checksum, _trace = download_ref(enhancer, copy.deepcopy(ref), download_dir)
+        if result is not None:
             fp = result['downloaded_file']
-            checksum = ''
-            try:
-                with open(fp, 'rb') as fh:
-                    checksum = hashlib.sha256(fh.read()).hexdigest()
-            except Exception:
-                pass
             db.move_entry_to_downloaded(row['id'], result, fp, checksum, result.get('download_source', 'unknown'))
             click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
             ok += 1

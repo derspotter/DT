@@ -6,7 +6,7 @@ import pikepdf
 from click.testing import CliRunner
 
 from dl_lit.cli import cli
-from dl_lit.get_bib_pages import extract_reference_sections, _normalize_source_metadata
+from dl_lit.get_bib_pages import extract_reference_sections, normalize_source_metadata
 from dl_lit.APIscraper_v2 import validate_bibliography_entries
 
 
@@ -133,7 +133,7 @@ class TestGetBibPages(unittest.TestCase):
             self.assertTrue(any(path.endswith(suffix) for path in saved_files), f"Missing expected file suffix: {suffix}")
 
     def test_normalize_source_metadata_drops_location_like_source(self):
-        normalized = _normalize_source_metadata({
+        normalized = normalize_source_metadata({
             'title': 'Collected Essays',
             'source': 'Cambridge, MA',
             'publisher': 'MIT Press',

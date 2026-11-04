@@ -1,22 +1,16 @@
 """Abandoned-job recovery around container restarts (scripts/deploy.sh restarts workers routinely)."""
-import importlib.util
 import os
 import signal
 import sqlite3
 import time
-from pathlib import Path
 
 import pytest
 
-WORKER = Path(__file__).resolve().parents[2] / "backend" / "scripts" / "daemon" / "worker.py"
+from tests._worker_import import load_worker
 
 
 def _load(monkeypatch):
-    monkeypatch.syspath_prepend(str(WORKER.parent))
-    spec = importlib.util.spec_from_file_location("dt_worker_recovery", WORKER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return load_worker("dt_worker_recovery", monkeypatch)
 
 
 SCHEMA = """

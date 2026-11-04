@@ -8,7 +8,20 @@ from pathlib import Path
 import argparse
 import concurrent.futures
 import os
-from .utils import OpenAlexRateLimitExceeded, get_global_rate_limiter, openalex_request_json
+from .identifiers import (
+    crossref_item_to_openalex_like,
+    inverted_index_to_text,
+    inverted_index_to_text_last_wins,
+    normalize_doi_lower,
+)
+from .utils import (
+    OpenAlexRateLimitExceeded,
+    env_bool,
+    env_float,
+    get_global_rate_limiter,
+    openalex_request_json,
+    redact_openalex_key,
+)
 
 try:
     from rapidfuzz import fuzz
@@ -44,6 +57,16 @@ def _build_retry_session(
 _missing_api_key_warned = False
 
 
+_redact_api_key = redact_openalex_key  # former name
+
+
+def _redacted_params(params) -> dict:
+    """``params`` for printing: the ``api_key`` value replaced."""
+    if not isinstance(params, dict) or "api_key" not in params:
+        return params
+    return {**params, "api_key": "<redacted>"}
+
+
 def clean_search_term(term):
     """Remove commas and clean up the search term."""
     if term is None:
@@ -52,22 +75,8 @@ def clean_search_term(term):
     return ' '.join(term.replace(',', ' ').split())
 
 def convert_inverted_index_to_text(inverted_index):
-    """Convert an abstract_inverted_index to readable text"""
-    if not inverted_index:
-        return ""
-
-    # Create a list of (word, position) tuples
-    word_positions = []
-    for word, positions in inverted_index.items():
-        for position in positions:
-            word_positions.append((word, position))
-
-    # Sort by position
-    word_positions.sort(key=lambda x: x[1])
-
-    # Join words
-    text = " ".join(word for word, _ in word_positions)
-    return text
+    """Like :func:`dl_lit.identifiers.inverted_index_to_text`, but ``""`` for empty input."""
+    return inverted_index_to_text(inverted_index) or ""
 
 def fetch_citing_work_ids(
     cited_by_url,
@@ -95,7 +104,7 @@ def fetch_citing_work_ids(
         url = f"{url}&api_key={quote_plus(api_key)}"
     page = 1
 
-    print(f"Fetching citing works from: {cited_by_url} (max: {max_citations})")
+    print(f"Fetching citing works from: {_redact_api_key(cited_by_url)} (max: {max_citations})")
 
     while url and len(citing_work_ids) < max_citations:
         try:
@@ -139,14 +148,14 @@ def fetch_citing_work_ids(
                 url = None # No more pages or reached limit
 
         except OpenAlexRateLimitExceeded as e:
-            print(f"OpenAlex quota exhausted while fetching citing works: {str(e)}")
+            print(f"OpenAlex quota exhausted while fetching citing works: {_redact_api_key(e)}")
             url = None
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching citing works from {url}: {str(e)}")
+            print(f"Error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}")
             # Stop fetching if there's an error
             url = None
         except Exception as e:
-            print(f"Unexpected error fetching citing works from {url}: {str(e)}")
+            print(f"Unexpected error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}")
             url = None
 
     print(f"Finished fetching citing works. Found {len(citing_work_ids)}")
@@ -225,13 +234,13 @@ def fetch_referenced_work_details(
             return batch_results
             
         except OpenAlexRateLimitExceeded as e:
-            print(f"OpenAlex quota exhausted while fetching referenced work details: {str(e)}")
+            print(f"OpenAlex quota exhausted while fetching referenced work details: {_redact_api_key(e)}")
             return []
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching referenced work details: {str(e)}")
+            print(f"Error fetching referenced work details: {_redact_api_key(e)}")
             return []
         except Exception as e:
-            print(f"Unexpected error fetching referenced work details: {str(e)}")
+            print(f"Unexpected error fetching referenced work details: {_redact_api_key(e)}")
             return []
 
     referenced_works = []
@@ -510,17 +519,22 @@ class OpenAlexCrossrefSearcher:
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
         self.api_key = os.getenv('OPENALEX_API_KEY') or os.getenv('RAG_FEEDER_OPENALEX_API_KEY')
-        self.enable_openalex_fallback = os.getenv('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+        self.enable_openalex_fallback = env_bool('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK')
         global _missing_api_key_warned
         if not self.api_key and not _missing_api_key_warned:
             print(
                 "[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key."
             )
             _missing_api_key_warned = True
-        self.openalex_timeout = float(os.getenv('RAG_FEEDER_OPENALEX_TIMEOUT', '20'))
-        self.crossref_timeout = float(os.getenv('RAG_FEEDER_CROSSREF_TIMEOUT', '20'))
-        self.semantic_scholar_timeout = float(os.getenv('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', '20'))
+        self.openalex_timeout = env_float('RAG_FEEDER_OPENALEX_TIMEOUT', 20.0)
+        self.crossref_timeout = env_float('RAG_FEEDER_CROSSREF_TIMEOUT', 20.0)
+        self.semantic_scholar_timeout = env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', 20.0)
+        # No urllib3 Retry here: openalex_request_json does its own 429/5xx and
+        # quota handling, and a stacked Retry would sleep through Retry-After uncapped.
         self.openalex_session = requests.Session()
+        openalex_adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+        self.openalex_session.mount("https://", openalex_adapter)
+        self.openalex_session.mount("http://", openalex_adapter)
         self.crossref_session = _build_retry_session()
         self.semantic_scholar_session = _build_retry_session()
 
@@ -621,25 +635,7 @@ class OpenAlexCrossrefSearcher:
             
             if data['message']['items']:
                 # Convert Crossref results to OpenAlex-like format for compatibility
-                results = []
-                for item in data['message']['items']:
-                    result = {
-                        'id': f"crossref:{item.get('DOI', '')}",
-                        'doi': item.get('DOI'),
-                        'display_name': item.get('title', [''])[0],
-                        'publication_year': item.get('published-print', {}).get('date-parts', [[None]])[0][0],
-                        'type': item.get('type'),
-                        'authorships': [
-                            {
-                                'author': {
-                                    'display_name': f"{author.get('given', '')} {author.get('family', '')}"
-                                }
-                            }
-                            for author in item.get('author', [])
-                        ]
-                    }
-                    results.append(result)
-                return results
+                return [crossref_item_to_openalex_like(item) for item in data['message']['items']]
             return []
                 
         except Exception as e:
@@ -691,9 +687,9 @@ class OpenAlexCrossrefSearcher:
                     return {"step": step, "results": [], "success": True} # Success but no results
                     
             except requests.exceptions.RequestException as e:
-                return {"step": step, "results": [], "success": False, "error": str(e)}
+                return {"step": step, "results": [], "success": False, "error": _redact_api_key(e)}
             except Exception as e:
-                return {"step": step, "results": [], "success": False, "error": f"Unexpected DOI search error: {str(e)}"}
+                return {"step": step, "results": [], "success": False, "error": f"Unexpected DOI search error: {_redact_api_key(e)}"}
         
         if not title and not container_title:
             return {"step": step, "results": [], "success": False}
@@ -754,36 +750,7 @@ class OpenAlexCrossrefSearcher:
                 
                 if data['message']['items']:
                     # Convert Crossref results to OpenAlex-like format
-                    results = []
-                    for item in data['message']['items']:
-                        # Get publication year from the most specific date available
-                        pub_year = None
-                        for date_field in ['published-print', 'published-online', 'published']:
-                            if date_parts := item.get(date_field, {}).get('date-parts', [[None]])[0]:
-                                pub_year = date_parts[0]
-                                if pub_year:
-                                    break
-
-                        result = {
-                            'id': f"crossref:{item.get('DOI', '')}",
-                            'doi': item.get('DOI'),
-                            'display_name': item.get('title', [''])[0],
-                            'publication_year': pub_year,
-                            'type': item.get('type'),
-                            'authorships': [
-                                {
-                                    'author': {
-                                        'display_name': f"{author.get('given', '')} {author.get('family', '')}"
-                                    }
-                                }
-                                for author in item.get('author', [])
-                            ],
-                            'referenced_works': [], # Crossref doesn't provide this directly
-                            'abstract_inverted_index': None, # Crossref doesn't provide this
-                            'keywords': [], # Crossref doesn't provide this
-                            'cited_by_api_url': item.get('is-referenced-by-count', 0) > 0 and f"https://api.crossref.org/works/{item.get('DOI')}/references" or None
-                        }
-                        results.append(result)
+                    results = [crossref_item_to_openalex_like(item) for item in data['message']['items']]
                     return {"step": step, "results": results, "success": True}
                 else:
                     return {"step": step, "results": [], "success": True} # Success but no results
@@ -818,7 +785,7 @@ class OpenAlexCrossrefSearcher:
 
             try:
                 print(f"\nStep {step}: OpenAlex Query")
-                print(f"Params: {params}")
+                print(f"Params: {_redacted_params(params)}")
                 data = openalex_request_json(
                     url=self.base_url,
                     params=params,
@@ -830,19 +797,11 @@ class OpenAlexCrossrefSearcher:
                 )
                 return {"step": step, "results": data.get('results', []), "success": True, "meta": data.get('meta')}
             except requests.exceptions.RequestException as e:
-                return {"step": step, "results": [], "success": False, "error": str(e)}
+                return {"step": step, "results": [], "success": False, "error": _redact_api_key(e)}
             except Exception as e:
-                return {"step": step, "results": [], "success": False, "error": f"Unexpected OpenAlex error: {str(e)}"}
+                return {"step": step, "results": [], "success": False, "error": f"Unexpected OpenAlex error: {_redact_api_key(e)}"}
 
-def normalize_doi(raw_doi: str | None) -> str | None:
-    """Normalize DOI strings to a bare, lowercase form."""
-    if not raw_doi:
-        return None
-    doi = raw_doi.strip().lower()
-    doi = re.sub(r'^(https?://)?(dx\.)?doi\.org/', '', doi)
-    doi = re.sub(r'^doi:\s*', '', doi)
-    doi = doi.strip().strip(' .;,')
-    return doi or None
+normalize_doi = normalize_doi_lower  # lowercase rule; the DB key uses identifiers.normalize_doi
 
 
 def coerce_year_int(value):
@@ -921,19 +880,8 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
         json.dump(enriched_references, f, indent=2)
     print(f"Enriched data saved to {output_path}")
 
-def get_abstract(inverted_index):
-    """Converts an OpenAlex inverted index to a string."""
-    if not inverted_index:
-        return None
-    
-    word_positions = {}
-    for word, positions in inverted_index.items():
-        for pos in positions:
-            word_positions[pos] = word
-            
-    # Sort by position and join the words
-    sorted_words = [word_positions[i] for i in sorted(word_positions.keys())]
-    return " ".join(sorted_words)
+get_abstract = inverted_index_to_text_last_wins
+
 
 def _build_enrichment_payload(ref, best_result):
     """Build a consistent enrichment payload for downstream consumers."""
@@ -973,6 +921,17 @@ def _build_enrichment_payload(ref, best_result):
         'ingest_source': ref.get('ingest_source'),
         'run_id': ref.get('run_id'),
     }
+
+
+def _print_match_candidates(ref, matched_results):
+    """Per-candidate scoring trace; printed only with RAG_FEEDER_MATCH_DEBUG set."""
+    print("DEBUG: Evaluating potential matches...")
+    for match in matched_results:
+        original_authors = ref.get('authors', 'N/A')
+        result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
+        print(f"  - Provider: {match['provider']} | Combined: {match['combined_score']:.2f} | TitleSim: {match['title_similarity']:.2f} | Author: {match['author_match_score']:.2f} | AuthorGate: {match['passes_author_gate']} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
+        print(f"    Original Ref Authors: {original_authors}")
+        print(f"    API Result Authors:   {result_authors}")
 
 
 def process_single_reference(
@@ -1045,13 +1004,8 @@ def process_single_reference(
 
         matched_results.sort(key=lambda x: (-x['combined_score'], -x['title_similarity'], -x['author_match_score'], x['first_found_in_step']))
 
-        print("DEBUG: Evaluating potential matches...")
-        for match in matched_results:
-            original_authors = ref.get('authors', 'N/A')
-            result_authors = [a.get('author', {}).get('display_name', 'N/A') for a in match['result'].get('authorships', [])]
-            print(f"  - Provider: {match['provider']} | Combined: {match['combined_score']:.2f} | TitleSim: {match['title_similarity']:.2f} | Author: {match['author_match_score']:.2f} | AuthorGate: {match['passes_author_gate']} | Step: {match['first_found_in_step']} | Title: {match['result'].get('display_name', 'N/A')[:60] if match['result'].get('display_name') else 'N/A'}")
-            print(f"    Original Ref Authors: {original_authors}")
-            print(f"    API Result Authors:   {result_authors}")
+        if env_bool("RAG_FEEDER_MATCH_DEBUG"):
+            _print_match_candidates(ref, matched_results)
 
         eligible_matches = [m for m in matched_results if m['passes_author_gate']]
         if not eligible_matches:
@@ -1256,6 +1210,10 @@ def process_single_reference(
     return None
 
 def _normalize_openalex_id(value: str | None) -> str | None:
+    """Last segment of an http URL, else the value unchanged (no case or W-check).
+
+    Deliberately not identifiers.normalize_openalex_id: it differs on e.g. ``w123``, ``A123``, ``" W123 "``.
+    """
     if not value:
         return None
     if value.startswith("http"):

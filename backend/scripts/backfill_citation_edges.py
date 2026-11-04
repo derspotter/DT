@@ -15,7 +15,6 @@ Usage:
 """
 
 import argparse
-import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -28,6 +27,7 @@ DL_LIT_PROJECT = ROOT / "dl_lit_project"
 if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 
+from dl_lit.identifiers import normalize_openalex_id  # noqa: E402
 from dl_lit.utils import (  # noqa: E402
     OpenAlexRateLimitExceeded,
     get_openalex_mailto,
@@ -40,11 +40,6 @@ RUN_ID = "openalex_refs_backfill"
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
-
-
-def normalize_openalex_id(value):
-    match = re.search(r"(W\d+)", str(value or ""), re.IGNORECASE)
-    return match.group(1).upper() if match else None
 
 
 def ensure_refs_fetched_column(conn):

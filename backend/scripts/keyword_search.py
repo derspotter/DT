@@ -3,9 +3,9 @@ import contextlib
 import io
 import json
 import os
-import re
 import signal
 import sys
+import traceback
 from collections import deque
 from pathlib import Path
 from _bootstrap import ensure_import_paths
@@ -23,6 +23,11 @@ from dl_lit.OpenAlexScraper import (
     fetch_referenced_work_details,
 )
 from dl_lit.db_manager import DatabaseManager
+from dl_lit.identifiers import (
+    extract_doi_lower,
+    normalize_openalex_id_strict,
+    openalex_work_to_record,
+)
 from dl_lit.keyword_search import (
     normalize_topic_ids,
     search_credits_per_page,
@@ -35,7 +40,10 @@ from dl_lit.keyword_search import (
 from dl_lit.utils import (
     OpenAlexRateLimitExceeded,
     get_global_rate_limiter,
+    get_openalex_session,
     openalex_request_json,
+    redact_openalex_key,
+    redact_openalex_request_error,
 )
 from reference_expansion import (
     DEFAULT_INCLUDE_DOWNSTREAM,
@@ -72,29 +80,9 @@ OPENALEX_SELECT = (
     'abstract_inverted_index,keywords,primary_location,open_access,biblio,'
     'referenced_works,cited_by_api_url,referenced_works_count,cited_by_count'
 )
-OPENALEX_ID_RE = re.compile(r'^W\d+$', re.IGNORECASE)
-DOI_RE = re.compile(r'10\.\d{4,9}/\S+', re.IGNORECASE)
-
-
-def normalize_openalex_id(value):
-    if not value:
-        return None
-    raw = str(value).strip()
-    if raw.startswith('http'):
-        raw = raw.rstrip('/').split('/')[-1]
-    if OPENALEX_ID_RE.match(raw):
-        return raw.upper()
-    return None
-
-
-def normalize_doi(value):
-    if not value:
-        return None
-    raw = str(value).strip().lower()
-    raw = raw.replace('https://doi.org/', '').replace('http://doi.org/', '')
-    raw = raw.replace('doi:', '')
-    match = DOI_RE.search(raw)
-    return match.group(0) if match else None
+normalize_openalex_id = normalize_openalex_id_strict
+normalize_doi = extract_doi_lower
+openalex_result_to_record = openalex_work_to_record  # former name; seed_expand imports it
 
 
 def _normalize_candidate_id(value):
@@ -106,14 +94,18 @@ def _openalex_get(params, mailto=None, retries=3):
     request_params = dict(params)
     if mailto:
         request_params['mailto'] = mailto
-    return openalex_request_json(
-        url=OPENALEX_WORKS_URL,
-        params=request_params,
-        headers={'Accept': 'application/json'},
-        timeout=30,
-        rate_limiter=get_global_rate_limiter(),
-        retries=retries,
-    )
+    try:
+        return openalex_request_json(
+            url=OPENALEX_WORKS_URL,
+            params=request_params,
+            headers={'Accept': 'application/json'},
+            timeout=30,
+            session=get_openalex_session(),
+            rate_limiter=get_global_rate_limiter(),
+            retries=retries,
+        )
+    except requests.RequestException as exc:
+        raise redact_openalex_request_error(exc) from None
 
 
 def fetch_work_by_openalex_id(openalex_id, mailto=None):
@@ -173,38 +165,6 @@ def _to_openalex_like(work):
         'cited_by_count': work.get('cited_by_count'),
     }
     return out
-
-
-def openalex_result_to_record(item, run_id=None):
-    biblio = item.get('biblio') or {}
-    primary_location = item.get('primary_location') or {}
-    source_info = primary_location.get('source') or {}
-    authors = [a.get('author', {}).get('display_name') for a in item.get('authorships', [])]
-
-    first_page = biblio.get('first_page')
-    last_page = biblio.get('last_page')
-    pages = f'{first_page}--{last_page}' if first_page and last_page else None
-
-    return {
-        'openalex_id': item.get('id'),
-        'doi': item.get('doi'),
-        'title': item.get('display_name'),
-        'year': item.get('publication_year'),
-        'authors': authors,
-        'abstract': item.get('abstract_inverted_index'),
-        'keywords': [kw.get('display_name') for kw in item.get('keywords', []) if kw.get('display_name')],
-        'source': source_info.get('display_name'),
-        'volume': biblio.get('volume'),
-        'issue': biblio.get('issue'),
-        'pages': pages,
-        'publisher': source_info.get('publisher'),
-        'type': item.get('type'),
-        'url': item.get('id'),
-        'open_access_url': item.get('open_access', {}).get('oa_url'),
-        'openalex_json': item,
-        'ingest_source': 'keyword_search',
-        'run_id': run_id,
-    }
 
 
 def _dedupe_openalex_items(items):
@@ -867,7 +827,7 @@ def main():
             raise
         except Exception as exc:
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            db.finish_search_run(run_id, 'failed', error=str(exc)[:500])
+            db.finish_search_run(run_id, 'failed', error=redact_openalex_key(exc)[:500])
             db.close_connection()
             raise
         db.close_connection()
@@ -884,5 +844,15 @@ def main():
     print(json.dumps(payload))
 
 
+def run_cli():
+    """Entry point: an uncaught error is printed to stderr (exit 1) with any api_key dropped."""
+    try:
+        main()
+    except Exception:  # noqa: BLE001 - every error path goes through the redaction
+        sys.stderr.write(redact_openalex_key(traceback.format_exc()))
+        sys.stderr.flush()
+        sys.exit(1)
+
+
 if __name__ == '__main__':
-    main()
+    run_cli()

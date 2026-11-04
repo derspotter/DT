@@ -20,8 +20,16 @@ import requests
 from bs4 import BeautifulSoup
 
 from .db_manager import DatabaseManager
+from .identifiers import inverted_index_to_text_lenient
 from .pdf_downloader import PDFDownloader
-from .utils import ServiceRateLimiter, get_global_rate_limiter
+from .utils import (
+    ServiceRateLimiter,
+    env_bool,
+    env_int,
+    get_global_rate_limiter,
+    get_openalex_session,
+    get_thread_session,
+)
 try:
     # bibtexparser 1.x does not ship middlewares; keep optional so downloads can run without it.
     from bibtexparser.middlewares import SeparateCoAuthors, LatexEncodingMiddleware  # type: ignore
@@ -34,7 +42,7 @@ GREEN = colorama.Fore.GREEN
 RED = colorama.Fore.RED
 YELLOW = colorama.Fore.YELLOW
 RESET = colorama.Style.RESET_ALL # Use colorama's reset
-DOWNLOAD_DEBUG_ENABLED = os.getenv("RAG_FEEDER_DOWNLOAD_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+DOWNLOAD_DEBUG_ENABLED = env_bool("RAG_FEEDER_DOWNLOAD_DEBUG")
 
 
 def _download_log(message: str) -> None:
@@ -111,18 +119,18 @@ class BibliographyEnhancer:
             if token.strip()
         }
         self.vpn_mode = os.getenv("RAG_FEEDER_VPN_MODE", "fallback").strip().lower()
-        self.vpn_enforce_eduvpn = os.getenv("RAG_FEEDER_VPN_ENFORCE_EDUVPN", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self.vpn_enforce_eduvpn = env_bool("RAG_FEEDER_VPN_ENFORCE_EDUVPN", True)
         self.vpn_status_cmd = (os.getenv("RAG_FEEDER_VPN_STATUS_CMD") or "").strip()
         self.vpn_connect_cmd = (os.getenv("RAG_FEEDER_VPN_CONNECT_CMD") or "").strip()
-        self.vpn_status_timeout_seconds = max(2, int(os.getenv("RAG_FEEDER_VPN_STATUS_TIMEOUT_SECONDS", "8") or "8"))
-        self.vpn_connect_timeout_seconds = max(5, int(os.getenv("RAG_FEEDER_VPN_CONNECT_TIMEOUT_SECONDS", "45") or "45"))
-        self.vpn_status_cache_ttl_seconds = max(1, int(os.getenv("RAG_FEEDER_VPN_STATUS_CACHE_SECONDS", "20") or "20"))
+        self.vpn_status_timeout_seconds = env_int("RAG_FEEDER_VPN_STATUS_TIMEOUT_SECONDS", 8, minimum=2)
+        self.vpn_connect_timeout_seconds = env_int("RAG_FEEDER_VPN_CONNECT_TIMEOUT_SECONDS", 45, minimum=5)
+        self.vpn_status_cache_ttl_seconds = env_int("RAG_FEEDER_VPN_STATUS_CACHE_SECONDS", 20, minimum=1)
         self._vpn_status_cache_until = 0.0
         self._vpn_status_cache_value = False
         self._vpn_warned_missing_status_cmd = False
-        self.enable_unpaywall = os.getenv("RAG_FEEDER_USE_UNPAYWALL", "1").strip().lower() in {"1", "true", "yes", "on"}
-        self.download_timeout = max(3, int(os.getenv("RAG_FEEDER_DOWNLOAD_TIMEOUT_SECONDS", "12") or "12"))
-        self.max_libgen_candidates = max(1, int(os.getenv("RAG_FEEDER_MAX_LIBGEN_CANDIDATES", "12") or "12"))
+        self.enable_unpaywall = env_bool("RAG_FEEDER_USE_UNPAYWALL", True)
+        self.download_timeout = env_int("RAG_FEEDER_DOWNLOAD_TIMEOUT_SECONDS", 12, minimum=3)
+        self.max_libgen_candidates = env_int("RAG_FEEDER_MAX_LIBGEN_CANDIDATES", 12, minimum=1)
         self.output_folder = Path(output_folder) if output_folder else None
         self._pdf_downloader = None
         # Legacy helper methods in this module still expect both names.
@@ -374,9 +382,7 @@ class BibliographyEnhancer:
         return status_code in {401, 402, 403, 407, 451, 500, 502, 503, 504}
 
     def _request_get_direct(self, url: str, **kwargs) -> requests.Response:
-        with requests.Session() as session:
-            session.trust_env = False
-            return session.get(url, **kwargs)
+        return get_thread_session("download").get(url, **kwargs)
 
     def _request_get_vpn(self, url: str, **kwargs) -> requests.Response:
         if not self.proxies:
@@ -385,10 +391,7 @@ class BibliographyEnhancer:
             raise requests.exceptions.RequestException(
                 "eduVPN not connected (or could not be verified); refusing desktop proxy route"
             )
-        with requests.Session() as session:
-            session.trust_env = False
-            session.proxies.update(self.proxies)
-            return session.get(url, **kwargs)
+        return get_thread_session("download-vpn", proxies=self.proxies).get(url, **kwargs)
 
     @staticmethod
     def _run_shell_cmd(command: str, timeout_seconds: int) -> tuple[bool, str]:
@@ -1120,12 +1123,9 @@ class BibliographyEnhancer:
                 
                 # If it seems to be HTML, try extracting PDF link
                 if 'text/html' in response.headers.get('Content-Type', '').lower():
-                    pdf_url = self.try_extract_pdf_link(
-                        url,
-                        source=source_label,
-                        allow_vpn_fallback=(route_used == "direct"),
-                        force_vpn=(route_used == "vpn"),
-                    )
+                    # Parse the landing page already in hand (relative links resolve
+                    # against response.url) instead of fetching it a second time.
+                    pdf_url = self._extract_pdf_link_from_response(response)
                     if pdf_url and pdf_url != url:
                         return self.download_paper(pdf_url, filename, ref_type)
             
@@ -2213,7 +2213,7 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
 
         try:
             print(f"  [OpenAlex] Fetching Batch {current_batch_num}/{total_batches} ({len(batch_ids)} IDs)...")
-            resp = requests.get(url, headers={"User-Agent": f"ReferenceIngestor/1.0 ({email})"}, timeout=60)
+            resp = get_openalex_session().get(url, headers={"User-Agent": f"ReferenceIngestor/1.0 ({email})"}, timeout=60)
             resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             data = resp.json()
             batch_res = data.get("results", [])
@@ -2237,28 +2237,7 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
 # ----------------------------------------------------------------------
 # Helper to convert OpenAlex abstract format
 # ----------------------------------------------------------------------
-def convert_inverted_index_to_text(inverted_index: dict | None) -> str | None:
-    """Convert OpenAlex abstract_inverted_index dict to continuous text, or return None if input is None."""
-    if inverted_index is None:
-        return None
-    if not isinstance(inverted_index, dict):
-        return "" # Return empty string for invalid format
-        
-    # Collect (position, term) tuples
-    pos_terms: list[tuple[int, str]] = []
-    for term, positions in inverted_index.items():
-        if not isinstance(positions, list):
-            continue # Skip invalid term entries
-        for pos in positions:
-            if isinstance(pos, int):
-                 pos_terms.append((pos, term))
-                 
-    if not pos_terms:
-        return "" # Return empty string if no valid terms/positions found
-        
-    pos_terms.sort(key=lambda x: x[0]) # Sort by position
-    # Join terms based on sorted positions
-    return " ".join(term for _, term in pos_terms)
+convert_inverted_index_to_text = inverted_index_to_text_lenient
 
 # ----------------------------------------------------------------------
 # Ingest JSON files & referenced works into DB

@@ -64,7 +64,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install pytest requests python-dotenv rapidfuzz 'bibtexparser>=2.0.0b8' pikepdf google-genai
-      - run: python -m pytest tests/test_keyword_search.py tests/test_keyword_search_script.py tests/test_openalex_quota.py tests/test_openalex_ref_counts.py tests/test_search_run_status.py tests/test_corpus_list_sort.py tests/test_backend_helper_scripts.py -q
+      - run: python -m pip install pytest pytest-mock requests python-dotenv rapidfuzz 'bibtexparser>=2.0.0b8' pikepdf google-genai click colorama beautifulsoup4
+      - run: python -m pytest tests/test_keyword_search.py tests/test_keyword_search_script.py tests/test_openalex_quota.py tests/test_openalex_ref_counts.py tests/test_search_run_status.py tests/test_corpus_list_sort.py tests/test_backend_helper_scripts.py tests/test_env_parsing.py tests/test_identifiers.py tests/test_llm_common.py tests/test_ingest_batching.py tests/test_download_path.py tests/test_thread_sessions.py tests/test_hygiene.py tests/test_gemini_timeout_retries.py tests/test_pipeline_daemon.py -q
       - run: python -m unittest discover -s tests -p 'test_upstream_*.py' -q
       - run: python -m unittest discover -s tests -p 'test_ocr_*.py' -q

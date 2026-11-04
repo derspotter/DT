@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import sys
 import tempfile
@@ -11,6 +12,7 @@ import os
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import requests
+from requests.adapters import HTTPAdapter
 
 
 OPENALEX_BASE_URL = 'https://api.openalex.org'
@@ -170,24 +172,65 @@ class ServiceRateLimiter:
 _global_rate_limiter = None
 
 
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
+def _env_number(name, default, parse, kind, minimum, maximum):
     raw = os.getenv(name)
-    if raw is None or raw == "":
-        return max(minimum, int(default))
-    try:
-        return max(minimum, int(raw))
-    except ValueError:
-        return max(minimum, int(default))
+    value = default
+    if raw is not None and raw.strip() != "":
+        try:
+            value = parse(raw.strip())
+        except ValueError:
+            print(f"[env] {name}={raw} is not a valid {kind}; using {default}", file=sys.stderr)
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
-def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+def env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    """Read an int env var; unset/empty -> default, invalid -> stderr warning + default, then clamp."""
+    return _env_number(name, int(default), int, "int", minimum, maximum)
+
+
+def env_float(name: str, default: float, *, minimum: float | None = None, maximum: float | None = None) -> float:
+    """Read a float env var; unset/empty -> default, invalid or non-finite -> stderr warning + default, then clamp."""
+    return float(_env_number(name, float(default), _finite_float, "float", minimum, maximum))
+
+
+def _finite_float(raw: str) -> float:
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError(f"not finite: {raw}")
+    return value
+
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+_env_bool_warned = set()  # (name, raw): env_bool also runs in per-candidate paths
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Read a bool env var: 1/true/yes/on and 0/false/no/off (case-insensitive, stripped).
+
+    Unset/empty -> default; anything else -> one stderr warning per name and value + default.
+    """
     raw = os.getenv(name)
-    if raw is None or raw == "":
-        return max(minimum, float(default))
-    try:
-        return max(minimum, float(raw))
-    except ValueError:
-        return max(minimum, float(default))
+    value = raw.strip().lower() if raw is not None else ""
+    if not value:
+        return bool(default)
+    if value in _TRUTHY:
+        return True
+    if value in _FALSY:
+        return False
+    if (name, raw) not in _env_bool_warned:
+        _env_bool_warned.add((name, raw))
+        print(f"[env] {name}={raw} is not a valid bool; using {bool(default)}", file=sys.stderr)
+    return bool(default)
+
+
+# Private names kept as aliases for one release.
+_env_int = env_int
+_env_float = env_float
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -408,6 +451,40 @@ def _apply_openalex_response_limits(
     return wait_seconds
 
 
+_API_KEY_VALUE = r"[^&#\s'\"]*"
+# Two passes, neither consuming the separator the next match needs: first every "&api_key=..."
+# (adjacent ones each start at their own "&"), then a leading "?api_key=..." with the "&" after
+# it, so "?api_key=a&page=2" -> "?page=2" and a lone "?api_key=a" -> "".
+_API_KEY_AMP_RE = re.compile(r"&api_key=" + _API_KEY_VALUE)
+_API_KEY_QMARK_RE = re.compile(r"\?api_key=" + _API_KEY_VALUE + r"(&?)")
+
+
+def redact_openalex_key(text) -> str:
+    """Drop every ``api_key=...`` query parameter from a printed URL or message."""
+    text = _API_KEY_AMP_RE.sub("", str(text))
+    return _API_KEY_QMARK_RE.sub(lambda m: "?" if m.group(1) else "", text)
+
+
+def redact_openalex_request_error(exc: requests.RequestException) -> requests.RequestException:
+    """``exc`` with the api key dropped from its message: same type, ``response``/``request`` kept.
+
+    requests puts the prepared URL (query string and all) into HTTPError / ConnectionError /
+    Timeout messages. Returns ``exc`` itself when its message carries no key.
+    """
+    message = redact_openalex_key(str(exc))
+    if message == str(exc) and "api_key=" not in repr(exc):
+        return exc
+    kwargs = {}
+    if getattr(exc, 'response', None) is not None:
+        kwargs['response'] = exc.response
+    if getattr(exc, 'request', None) is not None:
+        kwargs['request'] = exc.request
+    try:
+        return type(exc)(message, **kwargs)
+    except TypeError:  # a subclass with its own constructor signature
+        return requests.RequestException(message, **kwargs)
+
+
 def openalex_request_json(
     *,
     endpoint: str | None = None,
@@ -442,7 +519,7 @@ def openalex_request_json(
 
     request_url = url or f"{OPENALEX_BASE_URL}/{endpoint.lstrip('/')}"
     request_url, request_params = _merge_query_params(request_url, extra_params)
-    wait_cap_seconds = _env_float('RAG_FEEDER_OPENALEX_MAX_WAIT_SEC', 15.0)
+    wait_cap_seconds = env_float('RAG_FEEDER_OPENALEX_MAX_WAIT_SEC', 15.0, minimum=0.0)
     http = session or requests
     billable_request = not _is_openalex_lookup_request(request_url, request_params)
 
@@ -495,28 +572,57 @@ def openalex_request_json(
         except requests.RequestException as exc:
             last_error = exc
             if attempt == retries - 1:
-                raise
+                # The message holds the request URL, api_key included: never let that escape.
+                raise redact_openalex_request_error(exc) from None
             time.sleep(2 ** attempt)
 
     if last_error is not None:
-        raise last_error
+        raise redact_openalex_request_error(last_error) from None
     raise RuntimeError('OpenAlex request failed after retries')
 
 
-_openalex_session_local = threading.local()
+_thread_sessions_local = threading.local()
+
+
+def get_thread_session(
+    kind: str,
+    *,
+    proxies: dict | None = None,
+    trust_env: bool = False,
+    pool_maxsize: int = 16,
+) -> requests.Session:
+    """Return this thread's keep-alive requests.Session for ``kind`` (and ``proxies``).
+
+    requests.Session is not guaranteed thread-safe, so sessions are never shared
+    across threads; within a thread the connection pool is reused across calls.
+    The cache key is ``(kind, proxies)``; ``trust_env`` and ``pool_maxsize`` apply
+    when the session is first created for that key.
+    """
+    cache = getattr(_thread_sessions_local, 'sessions', None)
+    if cache is None:
+        cache = {}
+        _thread_sessions_local.sessions = cache
+    key = (kind, tuple(sorted(proxies.items())) if proxies else None)
+    session = cache.get(key)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = trust_env
+        if proxies:
+            session.proxies.update(proxies)
+        adapter = HTTPAdapter(pool_connections=pool_maxsize, pool_maxsize=pool_maxsize)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        cache[key] = session
+    return session
 
 
 def get_openalex_session() -> requests.Session:
     """Return this thread's shared requests.Session for OpenAlex calls.
 
-    requests.Session is not guaranteed thread-safe, so each thread gets its own
-    instance; within a thread the connection pool is reused across pages.
+    Unlike the download kinds it honours the environment (proxies,
+    REQUESTS_CA_BUNDLE, .netrc), as the former plain session did.
     """
-    session = getattr(_openalex_session_local, 'session', None)
-    if session is None:
-        session = requests.Session()
-        _openalex_session_local.session = session
-    return session
+    return get_thread_session('openalex', trust_env=True, pool_maxsize=64)
 
 
 def reset_global_rate_limiter():
@@ -535,18 +641,18 @@ def get_global_rate_limiter():
     """Get the shared rate limiter instance for the entire application."""
     global _global_rate_limiter
     if _global_rate_limiter is None:
-        default_rps = _env_int('RAG_FEEDER_API_DEFAULT_RPS', 40)
-        openalex_rps = _env_int('RAG_FEEDER_OPENALEX_RPS', 30)
-        crossref_rps = _env_int('RAG_FEEDER_CROSSREF_RPS', 20)
-        semantic_scholar_rps = _env_int('RAG_FEEDER_SEMANTIC_SCHOLAR_RPS', 1)
-        semantic_scholar_min_interval = _env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC', 1.1)
-        unpaywall_rps = _env_int('RAG_FEEDER_UNPAYWALL_RPS', 10)
-        scihub_rps = _env_int('RAG_FEEDER_SCIHUB_RPS', 8)
-        libgen_rps = _env_int('RAG_FEEDER_LIBGEN_RPS', 6)
-        libgen_min_interval = _env_float('RAG_FEEDER_LIBGEN_MIN_INTERVAL_SEC', 0.4)
-        gemini_per_minute = _env_int('RAG_FEEDER_GEMINI_PER_MIN', 2000)
-        gemini_daily = _env_int('RAG_FEEDER_GEMINI_DAILY', 100000)
-        gemini_tokens_per_min = _env_int('RAG_FEEDER_GEMINI_TOKENS_PER_MIN', 3000000)
+        default_rps = env_int('RAG_FEEDER_API_DEFAULT_RPS', 40, minimum=1)
+        openalex_rps = env_int('RAG_FEEDER_OPENALEX_RPS', 30, minimum=1)
+        crossref_rps = env_int('RAG_FEEDER_CROSSREF_RPS', 20, minimum=1)
+        semantic_scholar_rps = env_int('RAG_FEEDER_SEMANTIC_SCHOLAR_RPS', 1, minimum=1)
+        semantic_scholar_min_interval = env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_MIN_INTERVAL_SEC', 1.1, minimum=0.0)
+        unpaywall_rps = env_int('RAG_FEEDER_UNPAYWALL_RPS', 10, minimum=1)
+        scihub_rps = env_int('RAG_FEEDER_SCIHUB_RPS', 8, minimum=1)
+        libgen_rps = env_int('RAG_FEEDER_LIBGEN_RPS', 6, minimum=1)
+        libgen_min_interval = env_float('RAG_FEEDER_LIBGEN_MIN_INTERVAL_SEC', 0.4, minimum=0.0)
+        gemini_per_minute = env_int('RAG_FEEDER_GEMINI_PER_MIN', 2000, minimum=1)
+        gemini_daily = env_int('RAG_FEEDER_GEMINI_DAILY', 100000, minimum=1)
+        gemini_tokens_per_min = env_int('RAG_FEEDER_GEMINI_TOKENS_PER_MIN', 3000000, minimum=1)
         _global_rate_limiter = ServiceRateLimiter({
             'default': {'limit': default_rps, 'window': 1},
             'openalex': {'limit': openalex_rps, 'window': 1},

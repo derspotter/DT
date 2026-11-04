@@ -4,6 +4,7 @@ import time
 from typing import Iterable
 import requests
 
+from .identifiers import openalex_work_to_record
 from .utils import get_global_rate_limiter, get_openalex_session, openalex_request_json
 
 TOKEN_RE = re.compile(r'"[^"]+"|\(|\)|\bAND\b|\bOR\b|\bNOT\b|[^()\s]+', re.IGNORECASE)
@@ -361,37 +362,7 @@ def count_openalex(query: str,
     return int((data.get("meta") or {}).get("count") or 0)
 
 
-def openalex_result_to_record(item: dict, run_id: int | None = None) -> dict:
-    """Normalize OpenAlex result into a search result/queue record."""
-    biblio = item.get("biblio") or {}
-    primary_location = item.get("primary_location") or {}
-    source_info = primary_location.get("source") or {}
-    authors = [a.get("author", {}).get("display_name") for a in item.get("authorships", [])]
-
-    first_page = biblio.get("first_page")
-    last_page = biblio.get("last_page")
-    pages = f"{first_page}--{last_page}" if first_page and last_page else None
-
-    return {
-        "openalex_id": item.get("id"),
-        "doi": item.get("doi"),
-        "title": item.get("display_name"),
-        "year": item.get("publication_year"),
-        "authors": authors,
-        "abstract": item.get("abstract_inverted_index"),
-        "keywords": [kw.get("display_name") for kw in item.get("keywords", []) if kw.get("display_name")],
-        "source": source_info.get("display_name"),
-        "volume": biblio.get("volume"),
-        "issue": biblio.get("issue"),
-        "pages": pages,
-        "publisher": source_info.get("publisher"),
-        "type": item.get("type"),
-        "url": item.get("id"),
-        "open_access_url": item.get("open_access", {}).get("oa_url"),
-        "openalex_json": item,
-        "ingest_source": "keyword_search",
-        "run_id": run_id,
-    }
+openalex_result_to_record = openalex_work_to_record  # former name, kept for callers and tests
 
 
 def dedupe_results(results: Iterable[dict]) -> list[dict]:

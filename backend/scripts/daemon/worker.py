@@ -72,7 +72,6 @@ import signal
 import secrets
 import random
 import socket
-import hashlib
 from collections import Counter, defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -80,9 +79,10 @@ from pathlib import Path
 
 from dl_lit.db_manager import DatabaseManager
 from dl_lit.app_settings import apply_app_settings_env, effective_env, settings_fingerprint
-from dl_lit.utils import get_global_rate_limiter, reset_global_rate_limiter, set_global_rate_limiter
+from dl_lit.utils import env_int, get_global_rate_limiter, reset_global_rate_limiter, set_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
+from dl_lit.download_path import download_ref  # noqa: F401  (worker.download_ref)
 from dl_lit.scraper_lab import execute_scraper_job
 
 # Import constants
@@ -93,17 +93,61 @@ from reference_expansion import (
     DEFAULT_INCLUDE_UPSTREAM,
 )
 
+# One append handle per process for the pipeline log the UI reads (formerly one open() per line).
+# Keyed on the resolved path; reopened after an OSError, when RAG_FEEDER_LOG_DIR changes, and when
+# backend/src/index.js has rotated the file by renaming it (the path no longer names our inode).
+_LOG_STATE = {"handle": None, "path": None}
+_LOG_LOCK = threading.Lock()
+
+
+def _close_log_handle():
+    handle = _LOG_STATE["handle"]
+    _LOG_STATE["handle"] = None
+    _LOG_STATE["path"] = None
+    if handle is not None:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+def _log_handle_is_current(log_file: str) -> bool:
+    handle = _LOG_STATE["handle"]
+    if handle is None or _LOG_STATE["path"] != log_file:
+        return False
+    try:
+        return os.path.samestat(os.fstat(handle.fileno()), os.stat(log_file))
+    except (OSError, ValueError):
+        return False
+
+
+def _append_log_line(log_dir: str, line: str) -> None:
+    log_file = os.path.join(log_dir, "backend-pipeline.log")
+    with _LOG_LOCK:
+        for attempt in range(2):
+            try:
+                if not _log_handle_is_current(log_file):
+                    _close_log_handle()
+                    os.makedirs(log_dir, exist_ok=True)
+                    _LOG_STATE["handle"] = open(log_file, "a", encoding="utf-8")
+                    _LOG_STATE["path"] = log_file
+                _LOG_STATE["handle"].write(line + "\n")
+                _LOG_STATE["handle"].flush()
+                return
+            except OSError:
+                _close_log_handle()
+                if attempt:
+                    raise
+
+
 def log(msg: str):
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
     print(formatted_msg, flush=True)
     # Also append to the same pipeline log file that Node.js uses, so the UI can read it
     log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
-    log_file = os.path.join(log_dir, "backend-pipeline.log")
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(formatted_msg + "\n")
+        _append_log_line(log_dir, formatted_msg)
     except Exception as e:
         print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 
@@ -203,13 +247,13 @@ class PipelineDaemon:
             "enrich": "enrich",
             "download": "download",
         }.get(self.role, "pipeline")
-        self.heartbeat_interval_seconds = max(1, int(os.getenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", "3") or "3"))
+        self.heartbeat_interval_seconds = env_int("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", 3, minimum=1)
         self._last_heartbeat_at = 0.0
         # hostname:pid repeats after an in-place container restart (same hostname,
         # PID 1 again), which would make a dead predecessor look like us; the
         # nonce keeps every process distinguishable.
         self.worker_id = f"daemon:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"
-        self.job_timeout_seconds = max(60, int(os.getenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "1800") or "1800"))
+        self.job_timeout_seconds = env_int("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", 1800, minimum=60)
         self._ensure_heartbeat_table()
         self._recover_stale_running_jobs()
         self._heartbeat("starting", {"worker_id": self.worker_id}, force=True)
@@ -233,30 +277,54 @@ class PipelineDaemon:
             self.heartbeat_conn.commit()
 
     def _heartbeat(self, status: str, details: dict | None = None, force: bool = False):
+        """Upsert this daemon's heartbeat row. Never raises on an OperationalError.
+
+        If another connection holds the write lock past the busy timeout the beat is skipped
+        (the next one retries), so neither a heartbeat thread nor the main loop dies of a long
+        import. Lock contention and other OperationalErrors are logged apart, each at most once
+        a minute.
+        """
         now = time.time()
         if not force and (now - self._last_heartbeat_at) < self.heartbeat_interval_seconds:
             return
         with self.heartbeat_lock:
-            cur = self.heartbeat_conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, details_json, last_seen_at, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT(daemon_name) DO UPDATE SET
-                    worker_id = excluded.worker_id,
-                    status = excluded.status,
-                    details_json = excluded.details_json,
-                    last_seen_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    self.daemon_name,
-                    self.worker_id,
-                    str(status or "idle"),
-                    json.dumps(details or {}),
-                ),
-            )
-            self.heartbeat_conn.commit()
+            try:
+                cur = self.heartbeat_conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO daemon_heartbeat (daemon_name, worker_id, status, details_json, last_seen_at, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(daemon_name) DO UPDATE SET
+                        worker_id = excluded.worker_id,
+                        status = excluded.status,
+                        details_json = excluded.details_json,
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        self.daemon_name,
+                        self.worker_id,
+                        str(status or "idle"),
+                        json.dumps(details or {}),
+                    ),
+                )
+                self.heartbeat_conn.commit()
+            except sqlite3.OperationalError as exc:
+                try:
+                    if self.heartbeat_conn.in_transaction:
+                        self.heartbeat_conn.rollback()
+                except sqlite3.Error:
+                    pass
+                # Only lock contention is expected here; a read-only, full or failing database
+                # is a real fault and must not read as "busy". Throttled per kind, so a recent
+                # busy line never hides one.
+                msg = str(exc).lower()
+                busy = "locked" in msg or "busy" in msg
+                logged_at = self.__dict__.setdefault("_heartbeat_error_logged_at", {})
+                if now - logged_at.get(busy, 0.0) >= 60:
+                    logged_at[busy] = now
+                    log(f"Heartbeat skipped (database busy): {exc}" if busy else f"Heartbeat failed (database error): {exc}")
+                return
         self._last_heartbeat_at = now
 
     def _start_job_heartbeat(self, job: dict):
@@ -619,7 +687,7 @@ class PipelineDaemon:
             "openalex_json": None,
         }
         try:
-            result = self.enhancer.enhance_bibliography(ref, self.download_dir)
+            download_result, checksum, _trace = download_ref(self.enhancer, ref, self.download_dir)
         except Exception as exc:
             return False, {
                 "pending_work_id": pending_work_id,
@@ -628,23 +696,15 @@ class PipelineDaemon:
                 "failure_detail": str(exc),
             }
 
-        download_result = result if isinstance(result, dict) else ref
-        if not download_result or not download_result.get("downloaded_file"):
+        if download_result is None:
             return False, {
                 "pending_work_id": pending_work_id,
                 "action": "raw_download_failed",
-                "failure_category": download_result.get("download_failure_category") if isinstance(download_result, dict) else "download_failed",
-                "failure_detail": download_result.get("download_failure_detail") if isinstance(download_result, dict) else "download_failed",
+                "failure_category": ref.get("download_failure_category"),
+                "failure_detail": ref.get("download_failure_detail"),
             }
 
         fp = str(download_result["downloaded_file"])
-        checksum = ""
-        try:
-            with open(fp, "rb") as fh:
-                checksum = hashlib.sha256(fh.read()).hexdigest()
-        except Exception:
-            checksum = ""
-
         with self.db_lock:
             downloaded_id, move_error = self.db.mark_raw_work_downloaded(
                 pending_work_id,
@@ -708,7 +768,7 @@ class PipelineDaemon:
         max_rel = expansion.get("maxRelated", 30)
         _note_expansion_disabled(fetch_refs, fetch_cites)
 
-        wave_size_cfg = int(os.getenv("RAG_FEEDER_ENRICH_WAVE_SIZE", "2") or "2")
+        wave_size_cfg = env_int("RAG_FEEDER_ENRICH_WAVE_SIZE", 2, minimum=1)
         wave_size = max(1, min(len(to_process), max(1, min(workers, 32)), wave_size_cfg))
         remaining_entries = list(to_process)
         deferred_reason = None
@@ -817,8 +877,10 @@ class PipelineDaemon:
         authors_raw = row.get("authors")
         authors = []
         if isinstance(authors_raw, str):
-            try: authors = json.loads(authors_raw)
-            except: authors = [authors_raw]
+            try:
+                authors = json.loads(authors_raw)
+            except (json.JSONDecodeError, TypeError):
+                authors = [authors_raw]
         elif isinstance(authors_raw, list):
             authors = authors_raw
 
@@ -829,11 +891,11 @@ class PipelineDaemon:
                 doi=row.get("doi"), openalex_id=row.get("openalex_id"), title=row.get("title"),
                 authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="works"
             )
-        if dup_table == "works" and dup_id is not None:
-            existing = self.db.get_entry_by_id("works", int(dup_id)) or {}
-            if str(existing.get("download_status") or "").strip().lower() != "downloaded":
-                dup_table = None
-                dup_id = None
+            if dup_table == "works" and dup_id is not None:
+                existing = self.db.get_entry_by_id("works", int(dup_id)) or {}
+                if str(existing.get("download_status") or "").strip().lower() != "downloaded":
+                    dup_table = None
+                    dup_id = None
         if dup_table == "works" and dup_id is not None:
             with self.db_lock:
                 ok, msg = self.db.merge_duplicate_queued_work(qid, dup_table, dup_id, dup_field)
@@ -850,7 +912,7 @@ class PipelineDaemon:
         }
         
         try:
-            result = self.enhancer.enhance_bibliography(ref, self.download_dir)
+            result, checksum, trace = download_ref(self.enhancer, ref, self.download_dir)
         except Exception as exc:
             return "error", {
                 "queue_id": qid,
@@ -861,21 +923,14 @@ class PipelineDaemon:
                 "_trace": list(ref.get("download_trace") or []),
             }
 
-        download_result = result if isinstance(result, dict) else ref
-        trace = list(download_result.get("download_trace") or [])
         attempted_sources = []
         for event in trace:
             source_name = event.get("source")
             if source_name and source_name not in attempted_sources:
                 attempted_sources.append(source_name)
 
-        if result and result.get("downloaded_file"):
+        if result is not None:
             fp = str(result["downloaded_file"])
-            checksum = ""
-            try:
-                with open(fp, "rb") as fh: checksum = hashlib.sha256(fh.read()).hexdigest()
-            except: pass
-            
             with self.db_lock:
                 downloaded_id, move_error = self.db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
             if move_error or not downloaded_id:
@@ -899,8 +954,8 @@ class PipelineDaemon:
                 "_trace": trace,
             }
         else:
-            failure_category = download_result.get("download_failure_category") or "download_failed"
-            failure_detail = download_result.get("download_failure_detail") or download_result.get("download_reason") or "download_failed"
+            failure_category = ref.get("download_failure_category") or "download_failed"
+            failure_detail = ref.get("download_failure_detail") or ref.get("download_reason") or "download_failed"
             with self.db_lock:
                 self.db.mark_download_failed(qid, failure_category)
             return "failed", {
@@ -916,8 +971,7 @@ class PipelineDaemon:
     def do_download(self, corpus_id: int, limit: int):
         # Prevent one very large queued job (e.g. batchSize=3000) from monopolizing
         # the single daemon loop for a long period.
-        per_job_max = int(os.getenv("RAG_FEEDER_DOWNLOAD_JOB_MAX", "150") or "150")
-        per_job_max = max(1, min(per_job_max, 5000))
+        per_job_max = env_int("RAG_FEEDER_DOWNLOAD_JOB_MAX", 150, minimum=1, maximum=5000)
         effective_limit = min(max(1, int(limit or 1)), per_job_max)
         if effective_limit != limit:
             log(f"Clamped download job batch from {limit} to {effective_limit} (RAG_FEEDER_DOWNLOAD_JOB_MAX={per_job_max})")
@@ -934,8 +988,7 @@ class PipelineDaemon:
         # Download multiple files concurrently. Be careful not to overwhelm the disk or rate limiters.
         # Max out at min(limit, configured cap) parallel downloads.
         # Keep env configurable so operators can tune throughput without code changes.
-        max_workers_cfg = int(os.getenv("RAG_FEEDER_DOWNLOAD_WORKERS", "16") or "16")
-        max_workers_cfg = max(1, min(max_workers_cfg, 128))
+        max_workers_cfg = env_int("RAG_FEEDER_DOWNLOAD_WORKERS", 16, minimum=1, maximum=128)
         max_download_workers = min(len(rows), max_workers_cfg)
         
         with ThreadPoolExecutor(max_workers=max_download_workers) as executor:
@@ -1002,14 +1055,14 @@ class PipelineDaemon:
 
     def _run_direct_enrich_cycle(self):
         # Settings were refreshed by run() right before fetch_next_job().
-        default_limit = max(1, int(os.getenv("RAG_FEEDER_ENRICH_BATCH_SIZE", "10") or "10"))
-        default_workers = max(1, int(os.getenv("RAG_FEEDER_ENRICH_WORKERS", "6") or "6"))
+        default_limit = env_int("RAG_FEEDER_ENRICH_BATCH_SIZE", 10, minimum=1)
+        default_workers = env_int("RAG_FEEDER_ENRICH_WORKERS", 6, minimum=1)
         result = self.do_enrich(None, default_limit, default_workers, {})
         return result if (result or {}).get("processed", 0) > 0 else None
 
     def _run_direct_download_cycle(self):
         # Settings were refreshed by run() right before fetch_next_job().
-        default_limit = max(1, int(os.getenv("RAG_FEEDER_DOWNLOAD_BATCH_SIZE", "50") or "50"))
+        default_limit = env_int("RAG_FEEDER_DOWNLOAD_BATCH_SIZE", 50, minimum=1)
         result = self.do_download(None, default_limit)
         return result if (result or {}).get("processed", 0) > 0 else None
 
@@ -1127,79 +1180,70 @@ class PipelineDaemon:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1)
 
+    # Direct (job-less) batch cycles per role, run in turn when no job is pending.
+    DIRECT_CYCLES = {
+        "enrich": (("enrich", "_run_direct_enrich_cycle"),),
+        "download": (("download", "_run_direct_download_cycle"),),
+        "all": (("enrich", "_run_direct_enrich_cycle"), ("download", "_run_direct_download_cycle")),
+    }
+
+    def _run_direct_cycles(self) -> dict | None:
+        """Run this role's direct cycles, each under the direct-batch heartbeat thread.
+
+        Returns the summed counters when any cycle processed something, else None. A failing
+        cycle does not skip the next one. Failures are logged and listed under "errors" next to
+        the counters; with no counters to report they are raised to the main loop.
+        """
+        totals = None
+        failures = []
+        for phase, method_name in self.DIRECT_CYCLES.get(self.role, ()):
+            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": phase})
+            result = None
+            try:
+                result = getattr(self, method_name)()
+            except Exception as exc:
+                failures.append((f"{phase} cycle failed: {exc}", exc))
+            finally:
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1)
+            if result:
+                totals = totals or {}
+                for key in ("processed", "promoted", "queued", "downloaded", "failed"):
+                    totals[key] = totals.get(key, 0) + int(result.get(key, 0) or 0)
+        if failures:
+            messages = [message for message, _ in failures]
+            if totals is None:
+                raise RuntimeError("; ".join(messages)) from failures[0][1]
+            for message in messages:
+                log(message)
+            totals["errors"] = messages
+        return totals
+
     def run(self):
         log(f"{self.role} daemon starting. Waiting for work...")
         self._install_signal_handlers()
-        if self.role in {"enrich", "download"}:
-            while self.running:
-                try:
-                    self._heartbeat("idle", {"state": "polling", "mode": "db-driven", "role": self.role})
-                    self.refresh_app_settings()  # before claiming: a failure must not claim a job
-                    job = self.fetch_next_job()
-                    if job:
-                        self._process_job(job)
-                        continue
-                    direct_result = None
-                    heartbeat_stop = None
-                    heartbeat_thread = None
-                    try:
-                        if self.role == "enrich":
-                            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "enrich"})
-                            direct_result = self._run_direct_enrich_cycle()
-                        elif self.role == "download":
-                            heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": "download"})
-                            direct_result = self._run_direct_download_cycle()
-                    finally:
-                        if heartbeat_stop:
-                            heartbeat_stop.set()
-                        if heartbeat_thread:
-                            heartbeat_thread.join(timeout=1)
-                    if direct_result:
-                        self._heartbeat(
-                            "running",
-                            {
-                                "state": "processed_batch",
-                                "mode": "db-driven",
-                                "role": self.role,
-                                "result": {
-                                    "processed": int(direct_result.get("processed", 0) or 0),
-                                    "promoted": int(direct_result.get("promoted", 0) or 0),
-                                    "queued": int(direct_result.get("queued", 0) or 0),
-                                    "downloaded": int(direct_result.get("downloaded", 0) or 0),
-                                    "failed": int(direct_result.get("failed", 0) or 0),
-                                },
-                            },
-                            force=True,
-                        )
-                        continue
-                    time.sleep(5)
-                except KeyboardInterrupt:
-                    log("Received shutdown signal. Exiting gracefully...")
-                    self.running = False
-                    self._release_own_running_jobs()
-                    self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
-                except Exception as e:
-                    log(f"Critical error in main loop: {e}")
-                    self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
-                    time.sleep(10)
-            return
-
         while self.running:
             try:
-                self._heartbeat("idle", {"state": "polling"})
+                self._heartbeat("idle", {"state": "polling", "mode": "db-driven", "role": self.role})
                 self.refresh_app_settings()  # before claiming: a failure must not claim a job
                 job = self.fetch_next_job()
-                if not job:
-                    direct_result = None
-                    if self.role == "enrich":
-                        direct_result = self._run_direct_enrich_cycle()
-                    elif self.role == "download":
-                        direct_result = self._run_direct_download_cycle()
-                    if not direct_result:
-                        time.sleep(5)
+                if job:
+                    self._process_job(job)
                     continue
-                self._process_job(job)
-                    
+                direct_result = self._run_direct_cycles()
+                if direct_result:
+                    self._heartbeat(
+                        "running",
+                        {
+                            "state": "processed_batch",
+                            "mode": "db-driven",
+                            "role": self.role,
+                            "result": direct_result,
+                        },
+                        force=True,
+                    )
+                    continue
+                time.sleep(5)
             except KeyboardInterrupt:
                 log("Received shutdown signal. Exiting gracefully...")
                 self.running = False
@@ -1207,7 +1251,10 @@ class PipelineDaemon:
                 self._heartbeat("stopped", {"state": "keyboard_interrupt"}, force=True)
             except Exception as e:
                 log(f"Critical error in main loop: {e}")
-                self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
+                try:
+                    self._heartbeat("error", {"state": "loop_exception", "error": str(e)}, force=True)
+                except Exception as beat_error:  # the loop must survive a failing error beat
+                    log(f"Error heartbeat failed: {beat_error}")
                 time.sleep(10)
 
 if __name__ == "__main__":

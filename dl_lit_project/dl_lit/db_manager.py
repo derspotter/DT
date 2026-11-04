@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 from datetime import datetime
 import time
+from contextlib import contextmanager, nullcontext
+from dl_lit.identifiers import inverted_index_to_text, normalize_doi, normalize_openalex_id
 from dl_lit.utils import parse_bibtex_file_field
 
 # ANSI escape codes for colors
@@ -13,6 +15,10 @@ YELLOW = "\033[93m"
 BLUE = "\033[94m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
+
+# Bulk imports commit every this many entries, so no write lock is held for a whole file
+# (the workers' heartbeats and claims wait at most one chunk).
+INGEST_COMMIT_CHUNK = 500
 
 WORKS_INDEXES = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''",
@@ -94,14 +100,25 @@ class DatabaseManager:
         self._create_schema()
 
     def _table_columns(self, table_name: str) -> set[str]:
-        """Return concrete DB columns so payloads can carry extra API metadata safely."""
-        cur = self.conn.cursor()
-        cur.execute(f"PRAGMA table_info({table_name})")
-        return {str(row[1]) for row in cur.fetchall()}
+        """Return concrete DB columns so payloads can carry extra API metadata safely.
+
+        Cached per table on the instance; _ensure_column and _create_schema invalidate it.
+        A missing table (no columns) is not cached, so a later CREATE TABLE is seen.
+        """
+        cache = self.__dict__.setdefault("_columns_cache", {})
+        columns = cache.get(table_name)
+        if columns is None:
+            cur = self.conn.cursor()
+            cur.execute(f"PRAGMA table_info({table_name})")
+            columns = frozenset(str(row[1]) for row in cur.fetchall())
+            if columns:
+                cache[table_name] = columns
+        return set(columns)
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str) -> None:
         if column_name not in self._table_columns(table_name):
             self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+            self.__dict__.setdefault("_columns_cache", {}).pop(table_name, None)
 
     def _ensure_works_schema_columns(self) -> None:
         """Add canonical works columns introduced after the first schema version."""
@@ -119,6 +136,55 @@ class DatabaseManager:
         self._ensure_column("search_runs", "error", "TEXT")
         self._ensure_column("search_runs", "finished_at", "TIMESTAMP")
 
+    @contextmanager
+    def transaction(self):
+        """Run a block of writes as one transaction.
+
+        BEGIN IMMEDIATE unless a transaction is already open: the write lock is taken before the
+        first read, so a concurrent writer waits (busy_timeout) instead of invalidating this
+        snapshot (SQLITE_BUSY_SNAPSHOT on the first write). COMMITs on normal exit; if the body or
+        the COMMIT raises, ROLLBACKs and re-raises. Only the call that began the transaction
+        commits or rolls back, so nested use is a passthrough. Writers called inside must not
+        commit themselves: pass them commit=False. Keep network calls out of the block.
+
+        SQLite rolls back the whole transaction on some errors (SQLITE_FULL, I/O errors). If the
+        transaction this call opened is gone on normal exit, the block's writes are lost and
+        OperationalError is raised. A per-entry handler inside the block must re-raise when
+        ``conn.in_transaction`` is False: the entries before it are gone with the transaction.
+        """
+        if self.conn.in_transaction:
+            yield
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            if not self.conn.in_transaction:
+                raise sqlite3.OperationalError("transaction was lost before COMMIT; its writes are gone")
+            self.conn.commit()
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    @contextmanager
+    def savepoint(self):
+        """Run a block inside a SAVEPOINT: on an exception only the block's writes are undone.
+
+        RELEASEs on normal exit; on an exception ROLLBACK TO + RELEASE, then re-raises. Use it
+        inside transaction(); the block must not commit (pass commit=False to writers).
+        """
+        self._savepoint_seq = getattr(self, "_savepoint_seq", 0) + 1
+        name = f"sp_{self._savepoint_seq}"
+        self.conn.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            if self.conn.in_transaction:
+                self.conn.execute(f"ROLLBACK TO {name}")
+                self.conn.execute(f"RELEASE {name}")
+            raise
+        self.conn.execute(f"RELEASE {name}")
+
     def close_connection(self):
         """Closes the database connection."""
         if hasattr(self, 'conn') and self.conn:
@@ -130,6 +196,13 @@ class DatabaseManager:
 
     def _create_schema(self):
         """Creates the database schema, including all necessary tables if they don't exist."""
+        self._columns_cache = {}
+        try:
+            self._create_schema_tables()
+        finally:
+            self._columns_cache = {}  # the schema pass adds and alters tables
+
+    def _create_schema_tables(self):
         cursor = self.conn.cursor()
 
         # Canonical schema bootstrap always runs first. Once works_schema_version=1 is present
@@ -467,6 +540,15 @@ class DatabaseManager:
         return merged
 
     def _find_existing_work(self, *, doi=None, openalex_id=None, title=None, authors=None, editors=None, year=None, exclude_id: int | None = None) -> tuple[int | None, str | None]:
+        """Find the works row matching the input: DOI, OpenAlex id, then title, then alias.
+
+        An incoming record (no ``exclude_id``) merges with a title match whatever its identifiers
+        (a preprint and its journal version). ``exclude_id`` means an existing row is compared
+        against the others, and every such flow absorbs the match: merging two rows with
+        different identifiers would corrupt attribution, so a title or alias candidate whose
+        identifier differs is then skipped. The rule hangs on ``exclude_id`` so that a new absorb
+        flow cannot leave it out.
+        """
         cur = self.conn.cursor()
         normalized_contributors = self._normalize_contributor_fields(authors, editors)
         def _one(query, params, field):
@@ -496,43 +578,58 @@ class DatabaseManager:
         normalized_title = self._normalize_text(title)
         year_str = str(year).strip() if year is not None and str(year).strip() else None
         if normalized_title:
-            if year_str and normalized_contributors:
-                params = [normalized_title, normalized_contributors, year_str]
-                query = "SELECT id FROM works WHERE normalized_title = ? AND normalized_authors = ? AND CAST(year AS TEXT) = ?"
+            def candidate_filter(prefix=""):
+                sql, guard_params = "", []
+                if exclude_id and normalized_doi:
+                    sql += f" AND ({prefix}normalized_doi IS NULL OR {prefix}normalized_doi = '' OR {prefix}normalized_doi = ?)"
+                    guard_params.append(normalized_doi)
+                if exclude_id and normalized_openalex:
+                    sql += f" AND ({prefix}openalex_id IS NULL OR {prefix}openalex_id = '' OR {prefix}openalex_id = ?)"
+                    guard_params.append(normalized_openalex)
                 if exclude_id:
-                    query += " AND id != ?"
-                    params.append(int(exclude_id))
-                found_id, field = _one(query, params, "title_authors_year")
+                    sql += f" AND {prefix}id != ?"
+                    guard_params.append(int(exclude_id))
+                return sql, guard_params
+
+            def title_lookup(where, params, field):
+                guard_sql, guard_params = candidate_filter()
+                return _one(f"SELECT id FROM works WHERE {where}{guard_sql}", [*params, *guard_params], field)
+
+            if year_str and normalized_contributors:
+                found_id, field = title_lookup(
+                    "normalized_title = ? AND normalized_authors = ? AND CAST(year AS TEXT) = ?",
+                    [normalized_title, normalized_contributors, year_str],
+                    "title_authors_year",
+                )
                 if found_id:
                     return found_id, field
             if normalized_contributors:
-                params = [normalized_title, normalized_contributors]
-                query = "SELECT id FROM works WHERE normalized_title = ? AND normalized_authors = ?"
-                if exclude_id:
-                    query += " AND id != ?"
-                    params.append(int(exclude_id))
-                found_id, field = _one(query, params, "title_authors")
+                found_id, field = title_lookup(
+                    "normalized_title = ? AND normalized_authors = ?",
+                    [normalized_title, normalized_contributors],
+                    "title_authors",
+                )
                 if found_id:
                     return found_id, field
             if year_str:
-                params = [normalized_title, year_str]
-                query = "SELECT id FROM works WHERE normalized_title = ? AND CAST(year AS TEXT) = ?"
-                if exclude_id:
-                    query += " AND id != ?"
-                    params.append(int(exclude_id))
-                found_id, field = _one(query, params, "title_year")
+                found_id, field = title_lookup(
+                    "normalized_title = ? AND CAST(year AS TEXT) = ?", [normalized_title, year_str], "title_year"
+                )
                 if found_id:
                     return found_id, field
             # alias fallback
             params = [normalized_title]
-            query = "SELECT work_id FROM work_aliases WHERE work_table = 'works' AND normalized_alias_title = ?"
+            query = (
+                "SELECT a.work_id FROM work_aliases a JOIN works w ON w.id = a.work_id"
+                " WHERE a.work_table = 'works' AND a.normalized_alias_title = ?"
+            )
             if year_str and year_str.isdigit():
-                query += " AND (alias_year IS NULL OR alias_year BETWEEN ? AND ?)"
+                query += " AND (a.alias_year IS NULL OR a.alias_year BETWEEN ? AND ?)"
                 params.extend([int(year_str) - 1, int(year_str) + 1])
-            cur.execute(query, params)
-            row = cur.fetchone()
-            if row and (exclude_id is None or int(row[0]) != int(exclude_id)):
-                return int(row[0]), "alias_title"
+            guard_sql, guard_params = candidate_filter("w.")
+            found_id, field = _one(query + guard_sql, [*params, *guard_params], "alias_title")
+            if found_id:
+                return found_id, field
         return None, None
 
     def _insert_work_record(self, data: dict) -> int:
@@ -674,77 +771,12 @@ class DatabaseManager:
         return value
 
     def _normalize_doi(self, doi: str | None) -> str | None:
-        """Normalizes a DOI by extracting the core identifier from a URL if present."""
-        if not doi:
-            return None
-        # This regex is designed to find a DOI pattern, which typically starts with '10.'.
-        # It handles cases with a 'https://doi.org/' prefix or other URL variations.
-        match = re.search(r'(10\.\d{4,9}/[-._;()/:A-Z0-9]+)', doi, re.IGNORECASE)
-        if match:
-            # Return the matched DOI, standardized to uppercase for consistency.
-            normalized = match.group(1).upper()
-            return normalized
-        # If no URL-like structure is found, assume it might be a bare DOI already.
-        # We still standardize it to uppercase.
-        if doi: # Ensure doi is not None before calling upper()
-            normalized = doi.upper() # Ensure even bare DOIs are uppercased for consistency
-            return normalized
-        return None
+        """The ``normalized_doi`` key; see :func:`dl_lit.identifiers.normalize_doi`."""
+        return normalize_doi(doi)
 
     def _normalize_openalex_id(self, openalex_id: str | None) -> str | None:
-        """Normalizes an OpenAlex ID by extracting the core identifier (e.g., W123456789)."""
-        if not openalex_id:
-            return None
-        
-        # Regex to find 'W' followed by digits, possibly at the end of a URL
-        # Example: https://openalex.org/W123456789 -> W123456789
-        # Example: W123456789 -> W123456789
-        match = re.search(r'(W\d+)', openalex_id, re.IGNORECASE)
-        if match:
-            normalized = match.group(1).upper() # Ensure 'W' is uppercase
-            return normalized
-        
-        return None
-
-    def _make_node_id(self, openalex_id: str | None, doi: str | None, table: str | None, row_id: int | None) -> str | None:
-        normalized_openalex = self._normalize_openalex_id(openalex_id)
-        if normalized_openalex:
-            return normalized_openalex
-        normalized_doi = self._normalize_doi(doi)
-        if normalized_doi:
-            return normalized_doi
-        if table and row_id:
-            return f"{table}:{row_id}"
-        return None
-
-    def _insert_citation_edge(
-        self,
-        source_id: str | None,
-        target_id: str | None,
-        relationship_type: str,
-        *,
-        source_table: str | None = None,
-        target_table: str | None = None,
-        source_row_id: int | None = None,
-        target_row_id: int | None = None,
-        run_id: int | None = None,
-    ) -> bool:
-        if not source_id or not target_id or source_id == target_id:
-            return False
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO citation_edges
-                (source_id, target_id, relationship_type, source_table, target_table, source_row_id, target_row_id, run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (source_id, target_id, relationship_type, source_table, target_table, source_row_id, target_row_id, run_id),
-            )
-            return cursor.rowcount > 0
-        except sqlite3.Error as e:
-            print(f"{YELLOW}[DB Manager] Warning: Failed to insert citation edge: {e}{RESET}")
-            return False
+        """The ``openalex_id`` key; see :func:`dl_lit.identifiers.normalize_openalex_id`."""
+        return normalize_openalex_id(openalex_id)
 
     def _normalize_text(self, text: str | None) -> str | None:
         """Basic normalization for text fields like title and authors."""
@@ -832,23 +864,45 @@ class DatabaseManager:
         added_count = 0
         skipped_count = 0
         errors = []
-        for entry in entries:
-            entry = dict(entry)
-            if source_pdf:
-                entry["source_pdf"] = source_pdf
+        # One transaction per INGEST_COMMIT_CHUNK entries, each entry in its own savepoint so a
+        # failing entry leaves no rows. With identifier resolution (network calls) each entry
+        # commits on its own instead, so no write lock is held across a lookup.
+        resolving = bool(resolve_potential_duplicates and searcher)
+        step = 1 if resolving else INGEST_COMMIT_CHUNK
+        for chunk_start in range(0, len(entries), step):
+            with nullcontext() if resolving else self.transaction():
+                for raw_entry in entries[chunk_start:chunk_start + step]:
+                    try:
+                        entry = dict(raw_entry)
+                    except (TypeError, ValueError):
+                        skipped_count += 1
+                        errors.append(f"Skipped non-object entry: {type(raw_entry).__name__}")
+                        continue
+                    if source_pdf:
+                        entry["source_pdf"] = source_pdf
 
-            row_id, err = self.create_pending_work(
-                entry,
-                searcher=searcher,
-                rate_limiter=rate_limiter,
-                resolve_potential_duplicates=resolve_potential_duplicates,
-            )
-            if row_id:
-                added_count += 1
-            else:
-                skipped_count += 1
-                if err and "Duplicate already exists" not in err and "Title is required" not in err:
-                    errors.append(err)
+                    if resolving:
+                        row_id, err = self.create_pending_work(
+                            entry,
+                            searcher=searcher,
+                            rate_limiter=rate_limiter,
+                            resolve_potential_duplicates=resolve_potential_duplicates,
+                            commit=True,
+                        )
+                    else:
+                        try:
+                            with self.savepoint():
+                                row_id, err = self.create_pending_work(entry, commit=False)
+                        except Exception as exc:
+                            if not self.conn.in_transaction:
+                                raise  # SQLite dropped the transaction: the whole chunk is lost
+                            row_id, err = None, f"Skipped entry {entry.get('title')!r}: {exc}"
+                    if row_id:
+                        added_count += 1
+                    else:
+                        skipped_count += 1
+                        if err and "Duplicate already exists" not in err and "Title is required" not in err:
+                            errors.append(err)
 
         return added_count, skipped_count, errors
 
@@ -906,8 +960,11 @@ class DatabaseManager:
         exclude_id: int | None = None,
         exclude_table: str | None = None
     ) -> tuple[str | None, int | None, str | None]:
-        """Checks if an entry already exists in the canonical works table."""
-        effective_exclude_id = exclude_id if exclude_table == "works" else None
+        """Checks if an entry already exists in the canonical works table.
+
+        ``exclude_id`` compares an existing row against the others: see _find_existing_work.
+        """
+        effective_exclude_id = exclude_id if exclude_table in (None, "works") else None
         work_id, field = self._find_existing_work(
             doi=doi,
             openalex_id=openalex_id,
@@ -966,18 +1023,6 @@ class DatabaseManager:
             self.conn.rollback()
             return None, str(e)
 
-    def update_work_alias_owner(self, old_table: str, old_id: int, new_table: str, new_id: int) -> None:
-        """Move aliases from one work record to another."""
-        cur = self.conn.cursor()
-        try:
-            cur.execute(
-                "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
-                (new_table, new_id, old_table, old_id),
-            )
-            self.conn.commit()
-        except sqlite3.Error:
-            self.conn.rollback()
-
     def delete_work_aliases(self, work_table: str, work_id: int) -> None:
         """Remove aliases for a work record."""
         cur = self.conn.cursor()
@@ -1000,8 +1045,13 @@ class DatabaseManager:
         action: str,
         notes: str | None = None,
         updates: dict | None = None,
+        *,
+        commit: bool = True,
     ) -> None:
-        """Record a dedupe/merge decision."""
+        """Record a dedupe/merge decision.
+
+        With commit=False the insert joins the caller's transaction and a database error propagates.
+        """
         cur = self.conn.cursor()
         try:
             cur.execute(
@@ -1019,8 +1069,11 @@ class DatabaseManager:
                     json.dumps(updates) if updates else None,
                 ),
             )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
         except sqlite3.Error:
+            if not commit:
+                raise
             self.conn.rollback()
 
     def _fetch_record_dict(self, table: str, record_id: int) -> dict | None:
@@ -1033,8 +1086,11 @@ class DatabaseManager:
         columns = [d[0] for d in cur.description]
         return dict(zip(columns, row))
 
-    def add_corpus_item(self, corpus_id: int, table_name: str, row_id: int) -> None:
-        """Associate a work with a corpus using the canonical join table."""
+    def add_corpus_item(self, corpus_id: int, table_name: str, row_id: int, *, commit: bool = True) -> None:
+        """Associate a work with a corpus using the canonical join table.
+
+        With commit=False the insert joins the caller's transaction and a database error propagates.
+        """
         if not corpus_id or not row_id:
             return
         work_id = None
@@ -1054,33 +1110,13 @@ class DatabaseManager:
                    VALUES (?, ?, CURRENT_TIMESTAMP)""",
                 (int(corpus_id), int(work_id)),
             )
-            self.conn.commit()
+            if commit:
+                self.conn.commit()
         except sqlite3.Error as e:
+            if not commit:
+                raise
             print(f"{YELLOW}[DB Manager] Warning: failed to add corpus work: {e}{RESET}")
             self.conn.rollback()
-
-    def _get_corpus_ids_for_item(self, table_name: str, row_id: int) -> list[int]:
-        """Fetch all corpus IDs that include the given work."""
-        work_id = None
-        if table_name == "works":
-            work_id = int(row_id)
-        else:
-            work_id = self._resolve_work_id_from_legacy_pointer(table_name, int(row_id))
-        if not work_id:
-            return []
-        cur = self.conn.cursor()
-        cur.execute("SELECT corpus_id FROM corpus_works WHERE work_id = ?", (int(work_id),))
-        return [int(row[0]) for row in cur.fetchall()]
-
-    def reassign_corpus_membership(
-        self,
-        old_table: str,
-        old_row_id: int,
-        new_table: str,
-        new_row_id: int,
-    ) -> None:
-        """Compatibility no-op in the unified work model."""
-        return None
 
     def _prepare_resolution_ref(self, ref: dict) -> dict:
         """Build a minimal ref dict for OpenAlex/Crossref resolution."""
@@ -1201,269 +1237,6 @@ class DatabaseManager:
             (canonical_id, duplicate_id, match_field, notes, json.dumps(updates) if updates else None),
         )
 
-    def _merge_records(
-        self,
-        canonical_table: str,
-        canonical_id: int,
-        duplicate_table: str,
-        duplicate_id: int,
-        match_field: str | None,
-        notes: str | None = None,
-    ) -> tuple[bool, str | None]:
-        """Merge duplicate into canonical record and log the action."""
-        cur = self.conn.cursor()
-        canonical = self._fetch_record_dict(canonical_table, canonical_id)
-        duplicate = self._fetch_record_dict(duplicate_table, duplicate_id)
-        if not canonical or not duplicate:
-            return False, "Record not found for merge"
-
-        try:
-            cur.execute("BEGIN")
-
-            # Determine safe columns to backfill.
-            cur.execute(f"PRAGMA table_info({canonical_table})")
-            canonical_cols = {row[1] for row in cur.fetchall()}
-            cur.execute(f"PRAGMA table_info({duplicate_table})")
-            duplicate_cols = {row[1] for row in cur.fetchall()}
-
-            merge_fields = [
-                "doi",
-                "normalized_doi",
-                "openalex_id",
-                "year",
-                "source",
-                "journal_conference",
-                "volume",
-                "issue",
-                "pages",
-                "publisher",
-                "type",
-                "url",
-                "isbn",
-                "issn",
-                "abstract",
-                "keywords",
-                "authors",
-                "editors",
-                "normalized_title",
-                "normalized_authors",
-                "source_pdf",
-                "source_work_id",
-                "relationship_type",
-                "ingest_source",
-                "run_id",
-            ]
-
-            updates: dict[str, object] = {}
-            for field in merge_fields:
-                if field not in canonical_cols or field not in duplicate_cols:
-                    continue
-                canon_val = canonical.get(field)
-                dup_val = duplicate.get(field)
-                if (canon_val is None or canon_val == "") and dup_val not in (None, ""):
-                    updates[field] = dup_val
-
-            # Maintain normalized fields when updating DOI/title/authors.
-            if "doi" in updates and "normalized_doi" in canonical_cols and not updates.get("normalized_doi"):
-                updates["normalized_doi"] = self._normalize_doi(updates.get("doi"))
-            if "title" in updates and "normalized_title" in canonical_cols:
-                updates["normalized_title"] = self._normalize_text(updates.get("title"))
-            if "normalized_authors" in canonical_cols and ("authors" in updates or "editors" in updates):
-                updates["normalized_authors"] = self._normalize_contributor_fields(
-                    updates.get("authors", canonical.get("authors")),
-                    updates.get("editors", canonical.get("editors")),
-                )
-
-            absorb = canonical_table == "works" and duplicate_table == "works"
-            if absorb:
-                # Delete the duplicate before backfilling so values under unique indexes
-                # (normalized_doi, openalex_id) can move to the canonical row.
-                self._absorb_duplicate(canonical_id, duplicate_id, match_field=match_field, notes=notes, updates=updates)
-
-            if updates:
-                set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
-                cur.execute(
-                    f"UPDATE {canonical_table} SET {set_clause} WHERE id = ?",
-                    list(updates.values()) + [canonical_id],
-                )
-
-            if not absorb:
-                # Move aliases to canonical record
-                cur.execute(
-                    "UPDATE work_aliases SET work_table = ?, work_id = ? WHERE work_table = ? AND work_id = ?",
-                    (canonical_table, canonical_id, duplicate_table, duplicate_id),
-                )
-
-            # Add duplicate title as alias if different
-            duplicate_title = duplicate.get("title")
-            if duplicate_title:
-                canonical_title = canonical.get("title")
-                if self._normalize_text(duplicate_title) != self._normalize_text(canonical_title):
-                    cur.execute(
-                        """INSERT OR IGNORE INTO work_aliases
-                           (work_table, work_id, alias_title, normalized_alias_title, alias_year, relationship_type)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (
-                            canonical_table,
-                            canonical_id,
-                            duplicate_title,
-                            self._normalize_text(duplicate_title),
-                            duplicate.get("year"),
-                            "alias",
-                        ),
-                    )
-
-            if absorb:
-                cur.execute("COMMIT")
-                return True, None
-
-            # Delete duplicate row
-            cur.execute(f"DELETE FROM {duplicate_table} WHERE id = ?", (duplicate_id,))
-
-            cur.execute("COMMIT")
-            self._log_merge(
-                canonical_table=canonical_table,
-                canonical_id=canonical_id,
-                duplicate_table=duplicate_table,
-                duplicate_id=duplicate_id,
-                match_field=match_field,
-                action="merged",
-                notes=notes,
-                updates=updates,
-            )
-            return True, None
-        except sqlite3.Error as e:
-            cur.execute("ROLLBACK")
-            self._log_merge(
-                canonical_table=canonical_table,
-                canonical_id=canonical_id,
-                duplicate_table=duplicate_table,
-                duplicate_id=duplicate_id,
-                match_field=match_field,
-                action="merge_failed",
-                notes=str(e),
-                updates=None,
-            )
-            return False, str(e)
-
-    def _merge_incoming_into_existing(
-        self,
-        existing_table: str,
-        existing_id: int,
-        incoming_ref: dict,
-        match_field: str | None,
-        notes: str | None = None,
-        action: str = "skipped_duplicate",
-    ) -> tuple[bool, str | None]:
-        """Merge incoming (not yet inserted) data into an existing record."""
-        cur = self.conn.cursor()
-        existing = self._fetch_record_dict(existing_table, existing_id)
-        if not existing:
-            return False, "Existing record not found"
-
-        try:
-            cur.execute("BEGIN")
-
-            cur.execute(f"PRAGMA table_info({existing_table})")
-            existing_cols = {row[1] for row in cur.fetchall()}
-
-            merge_fields = [
-                "doi",
-                "normalized_doi",
-                "openalex_id",
-                "year",
-                "source",
-                "journal_conference",
-                "volume",
-                "issue",
-                "pages",
-                "publisher",
-                "type",
-                "url",
-                "isbn",
-                "issn",
-                "abstract",
-                "keywords",
-                "authors",
-                "editors",
-                "normalized_title",
-                "normalized_authors",
-                "source_pdf",
-                "source_work_id",
-                "relationship_type",
-                "ingest_source",
-                "run_id",
-            ]
-
-            updates: dict[str, object] = {}
-            for field in merge_fields:
-                if field not in existing_cols:
-                    continue
-                canon_val = existing.get(field)
-                incoming_val = incoming_ref.get(field)
-                if (canon_val is None or canon_val == "") and incoming_val not in (None, ""):
-                    updates[field] = incoming_val
-
-            if "doi" in updates and "normalized_doi" in existing_cols and not updates.get("normalized_doi"):
-                updates["normalized_doi"] = self._normalize_doi(updates.get("doi"))
-            if "title" in updates and "normalized_title" in existing_cols:
-                updates["normalized_title"] = self._normalize_text(updates.get("title"))
-            if "normalized_authors" in existing_cols and ("authors" in updates or "editors" in updates):
-                updates["normalized_authors"] = self._normalize_contributor_fields(
-                    updates.get("authors", existing.get("authors")),
-                    updates.get("editors", existing.get("editors")),
-                )
-
-            if updates:
-                set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
-                cur.execute(
-                    f"UPDATE {existing_table} SET {set_clause} WHERE id = ?",
-                    list(updates.values()) + [existing_id],
-                )
-
-            # Add incoming title as alias if it differs
-            incoming_title = incoming_ref.get("title")
-            if incoming_title and self._normalize_text(incoming_title) != self._normalize_text(existing.get("title")):
-                cur.execute(
-                    """INSERT OR IGNORE INTO work_aliases
-                       (work_table, work_id, alias_title, normalized_alias_title, alias_year, relationship_type)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (
-                        existing_table,
-                        existing_id,
-                        incoming_title,
-                        self._normalize_text(incoming_title),
-                        incoming_ref.get("year"),
-                        "alias",
-                    ),
-                )
-
-            cur.execute("COMMIT")
-            self._log_merge(
-                canonical_table=existing_table,
-                canonical_id=existing_id,
-                duplicate_table="incoming",
-                duplicate_id=None,
-                match_field=match_field,
-                action=action,
-                notes=notes,
-                updates=updates,
-            )
-            return True, None
-        except sqlite3.Error as e:
-            cur.execute("ROLLBACK")
-            self._log_merge(
-                canonical_table=existing_table,
-                canonical_id=existing_id,
-                duplicate_table="incoming",
-                duplicate_id=None,
-                match_field=match_field,
-                action="merge_failed",
-                notes=str(e),
-                updates=None,
-            )
-            return False, str(e)
-
     # ------------------------------------------------------------------
     # Canonical works workflow helpers
     # ------------------------------------------------------------------
@@ -1474,9 +1247,14 @@ class DatabaseManager:
         *,
         searcher=None,
         rate_limiter=None,
-        resolve_potential_duplicates: bool = False
+        resolve_potential_duplicates: bool = False,
+        commit: bool = True,
     ) -> tuple[int | None, str | None]:
-        """Insert or merge a raw reference into the canonical works table."""
+        """Insert or merge a raw reference into the canonical works table.
+
+        With commit=False nothing is committed here: the writes join the caller's transaction
+        (see transaction()).
+        """
         title = ref.get("title")
         if not title:
             return None, "Title is required"
@@ -1489,6 +1267,7 @@ class DatabaseManager:
         editors_raw = self._parse_name_list(ref.get("editors"))
         norm_authors = self._normalize_contributor_fields(authors_raw, editors_raw)
 
+        resolved_conflict = False
         tbl, eid, field = self.check_if_exists(
             doi=norm_doi, 
             openalex_id=ref.get("openalex_id"),
@@ -1498,7 +1277,7 @@ class DatabaseManager:
             year=ref.get("year")
         )
         if tbl:
-            high_confidence = field in {"normalized_doi", "openalex_id", "title_authors_year", "alias_title_year"}
+            high_confidence = field in {"normalized_doi", "openalex_id", "title_authors_year", "alias_title"}
             incoming_ref_for_merge = {
                 **ref,
                 "authors": json.dumps(authors_raw) if authors_raw else None,
@@ -1510,7 +1289,7 @@ class DatabaseManager:
             }
             resolved_conflict = False
             # If potential duplicate and both are missing identifiers, resolve both.
-            if resolve_potential_duplicates and searcher and field not in {"doi", "openalex_id"}:
+            if resolve_potential_duplicates and searcher and field not in {"normalized_doi", "openalex_id"}:
                 existing = self._fetch_record_dict(tbl, eid)
                 incoming_missing_id = not norm_doi and not self._normalize_openalex_id(ref.get("openalex_id"))
                 existing_missing_id = existing and not self._normalize_doi(existing.get("doi")) and not self._normalize_openalex_id(existing.get("openalex_id"))
@@ -1534,11 +1313,12 @@ class DatabaseManager:
                             if incoming_resolved.get("openalex_id"):
                                 incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
                             if corpus_id:
-                                self.add_corpus_item(corpus_id, tbl, eid)
+                                self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
                             work_row = self.get_entry_by_id("works", int(eid)) or {}
                             merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
                             self._update_work_record(int(eid), merged)
-                            self.conn.commit()
+                            if commit:
+                                self.conn.commit()
                             return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
                         else:
                             # Resolved IDs disagree; keep both and log.
@@ -1551,42 +1331,75 @@ class DatabaseManager:
                                 action="conflict",
                                 notes="resolved_ids_conflict",
                                 updates=None,
+                                commit=commit,
                             )
                             resolved_conflict = True
+                            # The existing record keeps its own resolved identity (it has none
+                            # yet), so later title-based lookups keep the two records apart.
+                            existing_ids = self._unclaimed_resolved_identifiers(existing_resolved)
+                            if existing_ids:
+                                self._update_work_record(int(eid), existing_ids)
+                            # An identifier another row already owns is a high-confidence match
+                            # with that row: link and merge there, no new row.
+                            owner_id, owner_field = self._resolved_identifier_owner(incoming_resolved)
+                            if owner_id:
+                                if corpus_id:
+                                    self.add_corpus_item(corpus_id, "works", owner_id, commit=commit)
+                                owner_row = self.get_entry_by_id("works", owner_id) or {}
+                                merged = self._apply_work_merge_priority(owner_row, self._build_raw_work_payload(ref))
+                                self._update_work_record(owner_id, merged)
+                                if commit:
+                                    self.conn.commit()
+                                return None, f"Duplicate already exists in works (ID {owner_id}) on {owner_field}"
                     else:
                         # Resolution failed; fall through to high-confidence check.
                         pass
 
             if high_confidence and not resolved_conflict:
                 if corpus_id:
-                    self.add_corpus_item(corpus_id, tbl, eid)
+                    self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
                 work_row = self.get_entry_by_id("works", int(eid)) or {}
-                merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
+                incoming = self._without_identifiers_of_other_rows(int(eid), self._build_raw_work_payload(ref))
+                merged = self._apply_work_merge_priority(work_row, incoming)
                 self._update_work_record(int(eid), merged)
-                self.conn.commit()
+                if commit:
+                    self.conn.commit()
                 return None, f"Duplicate already exists in {tbl} (ID {eid}) on {field}"
 
-            # Low-confidence duplicates are logged but allowed to insert.
-            self._log_merge(
-                canonical_table=tbl,
-                canonical_id=eid,
-                duplicate_table="incoming",
-                duplicate_id=None,
-                match_field=field,
-                action="possible_duplicate",
-                notes="low_confidence_match_inserted",
-                updates=None,
-            )
+            if not resolved_conflict:
+                # Low-confidence matches (title_authors, title_year) are logged and then merged
+                # into the matched work by _resolve_or_create_work below.
+                self._log_merge(
+                    canonical_table=tbl,
+                    canonical_id=eid,
+                    duplicate_table="incoming",
+                    duplicate_id=None,
+                    match_field=field,
+                    action="possible_duplicate",
+                    notes="low_confidence_match_merged",
+                    updates=None,
+                    commit=commit,
+                )
 
         try:
             payload = self._build_raw_work_payload(ref)
-            new_id, _ = self._resolve_or_create_work(
+            if resolved_conflict:
+                # Resolved ids disagree: a separate work. (None, None) skips the lookup, which
+                # would find the matched row again; the new row is inserted with its resolved
+                # identifiers, so later title-based lookups (enrichment) keep the two apart.
+                existing_match, allow_merge = (None, None), False
+                payload.update(self._unclaimed_resolved_identifiers(incoming_resolved))
+            else:
+                existing_match = (int(eid), field) if tbl == "works" else (None, None)
+                allow_merge = True
+            new_id, merged_on = self._resolve_or_create_work(
                 payload,
-                allow_merge=True,
-                existing=(int(eid), field) if tbl == "works" else (None, None),
+                allow_merge=allow_merge,
+                commit=commit,
+                existing=existing_match,
             )
             if corpus_id:
-                self.add_corpus_item(corpus_id, "works", int(new_id))
+                self.add_corpus_item(corpus_id, "works", int(new_id), commit=commit)
 
             translated_title = ref.get("translated_title")
             if translated_title:
@@ -1597,12 +1410,68 @@ class DatabaseManager:
                     alias_year=ref.get("translated_year"),
                     alias_language=ref.get("translated_language"),
                     relationship_type=ref.get("translation_relationship") or "translation",
+                    commit=commit,
                 )
 
+            if merged_on:
+                # A low-confidence merge: reported like any other duplicate (no new work).
+                return None, f"Duplicate already exists in works (ID {new_id}) on {merged_on}"
             return new_id, None
-            return int(new_id), None
         except sqlite3.IntegrityError as e:
             return None, f"IntegrityError inserting into works: {e}"
+
+    def _resolved_identifier_owner(self, resolved: dict) -> tuple[int | None, str | None]:
+        """The works row that already holds ``resolved``'s DOI (first) or OpenAlex id."""
+        cur = self.conn.cursor()
+        norm_doi = self._normalize_doi(resolved.get("doi"))
+        if norm_doi:
+            row = cur.execute("SELECT id FROM works WHERE normalized_doi = ?", (norm_doi,)).fetchone()
+            if row:
+                return int(row[0]), "normalized_doi"
+        openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
+        if openalex:
+            row = cur.execute("SELECT id FROM works WHERE openalex_id = ?", (openalex,)).fetchone()
+            if row:
+                return int(row[0]), "openalex_id"
+        return None, None
+
+    def _unclaimed_resolved_identifiers(self, resolved: dict) -> dict:
+        """The doi/normalized_doi/openalex_id of ``resolved`` that no works row holds yet.
+
+        An identifier another row already carries sits under a unique index; it is left out
+        rather than failing the write (for the incoming record such an owner is matched first,
+        see _resolved_identifier_owner).
+        """
+        out = {}
+        cur = self.conn.cursor()
+        norm_doi = self._normalize_doi(resolved.get("doi"))
+        if norm_doi and not cur.execute("SELECT 1 FROM works WHERE normalized_doi = ?", (norm_doi,)).fetchone():
+            out.update(doi=resolved.get("doi"), normalized_doi=norm_doi)
+        openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
+        if openalex and not cur.execute("SELECT 1 FROM works WHERE openalex_id = ?", (openalex,)).fetchone():
+            out["openalex_id"] = openalex
+        return out
+
+    def _without_identifiers_of_other_rows(self, work_id: int, payload: dict) -> dict:
+        """``payload`` minus the DOI/OpenAlex id another works row holds (unique indexes).
+
+        Merging such an identifier into ``work_id`` would fail the write; the duplicate is still
+        linked, and the split records stay as they are.
+        """
+        out = dict(payload)
+        cur = self.conn.cursor()
+        norm_doi = self._normalize_doi(out.get("doi"))
+        if norm_doi and cur.execute(
+            "SELECT 1 FROM works WHERE normalized_doi = ? AND id != ?", (norm_doi, work_id)
+        ).fetchone():
+            out.pop("doi", None)
+            out.pop("normalized_doi", None)
+        openalex = self._normalize_openalex_id(out.get("openalex_id"))
+        if openalex and cur.execute(
+            "SELECT 1 FROM works WHERE openalex_id = ? AND id != ?", (openalex, work_id)
+        ).fetchone():
+            out.pop("openalex_id", None)
+        return out
 
     def insert_ingest_entry(self, ref: dict, ingest_source: str | None = None) -> None:
         """Insert raw extracted entry for UI display, without dedupe enforcement."""
@@ -1651,73 +1520,6 @@ class DatabaseManager:
             (limit,),
         )
         return [row[0] for row in cur.fetchall()]
-
-    def fetch_pending_metadata_batch(self, limit: int = 50) -> list[dict]:
-        """Return up to ``limit`` pending works for enrichment as a list of dicts."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """SELECT id, title, authors, editors, year, doi, source, volume, issue, pages,
-                      publisher, type, url, isbn, issn, abstract, keywords, source_pdf,
-                      origin_key, run_id
-               FROM works
-               WHERE metadata_status IN ('pending', 'in_progress')
-               ORDER BY id
-               LIMIT ?""",
-            (limit,),
-        )
-        rows = cursor.fetchall()
-
-        result: list[dict] = []
-        for row in rows:
-            (row_id, title, authors_json, editors_json, year, doi, source, volume, issue, pages,
-             publisher, entry_type, url, isbn, issn, abstract, keywords_json, source_pdf,
-             origin_key, run_id) = row
-            authors: list[str] | None = None
-            if authors_json:
-                try:
-                    authors = json.loads(authors_json)
-                except json.JSONDecodeError:
-                    authors = [authors_json]  # fall back to raw string
-            
-            editors: list[str] | None = None
-            if editors_json:
-                try:
-                    editors = json.loads(editors_json)
-                except json.JSONDecodeError:
-                    editors = [editors_json]  # fall back to raw string
-
-            keywords: list[str] | None = None
-            if keywords_json:
-                try:
-                    keywords = json.loads(keywords_json)
-                except json.JSONDecodeError:
-                    keywords = [keywords_json]
-            
-            result.append(
-                {
-                    "id": row_id,
-                    "title": title,
-                    "authors": authors,
-                    "editors": editors,
-                    "year": year,
-                    "doi": doi,
-                    "source": source,
-                    "volume": volume,
-                    "issue": issue,
-                    "pages": pages,
-                    "publisher": publisher,
-                    "type": entry_type,
-                    "url": url,
-                    "isbn": isbn,
-                    "issn": issn,
-                    "abstract": abstract,
-                    "keywords": keywords,
-                    "source_pdf": source_pdf,
-                    "ingest_source": origin_key,
-                    "run_id": run_id,
-                }
-            )
-        return result
 
     def apply_enriched_metadata(
         self,
@@ -2039,25 +1841,8 @@ class DatabaseManager:
         return [dict(row) for row in rows]
 
     def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
-        """Convert OpenAlex abstract_inverted_index dict to continuous text, or return None if input is None."""
-        if not inverted_index:
-            return None
-        
-        max_index = -1
-        for indices in inverted_index.values():
-            if indices:
-                max_index = max(max_index, *indices)
-        
-        if max_index == -1:
-            return ""
-
-        word_list = [''] * (max_index + 1)
-        
-        for word, indices in inverted_index.items():
-            for index in indices:
-                word_list[index] = word
-                
-        return ' '.join(word_list)
+        """See :func:`dl_lit.identifiers.inverted_index_to_text`."""
+        return inverted_index_to_text(inverted_index)
 
     def move_entry_to_downloaded(self, source_id: int, enriched_metadata: dict, file_path: str, checksum: str, source_of_download: str):
         """Mark a matched work as downloaded."""
@@ -2079,8 +1864,9 @@ class DatabaseManager:
             primary_location = enriched_metadata.get('primary_location', {})
             source_info = primary_location.get('source', {}) if primary_location and primary_location.get('source') else {}
 
-            merged = {
-                **original_entry,
+            # Metadata from the downloader's ref only overwrites a column when it carries a value:
+            # the worker's ref has no abstract_inverted_index, which used to blank the abstract.
+            metadata = {
                 "title": enriched_metadata.get('title', original_entry.get('title')),
                 "authors": authors,
                 "year": enriched_metadata.get('publication_year', original_entry.get('year')),
@@ -2098,6 +1884,13 @@ class DatabaseManager:
                 "publisher": source_info.get('publisher', original_entry.get('publisher')),
                 "metadata_source": original_entry.get('metadata_source') or 'openalex_api',
                 "bibtex_entry_json": json.dumps(enriched_metadata),
+                "normalized_title": self._normalize_text(enriched_metadata.get('title', original_entry.get('title'))),
+                "normalized_authors": self._normalize_contributor_fields(authors, original_entry.get('editors')),
+            }
+            merged = {
+                **original_entry,
+                **{key: value for key, value in metadata.items() if value is not None},
+                # Download state: always written (the claim columns are cleared on purpose).
                 "status_notes": 'Successfully downloaded and processed',
                 "file_checksum": checksum,
                 "download_status": "downloaded",
@@ -2107,8 +1900,6 @@ class DatabaseManager:
                 "download_claimed_by": None,
                 "download_claimed_at": None,
                 "download_lease_expires_at": None,
-                "normalized_title": self._normalize_text(enriched_metadata.get('title', original_entry.get('title'))),
-                "normalized_authors": self._normalize_contributor_fields(authors, original_entry.get('editors')),
             }
             self._update_work_record(int(source_id), merged)
             self.conn.commit()
@@ -2117,6 +1908,63 @@ class DatabaseManager:
             self.conn.rollback()
             print(f"{RED}[DB Manager] Error moving entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
+
+    def _raw_download_fields(self, original: dict, download_result: dict) -> dict:
+        """Identity fields of a raw-download result over its source row (title, authors, ids, url)."""
+        authors = download_result.get('authors')
+        if authors is None:
+            authors = original.get('authors')
+        elif isinstance(authors, list):
+            authors = json.dumps(authors)
+        elif not isinstance(authors, str):
+            authors = json.dumps([str(authors)])
+        return {
+            'title': download_result.get('title') or original.get('title'),
+            'authors': authors,
+            'year': download_result.get('year') or original.get('year'),
+            'doi': download_result.get('doi') or original.get('doi'),
+            'openalex_id': download_result.get('openalex_id') or original.get('openalex_id'),
+        }
+
+    def _raw_download_payload(self, original: dict, download_result: dict, file_path: str, checksum: str, source: str) -> dict:
+        """The works row written by mark_raw_work_downloaded (both branches; the non-duplicate one adds 'type')."""
+        fields = self._raw_download_fields(original, download_result)
+        keywords = download_result.get('keywords')
+        now = datetime.now().isoformat()
+        return {
+            **original,
+            'title': fields['title'],
+            'authors': fields['authors'],
+            'year': fields['year'],
+            'doi': fields['doi'],
+            'normalized_doi': self._normalize_doi(fields['doi']),
+            'openalex_id': self._normalize_openalex_id(fields['openalex_id']),
+            'url': download_result.get('url') or download_result.get('open_access_url') or original.get('url'),
+            'file_path': file_path,
+            'abstract': download_result.get('abstract') or original.get('abstract'),
+            'keywords': json.dumps(keywords) if isinstance(keywords, list) else (keywords or original.get('keywords')),
+            'source': download_result.get('source') or original.get('source'),
+            'volume': download_result.get('volume') or original.get('volume'),
+            'issue': download_result.get('issue') or original.get('issue'),
+            'pages': download_result.get('pages') or original.get('pages'),
+            'publisher': download_result.get('publisher') or original.get('publisher'),
+            'metadata_source': 'raw_download_fallback',
+            'metadata_status': 'failed',
+            'metadata_error': 'Metadata fetch failed; raw download fallback succeeded',
+            'metadata_updated_at': now,
+            'metadata_claimed_by': None,
+            'metadata_claimed_at': None,
+            'metadata_lease_expires_at': None,
+            'bibtex_entry_json': json.dumps(download_result),
+            'status_notes': 'Downloaded after metadata enrichment failed',
+            'file_checksum': checksum,
+            'download_status': 'downloaded',
+            'download_source': source,
+            'download_error': None,
+            'downloaded_at': now,
+            'normalized_title': self._normalize_text(fields['title']),
+            'normalized_authors': self._normalize_contributor_fields(fields['authors'], original.get('editors')),
+        }
 
     def mark_raw_work_downloaded(
         self,
@@ -2127,115 +1975,33 @@ class DatabaseManager:
         source_of_download: str,
     ) -> tuple[int | None, str | None]:
         """Mark a raw work row as downloaded after raw-download fallback."""
-        cursor = self.conn.cursor()
         try:
             original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
                 raise sqlite3.Error(f"No entry found in works with ID {source_id}")
 
-            title = download_result.get('title') or original_entry.get('title')
-            authors = download_result.get('authors')
-            if authors is None:
-                authors = original_entry.get('authors')
-            elif isinstance(authors, list):
-                authors = json.dumps(authors)
-            elif not isinstance(authors, str):
-                authors = json.dumps([str(authors)])
-
-            doi = download_result.get('doi') or original_entry.get('doi')
-            openalex_id = download_result.get('openalex_id') or original_entry.get('openalex_id')
-            url_source = download_result.get('url') or download_result.get('open_access_url') or original_entry.get('url')
-            metadata_blob = json.dumps(download_result)
-            normalized_title = self._normalize_text(title)
-            normalized_authors = self._normalize_contributor_fields(authors, original_entry.get('editors'))
+            fields = self._raw_download_fields(original_entry, download_result)
+            payload = self._raw_download_payload(original_entry, download_result, file_path, checksum, source_of_download)
 
             duplicate_table, duplicate_id, duplicate_field = self.check_if_exists(
-                doi=doi,
-                openalex_id=openalex_id,
-                title=title,
-                authors=authors,
+                doi=fields['doi'],
+                openalex_id=fields['openalex_id'],
+                title=fields['title'],
+                authors=fields['authors'],
                 editors=original_entry.get('editors'),
-                year=download_result.get('year') or original_entry.get('year'),
+                year=fields['year'],
                 exclude_id=source_id,
                 exclude_table="works",
             )
             if duplicate_table == "works" and duplicate_id is not None:
                 existing = self.get_entry_by_id("works", int(duplicate_id)) or {}
-                payload = {
-                    **original_entry,
-                    "title": title,
-                    "authors": authors,
-                    "year": download_result.get('year') or original_entry.get('year'),
-                    "doi": doi,
-                    "normalized_doi": self._normalize_doi(doi),
-                    "openalex_id": self._normalize_openalex_id(openalex_id),
-                    "url": url_source,
-                    "file_path": file_path,
-                    "abstract": download_result.get('abstract') or original_entry.get('abstract'),
-                    "keywords": json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
-                    "source": download_result.get('source') or original_entry.get('source'),
-                    "volume": download_result.get('volume') or original_entry.get('volume'),
-                    "issue": download_result.get('issue') or original_entry.get('issue'),
-                    "pages": download_result.get('pages') or original_entry.get('pages'),
-                    "publisher": download_result.get('publisher') or original_entry.get('publisher'),
-                    "metadata_source": 'raw_download_fallback',
-                    "metadata_status": 'failed',
-                    "metadata_error": 'Metadata fetch failed; raw download fallback succeeded',
-                    "metadata_updated_at": datetime.now().isoformat(),
-                    "metadata_claimed_by": None,
-                    "metadata_claimed_at": None,
-                    "metadata_lease_expires_at": None,
-                    "bibtex_entry_json": metadata_blob,
-                    "status_notes": 'Downloaded after metadata enrichment failed',
-                    "file_checksum": checksum,
-                    "download_status": 'downloaded',
-                    "download_source": source_of_download,
-                    "download_error": None,
-                    "downloaded_at": datetime.now().isoformat(),
-                    "normalized_title": normalized_title,
-                    "normalized_authors": normalized_authors,
-                }
                 # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
                 self._absorb_duplicate(int(duplicate_id), int(source_id), match_field=duplicate_field, notes="mark_raw_work_downloaded")
                 self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
                 self.conn.commit()
                 return int(duplicate_id), None
 
-            payload = {
-                **original_entry,
-                'type': download_result.get('type') or original_entry.get('type'),
-                'title': title,
-                'authors': authors,
-                'year': download_result.get('year') or original_entry.get('year'),
-                'doi': doi,
-                'normalized_doi': self._normalize_doi(doi),
-                'openalex_id': self._normalize_openalex_id(openalex_id),
-                'url': url_source,
-                'file_path': file_path,
-                'abstract': download_result.get('abstract') or original_entry.get('abstract'),
-                'keywords': json.dumps(download_result.get('keywords')) if isinstance(download_result.get('keywords'), list) else (download_result.get('keywords') or original_entry.get('keywords')),
-                'source': download_result.get('source') or original_entry.get('source'),
-                'volume': download_result.get('volume') or original_entry.get('volume'),
-                'issue': download_result.get('issue') or original_entry.get('issue'),
-                'pages': download_result.get('pages') or original_entry.get('pages'),
-                'publisher': download_result.get('publisher') or original_entry.get('publisher'),
-                'metadata_source': 'raw_download_fallback',
-                'metadata_status': 'failed',
-                'metadata_error': 'Metadata fetch failed; raw download fallback succeeded',
-                'metadata_updated_at': datetime.now().isoformat(),
-                'metadata_claimed_by': None,
-                'metadata_claimed_at': None,
-                'metadata_lease_expires_at': None,
-                'bibtex_entry_json': metadata_blob,
-                'status_notes': 'Downloaded after metadata enrichment failed',
-                'file_checksum': checksum,
-                'download_status': 'downloaded',
-                'download_source': source_of_download,
-                'download_error': None,
-                'downloaded_at': datetime.now().isoformat(),
-                'normalized_title': normalized_title,
-                'normalized_authors': normalized_authors,
-            }
+            payload['type'] = download_result.get('type') or original_entry.get('type')
             self._update_work_record(int(source_id), payload)
             self.conn.commit()
             return int(source_id), None
@@ -2825,20 +2591,6 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] General error during save_to_disk: {e}{RESET}")
             return False
 
-    def get_all_from_queue(self) -> list[dict]:
-        """Fetch all currently queued or in-progress works."""
-        self.conn.row_factory = sqlite3.Row
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("SELECT * FROM works WHERE download_status IN ('queued', 'in_progress')")
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as e:
-            print(f"{RED}[DB Manager] SQLite error while fetching queue: {e}{RESET}")
-            return []
-        finally:
-            self.conn.row_factory = None
-
     def claim_download_batch(
         self,
         *,
@@ -2962,21 +2714,6 @@ class DatabaseManager:
             except Exception:
                 pass
             return []
-
-    def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
-        """Converts an OpenAlex abstract_inverted_index to readable text."""
-        if not inverted_index:
-            return None
-        word_positions = []
-        for word, positions in inverted_index.items():
-            for position in positions:
-                word_positions.append((word, position))
-        word_positions.sort(key=lambda x: x[1])
-        return " ".join(word for word, _ in word_positions)
-
-    def mark_downloaded_work(self, queue_id: int, enriched_data: dict, file_path: str, checksum: str) -> tuple[int | None, str | None]:
-        """Mark a queued work as downloaded."""
-        return self.move_entry_to_downloaded(queue_id, enriched_data, file_path, checksum, enriched_data.get('download_source', 'unknown'))
 
     def mark_download_failed(self, queue_id: int, reason: str) -> tuple[int | None, str | None]:
         """Mark a queued work as failed."""
