@@ -1,5 +1,11 @@
 import { expect, test, type Route } from '@playwright/test'
 import { seedActivity, seedPromotionStatus } from '../src/lib/seedStatus'
+import { mockLogSocket } from './helpers/mockApi'
+
+// Keep the page's sockets (app log stream, Vite HMR) off any live server.
+test.beforeEach(async ({ page }) => {
+  await mockLogSocket(page)
+})
 
 test('activity distinguishes waiting, active, idle and legacy stats', () => {
   expect(seedActivity({ raw_pending: 2, queued_download: 3, enriching: 0, downloading: 0 })).toEqual({
@@ -260,8 +266,6 @@ test('restored seed details preserve current expansion and table behavior', asyn
   let promoteBody: any = null
   page.on('pageerror', (error) => errors.push(error.message))
   await page.addInitScript(() => window.localStorage.setItem('rag_feeder_token', 'playwright-token'))
-  // Like the HTTP API below, keep the live-log socket independent of a backend.
-  await page.routeWebSocket('**/api/ws', () => {})
   await page.route('**/api/**', mockApi)
   await page.route('**/api/recursion-config', (route) => route.fulfill({ json: {
     keyword: { includeDownstream: true, relatedDepthDownstream: 1, maxRelated: 25 },

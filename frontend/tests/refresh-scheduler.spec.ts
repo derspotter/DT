@@ -1,11 +1,8 @@
-import { expect, test, type Page, type Route } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
+import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
 
 // One adaptive refresh scheduler: 2 s while a search runs, 20 s idle, nothing
 // while hidden, and a single trailing run per burst of worker log lines.
-
-function fulfil(route: Route, body: unknown) {
-  return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-}
 
 async function boot(
   page: Page,
@@ -19,17 +16,15 @@ async function boot(
   } = {},
 ) {
   const counts = { corpus: 0, pipelineStatus: 0, downloadStatus: 0, ingestRuns: 0, seeds: 0 }
+  await mockLogSocket(page)
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
     if (path === '/api/auth/me') {
-      return fulfil(route, {
-        // `admin` as a username is an admin regardless of the flag (App.svelte userIsAdmin).
-        user: { id: 1, username: admin ? 'admin' : 'reader', last_corpus_id: 1, is_admin: admin },
-        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
-      })
+      // `admin` as a username is an admin regardless of the flag (App.svelte userIsAdmin).
+      return fulfil(route, mePayload({ username: admin ? 'admin' : 'reader', admin }))
     }
     if (path === '/api/corpus') {
       counts.corpus += 1
@@ -141,7 +136,9 @@ test('a daemon killed mid-batch (stale heartbeat still "running") does not count
 })
 
 test('a log line that arrives while hidden is refreshed once the tab is visible again', async ({ page }) => {
-  const counts = await boot(page)
+  // Not the workspace: becoming visible loads a tab's own resources, and those
+  // would include ingest runs there. On the graph only the dirty flag does.
+  const counts = await boot(page, { hash: '#/graph' })
   await setVisibility(page, 'hidden')
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(100))
   await page.waitForTimeout(2000)
@@ -158,7 +155,9 @@ test('a log-triggered refresh on a non-polling tab discovers worker status (admi
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(300))
   await page.waitForTimeout(1500)
   expect(counts.pipelineStatus).toBeGreaterThanOrEqual(1)
-  expect(counts.downloadStatus).toBeGreaterThanOrEqual(1)
+  // The daemon status fills the download worker card too; the separate
+  // download-worker status is requested only by the worker buttons.
+  expect(counts.downloadStatus).toBe(0)
 })
 
 test('a re-arm on a non-polling tab keeps the pending trailing refresh for dirty data', async ({ page }) => {

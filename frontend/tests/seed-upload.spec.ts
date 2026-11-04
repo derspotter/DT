@@ -1,4 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
+import { mockLogSocket } from './helpers/mockApi'
 
 // Exercises the BibTeX/JSON seed upload flow end-to-end in the real frontend
 // with the backend mocked (no auth/DB available in CI): file picker accepts a
@@ -64,6 +65,7 @@ async function mockApi(route: Route) {
 
 test('BibTeX seed upload imports into the corpus and reports counts', async ({ page }) => {
   processPdfCalls = 0
+  await mockLogSocket(page)
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })

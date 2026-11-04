@@ -1,4 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
+import { mePayload, mockLogSocket } from './helpers/mockApi'
 
 const browsePayload = {
   source: 'api',
@@ -112,10 +113,7 @@ async function mockApi(route: Route) {
   let body: unknown = {}
 
   if (path === '/api/auth/me') {
-    body = {
-      user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
-      corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
-    }
+    body = mePayload()
   } else if (path === '/api/recursion-config') {
     body = { keyword: { includeDownstream: true, includeUpstream: false, relatedDepthDownstream: 1, relatedDepthUpstream: 0, maxRelated: 25 } }
   } else if (path === '/api/seed/sources') {
@@ -166,6 +164,7 @@ test('renders upstream corpus visualization from browse graph data', async ({ pa
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
+  await mockLogSocket(page)
   await page.route('**/api/**', mockApi)
 
   await page.goto('/#/upstream')

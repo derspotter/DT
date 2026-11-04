@@ -1,5 +1,5 @@
 <script>
-  import { onMount, tick } from 'svelte'
+  import { onMount } from 'svelte'
   import {
     login,
     fetchMe,
@@ -17,10 +17,10 @@
     saveCorpusKantroposAssignment,
     setAuthToken,
     getAuthToken,
+    onUnauthorized,
     uploadPdf,
     importSeed,
     extractBibliography,
-    fetchBibliographyEntries,
     fetchIngestStats,
     fetchIngestRuns,
     fetchSeedSources,
@@ -29,8 +29,6 @@
     promoteSeedCandidates,
     dismissSeedCandidates as dismissSeedCandidatesApi,
     removeSeedSource,
-    enqueueIngestEntries,
-    processMarkedIngestEntries,
     runKeywordSearch,
     cancelKeywordSearch,
     fetchRecursionConfig,
@@ -48,7 +46,6 @@
     fetchPipelineWorkerStatus,
     fetchPipelineDaemonStatus,
     fetchLogsTail,
-    startPipelineWorker,
     pausePipelineWorker,
     downloadCorpusExport,
     createCorpusItemDownloadUrl,
@@ -71,6 +68,19 @@
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
   import { seedActivity, seedPromotionStatus } from './lib/seedStatus'
+  import {
+    workState,
+    metadataLabel,
+    downloadLabel,
+    parseAuthors,
+    formatAuthors,
+    formatTitle,
+    normalizeWorkItem,
+    cellText,
+    nextSort,
+    parseSort,
+    sortIndicator,
+  } from './lib/works'
 
   const userTabGroups = [
     {
@@ -222,13 +232,6 @@
     includeUpstream && Number(relatedDepthUpstream) > 0 ? `upstream depth ${relatedDepthUpstream}` : '',
   ].filter(Boolean).join(' + ')
   let ingestStatsStatus = ''
-  let latestEntries = []
-  let latestEntriesStatus = ''
-  $: isWaitingLatestEntries =
-    latestEntriesStatus.startsWith('Waiting for extracted entries') ||
-    latestEntriesStatus.startsWith('Loading extracted entries')
-  let latestEntriesBase = ''
-  let latestSeedDocument = null
   let extractionProgress = {
     active: false,
     runId: 0,
@@ -245,29 +248,6 @@
   }
   let extractionProgressRunId = 0
   let extractionCompletionCheckRunId = 0
-  let latestSelection = []
-  let selectableLatestCount = 0
-  let selectedLatestCount = 0
-  let selectableLatestKeysCurrent = []
-  let allLatestSelected = false
-  function selectableLatestKeys(entries = []) {
-    return entries.reduce((keys, entry, index) => {
-      if (!isLatestSelectable(entry)) return keys
-      const key = latestSelectionKey(entry, index)
-      if (key) keys.push(key)
-      return keys
-    }, [])
-  }
-  $: selectableLatestKeysCurrent = selectableLatestKeys(latestEntries || [])
-  $: selectableLatestCount = selectableLatestKeysCurrent.length
-  $: selectedLatestCount = selectableLatestKeysCurrent.reduce((count, key) => {
-    return latestSelection.includes(key) ? count + 1 : count
-  }, 0)
-  $: allLatestSelected = selectableLatestCount > 0 && selectedLatestCount === selectableLatestCount
-  let enqueueStatus = ''
-  let processMarkedLimit = 10
-  let processMarkedStatus = ''
-  let processingMarked = false
   let ingestRuns = []
   let ingestRunsStatus = ''
   $: recentDocumentRuns = (ingestRuns || []).slice(0, 6)
@@ -276,19 +256,30 @@
   let expandedSeedSourceId = ''
   let seedCandidatesBySource = {}
   let seedCandidatesLoading = {}
-  let seedSelections = {}
-  let seedSelectionVersions = {}
+  // Shared stand-in for "nothing selected"; never mutated (selections are
+  // always replaced with a new Set).
+  const EMPTY_SET = Object.freeze(new Set())
+  const EMPTY_LIST = Object.freeze([])
+  let seedSelections = {}    // sourceId -> Set of candidate keys, replaced (never mutated) on change
+  // sortSeedCandidates memo, per source id on (candidates array reference,
+  // sort string): the seed list re-renders on every poll, and re-sorting
+  // every seed each time was wasted work. Candidate arrays are replaced,
+  // never mutated, on load.
+  const seedSortCache = new Map()
   let seedSorts = {}
   let seedPages = {}          // sourceId -> { total, offset, limit }
   let seedAllSelected = {}    // sourceId -> true when "All N items selected"
   let seedAppending = {}      // sourceId -> true while a "Show more" append is in flight
   const SEED_PAGE_SIZE = 200
 
-  function seedPage(source) {
-    return seedPages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
+  // Template callers pass `pages` (and the other trailing arguments of the
+  // seed helpers below) so Svelte tracks that state: in legacy mode a call in
+  // the markup only re-runs when one of its arguments changes.
+  function seedPage(source, pages = seedPages) {
+    return pages[seedSourceId(source)] || { total: 0, offset: 0, limit: SEED_PAGE_SIZE }
   }
   function seedSortParams(source) {
-    const current = seedSorts[seedSourceId(source)]
+    const current = parseSort(seedSorts[seedSourceId(source)])
     return current ? { sort: current.column, dir: current.direction } : { sort: '', dir: 'asc' }
   }
   let seedColumnVisibility = loadColumnVisibility('seed')
@@ -331,9 +322,7 @@
     relatedDepthUpstream: 0,
     maxRelated: 30,
   }
-  let searchResults = []
   let searchStatus = ''
-  let searchSource = ''
   let searchPreview = null
   let searchWarning = false
   let searchPreviewBusy = false
@@ -348,22 +337,6 @@
   $: topicOnlySearch = searchTopics.length > 0 && !String(searchQuery || '').trim()
   // relevance needs search text; OpenAlex rejects it for a filter-only listing.
   $: if (topicOnlySearch && searchSort === 'relevance') searchSort = 'cited_by_count'
-  let searchSelection = []
-  let searchQueueConfigs = {}
-  let searchQueueStatus = ''
-  let searchQueueBusy = false
-  let allSearchSelected = false
-  let selectedSearchCount = 0
-  $: allSearchSelected =
-    searchResults.length > 0 &&
-    searchResults.every((result, index) => {
-      const key = searchResultKey(result, index)
-      return key && searchSelection.includes(key)
-    })
-  $: selectedSearchCount = searchResults.reduce((count, result, index) => {
-    const key = searchResultKey(result, index)
-    return key && searchSelection.includes(key) ? count + 1 : count
-  }, 0)
 
   let openalexQuota = null
   let openalexQuotaLoading = false
@@ -426,8 +399,8 @@
   $: openalexQuotaView = formatOpenAlexQuota(openalexQuota)
 
   const CORPUS_PAGE_SIZE = 120
-  const RAW_STATUSES = new Set(['raw', 'extract_references_from_pdf', 'pending'])
-  const FAILED_STATUSES = new Set(['failed_enrichment', 'failed_download'])
+  // The poll's follow-up reload of every loaded row asks for pages this big.
+  const CORPUS_POLL_PAGE_ROWS = 1000
   let corpusItems = []
   let corpusTotal = 0
   let corpusHasMore = false
@@ -444,31 +417,21 @@
   let corpusFilterDebounce = null
   let corpusSort = ''
   let corpusLoading = false
+  // The first page as the poll last applied it (rows, totals, filter, sort):
+  // an identical answer leaves corpusItems alone, so the table does not re-render.
+  let lastCorpusPageSignature = ''
   let corpusLoadingMore = false
   let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
   let corpusSource = ''
+  // The last reload of the rows on screen failed or was abandoned.
+  let corpusRefreshFailed = false
   let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
-  $: rawItems = corpusItems.filter(i => !i.status || RAW_STATUSES.has(i.status))
-  $: metaItems = corpusItems.filter(i => i.status === 'enriching' || i.status === 'matched' || i.status === 'queued_download')
-  $: downloadedItems = corpusItems.filter(i => i.status === 'downloaded')
-  $: failedItems = corpusItems.filter(i => FAILED_STATUSES.has(i.status))
   $: rawTotal = Number(corpusStageTotals?.raw || 0)
   $: metadataTotal = Number(corpusStageTotals?.metadata || 0)
   $: downloadedTotal = Number(corpusStageTotals?.downloaded || 0)
   $: failedEnrichmentTotal = Number(corpusStageTotals?.failed_enrichment || 0)
   $: failedDownloadTotal = Number(corpusStageTotals?.failed_download || 0)
-  let corpusRowElements = {
-    raw: new Map(),
-    metadata: new Map(),
-    downloaded: new Map(),
-    failed: new Map(),
-  }
-  let pendingPromotionEvents = []
-  let promotionAnimationInFlight = false
-  let promotionFlushTimer = null
-  let promotionHighlights = new Set()
-  let promotionHighlightVersion = 0
   let prefersReducedMotion = false
   let reducedMotionMediaQuery = null
 
@@ -548,7 +511,9 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
-  let pipelineRefreshInFlight = false
+  // Bumped by resetLogState (type/filter change, corpus switch, sign-out): a
+  // tail or older-lines answer requested under an earlier scope is dropped.
+  let logsScopeEpoch = 0
   const REFRESH_ACTIVE_MS = 2000
   const REFRESH_IDLE_MS = 20000
   const REFRESH_TRAILING_MS = 1500
@@ -557,13 +522,12 @@
   let refreshTimerDueAt = 0
   let refreshDirty = false
   let refreshDisposed = false
-  let lastTabRefreshAt = 0
-  let rawCorpusTableEl = null
-  let metaCorpusTableEl = null
-  let downloadedCorpusTableEl = null
   let creatingCorpus = false
   let deletingCorpus = false
   let corpusActionStatus = ''
+  // A failed switch from a picker. corpusActionStatus renders on Korpus
+  // Management only; this one shows in the shell on every other tab.
+  let corpusSwitchError = ''
   let corpusActionError = false
   $: currentCorpus = (corpora || []).find((c) => Number(c.id) === Number(currentCorpusId)) || null
   // The graph opens scoped to the workspace corpus; for the admin, "All corpora"
@@ -588,6 +552,8 @@
   let kantroposAssignmentLoading = false
   let kantroposAssignmentSaving = false
   let kantroposAssignmentRequestSeq = 0
+  // The corpus the loaded assignment belongs to (null: not loaded).
+  let kantroposAssignmentCorpusId = null
   let selectedUpstreamTargetId = ''
   let selectedUpstreamAssignedCorpusId = null
   let upstreamBrowse = {
@@ -607,15 +573,76 @@
   const maxLogs = 200
   const maxLogHistory = 5000
 
+  // Live socket lines are buffered here (not reactive) and flushed into `logs`
+  // at most once per 250 ms while the logs tab is open; on other tabs the
+  // buffer is a ring capped at maxLogHistory, flushed when the tab opens.
+  // Every entry is { seq, text }; seq comes from one increasing counter and
+  // only keys the rows (older lines loaded later get higher numbers too).
+  const LOG_FLUSH_MS = 250
+  let logBuffer = []
+  let logFlushTimer = null
+  let logSeq = 0
+
+  function toLogEntries(lines) {
+    return lines.map((text) => ({ seq: ++logSeq, text }))
+  }
+
+  function clearLogBuffer() {
+    if (logFlushTimer) {
+      clearTimeout(logFlushTimer)
+      logFlushTimer = null
+    }
+    logBuffer = []
+  }
+
+  function pushLogLine(text) {
+    logBuffer.push({ seq: ++logSeq, text })
+    if (logBuffer.length > maxLogHistory) logBuffer.splice(0, logBuffer.length - maxLogHistory)
+    if (activeTab === 'logs' && !logFlushTimer) logFlushTimer = setTimeout(flushLogs, LOG_FLUSH_MS)
+  }
+
+  function flushLogs() {
+    if (logFlushTimer) {
+      clearTimeout(logFlushTimer)
+      logFlushTimer = null
+    }
+    const count = logBuffer.length
+    if (count === 0) return
+    const hadLines = logs.length > 0
+    logs = [...logs, ...logBuffer].slice(-maxLogHistory)
+    logBuffer = []
+    // Same per-line rule as before batching: an established cursor grows by
+    // one per line (capped); a first line into an empty view starts it.
+    if (logsCursor > 0) {
+      logsCursor = Math.min(maxLogHistory, logsCursor + count)
+    } else if (!hadLines) {
+      logsCursor = Math.min(maxLogHistory, count)
+    }
+  }
+
+  function tryParseJson(data) {
+    if (typeof data !== 'string') return null
+    try {
+      const parsed = JSON.parse(data)
+      return parsed && typeof parsed === 'object' ? parsed : null
+    } catch (error) {
+      return null
+    }
+  }
+
   function resetLogState() {
+    logsScopeEpoch += 1
+    clearLogBuffer()
     logs = []
     logsCursor = 0
     logsHasMore = false
+    logsLoadingOlder = false
     logsTailStatus = ''
   }
 
   function resetKantroposAssignmentState() {
     kantroposAssignment = null
+    kantroposAssignmentCorpusId = null
     selectedKantroposTargetId = ''
     kantroposAssignmentStatus = ''
     kantroposAssignmentError = false
@@ -777,83 +804,17 @@
     }
   }
 
-  function formatAuthors(entry) {
-    if (!entry) return ''
-    if (Array.isArray(entry.authors)) return entry.authors.join(', ')
-    if (typeof entry.authors === 'string') {
-      try {
-        const parsed = JSON.parse(entry.authors)
-        if (Array.isArray(parsed)) return parsed.join(', ')
-      } catch (error) {
-        // fall through
-      }
-    }
-    if (Array.isArray(entry.author)) return entry.author.join(', ')
-    return entry.authors || entry.author || ''
-  }
-
-  function formatAuthorsList(entry) {
-    if (!entry) return []
-    if (Array.isArray(entry.authors)) return entry.authors
-    if (typeof entry.authors === 'string') {
-      try {
-        const parsed = JSON.parse(entry.authors)
-        if (Array.isArray(parsed)) return parsed
-      } catch (error) {
-        // fall through
-      }
-    }
-    if (Array.isArray(entry.author)) return entry.author
-    const raw = String(entry.authors || entry.author || '').trim()
-    return raw ? raw.split(',').map((name) => name.trim()).filter(Boolean) : []
-  }
-
-  // Table cells show at most `cap` authors; the full list stays in the expanded
-  // detail card and on hover. formatAuthors itself must keep returning the full
-  // string — the corpus search filter matches against it.
-  function formatAuthorsShort(entry, cap = 3) {
-    const list = formatAuthorsList(entry)
-    if (list.length === 0) return formatAuthors(entry)
-    if (list.length <= cap) return list.join(', ')
-    return `${list.slice(0, cap).join(', ')} et al.`
-  }
-
   function normalizeCorpusItem(entry) {
-    if (!entry || typeof entry !== 'object') return entry
-    return {
-      ...entry,
-      authors_display: formatAuthors(entry),
-    }
+    return normalizeWorkItem(entry)
   }
 
   function normalizeUpstreamBrowseItem(entry) {
     if (!entry || typeof entry !== 'object') return entry
     return {
-      ...entry,
-      authors_display: formatAuthors(entry),
+      ...normalizeWorkItem(entry),
       source_corpora: Array.isArray(entry.source_corpora) ? entry.source_corpora : [],
       source_corpus_ids: Array.isArray(entry.source_corpus_ids) ? entry.source_corpus_ids : [],
     }
-  }
-
-  function formatTitle(entry) {
-    return entry?.title || entry?.source || entry?.url || 'Untitled'
-  }
-
-  function parseAuthorsValue(value) {
-    if (Array.isArray(value)) return value.map((v) => String(v || '').trim()).filter(Boolean)
-    if (typeof value === 'string') {
-      const raw = value.trim()
-      if (!raw) return []
-      try {
-        const parsed = JSON.parse(raw)
-        if (Array.isArray(parsed)) return parsed.map((v) => String(v || '').trim()).filter(Boolean)
-      } catch (error) {
-        // fall through
-      }
-      return raw.split(';').map((v) => v.trim()).filter(Boolean)
-    }
-    return []
   }
 
   function formatSeedDocumentLabel(meta, fallback = '') {
@@ -869,7 +830,7 @@
 
   function formatSeedDocumentDetails(meta) {
     if (!meta || typeof meta !== 'object') return ''
-    const authors = parseAuthorsValue(meta.authors)
+    const authors = parseAuthors(meta.authors)
     if (authors.length > 0) return authors.join(', ')
     const source = String(meta.source || '').trim()
     const publisher = String(meta.publisher || '').trim()
@@ -877,219 +838,17 @@
     return source || publisher || ''
   }
 
-  function formatPipelineStatus(statusRaw) {
-    const status = String(statusRaw || '').trim()
-    const map = {
-      raw: { label: 'Raw', tone: 'queued' },
-      enriching: { label: 'Enriching', tone: 'in_progress' },
-      matched: { label: 'Matched', tone: 'completed' },
-      queued_download: { label: 'Queued download', tone: 'in_progress' },
-      downloaded: { label: 'Downloaded', tone: 'completed' },
-      failed_enrichment: { label: 'Metadata not confirmed', tone: 'in_progress' },
-      failed_download: { label: 'Not retrievable', tone: 'in_progress' },
-    }
-    if (map[status]) return { ...map[status], raw: status }
-    if (!status) return { label: 'Unknown', tone: 'in_progress', raw: '' }
-    // Fall back to a shortened label.
-    return { label: status.replace(/_/g, ' '), tone: 'in_progress', raw: status }
-  }
-
-  function pipelineStatusLabel(statusRaw) {
-    return formatPipelineStatus(statusRaw).label
-  }
-
-  function pipelineStatusTone(statusRaw) {
-    return formatPipelineStatus(statusRaw).tone
-  }
-
-  function pipelineStatusTitle(statusRaw) {
-    const st = formatPipelineStatus(statusRaw)
-    return st.raw || st.label
-  }
-
-  function corpusMotionKey(stage, id) {
-    if (!stage) return ''
-    const numericId = Number(id)
-    if (!Number.isFinite(numericId)) return ''
-    return `${stage}:${numericId}`
-  }
-
-  function isPromotionHighlighted(stage, id) {
-    promotionHighlightVersion
-    const key = corpusMotionKey(stage, id)
-    return key ? promotionHighlights.has(key) : false
-  }
-
-  function addPromotionHighlight(stage, id, ttlMs = 700) {
-    const key = corpusMotionKey(stage, id)
-    if (!key) return
-    promotionHighlights.add(key)
-    promotionHighlights = new Set(promotionHighlights)
-    promotionHighlightVersion += 1
-    window.setTimeout(() => {
-      if (!promotionHighlights.has(key)) return
-      promotionHighlights.delete(key)
-      promotionHighlights = new Set(promotionHighlights)
-      promotionHighlightVersion += 1
-    }, ttlMs)
-  }
-
-  function stageFromTransitionSide(value) {
-    const v = String(value || '').trim().toLowerCase()
-    if (v === 'raw' || v === 'metadata' || v === 'downloaded' || v === 'failed') return v
-    return ''
-  }
-
-  function parsePromotionEventMessage(raw) {
-    if (typeof raw !== 'string' || !raw.startsWith('{')) return null
-    try {
-      const parsed = JSON.parse(raw)
-      if (!parsed || parsed.kind !== 'promotion') return null
-      const fromStage = stageFromTransitionSide(parsed.from_stage)
-      const toStage = stageFromTransitionSide(parsed.to_stage)
-      const itemId = Number(parsed.item_id)
-      const destItemId = Number(parsed.dest_item_id)
-      if (!fromStage || !toStage || !Number.isFinite(itemId)) return null
-      return {
-        corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
-        transition: String(parsed.transition || ''),
-        fromStage,
-        toStage,
-        itemId,
-        destItemId: Number.isFinite(destItemId) ? destItemId : null,
-      }
-    } catch (error) {
-      return null
-    }
-  }
-
-  function parseExtractionEventMessage(raw) {
-    if (typeof raw !== 'string' || !raw.startsWith('{')) return null
-    try {
-      const parsed = JSON.parse(raw)
-      const event = String(parsed?.event || '').trim().toLowerCase()
-      if (!parsed || parsed.kind !== 'extraction' || !['started', 'done'].includes(event)) return null
-      return {
-        event,
-        corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
-        baseName: String(parsed.base_name || '').trim(),
-        filename: String(parsed.filename || '').trim(),
-        status: String(parsed.status || 'success').trim().toLowerCase(),
-        mode: String(parsed.mode || '').trim().toLowerCase(),
-        reason: String(parsed.reason || '').trim(),
-      }
-    } catch (error) {
-      return null
-    }
-  }
-
-  function bindCorpusRow(node, params) {
-    let currentStage = ''
-    let currentKey = ''
-    const apply = (next) => {
-      const stage = stageFromTransitionSide(next?.stage)
-      const key = String(next?.key || '')
-      if (currentStage && currentKey && corpusRowElements[currentStage]) {
-        corpusRowElements[currentStage].delete(currentKey)
-      }
-      currentStage = stage
-      currentKey = key
-      if (currentStage && currentKey && corpusRowElements[currentStage]) {
-        corpusRowElements[currentStage].set(currentKey, node)
-      }
-    }
-    apply(params)
+  function extractionEventFromObject(parsed) {
+    const event = String(parsed?.event || '').trim().toLowerCase()
+    if (!parsed || parsed.kind !== 'extraction' || !['started', 'done'].includes(event)) return null
     return {
-      update(next) {
-        apply(next)
-      },
-      destroy() {
-        if (currentStage && currentKey && corpusRowElements[currentStage]) {
-          corpusRowElements[currentStage].delete(currentKey)
-        }
-      },
-    }
-  }
-
-  function queuePromotionAnimation(eventPayload) {
-    if (activeTab !== 'corpus') return
-    if (eventPayload?.corpusId !== null && Number(currentCorpusId) !== Number(eventPayload.corpusId)) return
-    const sourceKey = corpusMotionKey(eventPayload.fromStage, eventPayload.itemId)
-    const sourceEl = sourceKey ? corpusRowElements[eventPayload.fromStage]?.get(sourceKey) : null
-    const sourceRect = sourceEl ? sourceEl.getBoundingClientRect() : null
-    pendingPromotionEvents = [...pendingPromotionEvents, { ...eventPayload, sourceRect }]
-    if (pendingPromotionEvents.length > 200) {
-      pendingPromotionEvents = pendingPromotionEvents.slice(-200)
-    }
-    if (promotionFlushTimer || promotionAnimationInFlight) return
-    promotionFlushTimer = window.setTimeout(() => {
-      promotionFlushTimer = null
-      flushPromotionAnimations()
-    }, 110)
-  }
-
-  function waitForNextFrame() {
-    return new Promise((resolve) => {
-      requestAnimationFrame(() => resolve())
-    })
-  }
-
-  async function playPromotionAnimation(eventPayload) {
-    const destinationId = eventPayload.destItemId
-    if (!Number.isFinite(destinationId)) return
-    const destinationKey = corpusMotionKey(eventPayload.toStage, destinationId)
-    const destinationEl = destinationKey ? corpusRowElements[eventPayload.toStage]?.get(destinationKey) : null
-    if (!destinationEl) {
-      addPromotionHighlight(eventPayload.toStage, destinationId)
-      return
-    }
-
-    if (prefersReducedMotion || !eventPayload.sourceRect) {
-      addPromotionHighlight(eventPayload.toStage, destinationId)
-      return
-    }
-
-    const destinationRect = destinationEl.getBoundingClientRect()
-    const dx = eventPayload.sourceRect.left - destinationRect.left
-    const dy = eventPayload.sourceRect.top - destinationRect.top
-    if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
-      addPromotionHighlight(eventPayload.toStage, destinationId)
-      return
-    }
-
-    destinationEl.style.setProperty('--promotion-dx', `${dx}px`)
-    destinationEl.style.setProperty('--promotion-dy', `${dy}px`)
-    destinationEl.classList.add('promotion-slide')
-    await waitForNextFrame()
-    await new Promise((resolve) => setTimeout(resolve, 440))
-    destinationEl.classList.remove('promotion-slide')
-    destinationEl.style.removeProperty('--promotion-dx')
-    destinationEl.style.removeProperty('--promotion-dy')
-    addPromotionHighlight(eventPayload.toStage, destinationId)
-  }
-
-  async function flushPromotionAnimations() {
-    if (promotionAnimationInFlight) return
-    if (activeTab !== 'corpus') return
-    if (pendingPromotionEvents.length === 0) return
-    promotionAnimationInFlight = true
-    try {
-      const batch = pendingPromotionEvents
-      pendingPromotionEvents = []
-      await loadCorpus({ preserveSelection: true, quiet: true })
-      await tick()
-      await waitForNextFrame()
-      for (const eventPayload of batch) {
-        await playPromotionAnimation(eventPayload)
-      }
-    } finally {
-      promotionAnimationInFlight = false
-      if (pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
-        promotionFlushTimer = window.setTimeout(() => {
-          promotionFlushTimer = null
-          flushPromotionAnimations()
-        }, 110)
-      }
+      event,
+      corpusId: Number.isFinite(Number(parsed.corpus_id)) ? Number(parsed.corpus_id) : null,
+      baseName: String(parsed.base_name || '').trim(),
+      filename: String(parsed.filename || '').trim(),
+      status: String(parsed.status || 'success').trim().toLowerCase(),
+      mode: String(parsed.mode || '').trim().toLowerCase(),
+      reason: String(parsed.reason || '').trim(),
     }
   }
 
@@ -1165,10 +924,6 @@
     }
   }
 
-  function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms))
-  }
-
   function beginExtractionProgress(baseName, backendFilename = '') {
     extractionProgressRunId += 1
     extractionCompletionCheckRunId = 0
@@ -1199,12 +954,6 @@
     if (!sameRun) {
       beginExtractionProgress(normalizedBase, normalizedFile)
     }
-
-    latestEntriesBase = normalizedBase
-    latestSeedDocument = null
-    latestEntries = []
-    latestSelection = []
-    latestEntriesStatus = 'Waiting for extraction to finish...'
   }
 
   function finishExtractionProgress() {
@@ -1251,7 +1000,7 @@
     const runId = extractionProgress.runId
     if (!runId || extractionCompletionCheckRunId === runId) return
     extractionCompletionCheckRunId = runId
-    const baseName = String(latestEntriesBase || extractionProgress.baseName || '').trim()
+    const baseName = String(extractionProgress.baseName || '').trim()
     // A corpus reset also ends the run (finishExtractionProgress); the epoch
     // check keeps the post-await steps from acting on the new corpus as well.
     const epoch = corpusScopeEpoch
@@ -1259,38 +1008,41 @@
 
     try {
       if (baseName) {
-        const payload = await fetchBibliographyEntries(baseName)
+        // A corpus change or a newer run supersedes this completion: it must
+        // neither report on nor finish the run that replaced it.
+        await loadSeedSources({ quiet: true })
         if (stale()) return
-        const items = payload.items || []
-        if (payload.seed_document) {
-          latestSeedDocument = payload.seed_document
-        }
-        latestEntries = Array.isArray(items) ? items : []
-        latestSelection = []
-        if (latestEntries.length > 0) {
-          latestEntriesStatus = `Loaded ${latestEntries.length} entries.`
-        } else {
-          latestEntriesStatus = detail
+        // The pdf seed's candidate count says whether the extraction found
+        // entries; same match as focusSeedSource('pdf', baseName). The list
+        // may not show it: a seed filter hides it, or a newer reload dropped
+        // this one's answer. Only the seed itself can say it has no entries.
+        const seedId = `pdf:${baseName}`
+        const seed = seedSources.find((entry) => seedSourceId(entry) === seedId)
+        let outcome = 'Extraction complete.'
+        if (!(Number(seed?.candidate_count) > 0)) {
+          try {
+            const page = await fetchSeedCandidates('pdf', baseName, { limit: 1, lightSummary: true })
+            if (!(Number(page?.total) > 0)) outcome = detail
+          } catch (error) {
+            if (error?.status === 401) throw error
+            outcome = 'Extraction finished.'
+          }
+          if (stale()) return
         }
         updateExtractionProgress({
           phase: 'completed',
-          detail: latestEntries.length > 0 ? 'Extraction complete.' : detail,
+          detail: outcome,
           percent: 100,
           indeterminate: false,
         })
-        // Only a corpus change stops these; the run itself may end meanwhile
-        // (e.g. the entries view is closed) without skipping the follow-up.
-        await loadSeedSources({ quiet: true })
-        if (epoch !== corpusScopeEpoch) return
         await focusSeedSource('pdf', baseName)
-        if (epoch !== corpusScopeEpoch) return
+        if (stale()) return
         await loadIngestStats()
-        if (epoch !== corpusScopeEpoch) return
+        if (stale()) return
         await loadIngestRuns()
-        if (epoch !== corpusScopeEpoch) return
-        const completedRunId = extractionProgress.runId
+        if (stale()) return
         setTimeout(() => {
-          if (extractionProgress.active && extractionProgress.runId === completedRunId) {
+          if (extractionProgress.active && extractionProgress.runId === runId) {
             finishExtractionProgress()
           }
         }, 1200)
@@ -1298,9 +1050,6 @@
       }
 
       if (stale()) return
-      latestEntries = []
-      latestSelection = []
-      latestEntriesStatus = detail
       updateExtractionProgress({
         phase: 'completed',
         detail,
@@ -1310,13 +1059,10 @@
       finishExtractionProgress()
     } catch (error) {
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         finishExtractionProgress()
         return
       }
       if (stale()) return
-      latestEntriesStatus = detail
       updateExtractionProgress({
         phase: 'completed',
         detail,
@@ -1476,7 +1222,6 @@
       if (signalStatus === 'success') {
         void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
       } else {
-        latestEntriesStatus = 'Extraction failed.'
         finishExtractionProgress()
       }
       return
@@ -1602,21 +1347,6 @@
     scheduleRefresh()
   }
 
-  function snapshotCorpusScroll() {
-    return {
-      raw: rawCorpusTableEl?.scrollTop ?? 0,
-      meta: metaCorpusTableEl?.scrollTop ?? 0,
-      downloaded: downloadedCorpusTableEl?.scrollTop ?? 0,
-    }
-  }
-
-  function restoreCorpusScroll(snapshot) {
-    if (!snapshot) return
-    if (rawCorpusTableEl) rawCorpusTableEl.scrollTop = snapshot.raw
-    if (metaCorpusTableEl) metaCorpusTableEl.scrollTop = snapshot.meta
-    if (downloadedCorpusTableEl) downloadedCorpusTableEl.scrollTop = snapshot.downloaded
-  }
-
   // `running` only means the daemon heartbeat is fresh; it idles most of the
   // time. `in_flight` is a heartbeat in state "running", i.e. a batch in
   // progress, but a daemon killed mid-batch leaves that state behind with a
@@ -1641,6 +1371,9 @@
   // starts while one (e.g. from handleCorpusPollForbidden) is pending waits
   // for it instead of starting scoped loads under the old corpus.
   let corpusReconcilePromise = null
+  // The tab the last switching reconciliation reloaded (null: it cleared the
+  // corpus and loaded nothing). A tab opened meanwhile loads its own resources.
+  let corpusReconcileLoadedTab = null
   // Resolves true when it switched (or cleared) the workspace corpus.
   function reconcileCorpusWithBackend() {
     if (corpusReconcilePromise) return corpusReconcilePromise
@@ -1661,8 +1394,11 @@
 
   async function runCorpusReconcile() {
     const corpusIdAtRequest = currentCorpusId
+    const epoch = sessionEpoch
     try {
       const me = await fetchMe()
+      // Requested under an earlier session (sign-out, then a new sign-in).
+      if (epoch !== sessionEpoch) return false
       if (authStatus !== 'authenticated' || !me?.user) return false
       // The user switched corpus meanwhile; this answer may predate the switch.
       if (currentCorpusId !== corpusIdAtRequest) return false
@@ -1673,8 +1409,9 @@
       if (Number(nextCorpusId || 0) === Number(currentCorpusId || 0)) return false
       currentCorpusId = nextCorpusId
       resetFrontendState()
+      corpusReconcileLoadedTab = nextCorpusId ? activeTab : null
       if (nextCorpusId) {
-        await refreshAll()
+        await refreshAll(corpusReconcileLoadedTab)
         if (logsType === 'pipeline') handleLogsCorpusFilterChange()
       }
       return true
@@ -1690,6 +1427,95 @@
     if (error?.status === 403) void reconcileCorpusWithBackend()
   }
 
+  // What each tab renders, and therefore loads: boot (refreshAll), a tab
+  // switch (refreshForActiveTab) and the cadence (runLiveRefreshCycleOnce)
+  // all read this one table. The admin-only resources are added on top. The
+  // cadence skips TAB_OPEN_RESOURCES.
+  const TAB_RESOURCES = {
+    workspace: ['stats', 'corpus', 'seeds', 'runs'],
+    dashboard: ['stats', 'corpus', 'runs'],
+    downloads: [],
+    upstream: ['upstream'],
+    graph: [],
+    scraper: [],
+    logs: [],
+    admin: [],
+  }
+  // Loaded when the tab opens or on request, never by a tab's poll: ingest runs
+  // follow worker activity (a dirty cycle loads them), and the Korpus Management
+  // browse is a heavy read that its Refresh button repeats.
+  const TAB_OPEN_RESOURCES = new Set(['runs', 'upstream'])
+  const ADMIN_RESOURCES = {
+    dashboard: ['downloads', 'daemon', 'globalStats', 'globalDaemon'],
+    downloads: ['downloads', 'daemon'],
+    workspace: ['daemon'],
+  }
+
+  // The shared header (.header-stats) shows items found / promoted /
+  // downloaded on every tab, so every tab loads them on entry. Not the graph:
+  // it loads its own snapshot and must not hit the pipeline reads. Polling
+  // them is still up to the cadence (shouldRunLiveRefresh).
+  const HEADER_RESOURCES = ['stats', 'corpus', 'seeds']
+
+  function resourcesFor(tab, { admin = false } = {}) {
+    const tabId = normalizeTab(tab)
+    return [
+      ...new Set([
+        ...(tabId === 'graph' ? [] : HEADER_RESOURCES),
+        ...(TAB_RESOURCES[tabId] || []),
+        ...(admin ? ADMIN_RESOURCES[tabId] || [] : []),
+      ]),
+    ]
+  }
+
+  // `quiet` is false only for refreshAll (boot, sign-in, corpus switch),
+  // which shows the loading/result status lines; tab switches and polls do not.
+  const loaders = {
+    stats: ({ quiet }) => loadIngestStats({ quiet }),
+    corpus: ({ quiet }) => (quiet ? loadCorpus({ preserveSelection: true, quiet: true }) : loadCorpus()),
+    seeds: ({ quiet }) => loadSeedSources({ quiet }),
+    runs: ({ quiet }) => loadIngestRuns({ quiet }),
+    upstream: ({ quiet }) => loadUpstreamBrowse({ quiet }),
+    downloads: () => loadDownloads(),
+    daemon: ({ quiet }) => loadPipelineWorkerStatus({ quiet }),
+    globalStats: () => loadIngestStats({ quiet: true, global: true }),
+    globalDaemon: () => loadPipelineWorkerStatus({ quiet: true, global: true }),
+    quota: () => loadOpenAlexQuota(),
+  }
+
+  // One promise per resource in flight: a second request for the same
+  // resource joins it instead of fetching again. Cleared on a corpus switch or
+  // sign-out (invalidateCorpusScopedRequests), so the next corpus never joins
+  // a load that was requested for the previous one.
+  const resourcesInFlight = new Map()
+
+  function startResource(name, quiet) {
+    let result
+    try {
+      result = loaders[name]({ quiet })
+    } catch (error) {
+      result = Promise.reject(error)
+    }
+    // Loaders report their own failures; one that throws anyway must neither
+    // reject the other loads nor leave its name stuck in the map.
+    const pending = Promise.resolve(result)
+      .catch((error) => console.error(`Refreshing "${name}" failed`, error))
+      .finally(() => {
+        if (resourcesInFlight.get(name) === pending) resourcesInFlight.delete(name)
+      })
+    resourcesInFlight.set(name, pending)
+    return pending
+  }
+
+  async function refreshResources(names, { quiet = true } = {}) {
+    const unique = [...new Set(names)].filter((name) => loaders[name])
+    await Promise.all(unique.map((name) => resourcesInFlight.get(name) || startResource(name, quiet)))
+  }
+
+  function refreshQuota() {
+    return refreshResources(['quota'])
+  }
+
   async function runLiveRefreshCycle() {
     try {
       await runLiveRefreshCycleOnce()
@@ -1703,111 +1529,41 @@
     const dirty = refreshDirty
     refreshDirty = false
     if (authStatus !== 'authenticated') return
-    if (!shouldRunLiveRefresh()) {
-      // The Admin panel shows the OpenAlex budget too; keep it current there
-      // without the full workspace refresh.
-      if (activeTab === 'admin') void loadOpenAlexQuota()
-      // A running search run is what keeps the 2 s cadence going here; its
-      // terminal status has to be discoverable from any tab, or the cadence
-      // never ends and the run shows as running until the workspace is opened.
-      if (!dirty && !anySearchRunning) return
-      if (pipelineRefreshInFlight) {
-        if (dirty) refreshDirty = true
-        return
-      }
-      pipelineRefreshInFlight = true
-      try {
-        if (await awaitPendingCorpusReconcile()) return
-        const tasks = []
-        if (anySearchRunning) tasks.push(loadSeedSources({ quiet: true }))
-        if (dirty) {
-          tasks.push(loadIngestStats({ quiet: true }), loadIngestRuns())
-          // Discover a worker started elsewhere, so refreshReason() can go active.
-          if (diagnosticsEnabled) {
-            tasks.push(
-              loadPipelineWorkerStatus({ quiet: true }),
-              loadDownloadWorkerStatus({ quiet: true }),
-            )
-          }
-        }
-        await Promise.all(tasks)
-      } finally {
-        pipelineRefreshInFlight = false
-      }
-      return
+    const admin = diagnosticsEnabled
+    // Off the polling tabs only a search run (its terminal status has to be
+    // discoverable from any tab, or the cadence never ends) or dirty data
+    // (log lines) load anything; the tab's own resources are not refreshed.
+    const tabCycle = shouldRunLiveRefresh()
+    const names = tabCycle ? resourcesFor(activeTab, { admin }).filter((name) => !TAB_OPEN_RESOURCES.has(name)) : []
+    if (anySearchRunning) names.push('seeds')
+    if (dirty) {
+      names.push('runs')
+      if (!tabCycle) names.push('stats')
     }
-    if (pipelineRefreshInFlight) {
-      if (dirty) refreshDirty = true
-      return
-    }
-    pipelineRefreshInFlight = true
-    try {
-      // A corpus switch reloads the workspace itself; skip this cycle's loads.
-      if (await reconcileCorpusWithBackend()) return
-      const tasks = [
-        loadIngestStats({ quiet: true }),
-        loadCorpus({ preserveSelection: true, quiet: true }),
-        loadOpenAlexQuota(),
-      ]
-      if (dirty) tasks.push(loadIngestRuns())
-      // Not only while a run is known to be running: the workspace is where
-      // seeds live, and a run started elsewhere (or one this tab has not seen
-      // yet) has to be able to show up on its own.
-      if (anySearchRunning || activeTab === 'workspace') {
-        tasks.push(loadSeedSources({ quiet: true }))
-      }
-      if (diagnosticsEnabled) {
-        tasks.push(
-          loadDownloads(),
-          loadDownloadWorkerStatus({ quiet: true }),
-          loadPipelineWorkerStatus({ quiet: true }),
-        )
-      }
-      await Promise.all(tasks)
-    } finally {
-      pipelineRefreshInFlight = false
-    }
+    // Discover a worker started elsewhere, so refreshReason() can go active,
+    // and keep polling a busy one, so it can go idle again.
+    if (admin && (dirty || workerBusy(pipelineWorker) || workerBusy(downloadWorker))) names.push('daemon')
+    // The OpenAlex budget (workspace search panel, Admin settings row) moves
+    // only with searches and promotions, which refresh it themselves.
+    if (refreshReason() === 'idle' && (activeTab === 'admin' || activeTab === 'workspace')) names.push('quota')
+    if (names.length === 0) return
+    // A corpus switch reloads the workspace itself; skip this cycle's loads.
+    if (tabCycle ? await reconcileCorpusWithBackend() : await awaitPendingCorpusReconcile()) return
+    // A load already in flight was requested before these log lines: join it,
+    // but keep the data dirty so the trailing run fetches it fresh.
+    if (dirty && names.some((name) => resourcesInFlight.has(name))) refreshDirty = true
+    await refreshResources(names)
   }
 
   async function refreshForActiveTab(tabId) {
     if (authStatus !== 'authenticated') return
-    const now = Date.now()
-    // Avoid duplicate refreshes from rapid tab/hash updates.
-    if (now - lastTabRefreshAt < 800) return
-    if (pipelineRefreshInFlight) return
-    lastTabRefreshAt = now
-    pipelineRefreshInFlight = true
-    try {
-      if (await awaitPendingCorpusReconcile()) return
-      // The graph tab renders none of the pipeline/ingest counts, so skip the
-      // ingest-stats query there (completes #35's "don't load workspace data on
-      // the graph tab" — refreshAll already skips it; this is the per-tab path).
-      const tasks = []
-      if (tabId !== 'graph') {
-        tasks.push(loadIngestStats({ quiet: true }))
-      }
-      if (diagnosticsEnabled) {
-        tasks.push(
-          loadPipelineWorkerStatus({ quiet: true }),
-          loadDownloadWorkerStatus({ quiet: true }),
-        )
-      }
-      if (tabId === 'workspace') {
-        tasks.push(loadSeedSources({ quiet: true }))
-      }
-      if (tabId === 'dashboard' || tabId === 'workspace') {
-        tasks.push(loadCorpus({ preserveSelection: true, quiet: true }))
-      }
-      if (tabId === 'upstream') {
-        tasks.push(loadUpstreamBrowse({ quiet: true }))
-      }
-      if (diagnosticsEnabled && (tabId === 'dashboard' || tabId === 'downloads')) {
-        tasks.push(loadDownloads())
-      }
-      await Promise.all(tasks)
-    } finally {
-      pipelineRefreshInFlight = false
+    if (await awaitPendingCorpusReconcile()) {
+      // The switch reloaded the tab that was active when it started; another
+      // tab opened since still needs its own loads (shared ones are joined).
+      if (corpusReconcileLoadedTab === null || normalizeTab(corpusReconcileLoadedTab) === normalizeTab(tabId)) return
+      if (authStatus !== 'authenticated') return
     }
+    await refreshResources(resourcesFor(tabId, { admin: diagnosticsEnabled }))
   }
 
   async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
@@ -1820,9 +1576,11 @@
     // the seed list, corpus table and counts do not have to wait for the
     // auth round trip: start them now and let refreshAll collect them. A bad
     // token fails them with a 401 exactly as it fails fetchMe below.
-    const inFlight = tabNeedsWorkspaceData(landingTab) ? startWorkspaceLoads() : null
+    const inFlight = tabNeedsWorkspaceData(landingTab) ? startWorkspaceLoads(landingTab) : null
+    const epoch = sessionEpoch
     try {
       const payload = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = payload.user
       corpora = payload.corpora || []
       currentCorpusId = authUser?.last_corpus_id || (corpora[0]?.id ?? null)
@@ -1832,12 +1590,16 @@
         authFlowToken = ''
       }
       await Promise.all([loadRecursionConfig(), refreshAll(landingTab, { inFlight })])
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (!preserveAuthFlow && navigationRevision === startupNavigationRevision) {
         const latestTab = readTabFromHash({ includeUnavailable: true }) || activeTab || startupTab || 'workspace'
-        setActiveTab(latestTab, { replace: true })
+        setActiveTab(latestTab, { replace: true, loadedTab: landingTab })
       }
     } catch (error) {
+      // A 401 already ran expireSession (state reset, token cleared).
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       authStatus = 'unauthenticated'
       authError = ''
       authUser = null
@@ -1851,13 +1613,18 @@
   async function handleLogin(event) {
     event?.preventDefault?.()
     authError = ''
+    // A newer sign-in or a sign-out takes this attempt over; an expired token
+    // does not (signInEpoch). Its success starts the session `epoch` watches.
+    let attempt = signInEpoch
+    let epoch = sessionEpoch
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
-      if (payload?.user) {
-        authUser = payload.user
-        currentCorpusId = payload.user.last_corpus_id || null
-      }
+      if (attempt !== signInEpoch) return
+      enterSession(payload)
+      attempt = signInEpoch
+      epoch = sessionEpoch
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1866,12 +1633,18 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
-      await refreshAll()
+      const refreshedTab = activeTab
+      await refreshAll(refreshedTab)
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
+      // Only the attempt still in charge may report or clear. That includes a
+      // 401 from its own /me, which already ran expireSession.
+      if (attempt !== signInEpoch) return
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
@@ -1908,13 +1681,18 @@
       authError = 'Passwords do not match.'
       return
     }
+    // A newer sign-in or a sign-out takes this attempt over; an expired token
+    // does not (signInEpoch). Its success starts the session `epoch` watches.
+    let attempt = signInEpoch
+    let epoch = sessionEpoch
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
-      if (payload?.user) {
-        authUser = payload.user
-        currentCorpusId = payload.user.last_corpus_id || null
-      }
+      if (attempt !== signInEpoch) return
+      enterSession(payload)
+      attempt = signInEpoch
+      epoch = sessionEpoch
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1923,12 +1701,16 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
-      await refreshAll()
+      const refreshedTab = activeTab
+      await refreshAll(refreshedTab)
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
+      if (attempt !== signInEpoch) return
       authError = error.message || 'Failed to accept invite'
     }
   }
@@ -1949,13 +1731,18 @@
       authError = 'Passwords do not match.'
       return
     }
+    // A newer sign-in or a sign-out takes this attempt over; an expired token
+    // does not (signInEpoch). Its success starts the session `epoch` watches.
+    let attempt = signInEpoch
+    let epoch = sessionEpoch
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
-      if (payload?.user) {
-        authUser = payload.user
-        currentCorpusId = payload.user.last_corpus_id || null
-      }
+      if (attempt !== signInEpoch) return
+      enterSession(payload)
+      attempt = signInEpoch
+      epoch = sessionEpoch
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1964,12 +1751,16 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
-      await refreshAll()
+      const refreshedTab = activeTab
+      await refreshAll(refreshedTab)
+      // A 401 during the loads signed the session out already.
+      if (epoch !== sessionEpoch) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true })
+        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
+      if (attempt !== signInEpoch) return
       authError = error.message || 'Failed to reset password'
     }
   }
@@ -1987,68 +1778,94 @@
       inviteUsername = ''
       inviteEmail = ''
     } catch (error) {
+      if (error?.status === 401) return
       inviteStatus = error.message || 'Failed to create invitation'
       inviteError = true
     }
   }
 
+  // Bumped on every sign-out and on every successful sign-in: an answer
+  // requested under an earlier session, such as a pending /me poll, is dropped.
+  let sessionEpoch = 0
+  // What a sign-in attempt in flight answers to: a newer sign-in that succeeded
+  // or a deliberate sign-out. Not an expired token: a boot 401 landing during
+  // the submit must not cost the attempt its outcome.
+  let signInEpoch = 0
+
+  // The one path for an expired session: api.js runs it on every 401. Several
+  // requests can fail together; once signed out, the rest change nothing.
+  function expireSession() {
+    if (authStatus === 'unauthenticated' && !getAuthToken()) return
+    endSession()
+  }
+  onUnauthorized(expireSession)
+
   function handleLogout() {
+    signInEpoch += 1
+    endSession()
+  }
+
+  function endSession() {
+    // During boot the sign-in forms are already up, so an error on screen is
+    // the outcome of a submit, not of the session that is ending.
+    const keepError = authStatus === 'loading'
+    sessionEpoch += 1
     disconnectLogs()
     setAuthToken('')
     authStatus = 'unauthenticated'
-    authError = ''
+    if (!keepError) authError = ''
     authUser = null
     corpora = []
     currentCorpusId = null
     loginPassword = ''
-    resetFrontendState()
+    resetFrontendState({ signOut: true })
   }
 
-  // Only the workspace/dashboard/downloads tabs render the pipeline + corpus
-  // data. For other landing tabs (notably the graph, which loads its own
-  // snapshot) these are several synchronous DB queries that can stall the
-  // backend while the workers hold the SQLite lock — so skip them and let
-  // setActiveTab()/refreshForActiveTab() load exactly what the tab needs.
+  // A sign-in answered: whatever session is still open ends here, such as a
+  // live one under an invite or reset link, so nothing of it reaches the new
+  // user.
+  function enterSession(payload) {
+    if (getAuthToken()) endSession()
+    signInEpoch += 1
+    sessionEpoch += 1
+    if (payload?.token) setAuthToken(payload.token)
+    if (payload?.user) {
+      authUser = payload.user
+      currentCorpusId = payload.user.last_corpus_id || null
+    }
+  }
+
+  // The tabs whose loads bootstrapAuth may start before the auth round trip:
+  // all of them are scoped by the token alone. The Korpus Management loads
+  // need the corpus id from the auth payload, so they wait for refreshAll.
   function tabNeedsWorkspaceData(tabId) {
     return tabId === 'workspace' || tabId === 'dashboard' || tabId === 'downloads'
   }
 
-  // The loads that need nothing from the auth payload: the backend scopes
-  // them to the token's corpus itself. bootstrapAuth starts these before
-  // fetchMe returns; refreshAll starts them itself on every later refresh.
-  function startWorkspaceLoads() {
-    return [
-      loadSeedSources(),
-      loadIngestStats(),
-      loadIngestRuns(),
-      loadCorpus(),
-    ]
+  // The tab's loads that need nothing from the auth payload (the admin ones
+  // wait for it): the backend scopes them to the token's corpus itself.
+  // bootstrapAuth starts these before fetchMe returns and hands them to the
+  // refreshAll that follows, which does not request them again (they may
+  // have finished, and left the in-flight map, before the auth answer).
+  function startWorkspaceLoads(tabId) {
+    const names = resourcesFor(tabId)
+    return { names, done: refreshResources(names, { quiet: false }) }
   }
 
   async function refreshAll(targetTab = activeTab, { inFlight = null } = {}) {
     restoreStoredUploads()
     // The OpenAlex quota pill is shown on both the workspace search panel
     // and the admin settings row, so it needs to load once after every
-    // authentication regardless of which tab the user lands on (notably
-    // #/admin, which the workspace-only tasks below never touch).
-    void loadOpenAlexQuota()
-    if (!tabNeedsWorkspaceData(targetTab)) return
-    const tasks = inFlight ? [...inFlight] : startWorkspaceLoads()
-    tasks.push(loadKantroposAssignment())
+    // authentication regardless of which tab the user lands on.
+    void refreshQuota()
     // Not `diagnosticsEnabled`: bootstrapAuth calls this right after assigning
     // authUser, before Svelte has flushed the `$:` derivations, so the reactive
     // flag is still false for an admin on the first refresh.
-    if (userIsAdmin(authUser)) {
-      tasks.push(
-        loadDownloads(),
-        loadDownloadWorkerStatus(),
-        loadPipelineWorkerStatus(),
-      )
-    }
-    await Promise.all(tasks)
-    // Everything a tab refresh would fetch is fresh now. Stamp it so the
-    // setActiveTab() that follows a bootstrap does not fetch it all again.
-    lastTabRefreshAt = Date.now()
+    const names = resourcesFor(targetTab, { admin: userIsAdmin(authUser) })
+    await Promise.all([
+      inFlight?.done,
+      refreshResources(inFlight ? names.filter((name) => !inFlight.names.includes(name)) : names, { quiet: false }),
+    ])
   }
 
   // Bumped whenever the workspace corpus changes (or clears): a corpus-scoped
@@ -2063,82 +1880,197 @@
     corpusLoadRequestSeq += 1
     corpusLoading = false
     corpusLoadingMore = false
+    lastCorpusPageSignature = ''
+    resourcesInFlight.clear()
   }
 
-  function resetFrontendState() {
+  // Every corpus- and session-scoped value the workspace starts from. A
+  // corpus switch or a sign-out goes back to exactly this.
+  function initialWorkspaceState() {
+    return {
+      ingestStats: { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 },
+      ingestStatsStatus: '',
+      ingestRuns: [],
+      ingestRunsStatus: '',
+      seedSources: [],
+      seedSourcesStatus: '',
+      expandedSeedSourceId: '',
+      seedCandidatesBySource: {},
+      seedCandidatesLoading: {},
+      seedSelections: {},
+      seedSorts: {},
+      selectedSeedCandidateKeys: {},
+      seedPages: {},
+      seedAllSelected: {},
+      seedAppending: {},
+      seedActionStatus: '',
+      seedActionBusy: false,
+      seedLastRunKey: '',
+      seedFilterQuery: '',
+      seedWarningMessage: '',
+      searchQuery: '',
+      searchMaxResults: DEFAULT_SEARCH_MAX_RESULTS,
+      searchStatus: '',
+      searchPreview: null,
+      searchWarning: false,
+      startedSearchRunIds: new Set(),
+      uploads: [],
+      corpusItems: [],
+      corpusTotal: 0,
+      corpusHasMore: false,
+      corpusFilterQuery: '',
+      corpusLoadStatus: '',
+      corpusSource: '',
+      corpusRefreshFailed: false,
+      corpusStageTotals: { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 },
+      downloads: [],
+      downloadsSource: '',
+      downloadsQuery: '',
+      workerBacklog: { raw_pending: 0, enriching: 0, matched: 0, queued_download: 0, downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 },
+      exportStatus: '',
+      shareUsername: '',
+      shareRole: 'viewer',
+      shareStatus: '',
+      logs: [],
+      logsCursor: 0,
+      logsHasMore: false,
+      logsTailStatus: '',
+      corpusActionStatus: '',
+      corpusActionError: false,
+      corpusSwitchError: '',
+    }
+  }
+
+  // `signOut` also drops what belongs to the user rather than the corpus: the
+  // admin settings (and their unsaved draft, which may hold API keys), the
+  // invitation form, the instance-wide overview and the view choices (sorts,
+  // filters, promotion mode). A corpus switch keeps them.
+  function resetFrontendState({ signOut = false } = {}) {
     invalidateCorpusScopedRequests()
-    ingestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
-    ingestStatsStatus = ''
-    latestEntries = []
-    latestEntriesStatus = ''
-    latestEntriesBase = ''
-    latestSeedDocument = null
-    latestSelection = []
-    enqueueStatus = ''
-    processMarkedStatus = ''
-    ingestRuns = []
-    ingestRunsStatus = ''
-    seedSources = []
-    seedSourcesStatus = ''
-    expandedSeedSourceId = ''
-    seedCandidatesBySource = {}
-    seedCandidatesLoading = {}
-    seedSelections = {}
-    seedPages = {}
-    seedAllSelected = {}
-    seedAppending = {}
-    seedActionStatus = ''
-    seedActionBusy = false
-    seedLastRunKey = ''
-    searchQuery = ''
-    searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
+    clearTimeout(seedFilterDebounce)
+    clearTimeout(corpusFilterDebounce)
+    startedSearchRunMisses.clear()
+    seedSortCache.clear()
+    resetLogState()
+    ;({
+      ingestStats,
+      ingestStatsStatus,
+      ingestRuns,
+      ingestRunsStatus,
+      seedSources,
+      seedSourcesStatus,
+      expandedSeedSourceId,
+      seedCandidatesBySource,
+      seedCandidatesLoading,
+      seedSelections,
+      seedSorts,
+      selectedSeedCandidateKeys,
+      seedPages,
+      seedAllSelected,
+      seedAppending,
+      seedActionStatus,
+      seedActionBusy,
+      seedLastRunKey,
+      seedFilterQuery,
+      seedWarningMessage,
+      searchQuery,
+      searchMaxResults,
+      searchStatus,
+      searchPreview,
+      searchWarning,
+      startedSearchRunIds,
+      uploads,
+      corpusItems,
+      corpusTotal,
+      corpusHasMore,
+      corpusFilterQuery,
+      corpusLoadStatus,
+      corpusSource,
+      corpusRefreshFailed,
+      corpusStageTotals,
+      downloads,
+      downloadsSource,
+      downloadsQuery,
+      workerBacklog,
+      exportStatus,
+      shareUsername,
+      shareRole,
+      shareStatus,
+      logs,
+      logsCursor,
+      logsHasMore,
+      logsTailStatus,
+      corpusActionStatus,
+      corpusActionError,
+      corpusSwitchError,
+    } = initialWorkspaceState())
     resetTopicSearch()
-    searchResults = []
-    searchStatus = ''
-    searchSource = ''
-    searchSelection = []
-    searchQueueConfigs = {}
-    searchQueueStatus = ''
-    searchQueueBusy = false
-    corpusItems = []
-    corpusTotal = 0
-    corpusLoadStatus = ''
-    corpusSource = ''
-    corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0 }
-    downloads = []
-    downloadsSource = ''
-    downloadsQuery = ''
-    logs = []
-    logsCursor = 0
-    logsHasMore = false
-    logsTailStatus = ''
-    pendingPromotionEvents = []
-    promotionHighlights = new Set()
-    corpusActionStatus = ''
-    corpusActionError = false
     resetKantroposAssignmentState()
     resetUpstreamBrowseState()
     finishExtractionProgress()
+    if (signOut) {
+      // null makes the Admin tab fetch the settings again.
+      appSettings = null
+      appSettingsDraft = {}
+      appSettingsStatus = ''
+      appSettingsError = false
+      inviteUsername = ''
+      inviteEmail = ''
+      inviteStatus = ''
+      inviteError = false
+      globalIngestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
+      globalWorkerBacklog = { raw_pending: 0, enriching: 0, matched: 0, queued_download: 0, downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
+      kantroposTargets = []
+      selectedUpstreamTargetId = ''
+      openalexQuota = null
+      // The signed-out user's view choices.
+      logsType = 'pipeline'
+      logsFilterCurrentCorpus = true
+      searchField = 'default'
+      searchAuthor = ''
+      yearFrom = ''
+      yearTo = ''
+      searchSort = 'relevance'
+      relatedSort = 'most_cited'
+      promotionMode = 'new_seed'
+      corpusSort = ''
+      downloadsStatusFilter = 'all'
+      exportFilterStatus = 'all'
+      exportFilterYearFrom = ''
+      exportFilterYearTo = ''
+      exportFilterSource = ''
+    }
   }
 
   async function handleSelectCorpus(event) {
     corpusActionStatus = ''
     corpusActionError = false
-    const nextId = Number(event.target.value)
+    corpusSwitchError = ''
+    const picker = event.target
+    const nextId = Number(picker.value)
     if (!nextId) return
+    // An answer that arrives after a sign-out (or a newer sign-in) is dropped.
+    const epoch = sessionEpoch
     try {
       await selectCorpus(nextId)
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || nextId
       resetFrontendState()
       await refreshAll()
+      if (epoch !== sessionEpoch) return
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
     } catch (error) {
-      authError = error.message || 'Failed to select corpus'
+      if (error?.status === 401 || epoch !== sessionEpoch) return
+      corpusActionStatus = error.message || 'Failed to select corpus.'
+      corpusActionError = true
+      corpusSwitchError = corpusActionStatus
+      // The select's value is one-way: put it back on the corpus still active.
+      picker.value = String(currentCorpusId || '')
     }
   }
 
@@ -2149,23 +2081,26 @@
     const name = window.prompt('New corpus name')
     if (!name) return
     creatingCorpus = true
+    const epoch = sessionEpoch
     try {
       await createCorpus(name.trim())
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId
       resetFrontendState()
       await refreshAll()
+      if (epoch !== sessionEpoch) return
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
       corpusActionStatus = `Created corpus "${name.trim()}".`
       corpusActionError = false
     } catch (error) {
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       corpusActionStatus = error.message || 'Failed to create corpus.'
       corpusActionError = true
-      authError = error.message || 'Failed to create corpus'
     } finally {
       creatingCorpus = false
     }
@@ -2195,14 +2130,17 @@
     deletingCorpus = true
     corpusActionStatus = `Deleting "${corpusName}"...`
     corpusActionError = false
+    const epoch = sessionEpoch
     try {
       const payload = await deleteCorpusApi(currentCorpusId)
       const me = await fetchMe()
+      if (epoch !== sessionEpoch) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || payload?.selected_corpus_id || corpora[0]?.id || null
       resetFrontendState()
       await refreshAll()
+      if (epoch !== sessionEpoch) return
       if (logsType === 'pipeline') {
         handleLogsCorpusFilterChange()
       }
@@ -2210,6 +2148,7 @@
       corpusActionStatus = `Deleted corpus "${deletedName}".`
       corpusActionError = false
     } catch (error) {
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       corpusActionStatus = error.message || 'Failed to delete corpus.'
       corpusActionError = true
     } finally {
@@ -2233,11 +2172,24 @@
       shareStatus = `Shared with ${shareUsername.trim()} (${shareRole}).`
       shareUsername = ''
     } catch (error) {
+      if (error?.status === 401) return
       shareStatus = error.message || 'Failed to share corpus.'
     }
   }
 
-  async function loadKantroposTargets() {
+  // One request for the target list at a time: the browse and the assignment
+  // load both need it and may ask together.
+  let kantroposTargetsPromise = null
+  function loadKantroposTargets() {
+    if (!kantroposTargetsPromise) {
+      kantroposTargetsPromise = fetchKantroposTargets().finally(() => {
+        kantroposTargetsPromise = null
+      })
+    }
+    return kantroposTargetsPromise
+  }
+
+  async function fetchKantroposTargets() {
     try {
       const payload = await fetchKantroposCorpora()
       kantroposTargets = payload?.corpora || []
@@ -2247,6 +2199,7 @@
         selectedUpstreamTargetId = String(preferredTargetId || '')
       }
     } catch (error) {
+      if (error?.status === 401) return
       kantroposTargets = []
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
       kantroposAssignmentError = true
@@ -2258,12 +2211,22 @@
 
   async function loadUpstreamBrowse({ quiet = false, appendCurrent = false, appendPending = false } = {}) {
     const requestSeq = ++upstreamBrowseRequestSeq
+    const epoch = corpusScopeEpoch
     if (!quiet) {
       upstreamBrowseStatus = upstreamBrowse.target ? 'Refreshing upstream corpus browser...' : 'Loading upstream corpus browser...'
     }
     upstreamBrowseLoading = true
     try {
-      if (kantroposTargets.length === 0) {
+      // The assignment card lives on this tab only: load it with the browse
+      // (once per corpus for the quiet refreshes, so the card does not blink).
+      // It asks for the target list itself; an empty or failed list is not
+      // asked for twice in one load.
+      let targetsChecked = false
+      if (!appendCurrent && !appendPending && (!quiet || kantroposAssignmentCorpusId !== Number(currentCorpusId))) {
+        targetsChecked = await loadKantroposAssignment()
+        if (requestSeq !== upstreamBrowseRequestSeq) return
+      }
+      if (!targetsChecked && kantroposTargets.length === 0) {
         await loadKantroposTargets()
       }
       const targetId = String(selectedUpstreamTargetId || kantroposAssignment?.target_id || kantroposTargets[0]?.id || '').trim()
@@ -2305,11 +2268,7 @@
         upstreamBrowseStatus = 'Loaded upstream corpus browser.'
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401 || requestSeq !== upstreamBrowseRequestSeq || epoch !== corpusScopeEpoch) return
       if (!quiet) {
         upstreamBrowseStatus = error?.message || 'Failed to load upstream corpus browser.'
       }
@@ -2341,26 +2300,29 @@
     selectedUpstreamAssignedCorpusId = Number(selectedUpstreamAssignedCorpusId) === normalized ? null : normalized
   }
 
+  // True once the target list was checked (with no corpus there is nothing to
+  // load, so the caller still has to).
   async function loadKantroposAssignment() {
     const corpusId = Number(currentCorpusId)
     const requestSeq = ++kantroposAssignmentRequestSeq
     resetKantroposAssignmentState()
-    if (!Number.isFinite(corpusId) || corpusId <= 0) return
+    if (!Number.isFinite(corpusId) || corpusId <= 0) return false
     kantroposAssignmentLoading = true
     try {
       if (kantroposTargets.length === 0) {
         await loadKantroposTargets()
       }
       const payload = await fetchCorpusKantroposAssignment(corpusId)
-      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return true
       kantroposTargets = payload?.corpora || kantroposTargets
       kantroposAssignment = payload?.assignment || null
+      kantroposAssignmentCorpusId = corpusId
       selectedKantroposTargetId = payload?.assignment?.target_id || ''
       if (!payload?.can_edit && currentCorpus?.role !== 'viewer') {
         // no-op; backend truth is enough, UI editability still derives from current corpus role
       }
     } catch (error) {
-      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return
+      if (requestSeq !== kantroposAssignmentRequestSeq || Number(currentCorpusId) !== corpusId) return true
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos assignment.'
       kantroposAssignmentError = true
     } finally {
@@ -2368,6 +2330,7 @@
         kantroposAssignmentLoading = false
       }
     }
+    return true
   }
 
   async function handleSaveKantroposAssignment() {
@@ -2394,6 +2357,7 @@
         : 'Cleared Kantropos assignment.'
       kantroposAssignmentError = false
     } catch (error) {
+      if (error?.status === 401) return
       kantroposAssignmentStatus = error.message || 'Failed to save Kantropos assignment.'
       kantroposAssignmentError = true
     } finally {
@@ -2404,312 +2368,6 @@
   async function handleKantroposTargetChange(event) {
     selectedKantroposTargetId = String(event?.target?.value || '')
     await handleSaveKantroposAssignment()
-  }
-
-  async function loadLatestEntries(baseName, { waitForExtraction = false } = {}) {
-    if (!waitForExtraction && extractionProgress.active) {
-      finishExtractionProgress()
-    }
-    const waitRunId = waitForExtraction ? extractionProgress.runId : 0
-    // Entries are corpus-scoped: a corpus reset ends this load.
-    const epoch = corpusScopeEpoch
-    latestEntriesBase = baseName
-    latestSeedDocument = null
-    latestEntriesStatus = waitForExtraction ? 'Waiting for extracted entries...' : 'Loading extracted entries...'
-    latestEntries = []
-    latestSelection = []
-    const startedAt = Date.now()
-    const maxWaitMs = waitForExtraction ? 180_000 : 10_000
-    const pollIntervalMs = waitForExtraction ? 2_000 : 1_500
-
-    while (Date.now() - startedAt < maxWaitMs) {
-      if (waitForExtraction && waitRunId && extractionProgress.runId !== waitRunId) {
-        return
-      }
-      try {
-        const payload = await fetchBibliographyEntries(baseName)
-        if (epoch !== corpusScopeEpoch) return
-        const items = payload.items || []
-        if (payload.seed_document) {
-          latestSeedDocument = payload.seed_document
-        }
-        if (Array.isArray(items) && items.length > 0) {
-          latestEntries = items
-          if (waitForExtraction) {
-            if (!extractionProgress.backendDone) {
-              latestEntriesStatus = `Extracted ${items.length} entr${items.length === 1 ? 'y' : 'ies'} so far...`
-            } else {
-              latestEntriesStatus = `Loaded ${items.length} entries.`
-            }
-          } else {
-            latestEntriesStatus = `Loaded ${items.length} entries.`
-          }
-          if (waitForExtraction && extractionProgress.backendDone) {
-            updateExtractionProgress({
-              phase: 'completed',
-              detail: 'Extraction complete.',
-              percent: 100,
-              indeterminate: false,
-            })
-            // Briefly keep 100% visible, then clear.
-            const completedRunId = extractionProgress.runId
-            setTimeout(() => {
-              if (extractionProgress.active && extractionProgress.runId === completedRunId) {
-                finishExtractionProgress()
-              }
-            }, 1200)
-            return
-          }
-          if (!waitForExtraction) {
-            return
-          }
-        }
-      } catch (error) {
-        if (error?.status === 401) {
-          authStatus = 'unauthenticated'
-          setAuthToken('')
-          finishExtractionProgress()
-          return
-        }
-        if (epoch !== corpusScopeEpoch) return
-        if (!waitForExtraction) {
-          latestEntriesStatus = 'Failed to load extracted entries.'
-          return
-        }
-        // Keep waiting while extraction is in progress.
-      }
-      if (waitForExtraction) {
-        const elapsedSec = Math.floor((Date.now() - startedAt) / 1000)
-        if (!latestEntries.length) {
-          latestEntriesStatus = extractionProgress.backendDone
-            ? `Finalizing extracted entries... ${elapsedSec}s`
-            : `Waiting for extracted entries... ${elapsedSec}s`
-        }
-      } else {
-        latestEntriesStatus = 'Loading extracted entries...'
-      }
-      await sleep(pollIntervalMs)
-      if (epoch !== corpusScopeEpoch) return
-    }
-
-    if (waitForExtraction) {
-      latestEntriesStatus = extractionProgress.backendDone
-        ? 'Finalizing extracted entries...'
-        : 'Extraction still running. Waiting for entries to appear...'
-    } else {
-      latestEntriesStatus = 'No extracted entries found.'
-    }
-  }
-
-  function clearLatestEntriesView() {
-    if (extractionProgress.active) {
-      finishExtractionProgress()
-    }
-    latestEntries = []
-    latestEntriesBase = ''
-    latestSeedDocument = null
-    latestEntriesStatus = ''
-    latestSelection = []
-  }
-
-  async function handleToggleLatestRun(baseName) {
-    const normalized = String(baseName || '').trim()
-    if (!normalized) return
-    if (String(latestEntriesBase || '').trim() === normalized) {
-      clearLatestEntriesView()
-      return
-    }
-    await loadLatestEntries(normalized)
-  }
-
-  function latestSelectionKey(entry, index = -1) {
-    const primaryId = entry?.id ?? entry?.entry_id
-    if (primaryId !== null && primaryId !== undefined && String(primaryId).trim() !== '') {
-      return `id:${String(primaryId)}`
-    }
-
-    const doi = String(entry?.doi || '').trim().toLowerCase()
-    if (doi) {
-      return `doi:${doi}`
-    }
-
-    const title = String(formatTitle(entry) || '').trim().toLowerCase()
-    const authors = String(formatAuthors(entry) || '').trim().toLowerCase()
-    const year = entry?.year ?? ''
-    if (title || authors || year) {
-      return `tay:${title}|${authors}|${year}|${index}`
-    }
-
-    if (index >= 0) {
-      return `idx:${index}`
-    }
-    return ''
-  }
-
-  function hasLatestEntryId(entry) {
-    const primaryId = entry?.id ?? entry?.entry_id
-    return primaryId !== null && primaryId !== undefined && String(primaryId).trim() !== ''
-  }
-
-  function latestIngestState(entry) {
-    const state = String(entry?.ingest_state || '').trim().toLowerCase()
-    if ([
-      'added',
-      'pending',
-      'staged_raw',
-      'queued_enrichment',
-      'enriched',
-      'queued_download',
-      'downloaded',
-      'downloaded_elsewhere',
-      'failed_enrichment',
-      'failed_download',
-    ].includes(state)) {
-      return state
-    }
-    return 'pending'
-  }
-
-  function isLatestDownloaded(entry) {
-    return latestIngestState(entry) === 'downloaded'
-  }
-
-  function isLatestProcessed(entry) {
-    return latestIngestState(entry) === 'enriched'
-  }
-
-  function latestIngestTag(entry) {
-    const state = latestIngestState(entry)
-    switch (state) {
-      case 'downloaded':
-        return { label: 'Downloaded', className: 'downloaded' }
-      case 'queued_download':
-        return { label: 'Queued DL', className: 'queued' }
-      case 'enriched':
-        return { label: 'Enriched', className: 'completed' }
-      case 'queued_enrichment':
-        return { label: 'Queued', className: 'queued' }
-      case 'staged_raw':
-        return { label: 'Raw', className: 'pending' }
-      case 'failed_enrichment':
-        return { label: 'Enrich Fail', className: 'failed' }
-      case 'failed_download':
-        return { label: 'Download Fail', className: 'failed' }
-      default:
-        return { label: 'Pending', className: 'pending' }
-    }
-  }
-
-  function isLatestSelectable(entry) {
-    return hasLatestEntryId(entry) && ['pending', 'staged_raw'].includes(latestIngestState(entry))
-  }
-
-  function isLatestSelected(entry, index = -1) {
-    if (!isLatestSelectable(entry)) return false
-    const key = latestSelectionKey(entry, index)
-    if (!key) return false
-    return latestSelection.includes(key)
-  }
-
-  function clearLatestSelection() {
-    latestSelection = []
-  }
-
-  function selectAllLatest() {
-    latestSelection = selectableLatestKeys(latestEntries || [])
-  }
-
-  function toggleLatestSelection(entry, index) {
-    if (!isLatestSelectable(entry)) return;
-    const key = latestSelectionKey(entry, index);
-    if (!key) return;
-    if (latestSelection.includes(key)) {
-      latestSelection = latestSelection.filter(k => k !== key);
-    } else {
-      latestSelection = [...latestSelection, key];
-    }
-  }
-
-  async function enqueueSelectedLatest(withDownload = false) {
-    enqueueStatus = ''
-    const ids = (latestEntries || [])
-      .filter((entry, index) => isLatestSelectable(entry) && isLatestSelected(entry, index))
-      .map((entry) => entry.id ?? entry.entry_id)
-      .filter((id) => id !== null && id !== undefined && String(id).trim() !== '')
-    if (ids.length === 0) {
-      enqueueStatus = 'Select at least one entry.'
-      return
-    }
-    enqueueStatus = `Marking ${ids.length} entries for enrichment...`
-    try {
-      const payload = await enqueueIngestEntries(ids)
-      enqueueStatus = `Marked ${payload.marked} (staged: ${payload.staged}, already present downstream: ${payload.already_processed}, duplicates: ${payload.duplicates}). Starting enrichment...`
-      await loadDownloads()
-      await loadIngestStats()
-      
-      // Automatically trigger enrichment after marking
-      if (payload.marked > 0 || payload.staged > 0) {
-        // Set limit to match what was just marked, or default to a reasonable batch size
-        processMarkedLimit = Math.max(10, payload.marked + payload.staged)
-        await processMarkedBatch({ withDownload })
-      } else {
-        enqueueStatus += ' No new entries to enrich.'
-      }
-    } catch (error) {
-      let message = error?.message || 'Failed to enqueue entries.'
-      try {
-        // Avoid dumping raw JSON/tracebacks into the UI.
-        const parsed = JSON.parse(message)
-        if (parsed?.error) message = parsed.error
-      } catch {
-        // ignore
-      }
-      enqueueStatus = message
-    }
-  }
-
-  async function processMarkedBatch({ withDownload = false } = {}) {
-    processMarkedStatus = ''
-    if (processingMarked) return
-    const limit = Number(processMarkedLimit)
-    if (!Number.isFinite(limit) || limit <= 0) {
-      processMarkedStatus = 'Limit must be a positive number.'
-      return
-    }
-    processingMarked = true
-    processMarkedStatus = `Processing up to ${limit} marked entries (enrich -> with metadata)...`
-    try {
-      const payload = await processMarkedIngestEntries({
-        limit,
-        includeDownstream,
-        includeUpstream,
-        relatedDepthDownstream,
-        relatedDepthUpstream,
-        maxRelated,
-        enqueueDownload: withDownload,
-        downloadBatchSize: Math.max(25, limit),
-      })
-      processMarkedStatus = payload.message || 'Jobs queued successfully.'
-      await loadDownloads()
-      await loadIngestStats()
-    } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        processMarkedStatus = 'Session expired. Please sign in again.'
-        return
-      }
-      let message = error?.message || 'Failed to process marked entries.'
-      try {
-        const parsed = JSON.parse(message)
-        if (parsed?.error) message = parsed.error
-      } catch {
-        // ignore
-      }
-      processMarkedStatus = message
-    } finally {
-      processingMarked = false
-    }
   }
 
   async function handleFiles(event) {
@@ -2764,8 +2422,6 @@
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
       }
@@ -2791,8 +2447,6 @@
     } catch (error) {
       finishExtractionProgress()
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
       }
@@ -2800,8 +2454,8 @@
     }
   }
 
-  async function loadIngestRuns() {
-    ingestRunsStatus = 'Loading ingest runs...'
+  async function loadIngestRuns({ quiet = false } = {}) {
+    if (!quiet) ingestRunsStatus = 'Loading ingest runs...'
     const epoch = corpusScopeEpoch
     try {
       const payload = await fetchIngestRuns(20)
@@ -2810,10 +2464,7 @@
       pruneExtractedUploads()
       ingestRunsStatus = ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401) return
       if (epoch !== corpusScopeEpoch) return
       ingestRunsStatus = 'Failed to load ingest runs.'
     }
@@ -2833,10 +2484,9 @@
       if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401) return
+      // Requested for a corpus the workspace has left: change nothing.
+      if (!global && epoch !== corpusScopeEpoch) return
       if (!global) handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
       apiStatus = error?.status === 403 ? 'online' : 'offline'
@@ -2846,25 +2496,6 @@
   function seedSourceId(source) {
     if (!source) return ''
     return String(source.id || `${source.source_type}:${source.source_key}`)
-  }
-
-  function seedCandidateState(candidate) {
-    const state = String(candidate?.state || '').trim().toLowerCase()
-    if ([
-      'added',
-      'pending',
-      'staged_raw',
-      'queued_enrichment',
-      'enriched',
-      'queued_download',
-      'downloaded',
-      'downloaded_elsewhere',
-      'failed_enrichment',
-      'failed_download',
-    ].includes(state)) {
-      return state
-    }
-    return 'pending'
   }
 
   function isSeedCandidateInCorpus(candidate) {
@@ -2891,7 +2522,7 @@
       if (isSeedCandidateInCorpus(candidate)) {
         counts.in_corpus += 1
       }
-      const state = seedCandidateState(candidate)
+      const state = workState(candidate?.state)
       counts[state] = (counts[state] || 0) + 1
       if (state === 'downloaded_elsewhere') {
         if (candidate?.file_available === true) {
@@ -2911,6 +2542,7 @@
       seedSelections = Object.fromEntries(
         Object.entries(seedSelections).filter(([key]) => key !== sourceId)
       )
+      seedSortCache.delete(sourceId)
       selectedSeedCandidateKeys = Object.fromEntries(
         Object.entries(selectedSeedCandidateKeys).filter(([key]) => key !== sourceId)
       )
@@ -2929,6 +2561,11 @@
         }
       }
     }
+    // A paged seed (e.g. a 70,000-item search) only has its first page(s)
+    // loaded: counting those would overwrite the server's totals. Recount
+    // client-side only once the seed is fully loaded.
+    const page = seedPages[sourceId]
+    if (page && nextCandidates.length < page.total) return
     const nextCounts = summarizeSeedCandidateStates(nextCandidates)
     seedSources = seedSources.map((source) => {
       if (seedSourceId(source) !== sourceId) return source
@@ -2941,7 +2578,7 @@
   }
 
   function seedCandidateTag(candidate) {
-    switch (seedCandidateState(candidate)) {
+    switch (workState(candidate?.state)) {
       case 'downloaded':
         return {
           label: candidate?.file_available === false ? 'File missing' : 'PDF downloaded',
@@ -2976,12 +2613,9 @@
   // Downstream checkbox re-evaluates every row.
   function isSeedCandidateSelectable(candidate, downstreamOn = includeDownstream, downstreamDepth = relatedDepthDownstream) {
     if (downstreamOn && downstreamDepth >= 1) return true
-    return seedCandidateState(candidate) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
+    return workState(candidate?.state) !== 'downloaded' && !isSeedCandidateInCorpus(candidate)
   }
 
-  // The seed tables render inside {#key ...} blocks, so selectability changes
-  // driven by the Promotion Settings need to appear in the key itself.
-  $: downstreamPromotesAll = includeDownstream && relatedDepthDownstream >= 1
   $: expansionEnabled = (includeDownstream && relatedDepthDownstream >= 1) || (includeUpstream && relatedDepthUpstream >= 1)
 
   // Debounced so typing does not fire a request per keystroke. Both reset to
@@ -3022,11 +2656,7 @@
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       corpusLoadStatus = error?.message || 'Failed to remove the item from this corpus.'
     }
   }
@@ -3050,38 +2680,30 @@
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       corpusLoadStatus = error?.message || 'Failed to remove the selected items.'
     }
   }
 
   function toggleCorpusSort(column) {
-    const [currentColumn, currentDirection] = String(corpusSort || '').split(':')
-    const direction = currentColumn === column && currentDirection === 'asc' ? 'desc' : 'asc'
-    corpusSort = `${column}:${direction}`
+    corpusSort = nextSort(corpusSort, column)
     loadCorpus({ quiet: true })
-  }
-
-  function corpusSortIndicator(column, sort = corpusSort) {
-    const [currentColumn, currentDirection] = String(sort || '').split(':')
-    if (currentColumn !== column) return ''
-    return currentDirection === 'asc' ? ' ▲' : ' ▼'
   }
 
   function getSeedCandidatesForSource(source) {
     return seedCandidatesBySource[seedSourceId(source)] || []
   }
 
+  // Seed cells keep their '' blank, and a candidate without a state reads as
+  // pending (see metadataLabel in lib/works).
+  const SEED_CELL = { blank: '', seed: true }
+
   // Accessors used by the client-side sort (sortSeedCandidates), which only
   // applies to PDF seeds — those load in full. Search seeds page server-side
   // and sort server-side too (see toggleSeedSort / sortSeedCandidates).
   const SEED_SORT_ACCESSORS = {
-    metadata: (candidate) => seedMetadataLabel(candidate),
-    download: (candidate) => seedDownloadLabel(candidate),
+    metadata: (candidate) => metadataLabel(candidate, SEED_CELL),
+    download: (candidate) => downloadLabel(candidate, SEED_CELL),
     title: (candidate) => formatTitle(candidate),
     authors: (candidate) => formatAuthors(candidate),
     year: (candidate) => candidate?.year,
@@ -3091,85 +2713,10 @@
     cited_by: (candidate) => candidate?.cited_by_count,
   }
 
-  // Spec line 16: show the metadata and download axes separately. The derived
-  // `state` still drives every behaviour — only the display splits.
-  const SEED_METADATA_LABELS = {
-    pending: 'Pending',
-    enriching: 'Enriching',
-    matched: 'Confirmed',
-    failed_enrichment: 'Metadata not confirmed',
-  }
-  const SEED_DOWNLOAD_LABELS = {
-    not_requested: 'Not requested',
-    queued: 'Queued',
-    in_progress: 'Downloading',
-    downloaded: 'Downloaded',
-    failed: 'Not retrievable',
-    failed_download: 'Not retrievable',
-  }
-
-  // Search candidates carry no metadata_status of their own, so the column
-  // falls back to the resolved state (what the old row tag used to say).
-  const SEED_METADATA_BY_STATE = {
-    enriched: 'Confirmed',
-    added: 'Confirmed',
-    downloaded: 'Confirmed',
-    downloaded_elsewhere: 'Confirmed',
-    queued_download: 'Confirmed',
-    failed_download: 'Confirmed',
-    queued_enrichment: 'Enriching',
-    staged_raw: 'Pending',
-    pending: 'Pending',
-  }
-
-  function seedMetadataLabel(candidate) {
-    const state = seedCandidateState(candidate)
-    if (state === 'failed_enrichment') return SEED_METADATA_LABELS.failed_enrichment
-    const raw = String(candidate?.metadata_status || '').trim().toLowerCase()
-    if (SEED_METADATA_LABELS[raw]) return SEED_METADATA_LABELS[raw]
-    if (raw) return raw.replace(/_/g, ' ')
-    return SEED_METADATA_BY_STATE[state] || '-'
-  }
-
-  function seedDownloadLabel(candidate) {
-    const state = seedCandidateState(candidate)
-    if (state === 'failed_download') return SEED_DOWNLOAD_LABELS.failed_download
-    const raw = String(candidate?.download_status || '').trim().toLowerCase()
-    if (SEED_DOWNLOAD_LABELS[raw]) return SEED_DOWNLOAD_LABELS[raw]
-    if (raw) return raw.replace(/_/g, ' ')
-    if (state === 'downloaded') return candidate?.file_available === false ? 'File missing' : 'Downloaded'
-    if (state === 'downloaded_elsewhere') return candidate?.file_available === true ? 'Downloaded' : 'Stale record'
-    if (state === 'queued_download') return SEED_DOWNLOAD_LABELS.queued
-    return '-'
-  }
-
-  function seedCellText(candidate, key) {
-    switch (key) {
-      case 'metadata': return seedMetadataLabel(candidate)
-      case 'download': return seedDownloadLabel(candidate)
-      case 'title': return formatTitle(candidate)
-      case 'authors': return formatAuthorsShort(candidate)
-      case 'year': return candidate?.year || ''
-      case 'refs': return candidate?.refs_count ?? '–'
-      case 'cited_by': return candidate?.cited_by_count ?? '–'
-      case 'source': return candidate?.source || ''
-      case 'doi': return candidate?.doi || ''
-      case 'publisher': return candidate?.publisher || ''
-      case 'type': return candidate?.type || ''
-      case 'openalex': return candidate?.openalex_id || ''
-      case 'pages': return candidate?.pages || ''
-      case 'open_access': return candidate?.open_access_url ? 'Yes' : 'No'
-      case 'file': return candidate?.file_available ? 'Yes' : 'No'
-      default: return ''
-    }
-  }
-
   function toggleSeedSort(source, column) {
     if (!SEED_SORT_ACCESSORS[column]) return
     const sourceId = seedSourceId(source)
-    const current = seedSorts[sourceId]
-    const direction = current && current.column === column && current.direction === 'asc' ? 'desc' : 'asc'
-    seedSorts = { ...seedSorts, [sourceId]: { column, direction } }
+    seedSorts = { ...seedSorts, [sourceId]: nextSort(seedSorts[sourceId], column) }
     // Search seeds sort server-side (the metadata/download axes require every
     // row resolved, which the client only has for the loaded page) — reload
     // page one under the new sort. PDF seeds keep the client-side sort below.
@@ -3181,18 +2728,26 @@
   // `sorts` is passed in from the template rather than read off the module
   // binding so Svelte tracks seedSorts as a dependency of the markup.
   function seedSortIndicator(source, column, sorts = seedSorts) {
-    const current = sorts[seedSourceId(source)]
-    if (!current || current.column !== column) return ''
-    return current.direction === 'asc' ? ' ▲' : ' ▼'
+    return sortIndicator(sorts[seedSourceId(source)], column)
   }
 
   function sortSeedCandidates(source, candidates, sorts = seedSorts) {
+    const sourceId = seedSourceId(source)
+    const sortKey = String(sorts[sourceId] || '')
+    const cached = seedSortCache.get(sourceId)
+    if (cached && cached.candidates === candidates && cached.sortKey === sortKey) return cached.sorted
+    const sorted = computeSortedSeedCandidates(source, candidates, sorts)
+    seedSortCache.set(sourceId, { candidates, sortKey, sorted })
+    return sorted
+  }
+
+  function computeSortedSeedCandidates(source, candidates, sorts) {
     // Search seeds are already sorted server-side across the full result set
     // (see toggleSeedSort); re-sorting the loaded page client-side would only
     // reorder what happens to be loaded, not the whole set. PDF seeds load in
     // full, so the client-side sort below still gives a correct order.
     if (source.source_type === 'search') return candidates
-    const current = sorts[seedSourceId(source)]
+    const current = parseSort(sorts[seedSourceId(source)])
     const accessor = current && SEED_SORT_ACCESSORS[current.column]
     if (!accessor) return candidates
     const factor = current.direction === 'desc' ? -1 : 1
@@ -3214,12 +2769,25 @@
   }
 
   function getSeedSelectionForSource(source) {
-    return seedSelections[seedSourceId(source)] || []
+    return seedSelections[seedSourceId(source)] || EMPTY_SET
+  }
+
+  // Keys of the loaded candidates that can currently be selected.
+  function loadedSelectableKeys(source) {
+    return getSeedCandidatesForSource(source)
+      .filter((candidate) => isSeedCandidateSelectable(candidate))
+      .map((candidate) => String(candidate?.candidate_key || ''))
+      .filter(Boolean)
   }
 
   function selectedSeedCount(source) {
     const sourceId = seedSourceId(source)
-    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).length
+    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).size
+  }
+
+  function isSeedFullySelected(source) {
+    const selectableCount = estimatedSelectableSeedCount(source)
+    return selectableCount > 0 && selectedSeedCount(source) === selectableCount
   }
 
   function getSelectedSeedCandidate(source) {
@@ -3231,22 +2799,29 @@
     ) || null
   }
 
-  function selectableSeedCount(source) {
-    return getSeedCandidatesForSource(source).filter((candidate) => isSeedCandidateSelectable(candidate)).length
+  function selectableSeedCount(source, loaded = getSeedCandidatesForSource(source), downstreamOn = includeDownstream, downstreamDepth = relatedDepthDownstream) {
+    return loaded.filter((candidate) => isSeedCandidateSelectable(candidate, downstreamOn, downstreamDepth)).length
   }
 
-  function estimatedSelectableSeedCount(source) {
-    const sourceId = seedSourceId(source)
-    const page = seedPages[sourceId]
-    const loaded = seedCandidatesBySource[sourceId]
+  function estimatedSelectableSeedCount(
+    source,
+    page = seedPages[seedSourceId(source)],
+    loaded = seedCandidatesBySource[seedSourceId(source)],
+    loadedSelectableCount = null,
+    downstreamOn = includeDownstream,
+    downstreamDepth = relatedDepthDownstream,
+  ) {
     const total = page ? page.total : Number(source?.candidate_count || 0)
     // Once every row is actually loaded, count selectability exactly instead
     // of estimating — isSeedCandidateSelectable excludes more than just
     // in_corpus/downloaded (e.g. the includeDownstream override), so this is
     // strictly more accurate than any formula below.
     if (page && Array.isArray(loaded) && loaded.length >= total) {
-      return selectableSeedCount(source)
+      return loadedSelectableCount ?? selectableSeedCount(source, loaded, downstreamOn, downstreamDepth)
     }
+    // Downstream expansion makes every item selectable (see
+    // isSeedCandidateSelectable), including the rows not loaded yet.
+    if (downstreamOn && downstreamDepth >= 1) return total
     // state_counts is not resolved server-side above the metadata/download
     // sort limit (Task 5) — in that case the total is the best estimate.
     const stateCounts = source?.state_counts
@@ -3257,10 +2832,6 @@
     const inCorpus = Number(stateCounts.in_corpus || 0)
     const downloaded = Number(stateCounts.downloaded || 0)
     return Math.max(0, total - inCorpus - downloaded)
-  }
-
-  function isSeedCandidateSelected(source, candidate) {
-    return getSeedSelectionForSource(source).includes(String(candidate?.candidate_key || ''))
   }
 
   function setSelectedSeedCandidate(source, candidate) {
@@ -3277,43 +2848,34 @@
     const sourceId = seedSourceId(source)
     const candidateKey = String(candidate?.candidate_key || '')
     if (!sourceId || !candidateKey || !isSeedCandidateSelectable(candidate)) return
-    const current = seedSelections[sourceId] || []
-    const isSelected = current.includes(candidateKey)
+    const current = getSeedSelectionForSource(source)
+    const isSelected = current.has(candidateKey)
     if (isSelected && seedAllSelected[sourceId]) {
       // Deselecting one row out of "all N selected" drops into explicit mode:
       // everything else that's loaded stays selected, just not this row.
       seedAllSelected = { ...seedAllSelected, [sourceId]: false }
-      const loadedSelectableKeys = getSeedCandidatesForSource(source)
-        .filter((entry) => isSeedCandidateSelectable(entry))
-        .map((entry) => String(entry?.candidate_key || ''))
-        .filter(Boolean)
-      seedSelections = { ...seedSelections, [sourceId]: loadedSelectableKeys.filter((key) => key !== candidateKey) }
-      seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+      const next = new Set(loadedSelectableKeys(source))
+      next.delete(candidateKey)
+      seedSelections = { ...seedSelections, [sourceId]: next }
       return
     }
-    seedSelections = isSelected
-      ? { ...seedSelections, [sourceId]: current.filter((value) => value !== candidateKey) }
-      : { ...seedSelections, [sourceId]: [...current, candidateKey] }
-    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+    const next = new Set(current)
+    if (isSelected) next.delete(candidateKey)
+    else next.add(candidateKey)
+    seedSelections = { ...seedSelections, [sourceId]: next }
   }
 
   function clearSeedSelection(source) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
-    seedSelections = { ...seedSelections, [sourceId]: [] }
+    seedSelections = { ...seedSelections, [sourceId]: new Set() }
     seedAllSelected = { ...seedAllSelected, [sourceId]: false }
-    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
   }
 
   function selectAllSeedCandidates(source) {
     const sourceId = seedSourceId(source)
     if (!sourceId) return
-    const keys = getSeedCandidatesForSource(source)
-      .filter((candidate) => isSeedCandidateSelectable(candidate))
-      .map((candidate) => String(candidate.candidate_key || ''))
-      .filter(Boolean)
-    seedSelections = { ...seedSelections, [sourceId]: keys }
-    seedSelectionVersions = { ...seedSelectionVersions, [sourceId]: (seedSelectionVersions[sourceId] || 0) + 1 }
+    seedSelections = { ...seedSelections, [sourceId]: new Set(loadedSelectableKeys(source)) }
   }
 
   async function setAllSeedCandidatesSelected(source, checked) {
@@ -3355,6 +2917,9 @@
       seedSelections = Object.fromEntries(
         Object.entries(seedSelections).filter(([key]) => validSourceIds.has(key))
       )
+      for (const key of seedSortCache.keys()) {
+        if (!validSourceIds.has(key)) seedSortCache.delete(key)
+      }
       if (!quiet) {
         seedSourcesStatus = seedSources.length > 0
           ? `Loaded ${seedSources.length} seed${seedSources.length === 1 ? '' : 's'}.`
@@ -3371,11 +2936,7 @@
         }
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       handleCorpusPollForbidden(error)
       if (token !== seedSourcesRequestToken) return
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
@@ -3399,6 +2960,7 @@
       seedSourcesStatus = 'Cancelling search…'
       await loadSeedSources({ quiet: true })
     } catch (error) {
+      if (error?.status === 401) return
       seedSourcesStatus = error?.message || 'Could not cancel the search.'
     }
   }
@@ -3460,25 +3022,20 @@
       if (nextCandidates.length === 0) {
         return
       }
-      const allowed = new Set(nextCandidates.map((candidate) => String(candidate.candidate_key || '')).filter(Boolean))
-      const selectable = new Set(
-        nextCandidates
-          .filter((candidate) => isSeedCandidateSelectable(candidate))
-          .map((candidate) => String(candidate.candidate_key || ''))
-          .filter(Boolean)
-      )
-      seedSelections = {
-        ...seedSelections,
-        [sourceId]: (seedSelections[sourceId] || []).filter((key) => allowed.has(key) && selectable.has(key)),
+      // Keep only selected keys that are still loaded and selectable.
+      const selectable = new Set(loadedSelectableKeys(source))
+      const current = getSeedSelectionForSource(source)
+      if ([...current].some((key) => !selectable.has(key))) {
+        seedSelections = {
+          ...seedSelections,
+          [sourceId]: new Set([...current].filter((key) => selectable.has(key))),
+        }
       }
       if (!quiet) {
         seedActionStatus = ''
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      } else if (!quiet && token === seedCandidatesRequestTokens.get(sourceId) && epoch === corpusScopeEpoch) {
+      if (error?.status !== 401 && !quiet && token === seedCandidatesRequestTokens.get(sourceId) && epoch === corpusScopeEpoch) {
         seedActionStatus = error?.message || 'Failed to load seed candidates.'
       }
     } finally {
@@ -3590,12 +3147,8 @@
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
       ]
-      if (diagnosticsEnabled) {
-        refreshTasks.push(
-          loadDownloads(),
-          loadDownloadWorkerStatus({ quiet: true }),
-        )
-      }
+      // The daemon status also fills the download worker card.
+      if (diagnosticsEnabled) refreshTasks.push(loadPipelineWorkerStatus({ quiet: true }))
       await Promise.all(refreshTasks)
       const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
       if (refreshedSource) {
@@ -3605,15 +3158,11 @@
       seedActionStatus = status.text
       seedWarningMessage = status.warning ? status.text : ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
-      loadOpenAlexQuota()
+      void refreshQuota()
     }
   }
 
@@ -3623,7 +3172,7 @@
       await handlePromoteWholeSeedSource(source)
       return
     }
-    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    const candidateKeys = [...getSeedSelectionForSource(source)]
     await promoteSeedCandidateKeys(source, candidateKeys, { clearSelection: true })
   }
 
@@ -3670,12 +3219,8 @@
         loadIngestStats({ quiet: true }),
         loadCorpus({ preserveSelection: true, quiet: true }),
       ]
-      if (diagnosticsEnabled) {
-        refreshTasks.push(
-          loadDownloads(),
-          loadDownloadWorkerStatus({ quiet: true }),
-        )
-      }
+      // The daemon status also fills the download worker card.
+      if (diagnosticsEnabled) refreshTasks.push(loadPipelineWorkerStatus({ quiet: true }))
       await Promise.all(refreshTasks)
       const refreshedSource = seedSources.find((entry) => seedSourceId(entry) === sourceId)
       if (refreshedSource) {
@@ -3685,11 +3230,7 @@
       seedActionStatus = status.text
       seedWarningMessage = status.warning ? status.text : ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       // estimatedSelectableSeedCount is just that — an estimate. When it
       // undercounts already-excluded items (e.g. state_counts unresolved
       // above the summarization limit) the backend can still come back with
@@ -3700,14 +3241,14 @@
         : error?.message || 'Failed to promote seed candidates.'
     } finally {
       seedActionBusy = false
-      loadOpenAlexQuota()
+      void refreshQuota()
     }
   }
 
   async function handleDismissSelectedSeed(source) {
     const sourceId = seedSourceId(source)
     const allSelected = Boolean(seedAllSelected[sourceId])
-    const candidateKeys = (seedSelections[sourceId] || []).filter(Boolean)
+    const candidateKeys = [...getSeedSelectionForSource(source)]
     if (!allSelected && candidateKeys.length === 0) {
       seedActionStatus = 'Select at least one seed candidate to dismiss.'
       return
@@ -3731,11 +3272,7 @@
       }
       seedActionStatus = `Removed ${dismissLabel} candidate(s) from Seed.`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to dismiss seed candidates.'
     } finally {
       seedActionBusy = false
@@ -3753,16 +3290,13 @@
       seedSelections = Object.fromEntries(
         Object.entries(seedSelections).filter(([key]) => key !== sourceId)
       )
+      seedSortCache.delete(sourceId)
       if (expandedSeedSourceId === sourceId) {
         expandedSeedSourceId = ''
       }
       seedActionStatus = `Removed ${source.label} from Seed.`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to remove seed source.'
     } finally {
       seedActionBusy = false
@@ -3775,7 +3309,7 @@
       topics: searchTopics.map(({ id, label }) => ({ id, label })),
       maxResults: searchResultCap(maxResults), sort: searchSort,
       includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
-      maxRelated: 30, fallbackToSample: false,
+      maxRelated: 30,
     }
   }
 
@@ -3854,7 +3388,7 @@
         topicActiveIndex = topicSuggestions.length > 0 ? 0 : -1
       } catch (error) {
         if (token !== topicLookupToken) return
-        if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
+        if (error?.status === 401) return
         topicSuggestions = []
       }
     }, 250)
@@ -3921,17 +3455,26 @@
 
   // Submit: ask for the count first; warn above the threshold, else start.
   async function runSearch() {
+    // The preview takes up to a minute: a sign-out or a corpus switch meanwhile
+    // ends this search, whose form has been reset under it.
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
     searchWarning = false
     searchStatus = 'Checking how many works match...'
     searchPreviewBusy = true
+    let preview = null
     try {
-      searchPreview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
+      preview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
     } catch (error) {
-      // A failed preview must not block the search.
-      searchPreview = null
+      if (error?.status === 401) return
+      // Any other failed preview must not block the search.
     } finally {
       searchPreviewBusy = false
     }
+    if (session !== sessionEpoch || scope !== corpusScopeEpoch) return
+    searchPreview = preview
+    // The preview costs OpenAlex credits too.
+    void refreshQuota()
     const cap = searchResultCap(searchMaxResults)
     if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
       searchWarning = true
@@ -3946,9 +3489,8 @@
     if (maxResultsOverride !== null) searchMaxResults = maxResultsOverride
     searchStatus = 'Starting search...'
     try {
-      const { data, source, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
-      searchSource = source
-      loadOpenAlexQuota()
+      const { data, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
+      void refreshQuota()
       if (runId && running) {
         // Start polling on the 202 itself; the seed list may not report this
         // run for another poll or two (or at all, if registration lagged).
@@ -3962,172 +3504,11 @@
         searchStatus = 'Fetching in the background. The seed below fills in as pages arrive.'
         return
       }
-      searchResults = data
-      initializeSearchQueueConfig(data)
-      searchQueueStatus = ''
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
       searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
-      if (error?.status === 401) { authStatus = 'unauthenticated'; setAuthToken(''); return }
+      if (error?.status === 401) return
       searchStatus = error?.message || 'Search failed.'
-    }
-  }
-
-  function searchResultKey(result, index = -1) {
-    const openalexId = String(result?.openalex_id || '').trim().toLowerCase()
-    if (openalexId) return `oa:${openalexId}`
-    const doi = String(result?.doi || '').trim().toLowerCase()
-    if (doi) return `doi:${doi}`
-    const id = String(result?.id || '').trim().toLowerCase()
-    if (id) return `id:${id}`
-    return `idx:${index}:${String(result?.title || '').trim().toLowerCase()}`
-  }
-
-  function defaultSearchQueueConfig() {
-    return {
-      includeDownstream: Boolean(includeDownstream),
-      includeUpstream: Boolean(includeUpstream),
-      relatedDepthDownstream: Math.max(0, Number(relatedDepthDownstream) || 0),
-      relatedDepthUpstream: Math.max(0, Number(relatedDepthUpstream) || 0),
-      maxRelated: Math.max(1, Number(maxRelated) || 1),
-    }
-  }
-
-  function initializeSearchQueueConfig(results = searchResults) {
-    const next = {}
-    for (const [index, result] of (results || []).entries()) {
-      const key = searchResultKey(result, index)
-      if (!key) continue
-      next[key] = {
-        ...defaultSearchQueueConfig(),
-        ...(searchQueueConfigs[key] || {}),
-      }
-    }
-    searchQueueConfigs = next
-    searchSelection = searchSelection.filter((key) => Boolean(next[key]))
-  }
-
-  function getSearchQueueConfig(key) {
-    return searchQueueConfigs[key] || defaultSearchQueueConfig()
-  }
-
-  function updateSearchQueueConfig(key, patch) {
-    const current = getSearchQueueConfig(key)
-    searchQueueConfigs = {
-      ...searchQueueConfigs,
-      [key]: { ...current, ...patch },
-    }
-  }
-
-  function clearSearchSelection() {
-    searchSelection = []
-  }
-
-  function selectAllSearchResults() {
-    searchSelection = (searchResults || []).map((result, index) => searchResultKey(result, index)).filter(Boolean)
-  }
-
-  function toggleSearchSelection(result, index) {
-    const key = searchResultKey(result, index);
-    if (!key) return;
-    if (searchSelection.includes(key)) {
-      searchSelection = searchSelection.filter(k => k !== key);
-    } else {
-      searchSelection = [...searchSelection, key];
-    }
-  }
-
-  function buildSeedItemFromSearchResult(result) {
-    const openalexId = String(result?.openalex_id || '').trim()
-    if (openalexId) return { openalex_id: openalexId }
-
-    const id = String(result?.id || '').trim()
-    if (/^https?:\/\/openalex\.org\/w\d+$/i.test(id) || /^w\d+$/i.test(id)) {
-      return { openalex_id: id }
-    }
-
-    const doi = String(result?.doi || '').trim()
-    if (doi) return { doi }
-
-    return { title: String(result?.title || id || '').trim() }
-  }
-
-  async function enqueueSelectedSearchResults(startPipeline = false) {
-    searchQueueStatus = ''
-    if (searchQueueBusy) return
-
-    if (searchSource !== 'api') {
-      searchQueueStatus = 'Only API search results can be enqueued. Run the search against the live API first.'
-      return
-    }
-
-    const selectedRows = (searchResults || [])
-      .map((result, index) => ({ result, index, key: searchResultKey(result, index) }))
-      .filter(({ key }) => key && searchSelection.includes(key))
-
-    if (selectedRows.length === 0) {
-      searchQueueStatus = 'Select at least one search result.'
-      return
-    }
-
-    searchQueueBusy = true
-    let queuedSeeds = 0
-    let queuedWorks = 0
-    const failures = []
-
-    try {
-      for (let i = 0; i < selectedRows.length; i += 1) {
-        const { result, key } = selectedRows[i]
-        const cfg = getSearchQueueConfig(key)
-        const seedPayload = JSON.stringify([buildSeedItemFromSearchResult(result)])
-        const title = String(result?.title || result?.id || key).slice(0, 80)
-        searchQueueStatus = `Queueing ${i + 1}/${selectedRows.length}: ${title}`
-        try {
-          const payload = await runKeywordSearch({
-            query: '',
-            seedJson: seedPayload,
-            field: 'default',
-            author: '',
-            includeDownstream: Boolean(cfg.includeDownstream),
-            includeUpstream: Boolean(cfg.includeUpstream),
-            relatedDepthDownstream: Math.max(0, Number(cfg.relatedDepthDownstream) || 0),
-            relatedDepthUpstream: Math.max(0, Number(cfg.relatedDepthUpstream) || 0),
-            maxRelated: Math.max(1, Number(cfg.maxRelated) || 1),
-            enqueue: true,
-            fallbackToSample: false,
-          })
-          if (payload?.source !== 'api') {
-            throw new Error('backend did not return live API results')
-          }
-          queuedSeeds += 1
-          queuedWorks += Array.isArray(payload?.data) ? payload.data.length : 0
-        } catch (error) {
-          failures.push(`${title}: ${error?.message || 'enqueue failed'}`)
-        }
-      }
-
-      await Promise.all([
-        loadDownloads(),
-        loadIngestStats({ quiet: true }),
-        loadCorpus({ preserveSelection: true, quiet: true }),
-      ])
-
-      if (startPipeline && queuedSeeds > 0 && !pipelineWorker.running) {
-        await handleStartPipelineWorker()
-      }
-
-      if (queuedSeeds === 0) {
-        searchQueueStatus = failures.length > 0 ? `No items queued. ${failures[0]}` : 'No items queued.'
-      } else {
-        const failSuffix =
-          failures.length > 0
-            ? ` ${failures.length} item(s) failed${failures[0] ? ` (first: ${failures[0]})` : ''}.`
-            : ''
-        const pipelineSuffix = startPipeline && queuedSeeds > 0 ? ' Downloader started.' : ''
-        searchQueueStatus = `Queued ${queuedSeeds} seed item(s); ${queuedWorks} work(s) sent to the download queue.${failSuffix}${pipelineSuffix}`
-      }
-    } finally {
-      searchQueueBusy = false
     }
   }
 
@@ -4141,12 +3522,26 @@
     searchSort = 'relevance'
     resetTopicSearch()
     searchStatus = ''
-    searchSource = ''
-    searchSelection = []
-    searchQueueConfigs = {}
-    searchQueueStatus = ''
     searchPreview = null
     searchWarning = false
+  }
+
+  function corpusPageSignature(data, total, stageTotals) {
+    return JSON.stringify([corpusFilterQuery, corpusSort, total, stageTotals, data])
+  }
+
+  function applyCorpusCounts(total, stageTotals) {
+    corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
+    corpusHasMore = corpusItems.length < corpusTotal
+    if (stageTotals && typeof stageTotals === 'object') {
+      corpusStageTotals = {
+        raw: Number(stageTotals.raw || 0),
+        metadata: Number(stageTotals.metadata || 0),
+        downloaded: Number(stageTotals.downloaded || 0),
+        failed_enrichment: Number(stageTotals.failed_enrichment || 0),
+        failed_download: Number(stageTotals.failed_download || 0),
+      }
+    }
   }
 
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
@@ -4157,7 +3552,6 @@
     // null until the auth payload names the corpus (the initial value is 0):
     // the backend then answers for the token's corpus, which is that one.
     const requestCorpusId = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
-    const scrollSnapshot = !append && preserveSelection ? snapshotCorpusScroll() : null
     if (append) {
       if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
       corpusLoadingMore = true
@@ -4170,60 +3564,100 @@
     }
     try {
       const offset = append ? corpusItems.length : 0
-      const requestedLimit =
-        append
-          ? CORPUS_PAGE_SIZE
-          : quiet && preserveSelection
-            ? Math.max(CORPUS_PAGE_SIZE, corpusItems.length || 0)
-            : CORPUS_PAGE_SIZE
-      const { data, total, source, stageTotals } = await fetchCorpus({
-        limit: requestedLimit,
-        offset,
-        q: corpusFilterQuery,
-        sort: corpusSort,
-      })
-      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
-      const currentCorpusNumeric = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
+      // The poll asks for the first page only, also when more rows are loaded.
+      const poll = !append && quiet && preserveSelection
+      const query = { q: corpusFilterQuery, sort: corpusSort }
+      let { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
       // answered for the token's corpus, which is the one fetchMe reports.
-      const switchedCorpus = requestCorpusId !== null && requestCorpusId !== currentCorpusNumeric
-      if (requestSeq !== corpusLoadRequestSeq || switchedCorpus) {
+      const corpusScopeChanged = () => {
+        const nowCorpus = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
+        return requestCorpusId !== null && requestCorpusId !== nowCorpus
+      }
+      if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) {
         return
       }
+      // Committed only once the rows are replaced: a failed prefix reload
+      // keeps the old signature (and rows), so the next poll retries it.
+      let pageSignature = null
+      if (!append) {
+        pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
+        if (poll && pageSignature === lastCorpusPageSignature) {
+          corpusRefreshFailed = false
+          return
+        }
+        // The first page's counts hold whatever the reload below does.
+        applyCorpusCounts(total, stageTotals)
+        // The first page changed while more pages are loaded: a fresh page in
+        // front of the old tail would shift the offsets (rows lost or doubled
+        // on the next "Show more"), so reload every loaded row, in sequential
+        // pages of at most CORPUS_POLL_PAGE_ROWS. The rows are replaced only
+        // once every page answered; a failed page throws and changes nothing.
+        // A write between two pages shifts the offsets (a row doubled or
+        // skipped at the boundary). Each page after the first starts on the
+        // last row already read, and the sort ends in a unique id, so any such
+        // shift shows there: the row in that slot is a different one. Such an
+        // attempt is retried once, and a second inconsistent one leaves rows
+        // and signature for the next poll. Two writes that cancel out exactly
+        // at a boundary stay invisible until the first page next changes.
+        if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
+          const loadedRows = corpusItems.length
+          let prefix = null
+          for (let attempt = 0; attempt < 2 && !prefix; attempt += 1) {
+            const rows = []
+            const totals = new Set()
+            let last = null
+            let aligned = true
+            while (aligned && rows.length < loadedRows) {
+              const overlap = rows.length > 0 ? 1 : 0
+              const pageOffset = rows.length - overlap
+              const pageLimit = Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset)
+              const answer = await fetchCorpus({ limit: pageLimit, offset: pageOffset, ...query })
+              if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) return
+              const pageRows = Array.isArray(answer.data) ? answer.data : []
+              aligned = !overlap || pageRows[0]?.id === rows[rows.length - 1]?.id
+              rows.push(...pageRows.slice(overlap))
+              totals.add(Number(answer.total))
+              last = answer
+              // The corpus ends before the loaded count (rows were removed).
+              if (pageRows.length < pageLimit) break
+            }
+            // Corpus keys its rows by id.
+            const ids = rows.map((row) => row?.id)
+            if (aligned && totals.size === 1 && new Set(ids).size === ids.length) {
+              prefix = rows
+              ;({ total, source, stageTotals } = last)
+            }
+          }
+          if (!prefix) {
+            console.warn('Corpus refresh abandoned: the pages disagreed twice.')
+            corpusRefreshFailed = true
+            return
+          }
+          data = prefix
+        }
+      }
+      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
-      corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
-      corpusHasMore = corpusItems.length < corpusTotal
+      if (pageSignature !== null) lastCorpusPageSignature = pageSignature
+      applyCorpusCounts(total, stageTotals)
       corpusSource = source
-      if (stageTotals && typeof stageTotals === 'object') {
-        corpusStageTotals = {
-          raw: Number(stageTotals.raw || 0),
-          metadata: Number(stageTotals.metadata || 0),
-          downloaded: Number(stageTotals.downloaded || 0),
-          failed_enrichment: Number(stageTotals.failed_enrichment || 0),
-          failed_download: Number(stageTotals.failed_download || 0),
-        }
-      }
-      if (corpusSource === 'sample') {
-        if (!quiet) corpusLoadStatus = 'Showing sample corpus data.'
-      } else {
-        if (!quiet) {
-          corpusLoadStatus = corpusHasMore
-            ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
-            : `Showing ${corpusItems.length} entries.`
-        }
-      }
-      if (scrollSnapshot) {
-        await tick()
-        restoreCorpusScroll(scrollSnapshot)
+      if (!append) corpusRefreshFailed = false
+      if (!quiet) {
+        corpusLoadStatus = corpusHasMore
+          ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
+          : `Showing ${corpusItems.length} entries.`
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       handleCorpusPollForbidden(error)
+      // A newer load or a corpus switch owns the status now.
+      if (requestSeq !== corpusLoadRequestSeq) return
+      if (!append) {
+        console.warn('Corpus refresh failed', error)
+        corpusRefreshFailed = true
+      }
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
       }
@@ -4243,10 +3677,8 @@
       downloads = data
       downloadsSource = source
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-      }
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
+      downloadsSource = 'error'
     }
   }
 
@@ -4257,11 +3689,7 @@
       downloadWorker = payload
       if (!quiet) downloadWorkerStatus = ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       if (!quiet) downloadWorkerStatus = error?.message || 'Failed to load worker status.'
     }
   }
@@ -4304,44 +3732,8 @@
       }
       if (!quiet) pipelineWorkerStatus = ''
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
       if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load worker status.'
-    }
-  }
-
-  async function handleStartPipelineWorker() {
-    if (pipelineWorkerBusy) return
-    pipelineWorkerBusy = true
-    pipelineWorkerStatus = 'Starting pipeline...'
-    try {
-      await startPipelineWorker({
-        intervalSeconds: Number(pipelineWorker?.config?.intervalSeconds) || 15,
-        promoteBatchSize: Number(pipelineWorker?.config?.promoteBatchSize) || 25,
-        promoteWorkers: Number(pipelineWorker?.config?.promoteWorkers) || 6,
-        downloadBatchSize: Number(pipelineWorker?.config?.downloadBatchSize) || 5,
-        downloadWorkers: Number(pipelineWorker?.config?.downloadWorkers) || 0,
-      })
-      await Promise.all([
-        loadPipelineWorkerStatus(),
-        loadIngestStats(),
-        loadCorpus(),
-        loadDownloads(),
-        loadDownloadWorkerStatus(),
-      ])
-      pipelineWorkerStatus = 'Pipeline running.'
-    } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
-      pipelineWorkerStatus = error?.message || 'Failed to start pipeline.'
-    } finally {
-      pipelineWorkerBusy = false
     }
   }
 
@@ -4354,11 +3746,7 @@
       await loadPipelineWorkerStatus()
       pipelineWorkerStatus = 'Pipeline paused.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       pipelineWorkerStatus = error?.message || 'Failed to pause pipeline.'
     } finally {
       pipelineWorkerBusy = false
@@ -4378,11 +3766,7 @@
         downloadWorkerStatus = 'Worker started (auto throughput mode).'
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       downloadWorkerStatus = error?.message || 'Failed to start worker.'
     } finally {
       downloadWorkerBusy = false
@@ -4398,11 +3782,7 @@
       await loadDownloadWorkerStatus()
       downloadWorkerStatus = 'Worker stopped.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       downloadWorkerStatus = error?.message || 'Failed to stop worker.'
     } finally {
       downloadWorkerBusy = false
@@ -4419,11 +3799,7 @@
       await loadDownloads()
       downloadWorkerStatus = 'Batch completed (auto throughput mode).'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       downloadWorkerStatus = error?.message || 'Batch failed.'
     } finally {
       downloadWorkerBusy = false
@@ -4453,8 +3829,6 @@
       exportStatus = `${label} export downloaded.`
     } catch (error) {
       if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
         exportStatus = 'Session expired. Please sign in again.'
         return
       }
@@ -4477,19 +3851,17 @@
       link.remove()
       corpusLoadStatus = 'Download started.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       corpusLoadStatus = error?.message || 'Failed to download file.'
     }
   }
 
   async function loadAppSettings() {
     if (!isAdmin) return
+    const epoch = sessionEpoch
     try {
       const payload = await fetchAppSettings()
+      if (epoch !== sessionEpoch) return
       appSettings = payload?.settings || null
       // Secrets are never returned, so their draft fields start blank and a
       // blank field means "leave unchanged" on save.
@@ -4506,11 +3878,7 @@
         gemini_model: appSettings?.gemini_model?.value || '',
       }
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       appSettingsStatus = error?.message || 'Failed to load settings.'
       appSettingsError = true
     }
@@ -4530,11 +3898,7 @@
       appSettingsStatus = 'Settings saved. New values apply to the next pipeline run.'
       await loadAppSettings()
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       appSettingsStatus = error?.message || 'Failed to save settings.'
       appSettingsError = true
     }
@@ -4554,11 +3918,7 @@
       link.click()
       link.remove()
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       ingestRunsStatus = error?.message || 'Failed to download the seed document.'
     } finally {
       if (objectUrl) URL.revokeObjectURL(objectUrl)
@@ -4583,25 +3943,25 @@
       URL.revokeObjectURL(url)
       seedActionStatus = `Downloaded ${filename}.`
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401) return
       seedActionStatus = error?.message || 'Failed to download seed candidate file.'
     }
   }
 
   function canDownloadSeedCandidate(candidate) {
-    const state = seedCandidateState(candidate)
+    const state = workState(candidate?.state)
     const workId = Number(candidate?.downloaded_work_id)
     return (state === 'downloaded' || state === 'downloaded_elsewhere') &&
       Number.isFinite(workId) &&
       workId > 0 &&
       candidate?.file_available === true
   }
+  // A reconnect (force = false) never hydrates over content, rendered or
+  // buffered; only the first connect with nothing and the explicit refreshes
+  // (Refresh from file, type/filter change) replace the view with the tail.
   async function hydrateLogsFromTail({ force = false } = {}) {
-    if (!force && logs.length > 0) return
+    if (!force && (logs.length > 0 || logBuffer.length > 0)) return
+    const epoch = logsScopeEpoch
     logsTailStatus = 'Loading recent logs...'
     try {
       const payload = await fetchLogsTail({
@@ -4611,25 +3971,34 @@
         cursor: 0,
         corpusId: getLogsCorpusId(),
       })
+      if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
-      logs = entries.slice(-maxLogHistory)
+      // The tail replaces the view: pending lines are dropped, not appended
+      // after it (the backend persists a line before broadcasting it, so the
+      // tail may hold them). A line that arrived between the request and this
+      // answer is dropped from the view as before batching; it is in the file
+      // and the next refresh shows it.
+      clearLogBuffer()
+      logs = toLogEntries(entries.slice(-maxLogHistory))
       logsCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
         : logs.length
       logsHasMore = Boolean(payload?.has_more)
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401 || epoch !== logsScopeEpoch) return
       logsTailStatus = error?.message || 'Failed to load persisted logs.'
     }
   }
 
   async function loadOlderLogs() {
     if (logsLoadingOlder || !logsHasMore) return
+    // The cursor counts the newest lines already shown; buffered lines are
+    // in the file too, so they go into the view (and the cursor) first, or
+    // the page would repeat lines and skip as many older ones.
+    flushLogs()
+    const epoch = logsScopeEpoch
+    const cursorAtRequest = logsCursor
     logsLoadingOlder = true
     logsTailStatus = 'Loading older logs...'
     try {
@@ -4637,27 +4006,68 @@
         type: logsType,
         lines: maxLogs,
         includeRotated: true,
-        cursor: logsCursor,
+        cursor: cursorAtRequest,
         corpusId: getLogsCorpusId(),
       })
+      if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
       if (entries.length > 0) {
-        logs = [...entries, ...logs].slice(-maxLogHistory)
+        logs = [...toLogEntries(entries), ...logs].slice(-maxLogHistory)
       }
-      logsCursor = Number.isFinite(Number(payload?.next_cursor))
+      // Lines flushed while the request was pending advanced the cursor;
+      // keep that advance on top of the answer's.
+      const advanced = logsCursor - cursorAtRequest
+      const nextCursor = Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
-        : logsCursor + entries.length
+        : cursorAtRequest + entries.length
+      logsCursor = nextCursor + advanced
       logsHasMore = Boolean(payload?.has_more)
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} older log lines.` : 'No older logs found.'
     } catch (error) {
-      if (error?.status === 401) {
-        authStatus = 'unauthenticated'
-        setAuthToken('')
-        return
-      }
+      if (error?.status === 401 || epoch !== logsScopeEpoch) return
       logsTailStatus = error?.message || 'Failed to load older logs.'
     } finally {
-      logsLoadingOlder = false
+      if (epoch === logsScopeEpoch) logsLoadingOlder = false
+    }
+  }
+
+  function handleExtractionFrame(frame) {
+    const extractionEvent = extractionEventFromObject(frame)
+    if (!extractionEvent) return
+    const currentCorpus = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
+    const corpusMatches = extractionEvent.corpusId === null || currentCorpus === null || extractionEvent.corpusId === currentCorpus
+    if (extractionEvent.event === 'started') {
+      updateUploadByBackendFilename(extractionEvent.filename, {
+        status: 'extracting',
+        message: 'Extracting bibliography',
+      })
+      if (corpusMatches) {
+        ensureExtractionRunActive(extractionEvent.baseName, extractionEvent.filename)
+      }
+      return
+    }
+
+    updateUploadByBackendFilename(
+      extractionEvent.filename,
+      extractionEvent.status === 'success'
+        ? { status: 'extracted', message: 'Extraction complete' }
+        : { status: 'failed', message: 'Extraction failed' }
+    )
+    const baseMatches = extractionProgress.baseName && extractionEvent.baseName === extractionProgress.baseName
+    const fileMatches = extractionProgress.backendFilename && extractionEvent.filename === extractionProgress.backendFilename
+    if (extractionProgress.active && corpusMatches && (baseMatches || fileMatches)) {
+      updateExtractionProgress({
+        phase: extractionEvent.status === 'success' ? 'finalizing' : 'completed',
+        detail: extractionEvent.status === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
+        percent: extractionEvent.status === 'success' ? 98 : 100,
+        indeterminate: false,
+        backendDone: true,
+      })
+      if (extractionEvent.status === 'success') {
+        void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
+      } else {
+        finishExtractionProgress()
+      }
     }
   }
 
@@ -4694,64 +4104,20 @@
       }
       ws.onmessage = (event) => {
         if (logsSocket !== ws) return
-        const promotionEvent = parsePromotionEventMessage(event.data)
-        if (promotionEvent) {
-          queuePromotionAnimation(promotionEvent)
-          return
-        }
-        const extractionEvent = parseExtractionEventMessage(event.data)
-        if (extractionEvent) {
-          const currentCorpus = Number.isFinite(Number(currentCorpusId)) ? Number(currentCorpusId) : null
-          const corpusMatches = extractionEvent.corpusId === null || currentCorpus === null || extractionEvent.corpusId === currentCorpus
-          if (extractionEvent.event === 'started') {
-            updateUploadByBackendFilename(extractionEvent.filename, {
-              status: 'extracting',
-              message: 'Extracting bibliography',
-            })
-            if (corpusMatches) {
-              ensureExtractionRunActive(extractionEvent.baseName, extractionEvent.filename)
-            }
-            return
-          }
-
-          updateUploadByBackendFilename(
-            extractionEvent.filename,
-            extractionEvent.status === 'success'
-              ? { status: 'extracted', message: 'Extraction complete' }
-              : { status: 'failed', message: 'Extraction failed' }
-          )
-          const baseMatches = extractionProgress.baseName && extractionEvent.baseName === extractionProgress.baseName
-          const fileMatches = extractionProgress.backendFilename && extractionEvent.filename === extractionProgress.backendFilename
-          if (extractionProgress.active && corpusMatches && (baseMatches || fileMatches)) {
-            updateExtractionProgress({
-              phase: extractionEvent.status === 'success' ? 'finalizing' : 'completed',
-              detail: extractionEvent.status === 'success' ? 'Finalizing extracted entries...' : 'Extraction failed.',
-              percent: extractionEvent.status === 'success' ? 98 : 100,
-              indeterminate: false,
-              backendDone: true,
-            })
-            if (extractionEvent.status === 'success') {
-              void finalizeExtractionAfterBackendCompletion('No bibliography entries found in this PDF.')
-            } else {
-              latestEntriesStatus = 'Extraction failed.'
-              finishExtractionProgress()
-            }
-          }
-          return
-        }
         const line = event.data
+        // JSON frames are parsed once: extraction events drive the extraction
+        // card, every other JSON frame is ignored and never becomes a log row.
+        const msg = typeof line === 'string' && line.startsWith('{') ? tryParseJson(line) : null
+        if (msg) {
+          if (msg.kind === 'extraction') handleExtractionFrame(msg)
+          return
+        }
         if (typeof line === 'string' && line.startsWith('{')) return
         if (typeof line === 'string' && line.startsWith('WebSocket connection established')) return
         if (!isLogLineForCurrentCorpus(line)) return
         updateExtractionProgressFromLog(line)
         if (logsType !== 'pipeline') return
-        const hadLines = logs.length > 0
-        logs = [...logs, line].slice(-maxLogHistory)
-        if (logsCursor > 0) {
-          logsCursor = Math.min(maxLogHistory, logsCursor + 1)
-        } else if (!hadLines) {
-          logsCursor = logs.length
-        }
+        pushLogLine(line)
         if (shouldTriggerPipelineRefresh(line)) {
           const isWorkerTick =
             String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
@@ -4785,6 +4151,9 @@
     hydrateLogsFromTail({ force: true })
   }
 
+  // Transport teardown only: buffered lines survive a reconnect. They are
+  // dropped with the log state (resetLogState, resetFrontendState on sign-out
+  // and corpus switch).
   function disconnectLogs() {
     if (logsReconnectTimer) {
       clearTimeout(logsReconnectTimer)
@@ -4806,22 +4175,6 @@
     logsType = next === 'app' ? 'app' : 'pipeline'
     resetLogState()
     await hydrateLogsFromTail({ force: true })
-  }
-
-  function buildDegreeMap(nodes, edges) {
-    const map = new Map()
-    for (const node of nodes) {
-      map.set(node.id, 0)
-    }
-    for (const edge of edges) {
-      map.set(edge.source, (map.get(edge.source) || 0) + 1)
-      map.set(edge.target, (map.get(edge.target) || 0) + 1)
-    }
-    return map
-  }
-
-  function clamp(value, min, max) {
-    return Math.min(Math.max(value, min), max)
   }
 
   $: tabIds = new Set(tabGroups.flatMap(group => group.tabs).map(tab => tab.id))
@@ -4851,19 +4204,16 @@
     }
   }
 
-  function setActiveTab(tabId, { replace = false } = {}) {
+  // `loadedTab`: the tab a refreshAll just loaded (sign-in, boot); landing on
+  // it again does not fetch everything a second time.
+  function setActiveTab(tabId, { replace = false, loadedTab = null } = {}) {
     const normalized = normalizeTab(tabId)
     const safeTab = tabIds.has(normalized) ? normalized : 'workspace'
     navigationRevision += 1
     activeTab = safeTab
+    if (safeTab === 'logs') flushLogs()
     updateHash(safeTab, replace)
-    if (safeTab === 'workspace' && pendingPromotionEvents.length > 0 && !promotionFlushTimer) {
-      promotionFlushTimer = window.setTimeout(() => {
-        promotionFlushTimer = null
-        flushPromotionAnimations()
-      }, 80)
-    }
-    refreshForActiveTab(safeTab)
+    if (loadedTab === null || normalizeTab(loadedTab) !== safeTab) void refreshForActiveTab(safeTab)
     // The cadence depends on the tab (e.g. corpus has none, workspace is idle-polled).
     scheduleRefresh()
   }
@@ -4904,15 +4254,24 @@
     }
     window.addEventListener('hashchange', onHashChange)
 
+    // `focus` and `visibilitychange` usually fire together: one refresh per
+    // 250 ms window.
+    let focusRefreshTimer = null
     const onFocusOrVisible = () => {
       if (document.visibilityState === 'hidden') {
+        if (focusRefreshTimer) clearTimeout(focusRefreshTimer)
+        focusRefreshTimer = null
         scheduleRefresh()
         return
       }
-      // Becoming visible refreshes once; the regular cadence resumes afterwards.
-      // Log lines that arrived while hidden left the data dirty: run their
-      // trailing refresh now instead of at the next regular cycle.
-      void refreshForActiveTab(activeTab).finally(() => scheduleRefresh({ delayMs: refreshDirty ? REFRESH_TRAILING_MS : null }))
+      if (focusRefreshTimer) return
+      focusRefreshTimer = setTimeout(() => {
+        focusRefreshTimer = null
+        // Becoming visible refreshes once; the regular cadence resumes afterwards.
+        // Log lines that arrived while hidden left the data dirty: run their
+        // trailing refresh now instead of at the next regular cycle.
+        void refreshForActiveTab(activeTab).finally(() => scheduleRefresh({ delayMs: refreshDirty ? REFRESH_TRAILING_MS : null }))
+      }, 250)
     }
     window.addEventListener('focus', onFocusOrVisible)
     document.addEventListener('visibilitychange', onFocusOrVisible)
@@ -4938,19 +4297,17 @@
       window.removeEventListener('hashchange', onHashChange)
       window.removeEventListener('focus', onFocusOrVisible)
       document.removeEventListener('visibilitychange', onFocusOrVisible)
+      if (focusRefreshTimer) clearTimeout(focusRefreshTimer)
       reducedMotionMediaQuery?.removeEventListener?.('change', onReducedMotionChange)
       reducedMotionMediaQuery = null
       disconnectLogs()
+      clearLogBuffer()
       refreshDisposed = true
       if (refreshTimer) {
         clearTimeout(refreshTimer)
         refreshTimer = null
       }
       if (import.meta.env.DEV) delete window.__dtRefresh
-      if (promotionFlushTimer) {
-        clearTimeout(promotionFlushTimer)
-        promotionFlushTimer = null
-      }
     }
   })
 </script>
@@ -5021,7 +4378,7 @@
       {:else}
         <h1>Sign in</h1>
         <p class="subtitle">Use your username and password to access corpora.</p>
-        <form class="login-form" on:submit={handleLogin}>
+        <form class="login-form" data-testid="login-form" on:submit={handleLogin}>
           <label>
             Username
             <input type="text" bind:value={loginUsername} autocomplete="username" required />
@@ -5055,9 +4412,12 @@
           </p>
         </div>
         <div class="header-stats">
-          <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
-          <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
-          <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+          <!-- The graph tab does not load these counts (resourcesFor), so it does not show them. -->
+          {#if activeTab !== 'graph'}
+            <span title="Items collected across all seeds"><strong>{itemsFoundCount}</strong> items found</span>
+            <span title="Items promoted into the corpus"><strong>{itemsPromotedCount}</strong> items promoted</span>
+            <span title="Items with a downloaded PDF"><strong>{pipelineDownloadedCount}</strong> items downloaded</span>
+          {/if}
           <span title="Whether the app's backend server answered the most recent request">backend <strong class:status-bad={apiStatus === 'offline'}>{backendStatusLabel}</strong></span>
         </div>
         <div class="header-main__top">
@@ -5074,12 +4434,15 @@
           </label>
           <div class="header-user header-user--compact">
             <span class="eyebrow">Signed in</span>
-            <strong>{authUser?.username}</strong>
+            <strong data-testid="auth-user">{authUser?.username}</strong>
             <button class="secondary logout-button" type="button" on:click={handleLogout}>
               Log out
             </button>
           </div>
         </div>
+        {#if corpusSwitchError && activeTab !== 'upstream'}
+          <p class="error small" role="alert" data-testid="corpus-switch-error">{corpusSwitchError}</p>
+        {/if}
       </div>
     </header>
 
@@ -5448,8 +4811,14 @@
               {#each seedSources as source (seedSourceId(source))}
                 {@const sourceId = seedSourceId(source)}
                 {@const isExpanded = expandedSeedSourceId === sourceId}
-                {@const sourceCandidates = sortSeedCandidates(source, getSeedCandidatesForSource(source), seedSorts)}
-                {@const selectionVersion = seedSelectionVersions[sourceId] || 0}
+                {@const loaded = seedCandidatesBySource[sourceId]}
+                {@const sourceCandidates = sortSeedCandidates(source, loaded || EMPTY_LIST, seedSorts)}
+                {@const page = seedPage(source, seedPages)}
+                {@const selection = seedSelections[sourceId] || EMPTY_SET}
+                {@const selectedCount = seedAllSelected[sourceId] ? page.total : selection.size}
+                {@const loadedSelectableCount = selectableSeedCount(source, loaded || EMPTY_LIST, includeDownstream, relatedDepthDownstream)}
+                {@const selectableCount = estimatedSelectableSeedCount(source, seedPages[sourceId], loaded, loadedSelectableCount, includeDownstream, relatedDepthDownstream)}
+                {@const fullySelected = selectableCount > 0 && selectedCount === selectableCount}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
                     class="seed-source__summary"
@@ -5469,24 +4838,26 @@
                   >
                     <div class="seed-source__summary-main">
                       <div class="seed-source__heading">
-                        {#key `${sourceId}:summary-selection:${selectionVersion}`}
-                          <label
-                            class="seed-source__select"
-                            title={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)
-                              ? 'Clear all items in this seed'
-                              : 'Select all items in this seed'}
-                          >
-                            <input
-                              type="checkbox"
-                              checked={estimatedSelectableSeedCount(source) > 0 && selectedSeedCount(source) === estimatedSelectableSeedCount(source)}
-                              disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
-                              aria-label="Select all items in this seed"
-                              on:click|stopPropagation
-                              on:keydown|stopPropagation
-                              on:change|stopPropagation={(e) => setAllSeedCandidatesSelected(source, e.currentTarget.checked)}
-                            />
-                          </label>
-                        {/key}
+                        <label
+                          class="seed-source__select"
+                          title={fullySelected ? 'Clear all items in this seed' : 'Select all items in this seed'}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={fullySelected}
+                            disabled={seedActionBusy || selectableCount === 0}
+                            aria-label="Select all items in this seed"
+                            on:click|stopPropagation
+                            on:keydown|stopPropagation
+                            on:change|stopPropagation={async (e) => {
+                              const input = e.currentTarget
+                              await setAllSeedCandidatesSelected(source, input.checked)
+                              // The click flipped the DOM state; if the model did not follow
+                              // (nothing selectable loaded), put it back.
+                              input.checked = isSeedFullySelected(source)
+                            }}
+                          />
+                        </label>
                         {#if source.seed_kind === 'snowball'}
                           <span
                             class="tag snowball"
@@ -5511,30 +4882,28 @@
                       {/if}
                     </div>
                     <div class="seed-source__summary-side">
-                      {#key `${sourceId}:summary-actions:${selectionVersion}`}
-                        <div class="seed-source__summary-actions">
-                          <button
-                            class="seed-source__action seed-source__action--promote"
-                            type="button"
-                            disabled={seedActionBusy || estimatedSelectableSeedCount(source) === 0}
-                            title={estimatedSelectableSeedCount(source) === 0 ? 'No promotable items remain in this seed' : 'Promote all promotable items from this seed'}
-                            aria-label="Promote all promotable items"
-                            on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
-                          >
-                            →
-                          </button>
-                          <button
-                            class="seed-source__action seed-source__action--remove"
-                            type="button"
-                            disabled={seedActionBusy}
-                            title="Remove this seed and its items"
-                            aria-label="Remove seed"
-                            on:click|stopPropagation={() => handleRemoveSeedSource(source)}
-                          >
-                            ×
-                          </button>
-                        </div>
-                      {/key}
+                      <div class="seed-source__summary-actions">
+                        <button
+                          class="seed-source__action seed-source__action--promote"
+                          type="button"
+                          disabled={seedActionBusy || selectableCount === 0}
+                          title={selectableCount === 0 ? 'No promotable items remain in this seed' : 'Promote all promotable items from this seed'}
+                          aria-label="Promote all promotable items"
+                          on:click|stopPropagation={() => handlePromoteWholeSeedSource(source)}
+                        >
+                          →
+                        </button>
+                        <button
+                          class="seed-source__action seed-source__action--remove"
+                          type="button"
+                          disabled={seedActionBusy}
+                          title="Remove this seed and its items"
+                          aria-label="Remove seed"
+                          on:click|stopPropagation={() => handleRemoveSeedSource(source)}
+                        >
+                          ×
+                        </button>
+                      </div>
                       <div class="pill-row">
                         <span class="pill" title="Total items found in this seed">{source.candidate_count} items</span>
                         {#if source.candidate_count - (source.state_counts?.in_corpus || 0) > 0}
@@ -5553,190 +4922,191 @@
 
                   {#if isExpanded}
                       <div class="seed-source__body">
-                        {#key `${sourceId}:toolbar:${selectionVersion}:${downstreamPromotesAll}`}
-                          <div class="table-toolbar">
-                            <div class="table-toolbar-left">
-                              <span class="muted">
-                                {#if seedAllSelected[sourceId]}
-                                  All {seedPage(source).total.toLocaleString('en-US')} items selected
-                                {:else}
-                                  Selected: {selectedSeedCount(source)} / {selectableSeedCount(source)} selectable
-                                {/if}
-                              </span>
-                              <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
-                              <button class="secondary" type="button" on:click={() => setAllSeedCandidatesSelected(source, true)} disabled={seedActionBusy}>Select all</button>
-                              <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
-                            </div>
-                            <div class="table-toolbar-right">
-                              <div class="toolbar-actions">
-                                <button class="secondary" type="button" on:click={() => handleDismissSelectedSeed(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
-                                  Dismiss selected
-                                </button>
-                                <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedSeedCount(source) === 0}>
-                                  Promote to Corpus
-                                </button>
-                              </div>
+                        <div class="table-toolbar">
+                          <div class="table-toolbar-left">
+                            <span class="muted">
+                              {#if seedAllSelected[sourceId]}
+                                All {page.total.toLocaleString('en-US')} items selected
+                              {:else}
+                                Selected: {selectedCount} / {loadedSelectableCount} selectable
+                              {/if}
+                            </span>
+                            <ColumnPicker table="seed" visibility={seedColumnVisibility} onChange={updateSeedColumns} />
+                            <button class="secondary" type="button" on:click={() => setAllSeedCandidatesSelected(source, true)} disabled={seedActionBusy}>Select all</button>
+                            <button class="secondary" type="button" on:click={() => clearSeedSelection(source)} disabled={seedActionBusy}>Clear</button>
+                          </div>
+                          <div class="table-toolbar-right">
+                            <div class="toolbar-actions">
+                              <button class="secondary" type="button" on:click={() => handleDismissSelectedSeed(source)} disabled={seedActionBusy || selectedCount === 0}>
+                                Dismiss selected
+                              </button>
+                              <button class="primary" type="button" on:click={() => handlePromoteSeedSource(source)} disabled={seedActionBusy || selectedCount === 0}>
+                                Promote to Corpus
+                              </button>
                             </div>
                           </div>
-                        {/key}
+                        </div>
 
                         {#if seedCandidatesLoading[sourceId]}
                           <p class="muted">Loading items...</p>
                         {:else if sourceCandidates.length === 0}
                           <p class="muted">No active items remain in this seed.</p>
                         {:else}
-                          {#key `${sourceId}:selection:${selectionVersion}:${downstreamPromotesAll}`}
-                            <div class="table table-scroll seed-candidate-table">
-                              <div class="table-row header" style={seedGridStyle}>
-                                <span class="ingest-select-cell" aria-hidden="true"></span>
+                          <div class="table table-scroll seed-candidate-table">
+                            <div class="table-row header" style={seedGridStyle}>
+                              <span class="ingest-select-cell" aria-hidden="true"></span>
+                              {#each seedActiveColumns as column (column.key)}
+                                {@const sortDisabled = (column.key === 'metadata' || column.key === 'download') && source.source_type === 'search' && page.total > 2000}
+                                <span title={column.hint || ''}>
+                                  {#if column.sortable}
+                                    <button
+                                      class="table-sort"
+                                      type="button"
+                                      disabled={sortDisabled}
+                                      title={sortDisabled ? 'Sorting by state needs every item resolved; not available above 2,000 items' : ''}
+                                      on:click={() => toggleSeedSort(source, column.key)}
+                                    >
+                                      {column.label}{seedSortIndicator(source, column.key, seedSorts)}
+                                    </button>
+                                  {:else}
+                                    {column.label}
+                                  {/if}
+                                </span>
+                              {/each}
+                            </div>
+                            {#each sourceCandidates as candidate (candidate.candidate_key)}
+                              {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
+                              {@const candidateKey = String(candidate?.candidate_key || '')}
+                              {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
+                              {@const checked = selection.has(candidateKey)}
+                              {@const selectable = isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
+                              <div
+                                data-testid="seed-candidate-row"
+                                class={`table-row clickable ${checked ? 'selected' : ''} ${active ? 'active-row' : ''}`}
+                                style={seedGridStyle}
+                                on:click={(e) => {
+                                  if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                                  setSelectedSeedCandidate(source, candidate);
+                                }}
+                                on:keydown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
+                                    e.preventDefault();
+                                    setSelectedSeedCandidate(source, candidate);
+                                  }
+                                }}
+                                role="button"
+                                aria-pressed={active}
+                                tabindex="0"
+                              >
+                                <span class="ingest-select-cell">
+                                  {#if selectable}
+                                    <input
+                                      type="checkbox"
+                                      {checked}
+                                      on:click|stopPropagation
+                                      on:change={(e) => {
+                                        setSelectedSeedCandidate(source, candidate);
+                                        toggleSeedCandidateSelection(source, candidate);
+                                        e.currentTarget.checked = getSeedSelectionForSource(source).has(candidateKey);
+                                      }}
+                                    />
+                                  {:else}
+                                    <input type="checkbox" disabled />
+                                  {/if}
+                                </span>
                                 {#each seedActiveColumns as column (column.key)}
-                                  {@const sortDisabled = (column.key === 'metadata' || column.key === 'download') && source.source_type === 'search' && seedPage(source).total > 2000}
-                                  <span title={column.hint || ''}>
-                                    {#if column.sortable}
+                                  {@const text = cellText(candidate, column.key, SEED_CELL)}
+                                  {#if column.key === 'corpus'}
+                                    <span class="seed-candidate__corpus-cell">
+                                      {#if isSeedCandidateInCorpus(candidate)}
+                                        <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
+                                      {:else if selectable}
+                                        <button
+                                          class="seed-candidate__promote"
+                                          type="button"
+                                          title="Promote this item to the corpus using the current Promotion Settings"
+                                          aria-label={`Promote ${formatTitle(candidate)} to corpus`}
+                                          disabled={seedActionBusy}
+                                          on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                        >→ Promote</button>
+                                      {/if}
+                                    </span>
+                                  {:else if column.key === 'download' && canDownloadSeedCandidate(candidate)}
+                                    <span>
                                       <button
-                                        class="table-sort"
+                                        class="link seed-download-link"
                                         type="button"
-                                        disabled={sortDisabled}
-                                        title={sortDisabled ? 'Sorting by state needs every item resolved; not available above 2,000 items' : ''}
-                                        on:click={() => toggleSeedSort(source, column.key)}
-                                      >
-                                        {column.label}{seedSortIndicator(source, column.key, seedSorts)}
-                                      </button>
-                                    {:else}
-                                      {column.label}
-                                    {/if}
-                                  </span>
+                                        title={`Download the file from work ${candidate.downloaded_work_id}`}
+                                        on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
+                                      >{text} ⤓</button>
+                                    </span>
+                                  {:else if column.key === 'authors'}
+                                    <span title={formatAuthors(candidate)}>{text}</span>
+                                  {:else}
+                                    <span title={text}>{text}</span>
+                                  {/if}
                                 {/each}
                               </div>
-                              {#each sourceCandidates as candidate (candidate.candidate_key)}
-                                {@const activeCandidateKey = String(selectedSeedCandidateKeys[sourceId] || '')}
-                                {@const candidateKey = String(candidate?.candidate_key || '')}
-                                {@const active = activeCandidateKey !== '' && activeCandidateKey === candidateKey}
-                                <div
-                                  class={`table-row clickable ${isSeedCandidateSelected(source, candidate) ? 'selected' : ''} ${active ? 'active-row' : ''}`}
-                                  style={seedGridStyle}
-                                  on:click={(e) => {
-                                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                                    setSelectedSeedCandidate(source, candidate);
-                                  }}
-                                  on:keydown={(e) => {
-                                    if (e.key === 'Enter' || e.key === ' ') {
-                                      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                                      e.preventDefault();
-                                      setSelectedSeedCandidate(source, candidate);
-                                    }
-                                  }}
-                                  role="button"
-                                  aria-pressed={active}
-                                  tabindex="0"
-                                >
-                                  <span class="ingest-select-cell">
-                                    {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                      <input
-                                        type="checkbox"
-                                        checked={isSeedCandidateSelected(source, candidate)}
-                                        on:click|stopPropagation
-                                        on:change={() => {
-                                          setSelectedSeedCandidate(source, candidate);
-                                          toggleSeedCandidateSelection(source, candidate);
-                                        }}
-                                      />
-                                    {:else}
-                                      <input type="checkbox" disabled />
-                                    {/if}
-                                  </span>
-                                  {#each seedActiveColumns as column (column.key)}
-                                    {#if column.key === 'corpus'}
-                                      <span class="seed-candidate__corpus-cell">
-                                        {#if isSeedCandidateInCorpus(candidate)}
-                                          <span class="seed-candidate__promoted-check" title="Added to corpus" aria-label="Added to corpus">✓</span>
-                                        {:else if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                          <button
-                                            class="seed-candidate__promote"
-                                            type="button"
-                                            title="Promote this item to the corpus using the current Promotion Settings"
-                                            aria-label={`Promote ${formatTitle(candidate)} to corpus`}
-                                            disabled={seedActionBusy}
-                                            on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
-                                          >→ Promote</button>
+                              {#if active}
+                                <div class="seed-inline-detail-row">
+                                  <div class="inline-detail-card">
+                                    <div class="inline-detail-main">
+                                      <div class="inline-detail-meta-row">
+                                        <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
+                                          Stage: {seedCandidateTag(candidate).label}
+                                        </span>
+                                        <span class="inline-detail-chip">Year: {candidate.year || '-'}</span>
+                                        <span class="inline-detail-chip">Author: {formatAuthors(candidate) || '-'}</span>
+                                        <span class="inline-detail-chip">Source: {candidate.source || candidate.publisher || '-'}</span>
+                                        <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
+                                          In Corpus: {isSeedCandidateInCorpus(candidate) ? 'Yes' : 'No'}
+                                        </span>
+                                        {#if candidate?.doi}
+                                          <a class="inline-detail-link" href={doiHref(candidate.doi)} target="_blank" rel="noreferrer">DOI</a>
                                         {/if}
-                                      </span>
-                                    {:else if column.key === 'download' && canDownloadSeedCandidate(candidate)}
-                                      <span>
-                                        <button
-                                          class="link seed-download-link"
-                                          type="button"
-                                          title={`Download the file from work ${candidate.downloaded_work_id}`}
-                                          on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
-                                        >{seedCellText(candidate, column.key)} ⤓</button>
-                                      </span>
-                                    {:else if column.key === 'authors'}
-                                      <span title={formatAuthors(candidate)}>{seedCellText(candidate, column.key)}</span>
-                                    {:else}
-                                      <span title={seedCellText(candidate, column.key)}>{seedCellText(candidate, column.key)}</span>
-                                    {/if}
-                                  {/each}
-                                </div>
-                                {#if active}
-                                  <div class="seed-inline-detail-row">
-                                    <div class="inline-detail-card">
-                                      <div class="inline-detail-main">
-                                        <div class="inline-detail-meta-row">
-                                          <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
-                                            Stage: {seedCandidateTag(candidate).label}
+                                        {#if candidate?.openalex_id}
+                                          <a class="inline-detail-link" href={openAlexHref(candidate.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
+                                        {/if}
+                                      </div>
+                                      <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
+                                        <span class="seed-refs-cell__down">↓ Refs: {cellText(candidate, 'refs', SEED_CELL)}</span>
+                                        <span class="seed-refs-cell__up">↑ Cited: {cellText(candidate, 'cited_by', SEED_CELL)}</span>
+                                      </div>
+                                      <div class="inline-detail-actions">
+                                        {#if selectable}
+                                          <button
+                                            class="primary"
+                                            type="button"
+                                            disabled={seedActionBusy}
+                                            title={expansionSummary
+                                              ? `Promote just this item (reference expansion is on: ${expansionSummary})`
+                                              : 'Promote just this item into the corpus'}
+                                            on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
+                                          >
+                                            Promote this item
+                                          </button>
+                                          {#if expansionSummary}
+                                            <span class="muted small">Pulls in related works: {expansionSummary}, max {maxRelated}/paper.</span>
+                                          {/if}
+                                        {:else}
+                                          <span class="muted small">
+                                            {isSeedCandidateInCorpus(candidate) ? 'Already in this corpus.' : 'Already downloaded.'}
                                           </span>
-                                          <span class="inline-detail-chip">Year: {candidate.year || '-'}</span>
-                                          <span class="inline-detail-chip">Author: {formatAuthors(candidate) || '-'}</span>
-                                          <span class="inline-detail-chip">Source: {candidate.source || candidate.publisher || '-'}</span>
-                                          <span class={`inline-detail-chip ${isSeedCandidateInCorpus(candidate) ? 'inline-detail-chip--active' : ''}`}>
-                                            In Corpus: {isSeedCandidateInCorpus(candidate) ? 'Yes' : 'No'}
-                                          </span>
-                                          {#if candidate?.doi}
-                                            <a class="inline-detail-link" href={doiHref(candidate.doi)} target="_blank" rel="noreferrer">DOI</a>
-                                          {/if}
-                                          {#if candidate?.openalex_id}
-                                            <a class="inline-detail-link" href={openAlexHref(candidate.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
-                                          {/if}
-                                        </div>
-                                        <div class="seed-refs-cell" title="Downstream: works this item cites. Upstream: works citing it.">
-                                          <span class="seed-refs-cell__down">↓ Refs: {seedCellText(candidate, 'refs')}</span>
-                                          <span class="seed-refs-cell__up">↑ Cited: {seedCellText(candidate, 'cited_by')}</span>
-                                        </div>
-                                        <div class="inline-detail-actions">
-                                          {#if isSeedCandidateSelectable(candidate, includeDownstream, relatedDepthDownstream)}
-                                            <button
-                                              class="primary"
-                                              type="button"
-                                              disabled={seedActionBusy}
-                                              title={expansionSummary
-                                                ? `Promote just this item (reference expansion is on: ${expansionSummary})`
-                                                : 'Promote just this item into the corpus'}
-                                              on:click|stopPropagation={() => handlePromoteSingleSeedCandidate(source, candidate)}
-                                            >
-                                              Promote this item
-                                            </button>
-                                            {#if expansionSummary}
-                                              <span class="muted small">Pulls in related works: {expansionSummary}, max {maxRelated}/paper.</span>
-                                            {/if}
-                                          {:else}
-                                            <span class="muted small">
-                                              {isSeedCandidateInCorpus(candidate) ? 'Already in this corpus.' : 'Already downloaded.'}
-                                            </span>
-                                          {/if}
-                                        </div>
+                                        {/if}
                                       </div>
                                     </div>
                                   </div>
-                                {/if}
-                              {/each}
+                                </div>
+                              {/if}
+                            {/each}
+                          </div>
+                          {#if page.total > sourceCandidates.length}
+                            <div class="seed-table-footer">
+                              <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {page.total.toLocaleString('en-US')}</span>
+                              <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId] || seedAppending[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
                             </div>
-                            {#if seedPage(source).total > sourceCandidates.length}
-                              <div class="seed-table-footer">
-                                <span class="muted small">Showing {sourceCandidates.length.toLocaleString('en-US')} of {seedPage(source).total.toLocaleString('en-US')}</span>
-                                <button class="secondary" type="button" disabled={seedCandidatesLoading[sourceId] || seedAppending[sourceId]} on:click|stopPropagation={() => loadMoreSeedCandidates(source)}>Show more</button>
-                              </div>
-                            {/if}
-                          {/key}
+                          {/if}
                         {/if}
                       </div>
                   {/if}
@@ -5751,6 +5121,7 @@
             <div class="corpus-workspace-shell">
               <Corpus
                 {corpusSource}
+                {corpusRefreshFailed}
                 {corpusTotal}
                 {corpusItems}
                 {rawTotal}
@@ -5759,14 +5130,11 @@
                 {failedEnrichmentTotal}
                 {failedDownloadTotal}
                 {bucketLabel}
-                {formatAuthors}
-                {formatAuthorsShort}
                 {corpusFilterQuery}
                 {handleCorpusFilterInput}
                 {handleRemoveCorpusWork}
                 {handleRemoveSelectedCorpusWorks}
                 {toggleCorpusSort}
-                {corpusSortIndicator}
                 {corpusSort}
                 {doiHref}
                 {openAlexHref}
@@ -5822,7 +5190,6 @@
           browse={upstreamBrowse}
           selectedAssignedCorpusId={selectedUpstreamAssignedCorpusId}
           toggleAssignedCorpus={handleToggleUpstreamAssignedCorpus}
-          {formatAuthors}
           {doiHref}
           {openAlexHref}
         />
@@ -5864,402 +5231,6 @@
         />
       {/if}
 
-      {#if activeTab === 'ingest'}
-        <div class="card" data-testid="ingest-panel">
-          <h2>Seed document</h2>
-          <p>Upload PDFs (extract bibliographies) or BibTeX/JSON files (imported straight into the corpus), and select entries for further processing.</p>
-          <div class="uploader">
-            <label class="upload-drop">
-              <input type="file" multiple accept=".pdf,.bib,.json" on:change={handleFiles} />
-              <span>Drop PDF, BibTeX, or JSON files to add (uploads start automatically)</span>
-            </label>
-          </div>
-          <div class="upload-list">
-            {#if uploads.length === 0}
-              <p class="muted">No files selected yet.</p>
-            {:else}
-              {#each uploads as item}
-                <div class="upload-item">
-                  <div>
-                    <strong>{item.name}</strong>
-                    <span>{item.message || formatBytes(item.size)}</span>
-                  </div>
-                  <div class="upload-actions">
-                    <span class={`status ${item.status}`}>{item.status}</span>
-                    {#if !seedKindForName(item.name)}
-                      <button
-                        type="button"
-                        on:click={() => extractForItem(item)}
-                        disabled={!item.backendFilename || item.status === 'queued' || item.status === 'extracting'}
-                      >
-                        Extract
-                      </button>
-                    {/if}
-                  </div>
-                </div>
-              {/each}
-            {/if}
-          </div>
-        </div>
-
-        <div class="card">
-          <h3>Extracted entries</h3>
-          {#if latestEntriesStatus}
-            <p class="muted">{latestEntriesStatus}</p>
-          {/if}
-          {#if extractionProgress.active && isWaitingLatestEntries}
-            <div class="extract-progress">
-              <div
-                class={`extract-progress-track ${extractionProgress.indeterminate ? 'indeterminate' : ''}`}
-                role="progressbar"
-                aria-label="Extraction progress"
-                aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow={Math.round(extractionProgress.percent || 0)}
-              >
-                <div
-                  class="extract-progress-bar"
-                  style={extractionProgress.indeterminate ? '' : `width: ${Math.max(2, Math.min(100, extractionProgress.percent || 0))}%`}
-                ></div>
-              </div>
-              {#if extractionProgress.detail}
-                <p class="muted small">{extractionProgress.detail}</p>
-              {/if}
-            </div>
-          {/if}
-          {#if latestEntriesBase}
-            <p class="muted">Source: {formatSeedDocumentLabel(latestSeedDocument, latestEntriesBase)}</p>
-            {#if formatSeedDocumentDetails(latestSeedDocument)}
-              <p class="muted">{formatSeedDocumentDetails(latestSeedDocument)}</p>
-            {/if}
-          {/if}
-          <div class="split">
-            <button class="secondary" type="button" on:click={loadIngestStats}>Refresh stats</button>
-            <button class="secondary" type="button" on:click={loadIngestRuns}>Refresh runs</button>
-            {#if ingestStatsStatus}
-              <span class="muted">{ingestStatsStatus}</span>
-            {/if}
-          </div>
-          <div class="pill-row">
-            <span class="pill">Raw: {pipelineRawCount}</span>
-            <span class="pill">With metadata: {pipelineMetadataCount}</span>
-            <span class="pill">Downloaded: {pipelineDownloadedCount}</span>
-          </div>
-          <div class="split">
-            {#if ingestRunsStatus}
-              <span class="muted">{ingestRunsStatus}</span>
-            {/if}
-          </div>
-          {#if ingestRuns.length > 0}
-            <div class="table">
-              <div class="table-row header cols-runs">
-                <span>Run</span>
-                <span>Entries</span>
-                <span>Last seen</span>
-                <span>Source details</span>
-              </div>
-              {#each ingestRuns as run}
-                <div 
-                  class="table-row cols-runs clickable"
-                  on:click={(e) => {
-                    if (e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                    handleToggleLatestRun(run.ingest_source);
-                  }}
-                  on:keydown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      handleToggleLatestRun(run.ingest_source);
-                    }
-                  }}
-                  role="button"
-                  tabindex="0"
-                >
-                  <span>
-                    <button
-                      class="link truncate-line"
-                      type="button"
-                      title={formatSeedDocumentLabel(
-                        {
-                          title: run.seed_title,
-                          year: run.seed_year,
-                          doi: run.seed_doi,
-                        },
-                        run.ingest_source
-                      )}
-                      on:click={() => handleToggleLatestRun(run.ingest_source)}
-                    >
-                      {formatSeedDocumentLabel(
-                        {
-                          title: run.seed_title,
-                          year: run.seed_year,
-                          doi: run.seed_doi,
-                        },
-                        run.ingest_source
-                      )}
-                    </button>
-                  </span>
-                  <span>{run.entry_count}</span>
-                  <span class="nowrap">{run.last_created_at || ''}</span>
-                  <span
-                    class="truncate-line"
-                    title={
-                      formatSeedDocumentDetails({
-                        authors: run.seed_authors,
-                        source: run.seed_source,
-                        publisher: run.seed_publisher,
-                      }) || (run.source_pdf || '')
-                    }
-                  >
-                    {formatSeedDocumentDetails({
-                      authors: run.seed_authors,
-                      source: run.seed_source,
-                      publisher: run.seed_publisher,
-                    }) || (run.source_pdf || '')}
-                  </span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-          {#if latestEntries.length === 0 && !isWaitingLatestEntries}
-            <p class="muted">{latestEntriesBase ? 'No extracted entries found for this source yet.' : 'Upload a PDF and run Extract to view entries.'}</p>
-          {:else}
-            <div class="table-toolbar">
-              <div class="table-toolbar-left">
-                <span class="muted">Selected: {selectedLatestCount} / {selectableLatestCount} selectable</span>
-                <button class="secondary" type="button" on:click={selectAllLatest}>Select all</button>
-                <button class="secondary" type="button" on:click={clearLatestSelection}>Clear</button>
-              </div>
-              <div class="table-toolbar-right">
-                <div class="toolbar-actions">
-                  <button
-                    class="secondary"
-                    type="button"
-                    on:click={() => enqueueSelectedLatest(false)}
-                    disabled={selectedLatestCount === 0 || processingMarked}
-                  >
-                    {processingMarked ? 'Processing...' : 'Enrich'}
-                  </button>
-                  <button
-                    class="primary"
-                    type="button"
-                    on:click={() => enqueueSelectedLatest(true)}
-                    disabled={selectedLatestCount === 0 || processingMarked}
-                  >
-                    {processingMarked ? 'Processing...' : 'Enrich + Download'}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div class="expansion-settings-row" style="display: flex; align-items: center; gap: 20px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--stroke); border-radius: 8px; margin-bottom: 16px; flex-wrap: nowrap; overflow-x: auto;">
-              <span class="muted small" style="text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; white-space: nowrap;">Enrichment Expansion</span>
-              
-              <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px; white-space: nowrap;" class:opacity-50={!includeDownstream}>
-                <label class="expansion-toggle">
-                  <input type="checkbox" bind:checked={includeDownstream} />
-                  <span>Downstream</span>
-                </label>
-                <span class="muted small" style="margin-left: 4px;">Depth</span>
-                <input type="number" min="0" max="4" bind:value={relatedDepthDownstream} disabled={!includeDownstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
-              </div>
-
-              <div style="display: flex; gap: 8px; align-items: center; background: rgba(0,0,0,0.03); padding: 4px 10px; border-radius: 6px;" class:opacity-50={!includeUpstream}>
-                <label class="expansion-toggle">
-                  <input type="checkbox" bind:checked={includeUpstream} />
-                  <span>Upstream</span>
-                </label>
-                <span class="muted small" style="margin-left: 4px;">Depth</span>
-                <input type="number" min="0" max="4" bind:value={relatedDepthUpstream} disabled={!includeUpstream} class="depth-input" style="padding: 4px; width: 44px; border-radius: 4px; border: 1px solid var(--stroke); background: white;" />
-              </div>
-
-              <div style="width: 1px; height: 20px; background: var(--stroke);"></div>
-              
-              <div style="display: flex; gap: 8px; align-items: center;">
-                <span class="muted small">Max Related / Paper</span>
-                <input type="number" min="1" max="100" bind:value={maxRelated} class="short-input" style="padding: 4px; width: 60px; border-radius: 4px; border: 1px solid var(--stroke);" />
-              </div>
-            </div>
-            {#if enqueueStatus}
-              <p class="muted">{enqueueStatus}</p>
-            {/if}
-            {#if processMarkedStatus}
-              <p class="muted">{processMarkedStatus}</p>
-            {/if}
-            <div class="table">
-              <div class="table-row header cols-6">
-                <span class="ingest-select-cell">
-                  <input
-                    type="checkbox"
-                    aria-label="Select all"
-                    bind:checked={allLatestSelected}
-                    disabled={selectableLatestCount === 0}
-                    on:change={(e) => (e.target.checked ? selectAllLatest() : clearLatestSelection())}
-                  />
-                  <span>Status</span>
-                </span>
-                <span>Title</span>
-                <span>Authors</span>
-                <span>Year</span>
-                <span>Source</span>
-                <span>DOI</span>
-              </div>
-              {#each latestEntries as entry, index}
-                <div 
-                  class={`table-row cols-6 clickable ${isLatestSelected(entry, index) ? 'selected' : ''} ${isLatestDownloaded(entry) ? 'downloaded' : isLatestProcessed(entry) ? 'enriched' : ''}`}
-                  on:click={(e) => {
-                    if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                    toggleLatestSelection(entry, index);
-                  }}
-                  on:keydown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'A') return;
-                      e.preventDefault();
-                      toggleLatestSelection(entry, index);
-                    }
-                  }}
-                  role="checkbox"
-                  aria-checked={isLatestSelected(entry, index)}
-                  tabindex="0"
-                >
-                  <span class="ingest-select-cell">
-                    {#if isLatestSelectable(entry)}
-                      <input
-                        type="checkbox"
-                        aria-label={`Select ${formatTitle(entry)}`}
-                        bind:group={latestSelection}
-                        value={latestSelectionKey(entry, index)}
-                      />
-                    {:else}
-                      <input
-                        type="checkbox"
-                        aria-label={`${formatTitle(entry)} is not selectable`}
-                        disabled
-                      />
-                    {/if}
-                    <span class={`tag ${latestIngestTag(entry).className} ingest-state-tag`}>{latestIngestTag(entry).label}</span>
-                  </span>
-                  <span>{formatTitle(entry)}</span>
-                  <span>{formatAuthors(entry)}</span>
-                  <span>{entry.year || ''}</span>
-                  <span>{entry.source || entry.publisher || ''}</span>
-                  <span>{entry.doi || ''}</span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      {/if}
-
-      {#if activeTab === 'search'}
-        <div class="card" data-testid="search-panel">
-          <h2>Keyword search</h2>
-          <p>Search OpenAlex for works and optionally expand related references.</p>
-          <div class="search-explanation">
-            <details>
-              <summary>How to use this search (quick guide)</summary>
-              <p>
-                Search runs as a normal OpenAlex query.
-                The backend sends the request to the OpenAlex script, normalizes input,
-                then deduplicates results before returning.
-              </p>
-              <ul>
-                <li>Use normal boolean searches like <code>institutional AND economics</code>.</li>
-                <li>Field selector controls which metadata is searched.</li>
-                <li>Depth/Max Related controls how far citation graph expansion should go.</li>
-              </ul>
-            </details>
-          </div>
-          <form class="search-form" on:submit|preventDefault={runSearch}>
-            <div class="search-primary-row">
-              <div class="search-field search-main-input">
-                <div class="label-row">
-                  <label for="search-query">Text query</label>
-                  <span class="field-hint label-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</span>
-                </div>
-                <input
-                  id="search-query"
-                  type="text"
-                  placeholder="institutional economics AND governance"
-                  bind:value={searchQuery}
-                  data-testid="search-query"
-                  title='Use AND/OR/NOT. Missing operators are treated as implicit AND.'
-                />
-              </div>
-              <div class="search-field search-scope">
-                <label for="search-field">Search field</label>
-                <select id="search-field" bind:value={searchField} title="Limit the OpenAlex query to title/abstract/fulltext scope.">
-                  <option value="default">All fields</option>
-                  <option value="title">Title</option>
-                  <option value="abstract">Abstract</option>
-                  <option value="title_and_abstract">Title + abstract</option>
-                  <option value="fulltext">Full text</option>
-                </select>
-              </div>
-              <button
-                class="primary search-submit-btn"
-                type="submit"
-                data-testid="search-submit"
-                title="Run Search"
-              >
-                Search
-              </button>
-            </div>
-
-            <div class="search-secondary-row">
-              <div class="filter-group search-author-group">
-                <div class="filter-label">Author</div>
-                <input
-                  id="search-author"
-                  type="text"
-                  placeholder="Elinor Ostrom"
-                  bind:value={searchAuthor}
-                  title="Resolve an OpenAlex author first, then filter works by that author ID."
-                />
-              </div>
-              <div class="filter-group">
-                <div class="filter-label">Published between</div>
-                <div class="filter-inputs">
-                  <input id="search-year-from" type="number" placeholder="Year" bind:value={yearFrom} class="year-input" />
-                  <span class="range-sep">–</span>
-                  <input id="search-year-to" type="number" placeholder="Year" bind:value={yearTo} class="year-input" />
-                </div>
-              </div>
-
-              <div class="spacer"></div>
-
-              <button
-                class="text-btn reset-btn"
-                type="button"
-                on:click={resetSearchForm}
-              >
-                Reset filters
-              </button>
-            </div>
-            
-            <p class="field-hint">Use <code>AND</code>, <code>OR</code>, <code>NOT</code>. Example: <code>tax AND welfare NOT Keynes</code>.</p>
-          </form>
-          <p class="muted">{searchStatus}{#if searchSource} ({searchSource}){/if}</p>
-          <div class="table">
-            <div class="table-row header cols-search">
-              <span>Title</span>
-              <span>Authors</span>
-              <span>Year</span>
-              <span>Type</span>
-              <span>DOI</span>
-            </div>
-            {#each searchResults as result, index}
-              <div class="table-row cols-search">
-                <span>{result.title}</span>
-                <span>{result.authors}</span>
-                <span>{result.year}</span>
-                <span>{result.type}</span>
-                <span>{result.doi || ''}</span>
-              </div>
-            {/each}
-          </div>
-        </div>
-      {/if}
-
       {#if activeTab === 'downloads'}
         <div class="card" data-testid="downloads-panel">
           <h2>Download activity</h2>
@@ -6270,8 +5241,8 @@
               Live download activity from API.
             {:else if downloadsSource === 'stub'}
               Stub download activity from API.
-            {:else if downloadsSource === 'sample'}
-              Sample download activity.
+            {:else if downloadsSource === 'error'}
+              Failed to load download activity.
             {:else}
               Download activity loaded ({downloadsSource}).
             {/if}

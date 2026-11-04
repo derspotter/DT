@@ -1,8 +1,3 @@
-import {
-  sampleSearchResults,
-  sampleDownloads,
-} from './sample-data'
-
 const DEFAULT_TIMEOUT = 8_000
 // Uploads can be large over SSH port-forwarding; keep this generous.
 const UPLOAD_TIMEOUT = 600_000
@@ -10,6 +5,7 @@ const UPLOAD_TIMEOUT = 600_000
 const PIPELINE_TIMEOUT = 600_000
 const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
 let authToken = localStorage.getItem('rag_feeder_token') || ''
+let unauthorizedHandler = null
 
 export function setAuthToken(token) {
   authToken = token || ''
@@ -24,7 +20,25 @@ export function getAuthToken() {
   return authToken
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) {
+// The app registers one handler (its sign-out path); every request that
+// answers 401 runs it before throwing.
+export function onUnauthorized(handler) {
+  unauthorizedHandler = typeof handler === 'function' ? handler : null
+}
+
+// `fetch` rejects with text meant for developers ("signal is aborted without
+// reason", "Failed to fetch"). HTTP errors (they carry a status) and anything
+// else, such as a body that is not JSON, pass through.
+function transportError(error, timedOut) {
+  if (error?.status !== undefined) return error
+  if (timedOut) return new Error('The server did not answer in time.', { cause: error })
+  if (error instanceof TypeError) return new Error('Could not reach the server.', { cause: error })
+  return error
+}
+
+// `read` runs while the timer is armed, so a body that stalls after the
+// headers is aborted too. A `raw` caller reads its own body after this returns.
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT, read = (response) => response) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -33,174 +47,162 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT) 
       headers.Authorization = `Bearer ${authToken}`
     }
     const response = await fetch(url, { cache: 'no-store', ...options, headers, signal: controller.signal })
-    return response
+    return await read(response)
+  } catch (error) {
+    throw transportError(error, controller.signal.aborted)
   } finally {
     clearTimeout(timeout)
   }
 }
 
-async function throwIfUnauthorized(response) {
-  if (response.status === 401) {
-    const payload = await response.text()
-    const error = new Error(payload || 'Unauthorized')
-    error.status = 401
-    throw error
-  }
+function apiUrl(pathOrUrl) {
+  const value = String(pathOrUrl || '')
+  if (/^https?:\/\//i.test(value)) return value
+  return `${API_BASE}${value.startsWith('/') ? value : `/${value}`}`
 }
 
-export async function login({ username, password }) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object') return false
+  const proto = Object.getPrototypeOf(value)
+  return proto === Object.prototype || proto === null || Array.isArray(value)
+}
+
+// The one request path: bearer header, timeout, JSON body, 401 handling and
+// error messages. `notifyUnauthorized: false` is for the sign-in endpoints,
+// whose 401 means "wrong credentials", not "session expired".
+async function requestJson(path, {
+  method = 'GET',
+  body,
+  headers = {},
+  timeout = DEFAULT_TIMEOUT,
+  errorMessage = 'Request failed',
+  raw = false,
+  notifyUnauthorized = true,
+} = {}) {
+  const options = { method, headers: { ...headers } }
+  if (body !== undefined) {
+    if (isPlainObject(body)) {
+      options.headers['Content-Type'] = 'application/json'
+      options.body = JSON.stringify(body)
+    } else {
+      options.body = body
+    }
+  }
+  const sentToken = authToken
+  return fetchWithTimeout(apiUrl(path), options, timeout, async (response) => {
+    if (response.status === 401) {
+      const text = await response.text().catch(() => '')
+      // A 401 for a token that is no longer current (signed out, or signed in
+      // again meanwhile) says nothing about the session in use now.
+      if (notifyUnauthorized && sentToken === authToken) unauthorizedHandler?.()
+      throw Object.assign(new Error(errorText(text) || 'Unauthorized'), { status: 401 })
+    }
+    if (!response.ok) {
+      const text = await response.text().catch(() => '')
+      throw Object.assign(new Error(errorText(text) || errorMessage), { status: response.status })
+    }
+    return raw ? response : response.json()
   })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Login failed')
+}
+
+// The backend answers errors as { error: '...' }; show that string, not the
+// raw JSON body.
+function errorText(text) {
+  if (!text) return ''
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed.error === 'string' && parsed.error) return parsed.error
+  } catch {
+    // not JSON; use the text as is
   }
-  const payload = await response.json()
-  if (payload.token) {
-    setAuthToken(payload.token)
-  }
-  return payload
+  return text
+}
+
+function dispositionFilename(response) {
+  const disposition = response.headers.get('content-disposition') || ''
+  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
+  if (star && star[1]) return decodeURIComponent(star[1])
+  if (plain && plain[1]) return plain[1]
+  return ''
+}
+
+// The sign-in calls return the payload and leave the token to the caller: only
+// the attempt that still owns the session may store it.
+export async function login({ username, password }) {
+  return requestJson('/api/auth/login', {
+    method: 'POST',
+    body: { username, password },
+    errorMessage: 'Login failed',
+    notifyUnauthorized: false,
+  })
 }
 
 export async function fetchMe() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/auth/me`)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load user')
-  }
-  return response.json()
+  return requestJson('/api/auth/me', { errorMessage: 'Failed to load user' })
 }
 
 export async function requestPasswordReset(email) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/auth/forgot-password`, {
+  return requestJson('/api/auth/forgot-password', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email }),
+    body: { email },
+    errorMessage: 'Failed to send password reset email',
+    notifyUnauthorized: false,
   })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to send password reset email')
-  }
-  return response.json()
 }
 
 export async function acceptInvite({ token, password }) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/auth/accept-invite`, {
+  return requestJson('/api/auth/accept-invite', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token, password }),
+    body: { token, password },
+    errorMessage: 'Failed to accept invite',
+    notifyUnauthorized: false,
   })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to accept invite')
-  }
-  const payload = await response.json()
-  if (payload.token) {
-    setAuthToken(payload.token)
-  }
-  return payload
 }
 
 export async function resetPassword({ token, password }) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/auth/reset-password`, {
+  return requestJson('/api/auth/reset-password', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token, password }),
+    body: { token, password },
+    errorMessage: 'Failed to reset password',
+    notifyUnauthorized: false,
   })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to reset password')
-  }
-  const payload = await response.json()
-  if (payload.token) {
-    setAuthToken(payload.token)
-  }
-  return payload
 }
 
 export async function createUserInvitation({ username, email }) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/auth/invitations`, {
+  return requestJson('/api/auth/invitations', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, email }),
+    body: { username, email },
+    errorMessage: 'Failed to create invitation',
   })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to create invitation')
-  }
-  return response.json()
 }
 
 export async function fetchCorpora() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora`)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load corpora')
-  }
-  return response.json()
+  return requestJson('/api/corpora', { errorMessage: 'Failed to load corpora' })
 }
 
 export async function selectCorpus(corpusId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/select`, {
-    method: 'POST',
-  })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to select corpus')
-  }
-  return response.json()
+  return requestJson(`/api/corpora/${corpusId}/select`, { method: 'POST', errorMessage: 'Failed to select corpus' })
 }
 
 export async function createCorpus(name) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
-  })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to create corpus')
-  }
-  return response.json()
+  return requestJson('/api/corpora', { method: 'POST', body: { name }, errorMessage: 'Failed to create corpus' })
 }
 
 export async function deleteCorpus(corpusId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}`, {
-    method: 'DELETE',
-  })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to delete corpus')
-  }
-  return response.json()
+  return requestJson(`/api/corpora/${corpusId}`, { method: 'DELETE', errorMessage: 'Failed to delete corpus' })
 }
 
 export async function shareCorpus(corpusId, { username, role }) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/share`, {
+  return requestJson(`/api/corpora/${corpusId}/share`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, role }),
+    body: { username, role },
+    errorMessage: 'Failed to share corpus',
   })
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to share corpus')
-  }
-  return response.json()
 }
 
 export async function fetchKantroposCorpora() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/kantropos/corpora`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load Kantropos corpora')
-  }
-  return response.json()
+  return requestJson('/api/kantropos/corpora', { errorMessage: 'Failed to load Kantropos corpora' })
 }
 
 export async function fetchKantroposCorpusBrowse(targetId, options = {}) {
@@ -212,106 +214,55 @@ export async function fetchKantroposCorpusBrowse(targetId, options = {}) {
     params.set('pending_limit', String(Number(options.pendingLimit)))
   }
   const suffix = params.size > 0 ? `?${params.toString()}` : ''
-  const response = await fetchWithTimeout(`${API_BASE}/api/kantropos/corpora/${encodeURIComponent(String(targetId || ''))}/browse${suffix}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load Kantropos corpus browser data')
-  }
-  return response.json()
+  return requestJson(`/api/kantropos/corpora/${encodeURIComponent(String(targetId || ''))}/browse${suffix}`, {
+    errorMessage: 'Failed to load Kantropos corpus browser data',
+  })
 }
 
 export async function fetchCorpusKantroposAssignment(corpusId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/kantropos-assignment`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load Kantropos assignment')
-  }
-  return response.json()
+  return requestJson(`/api/corpora/${corpusId}/kantropos-assignment`, { errorMessage: 'Failed to load Kantropos assignment' })
 }
 
 export async function saveCorpusKantroposAssignment(corpusId, targetId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpora/${corpusId}/kantropos-assignment`, {
+  return requestJson(`/api/corpora/${corpusId}/kantropos-assignment`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ targetId }),
+    body: { targetId },
+    errorMessage: 'Failed to save Kantropos assignment',
   })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to save Kantropos assignment')
-  }
-  return response.json()
 }
 
 export async function createScraperRun({ sourceType, query }) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/scraper/runs`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourceType, query }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to create scraper run')
-  }
-  return response.json()
+  return requestJson('/api/scraper/runs', {
+    method: 'POST',
+    body: { sourceType, query },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to create scraper run',
+  })
 }
 
 export async function fetchScraperRuns(limit = 50) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/scraper/runs?limit=${encodeURIComponent(String(limit))}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load scraper runs')
-  }
-  return response.json()
+  return requestJson(`/api/scraper/runs?limit=${encodeURIComponent(String(limit))}`, { errorMessage: 'Failed to load scraper runs' })
 }
 
 export async function fetchScraperRun(runId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/scraper/runs/${encodeURIComponent(String(runId || ''))}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load scraper run')
-  }
-  return response.json()
+  return requestJson(`/api/scraper/runs/${encodeURIComponent(String(runId || ''))}`, { errorMessage: 'Failed to load scraper run' })
 }
 
 export async function applyScraperArtifacts({ targetId, artifactIds }) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/scraper/apply`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ targetId, artifactIds }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to apply scraper artifacts')
-  }
-  return response.json()
+  return requestJson('/api/scraper/apply', {
+    method: 'POST',
+    body: { targetId, artifactIds },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to apply scraper artifacts',
+  })
 }
 
 export async function downloadScraperMetadataDraft(eventId) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/scraper/apply-events/${encodeURIComponent(String(eventId || ''))}/metadata-bib`,
-    {},
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to download generated metadata.bib')
-  }
+  const response = await requestJson(`/api/scraper/apply-events/${encodeURIComponent(String(eventId || ''))}/metadata-bib`, {
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to download generated metadata.bib',
+    raw: true,
+  })
   const blob = await response.blob()
   return { blob, filename: 'metadata.bib' }
 }
@@ -319,103 +270,49 @@ export async function downloadScraperMetadataDraft(eventId) {
 export async function uploadPdf(file) {
   const formData = new FormData()
   formData.append('file', file)
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/process_pdf`,
-    {
-      method: 'POST',
-      body: formData,
-    },
-    UPLOAD_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const message = await response.text()
-    throw new Error(message || 'Upload failed')
-  }
-  const payload = await response.json()
-  return payload
+  return requestJson('/api/process_pdf', {
+    method: 'POST',
+    body: formData,
+    timeout: UPLOAD_TIMEOUT,
+    errorMessage: 'Upload failed',
+  })
 }
 
 export async function importSeed(filename, kind) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/ingest/import-seed`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename, kind }),
-    },
-    UPLOAD_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const message = await response.text()
-    throw new Error(message || 'Import failed')
-  }
-  return response.json()
+  return requestJson('/api/ingest/import-seed', {
+    method: 'POST',
+    body: { filename, kind },
+    timeout: UPLOAD_TIMEOUT,
+    errorMessage: 'Import failed',
+  })
 }
 
 export async function extractBibliography(filename) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/extract-bibliography/${encodeURIComponent(filename)}`,
-    {
-      method: 'POST',
-    }
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Extraction failed')
-  }
-  return response.json()
+  return requestJson(`/api/extract-bibliography/${encodeURIComponent(filename)}`, {
+    method: 'POST',
+    errorMessage: 'Extraction failed',
+  })
 }
 
 export async function fetchBibliographyEntries(baseName) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/ingest/latest?baseName=${encodeURIComponent(baseName)}&limit=5000`
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load ingest entries')
-  }
-  return response.json()
+  return requestJson(`/api/ingest/latest?baseName=${encodeURIComponent(baseName)}&limit=5000`, {
+    errorMessage: 'Failed to load ingest entries',
+  })
 }
 
 export async function fetchIngestStats({ global = false } = {}) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/stats${global ? '?global=1' : ''}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    const error = new Error(payload || 'Failed to load ingest stats')
-    error.status = response.status
-    throw error
-  }
-  return response.json()
+  return requestJson(`/api/ingest/stats${global ? '?global=1' : ''}`, { errorMessage: 'Failed to load ingest stats' })
 }
 
 export async function fetchIngestRuns(limit = 20) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/ingest/runs?limit=${encodeURIComponent(String(limit))}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load ingest runs')
-  }
-  return response.json()
+  return requestJson(`/api/ingest/runs?limit=${encodeURIComponent(String(limit))}`, { errorMessage: 'Failed to load ingest runs' })
 }
 
 export async function fetchSeedSources(limit = 100, { q = '' } = {}) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   if (q) params.set('q', q)
-  const response = await fetchWithTimeout(`${API_BASE}/api/seed/sources?${params.toString()}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    const error = new Error(payload || 'Failed to load seed sources')
-    error.status = response.status
-    throw error
-  }
-  return response.json()
+  return requestJson(`/api/seed/sources?${params.toString()}`, { errorMessage: 'Failed to load seed sources' })
 }
 
 // `lightSummary` asks the route to skip the source_summary state counts,
@@ -429,39 +326,19 @@ export async function fetchSeedCandidates(sourceType, sourceKey, { q = '', limit
   params.set('offset', String(offset))
   if (sort) { params.set('sort', sort); params.set('dir', dir) }
   if (lightSummary) params.set('summary', 'light')
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates?${params}`
+  return requestJson(
+    `/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates?${params}`,
+    { errorMessage: 'Failed to load seed candidates' }
   )
-  await throwIfUnauthorized(response)
-  if (!response.ok) throw new Error((await response.text()) || 'Failed to load seed candidates')
-  return response.json()
 }
 
 export async function downloadSeedCandidateFile(sourceType, sourceKey, candidateKey) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates/${encodeURIComponent(String(candidateKey || ''))}/file`,
-    { method: 'GET' },
-    PIPELINE_TIMEOUT
+  const response = await requestJson(
+    `/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/candidates/${encodeURIComponent(String(candidateKey || ''))}/file`,
+    { timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to download seed candidate file', raw: true }
   )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to download seed candidate file')
-  }
-
   const blob = await response.blob()
-  const disposition = response.headers.get('content-disposition') || ''
-  let filename = ''
-  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
-  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
-  if (star && star[1]) {
-    filename = decodeURIComponent(star[1])
-  } else if (plain && plain[1]) {
-    filename = plain[1]
-  }
-  if (!filename) {
-    filename = 'seed-candidate.pdf'
-  }
+  const filename = dispositionFilename(response) || 'seed-candidate.pdf'
   return { blob, filename }
 }
 
@@ -479,12 +356,11 @@ export async function promoteSeedCandidates(sourceType, sourceKey, {
   downloadBatchSize = 25,
   workers = 6,
 } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/promote`,
+  return requestJson(
+    `/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}/promote`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body: {
         candidateKeys,
         q,
         includeDownstream,
@@ -497,68 +373,36 @@ export async function promoteSeedCandidates(sourceType, sourceKey, {
         enqueueDownload,
         downloadBatchSize,
         workers,
-      }),
-    },
-    PIPELINE_TIMEOUT
+      },
+      timeout: PIPELINE_TIMEOUT,
+      errorMessage: 'Failed to promote seed candidates',
+    }
   )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to promote seed candidates')
-  }
-  return response.json()
 }
 
 export async function dismissSeedCandidates(sourceType, sourceKey, candidateKeys, { all = false, q = '' } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/candidates/dismiss`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sourceType, sourceKey, ...(all ? { all: true, q } : { candidateKeys }) }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to dismiss seed candidates')
-  }
-  return response.json()
+  return requestJson('/api/seed/candidates/dismiss', {
+    method: 'POST',
+    body: { sourceType, sourceKey, ...(all ? { all: true, q } : { candidateKeys }) },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to dismiss seed candidates',
+  })
 }
 
 export async function removeSeedSource(sourceType, sourceKey) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}`,
-    {
-      method: 'DELETE',
-    },
-    PIPELINE_TIMEOUT
+  return requestJson(
+    `/api/seed/sources/${encodeURIComponent(String(sourceType || ''))}/${encodeURIComponent(String(sourceKey || ''))}`,
+    { method: 'DELETE', timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to remove seed source' }
   )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to remove seed source')
-  }
-  return response.json()
 }
 
 export async function enqueueIngestEntries(entryIds) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/ingest/enqueue`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entryIds }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to enqueue entries')
-  }
-  return response.json()
+  return requestJson('/api/ingest/enqueue', {
+    method: 'POST',
+    body: { entryIds },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to enqueue entries',
+  })
 }
 
 export async function processMarkedIngestEntries({
@@ -571,56 +415,44 @@ export async function processMarkedIngestEntries({
   enqueueDownload = false,
   downloadBatchSize = 25,
 } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/ingest/process-marked`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        limit,
-        includeDownstream,
-        includeUpstream,
-        relatedDepthDownstream,
-        relatedDepthUpstream,
-        maxRelated,
-        enqueueDownload,
-        downloadBatchSize,
-      }),
+  return requestJson('/api/ingest/process-marked', {
+    method: 'POST',
+    body: {
+      limit,
+      includeDownstream,
+      includeUpstream,
+      relatedDepthDownstream,
+      relatedDepthUpstream,
+      maxRelated,
+      enqueueDownload,
+      downloadBatchSize,
     },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to process marked entries')
-  }
-  return response.json()
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to process marked entries',
+  })
 }
 
 // Type-ahead for the Topic field; the backend proxies OpenAlex autocomplete
 // (free of credits) and returns [{ id, label, hint, works_count }].
 export async function fetchTopicSuggestions(q) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/openalex/topics?q=${encodeURIComponent(String(q || ''))}`, {}, 15_000)
-  await throwIfUnauthorized(response)
-  if (!response.ok) throw new Error((await response.text()) || 'Topic lookup failed')
-  const payload = await response.json()
+  const payload = await requestJson(`/api/openalex/topics?q=${encodeURIComponent(String(q || ''))}`, {
+    timeout: 15_000,
+    errorMessage: 'Topic lookup failed',
+  })
   return Array.isArray(payload?.topics) ? payload.topics : []
 }
 
 export async function previewKeywordSearch(body) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search/preview`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  }, 60_000)
-  await throwIfUnauthorized(response)
-  if (!response.ok) throw new Error((await response.text()) || 'Preview failed')
-  return response.json()
+  return requestJson('/api/keyword-search/preview', {
+    method: 'POST',
+    body,
+    timeout: 60_000,
+    errorMessage: 'Preview failed',
+  })
 }
 
 export async function cancelKeywordSearch(runId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/keyword-search/${encodeURIComponent(String(runId))}/cancel`, { method: 'POST' })
-  await throwIfUnauthorized(response)
-  if (!response.ok) throw new Error((await response.text()) || 'Cancel failed')
-  return response.json()
+  return requestJson(`/api/keyword-search/${encodeURIComponent(String(runId))}/cancel`, { method: 'POST', errorMessage: 'Cancel failed' })
 }
 
 export async function runKeywordSearch({
@@ -638,79 +470,49 @@ export async function runKeywordSearch({
   relatedDepthUpstream = 0,
   maxRelated = 30,
   enqueue = false,
-  fallbackToSample = true,
   topics = [],
 }) {
-  try {
-    const response = await fetchWithTimeout(
-      `${API_BASE}/api/keyword-search`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          query,
-          seedJson,
-          field,
-          author,
-          yearFrom,
-          yearTo,
-          maxResults,
-          sort,
-          includeDownstream,
-          includeUpstream,
-          relatedDepthDownstream,
-          relatedDepthUpstream,
-          maxRelated,
-          enqueue,
-          topics,
-        }),
-      },
-      PIPELINE_TIMEOUT
-    )
-    await throwIfUnauthorized(response)
-    if (!response.ok) {
-      const payload = await response.json().catch(() => null)
-      throw new Error(payload?.error || `HTTP ${response.status}`)
-    }
-    const payload = await response.json()
-    const running = response.status === 202
-    const data = running ? [] : (Array.isArray(payload) ? payload : payload.results || [])
-    return {
-      data,
-      source: payload.source || 'api',
-      runId: payload.runId,
-      expansion: payload.expansion,
-      running,
-    }
-  } catch (error) {
-    if (error?.status === 401) {
-      throw error
-    }
-    if (!fallbackToSample) {
-      throw error
-    }
-    return { data: sampleSearchResults, source: 'sample', error }
+  const response = await requestJson('/api/keyword-search', {
+    method: 'POST',
+    body: {
+      query,
+      seedJson,
+      field,
+      author,
+      yearFrom,
+      yearTo,
+      maxResults,
+      sort,
+      includeDownstream,
+      includeUpstream,
+      relatedDepthDownstream,
+      relatedDepthUpstream,
+      maxRelated,
+      enqueue,
+      topics,
+    },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Search failed',
+    raw: true,
+  })
+  const payload = await response.json()
+  const running = response.status === 202
+  const data = running ? [] : (Array.isArray(payload) ? payload : payload.results || [])
+  return {
+    data,
+    source: payload.source || 'api',
+    runId: payload.runId,
+    expansion: payload.expansion,
+    running,
   }
 }
 
 export async function fetchRecursionConfig() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/recursion-config`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load recursion config')
-  }
-  return response.json()
+  return requestJson('/api/recursion-config', { errorMessage: 'Failed to load recursion config' })
 }
 
 export async function fetchOpenAlexQuota() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/openalex/quota`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load OpenAlex quota')
-  }
-  return response.json()
+  return requestJson('/api/openalex/quota', { errorMessage: 'Failed to load OpenAlex quota' })
 }
 
 export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' } = {}) {
@@ -719,14 +521,7 @@ export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' }
   params.set('offset', String(offset))
   if (q) params.set('q', q)
   if (sort) params.set('sort', sort)
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpus?${params.toString()}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const error = new Error(`HTTP ${response.status}`)
-    error.status = response.status
-    throw error
-  }
-  const payload = await response.json()
+  const payload = await requestJson(`/api/corpus?${params.toString()}`, { errorMessage: 'Failed to load corpus' })
   const data = Array.isArray(payload) ? payload : payload.items || []
   const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
   const stageTotals = payload?.stage_totals || null
@@ -751,14 +546,10 @@ function safeDownloadFilename(raw) {
 }
 
 export async function fetchSeedSourceDocument(sourceKey) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/seed/sources/pdf/${encodeURIComponent(String(sourceKey || ''))}/file`
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to download the seed document')
-  }
+  const response = await requestJson(`/api/seed/sources/pdf/${encodeURIComponent(String(sourceKey || ''))}/file`, {
+    errorMessage: 'Failed to download the seed document',
+    raw: true,
+  })
   const disposition = response.headers.get('content-disposition') || ''
   const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i)
   const filename = match ? safeDownloadFilename(match[1]) : `${sourceKey || 'seed'}.pdf`
@@ -766,155 +557,75 @@ export async function fetchSeedSourceDocument(sourceKey) {
 }
 
 export async function removeCorpusWorks(workIds) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/remove`, {
+  return requestJson('/api/corpus/works/remove', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ workIds }),
+    body: { workIds },
+    errorMessage: 'Failed to remove items from corpus',
   })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to remove items from corpus')
-  }
-  return response.json()
 }
 
 export async function fetchAppSettings() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load settings')
-  }
-  return response.json()
+  return requestJson('/api/admin/settings', { errorMessage: 'Failed to load settings' })
 }
 
 export async function saveAppSettings(settings) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/admin/settings`, {
+  return requestJson('/api/admin/settings', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ settings }),
+    body: { settings },
+    errorMessage: 'Failed to save settings',
   })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to save settings')
-  }
-  return response.json()
 }
 
 export async function removeCorpusWork(workId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/corpus/works/${encodeURIComponent(String(workId))}`, {
+  return requestJson(`/api/corpus/works/${encodeURIComponent(String(workId))}`, {
     method: 'DELETE',
+    errorMessage: 'Failed to remove item from corpus',
   })
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to remove item from corpus')
-  }
-  return response.json()
 }
 
 export async function fetchDownloadQueue() {
-  try {
-    const response = await fetchWithTimeout(`${API_BASE}/api/downloads`)
-    await throwIfUnauthorized(response)
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`)
-    }
-    const payload = await response.json()
-    const data = Array.isArray(payload) ? payload : payload.items || []
-    return { data, source: payload.source || 'api' }
-  } catch (error) {
-    if (error?.status === 401) {
-      throw error
-    }
-    return { data: sampleDownloads, source: 'sample', error }
-  }
+  const payload = await requestJson('/api/downloads', { errorMessage: 'Failed to load download activity' })
+  const data = Array.isArray(payload) ? payload : payload.items || []
+  return { data, source: payload.source || 'api' }
 }
 
 export async function fetchDownloadWorkerStatus() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/downloads/worker/status`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load download worker status')
-  }
-  return response.json()
+  return requestJson('/api/downloads/worker/status', { errorMessage: 'Failed to load download worker status' })
 }
 
 export async function startDownloadWorker() {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/downloads/worker/start`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to start download worker')
-  }
-  return response.json()
+  return requestJson('/api/downloads/worker/start', {
+    method: 'POST',
+    body: {},
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to start download worker',
+  })
 }
 
 export async function stopDownloadWorker({ force = false } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/downloads/worker/stop`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to stop download worker')
-  }
-  return response.json()
+  return requestJson('/api/downloads/worker/stop', {
+    method: 'POST',
+    body: { force },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to stop download worker',
+  })
 }
 
 export async function runDownloadWorkerOnce() {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/downloads/worker/run-once`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to run download worker')
-  }
-  return response.json()
+  return requestJson('/api/downloads/worker/run-once', {
+    method: 'POST',
+    body: {},
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to run download worker',
+  })
 }
 
 export async function fetchPipelineWorkerStatus() {
-  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/worker/status`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load pipeline worker status')
-  }
-  return response.json()
+  return requestJson('/api/pipeline/worker/status', { errorMessage: 'Failed to load pipeline worker status' })
 }
 
 export async function fetchPipelineDaemonStatus({ global = false } = {}) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/daemon/status${global ? '?global=1' : ''}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load daemon status')
-  }
-  return response.json()
+  return requestJson(`/api/pipeline/daemon/status${global ? '?global=1' : ''}`, { errorMessage: 'Failed to load daemon status' })
 }
 
 export async function fetchPipelineJobsSummary({ jobIds = [], types = [], recentLimit = 50 } = {}) {
@@ -937,13 +648,7 @@ export async function fetchPipelineJobsSummary({ jobIds = [], types = [], recent
   }
 
   const query = params.toString()
-  const response = await fetchWithTimeout(`${API_BASE}/api/pipeline/jobs/summary${query ? `?${query}` : ''}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to load pipeline jobs summary')
-  }
-  return response.json()
+  return requestJson(`/api/pipeline/jobs/summary${query ? `?${query}` : ''}`, { errorMessage: 'Failed to load pipeline jobs summary' })
 }
 
 export async function fetchLogsTail({
@@ -961,13 +666,7 @@ export async function fetchLogsTail({
   if (type === 'pipeline' && corpusId !== undefined && corpusId !== null) {
     params.set('corpus_id', String(corpusId))
   }
-  const response = await fetchWithTimeout(`${API_BASE}/api/logs/tail?${params.toString()}`)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to fetch log tail')
-  }
-  return response.json()
+  return requestJson(`/api/logs/tail?${params.toString()}`, { errorMessage: 'Failed to fetch log tail' })
 }
 
 export async function startPipelineWorker({
@@ -977,39 +676,21 @@ export async function startPipelineWorker({
   downloadBatchSize = 5,
   downloadWorkers = 0,
 } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/pipeline/worker/start`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ intervalSeconds, promoteBatchSize, promoteWorkers, downloadBatchSize, downloadWorkers }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to start pipeline worker')
-  }
-  return response.json()
+  return requestJson('/api/pipeline/worker/start', {
+    method: 'POST',
+    body: { intervalSeconds, promoteBatchSize, promoteWorkers, downloadBatchSize, downloadWorkers },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to start pipeline worker',
+  })
 }
 
 export async function pausePipelineWorker({ force = false } = {}) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/pipeline/worker/pause`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force }),
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to pause pipeline worker')
-  }
-  return response.json()
+  return requestJson('/api/pipeline/worker/pause', {
+    method: 'POST',
+    body: { force },
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to pause pipeline worker',
+  })
 }
 
 export async function downloadCorpusExport(format, { status = '', yearFrom = '', yearTo = '', source = '' } = {}) {
@@ -1019,31 +700,16 @@ export async function downloadCorpusExport(format, { status = '', yearFrom = '',
   if (yearTo !== '' && yearTo !== null && yearTo !== undefined) params.set('year_to', String(yearTo))
   if (source) params.set('source', String(source))
   const query = params.toString()
-  const endpoint = `${API_BASE}/api/exports/${encodeURIComponent(String(format || ''))}${query ? `?${query}` : ''}`
+  const endpoint = `/api/exports/${encodeURIComponent(String(format || ''))}${query ? `?${query}` : ''}`
 
-  const response = await fetchWithTimeout(
-    endpoint,
-    {
-      method: 'GET',
-    },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to export corpus data')
-  }
+  const response = await requestJson(endpoint, {
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to export corpus data',
+    raw: true,
+  })
 
   const blob = await response.blob()
-  const disposition = response.headers.get('content-disposition') || ''
-  let filename = ''
-  const star = disposition.match(/filename\*=UTF-8''([^;]+)/i)
-  const plain = disposition.match(/filename=\"?([^\";]+)\"?/i)
-  if (star && star[1]) {
-    filename = decodeURIComponent(star[1])
-  } else if (plain && plain[1]) {
-    filename = plain[1]
-  }
+  let filename = dispositionFilename(response)
 
   if (!filename) {
     const fallback = {
@@ -1059,41 +725,25 @@ export async function downloadCorpusExport(format, { status = '', yearFrom = '',
 }
 
 export async function createCorpusItemDownloadUrl(itemId) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/corpus/downloaded/${encodeURIComponent(String(itemId || ''))}/download-ticket`,
-    { method: 'POST' },
-    PIPELINE_TIMEOUT
-  )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to prepare file download')
-  }
-
-  const payload = await response.json()
+  const payload = await requestJson(`/api/corpus/downloaded/${encodeURIComponent(String(itemId || ''))}/download-ticket`, {
+    method: 'POST',
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to prepare file download',
+  })
   const url = String(payload?.url || '').trim()
   if (!url) throw new Error('Download ticket response did not include a URL')
   return API_BASE && url.startsWith('/') ? `${API_BASE}${url}` : url
 }
 
 export async function createUpstreamCorpusItemDownloadUrl(targetId, itemId) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/kantropos/corpora/${encodeURIComponent(String(targetId || ''))}/works/${encodeURIComponent(String(itemId || ''))}/download-ticket`,
-    { method: 'POST' },
-    PIPELINE_TIMEOUT
+  const payload = await requestJson(
+    `/api/kantropos/corpora/${encodeURIComponent(String(targetId || ''))}/works/${encodeURIComponent(String(itemId || ''))}/download-ticket`,
+    { method: 'POST', timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to prepare upstream file download' }
   )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || 'Failed to prepare upstream file download')
-  }
-
-  const payload = await response.json()
   const url = String(payload?.url || '').trim()
   if (!url) throw new Error('Download ticket response did not include a URL')
   return API_BASE && url.startsWith('/') ? `${API_BASE}${url}` : url
 }
-
 
 function graph3DParams({
   maxNodes = 10000,
@@ -1124,31 +774,14 @@ function graph3DParams({
   return params
 }
 
-function apiUrl(pathOrUrl) {
-  const value = String(pathOrUrl || '')
-  if (/^https?:\/\//i.test(value)) return value
-  return `${API_BASE}${value.startsWith('/') ? value : `/${value}`}`
-}
-
 async function fetchGraph3DResource(pathOrUrl, type = 'json') {
-  const response = await fetchWithTimeout(apiUrl(pathOrUrl), {}, PIPELINE_TIMEOUT)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || `HTTP ${response.status}`)
-  }
+  const response = await requestJson(pathOrUrl, { timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to load graph data', raw: true })
   return type === 'arrayBuffer' ? response.arrayBuffer() : response.json()
 }
 
 export async function fetchGraph3DSnapshot(options = {}) {
   const params = graph3DParams(options)
-  const response = await fetchWithTimeout(`${API_BASE}/api/graph/3d/snapshot?${params.toString()}`, {}, PIPELINE_TIMEOUT)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || `HTTP ${response.status}`)
-  }
-  return response.json()
+  return requestJson(`/api/graph/3d/snapshot?${params.toString()}`, { timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to load graph snapshot' })
 }
 
 export async function fetchGraph3DSnapshotResources(manifest) {
@@ -1175,25 +808,15 @@ export async function fetchGraph3DSnapshotResources(manifest) {
 }
 
 export async function fetchGraph3DNodeDetail(nodeId) {
-  const response = await fetchWithTimeout(`${API_BASE}/api/graph/3d/node/${encodeURIComponent(String(nodeId || ''))}`, {}, PIPELINE_TIMEOUT)
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || `HTTP ${response.status}`)
-  }
-  return response.json()
+  return requestJson(`/api/graph/3d/node/${encodeURIComponent(String(nodeId || ''))}`, {
+    timeout: PIPELINE_TIMEOUT,
+    errorMessage: 'Failed to load graph node',
+  })
 }
 
 export async function fetchGraph3DClusterDetail(snapshotKey, clusterId) {
-  const response = await fetchWithTimeout(
-    `${API_BASE}/api/graph/3d/cluster/${encodeURIComponent(String(snapshotKey || ''))}/${encodeURIComponent(String(clusterId || ''))}`,
-    {},
-    PIPELINE_TIMEOUT
+  return requestJson(
+    `/api/graph/3d/cluster/${encodeURIComponent(String(snapshotKey || ''))}/${encodeURIComponent(String(clusterId || ''))}`,
+    { timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to load graph cluster' }
   )
-  await throwIfUnauthorized(response)
-  if (!response.ok) {
-    const payload = await response.text()
-    throw new Error(payload || `HTTP ${response.status}`)
-  }
-  return response.json()
 }

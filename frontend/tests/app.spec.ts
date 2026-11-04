@@ -185,8 +185,7 @@ test.describe('Korpus Builder live integration', () => {
     if (await corpusRows.count()) {
       await corpusRows.first().click()
       // .corpus-details-grid was replaced by an inline detail card when the
-      // workspace was reshaped; only its CSS survives. Assert the card opens
-      // with populated chips instead.
+      // workspace was reshaped. Assert the card opens with populated chips.
       await expect(corpusPanel.locator('.inline-detail-card').first()).toBeVisible()
       await expect(corpusPanel.locator('.inline-detail-chip').first()).not.toBeEmpty()
     }

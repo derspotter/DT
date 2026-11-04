@@ -1,4 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
+import { mePayload, mockLogSocket } from './helpers/mockApi'
 
 const graph3dPayload = {
   nodes: [
@@ -110,10 +111,7 @@ async function mockApi(route: Route) {
   let body: unknown = {}
 
   if (path === '/api/auth/me') {
-    body = {
-      user: { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
-      corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
-    }
+    body = mePayload()
   } else if (path === '/api/graph/3d/snapshot') {
     body = graph3dSnapshotManifest
   } else if (path === '/api/graph/3d/snapshot/playwrightsnapshot/nodes.bin') {
@@ -169,6 +167,7 @@ test('graph tab is available to non-admin users', async ({ page }) => {
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
+  await mockLogSocket(page)
   await page.route('**/api/**', mockApi)
   // Override auth to a non-admin researcher (registered last, so it wins).
   await page.route('**/api/auth/me', (route) =>
@@ -193,6 +192,7 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
+  await mockLogSocket(page)
   await page.route('**/api/**', mockApi)
 
   const graphResponse = page.waitForResponse((res) => {
@@ -225,6 +225,7 @@ async function openLoadedGraphPanel(page) {
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
+  await mockLogSocket(page)
   const loaded = page.waitForResponse((res) =>
     new URL(res.url()).pathname === '/api/graph/3d/snapshot/playwrightsnapshot/nodes_meta.json'
   )
