@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
 import { fulfil, mockLogSocket } from './helpers/mockApi'
 
 // One tab→resources table with per-resource in-flight dedupe: every tab loads
@@ -11,6 +11,8 @@ const STALE_CORPUS_NOTE = 'Refresh failed; showing earlier rows.'
 function corpusRow(id: number) {
   return { id, work_id: id, title: `Work ${id}`, authors: 'A. Author', year: 2024, status: 'downloaded' }
 }
+
+type Step = { delayMs: number; fail: boolean }
 
 type Options = {
   hash?: string
@@ -43,6 +45,21 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     moveAfterPrefixStart: [] as number[],
     // Answer corpus selects with this error instead of switching.
     selectError: null as string | null,
+    // Per request, in order: wait, and optionally answer 503. Once empty, the
+    // resource answers normally.
+    corpusSteps: [] as Step[],
+    daemonSteps: [] as Step[],
+    browseSteps: [] as Step[],
+    // The keyword-search preview's answer.
+    previewCount: 5,
+    previewDelayMs: 0,
+  }
+  const scripted = async (route: Route, steps: Step[]) => {
+    const step = steps.shift()
+    if (!step) return false
+    await new Promise((resolve) => setTimeout(resolve, step.delayMs))
+    if (step.fail) await fulfil(route, { error: 'busy' }, 503)
+    return step.fail
   }
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -63,6 +80,7 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       })
     }
     if (path === '/api/corpus') {
+      if (await scripted(route, state.corpusSteps)) return
       if (delays.corpus) await new Promise((resolve) => setTimeout(resolve, delays.corpus))
       const limit = Number(url.searchParams.get('limit') || CORPUS_PAGE_SIZE)
       const offset = Number(url.searchParams.get('offset') || 0)
@@ -86,6 +104,10 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       }
       return
     }
+    if (path === '/api/keyword-search/preview') {
+      await new Promise((resolve) => setTimeout(resolve, state.previewDelayMs))
+      return fulfil(route, { count: state.previewCount, threshold: 100000 })
+    }
     const select = path.match(/^\/api\/corpora\/(\d+)\/select$/)
     if (select) {
       if (state.selectError) return fulfil(route, { error: state.selectError }, 403)
@@ -108,12 +130,14 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       return fulfil(route, { stats: url.searchParams.get('global') === '1' ? { downloaded: 42 } : { downloaded: state.statsDownloaded } })
     }
     if (path === '/api/pipeline/daemon/status') {
+      if (url.searchParams.get('global') !== '1' && await scripted(route, state.daemonSteps)) return
       return fulfil(route, { daemon: { workers: {} }, backlog: url.searchParams.get('global') === '1' ? { downloading: 3 } : {} })
     }
     if (path === '/api/downloads') return fulfil(route, { items: [], source: 'api' })
     if (path === '/api/downloads/worker/status') return fulfil(route, {})
     if (path === '/api/kantropos/corpora') return fulfil(route, { corpora: [{ id: 'k1', name: 'Kantropos One' }] })
     if (path === '/api/kantropos/corpora/k1/browse') {
+      if (await scripted(route, state.browseSteps)) return
       return fulfil(route, { target: { id: 'k1', name: 'Kantropos One' }, summary: {}, assigned_corpora: [], current_items: [], pending_items: [] })
     }
     if (path === '/api/corpora/1/kantropos-assignment' || path === '/api/corpora/2/kantropos-assignment') {
@@ -515,3 +539,64 @@ test('a corpus switch keeps the search form choices', async ({ page }) => {
   await expect(card.getByRole('spinbutton', { name: 'To' })).toHaveValue('2000')
   await expect(card.getByRole('combobox', { name: 'Sort' })).toHaveValue('newest')
 })
+
+// Switches to corpus 2 with its loads answering late, then back to corpus 1,
+// whose loads answer at once: the first switch's answers are stale when they land.
+async function switchAwayAndBack(page: Page, steps: Step[]) {
+  const picker = page.locator('.header-corpus-picker select')
+  await picker.selectOption('2')
+  await expect.poll(() => steps.length).toBe(0)
+  await expect(picker).toHaveValue('2')
+  await picker.selectOption('1')
+  await expect(picker).toHaveValue('1')
+}
+
+test('a corpus load that fails after a newer switch leaves the status and the note alone', async ({ page }) => {
+  const { state } = await boot(page, { corpusTotal: 2 })
+  const panel = page.getByTestId('corpus-panel')
+  state.corpusSteps = [{ delayMs: 1200, fail: true }]
+  await switchAwayAndBack(page, state.corpusSteps)
+  const status = panel.locator('.corpus-lazy-status')
+  await expect(status).toContainText('Showing 2 entries.')
+  await page.waitForTimeout(1500)
+  await expect(status).toContainText('Showing 2 entries.')
+  await expect(panel).toContainText('Live corpus from API.')
+})
+
+test('a worker status load that fails after a newer switch leaves the status alone', async ({ page }) => {
+  const { state } = await boot(page, { admin: true, hash: '#/dashboard' })
+  state.daemonSteps = [{ delayMs: 1200, fail: true }]
+  await switchAwayAndBack(page, state.daemonSteps)
+  await page.waitForTimeout(1500)
+  await expect(page.getByText('busy', { exact: true })).toHaveCount(0)
+})
+
+test('a browse that fails after a newer one leaves the status alone', async ({ page }) => {
+  const { state } = await boot(page, { admin: true, hash: '#/upstream' })
+  state.browseSteps = [{ delayMs: 1200, fail: true }]
+  await switchAwayAndBack(page, state.browseSteps)
+  await expect(page.getByText('Loaded upstream corpus browser.')).toBeVisible()
+  await page.waitForTimeout(1500)
+  await expect(page.getByText('Loaded upstream corpus browser.')).toBeVisible()
+  await expect(page.getByText('busy', { exact: true })).toHaveCount(0)
+})
+
+for (const { count, name } of [{ count: 5, name: 'small' }, { count: 342118, name: 'above the threshold' }]) {
+  test(`a search preview (${name}) answered after a corpus switch changes nothing`, async ({ page }) => {
+    const { state, count: requests } = await boot(page)
+    state.previewCount = count
+    state.previewDelayMs = 800
+    const card = page.locator('.seed-intake-card--search')
+    await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+    await card.getByRole('spinbutton', { name: 'Max results' }).fill('0')
+    await card.getByRole('button', { name: 'Search', exact: true }).click()
+    await expect.poll(() => requests('/api/keyword-search/preview')).toBe(1)
+    await page.locator('.header-corpus-picker select').selectOption('2')
+    await expect(page.locator('.header-corpus-picker select')).toHaveValue('2')
+    await page.waitForTimeout(1200)
+    expect(requests('/api/keyword-search')).toBe(0)
+    await expect(page.getByTestId('search-warning')).toHaveCount(0)
+    await expect(page.getByText(/works match/)).toHaveCount(0)
+    await expect(card.getByRole('button', { name: 'Search', exact: true })).toBeEnabled()
+  })
+}

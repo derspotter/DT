@@ -764,3 +764,122 @@ test('a stale-token 401 at boot does not discard an in-flight login', async ({ p
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
   expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBe('token-b')
 })
+
+test('a 401 on a search preview stops the search and leaves no status behind', async ({ page }) => {
+  let expired = false
+  let searchPosts = 0
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (path === '/api/auth/me') return fulfil(route, { user: userA, corpora: [corpus] })
+    if (path === '/api/keyword-search') {
+      searchPosts += 1
+      return fulfil(route, { error: 'Unauthorized' }, 401)
+    }
+    if (path === '/api/keyword-search/preview') {
+      expired = true
+      return fulfil(route, { error: 'Unauthorized' }, 401)
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect(page.getByTestId('login-form')).toBeVisible()
+  expect(expired).toBe(true)
+  await logIn(page, 'alice')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  await expect(card.locator('.seed-search-footer p.muted').first()).toHaveText('')
+  expect(searchPosts).toBe(0)
+})
+
+test('a search preview answered after a sign-out does not reach the next user', async ({ page }) => {
+  const previewAnswer = deferred()
+  let previewSeen = false
+  let searchPosts = 0
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+    }
+    if (path === '/api/keyword-search') {
+      searchPosts += 1
+      return fulfil(route, { runId: 1, status: 'running' }, 202)
+    }
+    if (path === '/api/keyword-search/preview') {
+      previewSeen = true
+      await previewAnswer.promise
+      return fulfil(route, { count: 5, threshold: 100000 })
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect.poll(() => previewSeen).toBe(true)
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+
+  previewAnswer.resolve()
+  await page.waitForTimeout(300)
+  await expect(page.getByText(/works match/)).toHaveCount(0)
+  expect(searchPosts).toBe(0)
+})
+
+test('an invitation that answers 401 leaves no status for the next admin', async ({ page }) => {
+  const adminA = { ...userA, is_admin: true }
+  const adminB = { ...userB, is_admin: true }
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: adminB })
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? adminB : adminA, corpora: [corpus] })
+    }
+    if (path === '/api/auth/invitations') return fulfil(route, { error: 'Invalid token' }, 401)
+    if (path === '/api/admin/settings') return fulfil(route, { settings: {} })
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/admin')
+  const form = page.locator('.admin-invite-form')
+  await form.getByLabel('Username').fill('carol')
+  await form.getByLabel('Email').fill('carol@example.org')
+  await form.getByRole('button', { name: /invit/i }).click()
+  await expect(page.getByTestId('login-form')).toBeVisible()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await page.evaluate(() => { window.location.hash = '#/admin' })
+  await expect(page.locator('.admin-invite-form')).toBeVisible()
+  await expect(page.locator('.admin-invite-form__status')).toHaveCount(0)
+})

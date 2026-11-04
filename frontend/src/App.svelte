@@ -1760,6 +1760,7 @@
       inviteUsername = ''
       inviteEmail = ''
     } catch (error) {
+      if (error?.status === 401) return
       inviteStatus = error.message || 'Failed to create invitation'
       inviteError = true
     }
@@ -2178,6 +2179,7 @@
         selectedUpstreamTargetId = String(preferredTargetId || '')
       }
     } catch (error) {
+      if (error?.status === 401) return
       kantroposTargets = []
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
       kantroposAssignmentError = true
@@ -2189,6 +2191,7 @@
 
   async function loadUpstreamBrowse({ quiet = false, appendCurrent = false, appendPending = false } = {}) {
     const requestSeq = ++upstreamBrowseRequestSeq
+    const epoch = corpusScopeEpoch
     if (!quiet) {
       upstreamBrowseStatus = upstreamBrowse.target ? 'Refreshing upstream corpus browser...' : 'Loading upstream corpus browser...'
     }
@@ -2242,7 +2245,7 @@
         upstreamBrowseStatus = 'Loaded upstream corpus browser.'
       }
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || requestSeq !== upstreamBrowseRequestSeq || epoch !== corpusScopeEpoch) return
       if (!quiet) {
         upstreamBrowseStatus = error?.message || 'Failed to load upstream corpus browser.'
       }
@@ -2328,6 +2331,7 @@
         : 'Cleared Kantropos assignment.'
       kantroposAssignmentError = false
     } catch (error) {
+      if (error?.status === 401) return
       kantroposAssignmentStatus = error.message || 'Failed to save Kantropos assignment.'
       kantroposAssignmentError = true
     } finally {
@@ -2930,6 +2934,7 @@
       seedSourcesStatus = 'Cancelling search…'
       await loadSeedSources({ quiet: true })
     } catch (error) {
+      if (error?.status === 401) return
       seedSourcesStatus = error?.message || 'Could not cancel the search.'
     }
   }
@@ -3424,19 +3429,26 @@
 
   // Submit: ask for the count first; warn above the threshold, else start.
   async function runSearch() {
+    // The preview takes up to a minute: a sign-out or a corpus switch meanwhile
+    // ends this search, whose form has been reset under it.
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
     searchWarning = false
     searchStatus = 'Checking how many works match...'
     searchPreviewBusy = true
+    let preview = null
     try {
-      searchPreview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
+      preview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
     } catch (error) {
-      // A failed preview must not block the search.
-      searchPreview = null
+      if (error?.status === 401) return
+      // Any other failed preview must not block the search.
     } finally {
       searchPreviewBusy = false
-      // The preview costs OpenAlex credits too.
-      void refreshQuota()
     }
+    if (session !== sessionEpoch || scope !== corpusScopeEpoch) return
+    searchPreview = preview
+    // The preview costs OpenAlex credits too.
+    void refreshQuota()
     const cap = searchResultCap(searchMaxResults)
     if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
       searchWarning = true
@@ -3614,6 +3626,8 @@
     } catch (error) {
       if (error?.status === 401) return
       handleCorpusPollForbidden(error)
+      // A newer load or a corpus switch owns the status now.
+      if (requestSeq !== corpusLoadRequestSeq) return
       if (!append) {
         console.warn('Corpus refresh failed', error)
         corpusRefreshFailed = true
@@ -3692,7 +3706,7 @@
       }
       if (!quiet) pipelineWorkerStatus = ''
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
       if (!quiet) pipelineWorkerStatus = error?.message || 'Failed to load worker status.'
     }
   }
