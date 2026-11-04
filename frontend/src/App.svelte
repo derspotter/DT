@@ -1416,7 +1416,8 @@
 
   // What each tab renders, and therefore loads: boot (refreshAll), a tab
   // switch (refreshForActiveTab) and the cadence (runLiveRefreshCycleOnce)
-  // all read this one table. The admin-only resources are added on top.
+  // all read this one table. The admin-only resources are added on top. The
+  // cadence skips TAB_OPEN_RESOURCES.
   const TAB_RESOURCES = {
     workspace: ['stats', 'corpus', 'seeds', 'runs'],
     dashboard: ['stats', 'corpus', 'runs'],
@@ -1427,6 +1428,10 @@
     logs: [],
     admin: [],
   }
+  // Loaded when the tab opens or on request, never by a tab's poll: ingest runs
+  // follow worker activity (a dirty cycle loads them), and the Korpus Management
+  // browse is a heavy read that its Refresh button repeats.
+  const TAB_OPEN_RESOURCES = new Set(['runs', 'upstream'])
   const ADMIN_RESOURCES = {
     dashboard: ['downloads', 'daemon', 'globalStats', 'globalDaemon'],
     downloads: ['downloads', 'daemon'],
@@ -1456,7 +1461,7 @@
     stats: ({ quiet }) => loadIngestStats({ quiet }),
     corpus: ({ quiet }) => (quiet ? loadCorpus({ preserveSelection: true, quiet: true }) : loadCorpus()),
     seeds: ({ quiet }) => loadSeedSources({ quiet }),
-    runs: () => loadIngestRuns(),
+    runs: ({ quiet }) => loadIngestRuns({ quiet }),
     upstream: ({ quiet }) => loadUpstreamBrowse({ quiet }),
     downloads: () => loadDownloads(),
     daemon: ({ quiet }) => loadPipelineWorkerStatus({ quiet }),
@@ -1516,7 +1521,7 @@
     // discoverable from any tab, or the cadence never ends) or dirty data
     // (log lines) load anything; the tab's own resources are not refreshed.
     const tabCycle = shouldRunLiveRefresh()
-    const names = tabCycle ? resourcesFor(activeTab, { admin }) : []
+    const names = tabCycle ? resourcesFor(activeTab, { admin }).filter((name) => !TAB_OPEN_RESOURCES.has(name)) : []
     if (anySearchRunning) names.push('seeds')
     if (dirty) {
       names.push('runs')
@@ -2428,8 +2433,8 @@
     }
   }
 
-  async function loadIngestRuns() {
-    ingestRunsStatus = 'Loading ingest runs...'
+  async function loadIngestRuns({ quiet = false } = {}) {
+    if (!quiet) ingestRunsStatus = 'Loading ingest runs...'
     const epoch = corpusScopeEpoch
     try {
       const payload = await fetchIngestRuns(20)

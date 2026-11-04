@@ -53,6 +53,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // The keyword-search preview's answer.
     previewCount: 5,
     previewDelayMs: 0,
+    // Daemon workers; a running batch puts an admin on the 2 s cadence.
+    workers: {} as Record<string, unknown>,
+    ingestRuns: [] as Record<string, unknown>[],
   }
   const scripted = async (route: Route, steps: Step[]) => {
     const step = steps.shift()
@@ -125,13 +128,13 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
           : []
       return fulfil(route, { sources, total: sources.length, source: 'api' })
     }
-    if (path === '/api/ingest/runs') return fulfil(route, { runs: [], total: 0, source: 'api' })
+    if (path === '/api/ingest/runs') return fulfil(route, { runs: state.ingestRuns, total: state.ingestRuns.length, source: 'api' })
     if (path === '/api/ingest/stats') {
       return fulfil(route, { stats: url.searchParams.get('global') === '1' ? { downloaded: 42 } : { downloaded: state.statsDownloaded } })
     }
     if (path === '/api/pipeline/daemon/status') {
       if (url.searchParams.get('global') !== '1' && await scripted(route, state.daemonSteps)) return
-      return fulfil(route, { daemon: { workers: {} }, backlog: url.searchParams.get('global') === '1' ? { downloading: 3 } : {} })
+      return fulfil(route, { daemon: { workers: state.workers }, backlog: url.searchParams.get('global') === '1' ? { downloading: 3 } : {} })
     }
     if (path === '/api/downloads') return fulfil(route, { items: [], source: 'api' })
     if (path === '/api/downloads/worker/status') return fulfil(route, {})
@@ -600,3 +603,49 @@ for (const { count, name } of [{ count: 5, name: 'small' }, { count: 342118, nam
     await expect(card.getByRole('button', { name: 'Search', exact: true })).toBeEnabled()
   })
 }
+
+test('poll cycles load ingest runs only when dirty, and never flash their status', async ({ page }) => {
+  const { count, reset } = await boot(page, {
+    running: true,
+    // The status line renders in the extracted-documents list.
+    setup: (state) => { state.ingestRuns = [{ ingest_source: 'paper', title: 'Paper' }] },
+  })
+  await expect(page.getByText('Extracted seed documents')).toBeVisible()
+  await page.evaluate(() => {
+    const w = window as any
+    w.__runsStatusSeen = false
+    w.__runsStatusObserver = new MutationObserver(() => {
+      if (document.body.textContent?.includes('Loading ingest runs...')) w.__runsStatusSeen = true
+    })
+    w.__runsStatusObserver.observe(document.body, { subtree: true, childList: true, characterData: true })
+  })
+  reset()
+  await expect.poll(() => count('/api/corpus'), { timeout: 8000 }).toBeGreaterThanOrEqual(2)
+  expect(count('/api/ingest/runs')).toBe(0)
+
+  // A log line marks the data dirty: the next cycle loads them.
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(() => count('/api/ingest/runs')).toBe(1)
+
+  // Opening the tab loads them too.
+  reset()
+  await page.evaluate(() => { window.location.hash = '#/graph' })
+  await page.evaluate(() => { window.location.hash = '#/workspace' })
+  await expect.poll(() => count('/api/ingest/runs')).toBeGreaterThanOrEqual(1)
+  expect(await page.evaluate(() => (window as any).__runsStatusSeen)).toBe(false)
+})
+
+test('Korpus Management does not poll the browse while a worker is busy', async ({ page }) => {
+  const { count, state, reset } = await boot(page, { admin: true, hash: '#/upstream' })
+  state.workers = { enrich: { online: true, status: 'running', last_seen_at: '2026-10-24T09:00:00Z', details: {} } }
+  // The next load finds the busy worker and puts the tab on the 2 s cadence.
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(() => page.evaluate(() => (window as any).__dtRefresh.reason())).toBe('active')
+  reset()
+  await expect.poll(() => count('/api/corpus'), { timeout: 8000 }).toBeGreaterThanOrEqual(2)
+  expect(count('/api/kantropos/corpora/k1/browse')).toBe(0)
+
+  // The explicit refresh still loads it.
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await expect.poll(() => count('/api/kantropos/corpora/k1/browse')).toBe(1)
+})
