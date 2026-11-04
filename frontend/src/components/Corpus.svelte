@@ -12,6 +12,7 @@
     sortIndicator,
   } from '../lib/works';
   export let corpusSource;
+  export let corpusRefreshFailed = false;
   export let corpusTotal;
   export let corpusItems;
   export let rawTotal;
@@ -187,7 +188,13 @@
     <div class="workspace-panel-title">
       <h3 class="workspace-section-title">3. Corpus</h3>
       <p class="muted">
-        {corpusSource === 'api' ? 'Live corpus from API.' : 'Sample corpus data.'}
+        {#if corpusSource !== 'api'}
+          Corpus not loaded.
+        {:else if corpusRefreshFailed}
+          Refresh failed; showing earlier rows.
+        {:else}
+          Live corpus from API.
+        {/if}
         {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusTotal}.{/if}
       </p>
     </div>

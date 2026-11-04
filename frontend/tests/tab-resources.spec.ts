@@ -6,6 +6,7 @@ import { fulfil, mockLogSocket } from './helpers/mockApi'
 // re-requested, and the corpus poll asks for one page.
 
 const CORPUS_PAGE_SIZE = 120
+const STALE_CORPUS_NOTE = 'Refresh failed; showing earlier rows.'
 
 function corpusRow(id: number) {
   return { id, work_id: id, title: `Work ${id}`, authors: 'A. Author', year: 2024, status: 'downloaded' }
@@ -37,6 +38,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // Ids prepended, one each, right after a prefix-reload page at offset 0
     // (limit > one page) is answered: a leading insert between two pages.
     insertAfterPrefixStart: [] as number[],
+    // Same trigger: the row at `from` moves to the very end, past the loaded
+    // rows, so the reload's next page starts one row later than asked.
+    moveAfterPrefixStart: [] as number[],
   }
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -73,6 +77,10 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       await fulfil(route, { items, total, source: 'api', stage_totals: { downloaded: total } })
       if (offset === 0 && limit > CORPUS_PAGE_SIZE && state.insertAfterPrefixStart.length > 0) {
         state.corpusIds = [state.insertAfterPrefixStart.shift()!, ...state.corpusIds]
+      }
+      if (offset === 0 && limit > CORPUS_PAGE_SIZE && state.moveAfterPrefixStart.length > 0) {
+        const [moved] = state.corpusIds.splice(state.moveAfterPrefixStart.shift()!, 1)
+        state.corpusIds.push(moved)
       }
       return
     }
@@ -271,13 +279,20 @@ test('a failed prefix reload is retried by the next poll', async ({ page }) => {
   state.corpusIds = [1000, ...state.corpusIds]
   state.failPrefixReloads = 1
   const prefixReloads = () => log.filter((e) => e.path === '/api/corpus' && Number(e.search.get('limit')) > CORPUS_PAGE_SIZE).length
-  // First poll: the first page changed, its prefix reload answers 503.
+  await expect(panel).toContainText('Live corpus from API.')
+  // First poll: the first page changed, its prefix reload answers 503. The
+  // user is told, and the first page's counts still apply.
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect.poll(prefixReloads).toBe(1)
-  await page.waitForTimeout(300)
+  await expect(panel).toContainText(STALE_CORPUS_NOTE)
+  await expect(panel).not.toContainText('Live corpus from API.')
+  await expect(panel).toContainText(`Loaded ${CORPUS_PAGE_SIZE * 2}/301`)
+  await expect(page.locator('.header-stats')).toContainText('301 items promoted')
   // Second, identical poll: retries the reload, which now succeeds.
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect.poll(prefixReloads).toBe(2)
+  await expect(panel).toContainText('Live corpus from API.')
+  await expect(panel).not.toContainText(STALE_CORPUS_NOTE)
   await expect(panel).toContainText(/Loaded \d+\/301/)
   await panel.getByRole('button', { name: 'Show more' }).click()
   await expect(panel).toContainText('Loaded 301/301')
@@ -320,18 +335,19 @@ test('a changed first page reloads every loaded row in bounded pages', async ({ 
 
   // A leading insert; the prefix reload's second page fails first.
   state.corpusIds = [5000, ...state.corpusIds]
-  state.failOffset = 1000
+  state.failOffset = 999
   reset()
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
-  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '320@1000'])
-  await page.waitForTimeout(300)
+  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999'])
+  await expect(panel).toContainText(STALE_CORPUS_NOTE)
   // Rows and signature untouched: the old rows stay, the next poll retries.
-  await expect(panel).toContainText('Loaded 1320/1400')
+  await expect(panel).toContainText('Loaded 1320/1401')
   expect((await tableIds())[0]).toBe('1')
 
   reset()
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
-  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '320@1000'])
+  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999'])
+  await expect(panel).toContainText('Live corpus from API.')
   await expect(panel).toContainText('Loaded 1320/1401')
   const ids = await tableIds()
   expect(ids.length).toBe(1320)
@@ -354,7 +370,7 @@ test('a prefix reload whose pages disagree is retried once, then left alone', as
   const corpusRequests = () => log
     .filter((e) => e.path === '/api/corpus')
     .map((e) => `${e.search.get('limit')}@${e.search.get('offset')}`)
-  const prefixRequests = [`${CORPUS_PAGE_SIZE}@0`, '1000@0', '320@1000', '1000@0', '320@1000']
+  const prefixRequests = [`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999', '1000@0', '321@999']
 
   // A row lands in front between the pages of the reload and again during
   // its retry: both attempts are inconsistent, so nothing changes.
@@ -363,8 +379,10 @@ test('a prefix reload whose pages disagree is retried once, then left alone', as
   reset()
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect.poll(corpusRequests).toEqual(prefixRequests)
-  await page.waitForTimeout(300)
-  await expect(panel).toContainText('Loaded 1320/1400')
+  await expect(panel).toContainText(STALE_CORPUS_NOTE)
+  await expect(panel).not.toContainText('Live corpus from API.')
+  // The rows stay; the counts are the first page's.
+  await expect(panel).toContainText('Loaded 1320/1401')
   expect((await tableIds())[0]).toBe('1')
   expect(errors).toEqual([])
 
@@ -380,5 +398,61 @@ test('a prefix reload whose pages disagree is retried once, then left alone', as
   expect(new Set(ids).size).toBe(1320)
   expect(ids.slice(0, 4)).toEqual(['8000', '7000', '6000', '5000'])
   expect(ids[1319]).toBe('1316')
+  await expect(panel).toContainText('Live corpus from API.')
   expect(errors).toEqual([])
+})
+
+test('a row that leaves the loaded range mid-reload (no id repeats, total unchanged) is retried', async ({ page }) => {
+  test.setTimeout(90_000)
+  const errors: string[] = []
+  page.on('pageerror', (error) => errors.push(String(error)))
+  const { state, log, reset } = await boot(page, { corpusTotal: 1400 })
+  const panel = page.getByTestId('corpus-panel')
+  await showMoreUntil(panel, 1320, 1400)
+  const corpusRequests = () => log
+    .filter((e) => e.path === '/api/corpus')
+    .map((e) => `${e.search.get('limit')}@${e.search.get('offset')}`)
+
+  // Sorted by a mutable column: a row of the first reload page moves past the
+  // loaded rows while the reload runs, so the next page's rows shift by one.
+  state.corpusIds = [5000, ...state.corpusIds]
+  state.moveAfterPrefixStart = [10]
+  reset()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999', '1000@0', '321@999'])
+  await expect(panel).toContainText('Live corpus from API.')
+  const ids = await panel.locator('.corpus-table').evaluate((table) =>
+    [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
+  )
+  // The server's order: 5000, 1..1400 without the moved row 10. No gap.
+  expect(ids.length).toBe(1320)
+  expect(ids.slice(0, 11)).toEqual(['5000', '1', '2', '3', '4', '5', '6', '7', '8', '9', '11'])
+  expect(ids[1319]).toBe('1320')
+  expect(errors).toEqual([])
+})
+
+test('the corpus note is true before the first answer and after a failed load', async ({ page }) => {
+  const { state } = await boot(page, { setup: (s) => { s.failOffset = 0 } })
+  const panel = page.getByTestId('corpus-panel')
+  await expect(panel).toContainText('Corpus not loaded.')
+  await expect(panel).not.toContainText('Sample corpus data.')
+  await expect(panel).not.toContainText('Live corpus from API.')
+  expect(state.failOffset).toBeNull()
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect(panel).toContainText('Live corpus from API.')
+  await expect(panel).not.toContainText('Corpus not loaded.')
+})
+
+test('a failed first-page poll does not claim a live corpus', async ({ page }) => {
+  const { state } = await boot(page, { corpusTotal: 3 })
+  const panel = page.getByTestId('corpus-panel')
+  await expect(panel).toContainText('Live corpus from API.')
+  state.failOffset = 0
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect(panel).toContainText(STALE_CORPUS_NOTE)
+  await expect(panel).not.toContainText('Live corpus from API.')
+  // The next poll finds the same first page: the rows are current after all.
+  await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
+  await expect(panel).toContainText('Live corpus from API.')
+  await expect(panel).not.toContainText(STALE_CORPUS_NOTE)
 })

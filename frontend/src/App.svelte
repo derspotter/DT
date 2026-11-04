@@ -424,6 +424,8 @@
   let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
   let corpusSource = ''
+  // The last reload of the rows on screen failed or was abandoned.
+  let corpusRefreshFailed = false
   let corpusStageTotals = { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
   $: rawTotal = Number(corpusStageTotals?.raw || 0)
   $: metadataTotal = Number(corpusStageTotals?.metadata || 0)
@@ -1902,6 +1904,7 @@
       corpusFilterQuery: '',
       corpusLoadStatus: '',
       corpusSource: '',
+      corpusRefreshFailed: false,
       corpusStageTotals: { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 },
       downloads: [],
       downloadsSource: '',
@@ -1970,6 +1973,7 @@
       corpusFilterQuery,
       corpusLoadStatus,
       corpusSource,
+      corpusRefreshFailed,
       corpusStageTotals,
       downloads,
       downloadsSource,
@@ -3483,6 +3487,20 @@
     return JSON.stringify([corpusFilterQuery, corpusSort, total, stageTotals, data])
   }
 
+  function applyCorpusCounts(total, stageTotals) {
+    corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
+    corpusHasMore = corpusItems.length < corpusTotal
+    if (stageTotals && typeof stageTotals === 'object') {
+      corpusStageTotals = {
+        raw: Number(stageTotals.raw || 0),
+        metadata: Number(stageTotals.metadata || 0),
+        downloaded: Number(stageTotals.downloaded || 0),
+        failed_enrichment: Number(stageTotals.failed_enrichment || 0),
+        failed_download: Number(stageTotals.failed_download || 0),
+      }
+    }
+  }
+
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
     if (!append && corpusLoading) return
     if (!append && quiet && corpusLoadingMore) return
@@ -3522,15 +3540,24 @@
       let pageSignature = null
       if (!append) {
         pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
-        if (poll && pageSignature === lastCorpusPageSignature) return
+        if (poll && pageSignature === lastCorpusPageSignature) {
+          corpusRefreshFailed = false
+          return
+        }
+        // The first page's counts hold whatever the reload below does.
+        applyCorpusCounts(total, stageTotals)
         // The first page changed while more pages are loaded: a fresh page in
         // front of the old tail would shift the offsets (rows lost or doubled
         // on the next "Show more"), so reload every loaded row, in sequential
         // pages of at most CORPUS_POLL_PAGE_ROWS. The rows are replaced only
         // once every page answered; a failed page throws and changes nothing.
         // A write between two pages shifts the offsets (a row doubled or
-        // skipped at the boundary): such an attempt is retried once, and a
-        // second inconsistent one leaves rows and signature for the next poll.
+        // skipped at the boundary). Each page after the first starts on the
+        // last row already read, and the sort ends in a unique id, so any such
+        // shift shows there: the row in that slot is a different one. Such an
+        // attempt is retried once, and a second inconsistent one leaves rows
+        // and signature for the next poll. Two writes that cancel out exactly
+        // at a boundary stay invisible until the first page next changes.
         if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
           const loadedRows = corpusItems.length
           let prefix = null
@@ -3538,12 +3565,16 @@
             const rows = []
             const totals = new Set()
             let last = null
-            for (let pageOffset = 0; pageOffset < loadedRows; pageOffset += CORPUS_POLL_PAGE_ROWS) {
+            let aligned = true
+            while (aligned && rows.length < loadedRows) {
+              const overlap = rows.length > 0 ? 1 : 0
+              const pageOffset = rows.length - overlap
               const pageLimit = Math.min(CORPUS_POLL_PAGE_ROWS, loadedRows - pageOffset)
               const answer = await fetchCorpus({ limit: pageLimit, offset: pageOffset, ...query })
               if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) return
               const pageRows = Array.isArray(answer.data) ? answer.data : []
-              rows.push(...pageRows)
+              aligned = !overlap || pageRows[0]?.id === rows[rows.length - 1]?.id
+              rows.push(...pageRows.slice(overlap))
               totals.add(Number(answer.total))
               last = answer
               // The corpus ends before the loaded count (rows were removed).
@@ -3551,30 +3582,25 @@
             }
             // Corpus keys its rows by id.
             const ids = rows.map((row) => row?.id)
-            if (totals.size === 1 && new Set(ids).size === ids.length) {
+            if (aligned && totals.size === 1 && new Set(ids).size === ids.length) {
               prefix = rows
               ;({ total, source, stageTotals } = last)
             }
           }
-          if (!prefix) return
+          if (!prefix) {
+            console.warn('Corpus refresh abandoned: the pages disagreed twice.')
+            corpusRefreshFailed = true
+            return
+          }
           data = prefix
         }
       }
       const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
-      corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
-      corpusHasMore = corpusItems.length < corpusTotal
+      applyCorpusCounts(total, stageTotals)
       corpusSource = source
-      if (stageTotals && typeof stageTotals === 'object') {
-        corpusStageTotals = {
-          raw: Number(stageTotals.raw || 0),
-          metadata: Number(stageTotals.metadata || 0),
-          downloaded: Number(stageTotals.downloaded || 0),
-          failed_enrichment: Number(stageTotals.failed_enrichment || 0),
-          failed_download: Number(stageTotals.failed_download || 0),
-        }
-      }
+      if (!append) corpusRefreshFailed = false
       if (!quiet) {
         corpusLoadStatus = corpusHasMore
           ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
@@ -3583,6 +3609,10 @@
     } catch (error) {
       if (error?.status === 401) return
       handleCorpusPollForbidden(error)
+      if (!append) {
+        console.warn('Corpus refresh failed', error)
+        corpusRefreshFailed = true
+      }
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
       }
@@ -5043,6 +5073,7 @@
             <div class="corpus-workspace-shell">
               <Corpus
                 {corpusSource}
+                {corpusRefreshFailed}
                 {corpusTotal}
                 {corpusItems}
                 {rawTotal}
