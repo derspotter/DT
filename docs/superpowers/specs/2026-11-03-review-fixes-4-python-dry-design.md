@@ -125,6 +125,10 @@ their loops in it and pass `commit=False`. `create_pending_work`: `high_confiden
 checks `field not in {"normalized_doi", "openalex_id"}`, and the low-confidence branch keeps
 merging (current behaviour) but logs `action="possible_duplicate", notes=
 "low_confidence_match_merged"` and the comment says so. The unreachable `return` goes.
+The title/alias identifier guard of `_find_existing_work` is opt-in (`identifier_guard=True`, default off): only
+flows that compare one existing row against the others and absorb the match
+(`apply_enriched_metadata`, `mark_raw_work_downloaded`) pass it, and an incoming record still
+merges with a title match that carries a different DOI.
 
 ### D6. Import links duplicates
 `ingest_import_seed.py` sets `entry["corpus_id"] = args.corpus_id` before

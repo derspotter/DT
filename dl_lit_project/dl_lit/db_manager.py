@@ -539,7 +539,14 @@ class DatabaseManager:
                 merged[key] = value
         return merged
 
-    def _find_existing_work(self, *, doi=None, openalex_id=None, title=None, authors=None, editors=None, year=None, exclude_id: int | None = None) -> tuple[int | None, str | None]:
+    def _find_existing_work(self, *, doi=None, openalex_id=None, title=None, authors=None, editors=None, year=None, exclude_id: int | None = None, identifier_guard: bool = False) -> tuple[int | None, str | None]:
+        """Find the works row matching the input: DOI, OpenAlex id, then title, then alias.
+
+        An incoming record merges with a title match whatever its identifiers (a preprint and its
+        journal version). ``identifier_guard`` is for flows that compare one existing row against
+        the others and absorb the match, where merging two rows with different identifiers would
+        corrupt attribution: a title or alias candidate whose identifier differs is then skipped.
+        """
         cur = self.conn.cursor()
         normalized_contributors = self._normalize_contributor_fields(authors, editors)
         def _one(query, params, field):
@@ -569,14 +576,12 @@ class DatabaseManager:
         normalized_title = self._normalize_text(title)
         year_str = str(year).strip() if year is not None and str(year).strip() else None
         if normalized_title:
-            # A title-based candidate whose identifier differs from the incoming one is another
-            # work (a resolved-identifier conflict): such candidates are never returned.
-            def identity_guard(prefix=""):
+            def candidate_filter(prefix=""):
                 sql, guard_params = "", []
-                if normalized_doi:
+                if identifier_guard and normalized_doi:
                     sql += f" AND ({prefix}normalized_doi IS NULL OR {prefix}normalized_doi = '' OR {prefix}normalized_doi = ?)"
                     guard_params.append(normalized_doi)
-                if normalized_openalex:
+                if identifier_guard and normalized_openalex:
                     sql += f" AND ({prefix}openalex_id IS NULL OR {prefix}openalex_id = '' OR {prefix}openalex_id = ?)"
                     guard_params.append(normalized_openalex)
                 if exclude_id:
@@ -585,7 +590,7 @@ class DatabaseManager:
                 return sql, guard_params
 
             def title_lookup(where, params, field):
-                guard_sql, guard_params = identity_guard()
+                guard_sql, guard_params = candidate_filter()
                 return _one(f"SELECT id FROM works WHERE {where}{guard_sql}", [*params, *guard_params], field)
 
             if year_str and normalized_contributors:
@@ -619,7 +624,7 @@ class DatabaseManager:
             if year_str and year_str.isdigit():
                 query += " AND (a.alias_year IS NULL OR a.alias_year BETWEEN ? AND ?)"
                 params.extend([int(year_str) - 1, int(year_str) + 1])
-            guard_sql, guard_params = identity_guard("w.")
+            guard_sql, guard_params = candidate_filter("w.")
             found_id, field = _one(query + guard_sql, [*params, *guard_params], "alias_title")
             if found_id:
                 return found_id, field
@@ -946,9 +951,14 @@ class DatabaseManager:
         editors: list | str | None = None,
         year: int | str | None = None,
         exclude_id: int | None = None,
-        exclude_table: str | None = None
+        exclude_table: str | None = None,
+        *,
+        identifier_guard: bool = False,
     ) -> tuple[str | None, int | None, str | None]:
-        """Checks if an entry already exists in the canonical works table."""
+        """Checks if an entry already exists in the canonical works table.
+
+        ``identifier_guard``: see _find_existing_work.
+        """
         effective_exclude_id = exclude_id if exclude_table == "works" else None
         work_id, field = self._find_existing_work(
             doi=doi,
@@ -958,6 +968,7 @@ class DatabaseManager:
             editors=editors,
             year=year,
             exclude_id=effective_exclude_id,
+            identifier_guard=identifier_guard,
         )
         if work_id:
             return "works", int(work_id), field
@@ -1539,6 +1550,7 @@ class DatabaseManager:
                 editors=merged.get("editors"),
                 year=merged.get("year"),
                 exclude_id=int(work_id),
+                identifier_guard=True,
             )
             if existing_id:
                 existing = self.get_entry_by_id("works", int(existing_id)) or {}
@@ -1955,6 +1967,7 @@ class DatabaseManager:
                 year=fields['year'],
                 exclude_id=source_id,
                 exclude_table="works",
+                identifier_guard=True,
             )
             if duplicate_table == "works" and duplicate_id is not None:
                 existing = self.get_entry_by_id("works", int(duplicate_id)) or {}

@@ -425,3 +425,48 @@ def test_transaction_raises_when_the_transaction_it_opened_is_gone(tmp_path):
         assert not db.conn.in_transaction
     finally:
         db.close_connection()
+
+
+# --- second pass: the create path merges title matches whatever their identifiers (spec D5) --
+def test_same_title_authors_year_with_a_different_doi_merges_on_create(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    ref = {"title": "Institutions and growth", "authors": ["Jane Roe"], "year": 2020}
+    try:
+        first_id, err = db.create_pending_work({**ref, "doi": "10.2139/ssrn.111"})
+        assert err is None
+        row_id, err = db.create_pending_work({**ref, "doi": "10.1000/journal.222", "corpus_id": 7})
+        assert row_id is None
+        assert err == f"Duplicate already exists in works (ID {first_id}) on title_authors_year"
+        assert db.conn.execute("SELECT id, normalized_doi FROM works").fetchall() == [
+            (first_id, db._normalize_doi("10.2139/ssrn.111"))
+        ]
+        assert _corpus_ids(db, first_id) == [7]
+    finally:
+        db.close_connection()
+
+
+def test_check_if_exists_matches_titles_across_identifiers_unless_guarded(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    ref = {"title": "Same Title", "authors": ["Jane Roe"], "year": 2020}
+    try:
+        work_id, _ = db.create_pending_work({**ref, "doi": "10.1/one"})
+        kwargs = dict(doi="10.1/two", openalex_id=None, title=ref["title"], authors=ref["authors"], year=2020)
+        assert db.check_if_exists(**kwargs) == ("works", work_id, "title_authors_year")
+        assert db.check_if_exists(**kwargs, identifier_guard=True) == (None, None, None)
+    finally:
+        db.close_connection()
+
+
+def test_raw_download_does_not_absorb_a_record_with_a_different_doi(tmp_path):
+    db = DatabaseManager(tmp_path / "lit.db")
+    ref = {"title": "Same Title", "authors": ["Jane Roe"], "year": 2020}
+    try:
+        first = db._insert_work_record({**db._build_raw_work_payload({**ref, "doi": "10.1/one"})})
+        second = db._insert_work_record({**db._build_raw_work_payload({**ref, "doi": "10.1/two"})})
+        db.conn.commit()
+        result, err = db.mark_raw_work_downloaded(first, {}, "/tmp/one.pdf", "sum", "direct")
+        assert (result, err) == (first, None)
+        assert db.conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 2
+        assert db.get_entry_by_id("works", second)["download_status"] != "downloaded"
+    finally:
+        db.close_connection()
