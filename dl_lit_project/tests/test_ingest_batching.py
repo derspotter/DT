@@ -445,14 +445,15 @@ def test_same_title_authors_year_with_a_different_doi_merges_on_create(tmp_path)
         db.close_connection()
 
 
-def test_check_if_exists_matches_titles_across_identifiers_unless_guarded(tmp_path):
+def test_check_if_exists_guards_identifiers_whenever_a_row_is_excluded(tmp_path):
     db = DatabaseManager(tmp_path / "lit.db")
     ref = {"title": "Same Title", "authors": ["Jane Roe"], "year": 2020}
     try:
         work_id, _ = db.create_pending_work({**ref, "doi": "10.1/one"})
         kwargs = dict(doi="10.1/two", openalex_id=None, title=ref["title"], authors=ref["authors"], year=2020)
         assert db.check_if_exists(**kwargs) == ("works", work_id, "title_authors_year")
-        assert db.check_if_exists(**kwargs, identifier_guard=True) == (None, None, None)
+        for exclude_table in ("works", None):  # exclude_id alone is enough: the guard cannot be left out
+            assert db.check_if_exists(**kwargs, exclude_id=work_id + 1, exclude_table=exclude_table) == (None, None, None)
     finally:
         db.close_connection()
 

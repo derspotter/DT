@@ -539,13 +539,15 @@ class DatabaseManager:
                 merged[key] = value
         return merged
 
-    def _find_existing_work(self, *, doi=None, openalex_id=None, title=None, authors=None, editors=None, year=None, exclude_id: int | None = None, identifier_guard: bool = False) -> tuple[int | None, str | None]:
+    def _find_existing_work(self, *, doi=None, openalex_id=None, title=None, authors=None, editors=None, year=None, exclude_id: int | None = None) -> tuple[int | None, str | None]:
         """Find the works row matching the input: DOI, OpenAlex id, then title, then alias.
 
-        An incoming record merges with a title match whatever its identifiers (a preprint and its
-        journal version). ``identifier_guard`` is for flows that compare one existing row against
-        the others and absorb the match, where merging two rows with different identifiers would
-        corrupt attribution: a title or alias candidate whose identifier differs is then skipped.
+        An incoming record (no ``exclude_id``) merges with a title match whatever its identifiers
+        (a preprint and its journal version). ``exclude_id`` means an existing row is compared
+        against the others, and every such flow absorbs the match: merging two rows with
+        different identifiers would corrupt attribution, so a title or alias candidate whose
+        identifier differs is then skipped. The rule hangs on ``exclude_id`` so that a new absorb
+        flow cannot leave it out.
         """
         cur = self.conn.cursor()
         normalized_contributors = self._normalize_contributor_fields(authors, editors)
@@ -578,10 +580,10 @@ class DatabaseManager:
         if normalized_title:
             def candidate_filter(prefix=""):
                 sql, guard_params = "", []
-                if identifier_guard and normalized_doi:
+                if exclude_id and normalized_doi:
                     sql += f" AND ({prefix}normalized_doi IS NULL OR {prefix}normalized_doi = '' OR {prefix}normalized_doi = ?)"
                     guard_params.append(normalized_doi)
-                if identifier_guard and normalized_openalex:
+                if exclude_id and normalized_openalex:
                     sql += f" AND ({prefix}openalex_id IS NULL OR {prefix}openalex_id = '' OR {prefix}openalex_id = ?)"
                     guard_params.append(normalized_openalex)
                 if exclude_id:
@@ -956,15 +958,13 @@ class DatabaseManager:
         editors: list | str | None = None,
         year: int | str | None = None,
         exclude_id: int | None = None,
-        exclude_table: str | None = None,
-        *,
-        identifier_guard: bool = False,
+        exclude_table: str | None = None
     ) -> tuple[str | None, int | None, str | None]:
         """Checks if an entry already exists in the canonical works table.
 
-        ``identifier_guard``: see _find_existing_work.
+        ``exclude_id`` compares an existing row against the others: see _find_existing_work.
         """
-        effective_exclude_id = exclude_id if exclude_table == "works" else None
+        effective_exclude_id = exclude_id if exclude_table in (None, "works") else None
         work_id, field = self._find_existing_work(
             doi=doi,
             openalex_id=openalex_id,
@@ -973,7 +973,6 @@ class DatabaseManager:
             editors=editors,
             year=year,
             exclude_id=effective_exclude_id,
-            identifier_guard=identifier_guard,
         )
         if work_id:
             return "works", int(work_id), field
@@ -1577,7 +1576,6 @@ class DatabaseManager:
                 editors=merged.get("editors"),
                 year=merged.get("year"),
                 exclude_id=int(work_id),
-                identifier_guard=True,
             )
             if existing_id:
                 existing = self.get_entry_by_id("works", int(existing_id)) or {}
@@ -1994,7 +1992,6 @@ class DatabaseManager:
                 year=fields['year'],
                 exclude_id=source_id,
                 exclude_table="works",
-                identifier_guard=True,
             )
             if duplicate_table == "works" and duplicate_id is not None:
                 existing = self.get_entry_by_id("works", int(duplicate_id)) or {}

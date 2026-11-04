@@ -218,6 +218,28 @@ def test_cli_downloaded_count_ignores_the_duplicate_merge_result(mocker, tmp_pat
     db.move_entry_to_downloaded.assert_called_once_with(2, enhancer.enhance_bibliography.return_value, str(pdf), "abc", "mock")
 
 
+def test_cli_keeps_two_queued_rows_with_the_same_title_and_different_dois(mocker, tmp_path):
+    db_path = tmp_path / "cli.db"
+    db = DatabaseManager(str(db_path))
+    first = _insert_work(db, "Same Title", year=2020, doi="10.1/one", download_status="queued")
+    second = _insert_work(db, "Same Title", year=2020, doi="10.1/two", download_status="queued")
+    db.close_connection()
+    enhancer = mocker.patch("dl_lit.cli.BibliographyEnhancer", autospec=True).return_value
+    enhancer.enhance_bibliography.return_value = None
+
+    result = CliRunner().invoke(cli, ["download-pdfs", "--db-path", str(db_path), "--download-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "duplicate detected" not in result.output
+    assert enhancer.enhance_bibliography.call_count == 2
+    db = DatabaseManager(str(db_path))
+    try:
+        rows = db.conn.execute("SELECT id, normalized_doi FROM works ORDER BY id").fetchall()
+        assert rows == [(first, db._normalize_doi("10.1/one")), (second, db._normalize_doi("10.1/two"))]
+    finally:
+        db.close_connection()
+
+
 # --- the daemon callers ---------------------------------------------------------
 
 def _worker_daemon(monkeypatch, tmp_path, enhancer):
@@ -269,6 +291,34 @@ def test_worker_download_single_reads_the_duplicate_row_under_db_lock(tmp_path, 
     daemon._download_single(row)
 
     assert (other, True) in held
+
+
+def test_worker_keeps_a_row_whose_doi_differs_from_a_downloaded_title_match(tmp_path, monkeypatch):
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF")
+    enhancer = _Enhancer({"downloaded_file": str(pdf), "checksum": "abc", "download_source": "mock"})
+    daemon = _worker_daemon(monkeypatch, tmp_path, enhancer)
+    qid = _insert_work(daemon.db, "Same Title", year=2020, doi="10.1/one", download_status="queued")
+    other = _insert_work(daemon.db, "Same Title", year=2020, doi="10.1/two", download_status="downloaded")
+
+    status, info = daemon._download_single(daemon.db.get_entry_by_id("works", qid))
+
+    assert status == "downloaded" and info["downloaded_id"] == qid
+    norm = daemon.db._normalize_doi
+    rows = daemon.db.conn.execute("SELECT id, normalized_doi FROM works ORDER BY id").fetchall()
+    assert rows == [(qid, norm("10.1/one")), (other, norm("10.1/two"))]
+
+
+def test_worker_still_drops_a_row_without_a_conflicting_identifier(tmp_path, monkeypatch):
+    enhancer = _Enhancer({"downloaded_file": ""})
+    daemon = _worker_daemon(monkeypatch, tmp_path, enhancer)
+    qid = _insert_work(daemon.db, "Same Title", year=2020, download_status="queued")
+    other = _insert_work(daemon.db, "Same Title", year=2020, doi="10.1/two", download_status="downloaded")
+
+    status, info = daemon._download_single(daemon.db.get_entry_by_id("works", qid))
+
+    assert (status, info["action"]) == ("skipped", "dropped_duplicate")
+    assert [r[0] for r in daemon.db.conn.execute("SELECT id FROM works")] == [other]
 
 
 def test_worker_raw_download_failure_reports_the_refs_failure_fields(tmp_path, monkeypatch):

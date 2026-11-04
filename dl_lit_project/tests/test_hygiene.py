@@ -486,10 +486,11 @@ def test_enrichment_does_not_absorb_a_record_with_a_different_openalex_id(tmp_pa
     db.conn.commit()
     assert db.apply_enriched_metadata(a, {"title": "Same Title", "year": 2020, "openalex_id": "W1"}) == (a, None)
     assert db.conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 2
-    # with the guard, an alias of the other record is no match either; the guard is opt-in
+    # comparing an existing row (exclude_id), an alias of the other record is no match either;
+    # an incoming record (no exclude_id) has no guard
     db.add_work_alias("works", b, "Alias Title", alias_year=2020)
-    assert db._find_existing_work(title="Alias Title", year=2020, openalex_id="W9", identifier_guard=True) == (None, None)
-    assert db._find_existing_work(title="Alias Title", year=2020, identifier_guard=True) == (b, "alias_title")
+    assert db._find_existing_work(title="Alias Title", year=2020, openalex_id="W9", exclude_id=a) == (None, None)
+    assert db._find_existing_work(title="Alias Title", year=2020, exclude_id=a) == (b, "alias_title")
     assert db._find_existing_work(title="Alias Title", year=2020, openalex_id="W9") == (b, "alias_title")
 
 

@@ -413,7 +413,10 @@ def test_role_all_runs_the_download_cycle_after_a_failing_enrich_cycle(monkeypat
     assert [e for e in events if e[0] == "direct"] == [("direct", "enrich"), ("direct", "download")]
     assert started == ["enrich", "download"]
     assert any("enrich cycle failed: enrich broke" in line for line in lines)
-    assert {"processed": 1, "promoted": 1, "errors": ["enrich cycle failed: enrich broke"]} in results
+    assert {
+        "processed": 1, "promoted": 1, "queued": 0, "downloaded": 0, "failed": 0,
+        "errors": ["enrich cycle failed: enrich broke"],
+    } in results
 
 
 def test_role_all_reports_both_failing_cycles(monkeypatch, tmp_path):
@@ -430,7 +433,8 @@ def test_a_failing_download_cycle_keeps_the_enrich_counters(monkeypatch, tmp_pat
     daemon._run_direct_download_cycle = _fail_cycle(events, "download")
     lines = _capture_log(monkeypatch)
     assert daemon._run_direct_cycles() == {
-        "processed": 1, "promoted": 1, "errors": ["download cycle failed: download broke"],
+        "processed": 1, "promoted": 1, "queued": 0, "downloaded": 0, "failed": 0,
+        "errors": ["download cycle failed: download broke"],
     }
     assert any("download cycle failed: download broke" in line for line in lines)
 
