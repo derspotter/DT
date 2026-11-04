@@ -137,8 +137,8 @@ test('a daemon killed mid-batch (stale heartbeat still "running") does not count
 
 test('a log line that arrives while hidden is refreshed once the tab is visible again', async ({ page }) => {
   // Not the workspace: becoming visible loads a tab's own resources, and those
-  // would include ingest runs there. On Logs only the dirty flag requests them.
-  const counts = await boot(page, { hash: '#/logs' })
+  // would include ingest runs there. On the graph only the dirty flag does.
+  const counts = await boot(page, { hash: '#/graph' })
   await setVisibility(page, 'hidden')
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(100))
   await page.waitForTimeout(2000)

@@ -241,7 +241,9 @@ test('a corpus switch during the seed reload inside the completion focus does no
     page,
     state,
     async (path, route) => {
-      if (path.startsWith('/api/seed/sources/pdf/paperA/candidates')) candidateRequests.push(path)
+      // From the switch on. Corpus A's list not showing the seed makes the
+      // completion ask for its count first; that is corpus A's own seed.
+      if (path.startsWith('/api/seed/sources/pdf/paperA/candidates') && state.phase === 'B') candidateRequests.push(path)
       if (path === '/api/seed/sources' && seedStage === 1) {
         // Corpus A's list does not show the seed yet, so focusSeedSource reloads.
         seedStage = 2
