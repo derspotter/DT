@@ -320,3 +320,139 @@ def test_a_failing_error_heartbeat_does_not_end_the_loop(monkeypatch, tmp_path):
     daemon.run()
     assert calls["fetch"] == 3
     assert [e for e in events if e[0] == "sleep"][:2] == [("sleep", 10), ("sleep", 10)]
+
+
+# --- second pass: a heartbeat failure names its cause ---------------------------------------
+
+class _FailingConn:
+    in_transaction = False
+
+    def __init__(self, message):
+        self.message = message
+
+    def cursor(self):
+        return self
+
+    def execute(self, *args):
+        raise sqlite3.OperationalError(self.message)
+
+
+def _capture_log(monkeypatch):
+    lines = []
+    monkeypatch.setattr(WORKER_MODULE, "log", lines.append)
+    return lines
+
+
+@pytest.mark.parametrize("message", ["database is locked", "database table is locked: daemon_heartbeat"])
+def test_heartbeat_logs_lock_contention_as_busy(tmp_path, monkeypatch, message):
+    lines = _capture_log(monkeypatch)
+    daemon = _heartbeat_daemon(tmp_path / "lit.db")
+    daemon.heartbeat_conn = _FailingConn(message)
+    daemon._heartbeat("running", {}, force=True)
+    assert lines == [f"Heartbeat skipped (database busy): {message}"]
+
+
+@pytest.mark.parametrize(
+    "message", ["attempt to write a readonly database", "disk I/O error", "database or disk is full"]
+)
+def test_heartbeat_does_not_call_other_operational_errors_busy(tmp_path, monkeypatch, message):
+    lines = _capture_log(monkeypatch)
+    daemon = _heartbeat_daemon(tmp_path / "lit.db")
+    daemon.heartbeat_conn = _FailingConn(message)
+    daemon._heartbeat("running", {}, force=True)
+    assert lines == [f"Heartbeat failed (database error): {message}"]
+
+
+def test_heartbeat_real_error_is_not_hidden_by_a_recent_busy_line(tmp_path, monkeypatch):
+    lines = _capture_log(monkeypatch)
+    daemon = _heartbeat_daemon(tmp_path / "lit.db")
+    daemon.heartbeat_conn = _FailingConn("database is locked")
+    daemon._heartbeat("running", {}, force=True)
+    daemon._heartbeat("running", {}, force=True)  # throttled
+    daemon.heartbeat_conn = _FailingConn("disk I/O error")
+    daemon._heartbeat("running", {}, force=True)
+    daemon._heartbeat("running", {}, force=True)  # throttled
+    assert lines == [
+        "Heartbeat skipped (database busy): database is locked",
+        "Heartbeat failed (database error): disk I/O error",
+    ]
+
+
+# --- second pass: direct cycles, role all ---------------------------------------------------
+
+def _fail_cycle(events, phase):
+    def cycle():
+        events.append(("direct", phase))
+        raise RuntimeError(f"{phase} broke")
+    return cycle
+
+
+def test_run_direct_cycles_sums_the_counters_of_every_cycle(monkeypatch, tmp_path):
+    daemon, _, _ = _loop_daemon("all", monkeypatch, tmp_path)
+    daemon._run_direct_enrich_cycle = lambda: {"processed": 3, "promoted": 2, "queued": 1, "failed": 1}
+    daemon._run_direct_download_cycle = lambda: {"processed": 4, "downloaded": 3, "failed": 1}
+    assert daemon._run_direct_cycles() == {"processed": 7, "promoted": 2, "queued": 1, "downloaded": 3, "failed": 2}
+
+
+def test_role_all_runs_the_download_cycle_after_a_failing_enrich_cycle(monkeypatch, tmp_path):
+    daemon, events, started = _loop_daemon("all", monkeypatch, tmp_path)
+    daemon.fetch_next_job = lambda: None
+    daemon._run_direct_enrich_cycle = _fail_cycle(events, "enrich")
+    lines = _capture_log(monkeypatch)
+    results = []
+    beat = daemon._heartbeat
+
+    def heartbeat(status, details=None, force=False):
+        results.append((details or {}).get("result"))
+        beat(status, details, force)
+
+    daemon._heartbeat = heartbeat
+
+    daemon.run()  # the download cycle stops the loop
+
+    assert [e for e in events if e[0] == "direct"] == [("direct", "enrich"), ("direct", "download")]
+    assert started == ["enrich", "download"]
+    assert any("enrich cycle failed: enrich broke" in line for line in lines)
+    assert {"processed": 1, "promoted": 1, "errors": ["enrich cycle failed: enrich broke"]} in results
+
+
+def test_role_all_reports_both_failing_cycles(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("all", monkeypatch, tmp_path)
+    daemon._run_direct_enrich_cycle = _fail_cycle(events, "enrich")
+    daemon._run_direct_download_cycle = _fail_cycle(events, "download")
+    with pytest.raises(RuntimeError) as caught:
+        daemon._run_direct_cycles()
+    assert str(caught.value) == "enrich cycle failed: enrich broke; download cycle failed: download broke"
+
+
+def test_a_failing_download_cycle_keeps_the_enrich_counters(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("all", monkeypatch, tmp_path)
+    daemon._run_direct_download_cycle = _fail_cycle(events, "download")
+    lines = _capture_log(monkeypatch)
+    assert daemon._run_direct_cycles() == {
+        "processed": 1, "promoted": 1, "errors": ["download cycle failed: download broke"],
+    }
+    assert any("download cycle failed: download broke" in line for line in lines)
+
+
+def test_a_single_role_cycle_failure_reaches_the_loop_error_path(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("enrich", monkeypatch, tmp_path)
+    daemon.fetch_next_job = lambda: None
+    daemon._run_direct_enrich_cycle = _fail_cycle(events, "enrich")
+    daemon.run()  # the fifth sleep stops the loop
+    assert ("heartbeat", "error", "loop_exception") in events
+    assert ("sleep", 10) in events
+
+
+def test_keyboard_interrupt_in_a_direct_cycle_still_ends_the_loop(monkeypatch, tmp_path):
+    daemon, events, _ = _loop_daemon("all", monkeypatch, tmp_path)
+    daemon.fetch_next_job = lambda: None
+    daemon._release_own_running_jobs = lambda: None
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    daemon._run_direct_enrich_cycle = interrupt
+    daemon.run()
+    assert ("direct", "download") not in events
+    assert events[-1] == ("heartbeat", "stopped", "keyboard_interrupt")

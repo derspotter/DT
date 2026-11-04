@@ -277,11 +277,12 @@ class PipelineDaemon:
             self.heartbeat_conn.commit()
 
     def _heartbeat(self, status: str, details: dict | None = None, force: bool = False):
-        """Upsert this daemon's heartbeat row. Never raises on a busy database.
+        """Upsert this daemon's heartbeat row. Never raises on an OperationalError.
 
         If another connection holds the write lock past the busy timeout the beat is skipped
-        (the next one retries) and logged at most once a minute, so neither a heartbeat thread
-        nor the main loop dies of a long import.
+        (the next one retries), so neither a heartbeat thread nor the main loop dies of a long
+        import. Lock contention and other OperationalErrors are logged apart, each at most once
+        a minute.
         """
         now = time.time()
         if not force and (now - self._last_heartbeat_at) < self.heartbeat_interval_seconds:
@@ -314,9 +315,15 @@ class PipelineDaemon:
                         self.heartbeat_conn.rollback()
                 except sqlite3.Error:
                     pass
-                if now - getattr(self, "_heartbeat_error_logged_at", 0.0) >= 60:
-                    self._heartbeat_error_logged_at = now
-                    log(f"Heartbeat skipped (database busy): {exc}")
+                # Only lock contention is expected here; a read-only, full or failing database
+                # is a real fault and must not read as "busy". Throttled per kind, so a recent
+                # busy line never hides one.
+                msg = str(exc).lower()
+                busy = "locked" in msg or "busy" in msg
+                logged_at = self.__dict__.setdefault("_heartbeat_error_logged_at", {})
+                if now - logged_at.get(busy, 0.0) >= 60:
+                    logged_at[busy] = now
+                    log(f"Heartbeat skipped (database busy): {exc}" if busy else f"Heartbeat failed (database error): {exc}")
                 return
         self._last_heartbeat_at = now
 
@@ -1183,13 +1190,19 @@ class PipelineDaemon:
     def _run_direct_cycles(self) -> dict | None:
         """Run this role's direct cycles, each under the direct-batch heartbeat thread.
 
-        Returns the summed counters when any cycle processed something, else None.
+        Returns the summed counters when any cycle processed something, else None. A failing
+        cycle does not skip the next one. Failures are logged and listed under "errors" next to
+        the counters; with no counters to report they are raised to the main loop.
         """
         totals = None
+        failures = []
         for phase, method_name in self.DIRECT_CYCLES.get(self.role, ()):
             heartbeat_stop, heartbeat_thread = self._start_direct_batch_heartbeat({"phase": phase})
+            result = None
             try:
                 result = getattr(self, method_name)()
+            except Exception as exc:
+                failures.append((f"{phase} cycle failed: {exc}", exc))
             finally:
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=1)
@@ -1197,6 +1210,13 @@ class PipelineDaemon:
                 totals = totals or {}
                 for key in ("processed", "promoted", "queued", "downloaded", "failed"):
                     totals[key] = totals.get(key, 0) + int(result.get(key, 0) or 0)
+        if failures:
+            messages = [message for message, _ in failures]
+            if totals is None:
+                raise RuntimeError("; ".join(messages)) from failures[0][1]
+            for message in messages:
+                log(message)
+            totals["errors"] = messages
         return totals
 
     def run(self):
