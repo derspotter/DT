@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { threadId as threadIdOfMain } from 'node:worker_threads'
 import bcrypt from 'bcryptjs'
 import { createPasswordHasher, getPasswordHasher } from '../src/passwordHasher.js'
 
@@ -29,32 +30,51 @@ test('hashes are bcryptjs-compatible both ways', async () => {
   expect(await hasher.compare('other', h)).toBe(false)
 })
 
-test('the main thread keeps running while hashes run', async () => {
-  const hasher = make()
-  const ticks = []
-  let last = Date.now()
-  const timer = setInterval(() => {
-    const now = Date.now()
-    ticks.push(now - last)
-    last = now
-  }, 10)
-  try {
-    await Promise.all([1, 2, 3, 4].map(() => hasher.hash('pw', 12)))
-  } finally {
-    clearInterval(timer)
+test('bcrypt runs in worker threads, not on the main thread', async () => {
+  const seen = []
+  const hasher = make({ onWorkerResult: (entry) => seen.push(entry) })
+  const h = await hasher.hash('pw', 4)
+  expect(await hasher.compare('pw', h)).toBe(true)
+  expect(seen.map((entry) => entry.op)).toEqual(['hash', 'compare'])
+  const workerIds = hasher.workers().map((worker) => worker.threadId)
+  for (const { threadId } of seen) {
+    expect(threadId).not.toBe(threadIdOfMain)
+    expect(workerIds).toContain(threadId)
   }
-  expect(ticks.length).toBeGreaterThanOrEqual(10)
-  // A synchronous rounds-12 hash blocks the loop for ~250 ms.
-  expect(Math.max(...ticks)).toBeLessThan(60)
+})
+
+test('the main thread keeps turning while a slow hash is pending', async () => {
+  // No time bound: a main-thread hashSync settles before the first turn; a
+  // worker-run rounds-16 hash (seconds) is still pending after 500 turns.
+  const hasher = make({ size: 1 })
+  let settled = false
+  const slow = hasher.hash('pw', 16).then(
+    () => { settled = true },
+    () => { settled = true }
+  )
+  let turns = 0
+  while (turns < 500 && !settled) {
+    await new Promise((resolve) => setImmediate(resolve))
+    turns += 1
+  }
+  expect({ turns, settled }).toEqual({ turns: 500, settled: false })
+  await hasher.close()
+  await slow
 })
 
 test('at most size hashes run at once and the queue bound holds', async () => {
   const hasher = make({ size: 1, maxQueue: 2 })
-  const first = [1, 2, 3].map(() => hasher.hash('pw', 12))
-  const startedAt = Date.now()
+  let settled = 0
+  const first = [1, 2, 3].map(() =>
+    hasher.hash('pw', 12).finally(() => {
+      settled += 1
+    })
+  )
+  expect(hasher.workers()).toHaveLength(1)
+  // The 4th call rejects while all three earlier calls are still pending:
+  // ordering, not elapsed time, shows it did not wait for a free slot.
   await expect(hasher.hash('pw', 12)).rejects.toMatchObject({ code: 'HASHER_BUSY' })
-  // The rejection is immediate, not after a queue slot frees up.
-  expect(Date.now() - startedAt).toBeLessThan(100)
+  expect(settled).toBe(0)
   const hashes = await Promise.all(first)
   for (const h of hashes) expect(bcrypt.compareSync('pw', h)).toBe(true)
   // The queue drained, so new work is accepted again.

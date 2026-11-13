@@ -12,7 +12,10 @@ function busyError() {
   return error;
 }
 
-export function createPasswordHasher({ size = 2, maxQueue = 64, unref = false } = {}) {
+// `onWorkerResult({ op, threadId })`, when given, is called for every answer
+// with the id of the thread that computed it (tests use it as evidence that
+// bcrypt runs off the main thread).
+export function createPasswordHasher({ size = 2, maxQueue = 64, unref = false, onWorkerResult = null } = {}) {
   const workers = new Set();
   const idle = [];
   const queue = [];
@@ -32,6 +35,13 @@ export function createPasswordHasher({ size = 2, maxQueue = 64, unref = false } 
     worker.job = null;
     worker.on('message', (msg) => {
       if (!worker.job || msg?.id !== worker.job.id) return;
+      if (onWorkerResult) {
+        try {
+          onWorkerResult({ op: worker.job.message.op, threadId: msg.threadId });
+        } catch {
+          // an observer never breaks the pool
+        }
+      }
       settle(worker, msg.error ? new Error(msg.error) : null, msg.result);
       release(worker);
     });
