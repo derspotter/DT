@@ -196,8 +196,8 @@ def test_half_configured_llm_provider_does_not_halt_worker(monkeypatch, tmp_path
     monkeypatch.setattr(mod.time, "sleep", stop)
     orig_process = mod.PipelineDaemon._process_job
 
-    def process_once(self, job):
-        orig_process(self, job)
+    def process_once(self, job, **kwargs):
+        orig_process(self, job, **kwargs)
         self.running = False
 
     monkeypatch.setattr(mod.PipelineDaemon, "_process_job", process_once)

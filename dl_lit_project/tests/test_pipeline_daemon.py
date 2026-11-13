@@ -143,6 +143,9 @@ def _loop_daemon(role, monkeypatch, tmp_path):
     daemon.role = role
     daemon.running = True
     daemon.heartbeat_interval_seconds = 3600
+    daemon.job_timeout_seconds = 3600
+    daemon._init_work_state()  # watchdog generations (D29); __new__ skips __init__
+    daemon._last_recovery_at = float("inf")  # periodic recovery is covered in test_worker_watchdog.py
     events = []
     jobs = [{"id": 1, "job_type": "enrich", "params": {}}]
     direct_methods = {"enrich": "_run_direct_enrich_cycle", "download": "_run_direct_download_cycle"}
@@ -159,7 +162,7 @@ def _loop_daemon(role, monkeypatch, tmp_path):
         return jobs.pop(0) if jobs else None
 
     daemon.fetch_next_job = fetch_next_job
-    daemon._process_job = lambda job: events.append(("job", job["id"]))
+    daemon._process_job = lambda job, **_: events.append(("job", job["id"]))
 
     def make_cycle(phase):
         def cycle():
@@ -175,9 +178,9 @@ def _loop_daemon(role, monkeypatch, tmp_path):
     started = []
     real_start = daemon._start_direct_batch_heartbeat
 
-    def start(details):
+    def start(details, **kwargs):
         started.append(details["phase"])
-        return real_start(details)
+        return real_start(details, **kwargs)
 
     daemon._start_direct_batch_heartbeat = start
     def sleep(seconds):
