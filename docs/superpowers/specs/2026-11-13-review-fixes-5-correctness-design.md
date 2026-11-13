@@ -486,6 +486,12 @@ tests.
 back before the `except sqlite3.IntegrityError` returns the error. With `commit=True`, the
 handler calls `self.conn.rollback()` when `self.conn.in_transaction` is true. The return
 value is unchanged: `(None, "IntegrityError inserting into works: …")`.
+*Amended in the final fix wave (C-I1):* the protection covers the whole entry, including the
+duplicate paths (the merge_log entry of a low-confidence match, the corpus link and the merge
+update of a high-confidence match). Every writer inside passes `commit=False`; with
+`commit=True` each path commits once at its end, and any other exception also rolls back what
+the entry left uncommitted before it propagates. A corpus-link database error therefore fails
+the entry instead of being logged as a warning.
 
 **D25. `ingest_import_seed` always prints one summary shape (PY-39).** Every outcome prints
 one JSON line and exits 0:

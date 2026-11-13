@@ -246,3 +246,51 @@ def test_import_seed_keeps_entry_errors_when_the_commit_fails(tmp_path, monkeypa
     assert out["stopped"] is True and out["error"].startswith("IntegrityError")
     assert (out["added"], out["skipped"], out["corpus_linked"], out["processed"]) == (0, 0, 0, 0)
     assert out["errors"] == ["Skipped non-object entry: str"]
+
+
+# --- PY-36 (final review C-I1): the duplicate paths are protected too -------------------------
+
+def _existing_work(db, title="Existing"):
+    work_id, err = db.create_pending_work({"title": title})
+    assert err is None and work_id
+    return work_id
+
+
+def _merge_log_count(db):
+    return db.conn.execute("SELECT COUNT(*) FROM merge_log").fetchone()[0]
+
+
+@pytest.mark.parametrize("commit", [True, False])
+def test_low_confidence_duplicate_leaves_no_merge_log_on_integrity_error(db, monkeypatch, commit):
+    work_id = _existing_work(db)
+    before = _merge_log_count(db)
+    monkeypatch.setattr(db, "check_if_exists", lambda **kw: ("works", work_id, "title_year"))
+    monkeypatch.setattr(db, "add_corpus_item", _failing_link(db))
+    if commit:
+        row_id, err = db.create_pending_work({"title": "Existing", "corpus_id": 1})
+    else:
+        with db.transaction():
+            row_id, err = db.create_pending_work({"title": "Existing", "corpus_id": 1}, commit=False)
+    assert row_id is None and err.startswith("IntegrityError inserting into works: boom")
+    assert db.conn.in_transaction is False
+    assert _merge_log_count(db) == before
+
+
+@pytest.mark.parametrize("commit", [True, False])
+def test_doi_duplicate_update_integrity_error_is_caught_and_undone(db, monkeypatch, commit):
+    work_id = _existing_work(db)
+    monkeypatch.setattr(db, "check_if_exists", lambda **kw: ("works", work_id, "normalized_doi"))
+
+    def failing_update(wid, data):
+        raise sqlite3.IntegrityError("unique doi")
+
+    monkeypatch.setattr(db, "_update_work_record", failing_update)
+    ref = {"title": "Existing", "doi": "10.1/x", "corpus_id": 1}
+    if commit:
+        row_id, err = db.create_pending_work(ref)
+    else:
+        with db.transaction():
+            row_id, err = db.create_pending_work(ref, commit=False)
+    assert row_id is None and err.startswith("IntegrityError inserting into works: unique doi")
+    assert db.conn.in_transaction is False
+    assert db.conn.execute("SELECT COUNT(*) FROM corpus_works WHERE work_id = ?", (work_id,)).fetchone()[0] == 0

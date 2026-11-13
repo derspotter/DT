@@ -1267,6 +1267,56 @@ class DatabaseManager:
         editors_raw = self._parse_name_list(ref.get("editors"))
         norm_authors = self._normalize_contributor_fields(authors_raw, editors_raw)
 
+        try:
+            # The whole entry is one unit: with commit=False a savepoint undoes its writes (the
+            # duplicate paths' merge_log/link/update too) before the handler returns; with
+            # commit=True the duplicate paths write without committing until their end, and the
+            # handler rolls back whatever this entry left uncommitted.
+            with nullcontext() if commit else self.savepoint():
+                return self._create_pending_work_entry(
+                    ref,
+                    title=title,
+                    corpus_id=corpus_id,
+                    norm_doi=norm_doi,
+                    norm_title=norm_title,
+                    authors_raw=authors_raw,
+                    editors_raw=editors_raw,
+                    norm_authors=norm_authors,
+                    searcher=searcher,
+                    rate_limiter=rate_limiter,
+                    resolve_potential_duplicates=resolve_potential_duplicates,
+                    commit=commit,
+                )
+        except sqlite3.IntegrityError as e:
+            if commit and self.conn.in_transaction:
+                self.conn.rollback()  # no half-written entry left open on the shared connection
+            return None, f"IntegrityError inserting into works: {e}"
+        except BaseException:
+            if commit and self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def _create_pending_work_entry(
+        self,
+        ref: dict,
+        *,
+        title,
+        corpus_id,
+        norm_doi,
+        norm_title,
+        authors_raw,
+        editors_raw,
+        norm_authors,
+        searcher,
+        rate_limiter,
+        resolve_potential_duplicates: bool,
+        commit: bool,
+    ) -> tuple[int | None, str | None]:
+        """create_pending_work's body after validation; the caller handles IntegrityError.
+
+        Every writer gets commit=False; with commit=True each path commits once at its end, so
+        an error part-way leaves nothing committed (create_pending_work rolls it back).
+        """
         resolved_conflict = False
         tbl, eid, field = self.check_if_exists(
             doi=norm_doi, 
@@ -1313,7 +1363,7 @@ class DatabaseManager:
                             if incoming_resolved.get("openalex_id"):
                                 incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
                             if corpus_id:
-                                self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
+                                self.add_corpus_item(corpus_id, tbl, eid, commit=False)
                             work_row = self.get_entry_by_id("works", int(eid)) or {}
                             merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
                             self._update_work_record(int(eid), merged)
@@ -1331,7 +1381,7 @@ class DatabaseManager:
                                 action="conflict",
                                 notes="resolved_ids_conflict",
                                 updates=None,
-                                commit=commit,
+                                commit=False,
                             )
                             resolved_conflict = True
                             # The existing record keeps its own resolved identity (it has none
@@ -1344,7 +1394,7 @@ class DatabaseManager:
                             owner_id, owner_field = self._resolved_identifier_owner(incoming_resolved)
                             if owner_id:
                                 if corpus_id:
-                                    self.add_corpus_item(corpus_id, "works", owner_id, commit=commit)
+                                    self.add_corpus_item(corpus_id, "works", owner_id, commit=False)
                                 owner_row = self.get_entry_by_id("works", owner_id) or {}
                                 merged = self._apply_work_merge_priority(owner_row, self._build_raw_work_payload(ref))
                                 self._update_work_record(owner_id, merged)
@@ -1357,7 +1407,7 @@ class DatabaseManager:
 
             if high_confidence and not resolved_conflict:
                 if corpus_id:
-                    self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
+                    self.add_corpus_item(corpus_id, tbl, eid, commit=False)
                 work_row = self.get_entry_by_id("works", int(eid)) or {}
                 incoming = self._without_identifiers_of_other_rows(int(eid), self._build_raw_work_payload(ref))
                 merged = self._apply_work_merge_priority(work_row, incoming)
@@ -1378,52 +1428,46 @@ class DatabaseManager:
                     action="possible_duplicate",
                     notes="low_confidence_match_merged",
                     updates=None,
-                    commit=commit,
+                    commit=False,
                 )
 
-        try:
-            # commit=False: the savepoint undoes this entry's writes before the handler below
-            # returns, so the caller's transaction keeps no partial rows.
-            with nullcontext() if commit else self.savepoint():
-                payload = self._build_raw_work_payload(ref)
-                if resolved_conflict:
-                    # Resolved ids disagree: a separate work. (None, None) skips the lookup, which
-                    # would find the matched row again; the new row is inserted with its resolved
-                    # identifiers, so later title-based lookups (enrichment) keep the two apart.
-                    existing_match, allow_merge = (None, None), False
-                    payload.update(self._unclaimed_resolved_identifiers(incoming_resolved))
-                else:
-                    existing_match = (int(eid), field) if tbl == "works" else (None, None)
-                    allow_merge = True
-                new_id, merged_on = self._resolve_or_create_work(
-                    payload,
-                    allow_merge=allow_merge,
-                    commit=commit,
-                    existing=existing_match,
-                )
-                if corpus_id:
-                    self.add_corpus_item(corpus_id, "works", int(new_id), commit=commit)
+        payload = self._build_raw_work_payload(ref)
+        if resolved_conflict:
+            # Resolved ids disagree: a separate work. (None, None) skips the lookup, which
+            # would find the matched row again; the new row is inserted with its resolved
+            # identifiers, so later title-based lookups (enrichment) keep the two apart.
+            existing_match, allow_merge = (None, None), False
+            payload.update(self._unclaimed_resolved_identifiers(incoming_resolved))
+        else:
+            existing_match = (int(eid), field) if tbl == "works" else (None, None)
+            allow_merge = True
+        new_id, merged_on = self._resolve_or_create_work(
+            payload,
+            allow_merge=allow_merge,
+            commit=False,
+            existing=existing_match,
+        )
+        if corpus_id:
+            self.add_corpus_item(corpus_id, "works", int(new_id), commit=False)
 
-                translated_title = ref.get("translated_title")
-                if translated_title:
-                    self.add_work_alias(
-                        work_table="works",
-                        work_id=int(new_id),
-                        alias_title=translated_title,
-                        alias_year=ref.get("translated_year"),
-                        alias_language=ref.get("translated_language"),
-                        relationship_type=ref.get("translation_relationship") or "translation",
-                        commit=commit,
-                    )
+        translated_title = ref.get("translated_title")
+        if translated_title:
+            self.add_work_alias(
+                work_table="works",
+                work_id=int(new_id),
+                alias_title=translated_title,
+                alias_year=ref.get("translated_year"),
+                alias_language=ref.get("translated_language"),
+                relationship_type=ref.get("translation_relationship") or "translation",
+                commit=False,
+            )
 
-                if merged_on:
-                    # A low-confidence merge: reported like any other duplicate (no new work).
-                    return None, f"Duplicate already exists in works (ID {new_id}) on {merged_on}"
-                return new_id, None
-        except sqlite3.IntegrityError as e:
-            if commit and self.conn.in_transaction:
-                self.conn.rollback()  # no half-written entry left open on the shared connection
-            return None, f"IntegrityError inserting into works: {e}"
+        if commit:
+            self.conn.commit()
+        if merged_on:
+            # A low-confidence merge: reported like any other duplicate (no new work).
+            return None, f"Duplicate already exists in works (ID {new_id}) on {merged_on}"
+        return new_id, None
 
     def _resolved_identifier_owner(self, resolved: dict) -> tuple[int | None, str | None]:
         """The works row that already holds ``resolved``'s DOI (first) or OpenAlex id."""
