@@ -282,6 +282,38 @@ def _quota_partial(exc):
     return list(getattr(exc, 'partial', None) or [])
 
 
+def _citing_metadata(exc):
+    """The citing works a quota-stopped citing fetch already returned, by normalised id."""
+    known = {}
+    for item in getattr(exc, 'partial_candidate_items', None) or []:
+        if isinstance(item, dict):
+            norm = _normalize_candidate_id(item.get('openalex_id') or item.get('id'))
+            if norm and norm not in known:
+                known[norm] = item
+    return known
+
+
+def _details_after_quota(exc, candidate_ids, known=None):
+    """A detail fetch stopped by quota: its partial details, plus one record for every candidate
+    it did not return, so nothing already fetched is lost. That record is the metadata fetched
+    earlier (``known``, e.g. a citing work) or, failing that, the bare id: ``{'openalex_id': id}``,
+    which _to_openalex_like turns into an item without title or year."""
+    details = _quota_partial(exc)
+    have = {
+        _normalize_candidate_id(d.get('openalex_id') or d.get('id'))
+        for d in details
+        if isinstance(d, dict)
+    }
+    known = known or {}
+    for candidate in candidate_ids:
+        norm = _normalize_candidate_id(candidate)
+        if not norm or norm in have:
+            continue
+        have.add(norm)
+        details.append(dict(known.get(norm) or {'openalex_id': candidate}))
+    return details
+
+
 def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_sort=DEFAULT_RELATED_SORT):
     cited_by_url = work.get('cited_by_api_url')
     if not cited_by_url:
@@ -312,8 +344,10 @@ def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_
             raise_on_quota=True,
         )
     except OpenAlexRateLimitExceeded as exc:
-        # The exception travels on; the ids fetched before it go with it.
-        exc.partial_candidate_ids = list(dict.fromkeys(_extract_openalex_ids(_quota_partial(exc))))
+        # The exception travels on; the works fetched before it go with it (their ids, and
+        # their metadata in case the detail fetch for them hits the quota too).
+        exc.partial_candidate_items = _quota_partial(exc)
+        exc.partial_candidate_ids = list(dict.fromkeys(_extract_openalex_ids(exc.partial_candidate_items)))
         raise
     return _extract_openalex_ids(citing_items)
 
@@ -373,6 +407,7 @@ def _crawl_direction(
     matched = 0
     # OpenAlex quota ran out: what was fetched up to then is kept, and the crawl stops.
     quota_stop = False
+    known = {}
 
     while queue:
         current, level = queue.popleft()
@@ -392,6 +427,7 @@ def _crawl_direction(
             print(f"[OpenAlex WARN] Expansion stopped early: {exc}")
             quota_stop = True
             downstream_ids, upstream_ids = [], list(getattr(exc, 'partial_candidate_ids', None) or [])
+            known = _citing_metadata(exc)
         candidate_ids = downstream_ids + upstream_ids
         if not candidate_ids:
             if quota_stop:
@@ -411,7 +447,7 @@ def _crawl_direction(
         except OpenAlexRateLimitExceeded as exc:
             print(f"[OpenAlex WARN] Expansion detail fetch stopped early: {exc}")
             quota_stop = True
-            ref_details = _quota_partial(exc)
+            ref_details = _details_after_quota(exc, candidate_ids, known)
 
         resolved = set()
         resolved_items = []

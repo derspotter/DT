@@ -300,9 +300,11 @@ def test_keyword_detail_quota_keeps_partial_details_and_stops_the_crawl(monkeypa
     base = [{"id": "https://openalex.org/W1", "display_name": "one", "referenced_works": ["https://openalex.org/W2", "https://openalex.org/W3"]}]
     all_items = list(base)
     stats = mod._crawl_direction(base, 3, 10, None, "downstream", all_items, set(), None)
-    assert stats["quota_exhausted"] is True and stats["added"] == 1
-    assert [i["id"] for i in all_items] == ["https://openalex.org/W1", "https://openalex.org/W2"]
-    assert len(collect_calls) == 1  # W2 is kept but not crawled further
+    assert stats["quota_exhausted"] is True and stats["added"] == 2
+    # W2's details are kept; W3, whose details never came, is kept as its bare id (round 2).
+    assert [i["id"] for i in all_items] == ["https://openalex.org/W1", "https://openalex.org/W2", "https://openalex.org/W3"]
+    assert all_items[1]["display_name"] == "two" and all_items[2]["display_name"] is None
+    assert len(collect_calls) == 1  # kept but not crawled further
 
 
 def test_keyword_citing_quota_keeps_the_partial_candidates(monkeypatch, capsys):
@@ -389,3 +391,52 @@ def test_seed_expand_keeps_partial_details_reports_and_stops(monkeypatch, tmp_pa
     assert payload["quota_exhausted"] is True and payload["message"] == mod.QUOTA_STOP_MESSAGE
     assert [(r["direction"], r["count"]) for r in payload["runs"]] == [("downstream", 1)]
     assert len(recorded) == 1  # no upstream direction, no second seed after the stop
+
+
+# --- round 2: partial citing results survive a second quota hit on the detail fetch ------------
+
+def test_keyword_citing_partial_survives_a_detail_quota(monkeypatch, capsys):
+    mod = _load_script(monkeypatch, "keyword_search", "keyword_search_partial_test")
+    monkeypatch.setattr(
+        mod, "fetch_citing_work_ids",
+        _quota_with_partial([], [{"openalex_id": "https://openalex.org/W5", "title": "Citing Five", "year": 2020}]),
+    )
+    monkeypatch.setattr(mod, "fetch_referenced_work_details", _quota_with_partial([], []))
+    base = [{"id": "https://openalex.org/W1", "display_name": "one"}]
+    all_items = list(base)
+    stats = mod._crawl_direction(base, 2, 10, None, "upstream", all_items, set(), None)
+    assert stats["quota_exhausted"] is True and stats["added"] == 1
+    assert [(i["id"], i["display_name"], i["publication_year"]) for i in all_items[1:]] == [
+        ("https://openalex.org/W5", "Citing Five", 2020)
+    ]
+    record = mod.openalex_result_to_record(all_items[1], run_id=1)
+    assert record["openalex_id"] and record["title"] == "Citing Five"
+
+
+def test_seed_expand_citing_partial_survives_a_detail_quota(monkeypatch, tmp_path, capsys):
+    mod = _load_script(monkeypatch, "seed_expand", "seed_expand_partial_test")
+    keyword_search = sys.modules["keyword_search"]
+    monkeypatch.setattr(
+        keyword_search, "fetch_citing_work_ids",
+        _quota_with_partial([], [{"openalex_id": "https://openalex.org/W5", "title": "Citing Five", "year": 2020}]),
+    )
+    monkeypatch.setattr(mod, "fetch_referenced_work_details", _quota_with_partial([], []))
+    _seed_expand_main(monkeypatch, tmp_path, mod, "--include-upstream")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["quota_exhausted"] is True
+    assert [(r["direction"], r["count"]) for r in payload["runs"]] == [("upstream", 1)]
+    from dl_lit.db_manager import DatabaseManager
+
+    db = DatabaseManager(db_path=tmp_path / "t.db")
+    rows = db.conn.execute("SELECT openalex_id, title FROM search_results WHERE search_run_id = ?", (payload["runs"][0]["run_id"],)).fetchall()
+    db.close_connection()
+    assert [tuple(r) for r in rows] == [("https://openalex.org/W5", "Citing Five")]
+
+
+def test_seed_expand_keeps_bare_ids_when_the_detail_fetch_hits_quota(monkeypatch, tmp_path, capsys):
+    mod = _load_script(monkeypatch, "seed_expand", "seed_expand_partial_test")
+    monkeypatch.setattr(mod, "fetch_referenced_work_details", _quota_with_partial([], []))
+    _seed_expand_main(monkeypatch, tmp_path, mod, "--include-downstream")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["quota_exhausted"] is True
+    assert [(r["direction"], r["count"]) for r in payload["runs"]] == [("downstream", 1)]

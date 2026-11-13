@@ -716,6 +716,13 @@ way, so the exit is how the work ends: both workers run under docker's
     `keyword_search.py` puts the same two keys in its final payload and finishes the run
     `done` with the message as its `error` note. The message is
     `OpenAlex quota exhausted; expansion stopped early. Results fetched before the stop are kept.`
+  - *Round 2:* the wrapper also attaches the citing works themselves
+    (`exc.partial_candidate_items`). When the follow-up detail fetch hits the quota too,
+    `_details_after_quota` keeps its partial details and adds one record for every candidate
+    it did not return: the metadata already fetched (a citing work's title, authors, year,
+    DOI, type) or, without any, the bare id `{'openalex_id': <id>}`, which `_to_openalex_like`
+    turns into an item without title or year. Both callers (`_crawl_direction`,
+    `seed_expand.py`) use it, so no work already fetched is dropped.
   - The backend logs the stop (`openAlexQuotaStop`, `console.warn`) in `/api/keyword-search`
     and in the promote route, which also returns it as `expansion_warning` and appends it to
     `message`. The frontend shows it through the existing displays: the promotion status

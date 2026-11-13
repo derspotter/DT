@@ -34,7 +34,8 @@ from keyword_search import (
     DEFAULT_RELATED_SORT,
     QUOTA_STOP_MESSAGE,
     RELATED_SORT_OPTIONS,
-    _quota_partial,
+    _citing_metadata,
+    _details_after_quota,
     _collect_candidate_ids,
     _normalize_candidate_id,
     _to_openalex_like,
@@ -140,6 +141,7 @@ def main():
             for direction in directions:
                 if quota_stop:
                     break
+                known = {}
                 try:
                     candidate_ids = _collect_for_direction(
                         work, direction, args.max_related, args.related_sort, args.mailto, rate_limiter
@@ -148,6 +150,7 @@ def main():
                     print(f'[OpenAlex WARN] {direction} expansion stopped early: {exc}', file=sys.stderr)
                     quota_stop = True
                     candidate_ids = list(getattr(exc, 'partial_candidate_ids', None) or [])
+                    known = _citing_metadata(exc)
                 if not candidate_ids:
                     continue
 
@@ -162,7 +165,7 @@ def main():
                 except OpenAlexRateLimitExceeded as exc:
                     print(f'[OpenAlex WARN] {direction} detail fetch stopped early: {exc}', file=sys.stderr)
                     quota_stop = True
-                    details = _quota_partial(exc)
+                    details = _details_after_quota(exc, candidate_ids, known)
 
                 items = []
                 seen = set()
