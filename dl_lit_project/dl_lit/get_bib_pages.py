@@ -195,9 +195,6 @@ Rules:
 Document has {total_physical_pages} physical pages.
 """.strip()
 
-    wait_rate_limit("gemini")
-    wait_rate_limit("gemini_daily")
-
     def _call():
         return api_client.models.generate_content(
             model=MODEL_NAME,
@@ -215,6 +212,8 @@ Document has {total_physical_pages} physical pages.
         backoff_seconds=GET_BIB_RETRY_BACKOFF_SECONDS,
         label="Gemini section detection",
         sleep=time.sleep,
+        before_attempt=lambda: (wait_rate_limit("gemini"), wait_rate_limit("gemini_daily")),
+        token_service="gemini_tokens",
     )
 
     token_count = extract_total_tokens(resp)
@@ -549,6 +548,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Extracting bibliography pages for {len(pdf_files)} PDF(s)...", flush=True)
     start_time = time.time()
     total_pages = 0
+    failed = 0
 
     for idx, pdf in enumerate(pdf_files, 1):
         try:
@@ -564,11 +564,16 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
         except Exception as exc:
+            failed += 1
             print(f"Error processing {pdf}: {exc}", flush=True)
 
     elapsed = time.time() - start_time
-    print(f"Done. Extracted {total_pages} page(s) in {elapsed:.2f}s.", flush=True)
-    return 0
+    print(
+        f"Done. Extracted {total_pages} page(s) in {elapsed:.2f}s; "
+        f"{failed} of {len(pdf_files)} PDF(s) failed.",
+        flush=True,
+    )
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":  # pragma: no cover

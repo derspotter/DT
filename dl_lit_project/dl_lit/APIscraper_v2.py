@@ -259,6 +259,8 @@ def _run_gemini_request(
     timeout_retries: int = GEMINI_TIMEOUT_RETRIES,
     retry_backoff_seconds: float = GEMINI_RETRY_BACKOFF_SECONDS,
     action_label: str = "Gemini request",
+    before_attempt=None,
+    token_service: str | None = None,
 ):
     """APIscraper defaults for ``llm_common.run_with_timeout``."""
     return run_with_timeout(
@@ -268,6 +270,8 @@ def _run_gemini_request(
         backoff_seconds=retry_backoff_seconds,
         label=action_label,
         sleep=time.sleep,
+        before_attempt=before_attempt,
+        token_service=token_service,
     )
 
 
@@ -296,6 +300,8 @@ def _run_generate_content(
         _call_model,
         timeout_seconds,
         action_label=f"Gemini generate_content ({model_name})",
+        before_attempt=lambda: (wait_rate_limit("gemini"), wait_rate_limit("gemini_daily")),
+        token_service="gemini_tokens",
     )
 
     token_count = extract_total_tokens(response)
@@ -427,8 +433,6 @@ def extract_inline_citations_from_text(
     text = _extract_pdf_text(pdf_path)
     prompt = f"{INLINE_TEXT_CITATION_PROMPT}\n\nArticle text:\n{text}"
     print(f"[INFO] Retrying inline extraction from extracted text for {pdf_path}.", flush=True)
-    wait_rate_limit("gemini")
-    wait_rate_limit("gemini_daily")
     response = _run_generate_content(
         model_name,
         prompt,
@@ -668,8 +672,6 @@ def upload_pdf_and_extract_bibliography(
         prompt = _resolve_prompt(extract_mode)
         model_name = _resolve_model_name(extract_mode)
         print(f"[INFO] Using model {model_name} for extract_mode={extract_mode}.", flush=True)
-        wait_rate_limit("gemini")
-        wait_rate_limit("gemini_daily")
         response = _run_generate_content(
             model_name,
             [prompt, uploaded_file],
