@@ -229,17 +229,22 @@ def test_section_detection_waits_per_attempt(monkeypatch):
 - Modify: `backend/scripts/daemon/worker.py`:
   - `:279-326` (`_heartbeat` catches `sqlite3.Error`)
   - `:328-361` (one `_start_heartbeat_thread`, used by `_start_job_heartbeat` and `_start_direct_batch_heartbeat`)
-  - `__init__` (`self._exit = os._exit`, `self._work_lock`, `self._work_generation`, `self._work_finished`, `self._last_recovery_at`)
+  - `__init__` (`self._exit = os._exit`, `self._work_lock`, `self._work_generation`, `self._work_finished`, `self._terminal`, `self._after_watchdog_win = lambda: None`, `self._last_recovery_at`)
   - `:1069-1188` (`_process_job`: generation start/finish)
   - `:1190-1220` (`_run_direct_cycles`: generation per cycle)
-  - `:1222-1258` (`run`: recovery every 60 s)
+  - `:1222-1258` (`run`: `_begin_work()` before any claim, terminal wait, recovery every 60 s)
 - Modify: `dl_lit_project/dl_lit/utils.py` (new `FetchResult` next to `OpenAlexRateLimitExceeded`, `:21`)
 - Modify: `dl_lit_project/dl_lit/OpenAlexScraper.py:85-256` (`fetch_citing_work_ids`, `fetch_referenced_work_details`: `FetchResult`, `raise_on_quota`)
 - Modify: `dl_lit_project/dl_lit/new_dl.py`:
   - `:966`, `:976` (LibGen)
   - `:2186-2235` (`fetch_openalex_batch`: `FetchResult`, `wait_if_needed("openalex")`)
   - `:2334` (caller)
-- Modify: `backend/scripts/keyword_search.py:297`, `:384` and `backend/scripts/seed_expand.py:135`, `:145` (pass `raise_on_quota=True`; keep the `except` branches)
+- Modify: the three direct fetcher calls, each passing `raise_on_quota=True`:
+  - `backend/scripts/keyword_search.py:297` (`fetch_citing_work_ids` in `_fetch_upstream_candidates`)
+  - `backend/scripts/keyword_search.py:384` (`fetch_referenced_work_details` in `_crawl_direction`)
+  - `backend/scripts/seed_expand.py:145` (`fetch_referenced_work_details`)
+
+  No wrapper changes. `_fetch_upstream_candidates`, `_collect_candidate_ids` and `seed_expand._collect_for_direction` (`:72`, called at `:135`) let the exception through. The `except` branches at `keyword_search.py:374`, `:390` and `seed_expand.py:138`, `:151` stay.
 - Test: `dl_lit_project/tests/test_worker_watchdog.py` (new), `dl_lit_project/tests/test_openalex_partial.py` (new)
 - Modify: `.github/workflows/ci.yml:68`
 
@@ -256,11 +261,11 @@ def test_section_detection_waits_per_attempt(monkeypatch):
   - `PipelineDaemon._start_heartbeat_thread(payload: dict, *, name: str, generation: int, deadline_seconds: float | None = None, on_deadline: Callable[[int], None] | None = None) -> tuple[threading.Event, threading.Thread]`. `on_deadline` receives the generation.
   - `PipelineDaemon._exit`, an injectable `os._exit`.
   - The constant `JOB_TIMEOUT_EXIT_CODE = 75`.
-  - `PipelineDaemon._begin_work() -> int` and `PipelineDaemon._end_work(generation: int) -> None`:
-    - `_begin_work` takes `_work_lock`, increments the generation, sets `_work_finished = False` and returns the generation.
+  - `PipelineDaemon._begin_work() -> int | None` and `PipelineDaemon._end_work(generation: int) -> None`:
+    - `_begin_work` takes `_work_lock`. It returns `None` once `_terminal` is set. Otherwise it increments the generation, sets `_work_finished = False` and returns the generation.
     - `_end_work` sets `_work_finished = True` when the generation is current.
 
-    `_process_job` and each direct cycle call them around the work. `_start_job_heartbeat(job, *, generation)` and `_start_direct_batch_heartbeat(details, *, generation)` gain the keyword.
+    `run()` calls `_begin_work()` before `fetch_next_job` and before each direct cycle. On `None` it claims nothing and sleeps in 0.5 s steps until the exit. `_process_job` and each direct cycle end their generation with `_end_work` in `finally`. `_start_job_heartbeat(job, *, generation)` and `_start_direct_batch_heartbeat(details, *, generation)` gain the keyword.
   - `PipelineDaemon._direct_batch_timeout_seconds() -> float`, which reads `RAG_FEEDER_DIRECT_BATCH_TIMEOUT`.
 - The env var `RAG_FEEDER_DIRECT_BATCH_TIMEOUT` defaults to `job_timeout_seconds`, with a minimum of 60.
 
@@ -280,14 +285,23 @@ def test_completed_job_wins_and_no_exit(tmp_path):
     # after 1 s: exits == [], row still 'completed'
 def test_stale_callback_does_not_touch_the_next_job(tmp_path):
     # job A: gen_a = _begin_work(), _end_work(gen_a), its thread left running; job B: gen_b = _begin_work(), below its deadline
-    # call the captured on_deadline(1) directly -> exits == [], job B row still 'running'
+    # call the captured on_deadline(gen_a) directly -> exits == [], job B row still 'running', daemon._terminal is False
 def test_watchdog_waits_for_the_write_lock_and_exits_only_after_winning(tmp_path):
     # a second sqlite3 connection holds BEGIN IMMEDIATE; job past deadline -> after 2.5 s: exits == [], row 'running'
     # release the lock (rollback) -> poll up to 3 s: exits == [75], row 'failed'
+def test_win_latches_terminal_state_until_exit(tmp_path):
+    # daemon._after_watchdog_win = gate.wait (a threading.Event): the callback wins job A's row, latches, then blocks
+    # meanwhile job A's main path finishes (_end_work(gen_a)); insert a second 'pending' job B
+    # run one loop iteration in a thread (fetch_next_job spy): _begin_work() returns None, fetch_next_job is never called,
+    # job B stays 'pending' with worker_id NULL, and no works row gains a claim
+    # gate.set() -> poll up to 4 s: exits == [75]
+def test_watchdog_heartbeat_lock_wait_is_bounded(tmp_path):
+    # another thread holds daemon.heartbeat_lock for 5 s, job past deadline -> no win while it is held (acquire timeout 1 s, retried);
+    # once released, the win and exit follow within 4 s
 def test_terminal_reporting_is_bounded(tmp_path):
     # wrap heartbeat_conn so that right after the ownership UPDATE commits, a second connection takes BEGIN IMMEDIATE
     # (the error heartbeat then waits on its 1000 ms busy timeout and fails); record the time of the win
-    # exits == [75] and exit time - win time < 2.5 s (poll timeout 4 s)
+    # exits == [75] and exit time - win time < 2.5 s (the 1 s heartbeat_lock wait plus the 1 s busy timeout; poll timeout 4 s)
 def test_direct_batch_deadline_exits(tmp_path):
     # monkeypatch daemon._direct_batch_timeout_seconds = lambda: 0.3; gen = _begin_work(); _start_direct_batch_heartbeat({...}, generation=gen)
     # -> exits == [75], heartbeat state "direct_batch_timeout"
@@ -318,10 +332,16 @@ def test_libgen_429_saves_debug_capture(monkeypatch):
 def test_libgen_503_saves_debug_capture(monkeypatch):
     # same with 503 -> context="http_503"
 def test_keyword_expansion_stops_on_quota(monkeypatch, capsys):
-    # backend/scripts/keyword_search: fetch_citing_work_ids patched to raise OpenAlexRateLimitExceeded when called with raise_on_quota=True
-    # (assert it was called with raise_on_quota=True); _crawl_direction prints "Expansion stopped early" and returns
-def test_seed_expand_stops_on_quota(monkeypatch, capsys):
-    # same for seed_expand's fetch_referenced_work_details -> stderr has "detail fetch stopped early"
+    # backend/scripts/keyword_search: fetch_citing_work_ids patched to record kwargs and raise OpenAlexRateLimitExceeded
+    # when called with raise_on_quota=True; _crawl_direction(direction='upstream') prints "Expansion stopped early" and returns;
+    # the recorded kwargs have raise_on_quota=True
+def test_keyword_detail_fetch_stops_on_quota(monkeypatch, capsys):
+    # same for keyword_search's fetch_referenced_work_details (:384) -> "Expansion detail fetch stopped early"
+def test_seed_expand_upstream_quota_passes_through_collect_for_direction(monkeypatch, capsys):
+    # seed_expand main with --include-upstream; keyword_search.fetch_citing_work_ids raises OpenAlexRateLimitExceeded (raise_on_quota=True)
+    # -> no TypeError; stderr has "upstream expansion stopped early"
+def test_seed_expand_detail_fetch_stops_on_quota(monkeypatch, capsys):
+    # seed_expand's fetch_referenced_work_details (:145) called with raise_on_quota=True raises -> stderr has "detail fetch stopped early"
 ```
 
 - [ ] **Step 2: Run them and verify they fail.** Run `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_worker_watchdog.py tests/test_openalex_partial.py -q`. Expected: FAIL. The cases are:
@@ -333,8 +353,12 @@ def test_seed_expand_stops_on_quota(monkeypatch, capsys):
   - there is no debug capture, and no `raise_on_quota`.
 - [ ] **Step 3: Implement D28, D29, D30 and D31.**
   - The beat loop checks `time.monotonic() - started >= deadline_seconds` and calls `on_deadline(generation)` on that beat and on every later beat until it returns `True`. A return of `True` means it won, lost the race, or found the generation stale; any of those ends the watchdog role.
-  - The job callback does the ownership `UPDATE` from the spec under `_work_lock`, with `PRAGMA busy_timeout = 1000` on `heartbeat_conn` around it.
-  - After winning, it makes one `error`-heartbeat attempt (busy 1000 ms, errors swallowed), then `log(...)`, then `self._exit(JOB_TIMEOUT_EXIT_CODE)`.
+  - The job callback does three things in one `_work_lock` section:
+    1. checks the generation, `_work_finished` and `_terminal`;
+    2. takes `heartbeat_lock` with `acquire(timeout=1.0)` (a timeout means not won) and runs the ownership `UPDATE` from the spec with `PRAGMA busy_timeout = 1000` around it;
+    3. on a win, sets `_terminal = True`.
+
+    Then, outside the lock, it calls `self._after_watchdog_win()`, makes one `error`-heartbeat attempt (`heartbeat_lock` acquired with a 1 s timeout, busy 1000 ms, errors swallowed), calls `log(...)`, and calls `self._exit(JOB_TIMEOUT_EXIT_CODE)`.
   - `run()` calls `_recover_stale_running_jobs()` when `time.time() - self._last_recovery_at >= 60`. `__init__` sets `_last_recovery_at` after its own call.
   - `FetchResult` is a plain `list` subclass whose `__init__` takes the keyword attributes.
 - [ ] **Step 4: Run both files, then the whole suite.** Expected: all passed. These must stay green: `test_pipeline_daemon.py`, `test_worker_recovery.py`, `test_keyword_search_script.py` and `test_openalex_ref_counts.py`.
@@ -361,7 +385,7 @@ def test_seed_expand_stops_on_quota(monkeypatch, capsys):
 - Modify: `backend/src/pythonProcess.js:101-103`
 - Modify: `frontend/src/components/AdminPanel.svelte:148-158` and `frontend/src/App.svelte:3868-3879` (two draft keys)
 - Test:
-  - new: `backend/tests/auth-mail.test.js`, `backend/tests/password-hasher.test.js`, `backend/tests/import-seed-route.test.js`
+  - new: `backend/tests/auth-mail.test.js`, `backend/tests/password-hasher.test.js`, `backend/tests/import-seed-route.test.js`, `backend/tests/extraction-models-route.test.js`
   - extended: `backend/tests/auth.test.js`, `backend/tests/python-process.test.js`, `backend/tests/corpus.test.js`, `backend/tests/corpus-sharing.test.js`
 
 **Interfaces:**
@@ -454,13 +478,30 @@ test('inline models come from Admin settings, then env, then defaults', () => {
   expect(extractionInlineModels({ RAG_FEEDER_API_INLINE_MODEL: 'adm' }, { RAG_FEEDER_API_INLINE_MODEL: 'env-pro' }).pro).toBe('adm')
   // PUT /api/admin/settings {inline_model:'m', inline_cheap_model:'c'} -> 200; GET shows both values
 })
-test('the extraction route reads its inline models only through the helper', () => {
-  // src = fs.readFileSync('src/app.js', 'utf8'); each of 'gemini-3.1-pro-preview' and 'gemini-3-flash-preview' occurs exactly once,
-  // and src has no RAG_FEEDER_API_INLINE_MODEL / _CHEAP_MODEL reads outside extractionInlineModels and APP_SETTING_DEFS
+// extraction-models-route.test.js (new). Before importing app.js, set RAG_FEEDER_PYTHON to a fake interpreter written into a temp dir,
+// RAG_FEEDER_UPLOADS_DIR to a temp dir holding a small PDF, and FAKE_PY_LOG to a temp file.
+// The fake (`#!/usr/bin/env node`, chmod 755) appends one JSON line per run to FAKE_PY_LOG:
+//   { script: basename(argv[2]), args, inline: env.RAG_FEEDER_API_INLINE_MODEL ?? null, extract: env.RAG_FEEDER_API_EXTRACT_MODEL ?? null }
+// It then acts per script:
+//   pdf_page_count.py / llm_upload_pdf.py / llm_delete_upload.py -> print the JSON the route parses (the implementer reads each parser);
+//   get_bib_pages.py -> exit with process.env.FAKE_GET_BIB_EXIT (default 1); when 0, write one page PDF where the route looks for pages;
+//   APIscraper_v2.py -> exit 0 and write no entries (the route then sees 0 produced references).
+// Satisfy the route's other preconditions (provider key through Admin settings, the upload row) the way the route requires.
+test('the inline fallback uses the Admin inline model', async () => {
+  // PUT /api/admin/settings {inline_model: 'adm-pro-x', inline_cheap_model: 'adm-cheap-x'}; FAKE_GET_BIB_EXIT=1
+  // POST /api/extract-bibliography for the uploaded PDF; poll FAKE_PY_LOG up to 10 s for an APIscraper_v2.py line
+  // -> that line's inline === 'adm-pro-x'
+})
+test('the zero-yield escalation uses the Admin cheap model, then the Admin fallback model', async () => {
+  // FAKE_GET_BIB_EXIT=0 (a page is written); same settings; poll until two APIscraper_v2.py lines with --extract-mode inline exist
+  // -> their inline values are ['adm-cheap-x', 'adm-pro-x'] in that order
+})
+test('without Admin settings the env, then the defaults, apply', async () => {
+  // clear both settings; RAG_FEEDER_API_INLINE_MODEL='env-pro' in process.env; scenario 1 -> inline === 'env-pro'
 })
 ```
 
-- [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/auth-mail.test.js tests/password-hasher.test.js tests/import-seed-route.test.js tests/auth.test.js tests/python-process.test.js tests/corpus.test.js tests/corpus-sharing.test.js`. Expected: FAIL. The cases are:
+- [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/auth-mail.test.js tests/password-hasher.test.js tests/import-seed-route.test.js tests/extraction-models-route.test.js tests/auth.test.js tests/python-process.test.js tests/corpus.test.js tests/corpus-sharing.test.js`. Expected: FAIL. The cases are:
   - the modules are missing;
   - the route answers a 500 (or the old shape) for the malformed seed;
   - both concurrent submissions succeed (once hashing is async) or the test cannot capture the token;
@@ -470,7 +511,7 @@ test('the extraction route reads its inline models only through the helper', () 
   - two `--corpus-id`;
   - 1005 items;
   - an unknown settings key;
-  - literals in the route.
+  - the APIscraper children receive the hard-coded models instead of `adm-pro-x` and `adm-cheap-x`.
 - [ ] **Step 3: Implement D16 to D23.**
   - `passwordWorker.js` answers `{ id, op: 'hash' | 'compare', ... }` messages with bcryptjs `hashSync`/`compareSync`.
   - The pool dispatches FIFO to idle workers.
@@ -496,7 +537,7 @@ test('the extraction route reads its inline models only through the helper', () 
   - `:3995-4031` (`loadOlderLogs`)
   - `:4050-4140` (`connectLogs`: disconnect time, marker on reconnect)
   - `:5122` (`{#key currentCorpusId}`)
-- Modify: `frontend/src/components/Logs.svelte:55-70` (marker row with `Reload logs`), `frontend/src/components/Corpus.svelte:379` (button disabled only while `corpusLoadingMore`)
+- Modify: `frontend/src/components/Logs.svelte:55-70` (marker row with `Reload logs`; `data-logs-cursor={logsCursor}` on the panel, with `logsCursor` passed as a prop), `frontend/src/components/Corpus.svelte:379` (button disabled only while `corpusLoadingMore`)
 - Modify: `frontend/src/app.css:2920`, `:3335` (`--ink`), plus a `.log-gap` rule
 - Test: `frontend/tests/corpus-load.spec.ts` (new), `frontend/tests/css-tokens.spec.ts` (new); extend `frontend/tests/seed-selection.spec.ts` and `frontend/tests/logs-stream.spec.ts`
 - Modify: `.github/workflows/ci.yml:54`
@@ -547,7 +588,12 @@ test('Load older sends nothing when the view is full and says so', async ({ page
 test('Load older admits only what still fits when the answer arrives', async ({ page }) => {
   // 4,950 shown; click Load older -> request lines=50 (held); push 30 live lines and let them flush; answer 50 older lines
   // -> 5,000 shown; the 20 newest of the 50 were prepended; status 'Loaded 20 of 50 older log lines; the view holds 5,000 lines.'
-  // the next Load older request carries cursor = (cursor before the click) + 30 (flushed live lines) + 20 (admitted), not + 50
+  // the panel's data-logs-cursor attribute (added by this task to Logs.svelte, bound to logsCursor) grew by 30 (flushed live lines) + 20 (admitted), not by 50
+})
+test('Load older admits nothing when live lines fill the view before the answer', async ({ page }) => {
+  // 4,950 shown; click Load older -> request lines=50 (held); push 50 live lines and let them flush (5,000 shown); answer 50 older lines
+  // -> still exactly 5,000 lines, none of the 50 older ones rendered; data-logs-cursor grew by 50 (the live lines) only;
+  // status 'The log view holds 5,000 lines. Older lines stay in the log file.'
 })
 test('a reconnect keeps the view and adds one gap marker with Reload logs', async ({ page }) => {
   // the first socket sends a,b,c then closes with 1006; the reconnected socket opens and sends d
@@ -575,6 +621,7 @@ test('a marker does not move the Load older cursor', async ({ page }) => {
 - [ ] **Step 3: Implement D1 to D7.**
   - `logsDisconnectedAt` is set in `onclose` only when it is null, and cleared in `resetLogState` and after the marker is pushed.
   - Times use `toLocaleTimeString('en-GB', { hour12: false })`.
+  - "Load older" admission at answer time is `const room = Math.max(0, maxLogHistory - logs.length); const accepted = room > 0 ? entries.slice(-room) : []`. Write the guard as given: `entries.slice(-0)` would admit the whole page.
   - Nothing changes for the first connect, and a 4401 close adds no marker.
 - [ ] **Step 4: Run the Task 5 specs plus the regression set, and build.** Run `E2E_FRONTEND_PORT=5190 npx playwright test tests/tab-resources.spec.ts tests/refresh-scheduler.spec.ts tests/corpus-reconcile.spec.ts tests/dead-code.spec.ts tests/table-columns.spec.ts tests/session.spec.ts --workers=2`, then `npx vite build`. Expected: all pass.
 - [ ] **Step 5: Add `tests/corpus-load.spec.ts tests/css-tokens.spec.ts` to `ci.yml:54` and commit** — `frontend: user corpus reloads supersede polls, Show more queues, append dedupes, Corpus keyed by corpus, select-all counts selectable rows, --text fixed, Load older admits what fits, reconnect gap marker (FE-39, FE-40, FE-41, FE-44, FE-45, FE-56, FE-60)`
