@@ -421,6 +421,9 @@
   // an identical answer leaves corpusItems alone, so the table does not re-render.
   let lastCorpusPageSignature = ''
   let corpusLoadingMore = false
+  // "Show more" asked for while a first-page load runs: that load's finally
+  // starts the append when it still owns the sequence (D1).
+  let corpusAppendQueued = false
   let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
   let corpusSource = ''
@@ -511,6 +514,9 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
+  // The first close of the log socket since it was last open (null while
+  // connected); a reconnect marks the gap from then to its reopen.
+  let logsDisconnectedAt = null
   // Bumped by resetLogState (type/filter change, corpus switch, sign-out): a
   // tail or older-lines answer requested under an earlier scope is dropped.
   let logsScopeEpoch = 0
@@ -576,8 +582,10 @@
   // Live socket lines are buffered here (not reactive) and flushed into `logs`
   // at most once per 250 ms while the logs tab is open; on other tabs the
   // buffer is a ring capped at maxLogHistory, flushed when the tab opens.
-  // Every entry is { seq, text }; seq comes from one increasing counter and
-  // only keys the rows (older lines loaded later get higher numbers too).
+  // Every entry is { seq, text, marker? }; seq comes from one increasing
+  // counter and only keys the rows (older lines loaded later get higher
+  // numbers too). A marker entry (a reconnect gap) is not a file line: it
+  // never moves logsCursor.
   const LOG_FLUSH_MS = 250
   let logBuffer = []
   let logFlushTimer = null
@@ -596,7 +604,11 @@
   }
 
   function pushLogLine(text) {
-    logBuffer.push({ seq: ++logSeq, text })
+    pushLogEntry({ seq: ++logSeq, text })
+  }
+
+  function pushLogEntry(entry) {
+    logBuffer.push(entry)
     if (logBuffer.length > maxLogHistory) logBuffer.splice(0, logBuffer.length - maxLogHistory)
     if (activeTab === 'logs' && !logFlushTimer) logFlushTimer = setTimeout(flushLogs, LOG_FLUSH_MS)
   }
@@ -606,9 +618,9 @@
       clearTimeout(logFlushTimer)
       logFlushTimer = null
     }
-    const count = logBuffer.length
-    if (count === 0) return
-    const hadLines = logs.length > 0
+    if (logBuffer.length === 0) return
+    const count = logBuffer.filter((entry) => !entry.marker).length
+    const hadLines = logs.some((entry) => !entry.marker)
     logs = [...logs, ...logBuffer].slice(-maxLogHistory)
     logBuffer = []
     // Same per-line rule as before batching: an established cursor grows by
@@ -638,6 +650,7 @@
     logsHasMore = false
     logsLoadingOlder = false
     logsTailStatus = ''
+    logsDisconnectedAt = null
   }
 
   function resetKantroposAssignmentState() {
@@ -915,7 +928,9 @@
   }
 
   function handleCorpusColumnScroll(event) {
-    if (!corpusHasMore || corpusLoadingMore || corpusLoading) return
+    // A load in flight queues the append (loadCorpus), so only a running
+    // append stops the trigger.
+    if (!corpusHasMore || corpusLoadingMore) return
     const target = event?.currentTarget
     if (!target) return
     const remaining = target.scrollHeight - target.scrollTop - target.clientHeight
@@ -1880,6 +1895,7 @@
     corpusLoadRequestSeq += 1
     corpusLoading = false
     corpusLoadingMore = false
+    corpusAppendQueued = false
     lastCorpusPageSignature = ''
     resourcesInFlight.clear()
   }
@@ -2637,7 +2653,7 @@
     corpusFilterQuery = String(event?.target?.value || '')
     clearTimeout(corpusFilterDebounce)
     corpusFilterDebounce = setTimeout(() => {
-      loadCorpus({ quiet: true })
+      loadCorpus({ quiet: true, supersede: true })
     }, 300)
   }
 
@@ -2687,7 +2703,7 @@
 
   function toggleCorpusSort(column) {
     corpusSort = nextSort(corpusSort, column)
-    loadCorpus({ quiet: true })
+    loadCorpus({ quiet: true, supersede: true })
   }
 
   function getSeedCandidatesForSource(source) {
@@ -2780,12 +2796,15 @@
       .filter(Boolean)
   }
 
+  // All-selected mode selects every selectable row (D4): its count is the
+  // selectable estimate, not the seed total, and it always reads as full.
   function selectedSeedCount(source) {
     const sourceId = seedSourceId(source)
-    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).size
+    return seedAllSelected[sourceId] ? estimatedSelectableSeedCount(source) : getSeedSelectionForSource(source).size
   }
 
   function isSeedFullySelected(source) {
+    if (seedAllSelected[seedSourceId(source)]) return true
     const selectableCount = estimatedSelectableSeedCount(source)
     return selectableCount > 0 && selectedSeedCount(source) === selectableCount
   }
@@ -3544,16 +3563,33 @@
     }
   }
 
-  async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
-    if (!append && corpusLoading) return
-    if (!append && quiet && corpusLoadingMore) return
+  // A user reload (filter, sort) passes supersede: it starts even while
+  // another load runs, and the newer sequence discards that load's answer and
+  // leaves the flags to this one. Every other first-page load (the poll among
+  // them) still yields to a load in flight. An append asked for while a
+  // first-page load runs is queued and starts from that load's finally (D1).
+  async function loadCorpus({ append = false, preserveSelection = false, quiet = false, supersede = false } = {}) {
+    if (append) {
+      if (corpusLoadingMore || !corpusHasMore) return
+      if (corpusLoading) {
+        corpusAppendQueued = true
+        return
+      }
+    } else if (supersede) {
+      // The new query starts from offset 0: a queued or running append
+      // belongs to the old one.
+      corpusAppendQueued = false
+      corpusLoadingMore = false
+    } else {
+      if (corpusLoading) return
+      if (quiet && corpusLoadingMore) return
+    }
 
     const requestSeq = ++corpusLoadRequestSeq
     // null until the auth payload names the corpus (the initial value is 0):
     // the backend then answers for the token's corpus, which is that one.
     const requestCorpusId = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
     if (append) {
-      if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
       corpusLoadingMore = true
       if (!quiet) corpusLoadStatus = 'Loading more corpus entries...'
     } else {
@@ -3638,7 +3674,15 @@
           data = prefix
         }
       }
-      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      let incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      if (append) {
+        // A row inserted since the last page shifts the offsets, so the next
+        // page can repeat a loaded row; Corpus keys its rows by id (D2). The
+        // next offset stays corpusItems.length and corpusHasMore still
+        // compares with the total, so a dropped row never ends paging early.
+        const loadedIds = new Set(corpusItems.map((item) => item?.id))
+        incoming = incoming.filter((item) => !loadedIds.has(item?.id))
+      }
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
       applyCorpusCounts(total, stageTotals)
@@ -3665,6 +3709,10 @@
       if (requestSeq === corpusLoadRequestSeq) {
         corpusLoading = false
         corpusLoadingMore = false
+        if (!append && corpusAppendQueued) {
+          corpusAppendQueued = false
+          if (corpusHasMore) loadCorpus({ append: true })
+        }
       }
     }
   }
@@ -3993,12 +4041,23 @@
     }
   }
 
+  const LOG_VIEW_FULL_STATUS = 'The log view holds 5,000 lines. Older lines stay in the log file.'
+
+  // Older lines are admitted only while the view has room (D6): a full view
+  // sends no request, and capacity is decided again when the answer arrives,
+  // because live lines may have filled the view meanwhile. Nothing fetched is
+  // trimmed; the cursor advances only by the lines admitted, so the rest are
+  // fetched again by the next request.
   async function loadOlderLogs() {
     if (logsLoadingOlder || !logsHasMore) return
     // The cursor counts the newest lines already shown; buffered lines are
     // in the file too, so they go into the view (and the cursor) first, or
     // the page would repeat lines and skip as many older ones.
     flushLogs()
+    if (logs.length >= maxLogHistory) {
+      logsTailStatus = LOG_VIEW_FULL_STATUS
+      return
+    }
     const epoch = logsScopeEpoch
     const cursorAtRequest = logsCursor
     logsLoadingOlder = true
@@ -4006,25 +4065,39 @@
     try {
       const payload = await fetchLogsTail({
         type: logsType,
-        lines: maxLogs,
+        lines: Math.min(maxLogs, maxLogHistory - logs.length),
         includeRotated: true,
         cursor: cursorAtRequest,
         corpusId: getLogsCorpusId(),
       })
       if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
-      if (entries.length > 0) {
-        logs = [...toLogEntries(entries), ...logs].slice(-maxLogHistory)
+      flushLogs()
+      const room = Math.max(0, maxLogHistory - logs.length)
+      // The newest lines sit next to the view. slice(-0) would be the whole page.
+      const accepted = room > 0 ? entries.slice(-room) : []
+      if (accepted.length > 0) {
+        logs = [...toLogEntries(accepted), ...logs]
       }
       // Lines flushed while the request was pending advanced the cursor;
       // keep that advance on top of the answer's.
       const advanced = logsCursor - cursorAtRequest
-      const nextCursor = Number.isFinite(Number(payload?.next_cursor))
+      const allAccepted = accepted.length === entries.length
+      const nextCursor = allAccepted && Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
-        : cursorAtRequest + entries.length
+        : cursorAtRequest + accepted.length
       logsCursor = nextCursor + advanced
-      logsHasMore = Boolean(payload?.has_more)
-      logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} older log lines.` : 'No older logs found.'
+      // Lines left out are still to be loaded.
+      logsHasMore = allAccepted ? Boolean(payload?.has_more) : true
+      if (entries.length === 0) {
+        logsTailStatus = 'No older logs found.'
+      } else if (accepted.length === 0) {
+        logsTailStatus = LOG_VIEW_FULL_STATUS
+      } else if (!allAccepted) {
+        logsTailStatus = `Loaded ${accepted.length} of ${entries.length} older log lines; the view holds 5,000 lines.`
+      } else {
+        logsTailStatus = `Loaded ${entries.length} older log lines.`
+      }
     } catch (error) {
       if (error?.status === 401 || epoch !== logsScopeEpoch) return
       logsTailStatus = error?.message || 'Failed to load older logs.'
@@ -4073,10 +4146,17 @@
     }
   }
 
-  function connectLogs() {
+  function logGapTime(date) {
+    return date.toLocaleTimeString('en-GB', { hour12: false })
+  }
+
+  // The first connect hydrates from the tail. A reconnect never hydrates and
+  // never replaces the view: when it opens it marks the gap since the first
+  // close instead (D7); "Reload logs" on the marker is the explicit refresh.
+  function connectLogs({ reconnect = false } = {}) {
     disconnectLogs()
     logsStatus = 'connecting'
-    hydrateLogsFromTail()
+    if (!reconnect) hydrateLogsFromTail()
     try {
       const envBase = String(import.meta.env.VITE_API_BASE || '').trim()
       const rawBase = envBase || window.location.origin
@@ -4097,12 +4177,25 @@
         logsStatus = 'reconnecting'
         logsReconnectTimer = setTimeout(() => {
           logsReconnectTimer = null
-          connectLogs()
+          connectLogs({ reconnect: true })
         }, 3000)
       }
       ws.onopen = () => {
         if (logsSocket !== ws) return
         logsStatus = 'connected'
+        if (reconnect && logsDisconnectedAt) {
+          // Live lines exist only for the pipeline view; another type has no gap.
+          if (logsType === 'pipeline') {
+            const from = logGapTime(logsDisconnectedAt)
+            const to = logGapTime(new Date())
+            pushLogEntry({
+              seq: ++logSeq,
+              text: `Connection lost ${from}–${to}. Lines from that period may be missing.`,
+              marker: true,
+            })
+          }
+        }
+        logsDisconnectedAt = null
       }
       ws.onmessage = (event) => {
         if (logsSocket !== ws) return
@@ -4136,6 +4229,8 @@
           logsStatus = 'unauthorized'
           return
         }
+        // A series of failed reconnects keeps the first close time.
+        if (!logsDisconnectedAt) logsDisconnectedAt = new Date()
         scheduleReconnect()
       }
       ws.onerror = () => {
@@ -4817,10 +4912,10 @@
                 {@const sourceCandidates = sortSeedCandidates(source, loaded || EMPTY_LIST, seedSorts)}
                 {@const page = seedPage(source, seedPages)}
                 {@const selection = seedSelections[sourceId] || EMPTY_SET}
-                {@const selectedCount = seedAllSelected[sourceId] ? page.total : selection.size}
                 {@const loadedSelectableCount = selectableSeedCount(source, loaded || EMPTY_LIST, includeDownstream, relatedDepthDownstream)}
                 {@const selectableCount = estimatedSelectableSeedCount(source, seedPages[sourceId], loaded, loadedSelectableCount, includeDownstream, relatedDepthDownstream)}
-                {@const fullySelected = selectableCount > 0 && selectedCount === selectableCount}
+                {@const selectedCount = seedAllSelected[sourceId] ? selectableCount : selection.size}
+                {@const fullySelected = Boolean(seedAllSelected[sourceId]) || (selectableCount > 0 && selectedCount === selectableCount)}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
                     class="seed-source__summary"
@@ -5121,33 +5216,36 @@
 
           <div class="seed-corpus-column seed-corpus-column--corpus" id="section-corpus">
             <div class="corpus-workspace-shell">
-              <Corpus
-                {corpusSource}
-                {corpusRefreshFailed}
-                {corpusTotal}
-                {corpusItems}
-                {rawTotal}
-                {metadataTotal}
-                {downloadedTotal}
-                {failedEnrichmentTotal}
-                {failedDownloadTotal}
-                {bucketLabel}
-                {corpusFilterQuery}
-                {handleCorpusFilterInput}
-                {handleRemoveCorpusWork}
-                {handleRemoveSelectedCorpusWorks}
-                {toggleCorpusSort}
-                {corpusSort}
-                {doiHref}
-                {openAlexHref}
-                {handleDownloadedCorpusFile}
-                {corpusLoadStatus}
-                {corpusHasMore}
-                {corpusLoadingMore}
-                {corpusLoading}
-                {loadCorpus}
-                {handleCorpusColumnScroll}
-              />
+              <!-- Keyed by corpus (D3): a switch resets the selection, the stage
+                   filter and the expanded row. -->
+              {#key currentCorpusId}
+                <Corpus
+                  {corpusSource}
+                  {corpusRefreshFailed}
+                  {corpusTotal}
+                  {corpusItems}
+                  {rawTotal}
+                  {metadataTotal}
+                  {downloadedTotal}
+                  {failedEnrichmentTotal}
+                  {failedDownloadTotal}
+                  {bucketLabel}
+                  {corpusFilterQuery}
+                  {handleCorpusFilterInput}
+                  {handleRemoveCorpusWork}
+                  {handleRemoveSelectedCorpusWorks}
+                  {toggleCorpusSort}
+                  {corpusSort}
+                  {doiHref}
+                  {openAlexHref}
+                  {handleDownloadedCorpusFile}
+                  {corpusLoadStatus}
+                  {corpusHasMore}
+                  {corpusLoadingMore}
+                  {loadCorpus}
+                  {handleCorpusColumnScroll}
+                />
+              {/key}
             </div>
           </div>
         </div>
@@ -5414,6 +5512,7 @@
           {logsHasMore}
           {logsTailStatus}
           {logs}
+          {logsCursor}
           {handleLogTypeChange}
           {handleLogsCorpusFilterChange}
           {loadOlderLogs}

@@ -1551,6 +1551,24 @@ button.danger:disabled {
   margin-bottom: 6px;
 }
 
+/* A reconnect gap: not a file line (D7). */
+.log-gap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  border-left: 3px solid #e0b354;
+  background: rgba(224, 179, 84, 0.12);
+  color: #f3dca6;
+}
+
+.log-gap button {
+  padding: 2px 8px;
+  font-size: 0.8rem;
+}
+
 .graph-3d-panel {
   margin-top: 18px;
   display: grid;
@@ -2917,7 +2935,7 @@ button.danger:disabled {
   border-radius: 999px;
   border: 1px solid var(--stroke);
   background: #fff;
-  color: var(--text);
+  color: var(--ink);
   font-size: 0.85rem;
   cursor: pointer;
 }
@@ -3332,7 +3350,7 @@ button.danger:disabled {
   border: 1px solid var(--stroke);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.72);
-  color: var(--text);
+  color: var(--ink);
   text-align: left;
 }
 

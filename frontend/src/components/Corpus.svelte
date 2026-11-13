@@ -29,7 +29,6 @@
   export let corpusLoadStatus;
   export let corpusHasMore;
   export let corpusLoadingMore;
-  export let corpusLoading;
   export let loadCorpus;
   export let handleCorpusColumnScroll;
 
@@ -282,6 +281,7 @@
         <div
           class={`table-row clickable corpus-select-row ${selected ? 'selected active-row' : ''} ${isRowSelected(item) ? 'row-checked' : ''}`}
           style={gridStyle}
+          data-work-id={workIdOf(item) ?? ''}
           on:click={() => toggleCorpusItemSelection(item, bucket)}
           on:keydown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
@@ -376,7 +376,7 @@
   <div class="corpus-lazy-status">
     <span class="muted">{corpusLoadStatus}</span>
     {#if corpusHasMore}
-      <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore || corpusLoading}>
+      <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore}>
         {corpusLoadingMore ? 'Loading…' : 'Show more'}
       </button>
     {/if}
