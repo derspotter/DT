@@ -1,4 +1,5 @@
 import inspect
+import re
 
 from dl_lit.db_manager import DatabaseManager
 
@@ -89,3 +90,55 @@ def test_resolve_or_create_work_falls_back_to_a_fresh_lookup_for_a_stale_id(tmp_
     assert field is None and new_id not in (gone, live)
     assert db.get_entry_by_id("works", new_id)["title"] == "Brand New"
     assert not db.conn.in_transaction
+
+
+def _identifier_lookups_that_scan_works(db, run):
+    """Run ``run()`` and return each traced SELECT on works that filters an identifier by
+    equality yet is planned as a full table scan (the partial indexes need ``!= ''``)."""
+    traced = []
+    db.conn.set_trace_callback(traced.append)
+    try:
+        run()
+    finally:
+        db.conn.set_trace_callback(None)
+    scans = []
+    for sql in traced:
+        text = " ".join(sql.split())
+        source = re.search(r"\bFROM works(?:\s+(?:AS\s+)?(?!WHERE\b|JOIN\b)(\w+))?", text, re.IGNORECASE)
+        if not text.upper().startswith("SELECT") or not source:
+            continue
+        if not re.search(r"\b(?:\w+\.)?(?:normalized_doi|openalex_id)\s*=", text):
+            continue
+        names = {"works", source.group(1)} - {None}
+        plan = " ".join(str(r[-1]) for r in db.conn.execute("EXPLAIN QUERY PLAN " + text))
+        # "SCAN works" on SQLite >= 3.36, "SCAN TABLE works" before; an alias plans as "SCAN w".
+        if any(re.search(rf"\bSCAN (?:TABLE )?{re.escape(n)}\b", plan) for n in names):
+            scans.append((text, plan))
+    return scans
+
+
+def test_resolved_identifier_helpers_use_the_partial_indexes(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    owner, _ = db.create_pending_work({"title": "Owner", "doi": "10.1/own", "openalex_id": "W1", "year": 2020})
+    resolved = {"doi": "10.1/own", "openalex_id": "W1"}
+    unclaimed = {"doi": "10.1/free", "openalex_id": "W2"}
+
+    def run():
+        db._resolved_identifier_owner(resolved)
+        db._resolved_identifier_owner(unclaimed)
+        db._unclaimed_resolved_identifiers(resolved)
+        db._unclaimed_resolved_identifiers(unclaimed)
+        db._without_identifiers_of_other_rows(owner + 1, {"doi": "10.1/own", "openalex_id": "W1"})
+
+    assert _identifier_lookups_that_scan_works(db, run) == []
+
+
+def test_a_duplicate_import_never_scans_works_for_an_identifier(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    db.create_pending_work({"title": "Paper", "doi": "10.1/p", "openalex_id": "W9", "year": 2021})
+
+    def run():
+        db.create_pending_work({"title": "Paper", "doi": "10.1/p", "openalex_id": "W9", "year": 2021, "corpus_id": 3})
+        db.create_pending_work({"title": "Other", "doi": "10.1/q", "year": 2022, "corpus_id": 3})
+
+    assert _identifier_lookups_that_scan_works(db, run) == []
