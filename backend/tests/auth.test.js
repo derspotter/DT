@@ -7,14 +7,28 @@ import Database from 'better-sqlite3'
 import request from 'supertest'
 
 // The routes await getPasswordHasher(). This stand-in hashes with bcryptjs's
-// async API (which yields between rounds, so two requests really interleave at
-// the await) and can be switched to answer HASHER_BUSY.
-const hasherState = { busy: false }
+// async API and can be switched to answer HASHER_BUSY. With `pairHashes` set,
+// the first hash waits until a second hash call starts: the second request has
+// then passed its own token lookup, so both submissions hold the same unused
+// token at once, whatever the scheduling.
+const hasherState = { busy: false, pairHashes: false, waiting: null }
 jest.unstable_mockModule('../src/passwordHasher.js', () => {
   const busy = () => Object.assign(new Error('Password hasher queue is full'), { code: 'HASHER_BUSY' })
   const hasher = {
     async hash(password, rounds = 10) {
       if (hasherState.busy) throw busy()
+      if (hasherState.pairHashes) {
+        if (hasherState.waiting) {
+          hasherState.waiting()
+          hasherState.waiting = null
+          hasherState.pairHashes = false
+        } else {
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('second submission never reached its hash')), 10_000)
+            hasherState.waiting = () => { clearTimeout(timer); resolve() }
+          })
+        }
+      }
       return bcrypt.hash(password, rounds)
     },
     async compare(password, hash) {
@@ -128,9 +142,11 @@ describe('auth routes: hashing, one-time tokens, mails and transactions', () => 
     expect(sent).toHaveLength(1)
     const token = tokenFromMail(sent[0])
     const passwords = ['first-pass', 'second-pass']
+    hasherState.pairHashes = true
     const results = await Promise.all(
       passwords.map((password) => request(app).post('/api/auth/accept-invite').send({ token, password }))
     )
+    expect(hasherState.pairHashes).toBe(false) // both requests reached their hash with the token unused
     expect(results.map((r) => r.status).sort()).toEqual([200, 400])
     const loser = results.find((r) => r.status === 400)
     expect(loser.body.error).toBe('Invite link is invalid or expired')
@@ -154,9 +170,11 @@ describe('auth routes: hashing, one-time tokens, mails and transactions', () => 
     expect(sent).toHaveLength(1)
     const token = tokenFromMail(sent[0])
     const passwords = ['first-pass', 'second-pass']
+    hasherState.pairHashes = true
     const results = await Promise.all(
       passwords.map((password) => request(app).post('/api/auth/reset-password').send({ token, password }))
     )
+    expect(hasherState.pairHashes).toBe(false) // both requests reached their hash with the token unused
     expect(results.map((r) => r.status).sort()).toEqual([200, 400])
     expect(results.find((r) => r.status === 400).body.error).toBe('Reset link is invalid or expired')
     const winnerPassword = passwords[results.findIndex((r) => r.status === 200)]
