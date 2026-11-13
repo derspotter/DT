@@ -652,7 +652,7 @@ test('a sign-in whose own /me answers 401 shows the error on the login form', as
 })
 
 for (const { flow, endpoint, button } of signInLinks) {
-  test(`${flow} whose own /me answers 401 shows the error on the form`, async ({ page }) => {
+  test(`${flow} whose own /me answers 401 shows the saved-password error on the sign-in form`, async ({ page }) => {
     await mockLogSocket(page)
     await page.route('**/api/**', async (route) => {
       const path = new URL(route.request().url()).pathname
@@ -661,7 +661,9 @@ for (const { flow, endpoint, button } of signInLinks) {
     })
     await page.goto(`/#/${flow}?token=one-time`)
     await submitPassword(page, button)
-    await expect(page.locator('.login-form .error')).toHaveText('Unknown user')
+    // The password call succeeded, so the failed /me is a failed sign-in (D12).
+    await expect(page.locator('.login-form .error'))
+      .toHaveText('Your password was saved, but signing in failed (Unknown user). Sign in with your new password.')
   })
 
   test(`a stale-token 401 at boot does not discard an in-flight ${flow}`, async ({ page }) => {
@@ -879,6 +881,10 @@ test('an invitation that answers 401 leaves no status for the next admin', async
   await expect(page.getByTestId('login-form')).toBeVisible()
   await logIn(page, 'bob')
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  // The sign-in lands on the workspace once its loads finish. Until then the
+  // hash is still the signed-out '#/admin', so setting it again is no
+  // navigation at all and the landing would win: wait for it first.
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
   await page.evaluate(() => { window.location.hash = '#/admin' })
   await expect(page.locator('.admin-invite-form')).toBeVisible()
   await expect(page.locator('.admin-invite-form__status')).toHaveCount(0)
@@ -916,7 +922,296 @@ test('the log type and corpus filter go back to their defaults on sign-out', asy
   await page.getByRole('button', { name: 'Log out' }).click()
   await logIn(page, 'bob')
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  // As above: the hash is still '#/logs' until the sign-in lands.
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
   await page.evaluate(() => { window.location.hash = '#/logs' })
   await expect(type).toHaveValue('pipeline')
   await expect(currentCorpus).toBeChecked()
 })
+
+const EXPIRED = 'Your session has expired. Please sign in again.'
+
+function storedToken(page: Page) {
+  return page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))
+}
+
+test('a 502 at boot keeps the token and offers Retry', async ({ page }) => {
+  let meRequests = 0
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') {
+      meRequests += 1
+      if (meRequests === 1) return fulfil(route, { error: 'Bad gateway' }, 502)
+      return fulfil(route, { user: userA, corpora: [corpus] })
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  const form = page.getByTestId('login-form')
+  await expect(form.locator('.error')).toHaveText('Bad gateway. Your session is kept; press Retry when the server is back.')
+  expect(await storedToken(page)).toBe('token-a')
+  await page.waitForTimeout(500)
+  // No automatic retry.
+  expect(meRequests).toBe(1)
+  await page.getByTestId('auth-retry').click()
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  expect(await storedToken(page)).toBe('token-a')
+})
+
+test('a network failure at boot keeps the token too', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'token-a')
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') return route.abort('connectionfailed')
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('login-form').locator('.error'))
+    .toHaveText('Could not reach the server. Your session is kept; press Retry when the server is back.')
+  await expect(page.getByTestId('auth-retry')).toBeVisible()
+  expect(await storedToken(page)).toBe('token-a')
+})
+
+test('a 401 mid-session says the session expired', async ({ page }) => {
+  let expired = false
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'token-a')
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (expired) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (path === '/api/auth/me') return fulfil(route, { user: userA, corpora: [corpus] })
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  expired = true
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByTestId('login-form').locator('.error')).toHaveText(EXPIRED)
+  await expect(page.getByTestId('auth-retry')).toHaveCount(0)
+})
+
+test('a 4401 socket close says the session expired', async ({ page }) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'token-a')
+  })
+  await mockLogSocket(page, (ws) => { setTimeout(() => ws.close({ code: 4401 }), 200) })
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') return fulfil(route, { user: userA, corpora: [corpus] })
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('login-form').locator('.error')).toHaveText(EXPIRED)
+  expect(await storedToken(page)).toBeNull()
+})
+
+test('a stale token at boot says the session expired; an explicit sign-out says nothing', async ({ page }) => {
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'stale-token')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (!auth.endsWith('token-b')) return fulfil(route, { error: 'Invalid token' }, 401)
+    if (path === '/api/auth/me') return fulfil(route, { user: userB, corpora: [corpus] })
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  const form = page.getByTestId('login-form')
+  await expect(form.locator('.error')).toHaveText(EXPIRED)
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await expect(form).toBeVisible()
+  await page.waitForTimeout(300)
+  await expect(form.locator('.error')).toHaveCount(0)
+})
+
+test('a stale boot 401 during a sign-in submit leaves the submit outcome on the form', async ({ page }) => {
+  const bootAnswer = deferred()
+  const loginAnswer = deferred()
+  let loginSeen = false
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'stale-token')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      loginSeen = true
+      await loginAnswer.promise
+      return fulfil(route, { error: 'Invalid credentials' }, 401)
+    }
+    if (auth.endsWith('stale-token')) {
+      await bootAnswer.promise
+      return fulfil(route, { error: 'Invalid token' }, 401)
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'bob')
+  await expect.poll(() => loginSeen).toBe(true)
+  bootAnswer.resolve()
+  await page.waitForFunction(() => !window.localStorage.getItem('rag_feeder_token'))
+  const error = page.getByTestId('login-form').locator('.error')
+  for (let i = 0; i < 6; i += 1) {
+    await expect(page.getByText(EXPIRED)).toHaveCount(0)
+    await page.waitForTimeout(50)
+  }
+  loginAnswer.resolve()
+  await expect(error).toHaveText('Invalid credentials')
+  await page.waitForTimeout(300)
+  await expect(error).toHaveText('Invalid credentials')
+})
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`${flow} accepted but /me fails: sign-in form with the username and the saved-password text`, async ({ page }) => {
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === endpoint) return fulfil(route, { token: 'token-new', user: { id: 7, username: 'neu', last_corpus_id: 1, is_admin: false } })
+      if (path === '/api/auth/me') return fulfil(route, { error: 'boom' }, 500)
+      return workspaceDefaults(path, route)
+    })
+    await page.goto(`/#/${flow}?token=t`)
+    await submitPassword(page, button)
+    const form = page.getByTestId('login-form')
+    await expect(form).toBeVisible()
+    await expect(form.getByLabel('Username')).toHaveValue('neu')
+    await expect(form.locator('.error'))
+      .toHaveText('Your password was saved, but signing in failed (boom). Sign in with your new password.')
+    expect(await storedToken(page)).toBeNull()
+    expect(await page.evaluate(() => window.location.hash)).toBe('#/login')
+  })
+}
+
+test('a quota answer from before a sign-out does not reach the next session', async ({ page }) => {
+  const oldAnswer = deferred()
+  let oldSeen = false
+  let oldAnswered = false
+  let bobQuotaRequests = 0
+  const quota = (remaining: number) => ({ available: true, stale: false, api_key_present: true, remaining, limit: 1000, reset_in_seconds: null })
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+    }
+    if (path === '/api/openalex/quota') {
+      if (auth.endsWith('token-b')) {
+        bobQuotaRequests += 1
+        return fulfil(route, quota(222))
+      }
+      oldSeen = true
+      await oldAnswer.promise
+      await fulfil(route, quota(111))
+      oldAnswered = true
+      return
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  await expect.poll(() => oldSeen).toBe(true)
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  // The old request still in flight did not block bob's own.
+  await expect.poll(() => bobQuotaRequests).toBeGreaterThanOrEqual(1)
+  const pill = page.getByTestId('openalex-quota')
+  await expect(pill).toContainText('222 of 1,000')
+  oldAnswer.resolve()
+  await expect.poll(() => oldAnswered).toBe(true)
+  await page.waitForTimeout(300)
+  await expect(pill).toContainText('222 of 1,000')
+})
+
+for (const outcome of ['success', 'failure'] as const) {
+  test(`a settings save that settles (${outcome}) after a sign-out writes nothing for the next admin`, async ({ page }) => {
+    const adminA = { ...userA, is_admin: true }
+    const adminB = { ...userB, is_admin: true }
+    const saveAnswer = deferred()
+    let saveSeen = false
+    let saveAnswered = false
+    await page.addInitScript(() => {
+      if (!window.sessionStorage.getItem('booted')) {
+        window.sessionStorage.setItem('booted', '1')
+        window.localStorage.setItem('rag_feeder_token', 'token-a')
+      }
+    })
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const request = route.request()
+      const path = new URL(request.url()).pathname
+      const auth = request.headers().authorization || ''
+      if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: adminB })
+      if (path === '/api/auth/me') {
+        return fulfil(route, { user: auth.endsWith('token-b') ? adminB : adminA, corpora: [corpus] })
+      }
+      if (path === '/api/admin/settings') {
+        if (request.method() === 'PUT') {
+          saveSeen = true
+          await saveAnswer.promise
+          if (outcome === 'success') await fulfil(route, { ok: true })
+          else await fulfil(route, { error: 'Stale save failure' }, 500)
+          saveAnswered = true
+          return
+        }
+        return fulfil(route, { settings: { openalex_api_key: { is_set: false } } })
+      }
+      return workspaceDefaults(path, route)
+    })
+
+    await page.goto('/#/admin')
+    await page.locator('.admin-settings-form').getByRole('button', { name: 'Save settings' }).click()
+    await expect.poll(() => saveSeen).toBe(true)
+    await page.getByRole('button', { name: 'Log out' }).click()
+    await logIn(page, 'bob')
+    await expect(page.getByTestId('auth-user')).toHaveText('bob')
+    await expect(page.getByTestId('seed-panel')).toBeVisible()
+    await page.evaluate(() => { window.location.hash = '#/admin' })
+    const form = page.locator('.admin-settings-form')
+    await expect(form).toBeVisible()
+    saveAnswer.resolve()
+    await expect.poll(() => saveAnswered).toBe(true)
+    await page.waitForTimeout(300)
+    await expect(form.getByText('Settings saved', { exact: false })).toHaveCount(0)
+    await expect(form.getByText('Stale save failure')).toHaveCount(0)
+  })
+}

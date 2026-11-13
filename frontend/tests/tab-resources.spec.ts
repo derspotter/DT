@@ -59,6 +59,8 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // The Kantropos target list, and whether its route answers 503.
     targets: [{ id: 'k1', name: 'Kantropos One' }],
     failTargets: false,
+    // Answer the global ingest stats with a 500.
+    failGlobalStats: false,
   }
   const scripted = async (route: Route, steps: Step[]) => {
     const step = steps.shift()
@@ -133,6 +135,7 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     }
     if (path === '/api/ingest/runs') return fulfil(route, { runs: state.ingestRuns, total: state.ingestRuns.length, source: 'api' })
     if (path === '/api/ingest/stats') {
+      if (state.failGlobalStats && url.searchParams.get('global') === '1') return fulfil(route, { error: 'stats down' }, 500)
       return fulfil(route, { stats: url.searchParams.get('global') === '1' ? { downloaded: 42 } : { downloaded: state.statsDownloaded } })
     }
     if (path === '/api/pipeline/daemon/status') {
@@ -664,5 +667,101 @@ test('an empty target list is fetched once per load', async ({ page }) => {
 test('a failed target list is fetched once per load and its error stays', async ({ page }) => {
   const { count } = await boot(page, { hash: '#/upstream', setup: (state) => { state.failTargets = true } })
   expect(count('/api/kantropos/corpora')).toBe(1)
-  await expect(page.getByText('targets down')).toBeVisible()
+  // The assignment card's error, and the browse status that names it.
+  await expect(page.getByText('targets down', { exact: true })).toBeVisible()
+  await expect(page.getByText('Could not load the Kantropos corpora: targets down')).toBeVisible()
+})
+
+const GLOBAL_UNAVAILABLE = 'Global totals could not be loaded.'
+
+function globalOverview(page: Page) {
+  return page.locator('.card', { has: page.getByRole('heading', { name: 'Global overview' }) })
+}
+
+test('a failed global stats load shows dashes and the unavailable note', async ({ page }) => {
+  await boot(page, { admin: true, hash: '#/dashboard', setup: (state) => { state.failGlobalStats = true } })
+  const overview = globalOverview(page)
+  await expect(overview).toBeVisible()
+  await expect(overview.getByText(GLOBAL_UNAVAILABLE)).toBeVisible()
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Raw' }).locator('strong')).toHaveText('—')
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Done' }).locator('strong')).toHaveText('—')
+  // The daemon backlog loaded: its numbers stay real.
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Downloading' }).locator('strong')).toHaveText('3')
+})
+
+test('global stats and daemon answers from before a sign-out do not reach the next session', async ({ page }) => {
+  let release: () => void = () => {}
+  const held = new Promise<void>((resolve) => { release = resolve })
+  const seen = { stats: false, daemon: false }
+  let answered = 0
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const url = new URL(request.url())
+    const path = url.pathname
+    const auth = request.headers().authorization || ''
+    const isB = auth.endsWith('token-b')
+    const global = url.searchParams.get('global') === '1'
+    if (path === '/api/auth/login') {
+      return fulfil(route, { token: 'token-b', user: { id: 2, username: 'second', last_corpus_id: 1, is_admin: true } })
+    }
+    if (path === '/api/auth/me') {
+      return fulfil(route, {
+        user: { id: isB ? 2 : 1, username: isB ? 'second' : 'first', last_corpus_id: 1, is_admin: true },
+        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'first' }],
+      })
+    }
+    if (global && path === '/api/ingest/stats' && !isB) {
+      seen.stats = true
+      await held
+      await fulfil(route, { stats: { raw_pending: 900, matched: 900, queued_download: 900, downloaded: 900 } })
+      answered += 1
+      return
+    }
+    if (global && path === '/api/pipeline/daemon/status' && !isB) {
+      seen.daemon = true
+      await held
+      await fulfil(route, { error: 'daemon down' }, 500)
+      answered += 1
+      return
+    }
+    if (path === '/api/ingest/stats') {
+      return fulfil(route, { stats: global ? { raw_pending: 7, matched: 6, queued_download: 5, downloaded: 4 } : {} })
+    }
+    if (path === '/api/pipeline/daemon/status') {
+      return fulfil(route, { daemon: { workers: {} }, backlog: global ? { enriching: 2, downloading: 1 } : {} })
+    }
+    if (path === '/api/corpus') return fulfil(route, { items: [], total: 0, source: 'api', stage_totals: {} })
+    if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
+    if (path === '/api/seed/sources') return fulfil(route, { sources: [], total: 0, source: 'api' })
+    return fulfil(route, {})
+  })
+
+  await page.goto('/#/dashboard')
+  await expect(page.getByTestId('auth-user')).toHaveText('first')
+  await expect.poll(() => seen.stats && seen.daemon).toBe(true)
+  await page.getByRole('button', { name: 'Log out' }).click()
+  const form = page.getByTestId('login-form')
+  await form.getByLabel('Username').fill('second')
+  await form.getByLabel('Password').fill('secret-password')
+  await form.getByRole('button', { name: 'Sign in' }).click()
+  await expect(page.getByTestId('auth-user')).toHaveText('second')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  await page.evaluate(() => { window.location.hash = '#/dashboard' })
+  const overview = globalOverview(page)
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Done' }).locator('strong')).toHaveText('4')
+
+  release()
+  await expect.poll(() => answered).toBe(2)
+  await page.waitForTimeout(300)
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Done' }).locator('strong')).toHaveText('4')
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Raw' }).locator('strong')).toHaveText('7')
+  await expect(overview.locator('.pipeline-stage', { hasText: 'Enriching' }).locator('strong')).toHaveText('2')
+  await expect(page.getByText(GLOBAL_UNAVAILABLE)).toHaveCount(0)
 })

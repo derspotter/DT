@@ -8,8 +8,16 @@
   export let pipelineWorkerStatus = ''
   export let recentDownloads = []
   export let showGlobalOverview = false
-  export let globalStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
-  export let globalBacklog = {}
+  // null until loaded; a null value renders as "—", never as 0.
+  export let globalStats = null
+  export let globalBacklog = null
+  // The last global load failed: the note shows next to the last numbers.
+  export let globalUnavailable = false
+
+  function globalValue(source, key) {
+    if (!source || source[key] === null) return '—'
+    return Number(source[key] || 0)
+  }
 
   $: enrichWorker = daemonStatus?.workers?.enrich || { online: false, status: 'offline', last_seen_at: null, details: null }
   $: downloadWorker = daemonStatus?.workers?.download || { online: false, status: 'offline', last_seen_at: null, details: null }
@@ -106,44 +114,47 @@
   {#if showGlobalOverview}
     <div class="card">
       <h2>Global overview</h2>
+      {#if globalUnavailable}
+        <p class="error">Global totals could not be loaded.</p>
+      {/if}
       <p>Pipeline totals across all corpora in the app.</p>
       <div class="pipeline-strip">
         <div class="pipeline-stage">
           <span class="stat-label">Raw</span>
-          <strong>{Number(globalStats?.raw_pending || 0)}</strong>
+          <strong>{globalValue(globalStats, 'raw_pending')}</strong>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-stage">
           <span class="stat-label">Meta</span>
-          <strong>{Number(globalStats?.matched || 0)}</strong>
+          <strong>{globalValue(globalStats, 'matched')}</strong>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-stage">
           <span class="stat-label">Queued DL</span>
-          <strong>{Number(globalStats?.queued_download || 0)}</strong>
+          <strong>{globalValue(globalStats, 'queued_download')}</strong>
         </div>
         <span class="pipeline-arrow" aria-hidden="true">→</span>
         <div class="pipeline-stage">
           <span class="stat-label">Done</span>
-          <strong>{Number(globalStats?.downloaded || 0)}</strong>
+          <strong>{globalValue(globalStats, 'downloaded')}</strong>
         </div>
       </div>
       <div class="pipeline-strip" style="margin-top: 12px;">
         <div class="pipeline-stage">
           <span class="stat-label">Enriching</span>
-          <strong>{Number(globalBacklog?.enriching || 0)}</strong>
+          <strong>{globalValue(globalBacklog, 'enriching')}</strong>
         </div>
         <div class="pipeline-stage">
           <span class="stat-label">Downloading</span>
-          <strong>{Number(globalBacklog?.downloading || 0)}</strong>
+          <strong>{globalValue(globalBacklog, 'downloading')}</strong>
         </div>
         <div class="pipeline-stage">
           <span class="stat-label">Failed enrich</span>
-          <strong>{Number(globalBacklog?.failed_enrichment || 0)}</strong>
+          <strong>{globalValue(globalBacklog, 'failed_enrichment')}</strong>
         </div>
         <div class="pipeline-stage">
           <span class="stat-label">Failed DL</span>
-          <strong>{Number(globalBacklog?.failed_download || 0)}</strong>
+          <strong>{globalValue(globalBacklog, 'failed_download')}</strong>
         </div>
       </div>
     </div>

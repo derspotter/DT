@@ -165,12 +165,11 @@
     queued_download: 0,
     downloaded: 0,
   }
-  let globalIngestStats = {
-    raw_pending: 0,
-    matched: 0,
-    queued_download: 0,
-    downloaded: 0,
-  }
+  // null: not loaded (the dashboard shows "—"). The *Error flags mark the
+  // last global load as failed; the last numbers stay next to the note.
+  let globalIngestStats = null
+  let globalStatsError = false
+  let globalDaemonError = false
   $: pipelineRawCount = Number(ingestStats.raw_pending || 0)
   $: pipelineMetadataCount = Number(ingestStats.matched || 0)
   $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
@@ -339,17 +338,21 @@
   $: if (topicOnlySearch && searchSort === 'relevance') searchSort = 'cited_by_count'
 
   let openalexQuota = null
-  let openalexQuotaLoading = false
+  // The session whose quota request is in flight (null: none). A request from
+  // before a sign-out neither blocks the next session's nor lands in it.
+  let openalexQuotaEpoch = null
 
   async function loadOpenAlexQuota() {
-    if (openalexQuotaLoading || authStatus !== 'authenticated') return
-    openalexQuotaLoading = true
+    if (openalexQuotaEpoch === sessionEpoch || authStatus !== 'authenticated') return
+    const epoch = sessionEpoch
+    openalexQuotaEpoch = epoch
     try {
-      openalexQuota = await fetchOpenAlexQuota()
+      const quota = await fetchOpenAlexQuota()
+      if (epoch === sessionEpoch) openalexQuota = quota
     } catch {
       // Leave the last known value; the pill is informational only.
     } finally {
-      openalexQuotaLoading = false
+      if (openalexQuotaEpoch === epoch) openalexQuotaEpoch = null
     }
   }
 
@@ -487,16 +490,7 @@
     failed_enrichment: 0,
     failed_download: 0,
   }
-  let globalWorkerBacklog = {
-    raw_pending: 0,
-    enriching: 0,
-    matched: 0,
-    queued_download: 0,
-    downloading: 0,
-    downloaded: 0,
-    failed_enrichment: 0,
-    failed_download: 0,
-  }
+  let globalWorkerBacklog = null
   let exportBusy = false
   let exportStatus = ''
   let exportFilterStatus = 'all'
@@ -551,6 +545,8 @@
   let inviteStatus = ''
   let inviteError = false
   let kantroposTargets = []
+  // The last target-list load's error message ('' when it loaded).
+  let kantroposTargetsError = ''
   let kantroposAssignment = null
   let selectedKantroposTargetId = ''
   let kantroposAssignmentStatus = ''
@@ -571,6 +567,8 @@
     graph: { nodes: [], edges: [], stats: {} },
   }
   let upstreamBrowseStatus = ''
+  // The status is an error (the browser shows it as one, with Retry).
+  let upstreamBrowseError = false
   let upstreamBrowseLoading = false
   let upstreamBrowseRequestSeq = 0
   let upstreamCurrentLimit = CORPUS_PAGE_SIZE
@@ -679,6 +677,7 @@
       graph: { nodes: [], edges: [], stats: {} },
     }
     upstreamBrowseStatus = ''
+    upstreamBrowseError = false
     upstreamBrowseLoading = false
   }
 
@@ -1584,6 +1583,7 @@
   async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
     authStatus = 'loading'
     authError = ''
+    authBootRetry = false
     const startupTab = !preserveAuthFlow ? readTabFromHash({ includeUnavailable: true }) : null
     const startupNavigationRevision = navigationRevision
     const landingTab = startupTab || activeTab
@@ -1615,14 +1615,41 @@
     } catch (error) {
       // A 401 already ran expireSession (state reset, token cleared).
       if (error?.status === 401 || epoch !== sessionEpoch) return
+      // Anything else (a timeout, a 502 during a deploy) says nothing about
+      // the token: keep it and let the user retry. No automatic retry.
+      const keptToken = Boolean(getAuthToken())
       authStatus = 'unauthenticated'
-      authError = ''
+      authError = keptToken ? `${asSentence(error?.message || 'Failed to load user')} Your session is kept; press Retry when the server is back.` : ''
+      authBootRetry = keptToken
       authUser = null
       corpora = []
       currentCorpusId = null
       disconnectLogs()
-      setAuthToken('')
     }
+  }
+
+  // "Bad gateway" -> "Bad gateway."; text that ends a sentence stays as is.
+  function asSentence(text) {
+    const value = String(text || '').trim()
+    return /[.!?]$/.test(value) ? value : `${value}.`
+  }
+
+  // Invite and reset links: the password call succeeded, so the link is used
+  // up, but signing in afterwards failed. The form to go back to is the
+  // sign-in one, with the account already filled in.
+  function recoverSavedPassword(username, error) {
+    if (getAuthToken()) endSession()
+    disconnectLogs()
+    setAuthToken('')
+    authStatus = 'unauthenticated'
+    authFlow = 'login'
+    authFlowToken = ''
+    authPassword = ''
+    authPasswordConfirm = ''
+    // replaceState fires no hashchange, which would clear the message.
+    if (typeof window !== 'undefined' && window.history?.replaceState) window.history.replaceState(null, '', '#/login')
+    if (username) loginUsername = username
+    authError = `Your password was saved, but signing in failed (${error?.message || 'unknown error'}). Sign in with your new password.`
   }
 
   async function handleLogin(event) {
@@ -1632,6 +1659,7 @@
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
+    authSubmitsInFlight += 1
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
       if (attempt !== signInEpoch) return
@@ -1664,6 +1692,8 @@
       authStatus = 'unauthenticated'
       disconnectLogs()
       setAuthToken('')
+    } finally {
+      authSubmitsInFlight -= 1
     }
   }
 
@@ -1671,12 +1701,15 @@
     event?.preventDefault?.()
     authError = ''
     authInfo = ''
+    authSubmitsInFlight += 1
     try {
       await requestPasswordReset(authEmail.trim())
       authInfo = 'If that email exists, a reset link has been sent.'
       authEmail = ''
     } catch (error) {
       authError = error.message || 'Failed to send password reset email'
+    } finally {
+      authSubmitsInFlight -= 1
     }
   }
 
@@ -1700,9 +1733,14 @@
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
+    // Set once the password call succeeded: a later failure is a failed
+    // sign-in, not a failed link.
+    let savedUsername = null
+    authSubmitsInFlight += 1
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
       if (attempt !== signInEpoch) return
+      savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
       epoch = sessionEpoch
@@ -1726,7 +1764,13 @@
       }
     } catch (error) {
       if (attempt !== signInEpoch) return
+      if (savedUsername !== null) {
+        recoverSavedPassword(savedUsername, error)
+        return
+      }
       authError = error.message || 'Failed to accept invite'
+    } finally {
+      authSubmitsInFlight -= 1
     }
   }
 
@@ -1750,9 +1794,14 @@
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
+    // Set once the password call succeeded: a later failure is a failed
+    // sign-in, not a failed link.
+    let savedUsername = null
+    authSubmitsInFlight += 1
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
       if (attempt !== signInEpoch) return
+      savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
       epoch = sessionEpoch
@@ -1776,7 +1825,13 @@
       }
     } catch (error) {
       if (attempt !== signInEpoch) return
+      if (savedUsername !== null) {
+        recoverSavedPassword(savedUsername, error)
+        return
+      }
       authError = error.message || 'Failed to reset password'
+    } finally {
+      authSubmitsInFlight -= 1
     }
   }
 
@@ -1806,12 +1861,22 @@
   // or a deliberate sign-out. Not an expired token: a boot 401 landing during
   // the submit must not cost the attempt its outcome.
   let signInEpoch = 0
+  // Sign-in, forgot-password, accept-invite and reset-password submits in
+  // flight: while one runs, its own outcome owns the form.
+  let authSubmitsInFlight = 0
+  // Boot failed for a reason other than a rejected token: the sign-in card
+  // offers Retry (bootstrapAuth) with the token kept.
+  let authBootRetry = false
 
-  // The one path for an expired session: api.js runs it on every 401. Several
-  // requests can fail together; once signed out, the rest change nothing.
+  // The one path for an expired session: api.js runs it on every 401, and the
+  // log socket on a 4401 close. Several requests can fail together; once
+  // signed out, the rest change nothing. The message says why the form is
+  // back, unless a submit in flight or an error already on screen owns it.
   function expireSession() {
     if (authStatus === 'unauthenticated' && !getAuthToken()) return
+    const showExpiry = authSubmitsInFlight === 0 && !authError && Boolean(getAuthToken())
     endSession()
+    if (showExpiry) authError = 'Your session has expired. Please sign in again.'
   }
   onUnauthorized(expireSession)
 
@@ -1825,6 +1890,7 @@
     // the outcome of a submit, not of the session that is ending.
     const keepError = authStatus === 'loading'
     sessionEpoch += 1
+    authBootRetry = false
     disconnectLogs()
     setAuthToken('')
     authStatus = 'unauthenticated'
@@ -1843,6 +1909,7 @@
     if (getAuthToken()) endSession()
     signInEpoch += 1
     sessionEpoch += 1
+    authBootRetry = false
     if (payload?.token) setAuthToken(payload.token)
     if (payload?.user) {
       authUser = payload.user
@@ -2023,6 +2090,7 @@
     resetTopicSearch()
     resetKantroposAssignmentState()
     resetUpstreamBrowseState()
+    kantroposTargetsError = ''
     finishExtractionProgress()
     if (signOut) {
       // null makes the Admin tab fetch the settings again.
@@ -2034,8 +2102,10 @@
       inviteEmail = ''
       inviteStatus = ''
       inviteError = false
-      globalIngestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
-      globalWorkerBacklog = { raw_pending: 0, enriching: 0, matched: 0, queued_download: 0, downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
+      globalIngestStats = null
+      globalWorkerBacklog = null
+      globalStatsError = false
+      globalDaemonError = false
       kantroposTargets = []
       selectedUpstreamTargetId = ''
       openalexQuota = null
@@ -2209,6 +2279,7 @@
     try {
       const payload = await fetchKantroposCorpora()
       kantroposTargets = payload?.corpora || []
+      kantroposTargetsError = ''
       const hasCurrentSelection = kantroposTargets.some((target) => String(target.id) === String(selectedUpstreamTargetId))
       if (!hasCurrentSelection) {
         const preferredTargetId = kantroposAssignment?.target_id || kantroposTargets[0]?.id || ''
@@ -2217,6 +2288,7 @@
     } catch (error) {
       if (error?.status === 401) return
       kantroposTargets = []
+      kantroposTargetsError = error?.message || 'Request failed'
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
       kantroposAssignmentError = true
       if (!selectedUpstreamTargetId) {
@@ -2247,8 +2319,14 @@
       }
       const targetId = String(selectedUpstreamTargetId || kantroposAssignment?.target_id || kantroposTargets[0]?.id || '').trim()
       if (!targetId) {
-        if (!quiet) upstreamBrowseStatus = 'No upstream corpora are configured.'
+        if (kantroposTargetsError) {
+          // A failed list is not an empty one: keep the last browse.
+          upstreamBrowseError = true
+          upstreamBrowseStatus = `Could not load the Kantropos corpora: ${kantroposTargetsError}`
+          return
+        }
         resetUpstreamBrowseState()
+        upstreamBrowseStatus = 'No upstream corpora are configured.'
         return
       }
       selectedUpstreamTargetId = targetId
@@ -2282,12 +2360,16 @@
       }
       if (!quiet) {
         upstreamBrowseStatus = 'Loaded upstream corpus browser.'
+      } else if (upstreamBrowseError) {
+        upstreamBrowseStatus = ''
       }
+      upstreamBrowseError = false
     } catch (error) {
       if (error?.status === 401 || requestSeq !== upstreamBrowseRequestSeq || epoch !== corpusScopeEpoch) return
-      if (!quiet) {
-        upstreamBrowseStatus = error?.message || 'Failed to load upstream corpus browser.'
-      }
+      // Quiet or not: a tab load that fails must not look like an empty corpus.
+      const message = String(error?.message || 'Request failed').replace(/\.+$/, '')
+      upstreamBrowseError = true
+      upstreamBrowseStatus = `Could not load the upstream corpus: ${message}.${upstreamBrowse.target ? ' Showing the last loaded data.' : ''}`
     } finally {
       if (requestSeq === upstreamBrowseRequestSeq) {
         upstreamBrowseLoading = false
@@ -2422,6 +2504,17 @@
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
         const result = await importSeed(payload.filename, seedKind)
+        if (result?.stopped) {
+          // The import stopped on an error; what it saved before that stays.
+          const processed = Number(result.processed || 0)
+          const added = Number(result.added || 0)
+          const message = processed === 0 && added === 0
+            ? `Import failed: ${result.error}`
+            : `Import stopped after ${processed} of ${Number(result.total || 0)} entries: ${result.error} (${added} added, ${Number(result.corpus_linked || 0)} linked before it).`
+          updateUpload(item.id, { status: 'failed', backendFilename: payload.filename, message })
+          apiStatus = 'online'
+          return
+        }
         const linked = Number(result.corpus_linked || 0)
         updateUpload(item.id, {
           status: 'imported',
@@ -2487,24 +2580,38 @@
   }
 
   async function loadIngestStats({ quiet = false, global = false } = {}) {
+    if (global) return loadGlobalIngestStats()
     if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
     const epoch = corpusScopeEpoch
     try {
-      const payload = await fetchIngestStats({ global })
-      if (!global && epoch !== corpusScopeEpoch) return
-      if (global) {
-        globalIngestStats = payload.stats || globalIngestStats
-      } else {
-        ingestStats = payload.stats || ingestStats
-      }
+      const payload = await fetchIngestStats()
+      if (epoch !== corpusScopeEpoch) return
+      ingestStats = payload.stats || ingestStats
       if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) return
       // Requested for a corpus the workspace has left: change nothing.
-      if (!global && epoch !== corpusScopeEpoch) return
-      if (!global) handleCorpusPollForbidden(error)
+      if (epoch !== corpusScopeEpoch) return
+      handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
+      apiStatus = error?.status === 403 ? 'online' : 'offline'
+    }
+  }
+
+  // The admin's totals across all corpora. Not corpus-scoped, so the session
+  // guards it: an answer or error from before a sign-out writes nothing.
+  async function loadGlobalIngestStats() {
+    const epoch = sessionEpoch
+    try {
+      const payload = await fetchIngestStats({ global: true })
+      if (epoch !== sessionEpoch) return
+      globalIngestStats = payload?.stats || globalIngestStats || {}
+      globalStatsError = false
+      apiStatus = 'online'
+    } catch (error) {
+      if (error?.status === 401 || epoch !== sessionEpoch) return
+      globalStatsError = true
       apiStatus = error?.status === 403 ? 'online' : 'offline'
     }
   }
@@ -3742,15 +3849,26 @@
     }
   }
 
+  // As loadGlobalIngestStats: session-scoped, not corpus-scoped.
+  async function loadGlobalWorkerBacklog() {
+    const epoch = sessionEpoch
+    try {
+      const payload = await fetchPipelineDaemonStatus({ global: true })
+      if (epoch !== sessionEpoch) return
+      globalWorkerBacklog = payload?.backlog || globalWorkerBacklog || {}
+      globalDaemonError = false
+    } catch (error) {
+      if (error?.status === 401 || epoch !== sessionEpoch) return
+      globalDaemonError = true
+    }
+  }
+
   async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
+    if (global) return loadGlobalWorkerBacklog()
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
     const epoch = corpusScopeEpoch
     try {
-      const payload = await fetchPipelineDaemonStatus({ global })
-      if (global) {
-        globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
-        return
-      }
+      const payload = await fetchPipelineDaemonStatus()
       // The backlog is corpus-scoped. A stale response leaves the status
       // alone: it may already show the newer corpus's request.
       if (epoch !== corpusScopeEpoch) return
@@ -3941,14 +4059,17 @@
     for (const key of ['openalex_api_key', 'openai_api_key', 'gemini_api_key']) {
       if (!String(payload[key] || '').trim()) delete payload[key]
     }
+    // A save that settles after a sign-out belongs to the session that ended.
+    const epoch = sessionEpoch
     try {
       appSettingsError = false
       appSettingsStatus = 'Saving...'
       await saveAppSettings(payload)
+      if (epoch !== sessionEpoch) return
       appSettingsStatus = 'Settings saved. New values apply to the next pipeline run.'
       await loadAppSettings()
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       appSettingsStatus = error?.message || 'Failed to save settings.'
       appSettingsError = true
     }
@@ -4223,9 +4344,9 @@
         if (logsSocket !== ws) return
         logsSocket = null
         if (event?.code === 4401) {
-          // Token rejected by the server: full sign-out, no reconnect. The
-          // status is set after handleLogout() so disconnectLogs() keeps it.
-          handleLogout()
+          // Token rejected by the server: the session expired, no reconnect.
+          // The status is set after expireSession() so disconnectLogs() keeps it.
+          expireSession()
           logsStatus = 'unauthorized'
           return
         }
@@ -4489,6 +4610,9 @@
           {/if}
           {#if authError}
             <p class="error">{authError}</p>
+          {/if}
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={() => bootstrapAuth()}>Retry</button>
           {/if}
           <div class="auth-actions">
             <button type="submit">Sign in</button>
@@ -5287,6 +5411,7 @@
           loadMorePending={() => loadUpstreamBrowse({ appendPending: true })}
           loading={upstreamBrowseLoading}
           status={upstreamBrowseStatus}
+          statusError={upstreamBrowseError}
           browse={upstreamBrowse}
           selectedAssignedCorpusId={selectedUpstreamAssignedCorpusId}
           toggleAssignedCorpus={handleToggleUpstreamAssignedCorpus}
@@ -5328,6 +5453,7 @@
           showGlobalOverview={isAdmin}
           globalStats={globalIngestStats}
           globalBacklog={globalWorkerBacklog}
+          globalUnavailable={globalStatsError || globalDaemonError}
         />
       {/if}
 

@@ -51,7 +51,7 @@ jobs:
       - run: npx playwright install --with-deps chromium
       # Mock-only specs (no live backend needed). Live/real specs are opt-in via
       # their own env flags and are intentionally excluded here.
-      - run: npx playwright test tests/graph-3d.spec.ts tests/seed-upload.spec.ts tests/boot-requests.spec.ts tests/search-scale.spec.ts tests/topic-search.spec.ts tests/table-columns.spec.ts tests/corpus-reconcile.spec.ts tests/dead-code.spec.ts tests/session.spec.ts tests/works-lib.spec.ts tests/seed-selection.spec.ts tests/tab-resources.spec.ts tests/logs-stream.spec.ts tests/refresh-scheduler.spec.ts tests/navigation.spec.ts tests/corpus-load.spec.ts tests/css-tokens.spec.ts --workers=2
+      - run: npx playwright test tests/graph-3d.spec.ts tests/seed-upload.spec.ts tests/boot-requests.spec.ts tests/search-scale.spec.ts tests/topic-search.spec.ts tests/table-columns.spec.ts tests/corpus-reconcile.spec.ts tests/dead-code.spec.ts tests/session.spec.ts tests/works-lib.spec.ts tests/seed-selection.spec.ts tests/tab-resources.spec.ts tests/logs-stream.spec.ts tests/refresh-scheduler.spec.ts tests/navigation.spec.ts tests/corpus-load.spec.ts tests/css-tokens.spec.ts tests/upstream-status.spec.ts --workers=2
 
   python-search:
     name: Python search and schema tests

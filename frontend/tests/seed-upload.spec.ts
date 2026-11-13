@@ -7,6 +7,8 @@ import { mockLogSocket } from './helpers/mockApi'
 // and calls /api/ingest/import-seed, and the result counts render on the item.
 
 let processPdfCalls = 0
+const IMPORTED = { added: 2, skipped: 1, corpus_linked: 2, total: 3, errors: [] }
+let importResult: Record<string, unknown> = IMPORTED
 
 async function mockApi(route: Route) {
   const url = new URL(route.request().url())
@@ -37,7 +39,7 @@ async function mockApi(route: Route) {
     return route.fulfill({
       status: 200,
       contentType: 'application/json',
-      body: JSON.stringify({ added: 2, skipped: 1, corpus_linked: 2, total: 3, errors: [] }),
+      body: JSON.stringify(importResult),
     })
   }
 
@@ -65,6 +67,7 @@ async function mockApi(route: Route) {
 
 test('BibTeX seed upload imports into the corpus and reports counts', async ({ page }) => {
   processPdfCalls = 0
+  importResult = IMPORTED
   await mockLogSocket(page)
   await page.addInitScript(() => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
@@ -92,4 +95,46 @@ test('BibTeX seed upload imports into the corpus and reports counts', async ({ p
   // Result counts render on the upload item (proves the full round-trip).
   await expect(page.getByText(/Imported 2 works \(1 skipped, 2 added to corpus\)/)).toBeVisible()
   expect(processPdfCalls).toBe(1)
+})
+
+async function uploadSeed(page: import('@playwright/test').Page) {
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await page.route('**/api/**', mockApi)
+  await page.goto('/#/workspace')
+  const fileInput = page.locator('input[type="file"]').first()
+  await expect(fileInput).toBeAttached()
+  await fileInput.setInputFiles({
+    name: 'references.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from('[]'),
+  })
+}
+
+test('a stopped import shows the counts it saved', async ({ page }) => {
+  importResult = {
+    added: 380, skipped: 0, corpus_linked: 20, total: 1000, processed: 400,
+    stopped: true, error: 'OperationalError: database is locked', errors: [],
+  }
+  await uploadSeed(page)
+  const message = 'Import stopped after 400 of 1000 entries: OperationalError: database is locked (380 added, 20 linked before it).'
+  const item = page.locator('.upload-item', { hasText: message })
+  await expect(page.getByText(message, { exact: true })).toBeVisible()
+  await expect(page.getByText(/Imported \d+ works/)).toHaveCount(0)
+  await expect(item.locator('.status')).toHaveText('failed')
+})
+
+test('an import that saved nothing shows Import failed', async ({ page }) => {
+  importResult = {
+    added: 0, skipped: 0, corpus_linked: 0, total: 0, processed: 0,
+    stopped: true, error: 'JSONDecodeError: Failed to parse json: Expecting value', errors: [],
+  }
+  await uploadSeed(page)
+  const message = 'Import failed: JSONDecodeError: Failed to parse json: Expecting value'
+  const item = page.locator('.upload-item', { hasText: message })
+  await expect(page.getByText(message, { exact: true })).toBeVisible()
+  await expect(page.getByText(/Imported \d+ works/)).toHaveCount(0)
+  await expect(item.locator('.status')).toHaveText('failed')
 })
