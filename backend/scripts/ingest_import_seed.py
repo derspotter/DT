@@ -10,14 +10,20 @@ CLI command.
 
 Entries are written in transactions of INGEST_COMMIT_CHUNK entries (so no write lock
 is held for the whole file), each entry inside its own savepoint: an entry that
-raises leaves no rows behind and counts as skipped. If SQLite rolls back the whole
-transaction (a full disk, an I/O error), the script fails with a non-zero exit and no
-summary: earlier chunks stay committed, and a rerun is safe because duplicates merge.
+raises leaves no rows behind and counts as skipped. If a chunk fails as a whole (BEGIN
+or COMMIT fails, or SQLite rolls back the transaction on a full disk or an I/O error),
+the import stops there: earlier chunks stay committed, and a rerun is safe because
+duplicates merge.
 
-Prints a JSON summary: {added, skipped, corpus_linked, total, errors}. `added`
+Every outcome prints one JSON summary line and exits 0:
+{added, skipped, corpus_linked, total, processed, stopped, error, errors}. `added`
 counts new works; `corpus_linked` counts entries (new or duplicate) linked to
 --corpus-id; `skipped` counts entries that could not be imported (non-object
-entries, missing titles, errors).
+entries, missing titles, errors); `total` counts the parsed entries. The counts and
+`processed` cover only committed chunks. `stopped` is true when a parse failure, a
+database setup failure or a failed chunk ended the run early, with
+`error: "<ExceptionType>: <message>"`; otherwise `stopped` is false, `processed`
+equals `total` and `error` is null. `errors` holds per-entry messages.
 """
 
 import argparse
@@ -83,6 +89,24 @@ def load_json_entries(path):
     return data if isinstance(data, list) else []
 
 
+def _print_summary(*, added=0, skipped=0, corpus_linked=0, total=0, processed=0, error=None, errors=()):
+    """Print the one summary shape every outcome uses; `stopped` is set exactly when there is an error."""
+    print(json.dumps({
+        "added": added,
+        "skipped": skipped,
+        "corpus_linked": corpus_linked,
+        "total": total,
+        "processed": processed,
+        "stopped": error is not None,
+        "error": error,
+        "errors": list(errors)[:20],
+    }))
+
+
+def _describe(exc):
+    return f"{type(exc).__name__}: {exc}"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
@@ -99,56 +123,74 @@ def main(argv=None):
             else load_json_entries(args.file)
         )
     except Exception as exc:
-        print(json.dumps({"added": 0, "skipped": 0, "corpus_linked": 0, "total": 0,
-                          "errors": [f"Failed to parse {args.kind}: {exc}"]}))
+        _print_summary(error=f"{type(exc).__name__}: Failed to parse {args.kind}: {exc}")
         return
 
-    db = DatabaseManager(args.db_path)
-    added = skipped = linked = 0
+    try:
+        db = DatabaseManager(args.db_path)
+    except Exception as exc:
+        _print_summary(total=len(entries), error=_describe(exc))
+        return
+
+    added = skipped = linked = processed = 0
     errors = []
+    error = None
     try:
         for chunk_start in range(0, len(entries), INGEST_COMMIT_CHUNK):
-            with db.transaction():
-                for raw in entries[chunk_start:chunk_start + INGEST_COMMIT_CHUNK]:
-                    if not isinstance(raw, dict):
-                        skipped += 1
-                        errors.append(f"Skipped non-object entry: {type(raw).__name__}")
-                        continue
-                    entry = dict(raw)
-                    if args.source_label and not entry.get("source"):
-                        entry["source"] = args.source_label
-                    if args.corpus_id is not None:
-                        entry["corpus_id"] = args.corpus_id
-                    try:
-                        with db.savepoint():
-                            row_id, err = db.create_pending_work(entry, commit=False)
-                    except Exception as exc:
-                        if not db.conn.in_transaction:
-                            raise  # SQLite dropped the transaction: the whole chunk is lost
-                        skipped += 1
-                        errors.append(str(exc))
-                        continue
-                    if row_id:
-                        added += 1
+            chunk = entries[chunk_start:chunk_start + INGEST_COMMIT_CHUNK]
+            # Chunk-local counts join the totals only once the chunk's transaction committed.
+            c_added = c_skipped = c_linked = 0
+            c_errors = []
+            try:
+                with db.transaction():
+                    for raw in chunk:
+                        if not isinstance(raw, dict):
+                            c_skipped += 1
+                            c_errors.append(f"Skipped non-object entry: {type(raw).__name__}")
+                            continue
+                        entry = dict(raw)
+                        if args.source_label and not entry.get("source"):
+                            entry["source"] = args.source_label
                         if args.corpus_id is not None:
-                            linked += 1
-                    elif err and "Duplicate" in err:
-                        # create_pending_work linked the existing work to the corpus.
-                        if args.corpus_id is not None:
-                            linked += 1
-                    else:
-                        skipped += 1
-                        if err and "Title is required" not in err:
-                            errors.append(err)
+                            entry["corpus_id"] = args.corpus_id
+                        try:
+                            with db.savepoint():
+                                row_id, err = db.create_pending_work(entry, commit=False)
+                        except Exception as exc:
+                            if not db.conn.in_transaction:
+                                raise  # SQLite dropped the transaction: the whole chunk is lost
+                            c_skipped += 1
+                            c_errors.append(str(exc))
+                            continue
+                        if row_id:
+                            c_added += 1
+                            if args.corpus_id is not None:
+                                c_linked += 1
+                        elif err and "Duplicate" in err:
+                            # create_pending_work linked the existing work to the corpus.
+                            if args.corpus_id is not None:
+                                c_linked += 1
+                        else:
+                            c_skipped += 1
+                            if err and "Title is required" not in err:
+                                c_errors.append(err)
+            except Exception as exc:
+                # BEGIN, COMMIT or a lost transaction: this chunk is gone, earlier ones stay.
+                error = _describe(exc)
+                break
+            added += c_added
+            skipped += c_skipped
+            linked += c_linked
+            processed += len(chunk)
+            errors.extend(c_errors)
     finally:
         try:
             db.close_connection()
         except Exception:
             pass
 
-    print(json.dumps({"added": added, "skipped": skipped, "corpus_linked": linked,
-                      "total": len(entries), "errors": errors[:20]}))
-
+    _print_summary(added=added, skipped=skipped, corpus_linked=linked, total=len(entries),
+                   processed=processed, error=error, errors=errors)
 
 if __name__ == "__main__":
     main()
