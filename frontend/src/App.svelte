@@ -514,6 +514,8 @@
   // Set by a gap marker until a tail reload: the cursor cannot count the lines
   // written during the gap, so "Load older" would repeat lines (D7).
   let logsNeedReload = false
+  // Bumped by every gap marker: only a tail load started after the latest gap clears it.
+  let logsGapGeneration = 0
   // Bumped by resetLogState (type/filter change, corpus switch, sign-out): a
   // tail or older-lines answer requested under an earlier scope is dropped.
   let logsScopeEpoch = 0
@@ -1714,6 +1716,12 @@
       // Only the attempt still in charge may report or clear. That includes a
       // 401 from its own /me, which already ran expireSession.
       if (attempt !== signInEpoch) return
+      // A newer submit owns the form and its message: only this attempt's own
+      // half-started session is taken down.
+      if (!authSubmitOwns(submit)) {
+        releaseOwnSession(submit)
+        return
+      }
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
@@ -1809,8 +1817,11 @@
       if (attempt !== signInEpoch) return
       if (savedUsername !== null) {
         if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
+        else releaseOwnSession(submit)
         return
       }
+      // A newer submit owns the form: its outcome stays on screen.
+      if (!authSubmitOwns(submit)) return
       authError = error.message || 'Failed to accept invite'
     } finally {
       endAuthSubmit(submit)
@@ -1881,8 +1892,11 @@
       if (attempt !== signInEpoch) return
       if (savedUsername !== null) {
         if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
+        else releaseOwnSession(submit)
         return
       }
+      // A newer submit owns the form: its outcome stays on screen.
+      if (!authSubmitOwns(submit)) return
       authError = error.message || 'Failed to reset password'
     } finally {
       endAuthSubmit(submit)
@@ -1951,6 +1965,16 @@
   }
   function authSubmitOwns(submit) {
     return submit.attempt === signInEpoch && submit.seq === authSubmitSeq
+  }
+  // A submit that no longer owns the form failed after its own enterSession:
+  // its session ends without touching the newer submit's message.
+  function releaseOwnSession(submit) {
+    if (submit.session === null || submit.session !== sessionEpoch || !getAuthToken()) return
+    const keptError = authError
+    const keptInfo = authInfo
+    endSession()
+    authError = keptError
+    authInfo = keptInfo
   }
   function authSubmitOwnsForm() {
     for (const submit of authSubmits) if (authSubmitOwns(submit)) return true
@@ -4238,6 +4262,7 @@
   async function hydrateLogsFromTail({ force = false } = {}) {
     if (!force && (logs.length > 0 || logBuffer.length > 0)) return
     const epoch = logsScopeEpoch
+    const gapGeneration = logsGapGeneration
     logsTailStatus = 'Loading recent logs...'
     try {
       const payload = await fetchLogsTail({
@@ -4260,7 +4285,8 @@
         ? Number(payload.next_cursor)
         : logs.length
       logsHasMore = Boolean(payload?.has_more)
-      logsNeedReload = false
+      // A tail requested before a newer gap cannot account for it.
+      if (gapGeneration === logsGapGeneration) logsNeedReload = false
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
     } catch (error) {
       if (error?.status === 401 || epoch !== logsScopeEpoch) return
@@ -4421,6 +4447,7 @@
               marker: true,
             })
             logsNeedReload = true
+            logsGapGeneration += 1
           }
         }
         logsDisconnectedAt = null

@@ -373,3 +373,28 @@ test('after a reconnect gap Load older waits for Reload logs (D7, K-M1)', async 
   await expect(page.locator('.log-line').first()).toHaveText(line(52))
   await expect(page.getByText(line(252), { exact: true })).toHaveCount(1)
 })
+
+test('a tail requested before a reconnect gap does not clear the gap (K-M1 round 2)', async ({ page }) => {
+  const line = (n: number) => `[pipeline] file line ${n}`
+  const file = Array.from({ length: 450 }, (_, i) => line(i + 1))
+  const { handle, tail } = await boot(page, '#/logs', file)
+  await expect(panel(page)).toHaveAttribute('data-log-count', '200')
+  const older = page.getByRole('button', { name: 'Load older' })
+  let release: () => void = () => {}
+  tail.hold = new Promise<void>((resolve) => { release = resolve })
+  await page.getByRole('button', { name: 'Refresh from file' }).click()
+  await expect.poll(() => tail.cursors.length).toBe(2)
+  // The gap opens while that tail request is still out.
+  await reconnect(page, handle)
+  await expect(older).toBeDisabled()
+  release()
+  await expect(panel(page)).toContainText('Loaded 200 recent log lines.')
+  await page.waitForTimeout(300)
+  await expect(older).toBeDisabled()
+  await expect(page.getByTestId('logs-older-hint')).toHaveText('Reload logs first')
+  // A reload started after the gap clears it.
+  await page.getByRole('button', { name: 'Refresh from file' }).click()
+  await expect.poll(() => tail.cursors.length).toBe(3)
+  await expect(older).toBeEnabled()
+  await expect(page.getByTestId('logs-older-hint')).toHaveCount(0)
+})

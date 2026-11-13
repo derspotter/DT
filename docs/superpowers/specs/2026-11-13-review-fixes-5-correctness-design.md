@@ -297,7 +297,9 @@ never replaces the rendered view.
   `logsNeedReload`: "Load older" is disabled, with the hint `Reload logs first` next to it,
   until a tail load (`Reload logs` or `Refresh from file`) replaces the view and resets the
   cursor; a scope reset (type, filter, corpus, sign-out) clears it too. After that reload,
-  "Load older" continues from the tail's cursor without a gap or a repeat.
+  "Load older" continues from the tail's cursor without a gap or a repeat. *Round 2:* each
+  marker bumps `logsGapGeneration`; a tail load clears `logsNeedReload` only when no gap
+  opened after it started, so a tail requested before the gap leaves the flag set.
 - The first connect hydrates as today. A reconnect issues no tail request, so the existing
   reconnect specs keep their invariants: one tail request, and every line already shown or
   buffered is kept.
@@ -365,6 +367,13 @@ now calls `expireSession()` instead of `handleLogout()`. It shows
   401, the sign-in submit (which owns the form, so `expireSession` left the message to it)
   shows the 401's own text (or the expiry message when there is none) on the sign-in form;
   the username stays filled in, as on the invite/reset `lostSession()` path.
+- *Round 2 (C-I2):* every catch path of every auth handler (sign-in, forgot-password,
+  accept-invite, reset-password) writes `authError`, `authStatus` or the token only while its
+  own submit owns the form. A late failure of a submit that no longer owns it leaves the newer
+  outcome on screen; when that submit had already started its own session, the session ends
+  (`releaseOwnSession`) with the newer submit's message kept. This also closes the formerly
+  parked cross-form case (an older sign-in failure overwriting a newer forgot-password
+  outcome).
 - An error shown by the current submission therefore stays. That includes #77's
   `keepError` case, pinned by `session.spec.ts:706` ("a stale-token 401 at boot leaves the
   failure of … on the form"). The same goes for an error that arrives after a stale boot 401:

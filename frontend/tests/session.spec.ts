@@ -1591,3 +1591,66 @@ for (const { flow, hash } of [
     expect(await storedToken(page)).toBe('token-a')
   })
 }
+
+// --- final fix wave round 2: every auth catch writes only while its submit owns the form -------
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`a late ${flow} failure does not overwrite a newer sign-in's error (C-I2 round 2)`, async ({ page }) => {
+    const held = deferred()
+    let linkSeen = false
+    let linkAnswered = false
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === endpoint) {
+        linkSeen = true
+        await held.promise
+        linkAnswered = true
+        return fulfil(route, { error: 'Link is invalid or expired' }, 400)
+      }
+      if (path === '/api/auth/login') return fulfil(route, { error: 'Invalid credentials' }, 401)
+      return fulfil(route, { error: 'Unauthorized' }, 401)
+    })
+    await page.goto(`/#/${flow}?token=t`)
+    await submitPassword(page, button)
+    await expect.poll(() => linkSeen).toBe(true)
+    await page.evaluate(() => { window.location.hash = '#/login' })
+    await logIn(page, 'alice')
+    const form = page.getByTestId('login-form')
+    await expect(form.locator('.error')).toHaveText('Invalid credentials')
+    held.resolve()
+    await expect.poll(() => linkAnswered).toBe(true)
+    await page.waitForTimeout(300)
+    await expect(form.locator('.error')).toHaveText('Invalid credentials')
+  })
+}
+
+test('a late sign-in failure does not overwrite a newer forgot-password outcome (C-I2 round 2)', async ({ page }) => {
+  const heldLogin = deferred()
+  let loginSeen = false
+  let loginAnswered = false
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/login') {
+      loginSeen = true
+      await heldLogin.promise
+      loginAnswered = true
+      return fulfil(route, { error: 'Invalid credentials' }, 401)
+    }
+    if (path === '/api/auth/forgot-password') return fulfil(route, { error: 'Mail server down' }, 500)
+    return fulfil(route, { error: 'Unauthorized' }, 401)
+  })
+  await page.goto('/#/login')
+  await logIn(page, 'alice')
+  await expect.poll(() => loginSeen).toBe(true)
+  await page.getByRole('link', { name: 'Forgot password?' }).click()
+  await page.getByLabel('Email').fill('alice@example.test')
+  await page.getByRole('button', { name: 'Send reset link' }).click()
+  const card = page.locator('.login-card')
+  await expect(card.locator('.error')).toHaveText('Mail server down')
+  heldLogin.resolve()
+  await expect.poll(() => loginAnswered).toBe(true)
+  await page.waitForTimeout(300)
+  await expect(card.locator('.error')).toHaveText('Mail server down')
+})
