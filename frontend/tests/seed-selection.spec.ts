@@ -101,7 +101,8 @@ test('toggling a row keeps the table mounted', async ({ page }) => {
   await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('Selected: 1 / 3 selectable')
 
   await page.locator('.seed-source__body').getByRole('button', { name: 'Select all', exact: true }).click()
-  await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('All 70,000 items selected')
+  // The selectable estimate: 70,000 minus 10 in the corpus and 5 downloaded.
+  await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('All 69,985 items selected')
   for (const index of [0, 1, 2]) await expect(rowCheckbox(page, index)).toBeChecked()
 
   // Deselecting one out of "all selected" drops into explicit mode.
@@ -200,6 +201,8 @@ test('select-all on a partly promoted paged seed reads checked and clears on the
   await selectAll.click()
   await expect(selectAll).toBeChecked()
   await expect(page.locator('.seed-source__select')).toHaveAttribute('title', 'Clear all items in this seed')
+  // All-selected counts the selectable rows (10 - 3 in the corpus), not the seed total.
+  await expect(toolbar).toContainText('All 7 items selected')
   for (const index of [0, 1, 2, 3, 4]) await expect(rowCheckbox(page, index)).toBeChecked()
 
   await selectAll.click()

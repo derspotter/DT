@@ -5023,7 +5023,7 @@
                           <div class="table-toolbar-left">
                             <span class="muted">
                               {#if seedAllSelected[sourceId]}
-                                All {page.total.toLocaleString('en-US')} items selected
+                                All {selectedCount.toLocaleString('en-US')} items selected
                               {:else}
                                 Selected: {selectedCount} / {loadedSelectableCount} selectable
                               {/if}
