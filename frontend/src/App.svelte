@@ -511,6 +511,9 @@
   // The first close of the log socket since it was last open (null while
   // connected); a reconnect marks the gap from then to its reopen.
   let logsDisconnectedAt = null
+  // Set by a gap marker until a tail reload: the cursor cannot count the lines
+  // written during the gap, so "Load older" would repeat lines (D7).
+  let logsNeedReload = false
   // Bumped by resetLogState (type/filter change, corpus switch, sign-out): a
   // tail or older-lines answer requested under an earlier scope is dropped.
   let logsScopeEpoch = 0
@@ -649,6 +652,7 @@
     logsLoadingOlder = false
     logsTailStatus = ''
     logsDisconnectedAt = null
+    logsNeedReload = false
   }
 
   function resetKantroposAssignmentState() {
@@ -1628,6 +1632,12 @@
     }
   }
 
+  // Retry after a boot failure that kept the token, from whichever auth form
+  // shows the D10 text: an invite, reset or forgot-password link stays open.
+  function retryBoot() {
+    bootstrapAuth({ preserveAuthFlow: authFlow !== 'login' })
+  }
+
   // "Bad gateway" -> "Bad gateway."; text that ends a sentence stays as is.
   function asSentence(text) {
     const value = String(text || '').trim()
@@ -1662,6 +1672,16 @@
     let attempt = signInEpoch
     let epoch = sessionEpoch
     const submit = beginAuthSubmit('login')
+    // A 401 from a load of the new session (the loads swallow it) expired the
+    // session; expireSession left the message to this submit, which reports
+    // the 401's own text, as /me's 401 does through the catch below.
+    const lostSession = () => {
+      if (epoch === sessionEpoch) return false
+      if (authSubmitOwns(submit) && authStatus === 'unauthenticated') {
+        authError = lastExpiryMessage || 'Your session has expired. Please sign in again.'
+      }
+      return true
+    }
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
       if (attempt !== signInEpoch) return
@@ -1681,11 +1701,11 @@
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
       // Signed out or expired meanwhile: the loads belong to no session.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
       // A 401 during the loads signed the session out already.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
@@ -1698,6 +1718,8 @@
       authStatus = 'unauthenticated'
       disconnectLogs()
       setAuthToken('')
+      // A token boot kept for Retry is gone with it: Retry would boot with none.
+      authBootRetry = false
     } finally {
       endAuthSubmit(submit)
     }
@@ -1710,9 +1732,13 @@
     const submit = beginAuthSubmit()
     try {
       await requestPasswordReset(authEmail.trim())
+      // A sign-in or a newer submit since then owns the form (and maybe a
+      // session): this answer says nothing there.
+      if (!authSubmitOwns(submit)) return
       authInfo = 'If that email exists, a reset link has been sent.'
       authEmail = ''
     } catch (error) {
+      if (!authSubmitOwns(submit)) return
       authError = error.message || 'Failed to send password reset email'
     } finally {
       endAuthSubmit(submit)
@@ -1944,7 +1970,9 @@
   function expireSession(message = 'Your session was rejected') {
     if (authStatus === 'unauthenticated' && !getAuthToken()) return
     lastExpiryMessage = message
-    const showExpiry = !authSubmitOwnsForm() && !authError && Boolean(getAuthToken())
+    // The boot error (authBootRetry) promised a kept token; the token is gone
+    // now, so the expiry message takes its place.
+    const showExpiry = !authSubmitOwnsForm() && (!authError || authBootRetry) && Boolean(getAuthToken())
     endSession()
     if (showExpiry) authError = 'Your session has expired. Please sign in again.'
   }
@@ -2182,6 +2210,7 @@
       globalStatsError = false
       globalDaemonError = false
       kantroposTargets = []
+      kantroposTargetsPromise = null
       selectedUpstreamTargetId = ''
       openalexQuota = null
       // The signed-out user's view choices.
@@ -2340,19 +2369,27 @@
 
   // One request for the target list at a time: the browse and the assignment
   // load both need it and may ask together.
+  // The shared request belongs to the session that sent it: a sign-out clears
+  // it, a new session sends its own, and an answer from an earlier session
+  // writes nothing.
   let kantroposTargetsPromise = null
+  let kantroposTargetsSession = null
   function loadKantroposTargets() {
-    if (!kantroposTargetsPromise) {
-      kantroposTargetsPromise = fetchKantroposTargets().finally(() => {
-        kantroposTargetsPromise = null
+    if (!kantroposTargetsPromise || kantroposTargetsSession !== sessionEpoch) {
+      const session = sessionEpoch
+      const promise = fetchKantroposTargets(session).finally(() => {
+        if (kantroposTargetsPromise === promise) kantroposTargetsPromise = null
       })
+      kantroposTargetsPromise = promise
+      kantroposTargetsSession = session
     }
     return kantroposTargetsPromise
   }
 
-  async function fetchKantroposTargets() {
+  async function fetchKantroposTargets(session) {
     try {
       const payload = await fetchKantroposCorpora()
+      if (session !== sessionEpoch) return
       kantroposTargets = payload?.corpora || []
       kantroposTargetsError = ''
       const hasCurrentSelection = kantroposTargets.some((target) => String(target.id) === String(selectedUpstreamTargetId))
@@ -2361,7 +2398,7 @@
         selectedUpstreamTargetId = String(preferredTargetId || '')
       }
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       kantroposTargets = []
       kantroposTargetsError = error?.message || 'Request failed'
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
@@ -4223,6 +4260,7 @@
         ? Number(payload.next_cursor)
         : logs.length
       logsHasMore = Boolean(payload?.has_more)
+      logsNeedReload = false
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
     } catch (error) {
       if (error?.status === 401 || epoch !== logsScopeEpoch) return
@@ -4238,7 +4276,7 @@
   // trimmed; the cursor advances only by the lines admitted, so the rest are
   // fetched again by the next request.
   async function loadOlderLogs() {
-    if (logsLoadingOlder || !logsHasMore) return
+    if (logsLoadingOlder || !logsHasMore || logsNeedReload) return
     // The cursor counts the newest lines already shown; buffered lines are
     // in the file too, so they go into the view (and the cursor) first, or
     // the page would repeat lines and skip as many older ones.
@@ -4382,6 +4420,7 @@
               text: `Connection lost ${from}–${to}. Lines from that period may be missing.`,
               marker: true,
             })
+            logsNeedReload = true
           }
         }
         logsDisconnectedAt = null
@@ -4620,6 +4659,9 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
+          {/if}
           <button type="submit" disabled={Boolean(authFormSubmit.acceptInvite)}>Activate account</button>
         </form>
       {:else if authFlow === 'reset-password'}
@@ -4640,6 +4682,9 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
+          {/if}
           <button type="submit" disabled={Boolean(authFormSubmit.resetPassword)}>Save password</button>
         </form>
       {:else if authFlow === 'forgot-password'}
@@ -4655,6 +4700,9 @@
           {/if}
           {#if authError}
             <p class="error">{authError}</p>
+          {/if}
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
           {/if}
           <div class="auth-actions">
             <button type="submit">Send reset link</button>
@@ -4680,7 +4728,7 @@
             <p class="error">{authError}</p>
           {/if}
           {#if authBootRetry}
-            <button type="button" class="secondary" data-testid="auth-retry" on:click={() => bootstrapAuth()}>Retry</button>
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
           {/if}
           <div class="auth-actions">
             <button type="submit" disabled={Boolean(authFormSubmit.login)}>Sign in</button>
@@ -5704,6 +5752,7 @@
           {logsStatus}
           {logsLoadingOlder}
           {logsHasMore}
+          {logsNeedReload}
           {logsTailStatus}
           {logs}
           {logsCursor}

@@ -342,21 +342,34 @@ test('a reconnect keeps the view and adds one gap marker with Reload logs', asyn
   expect(tail.cursors).toEqual(['0', '0'])
 })
 
-test('a marker does not move the Load older cursor', async ({ page }) => {
+test('after a reconnect gap Load older waits for Reload logs (D7, K-M1)', async ({ page }) => {
   const line = (n: number) => `[pipeline] file line ${n}`
   const file = Array.from({ length: 450 }, (_, i) => line(i + 1))
   const { handle, tail } = await boot(page, '#/logs', file)
   await expect(panel(page)).toHaveAttribute('data-log-count', '200')
+  const older = page.getByRole('button', { name: 'Load older' })
+  await expect(older).toBeEnabled()
+  await expect(page.getByTestId('logs-older-hint')).toHaveCount(0)
   await reconnect(page, handle)
   file.push(line(451))
   handle.socket!.send(line(451))
-  // 201 file lines and the marker.
+  // 201 file lines and the marker; the cursor cannot count lines written during the gap.
   await expect(panel(page)).toHaveAttribute('data-log-count', '202')
   await expect(page.locator('.log-gap')).toHaveCount(1)
-  await expect(panel(page)).toHaveAttribute('data-logs-cursor', '201')
-  await page.getByRole('button', { name: 'Load older' }).click()
-  await expect.poll(() => tail.cursors.length).toBe(2)
-  expect(tail.cursors[1]).toBe('201')
-  await expect(panel(page)).toHaveAttribute('data-log-count', '402')
-  await expect(page.locator('.log-line').first()).toHaveText(line(51))
+  await expect(older).toBeDisabled()
+  await expect(page.getByTestId('logs-older-hint')).toHaveText('Reload logs first')
+  expect(tail.cursors).toHaveLength(1)
+
+  await page.getByTestId('logs-reload').click()
+  await expect(panel(page)).toHaveAttribute('data-log-count', '200')
+  await expect(page.locator('.log-gap')).toHaveCount(0)
+  await expect(page.getByTestId('logs-older-hint')).toHaveCount(0)
+  await expect(older).toBeEnabled()
+  await older.click()
+  await expect.poll(() => tail.cursors.length).toBe(3)
+  expect(tail.cursors[2]).toBe('200')
+  await expect(panel(page)).toHaveAttribute('data-log-count', '400')
+  // No line twice: the reload's tail (252-451) and the older page (52-251) meet.
+  await expect(page.locator('.log-line').first()).toHaveText(line(52))
+  await expect(page.getByText(line(252), { exact: true })).toHaveCount(1)
 })

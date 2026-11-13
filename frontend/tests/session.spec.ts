@@ -1395,3 +1395,199 @@ for (const { flow, endpoint, button } of signInLinks) {
     expect(linkRequests).toBe(1)
   })
 }
+
+// --- final fix wave: stale auth outcomes, session-scoped loads, boot and sign-in edge cases ---
+
+test('a forgot-password answer that lands after a sign-in leaves the session alone (C-I2)', async ({ page }) => {
+  const heldForgot = deferred()
+  let forgotSeen = false
+  let forgotAnswered = false
+  let expired = false
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/forgot-password') {
+      forgotSeen = true
+      await heldForgot.promise
+      forgotAnswered = true
+      return fulfil(route, { error: 'Mail server down' }, 500)
+    }
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-a', user: userA })
+    if (!auth.endsWith('token-a') || expired) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (path === '/api/auth/me') return fulfil(route, { user: userA, corpora: [corpus] })
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/forgot-password')
+  await page.getByLabel('Email').fill('alice@example.test')
+  await page.getByRole('button', { name: 'Send reset link' }).click()
+  await expect.poll(() => forgotSeen).toBe(true)
+  await page.getByRole('link', { name: 'Back to sign in' }).click()
+  await logIn(page, 'alice')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  heldForgot.resolve()
+  await expect.poll(() => forgotAnswered).toBe(true)
+  await page.waitForTimeout(300)
+  // The abandoned failure must not sit in the session and swallow its expiry message.
+  expired = true
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByTestId('login-form').locator('.error')).toHaveText(EXPIRED)
+})
+
+test('a Kantropos target list requested before a sign-out is not shared with the next session (C-I3)', async ({ page }) => {
+  const heldTargets = deferred()
+  const targetRequests: string[] = []
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (!auth) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (path === '/api/auth/me') return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+    if (path === '/api/kantropos/corpora') {
+      targetRequests.push(auth.endsWith('token-b') ? 'b' : 'a')
+      if (auth.endsWith('token-a')) {
+        await heldTargets.promise
+        return fulfil(route, { error: 'alice down' }, 500)
+      }
+      return fulfil(route, { corpora: [{ id: 'k1', name: 'Kantropos One' }] })
+    }
+    if (path === '/api/corpora/1/kantropos-assignment') return fulfil(route, { assignment: null, corpora: null, can_edit: true })
+    if (path === '/api/kantropos/corpora/k1/browse') {
+      return fulfil(route, {
+        target: { id: 'k1', name: 'Kantropos One' },
+        summary: { pending_items_count: 1, pending_items_loaded: 1, has_imported_current: false },
+        assigned_corpora: [],
+        current_items: [],
+        pending_items: [{ id: 11, title: 'Pending Work Alpha', year: 2024 }],
+      })
+    }
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/upstream')
+  await expect.poll(() => targetRequests).toEqual(['a'])
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  await page.getByRole('button', { name: 'Korpus Management' }).click()
+  // Bob's session sends its own request instead of joining Alice's.
+  await expect.poll(() => targetRequests).toEqual(['a', 'b'])
+  await expect(page.getByText('Pending Work Alpha')).toBeVisible()
+  heldTargets.resolve()
+  await page.waitForTimeout(400)
+  await expect(page.getByText('alice down', { exact: false })).toHaveCount(0)
+  await expect(page.getByText('Pending Work Alpha')).toBeVisible()
+})
+
+test('a sign-in whose own workspace load answers 401 ends on the sign-in form with a message and the username (S-I2)', async ({ page }) => {
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-a', user: userA })
+    if (!auth.endsWith('token-a')) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (path === '/api/auth/me') return fulfil(route, { user: userA, corpora: [corpus] })
+    // The fresh token is rejected by the first workspace load after /me.
+    if (path === '/api/corpus') return fulfil(route, { error: 'Invalid token' }, 401)
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  const form = page.getByTestId('login-form')
+  await expect(form.locator('.error')).toHaveText('Invalid token')
+  await expect(form.getByLabel('Username')).toHaveValue('alice')
+  expect(await storedToken(page)).toBeNull()
+})
+
+test('a failed sign-in that discards the boot-kept token also hides Retry (K-M3)', async ({ page }) => {
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') return fulfil(route, { error: 'Bad gateway' }, 502)
+    if (path === '/api/auth/login') return fulfil(route, { error: 'Invalid credentials' }, 401)
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-retry')).toBeVisible()
+  await logIn(page, 'alice')
+  const form = page.getByTestId('login-form')
+  await expect(form.locator('.error')).toHaveText('Invalid credentials')
+  expect(await storedToken(page)).toBeNull()
+  await expect(page.getByTestId('auth-retry')).toHaveCount(0)
+})
+
+test('a 401 that lands after a boot failure kept the token says the session expired (S-M3)', async ({ page }) => {
+  const heldSeeds = deferred()
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') return fulfil(route, { error: 'Bad gateway' }, 502)
+    if (path === '/api/seed/sources') {
+      await heldSeeds.promise
+      return fulfil(route, { error: 'Invalid token' }, 401)
+    }
+    return workspaceDefaults(path, route)
+  })
+  await page.goto('/#/workspace')
+  const form = page.getByTestId('login-form')
+  await expect(form.locator('.error')).toHaveText('Bad gateway. Your session is kept; press Retry when the server is back.')
+  heldSeeds.resolve()
+  await expect(form.locator('.error')).toHaveText(EXPIRED)
+  await expect(page.getByTestId('auth-retry')).toHaveCount(0)
+  expect(await storedToken(page)).toBeNull()
+})
+
+for (const { flow, hash } of [
+  { flow: 'forgot-password', hash: '#/forgot-password' },
+  { flow: 'accept-invite', hash: '#/accept-invite?token=t' },
+  { flow: 'reset-password', hash: '#/reset-password?token=t' },
+]) {
+  test(`a boot failure on the ${flow} form offers the Retry its text mentions (S-M4)`, async ({ page }) => {
+    let meRequests = 0
+    await page.addInitScript(() => {
+      if (!window.sessionStorage.getItem('booted')) {
+        window.sessionStorage.setItem('booted', '1')
+        window.localStorage.setItem('rag_feeder_token', 'token-a')
+      }
+    })
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === '/api/auth/me') {
+        meRequests += 1
+        if (meRequests === 1) return fulfil(route, { error: 'Bad gateway' }, 502)
+        return fulfil(route, { user: userA, corpora: [corpus] })
+      }
+      return workspaceDefaults(path, route)
+    })
+    await page.goto(`/${hash}`)
+    const card = page.locator('.login-card')
+    await expect(card.locator('.error')).toHaveText('Bad gateway. Your session is kept; press Retry when the server is back.')
+    await page.getByTestId('auth-retry').click()
+    await expect.poll(() => meRequests).toBe(2)
+    await expect(card.locator('.error')).toHaveCount(0)
+    expect(await storedToken(page)).toBe('token-a')
+  })
+}

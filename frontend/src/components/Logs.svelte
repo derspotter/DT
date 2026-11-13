@@ -4,6 +4,8 @@
   export let logsFilterCurrentCorpus;
   export let logsLoadingOlder;
   export let logsHasMore;
+  // A reconnect gap since the last tail load: "Load older" waits for "Reload logs".
+  export let logsNeedReload = false;
   export let logsTailStatus;
   export let logs;
   export let logsCursor;
@@ -34,10 +36,14 @@
         class="secondary"
         type="button"
         on:click={loadOlderLogs}
-        disabled={logsLoadingOlder || !logsHasMore}
+        disabled={logsLoadingOlder || !logsHasMore || logsNeedReload}
+        title={logsNeedReload ? 'Reload logs first' : undefined}
       >
         {logsLoadingOlder ? 'Loading…' : 'Load older'}
       </button>
+      {#if logsNeedReload}
+        <span class="muted small" data-testid="logs-older-hint">Reload logs first</span>
+      {/if}
       <button
         class="secondary"
         type="button"

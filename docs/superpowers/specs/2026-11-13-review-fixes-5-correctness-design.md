@@ -291,7 +291,13 @@ never replaces the rendered view.
   (`data-testid="logs-reload"`). The button calls `hydrateLogsFromTail({ force: true })`, the
   existing explicit hydration, so the tail wins.
 - Marker entries are not file lines. `flushLogs` advances `logsCursor` only by the non-marker
-  entries, and "Load older" keeps working without a gap or a repeat.
+  entries.
+- *Amended in the final fix wave (K-M1):* the cursor cannot count the lines written to the
+  file during the gap, so "Load older" would repeat that many lines. A marker therefore sets
+  `logsNeedReload`: "Load older" is disabled, with the hint `Reload logs first` next to it,
+  until a tail load (`Reload logs` or `Refresh from file`) replaces the view and resets the
+  cursor; a scope reset (type, filter, corpus, sign-out) clears it too. After that reload,
+  "Load older" continues from the tail's cursor without a gap or a repeat.
 - The first connect hydrates as today. A reconnect issues no tail request, so the existing
   reconnect specs keep their invariants: one tail request, and every line already shown or
   buffered is kept.
@@ -300,6 +306,9 @@ never replaces the rendered view.
 ### Frontend: session and failure states
 
 **D8. Kantropos target failures are not "none configured" (FE-42), controller call.**
+*Amended in the final fix wave (C-I3):* the shared target-list request is session-scoped: a
+sign-out clears it, a new session sends its own request instead of joining one from an
+earlier session, and an answer (success or failure) from an earlier session writes nothing.
 `fetchKantroposTargets` sets `kantroposTargetsError` (the error message, `''` on success).
 `loadUpstreamBrowse` behaves as follows:
 - When the target list failed and no target id is known, it keeps the last browse and sets
@@ -326,6 +335,12 @@ and `authBootRetry = true`, and disconnects the socket. The transport message is
 sentence that ends in a period: a text without final punctuation gets one (`Bad gateway` →
 `Bad gateway. Your session is kept; …`), and one that already ends a sentence stays as is. The sign-in card shows a `Retry`
 button (`data-testid="auth-retry"`) while `authBootRetry` is set; it calls `bootstrapAuth()`.
+*Amended in the final fix wave (S-M4, K-M3, S-M3):* every auth form that can show this text
+(sign-in, forgot-password, accept-invite, reset-password) renders the Retry button, which
+calls `bootstrapAuth({ preserveAuthFlow: authFlow !== 'login' })` so a link's form stays open.
+A failed sign-in that clears the kept token also clears `authBootRetry`. A 401 that arrives
+after the boot failure (a load started before `/me` failed) replaces the boot text with the
+D11 expiry message; Retry disappears with the token.
 There is no automatic retry. A manual sign-in still works (`enterSession` replaces the token).
 A 401 behaves as today.
 
@@ -341,8 +356,15 @@ now calls `expireSession()` instead of `handleLogout()`. It shows
   it neither suppresses a later session's expiry message nor overwrites a newer submit's
   outcome (this also gates the D12 recovery).
 - `expireSession` decides before `endSession`:
-  `const showExpiry = !authSubmitOwnsForm() && !authError && <a token is held>`. After
-  `endSession`, it sets the message only when `showExpiry` is true.
+  `const showExpiry = !authSubmitOwnsForm() && (!authError || authBootRetry) && <a token is held>`
+  (the D10 boot error does not suppress it, amended S-M3). After `endSession`, it sets the
+  message only when `showExpiry` is true.
+- *Amended in the final fix wave (C-I2, S-I2/K-M2):* the forgot-password submit installs its
+  success or failure only while it owns the form, so an answer that lands after a sign-in
+  never puts a stale error into the session. When a sign-in's own loads after `/me` answer
+  401, the sign-in submit (which owns the form, so `expireSession` left the message to it)
+  shows the 401's own text (or the expiry message when there is none) on the sign-in form;
+  the username stays filled in, as on the invite/reset `lostSession()` path.
 - An error shown by the current submission therefore stays. That includes #77's
   `keepError` case, pinned by `session.spec.ts:706` ("a stale-token 401 at boot leaves the
   failure of … on the form"). The same goes for an error that arrives after a stale boot 401:
