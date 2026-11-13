@@ -24,6 +24,7 @@ from .identifiers import inverted_index_to_text_lenient
 from .pdf_downloader import PDFDownloader
 from .utils import (
     FetchResult,
+    OpenAlexRateLimitExceeded,
     ServiceRateLimiter,
     env_bool,
     env_int,
@@ -2205,6 +2206,10 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
         all_results.errors.append(message.strip())
         all_results.failed_ids.extend(batch_ids)
 
+    def _quota_exhausted(remaining_ids, message):
+        _batch_failed(remaining_ids, message)
+        all_results.quota_exhausted = True
+
     batch_size = 50 # OpenAlex recommended max batch size for filter
     total_batches = (len(work_ids) + batch_size - 1) // batch_size
     
@@ -2214,12 +2219,13 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
         batch_ids = work_ids[idx : idx + batch_size]
         current_batch_num = (idx // batch_size) + 1
         
-        if not limiter.wait_if_needed("openalex"):
-            print("[OpenAlex ERROR] Daily quota exceeded – stopping fetch early.")
-            all_results.complete = False
-            all_results.quota_exhausted = True
-            all_results.errors.append("OpenAlex daily quota exceeded")
-            all_results.failed_ids.extend(work_ids[idx:])
+        try:
+            proceed = limiter.wait_if_needed("openalex")
+        except OpenAlexRateLimitExceeded as e:
+            _quota_exhausted(work_ids[idx:], f"[OpenAlex WARN] Quota exhausted before Batch {current_batch_num}: {redact_openalex_key(e)}")
+            break
+        if not proceed:
+            _quota_exhausted(work_ids[idx:], "[OpenAlex ERROR] Daily quota exceeded – stopping fetch early.")
             break
             
         # Construct filter string like 'W123|W456'
@@ -2238,6 +2244,10 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
                 f"    [OpenAlex] Batch {current_batch_num}/{total_batches}: Got {len(batch_res)} results."
             )
             all_results.extend(batch_res)
+        except OpenAlexRateLimitExceeded as e:
+            # Quota is gone for every later batch too: stop, and list them all as failed.
+            _quota_exhausted(work_ids[idx:], f"    [OpenAlex WARN] Quota exhausted at Batch {current_batch_num}: {redact_openalex_key(e)} - stopping.")
+            break
         except requests.exceptions.Timeout:
             _batch_failed(batch_ids, f"    [OpenAlex WARN] Timeout occurred for Batch {current_batch_num} - skipping.")
         except requests.exceptions.HTTPError as e:

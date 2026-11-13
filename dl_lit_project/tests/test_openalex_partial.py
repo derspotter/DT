@@ -230,3 +230,24 @@ def test_seed_expand_detail_fetch_stops_on_quota(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert "detail fetch stopped early" in captured.err
     assert recorded and recorded[0].get("raise_on_quota") is True
+
+
+class _QuotaSession:
+    def get(self, url, **kwargs):
+        ids = _filter_ids(url)
+        if "W51" in ids:
+            raise OpenAlexRateLimitExceeded("daily quota exhausted")
+        return _Resp(ids)
+
+
+def test_fetch_openalex_batch_maps_quota_exhaustion_to_an_incomplete_result(monkeypatch, capsys):
+    limiter = ServiceRateLimiter({"default": {"limit": 1000, "window": 1}, "openalex": {"limit": 1000, "window": 1}})
+    monkeypatch.setattr(new_dl, "get_openalex_session", lambda: _QuotaSession())
+    ids = [f"W{i}" for i in range(1, 121)]
+    res = new_dl.fetch_openalex_batch(ids, limiter=limiter)
+    assert isinstance(res, FetchResult)
+    assert res.complete is False and res.quota_exhausted is True
+    assert res.errors and "daily quota exhausted" in res.errors[0]
+    assert res.failed_ids == [f"W{i}" for i in range(51, 121)]  # quota stops the fetch: batches 2 and 3
+    assert len(res) == 50
+    assert "[OpenAlex WARN] referenced works incomplete" in capsys.readouterr().out

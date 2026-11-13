@@ -9,6 +9,8 @@ import sqlite3
 import threading
 import time
 
+import pytest
+
 from tests._worker_import import load_worker
 
 WAIT = 0.02
@@ -398,7 +400,7 @@ def test_run_recovers_stale_jobs_every_60s(tmp_path, monkeypatch):
     real_recover = mod.PipelineDaemon._recover_stale_running_jobs
 
     def spy(self, *args, **kwargs):
-        calls.append(1)
+        calls.append(kwargs.get("periodic", False))
         return real_recover(self, *args, **kwargs)
 
     monkeypatch.setattr(mod.PipelineDaemon, "_recover_stale_running_jobs", spy)
@@ -407,7 +409,7 @@ def test_run_recovers_stale_jobs_every_60s(tmp_path, monkeypatch):
     monkeypatch.delenv("RAG_FEEDER_LLM_PROVIDER", raising=False)
     monkeypatch.setattr(mod.PipelineDaemon, "_build_enhancer", lambda self, *a: object())
     daemon = mod.PipelineDaemon(str(tmp_path / "lit.db"), role="enrich")
-    assert calls == [1]
+    assert calls == [False]  # start-up keeps the full rule
 
     base = time.time()
     offset = [0.0]
@@ -426,4 +428,116 @@ def test_run_recovers_stale_jobs_every_60s(tmp_path, monkeypatch):
     monkeypatch.setattr(mod.time, "sleep", lambda s: None)
     daemon.run()
     assert len(fetches) == 2
-    assert len(calls) == 2
+    assert calls == [False, True]  # the 60 s call reclaims from dead owners only
+
+
+# --- fix round 1: periodic recovery reclaims only from owners that are positively dead ---------
+
+def _cross_worker_setup(monkeypatch, tmp_path, owner_status, owner_last_seen):
+    """Two overlapping claimers: owner A (role all, daemon_name 'pipeline') holds an overdue
+    enrich job and a work claim; B (role enrich) runs its periodic recovery."""
+    mod = load_worker("dt_worker_watchdog", monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.delenv("RAG_FEEDER_LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(mod.PipelineDaemon, "_build_enhancer", lambda self, *a: object())
+    owner = mod.PipelineDaemon(str(tmp_path / "lit.db"), role="all")
+    other = mod.PipelineDaemon(str(tmp_path / "lit.db"), role="enrich")
+    other._exit = lambda code: None
+    c = _connect(tmp_path)
+    cur = c.execute(
+        "INSERT INTO pipeline_jobs (job_type, status, worker_id, started_at)"
+        " VALUES ('enrich', 'running', ?, datetime('now', '-2 hours'))",
+        (owner.worker_id,),
+    )
+    job_id = cur.lastrowid
+    c.execute(
+        "INSERT INTO works (id, title, metadata_status, metadata_claimed_by, metadata_claimed_at, metadata_lease_expires_at)"
+        " VALUES (77, 'w', 'in_progress', ?, 1, 9999999999)",
+        (owner.worker_id,),
+    )
+    c.execute(
+        f"UPDATE daemon_heartbeat SET status = ?, last_seen_at = datetime('now', '{owner_last_seen}') WHERE worker_id = ?",
+        (owner_status, owner.worker_id),
+    )
+    c.commit()
+    c.close()
+    return mod, owner, other, job_id
+
+
+def _run_other_once(mod, other, monkeypatch):
+    """One loop iteration of B with recovery due; the real fetch_next_job claims whatever is pending."""
+    claimed = []
+    real_fetch = other.fetch_next_job
+
+    def fetch():
+        job = real_fetch()
+        claimed.append(job and job["id"])
+        other.running = False
+        return job
+
+    other.fetch_next_job = fetch
+    other._process_job = lambda job, **kw: other._end_work(kw["generation"])
+    other._run_direct_enrich_cycle = lambda: None
+    other._last_recovery_at = time.time() - 61
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    other.run()
+    return claimed
+
+
+def _claim_row(tmp_path):
+    c = _connect(tmp_path)
+    row = c.execute("SELECT metadata_status, metadata_claimed_by FROM works WHERE id = 77").fetchone()
+    c.close()
+    return row
+
+
+
+@pytest.mark.parametrize("last_seen", ["-1 seconds", "-1 hours"], ids=["fresh", "stale"])
+def test_periodic_recovery_leaves_a_live_owners_overdue_job_running(tmp_path, monkeypatch, last_seen):
+    # The owner's watchdog cannot win while its job holds the write lock; another worker's
+    # periodic recovery must not hand the job out again (duplicate execution), whatever its age
+    # and however stale the owner's heartbeat looks under write contention.
+    mod, owner, other, job_id = _cross_worker_setup(monkeypatch, tmp_path, "running", last_seen)
+    claimed = _run_other_once(mod, other, monkeypatch)
+    assert claimed == [None]
+    assert _job_row(tmp_path, job_id)[:2] == ("running", owner.worker_id)
+    assert _claim_row(tmp_path) == ("in_progress", owner.worker_id)
+
+
+def test_periodic_recovery_reclaims_from_a_stopped_owner(tmp_path, monkeypatch):
+    mod, owner, other, job_id = _cross_worker_setup(monkeypatch, tmp_path, "stopped", "-1 seconds")
+    claimed = _run_other_once(mod, other, monkeypatch)
+    assert claimed == [job_id]
+    assert _job_row(tmp_path, job_id)[:2] == ("running", other.worker_id)
+    assert _claim_row(tmp_path) == ("pending", None)
+
+
+def test_periodic_recovery_reclaims_from_an_owner_without_heartbeat_row(tmp_path, monkeypatch):
+    mod, owner, other, job_id = _cross_worker_setup(monkeypatch, tmp_path, "running", "-1 seconds")
+    c = _connect(tmp_path)
+    c.execute("DELETE FROM daemon_heartbeat WHERE worker_id = ?", (owner.worker_id,))
+    c.commit()
+    c.close()
+    other._recover_stale_running_jobs(periodic=True)
+    assert _job_row(tmp_path, job_id)[:2] == ("pending", None)
+    assert _claim_row(tmp_path) == ("pending", None)
+
+
+def test_periodic_recovery_never_reclaims_this_workers_own_overdue_job(tmp_path, monkeypatch):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path, job_timeout=60)
+    c = _connect(tmp_path)
+    cur = c.execute(
+        "INSERT INTO pipeline_jobs (job_type, status, worker_id, started_at)"
+        " VALUES ('enrich', 'running', ?, datetime('now', '-2 hours'))",
+        (daemon.worker_id,),
+    )
+    job_id = cur.lastrowid
+    c.execute(
+        "UPDATE daemon_heartbeat SET last_seen_at = datetime('now', '-1 hours') WHERE worker_id = ?",
+        (daemon.worker_id,),
+    )
+    c.commit()
+    c.close()
+    assert daemon._recover_stale_running_jobs(periodic=True) == 0
+    assert _job_row(tmp_path, job_id)[:2] == ("running", daemon.worker_id)

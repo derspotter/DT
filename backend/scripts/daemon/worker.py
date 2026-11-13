@@ -562,8 +562,14 @@ class PipelineDaemon:
             return "", []
         return f"AND job_type IN ({','.join('?' for _ in types)})", list(types)
 
-    def _recover_stale_running_jobs(self, heartbeat_stale_seconds: int = 600):
+    def _recover_stale_running_jobs(self, heartbeat_stale_seconds: int = 600, *, periodic: bool = False):
         """Requeue running jobs of this role whose worker is gone.
+
+        `periodic=True` (run()'s 60 s call) reclaims only from owners that are positively
+        dead, never by job age or heartbeat staleness, and never this worker's own jobs: a live
+        owner whose job holds the write lock can look stale and overdue while it still runs,
+        and handing its job out again would execute it twice. See
+        `_recover_dead_owners_only`. The full rule below is the start-up rule.
 
         A job is considered abandoned when any of these hold:
         - it ran longer than the job timeout (the original rule);
@@ -575,6 +581,8 @@ class PipelineDaemon:
         Runs for every role at start-up, so a routine container restart never
         leaves a job stuck in 'running' until a role-"all" worker happens by.
         """
+        if periodic:
+            return self._recover_dead_owners_only()
         role_sql, role_params = self._role_job_filter()
         cur = self.db.conn.cursor()
         cur.execute(
@@ -616,6 +624,43 @@ class PipelineDaemon:
                 " OR claimed_by NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL AND status != 'stopped' AND datetime(last_seen_at) > datetime('now', ?))"
             ),
             params=[self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
+        )
+        if released:
+            log(f"Released {released} work claim(s) held by dead workers.")
+        return requeued
+
+    # An owner is positively dead when its worker_id has no heartbeat row at all, its row says
+    # 'stopped', or it is our predecessor (our daemon_name row names a different worker_id). The
+    # SQL uses the placeholder `owner`, and the params are [daemon_name, worker_id, worker_id].
+    _DEAD_OWNER_SQL = (
+        "owner IS NOT NULL AND owner != ? AND ("
+        " owner NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL)"
+        " OR owner IN (SELECT worker_id FROM daemon_heartbeat WHERE status = 'stopped' AND worker_id IS NOT NULL)"
+        " OR owner IN (SELECT worker_id FROM daemon_heartbeat WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?)"
+        ")"
+    )
+
+    def _recover_dead_owners_only(self) -> int:
+        """Periodic recovery: requeue jobs and release work claims of positively dead owners."""
+        role_sql, role_params = self._role_job_filter()
+        params = [self.worker_id, self.daemon_name, self.worker_id]
+        cur = self.db.conn.cursor()
+        cur.execute(
+            f"""
+            UPDATE pipeline_jobs
+               SET status = 'pending', started_at = NULL, worker_id = NULL
+             WHERE status = 'running'
+               {role_sql}
+               AND {self._DEAD_OWNER_SQL.replace("owner", "worker_id")}
+            """,
+            role_params + params,
+        )
+        requeued = int(cur.rowcount or 0)
+        self.db.conn.commit()
+        if requeued:
+            log(f"Recovered {requeued} pipeline job(s) of dead workers for role '{self.role}'.")
+        released = self._release_work_claims(
+            where_claimed_by=self._DEAD_OWNER_SQL.replace("owner", "claimed_by"), params=params
         )
         if released:
             log(f"Released {released} work claim(s) held by dead workers.")
@@ -1440,7 +1485,7 @@ class PipelineDaemon:
                 now = time.time()
                 if now - self._last_recovery_at >= RECOVERY_INTERVAL_SECONDS:
                     self._last_recovery_at = now
-                    self._recover_stale_running_jobs()
+                    self._recover_stale_running_jobs(periodic=True)
                 generation = self._begin_work()
                 if generation is None:
                     self._wait_for_exit()

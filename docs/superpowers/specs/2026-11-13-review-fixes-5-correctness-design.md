@@ -608,8 +608,18 @@ way, so the exit is how the work ends: both workers run under docker's
   worker had claimed (`in_progress` with its `worker_id`) to its queue state. Leases do not
   have to expire. The whole process exits, so sibling threads of the same worker die with it.
   Their claims are released the same way.
-- **Periodic recovery.** `run()` also calls `_recover_stale_running_jobs()` at most once every
-  60 s before `fetch_next_job`, for work that a worker which never came back left running.
+- **Periodic recovery.** `run()` also calls `_recover_stale_running_jobs(periodic=True)` at most
+  once every 60 s before `fetch_next_job`, for work that a worker which never came back left
+  running. The periodic call reclaims a job, and releases a work claim, only when its owner is
+  positively dead:
+  - the owner's `worker_id` has no `daemon_heartbeat` row at all;
+  - its row has status `'stopped'`;
+  - it is a predecessor: our `daemon_name` row now names a different `worker_id`.
+
+  It never reclaims by job age or by heartbeat staleness, and never this worker's own jobs.
+  A live owner whose job holds the write lock looks overdue and stale while it still runs: its
+  watchdog cannot win, and a reclaim would hand the job to a second worker (duplicate
+  execution). Start-up recovery keeps its full rule (age plus staleness) unchanged.
 
 **D30. Partial related-work fetches are reported (PY-50, PY-51), controller call.**
 - `dl_lit/utils.py` gains `class FetchResult(list)` with the attributes `complete: bool = True`,
