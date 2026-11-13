@@ -1280,3 +1280,48 @@ test('a sign-in abandoned by a sign-out does not suppress the next session\'s ex
   await expect(page.getByTestId('login-form').locator('.error')).toHaveText(EXPIRED)
   aliceConfig.resolve()
 })
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`a delayed ${flow} recovery does not overwrite a newer failed sign-in`, async ({ page }) => {
+    const heldSeeds = deferred()
+    let seedsHeld = false
+    let seedsAnswered = false
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const request = route.request()
+      const path = new URL(request.url()).pathname
+      const auth = request.headers().authorization || ''
+      if (path === endpoint) return fulfil(route, { token: 'token-new', user: { id: 7, username: 'neu', last_corpus_id: 1, is_admin: false } })
+      if (path === '/api/auth/login') return fulfil(route, { error: 'Invalid credentials' }, 401)
+      if (!auth.endsWith('token-new')) return fulfil(route, { error: 'Unauthorized' }, 401)
+      if (path === '/api/auth/me') return fulfil(route, { user: { id: 7, username: 'neu', last_corpus_id: 1, is_admin: false }, corpora: [corpus] })
+      if (path === '/api/seed/sources') {
+        seedsHeld = true
+        await heldSeeds.promise
+        await fulfil(route, { sources: [], total: 0, source: 'api' })
+        seedsAnswered = true
+        return
+      }
+      if (path === '/api/corpus') return fulfil(route, { error: 'Invalid token' }, 401)
+      return workspaceDefaults(path, route)
+    })
+    await page.goto(`/#/${flow}?token=t`)
+    await submitPassword(page, button)
+    await expect.poll(() => seedsHeld).toBe(true)
+    const form = page.getByTestId('login-form')
+    await expect(form).toBeVisible()
+    await expect.poll(() => storedToken(page)).toBeNull()
+
+    // A newer sign-in, which fails, owns the form from here on.
+    await form.getByLabel('Username').fill('carol')
+    await form.getByLabel('Password').fill('wrong-password')
+    await form.getByRole('button', { name: 'Sign in' }).click()
+    await expect(form.locator('.error')).toHaveText('Invalid credentials')
+
+    heldSeeds.resolve()
+    await expect.poll(() => seedsAnswered).toBe(true)
+    await page.waitForTimeout(300)
+    await expect(form.locator('.error')).toHaveText('Invalid credentials')
+    await expect(form.getByLabel('Username')).toHaveValue('carol')
+  })
+}

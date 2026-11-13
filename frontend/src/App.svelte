@@ -1752,7 +1752,7 @@
       // the session: the password is saved all the same.
       const lostSession = () => {
         if (epoch === sessionEpoch) return false
-        if (attempt === signInEpoch) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
         return true
       }
       const me = await fetchMe()
@@ -1776,7 +1776,7 @@
     } catch (error) {
       if (attempt !== signInEpoch) return
       if (savedUsername !== null) {
-        recoverSavedPassword(savedUsername, error)
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
         return
       }
       authError = error.message || 'Failed to accept invite'
@@ -1821,7 +1821,7 @@
       // the session: the password is saved all the same.
       const lostSession = () => {
         if (epoch === sessionEpoch) return false
-        if (attempt === signInEpoch) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
         return true
       }
       const me = await fetchMe()
@@ -1845,7 +1845,7 @@
     } catch (error) {
       if (attempt !== signInEpoch) return
       if (savedUsername !== null) {
-        recoverSavedPassword(savedUsername, error)
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
         return
       }
       authError = error.message || 'Failed to reset password'
@@ -1881,21 +1881,26 @@
   // the submit must not cost the attempt its outcome.
   let signInEpoch = 0
   // Sign-in, forgot-password, accept-invite and reset-password submits in
-  // flight, each with the signInEpoch it answers to. While one still owns
-  // the form (a sign-out or a newer sign-in has not taken it over), its own
-  // outcome is the message; an abandoned one says nothing about the next
-  // session, even before its `finally` runs.
+  // flight, each with the signInEpoch it answers to and its place in the
+  // order of submits. Only the newest submit, and only while no sign-out or
+  // newer sign-in took over, owns the form: its own outcome is the message.
+  // An abandoned one says nothing about the next session or the next submit,
+  // even before its `finally` runs.
   const authSubmits = new Set()
+  let authSubmitSeq = 0
   function beginAuthSubmit() {
-    const submit = { attempt: signInEpoch }
+    const submit = { attempt: signInEpoch, seq: ++authSubmitSeq }
     authSubmits.add(submit)
     return submit
   }
   function endAuthSubmit(submit) {
     authSubmits.delete(submit)
   }
+  function authSubmitOwns(submit) {
+    return submit.attempt === signInEpoch && submit.seq === authSubmitSeq
+  }
   function authSubmitOwnsForm() {
-    for (const submit of authSubmits) if (submit.attempt === signInEpoch) return true
+    for (const submit of authSubmits) if (authSubmitOwns(submit)) return true
     return false
   }
   // The text of the 401 that last expired a session (the loads that hit it

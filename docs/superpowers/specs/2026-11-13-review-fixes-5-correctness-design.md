@@ -333,11 +333,16 @@ A 401 behaves as today.
 token the page holds is rejected: a 401 from any request, or the socket's 4401 close, which
 now calls `expireSession()` instead of `handleLogout()`. It shows
 `Your session has expired. Please sign in again.` only when no newer outcome owns the form:
-- A counter `authSubmitsInFlight` is incremented when a sign-in, forgot-password,
-  accept-invite or reset-password submit starts, and decremented in its `finally`.
+- Every sign-in, forgot-password, accept-invite or reset-password submit registers itself
+  when it starts (removed in its `finally`) with the `signInEpoch` it answers to (updated
+  after its own `enterSession`) and its place in the order of submits. A submit owns the
+  form only while it is the newest submit and no sign-out or newer sign-in has moved
+  `signInEpoch`. An abandoned submit therefore owns nothing, even before its `finally` runs:
+  it neither suppresses a later session's expiry message nor overwrites a newer submit's
+  outcome (this also gates the D12 recovery).
 - `expireSession` decides before `endSession`:
-  `const showExpiry = authSubmitsInFlight === 0 && !authError`. After `endSession`, it sets
-  the message only when `showExpiry` is true.
+  `const showExpiry = !authSubmitOwnsForm() && !authError && <a token is held>`. After
+  `endSession`, it sets the message only when `showExpiry` is true.
 - An error shown by the current submission therefore stays. That includes #77's
   `keepError` case, pinned by `session.spec.ts:706` ("a stale-token 401 at boot leaves the
   failure of … on the form"). The same goes for an error that arrives after a stale boot 401:
