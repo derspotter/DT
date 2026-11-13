@@ -322,7 +322,9 @@ never replaces the rendered view.
 `bootstrapAuth` no longer clears the token on a non-401 error. It sets
 `authStatus = 'unauthenticated'`,
 `authError = '<transport message> Your session is kept; press Retry when the server is back.'`
-and `authBootRetry = true`, and disconnects the socket. The sign-in card shows a `Retry`
+and `authBootRetry = true`, and disconnects the socket. The transport message is shown as a
+sentence that ends in a period: a text without final punctuation gets one (`Bad gateway` →
+`Bad gateway. Your session is kept; …`), and one that already ends a sentence stays as is. The sign-in card shows a `Retry`
 button (`data-testid="auth-retry"`) while `authBootRetry` is set; it calls `bootstrapAuth()`.
 There is no automatic retry. A manual sign-in still works (`enterSession` replaces the token).
 A 401 behaves as today.

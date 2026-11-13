@@ -1215,3 +1215,68 @@ for (const outcome of ['success', 'failure'] as const) {
     await expect(form.getByText('Stale save failure')).toHaveCount(0)
   })
 }
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`${flow} whose workspace load answers 401 after /me still shows the saved-password text`, async ({ page }) => {
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const request = route.request()
+      const path = new URL(request.url()).pathname
+      const auth = request.headers().authorization || ''
+      if (path === endpoint) return fulfil(route, { token: 'token-new', user: { id: 7, username: 'neu', last_corpus_id: 1, is_admin: false } })
+      if (!auth.endsWith('token-new')) return fulfil(route, { error: 'Unauthorized' }, 401)
+      if (path === '/api/auth/me') return fulfil(route, { user: { id: 7, username: 'neu', last_corpus_id: 1, is_admin: false }, corpora: [corpus] })
+      // The new token is rejected by the first workspace load after /me.
+      if (path === '/api/corpus') return fulfil(route, { error: 'Invalid token' }, 401)
+      return workspaceDefaults(path, route)
+    })
+    await page.goto(`/#/${flow}?token=t`)
+    await submitPassword(page, button)
+    const form = page.getByTestId('login-form')
+    await expect(form).toBeVisible()
+    await expect(form.getByLabel('Username')).toHaveValue('neu')
+    await expect(form.locator('.error'))
+      .toHaveText('Your password was saved, but signing in failed (Invalid token). Sign in with your new password.')
+    expect(await storedToken(page)).toBeNull()
+  })
+}
+
+test('a sign-in abandoned by a sign-out does not suppress the next session\'s expiry message', async ({ page }) => {
+  const aliceConfig = deferred()
+  let aliceConfigSeen = false
+  let bobExpired = false
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      const { username } = request.postDataJSON()
+      return username === 'bob'
+        ? fulfil(route, { token: 'token-b', user: userB })
+        : fulfil(route, { token: 'token-a', user: userA })
+    }
+    if (auth.endsWith('token-b') && bobExpired) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (!auth) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (path === '/api/auth/me') return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+    if (path === '/api/recursion-config' && auth.endsWith('token-a')) {
+      aliceConfigSeen = true
+      await aliceConfig.promise
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  await expect.poll(() => aliceConfigSeen).toBe(true)
+  // Alice's sign-in is still loading when she signs out.
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('seed-panel')).toBeVisible()
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+
+  bobExpired = true
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await expect(page.getByTestId('login-form').locator('.error')).toHaveText(EXPIRED)
+  aliceConfig.resolve()
+})

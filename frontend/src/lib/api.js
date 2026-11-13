@@ -21,7 +21,7 @@ export function getAuthToken() {
 }
 
 // The app registers one handler (its sign-out path); every request that
-// answers 401 runs it before throwing.
+// answers 401 runs it, with the error text, before throwing.
 export function onUnauthorized(handler) {
   unauthorizedHandler = typeof handler === 'function' ? handler : null
 }
@@ -94,8 +94,9 @@ async function requestJson(path, {
       const text = await response.text().catch(() => '')
       // A 401 for a token that is no longer current (signed out, or signed in
       // again meanwhile) says nothing about the session in use now.
-      if (notifyUnauthorized && sentToken === authToken) unauthorizedHandler?.()
-      throw Object.assign(new Error(errorText(text) || 'Unauthorized'), { status: 401 })
+      const message = errorText(text) || 'Unauthorized'
+      if (notifyUnauthorized && sentToken === authToken) unauthorizedHandler?.(message)
+      throw Object.assign(new Error(message), { status: 401 })
     }
     if (!response.ok) {
       const text = await response.text().catch(() => '')

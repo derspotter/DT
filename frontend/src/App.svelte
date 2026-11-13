@@ -1659,12 +1659,13 @@
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
-    authSubmitsInFlight += 1
+    const submit = beginAuthSubmit()
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
       if (attempt !== signInEpoch) return
       enterSession(payload)
       attempt = signInEpoch
+      submit.attempt = attempt
       epoch = sessionEpoch
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
@@ -1676,6 +1677,8 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
+      // Signed out or expired meanwhile: the loads belong to no session.
+      if (epoch !== sessionEpoch) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
       // A 401 during the loads signed the session out already.
@@ -1693,7 +1696,7 @@
       disconnectLogs()
       setAuthToken('')
     } finally {
-      authSubmitsInFlight -= 1
+      endAuthSubmit(submit)
     }
   }
 
@@ -1701,7 +1704,7 @@
     event?.preventDefault?.()
     authError = ''
     authInfo = ''
-    authSubmitsInFlight += 1
+    const submit = beginAuthSubmit()
     try {
       await requestPasswordReset(authEmail.trim())
       authInfo = 'If that email exists, a reset link has been sent.'
@@ -1709,7 +1712,7 @@
     } catch (error) {
       authError = error.message || 'Failed to send password reset email'
     } finally {
-      authSubmitsInFlight -= 1
+      endAuthSubmit(submit)
     }
   }
 
@@ -1736,16 +1739,24 @@
     // Set once the password call succeeded: a later failure is a failed
     // sign-in, not a failed link.
     let savedUsername = null
-    authSubmitsInFlight += 1
+    const submit = beginAuthSubmit()
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
       if (attempt !== signInEpoch) return
       savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
+      submit.attempt = attempt
       epoch = sessionEpoch
+      // A 401 from any load of the new session (they swallow it) expired
+      // the session: the password is saved all the same.
+      const lostSession = () => {
+        if (epoch === sessionEpoch) return false
+        if (attempt === signInEpoch) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
+        return true
+      }
       const me = await fetchMe()
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1754,10 +1765,10 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
+      if (lostSession()) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
-      // A 401 during the loads signed the session out already.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
@@ -1770,7 +1781,7 @@
       }
       authError = error.message || 'Failed to accept invite'
     } finally {
-      authSubmitsInFlight -= 1
+      endAuthSubmit(submit)
     }
   }
 
@@ -1797,16 +1808,24 @@
     // Set once the password call succeeded: a later failure is a failed
     // sign-in, not a failed link.
     let savedUsername = null
-    authSubmitsInFlight += 1
+    const submit = beginAuthSubmit()
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
       if (attempt !== signInEpoch) return
       savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
+      submit.attempt = attempt
       epoch = sessionEpoch
+      // A 401 from any load of the new session (they swallow it) expired
+      // the session: the password is saved all the same.
+      const lostSession = () => {
+        if (epoch === sessionEpoch) return false
+        if (attempt === signInEpoch) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
+        return true
+      }
       const me = await fetchMe()
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1815,10 +1834,10 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
+      if (lostSession()) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
-      // A 401 during the loads signed the session out already.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
@@ -1831,7 +1850,7 @@
       }
       authError = error.message || 'Failed to reset password'
     } finally {
-      authSubmitsInFlight -= 1
+      endAuthSubmit(submit)
     }
   }
 
@@ -1862,8 +1881,26 @@
   // the submit must not cost the attempt its outcome.
   let signInEpoch = 0
   // Sign-in, forgot-password, accept-invite and reset-password submits in
-  // flight: while one runs, its own outcome owns the form.
-  let authSubmitsInFlight = 0
+  // flight, each with the signInEpoch it answers to. While one still owns
+  // the form (a sign-out or a newer sign-in has not taken it over), its own
+  // outcome is the message; an abandoned one says nothing about the next
+  // session, even before its `finally` runs.
+  const authSubmits = new Set()
+  function beginAuthSubmit() {
+    const submit = { attempt: signInEpoch }
+    authSubmits.add(submit)
+    return submit
+  }
+  function endAuthSubmit(submit) {
+    authSubmits.delete(submit)
+  }
+  function authSubmitOwnsForm() {
+    for (const submit of authSubmits) if (submit.attempt === signInEpoch) return true
+    return false
+  }
+  // The text of the 401 that last expired a session (the loads that hit it
+  // swallow their error).
+  let lastExpiryMessage = ''
   // Boot failed for a reason other than a rejected token: the sign-in card
   // offers Retry (bootstrapAuth) with the token kept.
   let authBootRetry = false
@@ -1872,9 +1909,10 @@
   // log socket on a 4401 close. Several requests can fail together; once
   // signed out, the rest change nothing. The message says why the form is
   // back, unless a submit in flight or an error already on screen owns it.
-  function expireSession() {
+  function expireSession(message = 'Your session was rejected') {
     if (authStatus === 'unauthenticated' && !getAuthToken()) return
-    const showExpiry = authSubmitsInFlight === 0 && !authError && Boolean(getAuthToken())
+    lastExpiryMessage = message
+    const showExpiry = !authSubmitOwnsForm() && !authError && Boolean(getAuthToken())
     endSession()
     if (showExpiry) authError = 'Your session has expired. Please sign in again.'
   }
