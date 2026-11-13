@@ -1425,12 +1425,12 @@ class DatabaseManager:
         cur = self.conn.cursor()
         norm_doi = self._normalize_doi(resolved.get("doi"))
         if norm_doi:
-            row = cur.execute("SELECT id FROM works WHERE normalized_doi = ?", (norm_doi,)).fetchone()
+            row = cur.execute("SELECT id FROM works WHERE normalized_doi = ? AND normalized_doi != ''", (norm_doi,)).fetchone()
             if row:
                 return int(row[0]), "normalized_doi"
         openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
         if openalex:
-            row = cur.execute("SELECT id FROM works WHERE openalex_id = ?", (openalex,)).fetchone()
+            row = cur.execute("SELECT id FROM works WHERE openalex_id = ? AND openalex_id != ''", (openalex,)).fetchone()
             if row:
                 return int(row[0]), "openalex_id"
         return None, None
@@ -1445,10 +1445,10 @@ class DatabaseManager:
         out = {}
         cur = self.conn.cursor()
         norm_doi = self._normalize_doi(resolved.get("doi"))
-        if norm_doi and not cur.execute("SELECT 1 FROM works WHERE normalized_doi = ?", (norm_doi,)).fetchone():
+        if norm_doi and not cur.execute("SELECT 1 FROM works WHERE normalized_doi = ? AND normalized_doi != ''", (norm_doi,)).fetchone():
             out.update(doi=resolved.get("doi"), normalized_doi=norm_doi)
         openalex = self._normalize_openalex_id(resolved.get("openalex_id"))
-        if openalex and not cur.execute("SELECT 1 FROM works WHERE openalex_id = ?", (openalex,)).fetchone():
+        if openalex and not cur.execute("SELECT 1 FROM works WHERE openalex_id = ? AND openalex_id != ''", (openalex,)).fetchone():
             out["openalex_id"] = openalex
         return out
 
@@ -1462,13 +1462,13 @@ class DatabaseManager:
         cur = self.conn.cursor()
         norm_doi = self._normalize_doi(out.get("doi"))
         if norm_doi and cur.execute(
-            "SELECT 1 FROM works WHERE normalized_doi = ? AND id != ?", (norm_doi, work_id)
+            "SELECT 1 FROM works WHERE normalized_doi = ? AND normalized_doi != '' AND id != ?", (norm_doi, work_id)
         ).fetchone():
             out.pop("doi", None)
             out.pop("normalized_doi", None)
         openalex = self._normalize_openalex_id(out.get("openalex_id"))
         if openalex and cur.execute(
-            "SELECT 1 FROM works WHERE openalex_id = ? AND id != ?", (openalex, work_id)
+            "SELECT 1 FROM works WHERE openalex_id = ? AND openalex_id != '' AND id != ?", (openalex, work_id)
         ).fetchone():
             out.pop("openalex_id", None)
         return out
