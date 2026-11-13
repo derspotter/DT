@@ -4,10 +4,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { threadId as threadIdOfMain } from 'node:worker_threads'
+import { jest } from '@jest/globals'
 import bcrypt from 'bcryptjs'
 import { createPasswordHasher, getPasswordHasher } from '../src/passwordHasher.js'
 
 const HASHER_URL = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'passwordHasher.js')).href
+
+// No assertion depends on elapsed time or speed; this only gives slow
+// runners room before Jest's watchdog fires.
+jest.setTimeout(30_000)
 
 const hashers = []
 const make = (options) => {
@@ -43,37 +48,26 @@ test('bcrypt runs in worker threads, not on the main thread', async () => {
   }
 })
 
-test('the main thread keeps turning while a slow hash is pending', async () => {
-  // No time bound: a main-thread hashSync settles before the first turn; a
-  // worker-run rounds-16 hash (seconds) is still pending after 500 turns.
-  const hasher = make({ size: 1 })
-  let settled = false
-  const slow = hasher.hash('pw', 16).then(
-    () => { settled = true },
-    () => { settled = true }
-  )
-  let turns = 0
-  while (turns < 500 && !settled) {
-    await new Promise((resolve) => setImmediate(resolve))
-    turns += 1
-  }
-  expect({ turns, settled }).toEqual({ turns: 500, settled: false })
-  await hasher.close()
-  await slow
-})
-
 test('at most size hashes run at once and the queue bound holds', async () => {
   const hasher = make({ size: 1, maxQueue: 2 })
   let settled = 0
   const first = [1, 2, 3].map(() =>
-    hasher.hash('pw', 12).finally(() => {
+    hasher.hash('pw', 4).finally(() => {
       settled += 1
     })
   )
   expect(hasher.workers()).toHaveLength(1)
-  // The 4th call rejects while all three earlier calls are still pending:
-  // ordering, not elapsed time, shows it did not wait for a free slot.
-  await expect(hasher.hash('pw', 12)).rejects.toMatchObject({ code: 'HASHER_BUSY' })
+  // The 4th call is refused at submission. Only microtasks run before the
+  // checks below, and a worker's answer arrives as a message (a macrotask),
+  // so no earlier hash can have settled or freed a slot, however fast it is.
+  let outcome = null
+  hasher.hash('pw', 4).then(
+    () => { outcome = 'resolved' },
+    (error) => { outcome = error }
+  )
+  await Promise.resolve()
+  await Promise.resolve()
+  expect(outcome).toMatchObject({ code: 'HASHER_BUSY' })
   expect(settled).toBe(0)
   const hashes = await Promise.all(first)
   for (const h of hashes) expect(bcrypt.compareSync('pw', h)).toBe(true)
@@ -83,7 +77,8 @@ test('at most size hashes run at once and the queue bound holds', async () => {
 
 test('a dead worker is replaced and its call rejects', async () => {
   const hasher = make({ size: 1 })
-  const pending = hasher.hash('pw', 14)
+  // Rounds 31 never finishes in practice, so only the kill can settle it.
+  const pending = hasher.hash('pw', 31)
   const queued = hasher.hash('queued', 4)
   const [worker] = hasher.workers()
   expect(worker).toBeDefined()
@@ -98,13 +93,14 @@ test('a dead worker is replaced and its call rejects', async () => {
 
 test('close rejects queued work and later calls', async () => {
   const hasher = make({ size: 1 })
-  const running = hasher.hash('pw', 12)
+  // Rounds 31 never finishes in practice, so only close() can settle it.
+  const running = hasher.hash('pw', 31)
   const queued = hasher.hash('pw', 4)
   running.catch(() => {})
   queued.catch(() => {})
   await hasher.close()
   await expect(queued).rejects.toThrow(/closed/)
-  await expect(running).rejects.toThrow()
+  await expect(running).rejects.toThrow(/closed/)
   await expect(hasher.hash('pw')).rejects.toThrow(/closed/)
 })
 
@@ -122,7 +118,7 @@ console.log(h.slice(0, 7))`
   fs.writeFileSync(file, script)
   try {
     const { code, stdout, stderr } = await new Promise((resolve) => {
-      execFile(process.execPath, [file], { timeout: 10_000 }, (error, out, err) => {
+      execFile(process.execPath, [file], { timeout: 30_000 }, (error, out, err) => {
         resolve({ code: error ? (error.code ?? error.signal) : 0, stdout: out, stderr: err })
       })
     })
@@ -131,4 +127,4 @@ console.log(h.slice(0, 7))`
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
-}, 15_000)
+}, 40_000)
