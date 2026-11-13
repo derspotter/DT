@@ -1,12 +1,21 @@
 # Review fixes, phase 5: correctness, silent failures and hardening — design
 
-Date: 2026-11-13. Branch `review-fixes-5` (worktree from master `2c8b8b7`). Source: Phase 1 of
-`.superpowers/sdd/2026-11-13-review-fixes-5-remaining/inventory.md` ("Proposed fix phases"),
+Date: 2026-11-13, revised the same day after Codex's pre-flight review
+(`.superpowers/sdd/2026-11-13-review-fixes-5-correctness/preflight-codex.md` in this worktree,
+findings 1-15) and the controller's rulings on it. Branch `review-fixes-5` (worktree from
+master `2c8b8b7`). Source: Phase 1 of
+`/home/jay/DT/.superpowers/sdd/2026-11-13-review-fixes-5-remaining/inventory.md` ("Proposed
+fix phases"; a copy sits in this worktree's `.superpowers/sdd/2026-11-13-review-fixes-5-correctness/`),
 33 rows: FE-39 to FE-46, FE-48, FE-50, FE-56 to FE-58, FE-60; BE-32, BE-40, BE-41, BE-43,
 BE-44, BE-49, BE-50; PY-36, PY-39, PY-44 to PY-53. PY-02 (the three #78 identifier helpers
 that miss their partial indexes) is the 34th Phase 1 row and ships separately as the hotfix
 on `hotfix-identifier-index-scans`. Same method as phases 2 to 4: Opus-medium implementers
 under subagent-driven development, Codex `gpt-6.1-sol` xhigh as the review gate.
+
+Two rows are closed only in part:
+- **BE-40:** this phase moves hashing off the event loop. The login rate limit is an
+  owner/ops follow-up (see non-goals).
+- **FE-60:** this phase makes the reconnect gap visible. Filling the gap is a later phase.
 
 Every row's evidence was re-read in the code on `2c8b8b7`; the line numbers below are from
 that commit. Where a fix is a product choice the inventory leaves open, the decision says
@@ -80,7 +89,12 @@ that commit. Where a fix is a product choice the inventory leaves open, the deci
 16. **bcrypt blocks the event loop, and login has no rate limit (BE-40).** `compareSync` runs at
     `:3097`, and `hashSync` at `:3209`, `:3236`, `:3291` and `:3356`. Every failed login costs about
     70 ms of main-thread time, and nothing limits the attempts, so this is a cheap DoS and an
-    open password-guessing endpoint.
+    open password-guessing endpoint. Switching to bcryptjs's async API would not help: it
+    still computes on the main thread, yielding only between chunks of about 100 ms.
+16a. **Invite and reset tokens can be used twice once hashing is async (found in pre-flight).**
+    Accept-invite and reset-password validate the token (`:3274-3285`, `:3341-3353`), hash, and
+    then mark the token used by id without checking `used_at` (`:3301`, `:3361`). Once the hash
+    is awaited, two submissions can validate the same token, and both change the password.
 17. **Every boot rehashes and rewrites the admin password (BE-41).** The unconditional
     `hashSync` and `UPDATE` run at `:972` and `:983`.
 18. **Multi-statement writes run without a transaction (BE-43).** These are
@@ -108,7 +122,9 @@ that commit. Where a fix is a product choice the inventory leaves open, the deci
     `COMMIT`, or a lost transaction (re-raised since #78), leaves the chunk loop through the
     bare `try/finally` (`ingest_import_seed.py:109-145`). The JSON print at `:147` is skipped, the
     process exits non-zero, and the UI shows "Python script failed (1): …" although earlier
-    chunks were committed.
+    chunks were committed. A parse failure (`:101-103`) prints a summary in the same
+    `added/skipped/…` shape as a success, so the UI shows "Imported 0 works". A failing
+    `DatabaseManager(...)` (`:105`) is outside any handler.
 24. **The rate-limit waits run once per call, not once per attempt (PY-44).**
     `get_bib_pages.py:198-199`, `APIscraper_v2.py:430-431` and `:671-672` wait before calling
     `run_with_timeout`, so timed-out retries are never counted against the rpm and daily budgets.
@@ -148,8 +164,8 @@ that commit. Where a fix is a product choice the inventory leaves open, the deci
   still true, or logged with what was lost.
 - Nothing from one session reaches the next: quota, Corpus selection, errors.
 - A user request is never dropped because a background poll is running.
-- Auth endpoints neither block the event loop nor accept unlimited guesses; mails escape what
-  they interpolate.
+- Auth endpoints do not block the event loop, password hashing cannot exhaust the CPU, a
+  one-time token works exactly once, and mails escape what they interpolate.
 - Every write that spans several statements is atomic, and every Python exit code tells the
   truth.
 - Each row has a test that fails before its fix.
@@ -160,15 +176,36 @@ that commit. Where a fix is a product choice the inventory leaves open, the deci
 - **BE-19, BE-46, FE-55, PY-14** are DECISION rows for the owner and are not touched.
 - No Phase 2 or Phase 3 rows. In particular, FE-14 (server-side stage filter) stays: the
   Corpus stage filter is still client-side over the loaded page after D3. FE-59 (merged
-  logs-tail scope) also stays: the reconnect backfill in D7 uses the same `getLogsCorpusId()`
-  scope as today's tail. Neither is made worse.
-- BE-40 fixes neither username enumeration through response timing (an unknown username
-  skips the bcrypt compare) nor rate limits on forgot-password, accept-invite and
-  reset-password. Those take high-entropy tokens or send mail and are out of this row.
+  logs-tail scope) also stays: D7 does not touch the tail's scope. Neither is made worse.
+- **FE-60 is closed by making the gap visible, not by filling it (D7).** Filling the gap
+  reliably needs persisted log-record identities and one replay cursor shared by
+  `/api/logs/tail` and the socket. Today the tail returns backward line offsets, the socket
+  sends plain strings, and the frontend `seq` values are local. No text matching can
+  reconcile them: repeated lines are ambiguous. **Later phase:** record ids and a replay
+  cursor (high-water mark) for tail and socket, live traffic buffered during replay and
+  deduped by id, and an expired cursor reported as a gap.
+- **The login rate limit of BE-40 is deferred; owner/ops follow-up.** A limiter needs the
+  real client address. Production is outer Caddy → frontend Caddy (`frontend/Caddyfile:7`, no
+  `trusted_proxies`) → backend, so the inner Caddy replaces the forwarded address with its
+  peer. In that chain every user would share one bucket, and a per-IP limit would become a
+  site-wide lockout. Blanket trust of private addresses would in turn let anything reaching
+  the backend directly forge its address: port 4000 is reachable on the docker network, and
+  `backend/docker-compose.yml:7` publishes it. The fix needs a production config change:
+  `trusted_proxies` on both Caddies, an Express `trust proxy` naming those peers only, and
+  closed alternate ingress. It must then be verified on the dev and production proxy paths.
+  This phase closes the event-loop half of BE-40 (D17). Its bounded hashing queue (at most 2
+  concurrent hashes, 64 queued, `503` beyond) is what stops a login burst from exhausting the
+  CPU in the meantime.
+- BE-40 does not address username enumeration through response timing: an unknown username
+  skips the bcrypt compare.
 - PY-47 does not add LibGen retries: a 429 still moves to the next mirror, as the code
   intends. Only the dead branches are fixed.
-- PY-49 does not make a hung Python thread stoppable. It fails the job and restarts the
-  process (D27).
+- PY-49 does not make a hung Python thread stoppable. It fails the job and restarts the whole
+  worker process (D29); sibling threads of that worker die with it, and their claims are
+  released by the restarted worker's start-up recovery. Selective termination would need
+  each job in its own child process, which is a later phase. A job that hangs while holding
+  the database write lock cannot be failed by the watchdog: the watchdog keeps retrying and
+  logs once a minute, and exits only after it wins.
 - PY-50 and PY-51 add no retries; a partial result is reported, not repaired.
 - The other `dl_lit` CLI commands that print errors and exit 0 (for example
   `extract-bib-pages`, `cli.py:444-445`) are not in the row and stay unchanged.
@@ -206,35 +243,56 @@ the selected count and the "Selected: N / M selectable" text show the selectable
 `{@const}` lines at `:4818`/`:4821` use the same rule. Promotion and dismissal are unchanged:
 they already skip unselectable rows on the server.
 
-**D5. `--text` → `--ink` (FE-45).** Both uses become `var(--ink)`. A node-side spec scans
-`src/app.css` and the `<style>` blocks of `src/**/*.svelte` for `var(--name` and fails on any
-name that no `--name:` defines. This covers the whole class of bug, not just the two lines.
+**D5. `--text` → `--ink` (FE-45).** Both uses become `var(--ink)`. A node-side spec collects
+the custom properties that are used and the ones that are defined:
+- **Used:** every `var(--name)` without a fallback in `src/app.css` and in all of
+  `src/**/*.svelte`. A `var(--name, fallback)` counts as safe, because `--border` and
+  `--row-checked` rely on their fallbacks on purpose.
+- **Defined:** every `--name:` anywhere in those files. That includes inline style
+  declarations such as ThreeGraph's `--label-x:` (`ThreeGraph.svelte:1976-1996`).
 
-**D6. Load older stops at the view's limit (FE-56), controller call.** `loadOlderLogs`
-requests `lines: Math.min(maxLogs, maxLogHistory - logs.length)` and prepends every line it
-gets (no trim). When `logs.length >= maxLogHistory`, it sends no request and sets
-`logsTailStatus = 'The log view holds 5,000 lines. Older lines stay in the log file.'`. The
-button stays enabled so that this message can be seen. The cursor advances by the lines
-actually prepended. Live lines keep trimming the oldest lines as today.
+The spec fails on a used name that nothing defines. On `2c8b8b7` it reports exactly `text`;
+after the fix it reports nothing, with no other CSS changed.
 
-**D7. Reconnect backfill (FE-60), controller call.** `onclose` (except 4401) stores
-`logsGapAnchor`, the texts of the last 3 lines of `[...logs, ...logBuffer]`. A reconnect is
-`connectLogs({ reconnect: true })`. After its `onopen`, it requests the tail
-(`lines: maxLogs` = 200, `cursor: 0`, same type and corpus scope) and calls the new pure
-function `gapLines(anchor, tailTexts, receivedSince)` from `frontend/src/lib/logMerge.js`:
-- it finds the last index `i` where `tailTexts[i-k+1..i]` equals `anchor` (`k = anchor.length`,
-  1 to 3);
-- it takes `missing = tailTexts.slice(i + 1)`;
-- it cuts `missing` at the first index from which it starts with `receivedSince[0]` (the lines
-  that arrived on the new socket before the answer are already shown);
-- it returns `missing`, or `null` when the anchor is not in the tail or the anchor is empty.
+**D6. Load older admits what fits when it answers (FE-56), controller call.**
+- `loadOlderLogs` sends no request when the view is full. Then it sets
+  `logsTailStatus = 'The log view holds 5,000 lines. Older lines stay in the log file.'`.
+- Otherwise it requests `lines: Math.min(maxLogs, maxLogHistory - logs.length)`.
+- Capacity is decided again when the answer arrives, because live lines may have filled the
+  view meanwhile. `flushLogs()` runs first. Then
+  `room = Math.max(0, maxLogHistory - logs.length)`, and the newest `room` of the fetched lines
+  (`entries.slice(-room)`, the ones adjacent to the view) are prepended. Nothing is trimmed.
+- The cursor advances only by the accepted count. The lines that were not accepted are
+  fetched again by the next request.
+- The status says what happened:
+  - `Loaded <n> older log lines.` when all were accepted;
+  - `Loaded <k> of <n> older log lines; the view holds 5,000 lines.` when only some were;
+  - the full-view text when none were.
+- The button stays enabled so that the message can be seen.
+- Live lines keep trimming the oldest lines as today.
 
-On an array result, the missing lines are inserted before the `receivedSince.length` newest
-view lines (`flushLogs()` first), the view is trimmed to `maxLogHistory`, and `logsCursor`
-grows by `missing.length` (capped). On `null` (a gap over 200 lines, or nothing to anchor on),
-the view reloads from the file: `hydrateLogsFromTail({ force: true })`, with the status
-`'Reconnected; reloaded the latest log lines.'`. The epoch guard (`logsScopeEpoch`) applies.
-The first connect keeps today's behaviour.
+**D7. A reconnect marks the gap (FE-60), controller call.** A reconnect never hydrates and
+never replaces the rendered view.
+- `onclose` (except 4401) records `logsDisconnectedAt = new Date()` the first time, so a series
+  of failed reconnects keeps the first time.
+- When a reconnecting socket opens, `onopen` pushes one marker entry into the log buffer and
+  then clears `logsDisconnectedAt`:
+
+  ```
+  { seq, text: 'Connection lost <from>–<to>. Lines from that period may be missing.', marker: true }
+  ```
+
+  `<from>` and `<to>` are local 24-hour `HH:MM:SS` times of the first close and the reopen,
+  and the dash is an en dash.
+- `Logs.svelte` renders a marker entry with the class `log-gap` and a `Reload logs` button
+  (`data-testid="logs-reload"`). The button calls `hydrateLogsFromTail({ force: true })`, the
+  existing explicit hydration, so the tail wins.
+- Marker entries are not file lines. `flushLogs` advances `logsCursor` only by the non-marker
+  entries, and "Load older" keeps working without a gap or a repeat.
+- The first connect hydrates as today. A reconnect issues no tail request, so the existing
+  reconnect specs keep their invariants: one tail request, and every line already shown or
+  buffered is kept.
+- A 4401 close adds no marker.
 
 ### Frontend: session and failure states
 
@@ -268,11 +326,20 @@ A 401 behaves as today.
 
 **D11. "Session expired" message (FE-48), controller call.** `expireSession` runs when a
 token the page holds is rejected: a 401 from any request, or the socket's 4401 close, which
-now calls `expireSession()` instead of `handleLogout()`. It sets
-`authError = 'Your session has expired. Please sign in again.'` after `endSession`. This
-applies both mid-session and at boot (a stored token that the server rejects). An explicit
-sign-out (`handleLogout`) shows no message. The sign-in submit clears the message, as it
-clears every `authError` today.
+now calls `expireSession()` instead of `handleLogout()`. It shows
+`Your session has expired. Please sign in again.` only when no newer outcome owns the form:
+- A counter `authSubmitsInFlight` is incremented when a sign-in, forgot-password,
+  accept-invite or reset-password submit starts, and decremented in its `finally`.
+- `expireSession` decides before `endSession`:
+  `const showExpiry = authSubmitsInFlight === 0 && !authError`. After `endSession`, it sets
+  the message only when `showExpiry` is true.
+- An error shown by the current submission therefore stays. That includes #77's
+  `keepError` case, pinned by `session.spec.ts:706` ("a stale-token 401 at boot leaves the
+  failure of … on the form"). The same goes for an error that arrives after a stale boot 401:
+  the submission writes its own error last.
+- The rule applies both mid-session and at boot (a stored token that the server rejects).
+- An explicit sign-out (`handleLogout`) shows no message.
+- The next submit clears the message, as it clears every `authError` today.
 
 **D12. Invite/reset after a saved password (FE-50), controller call.** In
 `handleAcceptInvite` and `handleResetPassword`, a failure after the password call succeeded
@@ -295,15 +362,22 @@ request's epoch. Sign-out already sets `openalexQuota = null` (`:2025`).
 - `globalIngestStats` and `globalWorkerBacklog` start as `null`.
 - The global branches of `loadIngestStats` and `loadPipelineWorkerStatus` set
   `globalStatsError` or `globalDaemonError` on failure and clear them on success.
+- Both global branches capture `sessionEpoch` at the start. On success and on failure they
+  write nothing when it has changed, so an answer or error from before a sign-out cannot undo
+  the reset or reach the next session. The corpus guard does not cover the global loads.
 - `Dashboard` gets `globalUnavailable` (either error) and renders `—` for every `null` value,
   plus `Global totals could not be loaded.` under the heading while `globalUnavailable` is set.
   The last loaded numbers stay on screen next to that note.
 - Sign-out resets both values to `null`.
 
-**D15. A stopped seed import is a failure (PY-39 UI half).** `uploadItem` checks
-`result.stopped`. When it is set, the upload gets status `failed` and the message
-`Import stopped after <processed> of <total> entries: <error> (<added> added, <corpus_linked>
-linked before it).`. The summary contract is D22.
+**D15. A stopped seed import is a failure (PY-39 UI half), controller call.** `uploadItem`
+checks `result.stopped`. When it is set, the upload gets status `failed`:
+- with `processed === 0` and `added === 0` (a parse or database-setup failure, or the first
+  chunk failing), the message is `Import failed: <error>`;
+- otherwise it is `Import stopped after <processed> of <total> entries: <error> (<added> added,
+  <corpus_linked> linked before it).`.
+
+The summary contract is D25.
 
 ### Backend
 
@@ -315,32 +389,43 @@ linked before it).`. The summary contract is D22.
 It renders one template with the current subjects, headings, texts and expiry lines
 (72 hours, 2 hours). `username` and `url` are escaped in the HTML, and the text part is left
 as is. `sendInviteEmail` and `sendPasswordResetEmail` keep their token logic and call it.
+`createApp({ broadcast, broadcastEvent, mailTransport } = {})` accepts an optional transport
+with `sendMail(options)`. When it is given, `sendTransactionalMail` uses it instead of SMTP.
+Tests use it to read the HTML that the invitation and forgot-password routes actually send.
 
-**D17. Async bcrypt (BE-40).** `bcrypt.compare` / `bcrypt.hash` (bcryptjs, async) replace
-every `compareSync`/`hashSync` in request handlers; `/api/auth/login`,
-`/api/auth/register`, `/accept-invite`, `/reset-password` become `async`. The boot
-compare/hash in `bootstrapDefaultCorpus` stays synchronous (before `listen`).
+**D17. Password hashing off the event loop (BE-40), controller call.**
+- `backend/src/passwordHasher.js` holds a small `worker_threads` pool. Its workers run
+  `backend/src/passwordWorker.js`, which calls bcryptjs's `hashSync`/`compareSync`, so the
+  `$2b$10$` hash format is unchanged. It exports:
+  - `createPasswordHasher({ size = 2, maxQueue = 64 } = {}) -> { hash(password, rounds = 10) ->
+    Promise<string>, compare(password, hash) -> Promise<boolean>, close() -> Promise<void> }`
+  - `getPasswordHasher()`, a process-wide instance created lazily. Its workers are
+    `unref()`'d, so neither the server nor Jest is kept alive by them.
+- At most `size` hashes run at once; up to `maxQueue` more wait in FIFO order. Beyond that,
+  the call rejects with an `Error` whose `code` is `'HASHER_BUSY'`. A worker that dies is
+  replaced, and its pending call rejects.
+- The handlers of `/api/auth/login`, `/api/auth/register`, `/api/auth/invitations`,
+  `/accept-invite` and `/reset-password` await `getPasswordHasher()`. On `HASHER_BUSY` they
+  answer `503` with `Retry-After: 5` and
+  `{ error: 'The server is busy; try again in a moment.' }`.
+- No `compareSync`/`hashSync` is left in a request handler. The boot compare/hash in
+  `bootstrapDefaultCorpus` stays synchronous, because it runs before `listen`.
+- The bound (2 running, 64 queued) is also what keeps a login burst from exhausting the CPU
+  until the rate limit (see non-goals) lands.
 
-**D18. Login rate limit (BE-40), controller call.**
-- `backend/src/loginLimiter.js` exports `createLoginLimiter({ maxPerUser = 10,
-  maxPerIp = 100, windowMs = 15 * 60_000, maxKeys = 10_000, now = Date.now })`. It returns
-  `{ check(ip, username) -> { allowed: boolean, retryAfterSeconds: number },
-  recordFailure(ip, username), recordSuccess(ip, username) }`.
-- Usernames are trimmed and lowercased. Failures are counted in a sliding window: once the
-  oldest failure in the window ages out, the key is allowed again.
-- A key is the pair `(ip, username)` with at most 10 failures, or the `ip` alone with at most
-  100 failures across usernames. Nothing is keyed by username alone, so nobody can lock
-  another user out from elsewhere.
-- A success clears that pair. Keys over `maxKeys` evict the oldest.
-- `/api/auth/login` calls `check` before the user lookup. When the check refuses, the route
-  answers `429` with the header `Retry-After: <seconds>` and
-  `{ error: 'Too many failed sign-in attempts. Try again in <n> minute(s).' }`, where
-  `n = ceil(retryAfterSeconds / 60)`.
-- Invalid credentials call `recordFailure`. The "invitation pending" 403 is not a failure.
-- `createApp` sets `app.set('trust proxy', 'loopback, linklocal, uniquelocal')`, so `req.ip` is
-  the client behind the two Caddy hops on the docker networks and not the proxy. A spoofed
-  leftmost `X-Forwarded-For` entry is ignored.
-- The frontend already shows the body's `error` on the sign-in form.
+**D18. One-time tokens are consumed atomically (found in pre-flight).** Accept-invite and
+reset-password keep the early read of the token, which gives the fast "invalid or expired"
+answer. After hashing, one `authDb.transaction` does two things:
+1. It runs `UPDATE <token table> SET used_at = CURRENT_TIMESTAMP WHERE id = ? AND used_at IS
+   NULL AND datetime(expires_at) > datetime('now')`. When that changes anything other than
+   exactly one row, the transaction throws, and the route answers the existing
+   `400 { error: 'Invite link is invalid or expired' }` or `'Reset link is invalid or
+   expired'`.
+2. Only after that, it updates the user's password (plus `account_status` and the timestamps,
+   as today).
+
+When two submissions race, exactly one succeeds. The stored hash matches the winner's
+password.
 
 **D19. Boot keeps a matching admin hash (BE-41).** `bootstrapDefaultCorpus` first reads the
 stored hash. When the row exists and `bcrypt.compareSync(adminPassword, stored)` is true, it
@@ -365,6 +450,10 @@ inside a `try`, which answers `500 { error }` on failure.
   call, and `cheap` for the cheap inline step.
 - The Admin panel's "Advanced" block gets two text inputs, "Inline model (cheap)" and
   "Inline model (fallback)", bound like `gemini_model`.
+- The two model literals appear in `app.js` only inside `extractionInlineModels`. A Jest test
+  reads `src/app.js` and pins that each literal occurs exactly once. That is the route-level
+  check that the route goes through the helper: the extraction route spawns Python and has no
+  test harness.
 
 **D23. `/api/corpus` limit clamp (BE-50), controller call.** The route clamps the limit with
 `Math.min(CORPUS_MAX_LIMIT, Math.max(0, coerceInt(req.query?.limit, 200)))`, where
@@ -380,19 +469,33 @@ back before the `except sqlite3.IntegrityError` returns the error. With `commit=
 handler calls `self.conn.rollback()` when `self.conn.in_transaction` is true. The return
 value is unchanged: `(None, "IntegrityError inserting into works: …")`.
 
-**D25. `ingest_import_seed` always prints a summary (PY-39).** Each chunk counts into local
-counters that are added to the totals only after its `with db.transaction()` exits. An
-exception out of a chunk (BEGIN, COMMIT or a lost transaction) stops the loop. The script
-then prints the totals of the committed chunks plus the following and exits 0:
+**D25. `ingest_import_seed` always prints one summary shape (PY-39).** Every outcome prints
+one JSON line and exits 0:
 
 ```
-stopped: true
-processed: <entries in committed chunks>
-error: "<ExceptionType>: <message>"
+added: int
+skipped: int
+corpus_linked: int
+total: int
+processed: int
+stopped: bool
+error: str | None
+errors: list[str]
 ```
 
-`errors` keeps the per-entry messages. A run without a failure prints `"stopped": false` and
-`"processed": total`.
+The only consumer chain is `spawnPython` → `runPythonJson` → the import-seed route, which
+forwards the JSON unchanged.
+- **Chunks.** Each chunk counts into local counters, which are added to the totals only
+  after its `with db.transaction()` exits. An exception out of a chunk (`BEGIN`, `COMMIT` or a
+  lost transaction) stops the loop. The script then prints the totals of the committed
+  chunks, with `stopped: true`, `processed` set to the entries in the committed chunks, and
+  `error: "<ExceptionType>: <message>"`.
+- **Parse failure.** It prints `stopped: true`, `processed: 0`, `total: 0`,
+  `error: "<ExceptionType>: Failed to parse <kind>: <message>"`, and all counts 0.
+- **Database setup failure** (`DatabaseManager(...)` raising). It prints `stopped: true`,
+  `processed: 0`, `total: <entries parsed>` and `error: "<ExceptionType>: <message>"`.
+- **A run without a failure** prints `stopped: false`, `processed: total` and `error: null`.
+- `errors` keeps the per-entry messages.
 
 **D26. Exit codes (PY-46, PY-52).**
 - `get_bib_pages.main()` counts the PDFs that raised, prints
@@ -428,11 +531,28 @@ error: "<ExceptionType>: <message>"
   delegate to it.
 
 **D29. Job and batch watchdog (PY-49), controller call.** The heartbeat thread is also the
-watchdog.
-- `_start_job_heartbeat` passes `deadline_seconds=self.job_timeout_seconds` (env
-  `RAG_FEEDER_PIPELINE_JOB_TIMEOUT`, default 1800).
-- When the deadline passes, the thread marks the job failed through `heartbeat_conn` (its own
-  connection, under `heartbeat_lock`):
+watchdog. It exits the worker only after it has won ownership of the timed-out work, and a
+callback from finished work can never act. A hung Python thread cannot be stopped any other
+way, so the exit is how the work ends: both workers run under docker's
+`restart: unless-stopped` in dev and prod.
+
+- **Generation token.** `self._work_lock` (a `threading.Lock`) guards
+  `self._work_generation` (an int) and `self._work_finished` (a bool).
+  - Starting a job or a direct batch takes the lock, increments the generation, sets
+    `_work_finished = False` and passes the new generation to the heartbeat thread.
+  - The work's `finally` sets `_work_finished = True` under the lock before it stops the
+    heartbeat thread.
+  - A deadline callback acts only when, under the lock, its generation is still current and
+    `_work_finished` is false. The 1-second teardown join can therefore leave a late callback
+    running, but that callback cannot touch later work.
+- **Deadlines.**
+  - Jobs: `deadline_seconds = self.job_timeout_seconds` (env
+    `RAG_FEEDER_PIPELINE_JOB_TIMEOUT`, default 1800).
+  - Direct batches: `env_int("RAG_FEEDER_DIRECT_BATCH_TIMEOUT", self.job_timeout_seconds,
+    minimum=60)`.
+- **Job ownership.** Under `_work_lock`, the callback runs a conditional `UPDATE` through
+  `heartbeat_conn` (its own connection, under `heartbeat_lock`). `busy_timeout` is set to
+  1000 ms for this statement and restored afterwards:
 
   ```sql
   UPDATE pipeline_jobs
@@ -441,16 +561,28 @@ watchdog.
   ```
 
   `result_json` is `{"error": "timed out after <N>s; worker restarted"}`.
-- It then writes an `error` heartbeat with `state: "job_timeout"`, logs, and calls
-  `self._exit(75)` (`os._exit` by default), so that docker's `restart: unless-stopped` starts a
-  fresh worker. A hung thread cannot be stopped any other way. If the failed-mark itself
-  fails (main connection holding the lock), the worker still exits, and the start-up recovery
-  requeues the job.
-- Direct batches use `deadline_seconds = env_int("RAG_FEEDER_DIRECT_BATCH_TIMEOUT",
-  self.job_timeout_seconds, minimum=60)` with `state: "direct_batch_timeout"` and no job row;
-  their claimed rows' leases expire as today.
-- `run()` also calls `_recover_stale_running_jobs()` at most once every 60 s before
-  `fetch_next_job`, for jobs that a worker which never came back left running.
+  - When exactly one row changed, the watchdog has won.
+  - When no row changed, the job was completed or cancelled first. The watchdog stops without
+    exiting.
+  - When the statement raises `sqlite3.Error` (for example, the hung job holds the write
+    lock), the watchdog has not won. It retries on every beat interval and logs
+    `job <id> timed out but could not be marked failed: <error>` at most once a minute. It
+    never exits without winning.
+  - The completion path's `mark_job_completed` is already conditional on `status='running'`.
+    When the watchdog has won, completion records nothing, as for a cancelled job.
+- **Batch ownership.** A direct batch has no job row. The watchdog wins when the generation
+  check passes.
+- **Terminal reporting is time-bounded.** After winning, the watchdog makes one attempt at an
+  `error` heartbeat with `state: "job_timeout"` (or `"direct_batch_timeout"`), also with a
+  1000 ms busy timeout, and swallows any error. It then logs and calls `self._exit(75)`
+  (`os._exit` by default). From winning to exit takes at most about 2 s plus the log write.
+- **Restart.** The restarted worker's start-up recovery (`_recover_stale_running_jobs`, which
+  includes `_release_work_claims`, `worker.py:376-432`) immediately returns every row the dead
+  worker had claimed (`in_progress` with its `worker_id`) to its queue state. Leases do not
+  have to expire. The whole process exits, so sibling threads of the same worker die with it.
+  Their claims are released the same way.
+- **Periodic recovery.** `run()` also calls `_recover_stale_running_jobs()` at most once every
+  60 s before `fetch_next_job`, for work that a worker which never came back left running.
 
 **D30. Partial related-work fetches are reported (PY-50, PY-51), controller call.**
 - `dl_lit/utils.py` gains `class FetchResult(list)` with the attributes `complete: bool = True`,
@@ -458,15 +590,31 @@ watchdog.
 - `fetch_citing_work_ids`, `fetch_referenced_work_details` and `new_dl.fetch_openalex_batch`
   return one. On an error they set `complete = False` and append the error (redacted as
   today). On `OpenAlexRateLimitExceeded` they also set `quota_exhausted = True`. The batch
-  fetchers add the failed batch's ids to `failed_ids`.
-- Each prints one closing `[OpenAlex WARN] <what> incomplete: <len(self)> fetched;
-  <errors[0]>` line when incomplete.
-- Nothing raises, so enrichment callers keep their behaviour.
-- `backend/scripts/keyword_search.py` (`:297`, `:384`) and `seed_expand.py` (`:135`, `:145`)
-  check `quota_exhausted` and stop early with their existing WARN text, replacing the
-  `except` branches that could never run. They print the incomplete line to stderr otherwise.
-- `ingest_json_directory` prints `[OpenAlex WARN] <len(failed_ids)> of <requested> referenced
-  works could not be fetched.` when `failed_ids` is set.
+  fetchers add the failed batch's ids to `failed_ids`. `FetchResult` compares equal to a
+  plain list.
+- **Status is reported where it is known.** Each fetcher prints one closing
+  `[OpenAlex WARN] <what> incomplete: <len(self)> fetched; <errors[0]>` line when incomplete,
+  on stdout like its existing progress lines. No wrapper has to carry the attributes:
+  `_fetch_upstream_candidates`, `_collect_candidate_ids` and `_extract_openalex_ids` turn
+  results into plain id lists, and deduplication or concatenation drops subclass attributes.
+  Only direct callers read the attributes.
+- **Quota exhaustion propagates as an exception where a caller handles it.** The two
+  OpenAlexScraper fetchers gain `raise_on_quota: bool = False`.
+  - With `True`, they re-raise `OpenAlexRateLimitExceeded` after printing.
+  - `backend/scripts/keyword_search.py` (`:297`, `:384`) and `seed_expand.py` (`:135`,
+    `:145`) pass `raise_on_quota=True`. Their existing `except OpenAlexRateLimitExceeded`
+    branches (`keyword_search.py:374`, `:390`; `seed_expand.py:138`, `:151`) stay. They can
+    now run, and they also still catch the helpers that raise today (for example
+    `fetch_work_by_openalex_id`).
+  - Enrichment callers keep the default `False`, so their behaviour does not change.
+- **`fetch_openalex_batch`** returns a `FetchResult` too. Its only caller,
+  `ingest_json_directory` (`new_dl.py:2334`), uses it directly and prints
+  `[OpenAlex WARN] <len(failed_ids)> of <requested> referenced works could not be fetched.`
+  when `failed_ids` is set.
+- **Rate limiter call fixed.** `fetch_openalex_batch` calls `limiter.wait_if_needed()` with
+  no service name (`new_dl.py:2204`), but the real `ServiceRateLimiter.wait_if_needed`
+  requires one (`utils.py:49`). The call becomes `limiter.wait_if_needed("openalex")`, and the
+  tests use the real limiter class.
 - There are no retries.
 
 **D31. LibGen branches (PY-47).** Both conditions become `getattr(e, "response", None) is
@@ -484,7 +632,7 @@ commits an empty transaction.
 1. Python transactions and exit codes (D24, D25, D26 for PY-52, D32).
 2. Python LLM attempts (D26 for PY-46, D27).
 3. Python worker liveness and partial fetches (D28 to D31).
-4. Backend auth and routes (D16 to D23).
+4. Backend auth and routes (D16 to D23; D18 is the token race found in pre-flight).
 5. Frontend tables and logs (D1 to D7).
 6. Frontend session and failure states (D8 to D15).
 
@@ -501,7 +649,49 @@ commits an empty transaction.
   and the dev stack on `:5175` is not used.
 - Never against `dl_lit_project/data/literature.db`.
 - After merge, check on the dev stack:
-  - a sign-in with a wrong password 11 times gives 429;
-  - a backend restart while the Logs tab is open fills the gap;
+  - 20 sign-ins in parallel stay responsive: other requests answer while the hashes run;
+  - a backend restart while the Logs tab is open shows the "Connection lost" marker, and
+    "Reload logs" replaces the view with the tail;
   - a stopped import shows the counts;
   - an admin overview with the daemon-status route failing shows "—".
+
+## Controller calls (for the owner)
+
+- **D3 (FE-41):** a corpus switch resets the Corpus selection, the stage filter (back to
+  "All") and the expanded row.
+- **D4 (FE-44):** in all-selected mode the count shows selectable rows, not the seed total.
+- **D6 (FE-56):** "Load older" admits only what fits in the 5,000-line view when the answer
+  arrives, and says how many lines it accepted.
+- **D7 (FE-60):** a reconnect adds a "Connection lost <from>–<to>. Lines from that period may
+  be missing." marker with "Reload logs". Filling the gap automatically waits for record ids
+  and a replay cursor in a later phase.
+- **D8 (FE-42):** a failed Kantropos target list is shown as an error and keeps the last view.
+  An empty list says "No upstream corpora are configured.".
+- **D9 (FE-46):** a failed Korpus Management load shows the error with Retry, keeps the last
+  data with a note, and hides the empty-state texts until a load succeeds.
+- **D10 (FE-43):** a non-401 failure at boot keeps the token and offers Retry. There is no
+  automatic retry.
+- **D11 (FE-48):** "Your session has expired. Please sign in again." appears only when no
+  current submission owns the form.
+- **D12 (FE-50):** when the password was saved but signing in failed, the sign-in form opens
+  with the username filled in, and the message says the password was saved.
+- **D14 (FE-58):** a failed global overview shows "—" plus "Global totals could not be
+  loaded.".
+- **D15 / D25 (PY-39):** a stopped import exits 0 with `stopped: true`. The UI shows
+  "Import failed: …" when nothing was saved, or "Import stopped after … (… added, … linked
+  before it)." otherwise.
+- **D17 (BE-40):** hashing runs in a worker pool, 2 at a time with 64 queued. Beyond that,
+  the answer is 503 "The server is busy; try again in a moment." with Retry-After: 5.
+- **D22 (BE-49):** two new Admin settings, "Inline model (cheap)" and "Inline model
+  (fallback)". They take precedence over the env, then today's defaults.
+- **D23 (BE-50):** `/api/corpus` returns at most 1000 rows per request.
+- **D29 (PY-49):** a job or batch past its timeout is marked failed, and the worker exits
+  with 75 to be restarted. This happens only after the watchdog has won ownership. A job
+  hung while holding the DB write lock is retried and logged, never killed blind.
+- **D30 (PY-50, PY-51):** partial OpenAlex fetches are logged as `[OpenAlex WARN]`, with no
+  retries. Quota exhaustion now stops keyword and seed expansion early, as their handlers
+  intended.
+- **Owner/ops follow-up (BE-40):** the login rate limit needs the outer-Caddy →
+  frontend-Caddy → backend forwarding chain configured (`trusted_proxies`, an Express trust
+  list naming the peers, closed alternate ingress on port 4000). It also needs verification
+  on both proxy paths. Not in this phase.
