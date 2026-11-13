@@ -2102,6 +2102,17 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
   if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
+// keyword_search.py and seed_expand.py report an expansion that OpenAlex quota
+// stopped early as `quota_exhausted: true` plus `message` in their JSON (the
+// results fetched before the stop are kept). Logs it and returns the message,
+// or null when the run was not stopped.
+export function openAlexQuotaStop(route, payload) {
+  if (!payload?.quota_exhausted) return null;
+  const message = String(payload.message || 'OpenAlex quota exhausted; expansion stopped early.');
+  console.warn(`[${route}] ${message}`);
+  return message;
+}
+
 // Shared by /api/keyword-search and /api/keyword-search/preview: validates
 // the request body and builds the keyword_search.py argv. `error` is set
 // (and `args` unusable) when a required filter is missing.
@@ -4669,7 +4680,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     const done = spawned.then(({ stdout }) => parseJsonFromOutput(stdout));
     done
       .then(
-        () => null,
+        // The run row carries a quota stop to the UI (status 'done', error = the note).
+        (payload) => { openAlexQuotaStop('/api/keyword-search', payload); return null; },
         (error) => {
           console.error('[/api/keyword-search] Search script failed:', error?.message || error);
           if (!responded) {
@@ -5030,6 +5042,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       // alongside the result rather than thrown.
       let expansionSeeds = [];
       let expansionError = null;
+      let expansionWarning = null;
       let tempExpandSeedPath = null;
       if (expansionAsNewSeeds) {
         try {
@@ -5065,6 +5078,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
             dbPath: DB_PATH,
             corpusId: req.corpusId,
           });
+          expansionWarning = openAlexQuotaStop('/api/seed/sources/:sourceType/:sourceKey/promote', expandResult);
           for (const run of expandResult?.runs || []) {
             const runId = Number(run?.run_id);
             if (!Number.isFinite(runId) || runId <= 0) continue;
@@ -5099,6 +5113,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
             ? ` ${expansionSeeds.length} expansion seed(s) added to Seed for review.`
             : ' No related works were found to seed.'
         : '';
+      const expansionNotice = expansionAsNewSeeds && !expansionError && expansionWarning ? ` ${expansionWarning}` : '';
 
       return res.json({
         success: true,
@@ -5111,10 +5126,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         promotion_mode: expansion.promotionMode,
         expansion_seeds: expansionSeeds,
         expansion_error: expansionError,
+        expansion_warning: expansionWarning,
         backlog: readWorkerBacklogSummary(req.corpusId),
         message: (shouldQueueEnrich || shouldQueueDownload
           ? 'Selected candidates were added to the corpus pipeline. Background workers will continue from DB state.'
-          : 'Selected candidates were already reflected in the corpus state.') + expansionMessage,
+          : 'Selected candidates were already reflected in the corpus state.') + expansionMessage + expansionNotice,
       });
     } catch (error) {
       console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Error:', error);

@@ -273,6 +273,15 @@ def _rank_candidate_ids(ids, related_sort, max_related, mailto):
     return (ranked + unranked)[:max_related]
 
 
+# Reported in the payload (and on the search run) when OpenAlex quota stopped an expansion.
+QUOTA_STOP_MESSAGE = 'OpenAlex quota exhausted; expansion stopped early. Results fetched before the stop are kept.'
+
+
+def _quota_partial(exc):
+    """The results a fetcher had before it raised OpenAlexRateLimitExceeded (D30, S-I1)."""
+    return list(getattr(exc, 'partial', None) or [])
+
+
 def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_sort=DEFAULT_RELATED_SORT):
     cited_by_url = work.get('cited_by_api_url')
     if not cited_by_url:
@@ -294,13 +303,18 @@ def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_
         separator = '&' if '?' in cited_by_url else '?'
         cited_by_url = f'{cited_by_url}{separator}sort={sort_value}'
 
-    citing_items = fetch_citing_work_ids(
-        cited_by_url,
-        rate_limiter,
-        mailto=mailto or 'spott@wzb.eu',
-        max_citations=max_related if max_related and max_related > 0 else 100,
-        raise_on_quota=True,
-    )
+    try:
+        citing_items = fetch_citing_work_ids(
+            cited_by_url,
+            rate_limiter,
+            mailto=mailto or 'spott@wzb.eu',
+            max_citations=max_related if max_related and max_related > 0 else 100,
+            raise_on_quota=True,
+        )
+    except OpenAlexRateLimitExceeded as exc:
+        # The exception travels on; the ids fetched before it go with it.
+        exc.partial_candidate_ids = list(dict.fromkeys(_extract_openalex_ids(_quota_partial(exc))))
+        raise
     return _extract_openalex_ids(citing_items)
 
 
@@ -350,13 +364,15 @@ def _crawl_direction(
     related_sort=DEFAULT_RELATED_SORT,
 ):
     if max_depth <= 0 or not base_items:
-        return {'added': 0, 'processed': 0, 'matched': 0}
+        return {'added': 0, 'processed': 0, 'matched': 0, 'quota_exhausted': False}
 
     queue = deque((item, 0) for item in base_items)
     local_seen = {_normalize_candidate_id(item.get('id')) for item in base_items if _normalize_candidate_id(item.get('id'))}
     processed = 0
     added = 0
     matched = 0
+    # OpenAlex quota ran out: what was fetched up to then is kept, and the crawl stops.
+    quota_stop = False
 
     while queue:
         current, level = queue.popleft()
@@ -374,9 +390,12 @@ def _crawl_direction(
             )
         except OpenAlexRateLimitExceeded as exc:
             print(f"[OpenAlex WARN] Expansion stopped early: {exc}")
-            break
+            quota_stop = True
+            downstream_ids, upstream_ids = [], list(getattr(exc, 'partial_candidate_ids', None) or [])
         candidate_ids = downstream_ids + upstream_ids
         if not candidate_ids:
+            if quota_stop:
+                break
             continue
 
         candidate_norms = {_normalize_candidate_id(item_id) for item_id in candidate_ids if _normalize_candidate_id(item_id)}
@@ -391,7 +410,8 @@ def _crawl_direction(
             )
         except OpenAlexRateLimitExceeded as exc:
             print(f"[OpenAlex WARN] Expansion detail fetch stopped early: {exc}")
-            break
+            quota_stop = True
+            ref_details = _quota_partial(exc)
 
         resolved = set()
         resolved_items = []
@@ -420,11 +440,14 @@ def _crawl_direction(
                 all_items.append(item)
             queue.append((item, level + 1))
             added += 1
+        if quota_stop:
+            break
 
     return {
         'added': added,
         'processed': processed,
         'matched': matched,
+        'quota_exhausted': quota_stop,
     }
 
 
@@ -462,6 +485,7 @@ def expand_references_recursive(
     upstream_added = 0
     processed = 0
     added = 0
+    quota_exhausted = False
 
     if include_downstream:
         downstream_stats = _crawl_direction(
@@ -478,8 +502,9 @@ def expand_references_recursive(
         downstream_added += downstream_stats.get('matched', 0)
         added += downstream_stats.get('added', 0)
         processed += downstream_stats.get('processed', 0)
+        quota_exhausted = bool(downstream_stats.get('quota_exhausted'))
 
-    if include_upstream:
+    if include_upstream and not quota_exhausted:
         upstream_stats = _crawl_direction(
             base_items=all_items,
             max_depth=related_depth_upstream,
@@ -494,13 +519,18 @@ def expand_references_recursive(
         upstream_added += upstream_stats.get('matched', 0)
         added += upstream_stats.get('added', 0)
         processed += upstream_stats.get('processed', 0)
+        quota_exhausted = bool(upstream_stats.get('quota_exhausted'))
 
-    return all_items, {
+    stats = {
         'added': added,
         'processed': processed,
         'downstream_added': downstream_added,
         'upstream_added': upstream_added,
     }
+    if quota_exhausted:
+        stats['quota_exhausted'] = True
+        stats['message'] = QUOTA_STOP_MESSAGE
+    return all_items, stats
 
 
 def _parse_seed_json(seed_json):
@@ -823,7 +853,9 @@ def main():
                 inline_results = [] if truncated else _render_results(records)
             else:
                 inline_results = [] if truncated else _render_stored_results(db, run_id, limit)
-            db.finish_search_run(run_id, 'done')
+            # A quota stop keeps the run 'done' (its results are real) with the stop as its note.
+            quota_note = expansion_stats.get('message') if expansion_stats.get('quota_exhausted') else None
+            db.finish_search_run(run_id, 'done', error=quota_note)
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
         except SystemExit:
             raise
@@ -843,6 +875,9 @@ def main():
         'fetched_count': state['fetched'],
         'truncated_results': truncated,
     }
+    if expansion_stats.get('quota_exhausted'):
+        payload['quota_exhausted'] = True
+        payload['message'] = expansion_stats.get('message') or QUOTA_STOP_MESSAGE
     print(json.dumps(payload))
 
 

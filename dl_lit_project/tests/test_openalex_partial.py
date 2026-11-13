@@ -219,7 +219,8 @@ def test_seed_expand_upstream_quota_passes_through_collect_for_direction(monkeyp
     captured = capsys.readouterr()
     assert "upstream expansion stopped early" in captured.err
     assert recorded and recorded[0].get("raise_on_quota") is True
-    assert json.loads(captured.out.strip().splitlines()[-1]) == {"runs": []}
+    payload = json.loads(captured.out.strip().splitlines()[-1])
+    assert payload["runs"] == [] and payload["quota_exhausted"] is True and "quota" in payload["message"]
 
 
 def test_seed_expand_detail_fetch_stops_on_quota(monkeypatch, tmp_path, capsys):
@@ -251,3 +252,140 @@ def test_fetch_openalex_batch_maps_quota_exhaustion_to_an_incomplete_result(monk
     assert res.failed_ids == [f"W{i}" for i in range(51, 121)]  # quota stops the fetch: batches 2 and 3
     assert len(res) == 50
     assert "[OpenAlex WARN] referenced works incomplete" in capsys.readouterr().out
+
+
+# --- final fix wave S-I1: a quota stop keeps what was fetched and is reported -----------------
+
+def test_quota_exception_carries_the_partial_results(monkeypatch):
+    def fake_request(**kwargs):
+        url = kwargs["url"]
+        if "openalex_id:" in url:
+            ids = _filter_ids(url)
+            if "W51" in ids:
+                raise OpenAlexRateLimitExceeded("daily quota exhausted")
+            return {"results": [_work(i) for i in ids]}
+        if "page2" in url:
+            raise OpenAlexRateLimitExceeded("daily quota exhausted")
+        return {"results": [_work("C1"), _work("C2")], "meta": {"next_page": "https://api.openalex.org/page2"}}
+
+    monkeypatch.setattr(OpenAlexScraper, "openalex_request_json", fake_request)
+    with pytest.raises(OpenAlexRateLimitExceeded) as citing:
+        fetch_citing_work_ids("https://api.openalex.org/works?filter=cites:W1", None, raise_on_quota=True)
+    assert [w["openalex_id"] for w in citing.value.partial] == ["https://openalex.org/C1", "https://openalex.org/C2"]
+    assert citing.value.partial.quota_exhausted is True
+
+    with pytest.raises(OpenAlexRateLimitExceeded) as details:
+        fetch_referenced_work_details([f"W{i}" for i in range(1, 61)], None, raise_on_quota=True)
+    assert len(details.value.partial) == 50 and details.value.partial.failed_ids == [f"W{i}" for i in range(51, 61)]
+
+
+def _quota_with_partial(recorded, partial):
+    def fetch(*args, **kwargs):
+        recorded.append(kwargs)
+        exc = OpenAlexRateLimitExceeded("daily quota exhausted")
+        exc.partial = FetchResult(partial, complete=False, quota_exhausted=True)
+        raise exc
+    return fetch
+
+
+def test_keyword_detail_quota_keeps_partial_details_and_stops_the_crawl(monkeypatch, capsys):
+    mod = _load_script(monkeypatch, "keyword_search", "keyword_search_partial_test")
+    recorded = []
+    monkeypatch.setattr(
+        mod, "fetch_referenced_work_details", _quota_with_partial(recorded, [{"openalex_id": "https://openalex.org/W2", "title": "two"}])
+    )
+    collect_calls = []
+    real_collect = mod._collect_candidate_ids
+    monkeypatch.setattr(mod, "_collect_candidate_ids", lambda *a, **k: collect_calls.append(1) or real_collect(*a, **k))
+    base = [{"id": "https://openalex.org/W1", "display_name": "one", "referenced_works": ["https://openalex.org/W2", "https://openalex.org/W3"]}]
+    all_items = list(base)
+    stats = mod._crawl_direction(base, 3, 10, None, "downstream", all_items, set(), None)
+    assert stats["quota_exhausted"] is True and stats["added"] == 1
+    assert [i["id"] for i in all_items] == ["https://openalex.org/W1", "https://openalex.org/W2"]
+    assert len(collect_calls) == 1  # W2 is kept but not crawled further
+
+
+def test_keyword_citing_quota_keeps_the_partial_candidates(monkeypatch, capsys):
+    mod = _load_script(monkeypatch, "keyword_search", "keyword_search_partial_test")
+    monkeypatch.setattr(
+        mod, "fetch_citing_work_ids", _quota_with_partial([], [{"openalex_id": "https://openalex.org/W5"}])
+    )
+    asked = []
+    monkeypatch.setattr(
+        mod,
+        "fetch_referenced_work_details",
+        lambda ids, *a, **k: asked.append(list(ids)) or FetchResult([{"openalex_id": "https://openalex.org/W5", "title": "c"}]),
+    )
+    base = [{"id": "https://openalex.org/W1", "display_name": "one"}]
+    all_items = list(base)
+    stats = mod._crawl_direction(base, 2, 10, None, "upstream", all_items, set(), None)
+    assert stats["quota_exhausted"] is True and stats["added"] == 1
+    assert asked and "W5" in asked[0][0]
+
+
+def test_keyword_expansion_reports_the_quota_stop_and_skips_the_next_direction(monkeypatch, capsys):
+    mod = _load_script(monkeypatch, "keyword_search", "keyword_search_partial_test")
+    directions = []
+
+    def crawl(**kwargs):
+        directions.append(kwargs["direction"])
+        return {"added": 1, "processed": 1, "matched": 1, "quota_exhausted": True}
+
+    monkeypatch.setattr(mod, "_crawl_direction", crawl)
+    base = [{"id": "https://openalex.org/W1", "display_name": "one"}]
+    _, stats = mod.expand_references_recursive(base, 1, 1, 10, None, include_downstream=True, include_upstream=True)
+    assert directions == ["downstream"]
+    assert stats["quota_exhausted"] is True and stats["message"] == mod.QUOTA_STOP_MESSAGE
+
+
+def test_keyword_search_payload_and_run_report_the_quota_stop(monkeypatch, tmp_path, capsys):
+    mod = _load_script(monkeypatch, "keyword_search", "keyword_search_partial_test")
+    items = [{"id": "https://openalex.org/W1", "display_name": "one"}]
+
+    def fake_search(**kwargs):
+        kwargs["on_page"](items, {"count": 1})
+        return items
+
+    monkeypatch.setattr(mod, "search_openalex", fake_search)
+    monkeypatch.setattr(
+        mod,
+        "expand_references_recursive",
+        lambda base_items, **kwargs: (
+            list(base_items) + [{"id": "https://openalex.org/W2", "display_name": "two"}],
+            {"added": 1, "processed": 1, "downstream_added": 1, "upstream_added": 0, "quota_exhausted": True, "message": mod.QUOTA_STOP_MESSAGE},
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", [
+        "x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--corpus-id", "1", "--include-downstream", "--related-depth", "1",
+    ])
+    mod.main()
+    lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines() if line.startswith("{")]
+    final = lines[-1]
+    assert final["quota_exhausted"] is True and final["message"] == mod.QUOTA_STOP_MESSAGE
+    assert final["fetched_count"] == 2
+    from dl_lit.db_manager import DatabaseManager
+
+    db = DatabaseManager(db_path=tmp_path / "t.db")
+    row = db.conn.execute("SELECT status, error FROM search_runs WHERE id = ?", (final["runId"],)).fetchone()
+    db.close_connection()
+    assert tuple(row) == ("done", mod.QUOTA_STOP_MESSAGE)
+
+
+def test_seed_expand_keeps_partial_details_reports_and_stops(monkeypatch, tmp_path, capsys):
+    mod = _load_script(monkeypatch, "seed_expand", "seed_expand_partial_test")
+    recorded = []
+    monkeypatch.setattr(
+        mod, "fetch_referenced_work_details", _quota_with_partial(recorded, [{"openalex_id": "https://openalex.org/W2", "title": "two"}])
+    )
+    work = {"id": "https://openalex.org/W1", "display_name": "one", "referenced_works": ["https://openalex.org/W2"]}
+    monkeypatch.setattr(mod, "fetch_work_by_openalex_id", lambda *a, **k: dict(work))
+    seeds = [{"openalex_id": "W1", "title": "one"}, {"openalex_id": "W9", "title": "nine"}]
+    monkeypatch.setattr(
+        sys, "argv",
+        ["seed_expand", "--db-path", str(tmp_path / "t.db"), "--seed-json", json.dumps(seeds), "--include-downstream", "--include-upstream"],
+    )
+    mod.main()
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["quota_exhausted"] is True and payload["message"] == mod.QUOTA_STOP_MESSAGE
+    assert [(r["direction"], r["count"]) for r in payload["runs"]] == [("downstream", 1)]
+    assert len(recorded) == 1  # no upstream direction, no second seed after the stop

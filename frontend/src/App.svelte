@@ -67,7 +67,7 @@
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
-  import { seedActivity, seedPromotionStatus } from './lib/seedStatus'
+  import { searchRunSubtitle, seedActivity, seedPromotionStatus } from './lib/seedStatus'
   import {
     workState,
     metadataLabel,
@@ -3145,14 +3145,7 @@
   }
 
   function runSubtitle(source) {
-    const run = source?.run
-    if (!run || !run.status || run.status === 'done') return ''
-    const fetched = Number(run.fetched_count || 0).toLocaleString('en-US')
-    const expected = run.expected_count === null || run.expected_count === undefined ? '…' : Number(run.expected_count).toLocaleString('en-US')
-    if (run.status === 'running') return `fetching ${fetched} of ${expected}`
-    if (run.status === 'failed') return `stopped after ${fetched} of ${expected}: ${run.error || 'unknown error'}`
-    if (run.status === 'cancelled') return `cancelled at ${fetched} of ${expected}`
-    return ''
+    return searchRunSubtitle(source?.run)
   }
 
   async function handleCancelSearch(source) {

@@ -682,6 +682,22 @@ way, so the exit is how the work ends: both workers run under docker's
     `:390`; `seed_expand.py:138`, `:151`) stay. They can now run, and they also still catch
     the helpers that raise today (for example `fetch_work_by_openalex_id`).
   - Enrichment callers keep the default `False`, so their behaviour does not change.
+  - *Amended in the final fix wave (S-I1): quota exhaustion never discards results already
+    fetched.* The re-raised exception carries the fetcher's `FetchResult` as `exc.partial`;
+    `_fetch_upstream_candidates` adds the ids of the citing works fetched before the stop as
+    `exc.partial_candidate_ids` and re-raises. The callers keep them: `_crawl_direction`
+    resolves the partial candidates (or keeps the partial details), adds them, stops the
+    crawl and returns `quota_exhausted: true`; `expand_references_recursive` then skips the
+    other direction and adds `quota_exhausted: true` and `message` to its stats.
+    `seed_expand.py` builds the run from the partial details as usual, expands no further
+    seed or direction, and prints `quota_exhausted: true` and `message` next to `runs`.
+    `keyword_search.py` puts the same two keys in its final payload and finishes the run
+    `done` with the message as its `error` note. The message is
+    `OpenAlex quota exhausted; expansion stopped early. Results fetched before the stop are kept.`
+  - The backend logs the stop (`openAlexQuotaStop`, `console.warn`) in `/api/keyword-search`
+    and in the promote route, which also returns it as `expansion_warning` and appends it to
+    `message`. The frontend shows it through the existing displays: the promotion status
+    becomes a warning, and a search seed's run subtitle shows the note of a `done` run.
 - **`fetch_openalex_batch`** returns a `FetchResult` too. Its only caller,
   `ingest_json_directory` (`new_dl.py:2334`), uses it directly and prints
   `[OpenAlex WARN] <len(failed_ids)> of <requested> referenced works could not be fetched.`
