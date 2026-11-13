@@ -224,3 +224,25 @@ def test_queue_writers_roll_back_non_sqlite_error(db, method):
     assert real.in_transaction is False
     assert db.get_entry_by_id("works", work_id)[column] == "failed"
     assert getattr(db, method)(work_id) == (work_id, None)
+
+
+def test_import_seed_keeps_entry_errors_when_the_commit_fails(tmp_path, monkeypatch, capsys):
+    """D25: a failed chunk drops its counts, but `errors` keeps why its entries were skipped."""
+    mod = _load_import_script(monkeypatch)
+    real_transaction = DatabaseManager.transaction
+
+    @contextmanager
+    def commit_fails(self):
+        with real_transaction(self):
+            yield
+            # A deferred foreign-key violation makes the COMMIT itself fail.
+            self.conn.execute("PRAGMA defer_foreign_keys = ON")
+            self.conn.execute("INSERT INTO search_results (search_run_id, title) VALUES (999, 'orphan')")
+
+    monkeypatch.setattr(DatabaseManager, "transaction", commit_fails)
+    seed = _write_seed(tmp_path, ["oops", {"title": "Good", "year": 2001}])
+    mod.main(["--db-path", str(tmp_path / "lit.db"), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
+    out = _last_json(capsys.readouterr().out)
+    assert out["stopped"] is True and out["error"].startswith("IntegrityError")
+    assert (out["added"], out["skipped"], out["corpus_linked"], out["processed"]) == (0, 0, 0, 0)
+    assert out["errors"] == ["Skipped non-object entry: str"]

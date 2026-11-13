@@ -23,7 +23,8 @@ entries, missing titles, errors); `total` counts the parsed entries. The counts 
 `processed` cover only committed chunks. `stopped` is true when a parse failure, a
 database setup failure or a failed chunk ended the run early, with
 `error: "<ExceptionType>: <message>"`; otherwise `stopped` is false, `processed`
-equals `total` and `error` is null. `errors` holds per-entry messages.
+equals `total` and `error` is null. `errors` holds per-entry messages, including those
+from a chunk that was rolled back.
 """
 
 import argparse
@@ -139,14 +140,15 @@ def main(argv=None):
         for chunk_start in range(0, len(entries), INGEST_COMMIT_CHUNK):
             chunk = entries[chunk_start:chunk_start + INGEST_COMMIT_CHUNK]
             # Chunk-local counts join the totals only once the chunk's transaction committed.
+            # Per-entry messages go straight to `errors`: they explain why entries were skipped
+            # even when the chunk is later rolled back.
             c_added = c_skipped = c_linked = 0
-            c_errors = []
             try:
                 with db.transaction():
                     for raw in chunk:
                         if not isinstance(raw, dict):
                             c_skipped += 1
-                            c_errors.append(f"Skipped non-object entry: {type(raw).__name__}")
+                            errors.append(f"Skipped non-object entry: {type(raw).__name__}")
                             continue
                         entry = dict(raw)
                         if args.source_label and not entry.get("source"):
@@ -160,7 +162,7 @@ def main(argv=None):
                             if not db.conn.in_transaction:
                                 raise  # SQLite dropped the transaction: the whole chunk is lost
                             c_skipped += 1
-                            c_errors.append(str(exc))
+                            errors.append(str(exc))
                             continue
                         if row_id:
                             c_added += 1
@@ -173,7 +175,7 @@ def main(argv=None):
                         else:
                             c_skipped += 1
                             if err and "Title is required" not in err:
-                                c_errors.append(err)
+                                errors.append(err)
             except Exception as exc:
                 # BEGIN, COMMIT or a lost transaction: this chunk is gone, earlier ones stay.
                 error = _describe(exc)
@@ -182,7 +184,6 @@ def main(argv=None):
             skipped += c_skipped
             linked += c_linked
             processed += len(chunk)
-            errors.extend(c_errors)
     finally:
         try:
             db.close_connection()
