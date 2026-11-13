@@ -147,6 +147,7 @@ def main():
                         rate_limiter,
                         mailto=args.mailto or 'spott@wzb.eu',
                         include_links=False,
+                        raise_on_quota=True,
                     )
                 except OpenAlexRateLimitExceeded as exc:
                     print(f'[OpenAlex WARN] {direction} detail fetch stopped early: {exc}', file=sys.stderr)

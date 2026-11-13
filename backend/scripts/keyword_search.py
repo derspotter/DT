@@ -299,6 +299,7 @@ def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_
         rate_limiter,
         mailto=mailto or 'spott@wzb.eu',
         max_citations=max_related if max_related and max_related > 0 else 100,
+        raise_on_quota=True,
     )
     return _extract_openalex_ids(citing_items)
 
@@ -386,6 +387,7 @@ def _crawl_direction(
                 rate_limiter,
                 mailto=mailto or 'spott@wzb.eu',
                 include_links=(level + 1 < max_depth),
+                raise_on_quota=True,
             )
         except OpenAlexRateLimitExceeded as exc:
             print(f"[OpenAlex WARN] Expansion detail fetch stopped early: {exc}")

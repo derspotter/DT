@@ -22,6 +22,23 @@ class OpenAlexRateLimitExceeded(RuntimeError):
     """Raised when OpenAlex is unavailable due to throttling or daily quota exhaustion."""
 
 
+class FetchResult(list):
+    """A list of fetched items that also says whether the fetch was complete.
+
+    ``complete`` is False when any request failed, ``quota_exhausted`` when one failed on
+    OpenAlex quota, ``errors`` holds the (redacted) error messages and ``failed_ids`` the ids
+    of failed batches. It compares equal to a plain list with the same items; copies,
+    slices and concatenations are plain lists without these attributes.
+    """
+
+    def __init__(self, iterable=(), *, complete=True, quota_exhausted=False, errors=None, failed_ids=None):
+        super().__init__(iterable)
+        self.complete = complete
+        self.quota_exhausted = quota_exhausted
+        self.errors = list(errors or [])
+        self.failed_ids = list(failed_ids or [])
+
+
 _missing_openalex_api_key_warned = False
 
 
