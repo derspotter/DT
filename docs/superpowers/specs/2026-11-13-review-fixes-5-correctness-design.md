@@ -261,7 +261,10 @@ after the fix it reports nothing, with no other CSS changed.
 - Capacity is decided again when the answer arrives, because live lines may have filled the
   view meanwhile. `flushLogs()` runs first. Then
   `room = Math.max(0, maxLogHistory - logs.length)`, and the newest `room` of the fetched lines
-  (`entries.slice(-room)`, the ones adjacent to the view) are prepended. Nothing is trimmed.
+  (`room > 0 ? entries.slice(-room) : []`, the ones adjacent to the view) are prepended.
+  Nothing is trimmed. The guard matters, because `entries.slice(-0)` is `slice(0)`, the whole
+  page. When `room` is 0, nothing is prepended, the cursor stays as it was, and the status is
+  the full-view text.
 - The cursor advances only by the accepted count. The lines that were not accepted are
   fetched again by the next request.
 - The status says what happened:
@@ -450,10 +453,18 @@ inside a `try`, which answers `500 { error }` on failure.
   call, and `cheap` for the cheap inline step.
 - The Admin panel's "Advanced" block gets two text inputs, "Inline model (cheap)" and
   "Inline model (fallback)", bound like `gemini_model`.
-- The two model literals appear in `app.js` only inside `extractionInlineModels`. A Jest test
-  reads `src/app.js` and pins that each literal occurs exactly once. That is the route-level
-  check that the route goes through the helper: the extraction route spawns Python and has no
-  test harness.
+- The route reads `extractionInlineModels()` once per request, when the extraction starts.
+  The inline model reaches the APIscraper child as `RAG_FEEDER_API_INLINE_MODEL` through
+  `runApiScraper`'s `inlineModelOverride`, as today.
+- A route-level Jest test proves that the route uses the value of the Admin setting:
+  - It sets distinctive models through `PUT /api/admin/settings`: `inline_cheap_model:
+    'adm-cheap-x'` and `inline_model: 'adm-pro-x'`.
+  - It starts `/api/extract-bibliography` with `RAG_FEEDER_PYTHON` pointing at a fake
+    interpreter. The fake records, for each child it is asked to run, the script name, the
+    args, and the env values `RAG_FEEDER_API_INLINE_MODEL` and `RAG_FEEDER_API_EXTRACT_MODEL`.
+  - It asserts which models each APIscraper child received.
+
+  The plan specifies the fake and its scenarios.
 
 **D23. `/api/corpus` limit clamp (BE-50), controller call.** The route clamps the limit with
 `Math.min(CORPUS_MAX_LIMIT, Math.max(0, coerceInt(req.query?.limit, 200)))`, where
@@ -537,22 +548,34 @@ way, so the exit is how the work ends: both workers run under docker's
 `restart: unless-stopped` in dev and prod.
 
 - **Generation token.** `self._work_lock` (a `threading.Lock`) guards
-  `self._work_generation` (an int) and `self._work_finished` (a bool).
-  - Starting a job or a direct batch takes the lock, increments the generation, sets
-    `_work_finished = False` and passes the new generation to the heartbeat thread.
-  - The work's `finally` sets `_work_finished = True` under the lock before it stops the
-    heartbeat thread.
-  - A deadline callback acts only when, under the lock, its generation is still current and
-    `_work_finished` is false. The 1-second teardown join can therefore leave a late callback
-    running, but that callback cannot touch later work.
+  `self._work_generation` (an int), `self._work_finished` (a bool) and `self._terminal` (a
+  bool, false until a watchdog wins).
+  - `_begin_work()` takes the lock. When `_terminal` is set, it returns `None`. Otherwise it
+    increments the generation, sets `_work_finished = False` and returns the new generation.
+  - The run loop calls `_begin_work()` before it claims anything: before `fetch_next_job` and
+    before each direct cycle, both of which claim rows. On `None` the loop claims nothing and
+    starts no job; it sleeps in 0.5 s steps until the process exits. When no job was found
+    and no direct cycle runs, the loop ends the generation with `_end_work`.
+  - The work's `finally` calls `_end_work(generation)`, which sets `_work_finished = True`
+    under the lock, before it stops the heartbeat thread.
+  - A deadline callback acts only when, under the lock, its generation is still current,
+    `_work_finished` is false and `_terminal` is false. The 1-second teardown join can
+    therefore leave a late callback running, but that callback cannot touch later work.
+- **Ownership holds through exit.** The callback decides and latches inside one `_work_lock`
+  section. Either it wins and sets `_terminal = True` before releasing the lock, or it does
+  not win and changes nothing. After a win, the finishing work can still call `_end_work`
+  (harmless), but `_begin_work` refuses every new generation, so no row is claimed and no job
+  starts until the process exits. The exit itself needs no further generation check: nothing
+  started after the win.
 - **Deadlines.**
   - Jobs: `deadline_seconds = self.job_timeout_seconds` (env
     `RAG_FEEDER_PIPELINE_JOB_TIMEOUT`, default 1800).
   - Direct batches: `env_int("RAG_FEEDER_DIRECT_BATCH_TIMEOUT", self.job_timeout_seconds,
     minimum=60)`.
 - **Job ownership.** Under `_work_lock`, the callback runs a conditional `UPDATE` through
-  `heartbeat_conn` (its own connection, under `heartbeat_lock`). `busy_timeout` is set to
-  1000 ms for this statement and restored afterwards:
+  `heartbeat_conn` (its own connection). It takes `heartbeat_lock` with
+  `acquire(timeout=1.0)`; a timeout counts as not won, and it retries on the next beat.
+  `busy_timeout` is set to 1000 ms for this statement and restored afterwards:
 
   ```sql
   UPDATE pipeline_jobs
@@ -565,17 +588,21 @@ way, so the exit is how the work ends: both workers run under docker's
   - When no row changed, the job was completed or cancelled first. The watchdog stops without
     exiting.
   - When the statement raises `sqlite3.Error` (for example, the hung job holds the write
-    lock), the watchdog has not won. It retries on every beat interval and logs
+    lock), or `heartbeat_lock` cannot be taken within 1 s, the watchdog has not won. It retries on every beat interval and logs
     `job <id> timed out but could not be marked failed: <error>` at most once a minute. It
     never exits without winning.
   - The completion path's `mark_job_completed` is already conditional on `status='running'`.
     When the watchdog has won, completion records nothing, as for a cancelled job.
 - **Batch ownership.** A direct batch has no job row. The watchdog wins when the generation
-  check passes.
-- **Terminal reporting is time-bounded.** After winning, the watchdog makes one attempt at an
-  `error` heartbeat with `state: "job_timeout"` (or `"direct_batch_timeout"`), also with a
-  1000 ms busy timeout, and swallows any error. It then logs and calls `self._exit(75)`
-  (`os._exit` by default). From winning to exit takes at most about 2 s plus the log write.
+  check passes, and it latches `_terminal` in the same lock section.
+- **Terminal reporting is time-bounded.** After the win (and outside `_work_lock`), the
+  watchdog makes one attempt at an `error` heartbeat with `state: "job_timeout"` (or
+  `"direct_batch_timeout"`). The attempt takes `heartbeat_lock` with `acquire(timeout=1.0)` and
+  skips the heartbeat on timeout. It writes with a 1000 ms busy timeout and swallows any
+  error. The watchdog then logs and calls `self._exit(75)` (`os._exit` by default). From the
+  win to the exit, the waits are at most 1 s for `heartbeat_lock` and 1 s for SQLite's busy
+  timeout, about 2 s plus the log write. A test seam `self._after_watchdog_win` (a no-op by
+  default) runs right after the latch, so that a test can suspend the callback there.
 - **Restart.** The restarted worker's start-up recovery (`_recover_stale_running_jobs`, which
   includes `_release_work_claims`, `worker.py:376-432`) immediately returns every row the dead
   worker had claimed (`in_progress` with its `worker_id`) to its queue state. Leases do not
@@ -601,11 +628,18 @@ way, so the exit is how the work ends: both workers run under docker's
 - **Quota exhaustion propagates as an exception where a caller handles it.** The two
   OpenAlexScraper fetchers gain `raise_on_quota: bool = False`.
   - With `True`, they re-raise `OpenAlexRateLimitExceeded` after printing.
-  - `backend/scripts/keyword_search.py` (`:297`, `:384`) and `seed_expand.py` (`:135`,
-    `:145`) pass `raise_on_quota=True`. Their existing `except OpenAlexRateLimitExceeded`
-    branches (`keyword_search.py:374`, `:390`; `seed_expand.py:138`, `:151`) stay. They can
-    now run, and they also still catch the helpers that raise today (for example
-    `fetch_work_by_openalex_id`).
+  - The keyword goes only on the three direct fetcher calls:
+    1. `keyword_search.py:297`, `fetch_citing_work_ids(...)` inside
+       `_fetch_upstream_candidates`;
+    2. `keyword_search.py:384`, `fetch_referenced_work_details(...)` in `_crawl_direction`;
+    3. `seed_expand.py:145`, `fetch_referenced_work_details(...)`.
+  - No wrapper gains a parameter. The exception travels unchanged through
+    `_fetch_upstream_candidates` and `_collect_candidate_ids` (shared by both scripts;
+    `seed_expand.py:31-34` imports it), and also through `seed_expand._collect_for_direction`
+    (`seed_expand.py:72`, called at `:135`), which takes no such keyword and is not changed.
+  - The existing `except OpenAlexRateLimitExceeded` branches (`keyword_search.py:374`,
+    `:390`; `seed_expand.py:138`, `:151`) stay. They can now run, and they also still catch
+    the helpers that raise today (for example `fetch_work_by_openalex_id`).
   - Enrichment callers keep the default `False`, so their behaviour does not change.
 - **`fetch_openalex_batch`** returns a `FetchResult` too. Its only caller,
   `ingest_json_directory` (`new_dl.py:2334`), uses it directly and prints
@@ -686,8 +720,9 @@ commits an empty transaction.
   (fallback)". They take precedence over the env, then today's defaults.
 - **D23 (BE-50):** `/api/corpus` returns at most 1000 rows per request.
 - **D29 (PY-49):** a job or batch past its timeout is marked failed, and the worker exits
-  with 75 to be restarted. This happens only after the watchdog has won ownership. A job
-  hung while holding the DB write lock is retried and logged, never killed blind.
+  with 75 to be restarted. This happens only after the watchdog has won ownership, and from
+  that moment the worker claims no new work. A job hung while holding the DB write lock is
+  retried and logged, never killed blind.
 - **D30 (PY-50, PY-51):** partial OpenAlex fetches are logged as `[OpenAlex WARN]`, with no
   retries. Quota exhaustion now stops keyword and seed expansion early, as their handlers
   intended.
