@@ -3876,6 +3876,8 @@
         extract_model: appSettings?.extract_model?.value || '',
         openai_model: appSettings?.openai_model?.value || '',
         gemini_model: appSettings?.gemini_model?.value || '',
+        inline_cheap_model: appSettings?.inline_cheap_model?.value || '',
+        inline_model: appSettings?.inline_model?.value || '',
       }
     } catch (error) {
       if (error?.status === 401 || epoch !== sessionEpoch) return

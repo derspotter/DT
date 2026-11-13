@@ -99,7 +99,8 @@ export function createPythonRunner({ pythonExec, dlLitProjectDir, repoRoot, dbPa
     });
 
     const finalArgs = [...args];
-    if (corpusId !== undefined && corpusId !== null) {
+    // A caller that already passes --corpus-id keeps its own; never add a second.
+    if (corpusId !== undefined && corpusId !== null && !finalArgs.includes('--corpus-id')) {
       finalArgs.push('--corpus-id', String(corpusId));
     }
 

@@ -156,6 +156,16 @@
             <input type="text" placeholder="model name" bind:value={appSettingsDraft.gemini_model} />
             <span class="muted small">{fallbackHint(appSettings.gemini_model)}</span>
           </label>
+          <label>
+            <span class="muted small">Inline model (cheap)</span>
+            <input type="text" placeholder="model name" bind:value={appSettingsDraft.inline_cheap_model} />
+            <span class="muted small">{fallbackHint(appSettings.inline_cheap_model)}</span>
+          </label>
+          <label>
+            <span class="muted small">Inline model (fallback)</span>
+            <input type="text" placeholder="model name" bind:value={appSettingsDraft.inline_model} />
+            <span class="muted small">{fallbackHint(appSettings.inline_model)}</span>
+          </label>
         {/if}
 
         <button class="primary" type="submit">Save settings</button>
