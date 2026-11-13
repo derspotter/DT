@@ -1,4 +1,5 @@
 import inspect
+import re
 
 from dl_lit.db_manager import DatabaseManager
 
@@ -103,12 +104,15 @@ def _identifier_lookups_that_scan_works(db, run):
     scans = []
     for sql in traced:
         text = " ".join(sql.split())
-        if not text.upper().startswith("SELECT") or "FROM works" not in text:
+        source = re.search(r"\bFROM works(?:\s+(?:AS\s+)?(?!WHERE\b|JOIN\b)(\w+))?", text, re.IGNORECASE)
+        if not text.upper().startswith("SELECT") or not source:
             continue
-        if "normalized_doi =" not in text and "openalex_id =" not in text:
+        if not re.search(r"\b(?:\w+\.)?(?:normalized_doi|openalex_id)\s*=", text):
             continue
+        names = {"works", source.group(1)} - {None}
         plan = " ".join(str(r[-1]) for r in db.conn.execute("EXPLAIN QUERY PLAN " + text))
-        if "SCAN works" in plan:
+        # "SCAN works" on SQLite >= 3.36, "SCAN TABLE works" before; an alias plans as "SCAN w".
+        if any(re.search(rf"\bSCAN (?:TABLE )?{re.escape(n)}\b", plan) for n in names):
             scans.append((text, plan))
     return scans
 
