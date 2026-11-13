@@ -585,6 +585,14 @@ way, so the exit is how the work ends: both workers run under docker's
     `RAG_FEEDER_PIPELINE_JOB_TIMEOUT`, default 1800).
   - Direct batches: `env_int("RAG_FEEDER_DIRECT_BATCH_TIMEOUT", self.job_timeout_seconds,
     minimum=60)`.
+  - *Amended in the final fix wave (K-I1):* scraper jobs (`scrape_eurlex`,
+    `scrape_expert_groups`, `UNWATCHED_JOB_TYPES` in `worker.py`) have no deadline, as on
+    master: their runner keeps its own run record (`scraper_runs`) and has no upper bound. Their
+    heartbeat thread only beats. When start-up recovery (or periodic recovery) requeues a
+    scraper job, it marks that job's `scraper_runs` row (`parameters_json.run_id`) `failed`
+    while it is still `running`, with the error "The worker stopped while this run was in
+    progress; its job was requeued.", so a crashed worker never leaves the run "running"
+    forever. The requeued job sets the run back to `running` when it is picked up again.
 - **Job ownership.** Under `_work_lock`, the callback runs a conditional `UPDATE` through
   `heartbeat_conn` (its own connection). It takes `heartbeat_lock` with
   `acquire(timeout=1.0)`; a timeout counts as not won, and it retries on the next beat.
@@ -605,14 +613,17 @@ way, so the exit is how the work ends: both workers run under docker's
     `job <id> timed out but could not be marked failed: <error>` at most once a minute. It
     never exits without winning.
   - The completion path's `mark_job_completed` is already conditional on `status='running'`.
-    When the watchdog has won, completion records nothing, as for a cancelled job.
+    When the watchdog has won, completion records nothing, as for a cancelled job; the log
+    line then says the job was "timed out by the watchdog", not "already cancelled" (amended,
+    S-M7).
 - **Batch ownership.** A direct batch has no job row. The watchdog wins when the generation
   check passes, and it latches `_terminal` in the same lock section.
 - **Terminal reporting is time-bounded.** After the win (and outside `_work_lock`), the
   watchdog makes one attempt at an `error` heartbeat with `state: "job_timeout"` (or
   `"direct_batch_timeout"`). The attempt takes `heartbeat_lock` with `acquire(timeout=1.0)` and
   skips the heartbeat on timeout. It writes with a 1000 ms busy timeout and swallows any
-  error. The watchdog then logs and calls `self._exit(75)` (`os._exit` by default). From the
+  error, but logs one line `Watchdog: terminal error heartbeat skipped (<reason>).` when it
+  skipped the heartbeat (lock timeout or exception) (amended, S-M6). The watchdog then logs and calls `self._exit(75)` (`os._exit` by default). From the
   win to the exit, the waits are at most 1 s for `heartbeat_lock` and 1 s for SQLite's busy
   timeout, about 2 s plus the log write. A test seam `self._after_watchdog_win` (a no-op by
   default) runs right after the latch, so that a test can suspend the callback there.
@@ -625,9 +636,16 @@ way, so the exit is how the work ends: both workers run under docker's
   once every 60 s before `fetch_next_job`, for work that a worker which never came back left
   running. The periodic call reclaims a job, and releases a work claim, only when its owner is
   positively dead:
-  - the owner's `worker_id` has no `daemon_heartbeat` row at all;
   - its row has status `'stopped'`;
-  - it is a predecessor: our `daemon_name` row now names a different `worker_id`.
+  - *amended in the final fix wave (K-M5):* it is a daemon worker
+    (`daemon:<host>:<pid>:<nonce>`) on this worker's hostname whose pid no longer exists
+    (`os.kill(pid, 0)` raises `ProcessLookupError`). A daemon worker on another host is never
+    reclaimed periodically, and a live pid on this host keeps its work even when it shares
+    our `daemon_name` (a second same-role worker that overwrites the same heartbeat row). The
+    former "predecessor" clause (our `daemon_name` row names a different `worker_id`) and the
+    "no heartbeat row" clause no longer apply to daemon worker ids here; a predecessor that a
+    container restart replaced is start-up recovery's job;
+  - an owner id that is not a daemon worker id and has no `daemon_heartbeat` row at all.
 
   It never reclaims by job age or by heartbeat staleness, and never this worker's own jobs.
   A live owner whose job holds the write lock looks overdue and stale while it still runs: its

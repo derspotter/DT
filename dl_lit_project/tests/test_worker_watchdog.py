@@ -514,9 +514,13 @@ def test_periodic_recovery_reclaims_from_a_stopped_owner(tmp_path, monkeypatch):
 
 
 def test_periodic_recovery_reclaims_from_an_owner_without_heartbeat_row(tmp_path, monkeypatch):
+    # A non-daemon owner id (no host/pid to check) with no heartbeat row at all is dead. A daemon
+    # id is checked by host and pid instead (final fix wave K-M5, tests below).
     mod, owner, other, job_id = _cross_worker_setup(monkeypatch, tmp_path, "running", "-1 seconds")
     c = _connect(tmp_path)
     c.execute("DELETE FROM daemon_heartbeat WHERE worker_id = ?", (owner.worker_id,))
+    c.execute("UPDATE pipeline_jobs SET worker_id = 'legacy-worker' WHERE id = ?", (job_id,))
+    c.execute("UPDATE works SET metadata_claimed_by = 'legacy-worker' WHERE id = 77")
     c.commit()
     c.close()
     other._recover_stale_running_jobs(periodic=True)
@@ -541,3 +545,200 @@ def test_periodic_recovery_never_reclaims_this_workers_own_overdue_job(tmp_path,
     c.close()
     assert daemon._recover_stale_running_jobs(periodic=True) == 0
     assert _job_row(tmp_path, job_id)[:2] == ("running", daemon.worker_id)
+
+
+# --- final fix wave K-I1: scraper jobs have no watchdog; recovery fails their scraper run -------
+
+def _insert_typed_job(tmp_path, job_type, worker_id, params=None):
+    c = _connect(tmp_path)
+    cur = c.execute(
+        "INSERT INTO pipeline_jobs (job_type, status, worker_id, started_at, parameters_json)"
+        " VALUES (?, 'running', ?, datetime('now'), ?)",
+        (job_type, worker_id, json.dumps(params or {})),
+    )
+    c.commit()
+    job_id = cur.lastrowid
+    c.close()
+    return {"id": job_id, "job_type": job_type, "corpus_id": None, "params": params or {}}
+
+
+@pytest.mark.parametrize("job_type", ["scrape_eurlex", "scrape_expert_groups"])
+def test_scraper_jobs_are_not_watched(tmp_path, monkeypatch, job_type):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    job = _insert_typed_job(tmp_path, job_type, daemon.worker_id, {"run_id": 1})
+    gen = daemon._begin_work()
+    handle = daemon._start_job_heartbeat(job, generation=gen)
+    try:
+        time.sleep(1.0)  # well past the 0.3 s job timeout
+        assert exits == []
+        assert _job_row(tmp_path, job["id"])[0] == "running"
+        assert daemon._terminal is False
+    finally:
+        _stop(handle)
+
+
+def _scraper_run(tmp_path, run_id, status="running"):
+    from dl_lit.scraper_lab import ensure_scraper_schema
+
+    c = _connect(tmp_path)
+    ensure_scraper_schema(c)
+    c.execute("INSERT INTO scraper_runs (id, source_type, status) VALUES (?, 'eurlex', ?)", (run_id, status))
+    c.commit()
+    c.close()
+
+
+def _scraper_run_row(tmp_path, run_id):
+    c = _connect(tmp_path)
+    row = c.execute("SELECT status, error, finished_at FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()
+    c.close()
+    return row
+
+
+def test_startup_recovery_fails_the_scraper_run_of_a_recovered_job(tmp_path, monkeypatch):
+    mod, old, _ = _daemon(monkeypatch, tmp_path)
+    _scraper_run(tmp_path, 5)
+    _scraper_run(tmp_path, 6)  # its job is not recovered: it stays as it is
+    job = _insert_typed_job(tmp_path, "scrape_eurlex", old.worker_id, {"run_id": 5})
+
+    mod2, new, _ = _daemon(monkeypatch, tmp_path)
+    assert _job_row(tmp_path, job["id"])[:2] == ("pending", None)
+    status, error, finished_at = _scraper_run_row(tmp_path, 5)
+    assert status == "failed" and "worker stopped" in error and finished_at
+    assert _scraper_run_row(tmp_path, 6)[0] == "running"
+
+
+def test_startup_recovery_without_scraper_tables_still_recovers(tmp_path, monkeypatch):
+    mod, old, _ = _daemon(monkeypatch, tmp_path)
+    job = _insert_typed_job(tmp_path, "scrape_eurlex", old.worker_id, {"run_id": 5})
+    mod2, new, _ = _daemon(monkeypatch, tmp_path)
+    assert _job_row(tmp_path, job["id"])[:2] == ("pending", None)
+
+
+# --- final fix wave K-M5: periodic predecessor = same host and a dead pid ----------------------
+
+def _dead_pid():
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.Popen([_sys.executable, "-c", "pass"])
+    proc.wait()
+    return proc.pid
+
+
+def _same_role_owner(monkeypatch, tmp_path, owner_id, *, owner_beat_last):
+    """Another enrich worker `owner_id` holds a running job and a claim; `daemon` (enrich) runs
+    its periodic recovery. owner_beat_last: the shared 'enrich' heartbeat row names the owner."""
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path, job_timeout=60)
+    job = _insert_typed_job(tmp_path, "enrich", owner_id)
+    c = _connect(tmp_path)
+    c.execute(
+        "INSERT INTO works (id, title, metadata_status, metadata_claimed_by, metadata_claimed_at, metadata_lease_expires_at)"
+        " VALUES (77, 'w', 'in_progress', ?, 1, 9999999999)",
+        (owner_id,),
+    )
+    if owner_beat_last:
+        c.execute("UPDATE daemon_heartbeat SET worker_id = ? WHERE daemon_name = 'enrich'", (owner_id,))
+    c.commit()
+    c.close()
+    return mod, daemon, job
+
+
+@pytest.mark.parametrize("owner_beat_last", [True, False], ids=["row-names-owner", "row-names-us"])
+def test_periodic_recovery_keeps_a_live_same_host_same_role_workers_job(tmp_path, monkeypatch, owner_beat_last):
+    import os
+    import socket
+
+    owner_id = f"daemon:{socket.gethostname()}:{os.getppid()}:abc123"  # a live process on this host
+    mod, daemon, job = _same_role_owner(monkeypatch, tmp_path, owner_id, owner_beat_last=owner_beat_last)
+    assert daemon._recover_stale_running_jobs(periodic=True) == 0
+    assert _job_row(tmp_path, job["id"])[:2] == ("running", owner_id)
+    assert _claim_row(tmp_path) == ("in_progress", owner_id)
+
+
+@pytest.mark.parametrize("owner_beat_last", [True, False], ids=["row-names-owner", "row-names-us"])
+def test_periodic_recovery_never_reclaims_another_hosts_worker(tmp_path, monkeypatch, owner_beat_last):
+    owner_id = f"daemon:some-other-host:{_dead_pid()}:abc123"
+    mod, daemon, job = _same_role_owner(monkeypatch, tmp_path, owner_id, owner_beat_last=owner_beat_last)
+    assert daemon._recover_stale_running_jobs(periodic=True) == 0
+    assert _job_row(tmp_path, job["id"])[:2] == ("running", owner_id)
+    assert _claim_row(tmp_path) == ("in_progress", owner_id)
+
+
+def test_periodic_recovery_reclaims_a_same_host_predecessor_with_a_dead_pid(tmp_path, monkeypatch):
+    import socket
+
+    owner_id = f"daemon:{socket.gethostname()}:{_dead_pid()}:abc123"
+    mod, daemon, job = _same_role_owner(monkeypatch, tmp_path, owner_id, owner_beat_last=True)
+    assert daemon._recover_stale_running_jobs(periodic=True) == 1
+    assert _job_row(tmp_path, job["id"])[:2] == ("pending", None)
+    assert _claim_row(tmp_path) == ("pending", None)
+
+
+# --- final fix wave S-M6, S-M7: watchdog log lines ----------------------------------------------
+
+def _capture_log(mod, monkeypatch):
+    lines = []
+    real = mod.log
+    monkeypatch.setattr(mod, "log", lambda msg: (lines.append(msg), real(msg)))
+    return lines
+
+
+def test_skipped_terminal_heartbeat_is_logged_on_lock_timeout(tmp_path, monkeypatch):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    lines = _capture_log(mod, monkeypatch)
+    monkeypatch.setattr(mod, "WATCHDOG_LOCK_TIMEOUT_SECONDS", 0.05)
+    holder_ready, release = threading.Event(), threading.Event()
+
+    def hold():
+        with daemon.heartbeat_lock:
+            holder_ready.set()
+            release.wait(5)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert holder_ready.wait(2)
+    try:
+        daemon._finish_after_win({"state": "job_timeout"}, "Job 1 timed out")
+    finally:
+        release.set()
+        t.join(5)
+    assert exits == [75]
+    assert any("terminal error heartbeat skipped" in line and "lock" in line for line in lines)
+
+
+def test_skipped_terminal_heartbeat_is_logged_on_exception(tmp_path, monkeypatch):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    lines = _capture_log(mod, monkeypatch)
+
+    class Broken(_ConnProxy):
+        def execute(self, sql, *args):
+            if "PRAGMA busy_timeout" in sql:
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._conn.execute(sql, *args)
+
+    daemon.heartbeat_conn = Broken(daemon.heartbeat_conn)
+    daemon._finish_after_win({"state": "job_timeout"}, "Job 1 timed out")
+    assert exits == [75]
+    assert any("terminal error heartbeat skipped" in line and "disk I/O error" in line for line in lines)
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed"])
+def test_completion_after_a_watchdog_win_says_timed_out(tmp_path, monkeypatch, outcome):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path, job_timeout=60)
+    lines = _capture_log(mod, monkeypatch)
+    job = _insert_typed_job(tmp_path, "scrape_eurlex", daemon.worker_id, {"run_id": 1})
+
+    def run_scraper(*args, **kwargs):
+        # The watchdog wins while the job is still running.
+        assert daemon._claim_timed_out_job(job["id"], "timed out after 60s; worker restarted") is True
+        daemon._terminal = True
+        if outcome == "failed":
+            raise RuntimeError("late failure")
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "execute_scraper_job", run_scraper)
+    gen = daemon._begin_work()
+    daemon._process_job(job, generation=gen)
+    assert _job_row(tmp_path, job["id"])[0] == "failed"
+    assert any("timed out by the watchdog" in line for line in lines)
+    assert not any("already cancelled" in line for line in lines)

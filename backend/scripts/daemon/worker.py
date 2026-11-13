@@ -161,6 +161,9 @@ WATCHDOG_BUSY_TIMEOUT_MS = 1000
 WATCHDOG_LOCK_TIMEOUT_SECONDS = 1.0
 # run() re-runs stale-job recovery at most this often.
 RECOVERY_INTERVAL_SECONDS = 60
+# Job types whose runner keeps its own run record (scraper_runs): the watchdog never times them
+# out (no deadline, as before D29), and a recovered job's run record is marked failed.
+UNWATCHED_JOB_TYPES = frozenset({"scrape_eurlex", "scrape_expert_groups"})
 
 _EXPANSION_NOTICE_LOGGED = False
 
@@ -425,6 +428,10 @@ class PipelineDaemon:
             "job_type": str(job["job_type"]),
             "corpus_id": job.get("corpus_id"),
         }
+        if str(job["job_type"]) in UNWATCHED_JOB_TYPES:
+            # Beats only: a scraper run has no upper bound and its run record would stay
+            # "running" if the worker exited under it.
+            return self._start_heartbeat_thread(details, name=f"job-heartbeat-{job['id']}", generation=generation)
         deadline = self.job_timeout_seconds
         return self._start_heartbeat_thread(
             details,
@@ -532,20 +539,25 @@ class PipelineDaemon:
     def _finish_after_win(self, details: dict, message: str) -> None:
         """Outside _work_lock, after the latch: one bounded error heartbeat, a log line, exit."""
         self._after_watchdog_win()
-        if self.heartbeat_lock.acquire(timeout=WATCHDOG_LOCK_TIMEOUT_SECONDS):
-            try:
-                conn = self.heartbeat_conn
-                previous_busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                conn.execute(f"PRAGMA busy_timeout = {WATCHDOG_BUSY_TIMEOUT_MS}")
-                try:
-                    self._heartbeat("error", details, force=True)
-                finally:
-                    conn.execute(f"PRAGMA busy_timeout = {int(previous_busy)}")
-            except Exception:  # noqa: BLE001 - the exit must not wait on reporting
-                pass
-            finally:
-                self.heartbeat_lock.release()
+        skipped = None
         try:
+            if self.heartbeat_lock.acquire(timeout=WATCHDOG_LOCK_TIMEOUT_SECONDS):
+                try:
+                    conn = self.heartbeat_conn
+                    previous_busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    conn.execute(f"PRAGMA busy_timeout = {WATCHDOG_BUSY_TIMEOUT_MS}")
+                    try:
+                        self._heartbeat("error", details, force=True)
+                    finally:
+                        conn.execute(f"PRAGMA busy_timeout = {int(previous_busy)}")
+                except Exception as exc:  # noqa: BLE001 - the exit must not wait on reporting
+                    skipped = f"{exc.__class__.__name__}: {exc}"
+                finally:
+                    self.heartbeat_lock.release()
+            else:
+                skipped = f"heartbeat lock not free within {WATCHDOG_LOCK_TIMEOUT_SECONDS:g}s"
+            if skipped:
+                log(f"Watchdog: terminal error heartbeat skipped ({skipped}).")
             log(message)
         finally:
             self._exit(JOB_TIMEOUT_EXIT_CODE)
@@ -608,11 +620,14 @@ class PipelineDaemon:
                             AND datetime(last_seen_at) > datetime('now', ?)
                     )
                )
+            RETURNING id, job_type, parameters_json
             """,
             role_params
             + [f"-{self.job_timeout_seconds} seconds", self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
         )
-        requeued = int(cur.rowcount or 0)
+        recovered = cur.fetchall()
+        requeued = len(recovered)
+        self._fail_scraper_runs_of(recovered)
         self.db.conn.commit()
         if requeued:
             log(f"Recovered {requeued} abandoned pipeline job(s) for role '{self.role}'.")
@@ -629,21 +644,82 @@ class PipelineDaemon:
             log(f"Released {released} work claim(s) held by dead workers.")
         return requeued
 
-    # An owner is positively dead when its worker_id has no heartbeat row at all, its row says
-    # 'stopped', or it is our predecessor (our daemon_name row names a different worker_id). The
-    # SQL uses the placeholder `owner`, and the params are [daemon_name, worker_id, worker_id].
-    _DEAD_OWNER_SQL = (
-        "owner IS NOT NULL AND owner != ? AND ("
-        " owner NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL)"
-        " OR owner IN (SELECT worker_id FROM daemon_heartbeat WHERE status = 'stopped' AND worker_id IS NOT NULL)"
-        " OR owner IN (SELECT worker_id FROM daemon_heartbeat WHERE daemon_name = ? AND worker_id IS NOT NULL AND worker_id != ?)"
-        ")"
-    )
+    def _fail_scraper_runs_of(self, recovered_jobs) -> None:
+        """Mark the scraper_runs row of every recovered scraper job failed (K-I1).
+
+        `recovered_jobs` are (id, job_type, parameters_json) rows. The requeued job sets its run
+        back to 'running' when it is picked up again. Runs inside the caller's transaction.
+        """
+        run_ids = []
+        for _job_id, job_type, params_json in recovered_jobs:
+            if job_type not in UNWATCHED_JOB_TYPES:
+                continue
+            try:
+                run_id = int((json.loads(params_json or "{}") or {}).get("run_id") or 0)
+            except (TypeError, ValueError, AttributeError):
+                run_id = 0
+            if run_id > 0:
+                run_ids.append(run_id)
+        if not run_ids:
+            return
+        try:
+            cur = self.db.conn.execute(
+                f"""
+                UPDATE scraper_runs
+                   SET status = 'failed', error = ?, finished_at = CURRENT_TIMESTAMP
+                 WHERE status = 'running' AND id IN ({','.join('?' for _ in run_ids)})
+                """,
+                ["The worker stopped while this run was in progress; its job was requeued."] + run_ids,
+            )
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e).lower():
+                return
+            raise
+        if cur.rowcount:
+            log(f"Marked {int(cur.rowcount)} interrupted scraper run(s) failed: {run_ids}.")
+
+    def _periodic_owner_is_dead(self):
+        """The owner test of periodic recovery, as a function of a worker_id (1 = dead).
+
+        Positively dead: its heartbeat row says 'stopped'; or it is a daemon worker
+        (daemon:<host>:<pid>:<nonce>) on this host whose pid is gone; or a non-daemon owner
+        without a heartbeat row. A daemon worker on another host is never reclaimed here, and
+        neither is a live pid on this host, even when it shares our daemon_name (a second
+        same-role worker). A predecessor that a container restart replaced (same hostname, PID 1
+        again) is start-up recovery's job.
+        """
+        beats = {
+            wid: status
+            for wid, status in self.db.conn.execute(
+                "SELECT worker_id, status FROM daemon_heartbeat WHERE worker_id IS NOT NULL"
+            ).fetchall()
+        }
+        host = socket.gethostname()
+
+        def dead(owner):
+            if owner is None or owner == self.worker_id:
+                return 0
+            if beats.get(owner) == "stopped":
+                return 1
+            parts = str(owner).split(":")
+            if len(parts) != 4 or parts[0] != "daemon" or not parts[2].isdigit():
+                return 0 if owner in beats else 1
+            if parts[1] != host:
+                return 0
+            try:
+                os.kill(int(parts[2]), 0)
+            except ProcessLookupError:
+                return 1
+            except OSError:
+                return 0  # exists, but not ours to signal
+            return 0
+
+        return dead
 
     def _recover_dead_owners_only(self) -> int:
         """Periodic recovery: requeue jobs and release work claims of positively dead owners."""
         role_sql, role_params = self._role_job_filter()
-        params = [self.worker_id, self.daemon_name, self.worker_id]
+        self.db.conn.create_function("rf_owner_dead", 1, self._periodic_owner_is_dead())
         cur = self.db.conn.cursor()
         cur.execute(
             f"""
@@ -651,17 +727,18 @@ class PipelineDaemon:
                SET status = 'pending', started_at = NULL, worker_id = NULL
              WHERE status = 'running'
                {role_sql}
-               AND {self._DEAD_OWNER_SQL.replace("owner", "worker_id")}
+               AND rf_owner_dead(worker_id) = 1
+            RETURNING id, job_type, parameters_json
             """,
-            role_params + params,
+            role_params,
         )
-        requeued = int(cur.rowcount or 0)
+        recovered = cur.fetchall()
+        requeued = len(recovered)
+        self._fail_scraper_runs_of(recovered)
         self.db.conn.commit()
         if requeued:
             log(f"Recovered {requeued} pipeline job(s) of dead workers for role '{self.role}'.")
-        released = self._release_work_claims(
-            where_claimed_by=self._DEAD_OWNER_SQL.replace("owner", "claimed_by"), params=params
-        )
+        released = self._release_work_claims(where_claimed_by="rf_owner_dead(claimed_by) = 1", params=[])
         if released:
             log(f"Released {released} work claim(s) held by dead workers.")
         return requeued
@@ -1384,6 +1461,8 @@ class PipelineDaemon:
             updated = self.mark_job_completed(job["id"], result or {})
             if updated:
                 log(f"Successfully completed job {job['id']}")
+            elif self._terminal:
+                log(f"Job {job['id']} finished execution after it was timed out by the watchdog; completion not recorded.")
             else:
                 log(f"Job {job['id']} finished execution but was already cancelled; completion not recorded.")
             self._heartbeat(
@@ -1402,7 +1481,9 @@ class PipelineDaemon:
             err_msg = traceback.format_exc()
             log(f"Job {job['id']} failed: {e}")
             updated = self.mark_job_failed(job["id"], err_msg)
-            if not updated:
+            if not updated and self._terminal:
+                log(f"Job {job['id']} failure not recorded because it was already timed out by the watchdog.")
+            elif not updated:
                 log(f"Job {job['id']} failure not recorded because it was already cancelled.")
             self._heartbeat(
                 "error",
