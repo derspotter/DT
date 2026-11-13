@@ -5672,6 +5672,13 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     const args = ['--db-path', DB_PATH, '--file', filePath, '--kind', kind, '--source-label', filename];
     try {
       const result = await runPythonJson(INGEST_IMPORT_SEED_SCRIPT, args, { dbPath: DB_PATH, corpusId: req.corpusId });
+      if (result?.stopped) {
+        // The summary goes to a session-local upload row; this is the lasting trace.
+        console.error(
+          `[/api/ingest/import-seed] stopped: ${filename} (corpus ${req.corpusId}): processed ${result.processed} of ${result.total}, `
+            + `${result.added} added, ${result.corpus_linked} linked: ${result.error}`
+        );
+      }
       return res.json(result);
     } catch (error) {
       console.error('[/api/ingest/import-seed] Error:', error);

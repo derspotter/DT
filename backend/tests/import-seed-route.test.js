@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import request from 'supertest'
+import { jest } from '@jest/globals'
 
 const VENV_PYTHON = '/home/jay/DT/venv/bin/python'
 
@@ -60,7 +61,19 @@ describe('POST /api/ingest/import-seed', () => {
 
   test('a malformed seed file answers the stopped summary, not a 500', async () => {
     fs.writeFileSync(path.join(uploadsDir, 'bad.json'), '{not json')
-    const res = await importSeed({ filename: 'bad.json', kind: 'json' })
+    const logged = jest.spyOn(console, 'error').mockImplementation(() => {})
+    let res
+    try {
+      res = await importSeed({ filename: 'bad.json', kind: 'json' })
+      // S-M5: a stopped import leaves a server log line with stopped/processed/error.
+      const line = logged.mock.calls.map((args) => args.join(' ')).find((text) => text.includes('[/api/ingest/import-seed] stopped'))
+      expect(line).toBeTruthy()
+      expect(line).toContain('bad.json')
+      expect(line).toContain('processed 0 of 0')
+      expect(line).toContain('JSONDecodeError: Failed to parse json:')
+    } finally {
+      logged.mockRestore()
+    }
     expect(res.status).toBe(200)
     expect(res.body.stopped).toBe(true)
     expect(res.body.processed).toBe(0)
@@ -73,7 +86,14 @@ describe('POST /api/ingest/import-seed', () => {
       path.join(uploadsDir, 'good.json'),
       JSON.stringify([{ title: 'Seed Route One' }, { title: 'Seed Route Two', year: 2020 }])
     )
-    const res = await importSeed({ filename: 'good.json', kind: 'json' })
+    const logged = jest.spyOn(console, 'error').mockImplementation(() => {})
+    let res
+    try {
+      res = await importSeed({ filename: 'good.json', kind: 'json' })
+      expect(logged.mock.calls.some((args) => String(args[0]).includes('[/api/ingest/import-seed] stopped'))).toBe(false)
+    } finally {
+      logged.mockRestore()
+    }
     expect(res.status).toBe(200)
     expect(res.body.stopped).toBe(false)
     expect(res.body.error).toBeNull()
