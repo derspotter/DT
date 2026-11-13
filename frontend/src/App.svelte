@@ -1654,12 +1654,14 @@
 
   async function handleLogin(event) {
     event?.preventDefault?.()
+    // Single-flight: a second submit (Enter, a double click) is ignored.
+    if (authFormSubmit.login) return
     authError = ''
     // A newer sign-in or a sign-out takes this attempt over; an expired token
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
-    const submit = beginAuthSubmit()
+    const submit = beginAuthSubmit('login')
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
       if (attempt !== signInEpoch) return
@@ -1667,6 +1669,7 @@
       attempt = signInEpoch
       submit.attempt = attempt
       epoch = sessionEpoch
+      submit.session = epoch
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -1718,6 +1721,8 @@
 
   async function handleAcceptInvite(event) {
     event?.preventDefault?.()
+    // Single-flight: a second submit (Enter, a double click) is ignored.
+    if (authFormSubmit.acceptInvite) return
     authError = ''
     authInfo = ''
     if (!authFlowToken) {
@@ -1739,15 +1744,16 @@
     // Set once the password call succeeded: a later failure is a failed
     // sign-in, not a failed link.
     let savedUsername = null
-    const submit = beginAuthSubmit()
+    const submit = beginAuthSubmit('acceptInvite')
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
-      if (attempt !== signInEpoch) return
+      if (!authSubmitOwns(submit)) return
       savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
       submit.attempt = attempt
       epoch = sessionEpoch
+      submit.session = epoch
       // A 401 from any load of the new session (they swallow it) expired
       // the session: the password is saved all the same.
       const lostSession = () => {
@@ -1787,6 +1793,8 @@
 
   async function handleResetPassword(event) {
     event?.preventDefault?.()
+    // Single-flight: a second submit (Enter, a double click) is ignored.
+    if (authFormSubmit.resetPassword) return
     authError = ''
     authInfo = ''
     if (!authFlowToken) {
@@ -1808,15 +1816,16 @@
     // Set once the password call succeeded: a later failure is a failed
     // sign-in, not a failed link.
     let savedUsername = null
-    const submit = beginAuthSubmit()
+    const submit = beginAuthSubmit('resetPassword')
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
-      if (attempt !== signInEpoch) return
+      if (!authSubmitOwns(submit)) return
       savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
       submit.attempt = attempt
       epoch = sessionEpoch
+      submit.session = epoch
       // A 401 from any load of the new session (they swallow it) expired
       // the session: the password is saved all the same.
       const lostSession = () => {
@@ -1888,13 +1897,31 @@
   // even before its `finally` runs.
   const authSubmits = new Set()
   let authSubmitSeq = 0
-  function beginAuthSubmit() {
-    const submit = { attempt: signInEpoch, seq: ++authSubmitSeq }
+  // The sign-in, accept-invite and reset-password forms are single-flight:
+  // the submit in flight per form (null: none). Its button is disabled and
+  // its handler ignores a second call. Cleared in the submit's `finally`, by
+  // a sign-out, and when the session the submit started ends.
+  let authFormSubmit = { login: null, acceptInvite: null, resetPassword: null }
+  function beginAuthSubmit(form = null) {
+    const submit = { attempt: signInEpoch, seq: ++authSubmitSeq, form, session: null }
     authSubmits.add(submit)
+    if (form) authFormSubmit = { ...authFormSubmit, [form]: submit }
     return submit
   }
   function endAuthSubmit(submit) {
     authSubmits.delete(submit)
+    releaseAuthForms((entry) => entry === submit)
+  }
+  function releaseAuthForms(matches) {
+    const next = { ...authFormSubmit }
+    let changed = false
+    for (const form of Object.keys(next)) {
+      if (next[form] && matches(next[form])) {
+        next[form] = null
+        changed = true
+      }
+    }
+    if (changed) authFormSubmit = next
   }
   function authSubmitOwns(submit) {
     return submit.attempt === signInEpoch && submit.seq === authSubmitSeq
@@ -1925,6 +1952,7 @@
 
   function handleLogout() {
     signInEpoch += 1
+    releaseAuthForms(() => true)
     endSession()
   }
 
@@ -1932,6 +1960,10 @@
     // During boot the sign-in forms are already up, so an error on screen is
     // the outcome of a submit, not of the session that is ending.
     const keepError = authStatus === 'loading'
+    // A submit whose session this is gives its form back (a submit that has
+    // not started a session yet, e.g. under a stale boot token, keeps it).
+    const endingSession = sessionEpoch
+    releaseAuthForms((submit) => submit.session === endingSession)
     sessionEpoch += 1
     authBootRetry = false
     disconnectLogs()
@@ -4595,7 +4627,7 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
-          <button type="submit">Activate account</button>
+          <button type="submit" disabled={Boolean(authFormSubmit.acceptInvite)}>Activate account</button>
         </form>
       {:else if authFlow === 'reset-password'}
         <h1>Reset password</h1>
@@ -4615,7 +4647,7 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
-          <button type="submit">Save password</button>
+          <button type="submit" disabled={Boolean(authFormSubmit.resetPassword)}>Save password</button>
         </form>
       {:else if authFlow === 'forgot-password'}
         <h1>Forgot password</h1>
@@ -4658,7 +4690,7 @@
             <button type="button" class="secondary" data-testid="auth-retry" on:click={() => bootstrapAuth()}>Retry</button>
           {/if}
           <div class="auth-actions">
-            <button type="submit">Sign in</button>
+            <button type="submit" disabled={Boolean(authFormSubmit.login)}>Sign in</button>
             <a href="#/forgot-password" class="text-link">Forgot password?</a>
           </div>
         </form>

@@ -1325,3 +1325,73 @@ for (const { flow, endpoint, button } of signInLinks) {
     await expect(form.getByLabel('Username')).toHaveValue('carol')
   })
 }
+
+test('a second sign-in submit while one is in flight is ignored', async ({ page }) => {
+  const firstAnswer = deferred()
+  let loginRequests = 0
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/login') {
+      loginRequests += 1
+      if (loginRequests === 1) {
+        await firstAnswer.promise
+        return fulfil(route, { error: 'Invalid credentials' }, 401)
+      }
+      // A duplicate would answer later with a server error.
+      return fulfil(route, { error: 'Bad gateway' }, 502)
+    }
+    return fulfil(route, { error: 'Unauthorized' }, 401)
+  })
+  await page.goto('/#/workspace')
+  const form = page.getByTestId('login-form')
+  await logIn(page, 'alice')
+  await expect.poll(() => loginRequests).toBe(1)
+  await expect(form.getByRole('button', { name: 'Sign in' })).toBeDisabled()
+  // Enter in a field (the form's own submit) bypasses the button.
+  await form.evaluate((element: HTMLFormElement) => element.requestSubmit())
+  await page.waitForTimeout(200)
+  expect(loginRequests).toBe(1)
+  firstAnswer.resolve()
+  await expect(form.locator('.error')).toHaveText('Invalid credentials')
+  await page.waitForTimeout(300)
+  await expect(form.locator('.error')).toHaveText('Invalid credentials')
+  expect(loginRequests).toBe(1)
+  await expect(form.getByRole('button', { name: 'Sign in' })).toBeEnabled()
+})
+
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`a second ${flow} submit while one is in flight is ignored and leaves no token`, async ({ page }) => {
+    const firstAnswer = deferred()
+    let linkRequests = 0
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === endpoint) {
+        linkRequests += 1
+        if (linkRequests === 1) {
+          await firstAnswer.promise
+          return fulfil(route, { token: 'token-new', user: { id: 7, username: 'neu', last_corpus_id: 1, is_admin: false } })
+        }
+        return fulfil(route, { error: 'Link is invalid or expired' }, 400)
+      }
+      if (path === '/api/auth/me') return fulfil(route, { error: 'boom' }, 500)
+      return workspaceDefaults(path, route)
+    })
+    await page.goto(`/#/${flow}?token=t`)
+    await submitPassword(page, button)
+    await expect.poll(() => linkRequests).toBe(1)
+    const submitButton = page.getByRole('button', { name: button })
+    await expect(submitButton).toBeDisabled()
+    await page.locator('.login-form').evaluate((element: HTMLFormElement) => element.requestSubmit())
+    await page.waitForTimeout(200)
+    expect(linkRequests).toBe(1)
+    firstAnswer.resolve()
+    const form = page.getByTestId('login-form')
+    await expect(form.locator('.error'))
+      .toHaveText('Your password was saved, but signing in failed (boom). Sign in with your new password.')
+    await expect(form.getByLabel('Username')).toHaveValue('neu')
+    expect(await storedToken(page)).toBeNull()
+    expect(linkRequests).toBe(1)
+  })
+}
