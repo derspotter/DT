@@ -130,3 +130,24 @@ test('app.js no longer imports spawnSync and has no PYTHONPATH literal', () => {
   expect(src).not.toMatch(/\bspawnSync\b/)
   expect(src).not.toMatch(/PYTHONPATH:/)
 })
+
+test('spawnPython does not add a second --corpus-id', async () => {
+  const script = writeScript('print_argv.py', [
+    'import json, sys',
+    'print(json.dumps(sys.argv[1:]))',
+  ].join('\n'))
+  const runner = makeRunner()
+  const given = JSON.parse((await runner.spawnPython(script, ['--corpus-id', '5'], { corpusId: 5 }).done).stdout)
+  expect(given.filter((a) => a === '--corpus-id')).toHaveLength(1)
+  expect(given).toEqual(['--corpus-id', '5'])
+  const appended = JSON.parse((await runner.spawnPython(script, ['x'], { corpusId: 5 }).done).stdout)
+  expect(appended).toEqual(['x', '--corpus-id', '5'])
+})
+
+test('the import-seed route leaves --corpus-id to spawnPython', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'app.js'), 'utf8')
+  const start = src.indexOf("app.post('/api/ingest/import-seed'")
+  expect(start).toBeGreaterThan(0)
+  const body = src.slice(start, src.indexOf('app.post(', start + 10))
+  expect(body).not.toMatch(/--corpus-id/)
+})

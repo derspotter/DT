@@ -38,11 +38,11 @@ def test_import_seed_links_existing_works_to_second_corpus(monkeypatch, tmp_path
 
     mod.main(base + ["--corpus-id", "1"])
     first = _last_json(capsys.readouterr().out)
-    assert first == {"added": 3, "skipped": 0, "corpus_linked": 3, "total": 3, "errors": []}
+    assert first == {"added": 3, "skipped": 0, "corpus_linked": 3, "total": 3, "processed": 3, "stopped": False, "error": None, "errors": []}
 
     mod.main(base + ["--corpus-id", "2"])
     second = _last_json(capsys.readouterr().out)
-    assert second == {"added": 0, "skipped": 0, "corpus_linked": 3, "total": 3, "errors": []}
+    assert second == {"added": 0, "skipped": 0, "corpus_linked": 3, "total": 3, "processed": 3, "stopped": False, "error": None, "errors": []}
 
     db = DatabaseManager(db_path)
     try:
@@ -270,7 +270,7 @@ def test_import_seed_commits_every_chunk(monkeypatch, tmp_path, capsys):
     del statements[:]
     mod.main(["--db-path", str(tmp_path / "lit.db"), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
     summary = _last_json(capsys.readouterr().out)
-    assert summary == {"added": 1200, "skipped": 0, "corpus_linked": 1200, "total": 1200, "errors": []}
+    assert summary == {"added": 1200, "skipped": 0, "corpus_linked": 1200, "total": 1200, "processed": 1200, "stopped": False, "error": None, "errors": []}
     assert len(_commits(statements)) == 3
 
 
@@ -342,7 +342,7 @@ def test_reimport_with_a_low_confidence_match_links_without_adding(monkeypatch, 
     capsys.readouterr()
     mod.main(base + ["--file", str(second), "--corpus-id", "2"])
     summary = _last_json(capsys.readouterr().out)
-    assert summary == {"added": 0, "skipped": 0, "corpus_linked": 1, "total": 1, "errors": []}
+    assert summary == {"added": 0, "skipped": 0, "corpus_linked": 1, "total": 1, "processed": 1, "stopped": False, "error": None, "errors": []}
     db = DatabaseManager(tmp_path / "lit.db")
     try:
         assert db.conn.execute("SELECT COUNT(*) FROM works").fetchone()[0] == 1
@@ -401,15 +401,18 @@ def test_add_pending_works_from_json_counts_never_exceed_the_rows_of_committed_c
     assert rows > 0 and rows % 5 == 0  # earlier chunks stay, the failing one is gone whole
 
 
-def test_import_seed_fails_when_sqlite_drops_the_transaction(monkeypatch, tmp_path, capsys):
+def test_import_seed_stops_with_a_summary_when_sqlite_drops_the_transaction(monkeypatch, tmp_path, capsys):
     mod = _load_import_script(monkeypatch)
     monkeypatch.setattr(mod, "DatabaseManager", _SmallDatabase)
     seed = tmp_path / "seed.json"
     seed.write_text(json.dumps(FILLER_ENTRIES), encoding="utf-8")
     db_path = tmp_path / "lit.db"
-    with pytest.raises(sqlite3.Error):
-        mod.main(["--db-path", str(db_path), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
-    assert '"added"' not in capsys.readouterr().out  # no summary claims rows that are gone
+    mod.main(["--db-path", str(db_path), "--file", str(seed), "--kind", "json", "--corpus-id", "1"])
+    summary = _last_json(capsys.readouterr().out)
+    # Spec D25: the run stops with a summary that claims no rows from the lost chunk.
+    assert summary["stopped"] is True and summary["error"].startswith("OperationalError")
+    assert (summary["added"], summary["corpus_linked"], summary["processed"]) == (0, 0, 0)
+    assert summary["total"] == len(FILLER_ENTRIES)
     assert _work_count(db_path) == 0
 
 
@@ -510,7 +513,7 @@ def test_import_seed_links_a_duplicate_whose_openalex_id_belongs_to_another_row(
     mod.main(["--db-path", str(db_path), "--file", str(seed), "--kind", "json", "--corpus-id", "5"])
 
     summary = _last_json(capsys.readouterr().out)
-    assert summary == {"added": 0, "skipped": 0, "corpus_linked": 1, "total": 1, "errors": []}
+    assert summary == {"added": 0, "skipped": 0, "corpus_linked": 1, "total": 1, "processed": 1, "stopped": False, "error": None, "errors": []}
     db = DatabaseManager(db_path)
     try:
         assert _corpus_ids(db, a) == [5]

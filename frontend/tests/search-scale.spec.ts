@@ -1,5 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
-import { seedActivity, seedPromotionStatus } from '../src/lib/seedStatus'
+import { searchRunSubtitle, seedActivity, seedPromotionStatus } from '../src/lib/seedStatus'
 import { mockLogSocket } from './helpers/mockApi'
 
 // Keep the page's sockets (app log stream, Vite HMR) off any live server.
@@ -26,6 +26,23 @@ test('promotion status preserves server outcomes and prioritizes partial failure
   expect(seedPromotionStatus({ success: true, message: 'Promoted', expansion_error: 'OpenAlex timed out' }, 1)).toEqual({
     warning: true, text: 'Corpus promotion completed, but reference expansion failed: OpenAlex timed out',
   })
+})
+
+test('an OpenAlex quota stop shows as a warning on the promotion and on the search run (S-I1)', () => {
+  const note = 'OpenAlex quota exhausted; expansion stopped early. Results fetched before the stop are kept.'
+  expect(seedPromotionStatus({
+    success: true,
+    promotion_mode: 'new_seed',
+    expansion_seeds: [{}],
+    expansion_warning: note,
+    message: `Promoted. 1 expansion seed(s) added to Seed for review. ${note}`,
+  }, 1)).toEqual({ warning: true, text: `Promoted. 1 expansion seed(s) added to Seed for review. ${note}` })
+  expect(seedPromotionStatus({ success: true, expansion_warning: note }, 2)).toEqual({
+    warning: true, text: `Processed 2 candidate(s). Corpus refreshed. ${note}`,
+  })
+  expect(searchRunSubtitle({ status: 'done', fetched_count: 3, error: note })).toBe(note)
+  expect(searchRunSubtitle({ status: 'done', fetched_count: 3, error: null })).toBe('')
+  expect(searchRunSubtitle({ status: 'failed', fetched_count: 3, expected_count: 9, error: 'boom' })).toBe('stopped after 3 of 9: boom')
 })
 
 // Exercises the preflight match-count preview and the 100k warning in the

@@ -33,6 +33,8 @@
   export let refresh = () => {}
   export let loading = false
   export let status = ''
+  // The status reports a failed load: shown as an error, with Retry.
+  export let statusError = false
   export let browse = {
     target: null,
     summary: {},
@@ -302,7 +304,10 @@
     </div>
 
     {#if status}
-      <p class="muted upstream-browser__status">{status}</p>
+      <p class={`${statusError ? 'error' : 'muted'} upstream-browser__status`}>{status}</p>
+    {/if}
+    {#if statusError}
+      <button class="secondary" type="button" data-testid="upstream-retry" on:click={() => refresh()} disabled={loading}>Retry</button>
     {/if}
 
     {#if browse?.target}
@@ -380,6 +385,9 @@
         </div>
       {/if}
 
+      <!-- Only a loaded target has pending or current items: before that the
+           empty-state texts would claim an empty corpus. -->
+      {#if browse?.target}
       <div class="upstream-comparison-grid">
         <section class="upstream-comparison-section">
           <div class="workspace-panel-title upstream-comparison-section__header">
@@ -581,6 +589,7 @@
           {/if}
         </section>
       </div>
+      {/if}
     </div>
   </div>
 </div>

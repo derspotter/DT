@@ -7,6 +7,7 @@ import request from 'supertest'
 
 describe('corpus sharing and multi-user isolation', () => {
   let app
+  let extractionInlineModels
   let dbPath = ''
   let tmpDir = ''
   const adminUsername = 'sharing-admin'
@@ -23,8 +24,9 @@ describe('corpus sharing and multi-user isolation', () => {
       { id: 'target-a', name: 'Target A', path: path.join(tmpDir, 'target-a') },
     ])
 
-    const { createApp } = await import('../src/app.js')
-    app = createApp({ broadcast: () => {} })
+    const appModule = await import('../src/app.js')
+    extractionInlineModels = appModule.extractionInlineModels
+    app = appModule.createApp({ broadcast: () => {} })
   })
 
   afterAll(() => {
@@ -552,6 +554,30 @@ describe('corpus sharing and multi-user isolation', () => {
     const after = await auth(request(app).get('/api/admin/settings'))
     expect(after.body.settings.openalex_rps.value).toBe('')
     expect(after.body.settings.search_warn_threshold.value).toBe('')
+  })
+
+  test('inline models come from Admin settings, then env, then defaults', async () => {
+    expect(extractionInlineModels({}, {})).toEqual({ cheap: 'gemini-3-flash-preview', pro: 'gemini-3.1-pro-preview' })
+    expect(extractionInlineModels({}, { RAG_FEEDER_API_INLINE_MODEL: 'env-pro' }).pro).toBe('env-pro')
+    expect(extractionInlineModels({}, { RAG_FEEDER_API_INLINE_CHEAP_MODEL: 'env-cheap' }).cheap).toBe('env-cheap')
+    expect(
+      extractionInlineModels({ RAG_FEEDER_API_INLINE_MODEL: 'adm' }, { RAG_FEEDER_API_INLINE_MODEL: 'env-pro' }).pro
+    ).toBe('adm')
+    expect(
+      extractionInlineModels({ RAG_FEEDER_API_INLINE_CHEAP_MODEL: 'adm-c' }, { RAG_FEEDER_API_INLINE_CHEAP_MODEL: 'env-c' }).cheap
+    ).toBe('adm-c')
+
+    const admin = await login(adminUsername, adminPassword)
+    const auth = (req) => req.set('Authorization', `Bearer ${admin.token}`)
+    const put = await auth(request(app).put('/api/admin/settings')).send({ settings: { inline_model: 'm', inline_cheap_model: 'c' } })
+    expect(put.status).toBe(200)
+    const get = await auth(request(app).get('/api/admin/settings'))
+    expect(get.body.settings.inline_model.value).toBe('m')
+    expect(get.body.settings.inline_cheap_model.value).toBe('c')
+    // The default argument reads the stored Admin settings.
+    expect(extractionInlineModels()).toEqual({ cheap: 'c', pro: 'm' })
+    const clear = await auth(request(app).put('/api/admin/settings')).send({ settings: { inline_model: '', inline_cheap_model: '' } })
+    expect(clear.status).toBe(200)
   })
 
   test('non-admins cannot read or write settings', async () => {

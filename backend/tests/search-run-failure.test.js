@@ -3,6 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
 import request from 'supertest'
+import { jest } from '@jest/globals'
 
 // The search child owns its own row: it marks the run done/failed/cancelled
 // before exiting. These tests cover the two ways that contract can break —
@@ -11,6 +12,7 @@ import request from 'supertest'
 describe('background search run: dead children and failed registration', () => {
   let app = null
   let finalizeDeadSearchRun = null
+  let openAlexQuotaStop = null
   let activeSearchRuns = null
   let authToken = ''
   let corpusId = null
@@ -51,6 +53,7 @@ describe('background search run: dead children and failed registration', () => {
     // hard-container-stop shape.
     fs.writeFileSync(fakePython, `#!/usr/bin/env node
 console.log(JSON.stringify({ event: 'run_created', runId: Number(process.env.FAKE_RUN_ID || '1') }))
+if (process.env.FAKE_FINAL_JSON) console.log(process.env.FAKE_FINAL_JSON)
 setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
 `)
     fs.chmodSync(fakePython, 0o755)
@@ -64,6 +67,7 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
     const mod = await import('../src/app.js')
     app = mod.createApp({ broadcast: () => {} })
     finalizeDeadSearchRun = mod.finalizeDeadSearchRun
+    openAlexQuotaStop = mod.openAlexQuotaStop
     activeSearchRuns = mod.activeSearchRuns
 
     const login = await request(app).post('/api/auth/login').send({
@@ -104,6 +108,7 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
     }
     delete process.env.FAKE_RUN_ID
     delete process.env.FAKE_EXIT_CODE
+    delete process.env.FAKE_FINAL_JSON
     if (tempDir && fs.existsSync(tempDir)) {
       try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch { /* noop */ }
     }
@@ -159,6 +164,49 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
     await new Promise((resolve) => setTimeout(resolve, 50))
     expect(runStatus(6002).status).toBe('done')
     expect(runStatus(6002).error).toBeNull()
+  })
+
+  test('a run stopped by OpenAlex quota is logged and keeps its done row with the note (S-I1)', async () => {
+    const note = 'OpenAlex quota exhausted; expansion stopped early. Results fetched before the stop are kept.'
+    insertRunningRun(6005)
+    const db = new Database(dbPath)
+    try {
+      // The script settles its own row: done, with the stop as its note.
+      db.prepare(`UPDATE search_runs SET status = 'done', error = ?, finished_at = CURRENT_TIMESTAMP WHERE id = 6005`).run(note)
+    } finally {
+      db.close()
+    }
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      process.env.FAKE_RUN_ID = '6005'
+      process.env.FAKE_EXIT_CODE = '0'
+      process.env.FAKE_FINAL_JSON = JSON.stringify({ runId: 6005, results: [], quota_exhausted: true, message: note })
+      const res = await request(app)
+        .post('/api/keyword-search')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ query: 'quota stop' })
+      expect(res.status).toBe(202)
+      const logged = await waitUntil(() => warn.mock.calls.some((args) => String(args[0]).includes(note)))
+      expect(logged).toBe(true)
+      expect(warn.mock.calls.find((args) => String(args[0]).includes(note))[0]).toContain('[/api/keyword-search]')
+      expect(runStatus(6005)).toMatchObject({ status: 'done', error: note })
+    } finally {
+      delete process.env.FAKE_FINAL_JSON
+      warn.mockRestore()
+    }
+  })
+
+  test('openAlexQuotaStop logs and returns the message only for a stopped payload', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(openAlexQuotaStop('/r', { runs: [] })).toBeNull()
+      expect(openAlexQuotaStop('/r', null)).toBeNull()
+      expect(warn).not.toHaveBeenCalled()
+      expect(openAlexQuotaStop('/r', { runs: [], quota_exhausted: true, message: 'stopped' })).toBe('stopped')
+      expect(warn).toHaveBeenCalledWith('[/r] stopped')
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   test('finalizeDeadSearchRun only touches rows still marked running', () => {

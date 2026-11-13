@@ -1267,6 +1267,56 @@ class DatabaseManager:
         editors_raw = self._parse_name_list(ref.get("editors"))
         norm_authors = self._normalize_contributor_fields(authors_raw, editors_raw)
 
+        try:
+            # The whole entry is one unit: with commit=False a savepoint undoes its writes (the
+            # duplicate paths' merge_log/link/update too) before the handler returns; with
+            # commit=True the duplicate paths write without committing until their end, and the
+            # handler rolls back whatever this entry left uncommitted.
+            with nullcontext() if commit else self.savepoint():
+                return self._create_pending_work_entry(
+                    ref,
+                    title=title,
+                    corpus_id=corpus_id,
+                    norm_doi=norm_doi,
+                    norm_title=norm_title,
+                    authors_raw=authors_raw,
+                    editors_raw=editors_raw,
+                    norm_authors=norm_authors,
+                    searcher=searcher,
+                    rate_limiter=rate_limiter,
+                    resolve_potential_duplicates=resolve_potential_duplicates,
+                    commit=commit,
+                )
+        except sqlite3.IntegrityError as e:
+            if commit and self.conn.in_transaction:
+                self.conn.rollback()  # no half-written entry left open on the shared connection
+            return None, f"IntegrityError inserting into works: {e}"
+        except BaseException:
+            if commit and self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def _create_pending_work_entry(
+        self,
+        ref: dict,
+        *,
+        title,
+        corpus_id,
+        norm_doi,
+        norm_title,
+        authors_raw,
+        editors_raw,
+        norm_authors,
+        searcher,
+        rate_limiter,
+        resolve_potential_duplicates: bool,
+        commit: bool,
+    ) -> tuple[int | None, str | None]:
+        """create_pending_work's body after validation; the caller handles IntegrityError.
+
+        Every writer gets commit=False; with commit=True each path commits once at its end, so
+        an error part-way leaves nothing committed (create_pending_work rolls it back).
+        """
         resolved_conflict = False
         tbl, eid, field = self.check_if_exists(
             doi=norm_doi, 
@@ -1313,7 +1363,7 @@ class DatabaseManager:
                             if incoming_resolved.get("openalex_id"):
                                 incoming_ref_for_merge["openalex_id"] = incoming_resolved.get("openalex_id")
                             if corpus_id:
-                                self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
+                                self.add_corpus_item(corpus_id, tbl, eid, commit=False)
                             work_row = self.get_entry_by_id("works", int(eid)) or {}
                             merged = self._apply_work_merge_priority(work_row, self._build_raw_work_payload(ref))
                             self._update_work_record(int(eid), merged)
@@ -1331,7 +1381,7 @@ class DatabaseManager:
                                 action="conflict",
                                 notes="resolved_ids_conflict",
                                 updates=None,
-                                commit=commit,
+                                commit=False,
                             )
                             resolved_conflict = True
                             # The existing record keeps its own resolved identity (it has none
@@ -1344,7 +1394,7 @@ class DatabaseManager:
                             owner_id, owner_field = self._resolved_identifier_owner(incoming_resolved)
                             if owner_id:
                                 if corpus_id:
-                                    self.add_corpus_item(corpus_id, "works", owner_id, commit=commit)
+                                    self.add_corpus_item(corpus_id, "works", owner_id, commit=False)
                                 owner_row = self.get_entry_by_id("works", owner_id) or {}
                                 merged = self._apply_work_merge_priority(owner_row, self._build_raw_work_payload(ref))
                                 self._update_work_record(owner_id, merged)
@@ -1357,7 +1407,7 @@ class DatabaseManager:
 
             if high_confidence and not resolved_conflict:
                 if corpus_id:
-                    self.add_corpus_item(corpus_id, tbl, eid, commit=commit)
+                    self.add_corpus_item(corpus_id, tbl, eid, commit=False)
                 work_row = self.get_entry_by_id("works", int(eid)) or {}
                 incoming = self._without_identifiers_of_other_rows(int(eid), self._build_raw_work_payload(ref))
                 merged = self._apply_work_merge_priority(work_row, incoming)
@@ -1378,47 +1428,46 @@ class DatabaseManager:
                     action="possible_duplicate",
                     notes="low_confidence_match_merged",
                     updates=None,
-                    commit=commit,
+                    commit=False,
                 )
 
-        try:
-            payload = self._build_raw_work_payload(ref)
-            if resolved_conflict:
-                # Resolved ids disagree: a separate work. (None, None) skips the lookup, which
-                # would find the matched row again; the new row is inserted with its resolved
-                # identifiers, so later title-based lookups (enrichment) keep the two apart.
-                existing_match, allow_merge = (None, None), False
-                payload.update(self._unclaimed_resolved_identifiers(incoming_resolved))
-            else:
-                existing_match = (int(eid), field) if tbl == "works" else (None, None)
-                allow_merge = True
-            new_id, merged_on = self._resolve_or_create_work(
-                payload,
-                allow_merge=allow_merge,
-                commit=commit,
-                existing=existing_match,
+        payload = self._build_raw_work_payload(ref)
+        if resolved_conflict:
+            # Resolved ids disagree: a separate work. (None, None) skips the lookup, which
+            # would find the matched row again; the new row is inserted with its resolved
+            # identifiers, so later title-based lookups (enrichment) keep the two apart.
+            existing_match, allow_merge = (None, None), False
+            payload.update(self._unclaimed_resolved_identifiers(incoming_resolved))
+        else:
+            existing_match = (int(eid), field) if tbl == "works" else (None, None)
+            allow_merge = True
+        new_id, merged_on = self._resolve_or_create_work(
+            payload,
+            allow_merge=allow_merge,
+            commit=False,
+            existing=existing_match,
+        )
+        if corpus_id:
+            self.add_corpus_item(corpus_id, "works", int(new_id), commit=False)
+
+        translated_title = ref.get("translated_title")
+        if translated_title:
+            self.add_work_alias(
+                work_table="works",
+                work_id=int(new_id),
+                alias_title=translated_title,
+                alias_year=ref.get("translated_year"),
+                alias_language=ref.get("translated_language"),
+                relationship_type=ref.get("translation_relationship") or "translation",
+                commit=False,
             )
-            if corpus_id:
-                self.add_corpus_item(corpus_id, "works", int(new_id), commit=commit)
 
-            translated_title = ref.get("translated_title")
-            if translated_title:
-                self.add_work_alias(
-                    work_table="works",
-                    work_id=int(new_id),
-                    alias_title=translated_title,
-                    alias_year=ref.get("translated_year"),
-                    alias_language=ref.get("translated_language"),
-                    relationship_type=ref.get("translation_relationship") or "translation",
-                    commit=commit,
-                )
-
-            if merged_on:
-                # A low-confidence merge: reported like any other duplicate (no new work).
-                return None, f"Duplicate already exists in works (ID {new_id}) on {merged_on}"
-            return new_id, None
-        except sqlite3.IntegrityError as e:
-            return None, f"IntegrityError inserting into works: {e}"
+        if commit:
+            self.conn.commit()
+        if merged_on:
+            # A low-confidence merge: reported like any other duplicate (no new work).
+            return None, f"Duplicate already exists in works (ID {new_id}) on {merged_on}"
+        return new_id, None
 
     def _resolved_identifier_owner(self, resolved: dict) -> tuple[int | None, str | None]:
         """The works row that already holds ``resolved``'s DOI (first) or OpenAlex id."""
@@ -1527,124 +1576,119 @@ class DatabaseManager:
         enrichment: dict,
     ) -> tuple[int | None, str | None]:
         """Update a pending work with enriched metadata."""
-        cur = self.conn.cursor()
         try:
-            cur.execute("BEGIN")
-            base = self.get_entry_by_id("works", work_id)
-            if not base:
-                cur.execute("ROLLBACK")
-                return None, "Row not found in works"
+            # BEGIN IMMEDIATE; any exception rolls back and re-raises, so the shared
+            # connection is never left mid-transaction. Only sqlite3.Error becomes a return value.
+            with self.transaction():
+                base = self.get_entry_by_id("works", work_id)
+                if not base:
+                    return None, "Row not found in works"  # commits an empty transaction
 
-            authors = enrichment.get("authors")
-            if authors is not None and not isinstance(authors, str):
-                authors = json.dumps(authors)
-            editors = enrichment.get("editors")
-            if editors is not None and not isinstance(editors, str):
-                editors = json.dumps(editors)
-            keywords = enrichment.get("keywords")
-            if keywords is not None and not isinstance(keywords, str):
-                keywords = json.dumps(keywords)
-            merged = {
-                **base,
-                **{k: v for k, v in enrichment.items() if v is not None},
-                "authors": authors if authors is not None else base.get("authors"),
-                "editors": editors if editors is not None else base.get("editors"),
-                "keywords": keywords if keywords is not None else base.get("keywords"),
-                "doi": enrichment.get("doi") or base.get("doi"),
-                "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
-                "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id") or enrichment.get("id") or base.get("openalex_id")),
-                "open_access_url": enrichment.get("open_access_url") or base.get("open_access_url"),
-                "normalized_title": self._normalize_text(enrichment.get("title") or base.get("title")),
-                "normalized_authors": self._normalize_contributor_fields(authors if authors is not None else base.get("authors"), editors if editors is not None else base.get("editors")),
-                "metadata_status": "matched",
-                "metadata_source": enrichment.get("metadata_source_type") or base.get("metadata_source") or "enrichment",
-                "metadata_error": None,
-                "metadata_updated_at": datetime.now().isoformat(),
-                "download_status": "not_requested" if str(base.get("download_status") or "not_requested") == "not_requested" else base.get("download_status"),
-                "referenced_work_ids": self._clean_json_text(enrichment.get("referenced_work_ids")) or base.get("referenced_work_ids"),
-                "cited_by_api_url": enrichment.get("cited_by_api_url") or base.get("cited_by_api_url"),
-                "crossref_json": self._clean_json_text(enrichment.get("crossref_json")) or base.get("crossref_json"),
-                "openalex_json": self._clean_json_text(enrichment.get("openalex_json") or enrichment),
-                "bibtex_entry_json": self._clean_json_text(enrichment.get("bibtex_entry_json")) or base.get("bibtex_entry_json"),
-            }
+                authors = enrichment.get("authors")
+                if authors is not None and not isinstance(authors, str):
+                    authors = json.dumps(authors)
+                editors = enrichment.get("editors")
+                if editors is not None and not isinstance(editors, str):
+                    editors = json.dumps(editors)
+                keywords = enrichment.get("keywords")
+                if keywords is not None and not isinstance(keywords, str):
+                    keywords = json.dumps(keywords)
+                merged = {
+                    **base,
+                    **{k: v for k, v in enrichment.items() if v is not None},
+                    "authors": authors if authors is not None else base.get("authors"),
+                    "editors": editors if editors is not None else base.get("editors"),
+                    "keywords": keywords if keywords is not None else base.get("keywords"),
+                    "doi": enrichment.get("doi") or base.get("doi"),
+                    "normalized_doi": self._normalize_doi(enrichment.get("doi") or base.get("doi")),
+                    "openalex_id": self._normalize_openalex_id(enrichment.get("openalex_id") or enrichment.get("id") or base.get("openalex_id")),
+                    "open_access_url": enrichment.get("open_access_url") or base.get("open_access_url"),
+                    "normalized_title": self._normalize_text(enrichment.get("title") or base.get("title")),
+                    "normalized_authors": self._normalize_contributor_fields(authors if authors is not None else base.get("authors"), editors if editors is not None else base.get("editors")),
+                    "metadata_status": "matched",
+                    "metadata_source": enrichment.get("metadata_source_type") or base.get("metadata_source") or "enrichment",
+                    "metadata_error": None,
+                    "metadata_updated_at": datetime.now().isoformat(),
+                    "download_status": "not_requested" if str(base.get("download_status") or "not_requested") == "not_requested" else base.get("download_status"),
+                    "referenced_work_ids": self._clean_json_text(enrichment.get("referenced_work_ids")) or base.get("referenced_work_ids"),
+                    "cited_by_api_url": enrichment.get("cited_by_api_url") or base.get("cited_by_api_url"),
+                    "crossref_json": self._clean_json_text(enrichment.get("crossref_json")) or base.get("crossref_json"),
+                    "openalex_json": self._clean_json_text(enrichment.get("openalex_json") or enrichment),
+                    "bibtex_entry_json": self._clean_json_text(enrichment.get("bibtex_entry_json")) or base.get("bibtex_entry_json"),
+                }
 
-            existing_id, field = self._find_existing_work(
-                doi=merged.get("doi"),
-                openalex_id=merged.get("openalex_id"),
-                title=merged.get("title"),
-                authors=merged.get("authors"),
-                editors=merged.get("editors"),
-                year=merged.get("year"),
-                exclude_id=int(work_id),
-            )
-            if existing_id:
-                existing = self.get_entry_by_id("works", int(existing_id)) or {}
-                # Absorb first: the canonical may take over the duplicate's DOI/openalex id,
-                # which sit under unique indexes while the duplicate row exists.
-                self._absorb_duplicate(int(existing_id), int(work_id), match_field=field, notes="apply_enriched_metadata")
-                self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
-                self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"), commit=False)
-                cur.execute("COMMIT")
-                marker = f"DUPLICATE_MERGED|table=works|id={existing_id}|field={field}|queued=0|queue_id=|queue_error="
-                return None, f"Entry already exists in works (ID {existing_id}) on {field} [{marker}]"
+                existing_id, field = self._find_existing_work(
+                    doi=merged.get("doi"),
+                    openalex_id=merged.get("openalex_id"),
+                    title=merged.get("title"),
+                    authors=merged.get("authors"),
+                    editors=merged.get("editors"),
+                    year=merged.get("year"),
+                    exclude_id=int(work_id),
+                )
+                if existing_id:
+                    existing = self.get_entry_by_id("works", int(existing_id)) or {}
+                    # Absorb first: the canonical may take over the duplicate's DOI/openalex id,
+                    # which sit under unique indexes while the duplicate row exists.
+                    self._absorb_duplicate(int(existing_id), int(work_id), match_field=field, notes="apply_enriched_metadata")
+                    self._update_work_record(int(existing_id), self._apply_work_merge_priority(existing, merged))
+                    self.add_work_alias("works", int(existing_id), base.get("title"), alias_year=base.get("year"), commit=False)
+                    marker = f"DUPLICATE_MERGED|table=works|id={existing_id}|field={field}|queued=0|queue_id=|queue_error="
+                    return None, f"Entry already exists in works (ID {existing_id}) on {field} [{marker}]"
 
-            self._update_work_record(int(work_id), merged)
-            cur.execute("COMMIT")
-            return int(work_id), None
+                self._update_work_record(int(work_id), merged)
+                return int(work_id), None
         except sqlite3.Error as e:
-            cur.execute("ROLLBACK")
             return None, f"A database error occurred during promotion: {e}"
 
     def enqueue_for_download(self, with_meta_id: int) -> tuple[int | None, str | None]:
         """Mark a canonical work row as queued for download."""
         cur = self.conn.cursor()
         try:
-            cur.execute("BEGIN")
-            cur.execute("SELECT id FROM works WHERE id = ?", (with_meta_id,))
-            if not cur.fetchone():
-                cur.execute("ROLLBACK")
-                return None, "Row not found in works"
+            # BEGIN IMMEDIATE; any exception rolls back and re-raises, so the shared
+            # connection is never left mid-transaction. Only sqlite3.Error becomes a return value.
+            with self.transaction():
+                cur.execute("SELECT id FROM works WHERE id = ?", (with_meta_id,))
+                if not cur.fetchone():
+                    return None, "Row not found in works"  # commits an empty transaction
 
-            cur.execute(
-                """UPDATE works
-                   SET download_status = 'queued',
-                       download_claimed_by = NULL,
-                       download_claimed_at = NULL,
-                       download_lease_expires_at = NULL,
-                       download_error = NULL
-                   WHERE id = ?""",
-                (with_meta_id,),
-            )
-            cur.execute("COMMIT")
-            return with_meta_id, None
+                cur.execute(
+                    """UPDATE works
+                       SET download_status = 'queued',
+                           download_claimed_by = NULL,
+                           download_claimed_at = NULL,
+                           download_lease_expires_at = NULL,
+                           download_error = NULL
+                       WHERE id = ?""",
+                    (with_meta_id,),
+                )
+                return with_meta_id, None
         except sqlite3.Error as e:
-            cur.execute("ROLLBACK")
             return None, f"Transaction failed: {e}"
 
     def queue_for_enrichment(self, no_meta_id: int) -> tuple[int | None, str | None]:
         """Mark a work row as pending enrichment and clear any stale claim."""
         cur = self.conn.cursor()
         try:
-            cur.execute("BEGIN")
-            cur.execute("SELECT id FROM works WHERE id = ?", (no_meta_id,))
-            if not cur.fetchone():
-                cur.execute("ROLLBACK")
-                return None, "Row not found in works"
+            # BEGIN IMMEDIATE; any exception rolls back and re-raises, so the shared
+            # connection is never left mid-transaction. Only sqlite3.Error becomes a return value.
+            with self.transaction():
+                cur.execute("SELECT id FROM works WHERE id = ?", (no_meta_id,))
+                if not cur.fetchone():
+                    return None, "Row not found in works"  # commits an empty transaction
 
-            cur.execute(
-                """UPDATE works
-                      SET metadata_status = 'pending',
-                          metadata_claimed_by = NULL,
-                          metadata_claimed_at = NULL,
-                          metadata_lease_expires_at = NULL,
-                          metadata_error = NULL
-                    WHERE id = ?""",
-                (no_meta_id,),
-            )
-            cur.execute("COMMIT")
-            return int(no_meta_id), None
+                cur.execute(
+                    """UPDATE works
+                          SET metadata_status = 'pending',
+                              metadata_claimed_by = NULL,
+                              metadata_claimed_at = NULL,
+                              metadata_lease_expires_at = NULL,
+                              metadata_error = NULL
+                        WHERE id = ?""",
+                    (no_meta_id,),
+                )
+                return int(no_meta_id), None
         except sqlite3.Error as e:
-            cur.execute("ROLLBACK")
             return None, f"Transaction failed: {e}"
 
     def claim_enrich_batch(

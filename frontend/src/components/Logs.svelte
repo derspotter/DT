@@ -4,8 +4,11 @@
   export let logsFilterCurrentCorpus;
   export let logsLoadingOlder;
   export let logsHasMore;
+  // A reconnect gap since the last tail load: "Load older" waits for "Reload logs".
+  export let logsNeedReload = false;
   export let logsTailStatus;
   export let logs;
+  export let logsCursor;
   
   export let handleLogTypeChange;
   export let handleLogsCorpusFilterChange;
@@ -13,7 +16,7 @@
   export let hydrateLogsFromTail;
 </script>
 
-<div class="card" data-testid="logs-panel" data-log-count={logs.length}>
+<div class="card" data-testid="logs-panel" data-log-count={logs.length} data-logs-cursor={logsCursor}>
   <h2>Logs</h2>
   <p class="muted">WebSocket status: {logsStatus}</p>
   <div class="log-toolbar">
@@ -33,10 +36,14 @@
         class="secondary"
         type="button"
         on:click={loadOlderLogs}
-        disabled={logsLoadingOlder || !logsHasMore}
+        disabled={logsLoadingOlder || !logsHasMore || logsNeedReload}
+        title={logsNeedReload ? 'Reload logs first' : undefined}
       >
         {logsLoadingOlder ? 'Loading…' : 'Load older'}
       </button>
+      {#if logsNeedReload}
+        <span class="muted small" data-testid="logs-older-hint">Reload logs first</span>
+      {/if}
       <button
         class="secondary"
         type="button"
@@ -58,7 +65,22 @@
       <p class="muted">Waiting for pipeline output...</p>
     {:else}
       {#each logs as entry (entry.seq)}
-        <div class="log-line">{entry.text}</div>
+        {#if entry.marker}
+          <div class="log-gap" role="status">
+            <span class="log-gap__text">{entry.text}</span>
+            <button
+              class="secondary"
+              type="button"
+              data-testid="logs-reload"
+              on:click={() => hydrateLogsFromTail({ force: true })}
+              disabled={logsLoadingOlder}
+            >
+              Reload logs
+            </button>
+          </div>
+        {:else}
+          <div class="log-line">{entry.text}</div>
+        {/if}
       {/each}
     {/if}
   </div>

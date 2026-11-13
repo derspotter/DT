@@ -15,6 +15,8 @@ import nodemailer from 'nodemailer';
 import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
 import { listCorpus } from './corpusList.js';
 import { createPythonRunner } from './pythonProcess.js';
+import { tokenMailContent } from './authMail.js';
+import { getPasswordHasher } from './passwordHasher.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -962,15 +964,19 @@ export function ensureAuthSchema(db) {
 }
 
 function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
-  const admin = db.prepare('SELECT id, last_corpus_id FROM users WHERE username = ?').get(authConfig.adminUsername);
+  const admin = db
+    .prepare('SELECT id, last_corpus_id, password_hash FROM users WHERE username = ?')
+    .get(authConfig.adminUsername);
   let adminId = admin?.id;
   // The bootstrap admin's password is sourced from RAG_ADMIN_PASSWORD. Keep the
   // stored hash in sync with the env on every startup so the documented
   // credentials always work (after the env changes, or after the DB is rebuilt).
   // NOTE: this makes the env authoritative for the bootstrap admin — a password
   // set for it via the UI is reset to RAG_ADMIN_PASSWORD on the next restart.
-  const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
+  // A stored hash that already matches is left alone (no rehash, no write).
+  // Synchronous on purpose: this runs before the server listens.
   if (!adminId) {
+    const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
     const result = db
       .prepare('INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)')
       .run(authConfig.adminUsername, hash);
@@ -980,7 +986,16 @@ function bootstrapDefaultCorpus(db, authConfig = resolveAuthConfig()) {
       adminId = result.lastInsertRowid;
     }
   } else {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, adminId);
+    let matches = false;
+    try {
+      matches = Boolean(admin.password_hash) && bcrypt.compareSync(authConfig.adminPassword, admin.password_hash);
+    } catch {
+      matches = false;
+    }
+    if (!matches) {
+      const hash = bcrypt.hashSync(authConfig.adminPassword, 10);
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, adminId);
+    }
   }
 
   let corpus = db
@@ -1866,11 +1881,13 @@ function initSmtpTransport() {
   return smtpTransport;
 }
 
-async function sendTransactionalMail({ to, subject, html, text }) {
+// `mailTransport` (createApp's option) replaces SMTP when given; tests use it
+// to read the mails the routes actually send.
+async function sendTransactionalMail({ to, subject, html, text }, mailTransport = null) {
   if (isNonDeliverableRecipient(to)) {
-    return initSmtpTransport().sendMail({ to, subject, html, text, from: SMTP_FROM });
+    return (mailTransport || initSmtpTransport()).sendMail({ to, subject, html, text, from: SMTP_FROM });
   }
-  const transport = initSmtpTransport();
+  const transport = mailTransport || initSmtpTransport();
   return transport.sendMail({
     from: `"Korpus Builder" <${SMTP_FROM}>`,
     to,
@@ -2085,6 +2102,17 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
   if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
+// keyword_search.py and seed_expand.py report an expansion that OpenAlex quota
+// stopped early as `quota_exhausted: true` plus `message` in their JSON (the
+// results fetched before the stop are kept). Logs it and returns the message,
+// or null when the run was not stopped.
+export function openAlexQuotaStop(route, payload) {
+  if (!payload?.quota_exhausted) return null;
+  const message = String(payload.message || 'OpenAlex quota exhausted; expansion stopped early.');
+  console.warn(`[${route}] ${message}`);
+  return message;
+}
+
 // Shared by /api/keyword-search and /api/keyword-search/preview: validates
 // the request body and builds the keyword_search.py argv. `error` is set
 // (and `args` unusable) when a required filter is missing.
@@ -2271,6 +2299,8 @@ const APP_SETTING_DEFS = [
   { key: 'extract_model', env: 'RAG_FEEDER_API_EXTRACT_MODEL', secret: false },
   { key: 'openai_model', env: 'RAG_FEEDER_OPENAI_MODEL', secret: false },
   { key: 'gemini_model', env: 'RAG_FEEDER_GEMINI_MODEL', secret: false },
+  { key: 'inline_cheap_model', env: 'RAG_FEEDER_API_INLINE_CHEAP_MODEL', secret: false },
+  { key: 'inline_model', env: 'RAG_FEEDER_API_INLINE_MODEL', secret: false },
 ];
 
 const APP_SETTING_BY_KEY = new Map(APP_SETTING_DEFS.map((def) => [def.key, def]));
@@ -2300,6 +2330,17 @@ function appSettingsEnv() {
     if (value) env[def.env] = value;
   }
   return env;
+}
+
+// The inline-extraction models of /api/extract-bibliography: the Admin setting,
+// else the env, else the default. `cheap` runs the first inline retry after a
+// zero-yield page run; `pro` is the last resort and the get_bib_pages fallback.
+export function extractionInlineModels(settingsEnv = appSettingsEnv(), env = process.env) {
+  const pick = (name, fallback) => settingsEnv?.[name] || env?.[name] || fallback;
+  return {
+    cheap: pick('RAG_FEEDER_API_INLINE_CHEAP_MODEL', 'gemini-3-flash-preview'),
+    pro: pick('RAG_FEEDER_API_INLINE_MODEL', 'gemini-3.1-pro-preview'),
+  };
 }
 
 // Every Python child is spawned through this runner, so all of them get the
@@ -2506,7 +2547,30 @@ async function llmDeleteUploaded(uploadedFileName) {
   }
 }
 
-export function createApp({ broadcast, broadcastEvent } = {}) {
+// The largest page GET /api/corpus serves; the frontend's largest request is
+// CORPUS_POLL_PAGE_ROWS = 1000.
+export const CORPUS_MAX_LIMIT = 1000;
+
+const HASHER_BUSY_MESSAGE = 'The server is busy; try again in a moment.';
+
+// Answers a full hashing queue with 503 + Retry-After; returns false for any
+// other error so the caller can handle it.
+function answerHasherBusy(res, error) {
+  if (error?.code !== 'HASHER_BUSY') return false;
+  res.set('Retry-After', '5');
+  res.status(503).json({ error: HASHER_BUSY_MESSAGE });
+  return true;
+}
+
+// Marks a one-time token that was already used (or expired) by the time its
+// transaction ran, e.g. by a concurrent submission.
+function spentTokenError() {
+  const error = new Error('Token already used or expired');
+  error.code = 'TOKEN_SPENT';
+  return error;
+}
+
+export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
   const app = express();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
@@ -2998,7 +3062,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
   app.use(cors(corsOptions));
   app.use(express.json());
 
+  // One transaction: a failure leaves neither a user without a corpus nor a
+  // corpus without its owner row.
   function createUserWithDefaultCorpus({ username, passwordHash, email = null, accountStatus = 'active', invitedByUserId = null }) {
+    return authDb.transaction(() => insertUserWithDefaultCorpus({ username, passwordHash, email, accountStatus, invitedByUserId }))();
+  }
+
+  function insertUserWithDefaultCorpus({ username, passwordHash, email, accountStatus, invitedByUserId }) {
     const result = authDb
       .prepare(
         `INSERT INTO users (username, password_hash, email, account_status, invited_by_user_id, invited_at)
@@ -3028,25 +3098,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       )
       .run(userId, canonicalEmail(email), tokenHash, timestampPlusHours(72), invitedByUserId);
     const inviteUrl = `${FRONTEND_URL}/#/accept-invite?token=${encodeURIComponent(token)}`;
-    const html = `
-      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#22313d;line-height:1.5">
-        <h2>Set your Korpus Builder password</h2>
-        <p>An account has been created for you.</p>
-        <p><strong>Username:</strong> ${username}</p>
-        <p>Use the link below to set your password and activate the account.</p>
-        <p><a href="${inviteUrl}" style="display:inline-block;padding:12px 18px;border-radius:999px;background:#0f8b8d;color:#fff;text-decoration:none;font-weight:600">Set password</a></p>
-        <p>If the button does not work, open this link:</p>
-        <p style="word-break:break-all">${inviteUrl}</p>
-        <p>This link expires in 72 hours.</p>
-      </div>
-    `;
-    const text = `An account has been created for you in Korpus Builder.\n\nUsername: ${username}\n\nSet your password here:\n${inviteUrl}\n\nThis link expires in 72 hours.`;
-    const delivery = await sendTransactionalMail({
-      to: canonicalEmail(email),
-      subject: 'Set your Korpus Builder password',
-      html,
-      text,
-    });
+    const { subject, html, text } = tokenMailContent({ kind: 'invite', username, url: inviteUrl });
+    const delivery = await sendTransactionalMail({ to: canonicalEmail(email), subject, html, text }, mailTransport);
     return { token, inviteUrl, messageId: delivery?.messageId || null };
   }
 
@@ -3061,29 +3114,13 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       )
       .run(userId, canonicalEmail(email), tokenHash, timestampPlusHours(2));
     const resetUrl = `${FRONTEND_URL}/#/reset-password?token=${encodeURIComponent(token)}`;
-    const html = `
-      <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#22313d;line-height:1.5">
-        <h2>Reset your Korpus Builder password</h2>
-        <p>Hello ${username},</p>
-        <p>Use the link below to set a new password.</p>
-        <p><a href="${resetUrl}" style="display:inline-block;padding:12px 18px;border-radius:999px;background:#0f8b8d;color:#fff;text-decoration:none;font-weight:600">Reset password</a></p>
-        <p>If the button does not work, open this link:</p>
-        <p style="word-break:break-all">${resetUrl}</p>
-        <p>This link expires in 2 hours.</p>
-      </div>
-    `;
-    const text = `Reset your Korpus Builder password:\n${resetUrl}\n\nThis link expires in 2 hours.`;
-    const delivery = await sendTransactionalMail({
-      to: canonicalEmail(email),
-      subject: 'Reset your Korpus Builder password',
-      html,
-      text,
-    });
+    const { subject, html, text } = tokenMailContent({ kind: 'reset', username, url: resetUrl });
+    const delivery = await sendTransactionalMail({ to: canonicalEmail(email), subject, html, text }, mailTransport);
     return { token, resetUrl, messageId: delivery?.messageId || null };
   }
 
   // --- Auth endpoints ---
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) {
       return res.status(400).json({ error: 'Missing username or password' });
@@ -3094,7 +3131,18 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (user?.account_status === 'invited') {
       return res.status(403).json({ error: 'Invitation pending. Use the link from your email to set your password.' });
     }
-    if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    let valid = false;
+    try {
+      valid = await getPasswordHasher().compare(password, user.password_hash);
+    } catch (error) {
+      if (answerHasherBusy(res, error)) return undefined;
+      console.error('[auth login] Password check failed:', error);
+      return res.status(500).json({ error: 'Login failed' });
+    }
+    if (!valid) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
@@ -3186,7 +3234,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     }
   });
 
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', async (req, res) => {
     if (!isStubMode()) {
       return res.status(404).json({ error: 'Not found' });
     }
@@ -3198,6 +3246,15 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!normalizedEmail || !normalizedEmail.includes('@')) {
       return res.status(400).json({ error: 'Invalid email address' });
     }
+    // Hash before the duplicate checks, so the checks and the insert run
+    // without an await between them.
+    let hash;
+    try {
+      hash = await getPasswordHasher().hash(password, 10);
+    } catch (error) {
+      if (answerHasherBusy(res, error)) return undefined;
+      throw error;
+    }
     const existing = authDb.prepare('SELECT id FROM users WHERE username = ?').get(username);
     if (existing) {
       return res.status(409).json({ error: 'User already exists' });
@@ -3206,7 +3263,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (existingEmail) {
       return res.status(409).json({ error: 'Email already exists' });
     }
-    const hash = bcrypt.hashSync(password, 10);
     const { userId } = createUserWithDefaultCorpus({
       username,
       passwordHash: hash,
@@ -3226,6 +3282,16 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!username || !email || !email.includes('@')) {
       return res.status(400).json({ error: 'Missing or invalid username/email' });
     }
+    // Hash before the duplicate checks, so the checks and the insert run
+    // without an await between them.
+    let placeholderHash;
+    try {
+      placeholderHash = await getPasswordHasher().hash(generateOpaqueToken(), 10);
+    } catch (error) {
+      if (answerHasherBusy(res, error)) return undefined;
+      console.error('[auth invite] Failed:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to create invitation' });
+    }
     if (authDb.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
       return res.status(409).json({ error: 'User already exists' });
     }
@@ -3233,7 +3299,6 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       return res.status(409).json({ error: 'Email already exists' });
     }
     try {
-      const placeholderHash = bcrypt.hashSync(generateOpaqueToken(), 10);
       const { userId } = createUserWithDefaultCorpus({
         username,
         passwordHash: placeholderHash,
@@ -3288,18 +3353,39 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!tokenRow) {
       return res.status(400).json({ error: 'Invite link is invalid or expired' });
     }
-    const passwordHash = bcrypt.hashSync(password, 10);
-    authDb.transaction(() => {
-      authDb
-        .prepare(
-          `UPDATE users
-           SET password_hash = ?, account_status = 'active', password_set_at = CURRENT_TIMESTAMP,
-               email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP)
-           WHERE id = ?`
-        )
-        .run(passwordHash, tokenRow.user_id);
-      authDb.prepare('UPDATE auth_invite_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = ?').run(tokenRow.id);
-    })();
+    let passwordHash;
+    try {
+      passwordHash = await getPasswordHasher().hash(password, 10);
+    } catch (error) {
+      if (answerHasherBusy(res, error)) return undefined;
+      throw error;
+    }
+    // The token is consumed first, conditionally: a submission that raced this
+    // one through the hash finds it used and changes nothing.
+    try {
+      authDb.transaction(() => {
+        const consumed = authDb
+          .prepare(
+            `UPDATE auth_invite_tokens SET used_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND used_at IS NULL AND datetime(expires_at) > datetime('now')`
+          )
+          .run(tokenRow.id);
+        if (consumed.changes !== 1) throw spentTokenError();
+        authDb
+          .prepare(
+            `UPDATE users
+             SET password_hash = ?, account_status = 'active', password_set_at = CURRENT_TIMESTAMP,
+                 email_verified_at = COALESCE(email_verified_at, CURRENT_TIMESTAMP)
+             WHERE id = ?`
+          )
+          .run(passwordHash, tokenRow.user_id);
+      })();
+    } catch (error) {
+      if (error?.code === 'TOKEN_SPENT') {
+        return res.status(400).json({ error: 'Invite link is invalid or expired' });
+      }
+      throw error;
+    }
     const user = authDb
       .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
       .get(tokenRow.user_id);
@@ -3353,13 +3439,33 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!tokenRow || tokenRow.account_status !== 'active') {
       return res.status(400).json({ error: 'Reset link is invalid or expired' });
     }
-    const passwordHash = bcrypt.hashSync(password, 10);
-    authDb.transaction(() => {
-      authDb
-        .prepare('UPDATE users SET password_hash = ?, password_set_at = CURRENT_TIMESTAMP WHERE id = ?')
-        .run(passwordHash, tokenRow.user_id);
-      authDb.prepare('UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = ?').run(tokenRow.id);
-    })();
+    let passwordHash;
+    try {
+      passwordHash = await getPasswordHasher().hash(password, 10);
+    } catch (error) {
+      if (answerHasherBusy(res, error)) return undefined;
+      throw error;
+    }
+    // Consume the token first, conditionally (see accept-invite).
+    try {
+      authDb.transaction(() => {
+        const consumed = authDb
+          .prepare(
+            `UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND used_at IS NULL AND datetime(expires_at) > datetime('now')`
+          )
+          .run(tokenRow.id);
+        if (consumed.changes !== 1) throw spentTokenError();
+        authDb
+          .prepare('UPDATE users SET password_hash = ?, password_set_at = CURRENT_TIMESTAMP WHERE id = ?')
+          .run(passwordHash, tokenRow.user_id);
+      })();
+    } catch (error) {
+      if (error?.code === 'TOKEN_SPENT') {
+        return res.status(400).json({ error: 'Reset link is invalid or expired' });
+      }
+      throw error;
+    }
     const user = authDb
       .prepare('SELECT id, username, email, account_status, last_corpus_id FROM users WHERE id = ?')
       .get(tokenRow.user_id);
@@ -3775,15 +3881,23 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!name) {
       return res.status(400).json({ error: 'Missing corpus name' });
     }
-    const result = authDb
-      .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
-      .run(name, req.user.id);
-    const corpusId = result.lastInsertRowid;
-    authDb
-      .prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')")
-      .run(req.user.id, corpusId);
-    authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusId, req.user.id);
-    return res.status(201).json({ id: corpusId, name });
+    try {
+      const corpusId = authDb.transaction(() => {
+        const result = authDb
+          .prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)')
+          .run(name, req.user.id);
+        const id = result.lastInsertRowid;
+        authDb
+          .prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'owner')")
+          .run(req.user.id, id);
+        authDb.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(id, req.user.id);
+        return id;
+      })();
+      return res.status(201).json({ id: corpusId, name });
+    } catch (error) {
+      console.error('[/api/corpora POST] Error:', error);
+      return res.status(500).json({ error: error?.message || 'Failed to create corpus' });
+    }
   });
 
   app.post('/api/corpora/:id/select', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
@@ -4162,6 +4276,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         void (async () => {
         try {
           sendExtractionStarted();
+          // Read once, when this extraction starts (Admin setting > env > default).
+          const inlineModels = extractionInlineModels();
 
           const inputPageCount = inputExists ? await getPdfPageCount(inputPdfPath) : null;
           if (inputPageCount) {
@@ -4249,7 +4365,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
               extractMode: 'inline',
               chunkPages,
               uploadedFileName: inlineUploadedFileName,
-              inlineModelOverride: 'gemini-3.1-pro-preview',
+              inlineModelOverride: inlineModels.pro,
               label: 'APIscraper inline fallback',
             });
             if (ok) {
@@ -4437,8 +4553,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
                 // 2) cheap INLINE on a 0-yield — the mode switch recovers flaky
                 //    page-mode misses without paying for the pro model.
                 if (produced <= 0) {
-                  const cheapInline =
-                    process.env.RAG_FEEDER_API_INLINE_CHEAP_MODEL || 'gemini-3-flash-preview';
+                  const cheapInline = inlineModels.cheap;
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Page mode produced 0 references; retrying with cheap inline (${cheapInline}).`);
                   produced = await runInlineMode(`APIscraper inline (${cheapInline})`, cheapInline);
                   producedMode = 'inline';
@@ -4446,8 +4561,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
 
                 // 3) last resort: inline with the pro model (RAG_FEEDER_API_INLINE_MODEL)
                 if (produced <= 0) {
-                  const proInline =
-                    process.env.RAG_FEEDER_API_INLINE_MODEL || 'gemini-3.1-pro-preview';
+                  const proInline = inlineModels.pro;
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Still 0 references; final fallback to inline (${proInline}).`);
                   produced = await runInlineMode(`APIscraper inline (${proInline})`, proInline);
                   producedMode = 'inline';
@@ -4566,7 +4680,8 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     const done = spawned.then(({ stdout }) => parseJsonFromOutput(stdout));
     done
       .then(
-        () => null,
+        // The run row carries a quota stop to the UI (status 'done', error = the note).
+        (payload) => { openAlexQuotaStop('/api/keyword-search', payload); return null; },
         (error) => {
           console.error('[/api/keyword-search] Search script failed:', error?.message || error);
           if (!responded) {
@@ -4927,6 +5042,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
       // alongside the result rather than thrown.
       let expansionSeeds = [];
       let expansionError = null;
+      let expansionWarning = null;
       let tempExpandSeedPath = null;
       if (expansionAsNewSeeds) {
         try {
@@ -4962,6 +5078,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             dbPath: DB_PATH,
             corpusId: req.corpusId,
           });
+          expansionWarning = openAlexQuotaStop('/api/seed/sources/:sourceType/:sourceKey/promote', expandResult);
           for (const run of expandResult?.runs || []) {
             const runId = Number(run?.run_id);
             if (!Number.isFinite(runId) || runId <= 0) continue;
@@ -4996,6 +5113,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
             ? ` ${expansionSeeds.length} expansion seed(s) added to Seed for review.`
             : ' No related works were found to seed.'
         : '';
+      const expansionNotice = expansionAsNewSeeds && !expansionError && expansionWarning ? ` ${expansionWarning}` : '';
 
       return res.json({
         success: true,
@@ -5008,10 +5126,11 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
         promotion_mode: expansion.promotionMode,
         expansion_seeds: expansionSeeds,
         expansion_error: expansionError,
+        expansion_warning: expansionWarning,
         backlog: readWorkerBacklogSummary(req.corpusId),
         message: (shouldQueueEnrich || shouldQueueDownload
           ? 'Selected candidates were added to the corpus pipeline. Background workers will continue from DB state.'
-          : 'Selected candidates were already reflected in the corpus state.') + expansionMessage,
+          : 'Selected candidates were already reflected in the corpus state.') + expansionMessage + expansionNotice,
       });
     } catch (error) {
       console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Error:', error);
@@ -5062,7 +5181,7 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (process.env.RAG_FEEDER_STUB === '1') {
       return res.json({ items: STUB_RESULTS.corpus, total: STUB_RESULTS.corpus.length, source: 'stub' });
     }
-    const limit = coerceInt(req.query?.limit, 200);
+    const limit = Math.min(CORPUS_MAX_LIMIT, Math.max(0, coerceInt(req.query?.limit, 200)));
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
@@ -5549,10 +5668,17 @@ export function createApp({ broadcast, broadcastEvent } = {}) {
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'Uploaded file not found. Please re-upload.' });
     }
+    // spawnPython appends the corpus flag from its corpusId option.
     const args = ['--db-path', DB_PATH, '--file', filePath, '--kind', kind, '--source-label', filename];
-    if (req.corpusId) args.push('--corpus-id', String(req.corpusId));
     try {
       const result = await runPythonJson(INGEST_IMPORT_SEED_SCRIPT, args, { dbPath: DB_PATH, corpusId: req.corpusId });
+      if (result?.stopped) {
+        // The summary goes to a session-local upload row; this is the lasting trace.
+        console.error(
+          `[/api/ingest/import-seed] stopped: ${filename} (corpus ${req.corpusId}): processed ${result.processed} of ${result.total}, `
+            + `${result.added} added, ${result.corpus_linked} linked: ${result.error}`
+        );
+      }
       return res.json(result);
     } catch (error) {
       console.error('[/api/ingest/import-seed] Error:', error);

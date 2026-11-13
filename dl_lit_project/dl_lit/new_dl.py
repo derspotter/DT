@@ -23,12 +23,15 @@ from .db_manager import DatabaseManager
 from .identifiers import inverted_index_to_text_lenient
 from .pdf_downloader import PDFDownloader
 from .utils import (
+    FetchResult,
+    OpenAlexRateLimitExceeded,
     ServiceRateLimiter,
     env_bool,
     env_int,
     get_global_rate_limiter,
     get_openalex_session,
     get_thread_session,
+    redact_openalex_key,
 )
 try:
     # bibtexparser 1.x does not ship middlewares; keep optional so downloads can run without it.
@@ -963,7 +966,7 @@ class BibliographyEnhancer:
                         else:
                             other_matches.append(match_entry)
             except requests.exceptions.RequestException as e:
-                if hasattr(e, 'response') and e.response and e.response.status_code == 429:
+                if getattr(e, 'response', None) is not None and e.response.status_code == 429:
                     print(f"  LibGen rate limit exceeded on {base_url}, trying next mirror")
                     self._save_libgen_debug_response(
                         base_url=base_url,
@@ -973,7 +976,7 @@ class BibliographyEnhancer:
                         error=str(e),
                     )
                     continue
-                if hasattr(e, 'response') and e.response and e.response.status_code in {500, 502, 503, 504}:
+                if getattr(e, 'response', None) is not None and e.response.status_code in {500, 502, 503, 504}:
                     self._save_libgen_debug_response(
                         base_url=base_url,
                         context=f"http_{e.response.status_code}",
@@ -2183,15 +2186,30 @@ class BibliographyEnhancer:
 # ----------------------------------------------------------------------
 # OpenAlex batch fetch helper – keeps rate-limiters & batch logic together
 # ----------------------------------------------------------------------
-def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name,authorships,publication_year,title,referenced_works,abstract_inverted_index", email: str = "default@example.com", limiter: ServiceRateLimiter | None = None) -> list[dict]:
-    """Fetch metadata for a list of OpenAlex IDs using the batch filter API, ≤100 IDs per call."""
+def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name,authorships,publication_year,title,referenced_works,abstract_inverted_index", email: str = "default@example.com", limiter: ServiceRateLimiter | None = None) -> FetchResult:
+    """Fetch metadata for a list of OpenAlex IDs using the batch filter API, ≤100 IDs per call.
+
+    Returns a FetchResult: a failed batch is skipped, sets ``complete`` False and lists its
+    ids in ``failed_ids``. There are no retries.
+    """
     if not work_ids:
-        return []
+        return FetchResult()
     if limiter is None:
         # Use the global rate limiter shared across all components
         limiter = get_global_rate_limiter()
 
-    all_results: list[dict] = []
+    all_results = FetchResult()
+
+    def _batch_failed(batch_ids, message):
+        print(message)
+        all_results.complete = False
+        all_results.errors.append(message.strip())
+        all_results.failed_ids.extend(batch_ids)
+
+    def _quota_exhausted(remaining_ids, message):
+        _batch_failed(remaining_ids, message)
+        all_results.quota_exhausted = True
+
     batch_size = 50 # OpenAlex recommended max batch size for filter
     total_batches = (len(work_ids) + batch_size - 1) // batch_size
     
@@ -2201,8 +2219,13 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
         batch_ids = work_ids[idx : idx + batch_size]
         current_batch_num = (idx // batch_size) + 1
         
-        if not limiter.wait_if_needed():
-            print("[OpenAlex ERROR] Daily quota exceeded – stopping fetch early.")
+        try:
+            proceed = limiter.wait_if_needed("openalex")
+        except OpenAlexRateLimitExceeded as e:
+            _quota_exhausted(work_ids[idx:], f"[OpenAlex WARN] Quota exhausted before Batch {current_batch_num}: {redact_openalex_key(e)}")
+            break
+        if not proceed:
+            _quota_exhausted(work_ids[idx:], "[OpenAlex ERROR] Daily quota exceeded – stopping fetch early.")
             break
             
         # Construct filter string like 'W123|W456'
@@ -2221,17 +2244,22 @@ def fetch_openalex_batch(work_ids: list[str], fields: str = "id,doi,display_name
                 f"    [OpenAlex] Batch {current_batch_num}/{total_batches}: Got {len(batch_res)} results."
             )
             all_results.extend(batch_res)
+        except OpenAlexRateLimitExceeded as e:
+            # Quota is gone for every later batch too: stop, and list them all as failed.
+            _quota_exhausted(work_ids[idx:], f"    [OpenAlex WARN] Quota exhausted at Batch {current_batch_num}: {redact_openalex_key(e)} - stopping.")
+            break
         except requests.exceptions.Timeout:
-            print(f"    [OpenAlex WARN] Timeout occurred for Batch {current_batch_num} - skipping.")
+            _batch_failed(batch_ids, f"    [OpenAlex WARN] Timeout occurred for Batch {current_batch_num} - skipping.")
         except requests.exceptions.HTTPError as e:
-             print(f"    [OpenAlex WARN] HTTP Error for Batch {current_batch_num}: {e} - skipping.")
-             # Maybe add specific handling for 429 Too Many Requests if needed
+            _batch_failed(batch_ids, f"    [OpenAlex WARN] HTTP Error for Batch {current_batch_num}: {redact_openalex_key(e)} - skipping.")
         except requests.exceptions.RequestException as e:
-            print(f"    [OpenAlex WARN] Request error for Batch {current_batch_num}: {e} - skipping.")
+            _batch_failed(batch_ids, f"    [OpenAlex WARN] Request error for Batch {current_batch_num}: {redact_openalex_key(e)} - skipping.")
         except json.JSONDecodeError:
-            print(f"    [OpenAlex WARN] Invalid JSON response for Batch {current_batch_num} – skipping.")
-            
+            _batch_failed(batch_ids, f"    [OpenAlex WARN] Invalid JSON response for Batch {current_batch_num} – skipping.")
+
     print(f"[OpenAlex] Finished fetching. Total results received: {len(all_results)}")
+    if not all_results.complete:
+        print(f"[OpenAlex WARN] referenced works incomplete: {len(all_results)} fetched; {all_results.errors[0]}")
     return all_results
 
 # ----------------------------------------------------------------------
@@ -2331,7 +2359,13 @@ def ingest_json_directory(input_dir: str | Path, db: DatabaseManager, email: str
 
     # Fetch their metadata via OpenAlex
     limiter = get_global_rate_limiter() # Use the global rate limiter shared across all components
-    openalex_results = fetch_openalex_batch(list(work_ids_to_fetch), email=email, limiter=limiter)
+    requested_ids = list(work_ids_to_fetch)
+    openalex_results = fetch_openalex_batch(requested_ids, email=email, limiter=limiter)
+    if openalex_results.failed_ids:
+        print(
+            f"[OpenAlex WARN] {len(openalex_results.failed_ids)} of {len(requested_ids)} "
+            "referenced works could not be fetched."
+        )
     added_ref_works = 0
     
     print(f"[INGEST] Processing {len(openalex_results)} results from OpenAlex...")

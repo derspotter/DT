@@ -8,7 +8,7 @@ from dl_lit import llm_common
 def _fake_attempts(behaviors, seen_timeouts):
     """Stand-in for llm_common._run_attempt: each attempt pops one scripted outcome."""
 
-    def _run_attempt(_call, timeout_seconds):
+    def _run_attempt(_call, timeout_seconds, **_kw):
         seen_timeouts.append(timeout_seconds)
         behavior = behaviors.pop(0)
         if isinstance(behavior, BaseException):

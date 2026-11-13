@@ -472,10 +472,10 @@ def add_pending_works_command(json_file, source_pdf, db_path):
             for error in errors:
                 click.echo(f"  - {error}")
     except Exception as e:
-        click.echo(f"{RED}An unexpected error occurred: {e}{RESET}")
+        click.echo(f"{RED}An unexpected error occurred: {e}{RESET}", err=True)
+        raise SystemExit(1)
     finally:
         db_manager.close_connection()
-        # traceback.print_exc()
 
 @cli.command("extract-bib-api")
 @click.argument('input_path', type=click.Path(exists=True, resolve_path=True))

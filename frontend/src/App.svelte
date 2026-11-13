@@ -67,7 +67,7 @@
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
   import ScraperLab from './components/ScraperLab.svelte'
-  import { seedActivity, seedPromotionStatus } from './lib/seedStatus'
+  import { searchRunSubtitle, seedActivity, seedPromotionStatus } from './lib/seedStatus'
   import {
     workState,
     metadataLabel,
@@ -165,12 +165,11 @@
     queued_download: 0,
     downloaded: 0,
   }
-  let globalIngestStats = {
-    raw_pending: 0,
-    matched: 0,
-    queued_download: 0,
-    downloaded: 0,
-  }
+  // null: not loaded (the dashboard shows "—"). The *Error flags mark the
+  // last global load as failed; the last numbers stay next to the note.
+  let globalIngestStats = null
+  let globalStatsError = false
+  let globalDaemonError = false
   $: pipelineRawCount = Number(ingestStats.raw_pending || 0)
   $: pipelineMetadataCount = Number(ingestStats.matched || 0)
   $: pipelineDownloadedCount = Number(ingestStats.downloaded || 0)
@@ -339,17 +338,21 @@
   $: if (topicOnlySearch && searchSort === 'relevance') searchSort = 'cited_by_count'
 
   let openalexQuota = null
-  let openalexQuotaLoading = false
+  // The session whose quota request is in flight (null: none). A request from
+  // before a sign-out neither blocks the next session's nor lands in it.
+  let openalexQuotaEpoch = null
 
   async function loadOpenAlexQuota() {
-    if (openalexQuotaLoading || authStatus !== 'authenticated') return
-    openalexQuotaLoading = true
+    if (openalexQuotaEpoch === sessionEpoch || authStatus !== 'authenticated') return
+    const epoch = sessionEpoch
+    openalexQuotaEpoch = epoch
     try {
-      openalexQuota = await fetchOpenAlexQuota()
+      const quota = await fetchOpenAlexQuota()
+      if (epoch === sessionEpoch) openalexQuota = quota
     } catch {
       // Leave the last known value; the pill is informational only.
     } finally {
-      openalexQuotaLoading = false
+      if (openalexQuotaEpoch === epoch) openalexQuotaEpoch = null
     }
   }
 
@@ -421,6 +424,9 @@
   // an identical answer leaves corpusItems alone, so the table does not re-render.
   let lastCorpusPageSignature = ''
   let corpusLoadingMore = false
+  // "Show more" asked for while a first-page load runs: that load's finally
+  // starts the append when it still owns the sequence (D1).
+  let corpusAppendQueued = false
   let corpusLoadRequestSeq = 0
   let corpusLoadStatus = ''
   let corpusSource = ''
@@ -484,16 +490,7 @@
     failed_enrichment: 0,
     failed_download: 0,
   }
-  let globalWorkerBacklog = {
-    raw_pending: 0,
-    enriching: 0,
-    matched: 0,
-    queued_download: 0,
-    downloading: 0,
-    downloaded: 0,
-    failed_enrichment: 0,
-    failed_download: 0,
-  }
+  let globalWorkerBacklog = null
   let exportBusy = false
   let exportStatus = ''
   let exportFilterStatus = 'all'
@@ -511,6 +508,14 @@
   let logsHasMore = false
   let logsLoadingOlder = false
   let logsTailStatus = ''
+  // The first close of the log socket since it was last open (null while
+  // connected); a reconnect marks the gap from then to its reopen.
+  let logsDisconnectedAt = null
+  // Set by a gap marker until a tail reload: the cursor cannot count the lines
+  // written during the gap, so "Load older" would repeat lines (D7).
+  let logsNeedReload = false
+  // Bumped by every gap marker: only a tail load started after the latest gap clears it.
+  let logsGapGeneration = 0
   // Bumped by resetLogState (type/filter change, corpus switch, sign-out): a
   // tail or older-lines answer requested under an earlier scope is dropped.
   let logsScopeEpoch = 0
@@ -545,6 +550,8 @@
   let inviteStatus = ''
   let inviteError = false
   let kantroposTargets = []
+  // The last target-list load's error message ('' when it loaded).
+  let kantroposTargetsError = ''
   let kantroposAssignment = null
   let selectedKantroposTargetId = ''
   let kantroposAssignmentStatus = ''
@@ -565,6 +572,8 @@
     graph: { nodes: [], edges: [], stats: {} },
   }
   let upstreamBrowseStatus = ''
+  // The status is an error (the browser shows it as one, with Retry).
+  let upstreamBrowseError = false
   let upstreamBrowseLoading = false
   let upstreamBrowseRequestSeq = 0
   let upstreamCurrentLimit = CORPUS_PAGE_SIZE
@@ -576,8 +585,10 @@
   // Live socket lines are buffered here (not reactive) and flushed into `logs`
   // at most once per 250 ms while the logs tab is open; on other tabs the
   // buffer is a ring capped at maxLogHistory, flushed when the tab opens.
-  // Every entry is { seq, text }; seq comes from one increasing counter and
-  // only keys the rows (older lines loaded later get higher numbers too).
+  // Every entry is { seq, text, marker? }; seq comes from one increasing
+  // counter and only keys the rows (older lines loaded later get higher
+  // numbers too). A marker entry (a reconnect gap) is not a file line: it
+  // never moves logsCursor.
   const LOG_FLUSH_MS = 250
   let logBuffer = []
   let logFlushTimer = null
@@ -596,7 +607,11 @@
   }
 
   function pushLogLine(text) {
-    logBuffer.push({ seq: ++logSeq, text })
+    pushLogEntry({ seq: ++logSeq, text })
+  }
+
+  function pushLogEntry(entry) {
+    logBuffer.push(entry)
     if (logBuffer.length > maxLogHistory) logBuffer.splice(0, logBuffer.length - maxLogHistory)
     if (activeTab === 'logs' && !logFlushTimer) logFlushTimer = setTimeout(flushLogs, LOG_FLUSH_MS)
   }
@@ -606,9 +621,9 @@
       clearTimeout(logFlushTimer)
       logFlushTimer = null
     }
-    const count = logBuffer.length
-    if (count === 0) return
-    const hadLines = logs.length > 0
+    if (logBuffer.length === 0) return
+    const count = logBuffer.filter((entry) => !entry.marker).length
+    const hadLines = logs.some((entry) => !entry.marker)
     logs = [...logs, ...logBuffer].slice(-maxLogHistory)
     logBuffer = []
     // Same per-line rule as before batching: an established cursor grows by
@@ -638,6 +653,8 @@
     logsHasMore = false
     logsLoadingOlder = false
     logsTailStatus = ''
+    logsDisconnectedAt = null
+    logsNeedReload = false
   }
 
   function resetKantroposAssignmentState() {
@@ -666,6 +683,7 @@
       graph: { nodes: [], edges: [], stats: {} },
     }
     upstreamBrowseStatus = ''
+    upstreamBrowseError = false
     upstreamBrowseLoading = false
   }
 
@@ -915,7 +933,9 @@
   }
 
   function handleCorpusColumnScroll(event) {
-    if (!corpusHasMore || corpusLoadingMore || corpusLoading) return
+    // A load in flight queues the append (loadCorpus), so only a running
+    // append stops the trigger.
+    if (!corpusHasMore || corpusLoadingMore) return
     const target = event?.currentTarget
     if (!target) return
     const remaining = target.scrollHeight - target.scrollTop - target.clientHeight
@@ -1569,6 +1589,7 @@
   async function bootstrapAuth({ preserveAuthFlow = false } = {}) {
     authStatus = 'loading'
     authError = ''
+    authBootRetry = false
     const startupTab = !preserveAuthFlow ? readTabFromHash({ includeUnavailable: true }) : null
     const startupNavigationRevision = navigationRevision
     const landingTab = startupTab || activeTab
@@ -1600,29 +1621,77 @@
     } catch (error) {
       // A 401 already ran expireSession (state reset, token cleared).
       if (error?.status === 401 || epoch !== sessionEpoch) return
+      // Anything else (a timeout, a 502 during a deploy) says nothing about
+      // the token: keep it and let the user retry. No automatic retry.
+      const keptToken = Boolean(getAuthToken())
       authStatus = 'unauthenticated'
-      authError = ''
+      authError = keptToken ? `${asSentence(error?.message || 'Failed to load user')} Your session is kept; press Retry when the server is back.` : ''
+      authBootRetry = keptToken
       authUser = null
       corpora = []
       currentCorpusId = null
       disconnectLogs()
-      setAuthToken('')
     }
+  }
+
+  // Retry after a boot failure that kept the token, from whichever auth form
+  // shows the D10 text: an invite, reset or forgot-password link stays open.
+  function retryBoot() {
+    bootstrapAuth({ preserveAuthFlow: authFlow !== 'login' })
+  }
+
+  // "Bad gateway" -> "Bad gateway."; text that ends a sentence stays as is.
+  function asSentence(text) {
+    const value = String(text || '').trim()
+    return /[.!?]$/.test(value) ? value : `${value}.`
+  }
+
+  // Invite and reset links: the password call succeeded, so the link is used
+  // up, but signing in afterwards failed. The form to go back to is the
+  // sign-in one, with the account already filled in.
+  function recoverSavedPassword(username, error) {
+    if (getAuthToken()) endSession()
+    disconnectLogs()
+    setAuthToken('')
+    authStatus = 'unauthenticated'
+    authFlow = 'login'
+    authFlowToken = ''
+    authPassword = ''
+    authPasswordConfirm = ''
+    // replaceState fires no hashchange, which would clear the message.
+    if (typeof window !== 'undefined' && window.history?.replaceState) window.history.replaceState(null, '', '#/login')
+    if (username) loginUsername = username
+    authError = `Your password was saved, but signing in failed (${error?.message || 'unknown error'}). Sign in with your new password.`
   }
 
   async function handleLogin(event) {
     event?.preventDefault?.()
+    // Single-flight: a second submit (Enter, a double click) is ignored.
+    if (authFormSubmit.login) return
     authError = ''
     // A newer sign-in or a sign-out takes this attempt over; an expired token
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
+    const submit = beginAuthSubmit('login')
+    // A 401 from a load of the new session (the loads swallow it) expired the
+    // session; expireSession left the message to this submit, which reports
+    // the 401's own text, as /me's 401 does through the catch below.
+    const lostSession = () => {
+      if (epoch === sessionEpoch) return false
+      if (authSubmitOwns(submit) && authStatus === 'unauthenticated') {
+        authError = lastExpiryMessage || 'Your session has expired. Please sign in again.'
+      }
+      return true
+    }
     try {
       const payload = await login({ username: loginUsername.trim(), password: loginPassword })
       if (attempt !== signInEpoch) return
       enterSession(payload)
       attempt = signInEpoch
+      submit.attempt = attempt
       epoch = sessionEpoch
+      submit.session = epoch
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -1633,10 +1702,12 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
+      // Signed out or expired meanwhile: the loads belong to no session.
+      if (lostSession()) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
       // A 401 during the loads signed the session out already.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
@@ -1645,10 +1716,20 @@
       // Only the attempt still in charge may report or clear. That includes a
       // 401 from its own /me, which already ran expireSession.
       if (attempt !== signInEpoch) return
+      // A newer submit owns the form and its message: only this attempt's own
+      // half-started session is taken down.
+      if (!authSubmitOwns(submit)) {
+        releaseOwnSession(submit)
+        return
+      }
       authError = error.message || 'Login failed'
       authStatus = 'unauthenticated'
       disconnectLogs()
       setAuthToken('')
+      // A token boot kept for Retry is gone with it: Retry would boot with none.
+      authBootRetry = false
+    } finally {
+      endAuthSubmit(submit)
     }
   }
 
@@ -1656,17 +1737,26 @@
     event?.preventDefault?.()
     authError = ''
     authInfo = ''
+    const submit = beginAuthSubmit()
     try {
       await requestPasswordReset(authEmail.trim())
+      // A sign-in or a newer submit since then owns the form (and maybe a
+      // session): this answer says nothing there.
+      if (!authSubmitOwns(submit)) return
       authInfo = 'If that email exists, a reset link has been sent.'
       authEmail = ''
     } catch (error) {
+      if (!authSubmitOwns(submit)) return
       authError = error.message || 'Failed to send password reset email'
+    } finally {
+      endAuthSubmit(submit)
     }
   }
 
   async function handleAcceptInvite(event) {
     event?.preventDefault?.()
+    // Single-flight: a second submit (Enter, a double click) is ignored.
+    if (authFormSubmit.acceptInvite) return
     authError = ''
     authInfo = ''
     if (!authFlowToken) {
@@ -1685,14 +1775,28 @@
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
+    // Set once the password call succeeded: a later failure is a failed
+    // sign-in, not a failed link.
+    let savedUsername = null
+    const submit = beginAuthSubmit('acceptInvite')
     try {
       const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
-      if (attempt !== signInEpoch) return
+      if (!authSubmitOwns(submit)) return
+      savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
+      submit.attempt = attempt
       epoch = sessionEpoch
+      submit.session = epoch
+      // A 401 from any load of the new session (they swallow it) expired
+      // the session: the password is saved all the same.
+      const lostSession = () => {
+        if (epoch === sessionEpoch) return false
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
+        return true
+      }
       const me = await fetchMe()
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1701,22 +1805,33 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
+      if (lostSession()) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
-      // A 401 during the loads signed the session out already.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
       if (attempt !== signInEpoch) return
+      if (savedUsername !== null) {
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
+        else releaseOwnSession(submit)
+        return
+      }
+      // A newer submit owns the form: its outcome stays on screen.
+      if (!authSubmitOwns(submit)) return
       authError = error.message || 'Failed to accept invite'
+    } finally {
+      endAuthSubmit(submit)
     }
   }
 
   async function handleResetPassword(event) {
     event?.preventDefault?.()
+    // Single-flight: a second submit (Enter, a double click) is ignored.
+    if (authFormSubmit.resetPassword) return
     authError = ''
     authInfo = ''
     if (!authFlowToken) {
@@ -1735,14 +1850,28 @@
     // does not (signInEpoch). Its success starts the session `epoch` watches.
     let attempt = signInEpoch
     let epoch = sessionEpoch
+    // Set once the password call succeeded: a later failure is a failed
+    // sign-in, not a failed link.
+    let savedUsername = null
+    const submit = beginAuthSubmit('resetPassword')
     try {
       const payload = await resetPassword({ token: authFlowToken, password: authPassword })
-      if (attempt !== signInEpoch) return
+      if (!authSubmitOwns(submit)) return
+      savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
       attempt = signInEpoch
+      submit.attempt = attempt
       epoch = sessionEpoch
+      submit.session = epoch
+      // A 401 from any load of the new session (they swallow it) expired
+      // the session: the password is saved all the same.
+      const lostSession = () => {
+        if (epoch === sessionEpoch) return false
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
+        return true
+      }
       const me = await fetchMe()
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       authUser = me.user
       corpora = me.corpora || []
       currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
@@ -1751,17 +1880,26 @@
       authFlowToken = ''
       const authNavigationRevision = navigationRevision
       await loadRecursionConfig()
+      if (lostSession()) return
       const refreshedTab = activeTab
       await refreshAll(refreshedTab)
-      // A 401 during the loads signed the session out already.
-      if (epoch !== sessionEpoch) return
+      if (lostSession()) return
       connectLogs()
       if (navigationRevision === authNavigationRevision) {
         setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
       }
     } catch (error) {
       if (attempt !== signInEpoch) return
+      if (savedUsername !== null) {
+        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
+        else releaseOwnSession(submit)
+        return
+      }
+      // A newer submit owns the form: its outcome stays on screen.
+      if (!authSubmitOwns(submit)) return
       authError = error.message || 'Failed to reset password'
+    } finally {
+      endAuthSubmit(submit)
     }
   }
 
@@ -1791,17 +1929,82 @@
   // or a deliberate sign-out. Not an expired token: a boot 401 landing during
   // the submit must not cost the attempt its outcome.
   let signInEpoch = 0
-
-  // The one path for an expired session: api.js runs it on every 401. Several
-  // requests can fail together; once signed out, the rest change nothing.
-  function expireSession() {
-    if (authStatus === 'unauthenticated' && !getAuthToken()) return
+  // Sign-in, forgot-password, accept-invite and reset-password submits in
+  // flight, each with the signInEpoch it answers to and its place in the
+  // order of submits. Only the newest submit, and only while no sign-out or
+  // newer sign-in took over, owns the form: its own outcome is the message.
+  // An abandoned one says nothing about the next session or the next submit,
+  // even before its `finally` runs.
+  const authSubmits = new Set()
+  let authSubmitSeq = 0
+  // The sign-in, accept-invite and reset-password forms are single-flight:
+  // the submit in flight per form (null: none). Its button is disabled and
+  // its handler ignores a second call. Cleared in the submit's `finally`, by
+  // a sign-out, and when the session the submit started ends.
+  let authFormSubmit = { login: null, acceptInvite: null, resetPassword: null }
+  function beginAuthSubmit(form = null) {
+    const submit = { attempt: signInEpoch, seq: ++authSubmitSeq, form, session: null }
+    authSubmits.add(submit)
+    if (form) authFormSubmit = { ...authFormSubmit, [form]: submit }
+    return submit
+  }
+  function endAuthSubmit(submit) {
+    authSubmits.delete(submit)
+    releaseAuthForms((entry) => entry === submit)
+  }
+  function releaseAuthForms(matches) {
+    const next = { ...authFormSubmit }
+    let changed = false
+    for (const form of Object.keys(next)) {
+      if (next[form] && matches(next[form])) {
+        next[form] = null
+        changed = true
+      }
+    }
+    if (changed) authFormSubmit = next
+  }
+  function authSubmitOwns(submit) {
+    return submit.attempt === signInEpoch && submit.seq === authSubmitSeq
+  }
+  // A submit that no longer owns the form failed after its own enterSession:
+  // its session ends without touching the newer submit's message.
+  function releaseOwnSession(submit) {
+    if (submit.session === null || submit.session !== sessionEpoch || !getAuthToken()) return
+    const keptError = authError
+    const keptInfo = authInfo
     endSession()
+    authError = keptError
+    authInfo = keptInfo
+  }
+  function authSubmitOwnsForm() {
+    for (const submit of authSubmits) if (authSubmitOwns(submit)) return true
+    return false
+  }
+  // The text of the 401 that last expired a session (the loads that hit it
+  // swallow their error).
+  let lastExpiryMessage = ''
+  // Boot failed for a reason other than a rejected token: the sign-in card
+  // offers Retry (bootstrapAuth) with the token kept.
+  let authBootRetry = false
+
+  // The one path for an expired session: api.js runs it on every 401, and the
+  // log socket on a 4401 close. Several requests can fail together; once
+  // signed out, the rest change nothing. The message says why the form is
+  // back, unless a submit in flight or an error already on screen owns it.
+  function expireSession(message = 'Your session was rejected') {
+    if (authStatus === 'unauthenticated' && !getAuthToken()) return
+    lastExpiryMessage = message
+    // The boot error (authBootRetry) promised a kept token; the token is gone
+    // now, so the expiry message takes its place.
+    const showExpiry = !authSubmitOwnsForm() && (!authError || authBootRetry) && Boolean(getAuthToken())
+    endSession()
+    if (showExpiry) authError = 'Your session has expired. Please sign in again.'
   }
   onUnauthorized(expireSession)
 
   function handleLogout() {
     signInEpoch += 1
+    releaseAuthForms(() => true)
     endSession()
   }
 
@@ -1809,7 +2012,12 @@
     // During boot the sign-in forms are already up, so an error on screen is
     // the outcome of a submit, not of the session that is ending.
     const keepError = authStatus === 'loading'
+    // A submit whose session this is gives its form back (a submit that has
+    // not started a session yet, e.g. under a stale boot token, keeps it).
+    const endingSession = sessionEpoch
+    releaseAuthForms((submit) => submit.session === endingSession)
     sessionEpoch += 1
+    authBootRetry = false
     disconnectLogs()
     setAuthToken('')
     authStatus = 'unauthenticated'
@@ -1828,6 +2036,7 @@
     if (getAuthToken()) endSession()
     signInEpoch += 1
     sessionEpoch += 1
+    authBootRetry = false
     if (payload?.token) setAuthToken(payload.token)
     if (payload?.user) {
       authUser = payload.user
@@ -1880,6 +2089,7 @@
     corpusLoadRequestSeq += 1
     corpusLoading = false
     corpusLoadingMore = false
+    corpusAppendQueued = false
     lastCorpusPageSignature = ''
     resourcesInFlight.clear()
   }
@@ -2007,6 +2217,7 @@
     resetTopicSearch()
     resetKantroposAssignmentState()
     resetUpstreamBrowseState()
+    kantroposTargetsError = ''
     finishExtractionProgress()
     if (signOut) {
       // null makes the Admin tab fetch the settings again.
@@ -2018,9 +2229,12 @@
       inviteEmail = ''
       inviteStatus = ''
       inviteError = false
-      globalIngestStats = { raw_pending: 0, matched: 0, queued_download: 0, downloaded: 0 }
-      globalWorkerBacklog = { raw_pending: 0, enriching: 0, matched: 0, queued_download: 0, downloading: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 }
+      globalIngestStats = null
+      globalWorkerBacklog = null
+      globalStatsError = false
+      globalDaemonError = false
       kantroposTargets = []
+      kantroposTargetsPromise = null
       selectedUpstreamTargetId = ''
       openalexQuota = null
       // The signed-out user's view choices.
@@ -2179,28 +2393,38 @@
 
   // One request for the target list at a time: the browse and the assignment
   // load both need it and may ask together.
+  // The shared request belongs to the session that sent it: a sign-out clears
+  // it, a new session sends its own, and an answer from an earlier session
+  // writes nothing.
   let kantroposTargetsPromise = null
+  let kantroposTargetsSession = null
   function loadKantroposTargets() {
-    if (!kantroposTargetsPromise) {
-      kantroposTargetsPromise = fetchKantroposTargets().finally(() => {
-        kantroposTargetsPromise = null
+    if (!kantroposTargetsPromise || kantroposTargetsSession !== sessionEpoch) {
+      const session = sessionEpoch
+      const promise = fetchKantroposTargets(session).finally(() => {
+        if (kantroposTargetsPromise === promise) kantroposTargetsPromise = null
       })
+      kantroposTargetsPromise = promise
+      kantroposTargetsSession = session
     }
     return kantroposTargetsPromise
   }
 
-  async function fetchKantroposTargets() {
+  async function fetchKantroposTargets(session) {
     try {
       const payload = await fetchKantroposCorpora()
+      if (session !== sessionEpoch) return
       kantroposTargets = payload?.corpora || []
+      kantroposTargetsError = ''
       const hasCurrentSelection = kantroposTargets.some((target) => String(target.id) === String(selectedUpstreamTargetId))
       if (!hasCurrentSelection) {
         const preferredTargetId = kantroposAssignment?.target_id || kantroposTargets[0]?.id || ''
         selectedUpstreamTargetId = String(preferredTargetId || '')
       }
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       kantroposTargets = []
+      kantroposTargetsError = error?.message || 'Request failed'
       kantroposAssignmentStatus = error.message || 'Failed to load Kantropos corpora.'
       kantroposAssignmentError = true
       if (!selectedUpstreamTargetId) {
@@ -2231,8 +2455,14 @@
       }
       const targetId = String(selectedUpstreamTargetId || kantroposAssignment?.target_id || kantroposTargets[0]?.id || '').trim()
       if (!targetId) {
-        if (!quiet) upstreamBrowseStatus = 'No upstream corpora are configured.'
+        if (kantroposTargetsError) {
+          // A failed list is not an empty one: keep the last browse.
+          upstreamBrowseError = true
+          upstreamBrowseStatus = `Could not load the Kantropos corpora: ${kantroposTargetsError}`
+          return
+        }
         resetUpstreamBrowseState()
+        upstreamBrowseStatus = 'No upstream corpora are configured.'
         return
       }
       selectedUpstreamTargetId = targetId
@@ -2266,12 +2496,16 @@
       }
       if (!quiet) {
         upstreamBrowseStatus = 'Loaded upstream corpus browser.'
+      } else if (upstreamBrowseError) {
+        upstreamBrowseStatus = ''
       }
+      upstreamBrowseError = false
     } catch (error) {
       if (error?.status === 401 || requestSeq !== upstreamBrowseRequestSeq || epoch !== corpusScopeEpoch) return
-      if (!quiet) {
-        upstreamBrowseStatus = error?.message || 'Failed to load upstream corpus browser.'
-      }
+      // Quiet or not: a tab load that fails must not look like an empty corpus.
+      const message = String(error?.message || 'Request failed').replace(/\.+$/, '')
+      upstreamBrowseError = true
+      upstreamBrowseStatus = `Could not load the upstream corpus: ${message}.${upstreamBrowse.target ? ' Showing the last loaded data.' : ''}`
     } finally {
       if (requestSeq === upstreamBrowseRequestSeq) {
         upstreamBrowseLoading = false
@@ -2406,6 +2640,17 @@
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
         const result = await importSeed(payload.filename, seedKind)
+        if (result?.stopped) {
+          // The import stopped on an error; what it saved before that stays.
+          const processed = Number(result.processed || 0)
+          const added = Number(result.added || 0)
+          const message = processed === 0 && added === 0
+            ? `Import failed: ${result.error}`
+            : `Import stopped after ${processed} of ${Number(result.total || 0)} entries: ${result.error} (${added} added, ${Number(result.corpus_linked || 0)} linked before it).`
+          updateUpload(item.id, { status: 'failed', backendFilename: payload.filename, message })
+          apiStatus = 'online'
+          return
+        }
         const linked = Number(result.corpus_linked || 0)
         updateUpload(item.id, {
           status: 'imported',
@@ -2471,24 +2716,38 @@
   }
 
   async function loadIngestStats({ quiet = false, global = false } = {}) {
+    if (global) return loadGlobalIngestStats()
     if (!quiet) ingestStatsStatus = 'Loading ingest stats...'
     const epoch = corpusScopeEpoch
     try {
-      const payload = await fetchIngestStats({ global })
-      if (!global && epoch !== corpusScopeEpoch) return
-      if (global) {
-        globalIngestStats = payload.stats || globalIngestStats
-      } else {
-        ingestStats = payload.stats || ingestStats
-      }
+      const payload = await fetchIngestStats()
+      if (epoch !== corpusScopeEpoch) return
+      ingestStats = payload.stats || ingestStats
       if (!quiet) ingestStatsStatus = ''
       apiStatus = 'online'
     } catch (error) {
       if (error?.status === 401) return
       // Requested for a corpus the workspace has left: change nothing.
-      if (!global && epoch !== corpusScopeEpoch) return
-      if (!global) handleCorpusPollForbidden(error)
+      if (epoch !== corpusScopeEpoch) return
+      handleCorpusPollForbidden(error)
       if (!quiet) ingestStatsStatus = 'Failed to load ingest stats.'
+      apiStatus = error?.status === 403 ? 'online' : 'offline'
+    }
+  }
+
+  // The admin's totals across all corpora. Not corpus-scoped, so the session
+  // guards it: an answer or error from before a sign-out writes nothing.
+  async function loadGlobalIngestStats() {
+    const epoch = sessionEpoch
+    try {
+      const payload = await fetchIngestStats({ global: true })
+      if (epoch !== sessionEpoch) return
+      globalIngestStats = payload?.stats || globalIngestStats || {}
+      globalStatsError = false
+      apiStatus = 'online'
+    } catch (error) {
+      if (error?.status === 401 || epoch !== sessionEpoch) return
+      globalStatsError = true
       apiStatus = error?.status === 403 ? 'online' : 'offline'
     }
   }
@@ -2637,7 +2896,7 @@
     corpusFilterQuery = String(event?.target?.value || '')
     clearTimeout(corpusFilterDebounce)
     corpusFilterDebounce = setTimeout(() => {
-      loadCorpus({ quiet: true })
+      loadCorpus({ quiet: true, supersede: true })
     }, 300)
   }
 
@@ -2687,7 +2946,7 @@
 
   function toggleCorpusSort(column) {
     corpusSort = nextSort(corpusSort, column)
-    loadCorpus({ quiet: true })
+    loadCorpus({ quiet: true, supersede: true })
   }
 
   function getSeedCandidatesForSource(source) {
@@ -2780,12 +3039,15 @@
       .filter(Boolean)
   }
 
+  // All-selected mode selects every selectable row (D4): its count is the
+  // selectable estimate, not the seed total, and it always reads as full.
   function selectedSeedCount(source) {
     const sourceId = seedSourceId(source)
-    return seedAllSelected[sourceId] ? seedPage(source).total : getSeedSelectionForSource(source).size
+    return seedAllSelected[sourceId] ? estimatedSelectableSeedCount(source) : getSeedSelectionForSource(source).size
   }
 
   function isSeedFullySelected(source) {
+    if (seedAllSelected[seedSourceId(source)]) return true
     const selectableCount = estimatedSelectableSeedCount(source)
     return selectableCount > 0 && selectedSeedCount(source) === selectableCount
   }
@@ -2944,14 +3206,7 @@
   }
 
   function runSubtitle(source) {
-    const run = source?.run
-    if (!run || !run.status || run.status === 'done') return ''
-    const fetched = Number(run.fetched_count || 0).toLocaleString('en-US')
-    const expected = run.expected_count === null || run.expected_count === undefined ? '…' : Number(run.expected_count).toLocaleString('en-US')
-    if (run.status === 'running') return `fetching ${fetched} of ${expected}`
-    if (run.status === 'failed') return `stopped after ${fetched} of ${expected}: ${run.error || 'unknown error'}`
-    if (run.status === 'cancelled') return `cancelled at ${fetched} of ${expected}`
-    return ''
+    return searchRunSubtitle(source?.run)
   }
 
   async function handleCancelSearch(source) {
@@ -3544,16 +3799,33 @@
     }
   }
 
-  async function loadCorpus({ append = false, preserveSelection = false, quiet = false } = {}) {
-    if (!append && corpusLoading) return
-    if (!append && quiet && corpusLoadingMore) return
+  // A user reload (filter, sort) passes supersede: it starts even while
+  // another load runs, and the newer sequence discards that load's answer and
+  // leaves the flags to this one. Every other first-page load (the poll among
+  // them) still yields to a load in flight. An append asked for while a
+  // first-page load runs is queued and starts from that load's finally (D1).
+  async function loadCorpus({ append = false, preserveSelection = false, quiet = false, supersede = false } = {}) {
+    if (append) {
+      if (corpusLoadingMore || !corpusHasMore) return
+      if (corpusLoading) {
+        corpusAppendQueued = true
+        return
+      }
+    } else if (supersede) {
+      // The new query starts from offset 0: a queued or running append
+      // belongs to the old one.
+      corpusAppendQueued = false
+      corpusLoadingMore = false
+    } else {
+      if (corpusLoading) return
+      if (quiet && corpusLoadingMore) return
+    }
 
     const requestSeq = ++corpusLoadRequestSeq
     // null until the auth payload names the corpus (the initial value is 0):
     // the backend then answers for the token's corpus, which is that one.
     const requestCorpusId = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
     if (append) {
-      if (corpusLoading || corpusLoadingMore || !corpusHasMore) return
       corpusLoadingMore = true
       if (!quiet) corpusLoadStatus = 'Loading more corpus entries...'
     } else {
@@ -3638,7 +3910,15 @@
           data = prefix
         }
       }
-      const incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      let incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
+      if (append) {
+        // A row inserted since the last page shifts the offsets, so the next
+        // page can repeat a loaded row; Corpus keys its rows by id (D2). The
+        // next offset stays corpusItems.length and corpusHasMore still
+        // compares with the total, so a dropped row never ends paging early.
+        const loadedIds = new Set(corpusItems.map((item) => item?.id))
+        incoming = incoming.filter((item) => !loadedIds.has(item?.id))
+      }
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
       applyCorpusCounts(total, stageTotals)
@@ -3665,6 +3945,10 @@
       if (requestSeq === corpusLoadRequestSeq) {
         corpusLoading = false
         corpusLoadingMore = false
+        if (!append && corpusAppendQueued) {
+          corpusAppendQueued = false
+          if (corpusHasMore) loadCorpus({ append: true })
+        }
       }
     }
   }
@@ -3694,15 +3978,26 @@
     }
   }
 
+  // As loadGlobalIngestStats: session-scoped, not corpus-scoped.
+  async function loadGlobalWorkerBacklog() {
+    const epoch = sessionEpoch
+    try {
+      const payload = await fetchPipelineDaemonStatus({ global: true })
+      if (epoch !== sessionEpoch) return
+      globalWorkerBacklog = payload?.backlog || globalWorkerBacklog || {}
+      globalDaemonError = false
+    } catch (error) {
+      if (error?.status === 401 || epoch !== sessionEpoch) return
+      globalDaemonError = true
+    }
+  }
+
   async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
+    if (global) return loadGlobalWorkerBacklog()
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
     const epoch = corpusScopeEpoch
     try {
-      const payload = await fetchPipelineDaemonStatus({ global })
-      if (global) {
-        globalWorkerBacklog = payload?.backlog || globalWorkerBacklog
-        return
-      }
+      const payload = await fetchPipelineDaemonStatus()
       // The backlog is corpus-scoped. A stale response leaves the status
       // alone: it may already show the newer corpus's request.
       if (epoch !== corpusScopeEpoch) return
@@ -3876,6 +4171,8 @@
         extract_model: appSettings?.extract_model?.value || '',
         openai_model: appSettings?.openai_model?.value || '',
         gemini_model: appSettings?.gemini_model?.value || '',
+        inline_cheap_model: appSettings?.inline_cheap_model?.value || '',
+        inline_model: appSettings?.inline_model?.value || '',
       }
     } catch (error) {
       if (error?.status === 401 || epoch !== sessionEpoch) return
@@ -3891,14 +4188,17 @@
     for (const key of ['openalex_api_key', 'openai_api_key', 'gemini_api_key']) {
       if (!String(payload[key] || '').trim()) delete payload[key]
     }
+    // A save that settles after a sign-out belongs to the session that ended.
+    const epoch = sessionEpoch
     try {
       appSettingsError = false
       appSettingsStatus = 'Saving...'
       await saveAppSettings(payload)
+      if (epoch !== sessionEpoch) return
       appSettingsStatus = 'Settings saved. New values apply to the next pipeline run.'
       await loadAppSettings()
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== sessionEpoch) return
       appSettingsStatus = error?.message || 'Failed to save settings.'
       appSettingsError = true
     }
@@ -3962,6 +4262,7 @@
   async function hydrateLogsFromTail({ force = false } = {}) {
     if (!force && (logs.length > 0 || logBuffer.length > 0)) return
     const epoch = logsScopeEpoch
+    const gapGeneration = logsGapGeneration
     logsTailStatus = 'Loading recent logs...'
     try {
       const payload = await fetchLogsTail({
@@ -3984,6 +4285,8 @@
         ? Number(payload.next_cursor)
         : logs.length
       logsHasMore = Boolean(payload?.has_more)
+      // A tail requested before a newer gap cannot account for it.
+      if (gapGeneration === logsGapGeneration) logsNeedReload = false
       logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} recent log lines.` : 'No persisted logs yet.'
     } catch (error) {
       if (error?.status === 401 || epoch !== logsScopeEpoch) return
@@ -3991,12 +4294,23 @@
     }
   }
 
+  const LOG_VIEW_FULL_STATUS = 'The log view holds 5,000 lines. Older lines stay in the log file.'
+
+  // Older lines are admitted only while the view has room (D6): a full view
+  // sends no request, and capacity is decided again when the answer arrives,
+  // because live lines may have filled the view meanwhile. Nothing fetched is
+  // trimmed; the cursor advances only by the lines admitted, so the rest are
+  // fetched again by the next request.
   async function loadOlderLogs() {
-    if (logsLoadingOlder || !logsHasMore) return
+    if (logsLoadingOlder || !logsHasMore || logsNeedReload) return
     // The cursor counts the newest lines already shown; buffered lines are
     // in the file too, so they go into the view (and the cursor) first, or
     // the page would repeat lines and skip as many older ones.
     flushLogs()
+    if (logs.length >= maxLogHistory) {
+      logsTailStatus = LOG_VIEW_FULL_STATUS
+      return
+    }
     const epoch = logsScopeEpoch
     const cursorAtRequest = logsCursor
     logsLoadingOlder = true
@@ -4004,25 +4318,39 @@
     try {
       const payload = await fetchLogsTail({
         type: logsType,
-        lines: maxLogs,
+        lines: Math.min(maxLogs, maxLogHistory - logs.length),
         includeRotated: true,
         cursor: cursorAtRequest,
         corpusId: getLogsCorpusId(),
       })
       if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
-      if (entries.length > 0) {
-        logs = [...toLogEntries(entries), ...logs].slice(-maxLogHistory)
+      flushLogs()
+      const room = Math.max(0, maxLogHistory - logs.length)
+      // The newest lines sit next to the view. slice(-0) would be the whole page.
+      const accepted = room > 0 ? entries.slice(-room) : []
+      if (accepted.length > 0) {
+        logs = [...toLogEntries(accepted), ...logs]
       }
       // Lines flushed while the request was pending advanced the cursor;
       // keep that advance on top of the answer's.
       const advanced = logsCursor - cursorAtRequest
-      const nextCursor = Number.isFinite(Number(payload?.next_cursor))
+      const allAccepted = accepted.length === entries.length
+      const nextCursor = allAccepted && Number.isFinite(Number(payload?.next_cursor))
         ? Number(payload.next_cursor)
-        : cursorAtRequest + entries.length
+        : cursorAtRequest + accepted.length
       logsCursor = nextCursor + advanced
-      logsHasMore = Boolean(payload?.has_more)
-      logsTailStatus = entries.length > 0 ? `Loaded ${entries.length} older log lines.` : 'No older logs found.'
+      // Lines left out are still to be loaded.
+      logsHasMore = allAccepted ? Boolean(payload?.has_more) : true
+      if (entries.length === 0) {
+        logsTailStatus = 'No older logs found.'
+      } else if (accepted.length === 0) {
+        logsTailStatus = LOG_VIEW_FULL_STATUS
+      } else if (!allAccepted) {
+        logsTailStatus = `Loaded ${accepted.length} of ${entries.length} older log lines; the view holds 5,000 lines.`
+      } else {
+        logsTailStatus = `Loaded ${entries.length} older log lines.`
+      }
     } catch (error) {
       if (error?.status === 401 || epoch !== logsScopeEpoch) return
       logsTailStatus = error?.message || 'Failed to load older logs.'
@@ -4071,10 +4399,17 @@
     }
   }
 
-  function connectLogs() {
+  function logGapTime(date) {
+    return date.toLocaleTimeString('en-GB', { hour12: false })
+  }
+
+  // The first connect hydrates from the tail. A reconnect never hydrates and
+  // never replaces the view: when it opens it marks the gap since the first
+  // close instead (D7); "Reload logs" on the marker is the explicit refresh.
+  function connectLogs({ reconnect = false } = {}) {
     disconnectLogs()
     logsStatus = 'connecting'
-    hydrateLogsFromTail()
+    if (!reconnect) hydrateLogsFromTail()
     try {
       const envBase = String(import.meta.env.VITE_API_BASE || '').trim()
       const rawBase = envBase || window.location.origin
@@ -4095,12 +4430,27 @@
         logsStatus = 'reconnecting'
         logsReconnectTimer = setTimeout(() => {
           logsReconnectTimer = null
-          connectLogs()
+          connectLogs({ reconnect: true })
         }, 3000)
       }
       ws.onopen = () => {
         if (logsSocket !== ws) return
         logsStatus = 'connected'
+        if (reconnect && logsDisconnectedAt) {
+          // Live lines exist only for the pipeline view; another type has no gap.
+          if (logsType === 'pipeline') {
+            const from = logGapTime(logsDisconnectedAt)
+            const to = logGapTime(new Date())
+            pushLogEntry({
+              seq: ++logSeq,
+              text: `Connection lost ${from}–${to}. Lines from that period may be missing.`,
+              marker: true,
+            })
+            logsNeedReload = true
+            logsGapGeneration += 1
+          }
+        }
+        logsDisconnectedAt = null
       }
       ws.onmessage = (event) => {
         if (logsSocket !== ws) return
@@ -4128,12 +4478,14 @@
         if (logsSocket !== ws) return
         logsSocket = null
         if (event?.code === 4401) {
-          // Token rejected by the server: full sign-out, no reconnect. The
-          // status is set after handleLogout() so disconnectLogs() keeps it.
-          handleLogout()
+          // Token rejected by the server: the session expired, no reconnect.
+          // The status is set after expireSession() so disconnectLogs() keeps it.
+          expireSession()
           logsStatus = 'unauthorized'
           return
         }
+        // A series of failed reconnects keeps the first close time.
+        if (!logsDisconnectedAt) logsDisconnectedAt = new Date()
         scheduleReconnect()
       }
       ws.onerror = () => {
@@ -4334,7 +4686,10 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
-          <button type="submit">Activate account</button>
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
+          {/if}
+          <button type="submit" disabled={Boolean(authFormSubmit.acceptInvite)}>Activate account</button>
         </form>
       {:else if authFlow === 'reset-password'}
         <h1>Reset password</h1>
@@ -4354,7 +4709,10 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
-          <button type="submit">Save password</button>
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
+          {/if}
+          <button type="submit" disabled={Boolean(authFormSubmit.resetPassword)}>Save password</button>
         </form>
       {:else if authFlow === 'forgot-password'}
         <h1>Forgot password</h1>
@@ -4369,6 +4727,9 @@
           {/if}
           {#if authError}
             <p class="error">{authError}</p>
+          {/if}
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
           {/if}
           <div class="auth-actions">
             <button type="submit">Send reset link</button>
@@ -4393,8 +4754,11 @@
           {#if authError}
             <p class="error">{authError}</p>
           {/if}
+          {#if authBootRetry}
+            <button type="button" class="secondary" data-testid="auth-retry" on:click={retryBoot}>Retry</button>
+          {/if}
           <div class="auth-actions">
-            <button type="submit">Sign in</button>
+            <button type="submit" disabled={Boolean(authFormSubmit.login)}>Sign in</button>
             <a href="#/forgot-password" class="text-link">Forgot password?</a>
           </div>
         </form>
@@ -4815,10 +5179,10 @@
                 {@const sourceCandidates = sortSeedCandidates(source, loaded || EMPTY_LIST, seedSorts)}
                 {@const page = seedPage(source, seedPages)}
                 {@const selection = seedSelections[sourceId] || EMPTY_SET}
-                {@const selectedCount = seedAllSelected[sourceId] ? page.total : selection.size}
                 {@const loadedSelectableCount = selectableSeedCount(source, loaded || EMPTY_LIST, includeDownstream, relatedDepthDownstream)}
                 {@const selectableCount = estimatedSelectableSeedCount(source, seedPages[sourceId], loaded, loadedSelectableCount, includeDownstream, relatedDepthDownstream)}
-                {@const fullySelected = selectableCount > 0 && selectedCount === selectableCount}
+                {@const selectedCount = seedAllSelected[sourceId] ? selectableCount : selection.size}
+                {@const fullySelected = Boolean(seedAllSelected[sourceId]) || (selectableCount > 0 && selectedCount === selectableCount)}
                 <div class={`seed-source ${isExpanded ? 'expanded' : ''}`}>
                   <div
                     class="seed-source__summary"
@@ -4926,7 +5290,7 @@
                           <div class="table-toolbar-left">
                             <span class="muted">
                               {#if seedAllSelected[sourceId]}
-                                All {page.total.toLocaleString('en-US')} items selected
+                                All {selectedCount.toLocaleString('en-US')} items selected
                               {:else}
                                 Selected: {selectedCount} / {loadedSelectableCount} selectable
                               {/if}
@@ -5119,33 +5483,36 @@
 
           <div class="seed-corpus-column seed-corpus-column--corpus" id="section-corpus">
             <div class="corpus-workspace-shell">
-              <Corpus
-                {corpusSource}
-                {corpusRefreshFailed}
-                {corpusTotal}
-                {corpusItems}
-                {rawTotal}
-                {metadataTotal}
-                {downloadedTotal}
-                {failedEnrichmentTotal}
-                {failedDownloadTotal}
-                {bucketLabel}
-                {corpusFilterQuery}
-                {handleCorpusFilterInput}
-                {handleRemoveCorpusWork}
-                {handleRemoveSelectedCorpusWorks}
-                {toggleCorpusSort}
-                {corpusSort}
-                {doiHref}
-                {openAlexHref}
-                {handleDownloadedCorpusFile}
-                {corpusLoadStatus}
-                {corpusHasMore}
-                {corpusLoadingMore}
-                {corpusLoading}
-                {loadCorpus}
-                {handleCorpusColumnScroll}
-              />
+              <!-- Keyed by corpus (D3): a switch resets the selection, the stage
+                   filter and the expanded row. -->
+              {#key currentCorpusId}
+                <Corpus
+                  {corpusSource}
+                  {corpusRefreshFailed}
+                  {corpusTotal}
+                  {corpusItems}
+                  {rawTotal}
+                  {metadataTotal}
+                  {downloadedTotal}
+                  {failedEnrichmentTotal}
+                  {failedDownloadTotal}
+                  {bucketLabel}
+                  {corpusFilterQuery}
+                  {handleCorpusFilterInput}
+                  {handleRemoveCorpusWork}
+                  {handleRemoveSelectedCorpusWorks}
+                  {toggleCorpusSort}
+                  {corpusSort}
+                  {doiHref}
+                  {openAlexHref}
+                  {handleDownloadedCorpusFile}
+                  {corpusLoadStatus}
+                  {corpusHasMore}
+                  {corpusLoadingMore}
+                  {loadCorpus}
+                  {handleCorpusColumnScroll}
+                />
+              {/key}
             </div>
           </div>
         </div>
@@ -5187,6 +5554,7 @@
           loadMorePending={() => loadUpstreamBrowse({ appendPending: true })}
           loading={upstreamBrowseLoading}
           status={upstreamBrowseStatus}
+          statusError={upstreamBrowseError}
           browse={upstreamBrowse}
           selectedAssignedCorpusId={selectedUpstreamAssignedCorpusId}
           toggleAssignedCorpus={handleToggleUpstreamAssignedCorpus}
@@ -5228,6 +5596,7 @@
           showGlobalOverview={isAdmin}
           globalStats={globalIngestStats}
           globalBacklog={globalWorkerBacklog}
+          globalUnavailable={globalStatsError || globalDaemonError}
         />
       {/if}
 
@@ -5410,8 +5779,10 @@
           {logsStatus}
           {logsLoadingOlder}
           {logsHasMore}
+          {logsNeedReload}
           {logsTailStatus}
           {logs}
+          {logsCursor}
           {handleLogTypeChange}
           {handleLogsCorpusFilterChange}
           {loadOlderLogs}

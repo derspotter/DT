@@ -15,6 +15,7 @@ from .identifiers import (
     normalize_doi_lower,
 )
 from .utils import (
+    FetchResult,
     OpenAlexRateLimitExceeded,
     env_bool,
     env_float,
@@ -87,15 +88,22 @@ def fetch_citing_work_ids(
     session=None,
     timeout=20,
     api_key=None,
+    raise_on_quota: bool = False,
 ):
     """
     Fetches the OpenAlex IDs of works that cite the work at the given URL.
     Handles pagination to get all citing work IDs.
+
+    Returns a FetchResult: on an error it holds what was fetched before it, with
+    ``complete`` False (and ``quota_exhausted`` on OpenAlex quota). With
+    ``raise_on_quota`` the OpenAlexRateLimitExceeded is re-raised after the warning, with
+    the FetchResult of the pages fetched before it as its ``partial`` attribute.
     """
     if not cited_by_url:
-        return []
+        return FetchResult()
 
-    citing_work_ids = []
+    citing_work_ids = FetchResult()
+    quota_error = None
     select_fields = "id,title,display_name,authorships,publication_year,doi,type"
     if include_links:
         select_fields += ",referenced_works,cited_by_api_url"
@@ -148,18 +156,42 @@ def fetch_citing_work_ids(
                 url = None # No more pages or reached limit
 
         except OpenAlexRateLimitExceeded as e:
-            print(f"OpenAlex quota exhausted while fetching citing works: {_redact_api_key(e)}")
+            message = f"OpenAlex quota exhausted while fetching citing works: {_redact_api_key(e)}"
+            print(message)
+            _mark_incomplete(citing_work_ids, message, quota=True)
+            quota_error = e
             url = None
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}")
+            message = f"Error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}"
+            print(message)
+            _mark_incomplete(citing_work_ids, message)
             # Stop fetching if there's an error
             url = None
         except Exception as e:
-            print(f"Unexpected error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}")
+            message = f"Unexpected error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}"
+            print(message)
+            _mark_incomplete(citing_work_ids, message)
             url = None
 
     print(f"Finished fetching citing works. Found {len(citing_work_ids)}")
+    _warn_if_incomplete(citing_work_ids, "citing works")
+    if quota_error is not None and raise_on_quota:
+        quota_error.partial = citing_work_ids  # the pages fetched before the quota ran out
+        raise quota_error
     return citing_work_ids
+
+
+def _mark_incomplete(result, message, *, quota=False, failed_ids=()):
+    result.complete = False
+    result.errors.append(message)
+    result.failed_ids.extend(failed_ids)
+    if quota:
+        result.quota_exhausted = True
+
+
+def _warn_if_incomplete(result, what):
+    if not result.complete:
+        print(f"[OpenAlex WARN] {what} incomplete: {len(result)} fetched; {result.errors[0]}")
 
 def fetch_referenced_work_details(
     referenced_work_ids,
@@ -169,13 +201,19 @@ def fetch_referenced_work_details(
     session=None,
     timeout=20,
     api_key=None,
+    raise_on_quota: bool = False,
 ):
     """
     Fetches detailed metadata for a list of referenced work OpenAlex IDs.
     Uses concurrent batch requests to efficiently get details for multiple works.
+
+    Returns a FetchResult; a failed batch sets ``complete`` False and lists its ids in
+    ``failed_ids``. With ``raise_on_quota`` an OpenAlexRateLimitExceeded is re-raised
+    after all batches have finished and the warning has been printed; its ``partial``
+    attribute is the FetchResult of the batches that succeeded.
     """
     if not referenced_work_ids:
-        return []
+        return FetchResult()
 
     # Process in batches of 50 (OpenAlex limit for pipe queries)
     batch_size = 50
@@ -193,7 +231,7 @@ def fetch_referenced_work_details(
             batches.append(work_ids)
 
     if not batches:
-        return []
+        return FetchResult()
 
     def _fetch_batch(work_ids):
         ids_query = "|".join(work_ids)
@@ -231,28 +269,45 @@ def fetch_referenced_work_details(
                     work_details['referenced_works'] = work.get("referenced_works") or []
                     work_details['cited_by_api_url'] = work.get("cited_by_api_url")
                 batch_results.append(work_details)
-            return batch_results
-            
-        except OpenAlexRateLimitExceeded as e:
-            print(f"OpenAlex quota exhausted while fetching referenced work details: {_redact_api_key(e)}")
-            return []
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching referenced work details: {_redact_api_key(e)}")
-            return []
-        except Exception as e:
-            print(f"Unexpected error fetching referenced work details: {_redact_api_key(e)}")
-            return []
+            return batch_results, None, None
 
-    referenced_works = []
-    
+        except OpenAlexRateLimitExceeded as e:
+            message = f"OpenAlex quota exhausted while fetching referenced work details: {_redact_api_key(e)}"
+            print(message)
+            return [], message, e
+        except requests.exceptions.RequestException as e:
+            message = f"Error fetching referenced work details: {_redact_api_key(e)}"
+            print(message)
+            return [], message, None
+        except Exception as e:
+            message = f"Unexpected error fetching referenced work details: {_redact_api_key(e)}"
+            print(message)
+            return [], message, None
+
+    referenced_works = FetchResult()
+    failures = {}
+
     # We use ThreadPoolExecutor to run batches concurrently.
     # Max workers clamped to 8 to avoid overwhelming the single rate limiter suddenly.
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(batches), 8)) as executor:
-        futures = [executor.submit(_fetch_batch, batch) for batch in batches]
+        futures = {executor.submit(_fetch_batch, batch): index for index, batch in enumerate(batches)}
         for future in concurrent.futures.as_completed(futures):
-            referenced_works.extend(future.result())
-            
+            batch_results, error, quota_error = future.result()
+            referenced_works.extend(batch_results)
+            if error is not None:
+                failures[futures[future]] = (error, quota_error)
+
+    quota_error = None
+    for index in sorted(failures):  # failed_ids in request order, whatever finished first
+        error, batch_quota_error = failures[index]
+        _mark_incomplete(referenced_works, error, quota=batch_quota_error is not None, failed_ids=batches[index])
+        quota_error = quota_error or batch_quota_error
+
     print(f"Fetched details for {len(referenced_works)} referenced works")
+    _warn_if_incomplete(referenced_works, "referenced work details")
+    if quota_error is not None and raise_on_quota:
+        quota_error.partial = referenced_works  # the batches that succeeded are kept
+        raise quota_error
     return referenced_works
 
 def get_authors_from_ref(ref):

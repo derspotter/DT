@@ -37,6 +37,7 @@ type State = {
   holdPromote: Promise<void> | null
   source?: typeof seedSource
   keywordConfig?: Record<string, unknown>
+  candidates?: typeof candidates
 }
 
 async function boot(page: Page, state: State) {
@@ -54,7 +55,8 @@ async function boot(page: Page, state: State) {
     }
     if (path === '/api/seed/sources') return fulfil(route, { sources: [source], total: 1, source: 'api' })
     if (path === '/api/seed/sources/search/70/candidates') {
-      return fulfil(route, { candidates, total: 70000, offset: 0, limit: 200, source_summary: source })
+      const rows = state.candidates || candidates
+      return fulfil(route, { candidates: rows, total: source.candidate_count, offset: 0, limit: 200, source_summary: source })
     }
     if (path === '/api/seed/sources/search/70/promote') {
       state.promoteBody = route.request().postDataJSON()
@@ -99,7 +101,8 @@ test('toggling a row keeps the table mounted', async ({ page }) => {
   await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('Selected: 1 / 3 selectable')
 
   await page.locator('.seed-source__body').getByRole('button', { name: 'Select all', exact: true }).click()
-  await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('All 70,000 items selected')
+  // The selectable estimate: 70,000 minus 10 in the corpus and 5 downloaded.
+  await expect(page.locator('.seed-source__body .table-toolbar')).toContainText('All 69,985 items selected')
   for (const index of [0, 1, 2]) await expect(rowCheckbox(page, index)).toBeChecked()
 
   // Deselecting one out of "all selected" drops into explicit mode.
@@ -176,4 +179,35 @@ test('downstream expansion makes every item of a paged seed promotable', async (
   await expect(page.getByText('Promoting 70,000 candidate(s) into the corpus...')).toBeVisible()
   await expect.poll(() => state.promoteBody?.downloadBatchSize).toBe(70000)
   release()
+})
+
+test('select-all on a partly promoted paged seed reads checked and clears on the next click', async ({ page }) => {
+  const errors = collectPageErrors(page)
+  // 10 items, 3 already in the corpus, the first page of 5 (all pending) loaded:
+  // 7 are selectable.
+  const state: State = {
+    corpusId: 1,
+    promoteBody: null,
+    holdPromote: null,
+    source: { ...seedSource, candidate_count: 10, state_counts: { in_corpus: 3, downloaded: 0 } },
+    candidates: [0, 1, 2, 3, 4].map((n) => ({ ...candidates[0], candidate_key: `p${n}`, title: `Partly paper ${n}` })),
+  }
+  await boot(page, state)
+  await page.getByText('Big search seed', { exact: true }).click()
+  await expect(page.getByTestId('seed-candidate-row')).toHaveCount(5)
+  const selectAll = page.getByRole('checkbox', { name: 'Select all items in this seed' })
+  const toolbar = page.locator('.seed-source__body .table-toolbar')
+
+  await selectAll.click()
+  await expect(selectAll).toBeChecked()
+  await expect(page.locator('.seed-source__select')).toHaveAttribute('title', 'Clear all items in this seed')
+  // All-selected counts the selectable rows (10 - 3 in the corpus), not the seed total.
+  await expect(toolbar).toContainText('All 7 items selected')
+  for (const index of [0, 1, 2, 3, 4]) await expect(rowCheckbox(page, index)).toBeChecked()
+
+  await selectAll.click()
+  await expect(selectAll).not.toBeChecked()
+  await expect(toolbar).toContainText('Selected: 0 / 5 selectable')
+  for (const index of [0, 1, 2, 3, 4]) await expect(rowCheckbox(page, index)).not.toBeChecked()
+  expect(errors).toEqual([])
 })

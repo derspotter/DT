@@ -8,7 +8,9 @@ section 2 as fresh seeds — one "Downstream of «title»" seed and one
 Related works are ranked before the max-related cap is applied (line 12), reusing
 the same helpers keyword_search.py uses so both paths agree on what "top N" means.
 
-Emits JSON: {"runs": [{"run_id": int, "direction": str, "label": str, "count": int}]}
+Emits JSON: {"runs": [{"run_id": int, "direction": str, "label": str, "count": int}]}, plus
+"quota_exhausted": true and "message" when OpenAlex quota stopped the expansion: the results
+fetched up to then become seeds as usual, and no further seed or direction is expanded.
 """
 
 import argparse
@@ -30,7 +32,10 @@ from dl_lit.utils import OpenAlexRateLimitExceeded, get_global_rate_limiter
 
 from keyword_search import (
     DEFAULT_RELATED_SORT,
+    QUOTA_STOP_MESSAGE,
     RELATED_SORT_OPTIONS,
+    _citing_metadata,
+    _details_after_quota,
     _collect_candidate_ids,
     _normalize_candidate_id,
     _to_openalex_like,
@@ -120,9 +125,12 @@ def main():
     rate_limiter = get_global_rate_limiter()
     db = DatabaseManager(db_path=args.db_path)
     runs = []
+    quota_stop = False
 
     try:
         for seed in seeds:
+            if quota_stop:
+                break
             if not isinstance(seed, dict):
                 continue
             work = _resolve_work(seed, args.mailto)
@@ -131,13 +139,18 @@ def main():
             title = seed.get('title') or work.get('display_name')
 
             for direction in directions:
+                if quota_stop:
+                    break
+                known = {}
                 try:
                     candidate_ids = _collect_for_direction(
                         work, direction, args.max_related, args.related_sort, args.mailto, rate_limiter
                     )
                 except OpenAlexRateLimitExceeded as exc:
                     print(f'[OpenAlex WARN] {direction} expansion stopped early: {exc}', file=sys.stderr)
-                    continue
+                    quota_stop = True
+                    candidate_ids = list(getattr(exc, 'partial_candidate_ids', None) or [])
+                    known = _citing_metadata(exc)
                 if not candidate_ids:
                     continue
 
@@ -147,10 +160,12 @@ def main():
                         rate_limiter,
                         mailto=args.mailto or 'spott@wzb.eu',
                         include_links=False,
+                        raise_on_quota=True,
                     )
                 except OpenAlexRateLimitExceeded as exc:
                     print(f'[OpenAlex WARN] {direction} detail fetch stopped early: {exc}', file=sys.stderr)
-                    continue
+                    quota_stop = True
+                    details = _details_after_quota(exc, candidate_ids, known)
 
                 items = []
                 seen = set()
@@ -197,7 +212,11 @@ def main():
     finally:
         db.close_connection()
 
-    print(json.dumps({'runs': runs}))
+    payload = {'runs': runs}
+    if quota_stop:
+        payload['quota_exhausted'] = True
+        payload['message'] = QUOTA_STOP_MESSAGE
+    print(json.dumps(payload))
 
 
 if __name__ == '__main__':
