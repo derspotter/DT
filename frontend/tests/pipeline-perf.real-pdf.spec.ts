@@ -212,41 +212,56 @@ test.describe('Real PDF pipeline performance', () => {
     const extractCompleteSeconds = (Date.now() - extractStart) / 1000
     const extractFirstResultSeconds = extractionSettled.ttfrMs / 1000
 
-    // The candidates endpoint ranks downloaded entries first, and enqueue skips those; only entries
-    // that can still be enriched (not downloaded, not already queued) are submitted. The seed is
-    // paged until ten such entries are found or it ends.
+    // The candidates endpoint ranks downloaded entries first. The display state is only a
+    // pre-filter: for a non-admin a downloaded match in an unreadable corpus shows as pending
+    // (D2), and enqueue (ingest_enqueue.py) counts any downloaded or already enriched/queued
+    // match as already_processed and marks only unmatched entries and matches with
+    // metadata pending/failed and no download requested. So enqueue itself decides: the
+    // next pre-filtered candidates are submitted until ten are marked or the seed ends.
     const ENRICHABLE_STATES = new Set(['staged_raw', 'pending', 'failed_enrichment'])
     const CANDIDATE_PAGE = 1000
+    const TARGET_MARKED = 10
     const entryIds: number[] = []
-    const enrichableIds: number[] = []
-    for (let offset = 0; enrichableIds.length < 10; offset += CANDIDATE_PAGE) {
+    const queue: number[] = []
+    let nextOffset = 0
+    let seedEnded = false
+    const fetchCandidatePage = async () => {
       const entriesPayload = await authedJson(
         request,
         token,
-        `/api/seed/sources/pdf/${encodeURIComponent(runName)}/candidates?limit=${CANDIDATE_PAGE}&offset=${offset}`
+        `/api/seed/sources/pdf/${encodeURIComponent(runName)}/candidates?limit=${CANDIDATE_PAGE}&offset=${nextOffset}`
       )
       const entries = Array.isArray(entriesPayload?.candidates) ? entriesPayload.candidates : []
       for (const item of entries) {
         const id = Number(item.id)
         if (!Number.isFinite(id)) continue
         entryIds.push(id)
-        if (enrichableIds.length < 10 && ENRICHABLE_STATES.has(String(item.state || ''))) enrichableIds.push(id)
+        if (ENRICHABLE_STATES.has(String(item.state || ''))) queue.push(id)
       }
       const total = Number(entriesPayload?.total)
-      if (entries.length < CANDIDATE_PAGE || (Number.isFinite(total) && offset + entries.length >= total)) break
+      if (entries.length < CANDIDATE_PAGE || (Number.isFinite(total) && nextOffset + entries.length >= total)) seedEnded = true
+      nextOffset += CANDIDATE_PAGE
     }
+    await fetchCandidatePage()
     const extractedCount = Math.max(entryIds.length, extractionSettled.finalCount)
     expect(extractedCount).toBeGreaterThan(0)
-    const requestedBatch = enrichableIds.length
-    let enqueuePayload: any = {}
-    if (requestedBatch === 0) {
-      console.log('[pipeline-perf] enrichment skipped: no eligible candidate in this seed (all downloaded or already queued)')
-    } else {
-      enqueuePayload = await authedJson(request, token, '/api/ingest/enqueue', 'POST', {
-        entryIds: enrichableIds,
-      })
+
+    let requestedBatch = 0
+    const enqueuePayload = { marked: 0, already_processed: 0, staged: 0, duplicates: 0 }
+    while (enqueuePayload.marked < TARGET_MARKED) {
+      while (queue.length < TARGET_MARKED - enqueuePayload.marked && !seedEnded) await fetchCandidatePage()
+      const batch = queue.splice(0, TARGET_MARKED - enqueuePayload.marked)
+      if (batch.length === 0) break
+      requestedBatch += batch.length
+      const answer = await authedJson(request, token, '/api/ingest/enqueue', 'POST', { entryIds: batch })
+      for (const key of Object.keys(enqueuePayload) as (keyof typeof enqueuePayload)[]) {
+        enqueuePayload[key] += Number(answer?.[key] || 0)
+      }
     }
-    const markedBatch = Number(enqueuePayload?.marked || 0)
+    if (enqueuePayload.marked === 0) {
+      console.log('[pipeline-perf] enrichment skipped: no eligible candidate in this seed (enqueue marked none: all downloaded, enriched or already queued)')
+    }
+    const markedBatch = enqueuePayload.marked
 
     let enrichPayload: any = { processed: 0, promoted: 0, failed: 0, queued: 0 }
     let enrichSeconds = 0
