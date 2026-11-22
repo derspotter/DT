@@ -698,7 +698,7 @@ def test_skipped_terminal_heartbeat_is_logged_on_lock_timeout(tmp_path, monkeypa
     t.start()
     assert holder_ready.wait(2)
     try:
-        daemon._finish_after_win({"state": "job_timeout"}, "Job 1 timed out")
+        daemon._finish_after_win({"state": "job_timeout"}, "Job 1 timed out", deadline=0.3, running={}, now=0.0)
     finally:
         release.set()
         t.join(5)
@@ -717,7 +717,7 @@ def test_skipped_terminal_heartbeat_is_logged_on_exception(tmp_path, monkeypatch
             return self._conn.execute(sql, *args)
 
     daemon.heartbeat_conn = Broken(daemon.heartbeat_conn)
-    daemon._finish_after_win({"state": "job_timeout"}, "Job 1 timed out")
+    daemon._finish_after_win({"state": "job_timeout"}, "Job 1 timed out", deadline=0.3, running={}, now=0.0)
     assert exits == [75]
     assert any("terminal error heartbeat skipped" in line and "disk I/O error" in line for line in lines)
 

@@ -73,6 +73,7 @@ import secrets
 import random
 import socket
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -166,6 +167,26 @@ WATCHDOG_BUSY_TIMEOUT_MS = 1000
 WATCHDOG_LOCK_TIMEOUT_SECONDS = 1.0
 # run() re-runs stale-job recovery at most this often.
 RECOVERY_INTERVAL_SECONDS = 60
+# K-M4 (D3): at a watchdog win, a running item counts a hung attempt once it has run this share
+# of the deadline; a sibling that started late in the batch is spared.
+HUNG_ITEM_MIN_RUN_FRACTION = 0.5
+# Columns the hung-item write uses per tracked phase (the claim that item holds).
+HUNG_ITEM_COLUMNS = {
+    "enrich": {
+        "status": "metadata_status", "error": "metadata_error", "claimed_by": "metadata_claimed_by",
+        "claimed_at": "metadata_claimed_at", "lease": "metadata_lease_expires_at",
+        "attempts": "metadata_attempt_count", "notes": False,
+    },
+    "download": {
+        "status": "download_status", "error": "download_error", "claimed_by": "download_claimed_by",
+        "claimed_at": "download_claimed_at", "lease": "download_lease_expires_at",
+        "attempts": "download_attempt_count", "notes": True,  # status_notes, as move_entry_to_failed
+    },
+}
+
+
+class ItemsLatched(Exception):
+    """A watchdog won: no item starts any more (D3)."""
 # Job types whose runner keeps its own run record (scraper_runs): the watchdog never times them
 # out (no deadline, as before D29), and a recovered job's run record is marked failed.
 UNWATCHED_JOB_TYPES = frozenset({"scrape_eurlex", "scrape_expert_groups"})
@@ -288,6 +309,12 @@ class PipelineDaemon:
         self._work_finished = True
         self._terminal = False
         self._after_watchdog_win = lambda: None  # test seam: runs right after the latch
+        # D3: items running now, (phase, work id) -> start time on _running_clock. The lock is
+        # held only for a dict operation or a copy, never across I/O; order _work_lock first.
+        self._running_items = {}
+        self._running_items_lock = threading.Lock()
+        self._items_latched = False
+        self._running_clock = time.monotonic  # test seam; the reporting budget reads it too
 
     def _begin_work(self) -> int | None:
         """Open a new work generation before anything is claimed; None once a watchdog won."""
@@ -522,6 +549,8 @@ class PipelineDaemon:
             outcome = self._claim_timed_out_job(job_id, error)
             if outcome is True:
                 self._terminal = True
+                running = self._latch_running_items()
+                now = self._running_clock()
         if outcome is False:
             log(f"Job {job_id} passed its {deadline:g}s timeout but was completed or cancelled first; watchdog stands down.")
             return True
@@ -534,6 +563,7 @@ class PipelineDaemon:
         self._finish_after_win(
             {**details, "state": "job_timeout", "error": error},
             f"Job {job_id} {error}: marked failed; exiting with code {JOB_TIMEOUT_EXIT_CODE}.",
+            deadline, running, now,
         )
         return True
 
@@ -542,33 +572,134 @@ class PipelineDaemon:
             if not self._generation_is_live(generation):
                 return True
             self._terminal = True
+            running = self._latch_running_items()
+            now = self._running_clock()
         error = f"timed out after {deadline:g}s; worker restarted"
         self._finish_after_win(
             {**payload, "state": "direct_batch_timeout", "error": error},
             f"Direct {payload.get('phase') or self.role} batch {error}; exiting with code {JOB_TIMEOUT_EXIT_CODE}.",
+            deadline, running, now,
         )
         return True
 
-    def _finish_after_win(self, details: dict, message: str) -> None:
-        """Outside _work_lock, after the latch: one bounded error heartbeat, a log line, exit."""
-        self._after_watchdog_win()
-        skipped = None
+    @contextmanager
+    def _item_running(self, phase: str, work_id: int):
+        """Track one item while its body runs (D3); refuse to start once a watchdog latched."""
+        key = (phase, int(work_id))
+        with self._running_items_lock:
+            if self._items_latched:
+                raise ItemsLatched(f"{phase} item {int(work_id)} not started: a watchdog won")
+            self._running_items[key] = self._running_clock()
         try:
+            yield
+        finally:
+            with self._running_items_lock:
+                self._running_items.pop(key, None)
+
+    def _latch_running_items(self) -> dict:
+        """Stop new items and snapshot the running ones. Only inside the winner's _work_lock section."""
+        with self._running_items_lock:
+            self._items_latched = True
+            return dict(self._running_items)
+
+    def _hung_item_limit(self) -> int:
+        return env_int("RAG_FEEDER_HUNG_ITEM_MAX_ATTEMPTS", 3, minimum=1)
+
+    def _fail_hung_items(self, conn, running: dict, deadline: float, now: float) -> tuple[int, int]:
+        """Fail the overdue items of the snapshot that reached the attempt limit; ``(failed, left)``.
+
+        Runs on the caller's connection with heartbeat_lock held and the busy timeout set;
+        commits, and raises sqlite3.Error (the caller rolls back).
+        """
+        limit = self._hung_item_limit()
+        error = f"hung past the {deadline:g}s timeout; attempt limit {limit} reached"
+        overdue = defaultdict(list)
+        for (phase, work_id), started in running.items():
+            if phase in HUNG_ITEM_COLUMNS and now - started >= deadline * HUNG_ITEM_MIN_RUN_FRACTION:
+                overdue[phase].append(int(work_id))
+        failed = 0
+        for phase, ids in overdue.items():
+            cols = HUNG_ITEM_COLUMNS[phase]
+            notes_sql = ", status_notes = ?" if cols["notes"] else ""
+            marks = ", ".join("?" for _ in ids)
+            cur = conn.execute(
+                f"""
+                UPDATE works
+                   SET {cols['status']} = 'failed', {cols['error']} = ?, {cols['claimed_by']} = NULL,
+                       {cols['claimed_at']} = NULL, {cols['lease']} = NULL{notes_sql}
+                 WHERE id IN ({marks}) AND {cols['status']} = 'in_progress' AND {cols['claimed_by']} = ?
+                   AND COALESCE({cols['attempts']}, 0) >= ?
+                """,
+                [error] + ([error] if cols["notes"] else []) + ids + [self.worker_id, limit],
+            )
+            failed += int(cur.rowcount or 0)
+        conn.commit()
+        return failed, len(running) - failed
+
+    def _finish_after_win(self, details: dict, message: str, deadline: float, running: dict, now: float) -> None:
+        """Outside _work_lock, after the latch: the hung-item write, one error heartbeat, a log
+        line, exit. Both writes share one busy budget of WATCHDOG_BUSY_TIMEOUT_MS (phase 5 bound)."""
+        self._after_watchdog_win()
+        try:
+            hung_line = None
+            hung_skipped = None
+            skipped = None
             if self.heartbeat_lock.acquire(timeout=WATCHDOG_LOCK_TIMEOUT_SECONDS):
                 try:
                     conn = self.heartbeat_conn
-                    previous_busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                    conn.execute(f"PRAGMA busy_timeout = {WATCHDOG_BUSY_TIMEOUT_MS}")
                     try:
-                        self._heartbeat("error", details, force=True)
-                    finally:
-                        conn.execute(f"PRAGMA busy_timeout = {int(previous_busy)}")
-                except Exception as exc:  # noqa: BLE001 - the exit must not wait on reporting
-                    skipped = f"{exc.__class__.__name__}: {exc}"
+                        previous_busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    except Exception as exc:  # noqa: BLE001 - the exit must not wait on reporting
+                        hung_skipped = str(exc) or exc.__class__.__name__
+                        skipped = f"{exc.__class__.__name__}: {exc}"
+                    else:
+                        budget_end = self._running_clock() + WATCHDOG_BUSY_TIMEOUT_MS / 1000
+
+                        def budget_left_ms() -> int:
+                            return int((budget_end - self._running_clock()) * 1000)
+
+                        try:
+                            left = budget_left_ms()
+                            if left < 1:
+                                hung_skipped = "reporting budget spent"
+                            else:
+                                try:
+                                    conn.execute(f"PRAGMA busy_timeout = {left}")
+                                    failed, remaining = self._fail_hung_items(conn, running, deadline, now)
+                                    hung_line = (
+                                        f"Watchdog: {failed} hung item(s) failed at the attempt limit, "
+                                        f"{remaining} left for a retry after the restart."
+                                    )
+                                except Exception as exc:  # noqa: BLE001 - sqlite3.Error or worse; exit anyway
+                                    hung_skipped = str(exc) or exc.__class__.__name__
+                                    try:
+                                        if conn.in_transaction:
+                                            conn.rollback()
+                                    except sqlite3.Error:
+                                        pass
+                            left = budget_left_ms()
+                            if left < 1:
+                                skipped = "reporting budget spent"
+                            else:
+                                try:
+                                    conn.execute(f"PRAGMA busy_timeout = {left}")
+                                    self._heartbeat("error", details, force=True)
+                                except Exception as exc:  # noqa: BLE001 - the exit must not wait on reporting
+                                    skipped = f"{exc.__class__.__name__}: {exc}"
+                        finally:
+                            try:
+                                conn.execute(f"PRAGMA busy_timeout = {int(previous_busy)}")
+                            except Exception:  # noqa: BLE001
+                                pass
                 finally:
                     self.heartbeat_lock.release()
             else:
                 skipped = f"heartbeat lock not free within {WATCHDOG_LOCK_TIMEOUT_SECONDS:g}s"
+                hung_skipped = skipped
+            if hung_line:
+                log(hung_line)
+            if hung_skipped:
+                log(f"Watchdog: hung items not recorded ({hung_skipped}).")
             if skipped:
                 log(f"Watchdog: terminal error heartbeat skipped ({skipped}).")
             log(message)
@@ -1006,36 +1137,52 @@ class PipelineDaemon:
         return int(entry["id"]), None, {"status": status, "attempts": attempt + 1, "diagnostics": last_diag}
 
     def _attempt_raw_download(self, entry: dict) -> tuple[bool, dict]:
+        """Raw-download fallback for an item whose enrichment failed; tracked under its metadata claim."""
         pending_work_id = int(entry["id"])
-        ref = {
-            "title": entry.get("title"),
-            "authors": entry.get("authors") or [],
-            "doi": entry.get("doi"),
-            "type": entry.get("type") or "",
-            "year": entry.get("year"),
-            "open_access_url": entry.get("url"),
-            "url": entry.get("url"),
-            "openalex_json": None,
-        }
-        try:
-            download_result, checksum, _trace = download_ref(self.enhancer, ref, self.download_dir)
-        except Exception as exc:
+        with self._item_running("enrich", pending_work_id):
+            ref = {
+                "title": entry.get("title"),
+                "authors": entry.get("authors") or [],
+                "doi": entry.get("doi"),
+                "type": entry.get("type") or "",
+                "year": entry.get("year"),
+                "open_access_url": entry.get("url"),
+                "url": entry.get("url"),
+                "openalex_json": None,
+            }
+            try:
+                return self._raw_download_and_record(pending_work_id, ref)
+            finally:
+                # The staged file goes on every outcome; a published PDF is a separate hard link.
+                staged = ref.get("downloaded_file")
+                if is_staged_path(staged):
+                    discard_download(staged)
+
+    def _raw_download_and_record(self, pending_work_id: int, ref: dict) -> tuple[bool, dict]:
+        def failure(category, detail):
             return False, {
                 "pending_work_id": pending_work_id,
                 "action": "raw_download_failed",
-                "failure_category": "enhancer_exception",
-                "failure_detail": str(exc),
+                "failure_category": category,
+                "failure_detail": detail,
             }
+
+        try:
+            download_result, checksum, _trace = download_ref(
+                self.enhancer, ref, self.download_dir, part_suffix=f".part-{secrets.token_hex(4)}"
+            )
+        except Exception as exc:
+            return failure("enhancer_exception", str(exc))
 
         if download_result is None:
-            return False, {
-                "pending_work_id": pending_work_id,
-                "action": "raw_download_failed",
-                "failure_category": ref.get("download_failure_category"),
-                "failure_detail": ref.get("download_failure_detail"),
-            }
+            return failure(ref.get("download_failure_category"), ref.get("download_failure_detail"))
 
         fp = str(download_result["downloaded_file"])
+        if not is_staged_path(fp):
+            # A staged request must come back staged: anything else bypasses the exclusive publish.
+            log(f"Work {pending_work_id}: the raw downloader returned an unstaged file ({fp}); not recorded.")
+            return failure("unstaged_download", f"unstaged file {fp}")
+        ref["downloaded_file"] = fp  # what the caller's finally discards
         with self.db_lock:
             downloaded_id, move_error = self.db.mark_raw_work_downloaded(
                 pending_work_id,
@@ -1043,15 +1190,18 @@ class PipelineDaemon:
                 fp,
                 checksum,
                 download_result.get("download_source", "unknown"),
+                claimed_by=self.worker_id,
+                part_path=fp,
             )
 
-        if move_error or not downloaded_id:
-            return False, {
-                "pending_work_id": pending_work_id,
-                "action": "raw_download_failed",
-                "failure_category": "move_to_downloaded_failed",
-                "failure_detail": move_error or "move_to_downloaded_failed",
-            }
+        if move_error == CLAIM_LOST:
+            self._enrich_claim_lost(pending_work_id)
+            return False, {"pending_work_id": pending_work_id, "action": CLAIM_LOST}
+        if downloaded_id is None:
+            # Success is the returned row id: an error text can be empty.
+            if move_error == "checksum_unavailable":
+                return failure("checksum_unavailable", move_error)
+            return failure("move_to_downloaded_failed", move_error or "move_to_downloaded_failed")
 
         return True, {
             "pending_work_id": pending_work_id,
@@ -1060,6 +1210,17 @@ class PipelineDaemon:
             "source": download_result.get("download_source", "unknown"),
             "route": download_result.get("download_route"),
         }
+
+    def _enrich_claim_lost(self, work_id: int) -> None:
+        log(f"Work {work_id}: enrich claim lost before its result was written; result discarded.")
+
+    def _tracked_enrich(self, entry, *args):
+        with self._item_running("enrich", int(entry["id"])):
+            return self._enrich_single(entry, *args)
+
+    def _tracked_download(self, row):
+        with self._item_running("download", int(row["id"])):
+            return self._download_single(row)
 
     def do_enrich(self, corpus_id: int, limit: int, workers: int, expansion: dict, pending_work_ids: list[int] | None = None):
         target_ids = [int(value) for value in (pending_work_ids or []) if str(value).strip().isdigit() and int(value) > 0]
@@ -1105,13 +1266,14 @@ class PipelineDaemon:
         deferred_reason = None
         remaining_ids = []
 
+        latched = False
         while remaining_entries:
             batch_entries = remaining_entries[:wave_size]
             remaining_entries = remaining_entries[wave_size:]
 
             with ThreadPoolExecutor(max_workers=min(len(batch_entries), workers, 32)) as executor:
                 futures = {
-                    executor.submit(self._enrich_single, e, fetch_refs, fetch_cites, max_cites, rel_down, rel_up, max_rel): e
+                    executor.submit(self._tracked_enrich, e, fetch_refs, fetch_cites, max_cites, rel_down, rel_up, max_rel): e
                     for e in batch_entries
                 }
                 for future in as_completed(futures):
@@ -1120,25 +1282,47 @@ class PipelineDaemon:
                     processed += 1
                     try:
                         _, enriched, enrich_meta = future.result()
+                    except ItemsLatched:
+                        latched = True  # never started: its claim stays for start-up recovery
+                        continue
                     except Exception as exc:
                         enriched, enrich_meta = None, {"status": "api_error"}
                         errors.append(str(exc))
 
                     if not enriched:
-                        raw_downloaded, raw_download_result = self._attempt_raw_download(entry)
+                        try:
+                            raw_downloaded, raw_download_result = self._attempt_raw_download(entry)
+                        except ItemsLatched:
+                            latched = True
+                            continue
                         if raw_downloaded:
                             results.append(raw_download_result)
                             continue
-                        failed += 1
+                        if (raw_download_result or {}).get("action") == CLAIM_LOST:
+                            results.append(raw_download_result)
+                            continue
                         reason = "Metadata fetch failed"
-                        moved_id, err = self.db.mark_metadata_failed(pending_work_id, reason)
+                        if (raw_download_result or {}).get("failure_category") == "checksum_unavailable":
+                            reason = "checksum_unavailable"
+                        moved_id, err = self.db.mark_metadata_failed(pending_work_id, reason, claimed_by=self.worker_id)
+                        if err == CLAIM_LOST:
+                            self._enrich_claim_lost(pending_work_id)
+                            results.append({"pending_work_id": pending_work_id, "action": CLAIM_LOST})
+                            continue
+                        failed += 1
+                        if moved_id is None:
+                            errors.append(f"Work {pending_work_id}: could not mark metadata failed: {err or 'no row'}")
                         result_payload = {"pending_work_id": pending_work_id, "action": "failed_enrichment"}
                         if raw_download_result:
                             result_payload["raw_download"] = raw_download_result
                         results.append(result_payload)
                         continue
 
-                    wid, err = self.db.apply_enriched_metadata(pending_work_id, enriched)
+                    wid, err = self.db.apply_enriched_metadata(pending_work_id, enriched, claimed_by=self.worker_id)
+                    if err == CLAIM_LOST:
+                        self._enrich_claim_lost(pending_work_id)
+                        results.append({"pending_work_id": pending_work_id, "action": CLAIM_LOST})
+                        continue
                     if not wid:
                         dup = parse_duplicate_merge_marker(err)
                         if dup:
@@ -1162,7 +1346,12 @@ class PipelineDaemon:
                         else:
                             failed += 1
                             errors.append(err or f"Promotion failed for pending work {pending_work_id}")
-                            self.db.reset_enrich_claim(pending_work_id, state="pending", error=err or "promotion_failed", selected=0)
+                            _, reset_err = self.db.reset_enrich_claim(
+                                pending_work_id, state="pending", error=err or "promotion_failed", selected=0,
+                                claimed_by=self.worker_id,
+                            )
+                            if reset_err == CLAIM_LOST:
+                                self._enrich_claim_lost(pending_work_id)
                             results.append({"pending_work_id": pending_work_id, "action": "promotion_failed", "error": err})
                         continue
 
@@ -1174,6 +1363,8 @@ class PipelineDaemon:
                     else:
                         results.append({"pending_work_id": pending_work_id, "work_id": int(wid), "action": "enqueue_skipped"})
 
+            if latched:
+                break  # a watchdog won: leave the batch, the exit follows
             if remaining_entries and self._has_pending_corpus_download_jobs():
                 deferred_reason = "pending_download"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
@@ -1371,7 +1562,7 @@ class PipelineDaemon:
         max_download_workers = min(len(rows), max_workers_cfg)
         
         with ThreadPoolExecutor(max_workers=max_download_workers) as executor:
-            futures = {executor.submit(self._download_single, row): row for row in rows}
+            futures = {executor.submit(self._tracked_download, row): row for row in rows}
             for future in as_completed(futures):
                 processed += 1
                 try:
