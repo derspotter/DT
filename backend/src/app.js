@@ -1270,12 +1270,15 @@ const bibEntryCountMemo = new Map();
 // `${path}\0${mtimeMs}\0${size}` -> the in-flight read, so concurrent cold
 // requests for the same file version share one read.
 const bibEntryCountReads = new Map();
+// path -> the fingerprint whose read failure was last logged, so a file that
+// stays unreadable is logged once per version, not on every request.
+const bibEntryCountWarned = new Map();
 
 // Reads and counts through one handle. The fingerprint is the handle's own stat,
 // so the stored count always belongs to the version that was read, even when
 // the file is atomically replaced after the caller's stat of the path. Only a
 // successful read is stored.
-async function readBibEntryCount(filePath) {
+async function readBibEntryCount(filePath, fingerprint = '') {
   let handle = null;
   try {
     handle = await fs.promises.open(filePath, 'r');
@@ -1284,8 +1287,13 @@ async function readBibEntryCount(filePath) {
     const matches = content.match(/@[A-Za-z]+\s*\{/g);
     const count = Array.isArray(matches) ? matches.length : 0;
     bibEntryCountMemo.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, count });
+    bibEntryCountWarned.delete(filePath);
     return count;
-  } catch {
+  } catch (error) {
+    if (error?.code !== 'ENOENT' && bibEntryCountWarned.get(filePath) !== fingerprint) {
+      bibEntryCountWarned.set(filePath, fingerprint);
+      console.warn('[kantropos] metadata.bib count failed', filePath, error?.code || error?.message || error);
+    }
     return null;
   } finally {
     if (handle) await handle.close().catch(() => {});
@@ -1301,7 +1309,7 @@ async function countBibEntriesInFile(filePath, stats) {
   const key = stats ? `${filePath}\0${stats.mtimeMs}\0${stats.size}` : `${filePath}\0`;
   let read = bibEntryCountReads.get(key);
   if (!read) {
-    read = readBibEntryCount(filePath).finally(() => bibEntryCountReads.delete(key));
+    read = readBibEntryCount(filePath, key).finally(() => bibEntryCountReads.delete(key));
     bibEntryCountReads.set(key, read);
   }
   return read;

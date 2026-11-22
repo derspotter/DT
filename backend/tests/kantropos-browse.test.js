@@ -391,11 +391,16 @@ describe('Kantropos browse read path', () => {
     fs.rmSync(fx.bibB)
     fs.mkdirSync(fx.bibB)
     readAsync.mockClear()
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
     const failed = await get('/api/kantropos/corpora')
     expect(countOf(failed.body, 'target-b')).toBeNull()
     const retried = await get('/api/kantropos/corpora')
     expect(countOf(retried.body, 'target-b')).toBeNull()
     expect(bibCalls(readAsync, fx.bibB)).toBe(2)
+    // A non-ENOENT read error is logged once per file version, not per request.
+    const bibWarnings = warn.mock.calls.filter((args) => args.some((arg) => String(arg).includes(fx.bibB)))
+    expect(bibWarnings).toHaveLength(1)
+    expect(String(bibWarnings[0][0])).toContain('[kantropos] metadata.bib count failed')
   })
 
   test('an atomic replace between the stat and the read never caches the new count under the old fingerprint', async () => {
