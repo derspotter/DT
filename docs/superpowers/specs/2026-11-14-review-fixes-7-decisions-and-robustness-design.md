@@ -162,7 +162,7 @@ Those calls go to the owner as a list at the end.
   starts the request it describes.
 - Every DOI key in the three scripts is the DB key.
 - The CLI and the daemon never download the same row at once; a result written after its claim
-  was lost is discarded. A hung item ends as a visible failure after a bounded number of hangs
+  was lost is discarded, and a late attempt never overwrites the published PDF. A hung item ends as a visible failure after a bounded number of hangs
   instead of a restart loop.
 - A Jest run keeps every temp dir under its run dir and removes it at the end; CI runs every
   Python test.
@@ -248,14 +248,21 @@ not non-issues.
     not keys. DOIs are case-insensitive, and the entries already in the upstream `metadata.bib`
     are lowercase. A DOI embedded in citation text (`Smith 2020, doi 10.1000/ABC, p. 3`) now
     yields `10.1000/abc`; today it yields the whole lowercased text.
-- **`backfill_openalex_topics.py`:** rows and returned works are matched on `normalize_doi(...)`,
-  the DB key, on both sides. Pass 2 keeps its query: the `--scope` clause, the `--limit` clause
-  and `topics_fetched IS NULL OR topics_fetched = 0`. A row's key is sent only when the **whole
-  key** has the DOI shape (`_DOI_IN_TEXT_RE.fullmatch`, the shared pattern): `10.`, 4 to 9
-  digits, `/`, then the pattern's character class, which has no `|` or `,`. Anything else (for
-  example `10.bogus|xyz`, or a 1-digit registrant the rule leaves whole) is skipped and counted
-  in the pass-2 log line, because one malformed token in the `doi:a|b|…` filter makes OpenAlex
-  reject the whole batch of 50. The filter sends each token lowercased.
+- **`backfill_openalex_topics.py`:** rows and returned works are matched on the DB key
+  (`normalize_doi`) on both sides. Pass 2 keeps its query: the `--scope` clause, the `--limit`
+  clause and `topics_fetched IS NULL OR topics_fetched = 0`.
+  - **The whole DOI is validated before the key is taken.** In the existing pass-2 loop, each
+    row's `doi` is first stripped of its recognised wrappers with the shared
+    `normalize_doi_lower` (a `doi.org` URL or `doi:` prefix, surrounding ` .;,`). The row is
+    sent only when that **bare value as a whole** has the DOI shape
+    (`_DOI_IN_TEXT_RE.fullmatch`): `10.`, 4 to 9 digits, `/`, then the pattern's character
+    class, which has no `|`, `,` or `+`. Its key is then `normalize_doi(bare)`.
+  - Validating after `normalize_doi` would not do: the rule extracts the first DOI-shaped run, so
+    `10.1000/ABC+123` and `10.1000/ABC|xyz` would both become the valid-looking `10.1000/ABC` and
+    fetch (and write) another work's topics. Embedded citation text is skipped too.
+  - A skipped row is counted in the pass-2 log line, because one malformed token in the
+    `doi:a|b|…` filter makes OpenAlex reject the whole batch of 50. The filter sends each token
+    lowercased.
 - **`test_identifiers.py`:** the three names leave `DOI_MAP` and their entries leave
   `tests/fixtures/identifier_cases.json`; `test_private_doi_copies_differ_from_every_shared_rule`
   is replaced by a test that each script's `normalize_doi` is `dl_lit.identifiers.normalize_doi`.
@@ -277,23 +284,62 @@ not non-issues.
   heartbeat thread (and so the deadline clock) starts (`:1394`, `:1525`), so a daemon lease
   outlasts its watchdog's deadline; past the deadline, the watchdog exits the worker and recovery
   takes over. This is the smaller change than renewing leases from the heartbeat.
-- **Ownership on every terminal write.** New
-  `DatabaseManager.owned_claim(phase: str, work_id: int, claimed_by: str)`, a context manager
-  that yields a bool. It runs `BEGIN IMMEDIATE` (unless a transaction is open), then checks
-  `<status> = 'in_progress' AND <claimed_by> = ?` for the phase's columns (`download_*` or
-  `metadata_*`). When the check fails it rolls back and yields `False`. When it passes it yields
-  `True`; the writer inside may commit itself (most do), and the context manager commits whatever
-  is still open on exit and rolls back on an exception. The write lock is held from the check
-  through the write, so no other process can take the row in between. Every write that ends a
-  download claim goes through it:
+- **A deliberate enrich deferral releases its unstarted rows.** When `do_enrich` yields
+  (`pending_download` or `interactive_backlog`, `worker.py:1157-1172`), the rows of the later
+  waves are still claimed by this worker, and the targeted continuation job (`:1409-1415`) may
+  run at once and find none of them eligible until their lease ends (31 min with the longer
+  lease). New `DatabaseManager.release_enrich_claims(work_ids: list[int], claimed_by: str) -> int`
+  returns those rows that are still `in_progress` with that `metadata_claimed_by` to `pending`,
+  clears the claim columns and takes back the attempt they never used
+  (`metadata_attempt_count = MAX(COALESCE(metadata_attempt_count, 0) - 1, 0)`). `do_enrich` calls
+  it for `remaining_ids` before it returns them.
+- **Ownership on every terminal write, inside the writer's own transaction.** Each writer that
+  ends a claim gains a keyword-only `claimed_by: str | None = None`. When it is given, the
+  ownership check is the first statement of the writer's **own** transaction:
+  - writers that already use `self.transaction()` (`apply_enriched_metadata`) run
+    `_claim_held(phase, work_id, claimed_by)` as the first statement inside that block;
+  - writers that commit themselves (`move_entry_to_downloaded`, `move_entry_to_failed` and so
+    `mark_download_failed`, `merge_duplicate_queued_work`, `mark_metadata_failed`,
+    `reset_enrich_claim`, `mark_raw_work_downloaded`) start with
+    `_begin_owned(phase, work_id, claimed_by)`: `BEGIN IMMEDIATE` (unless a transaction is open),
+    then the check, and a rollback when it fails. Their existing commit and rollback then end
+    that one transaction.
+
+  `_claim_held` checks `<status> = 'in_progress' AND <claimed_by> = ?` for the phase's columns
+  (`download_*` or `metadata_*`). The write lock is held from the check through the write, so no
+  other process can take the row in between, and a writer that fails part-way rolls back all of
+  its writes: there is no outer wrapper whose commit could keep a partial merge (the first
+  revision's `owned_claim` context manager could, because `transaction()` nested inside it skips
+  its rollback while `apply_enriched_metadata` swallows the error). A lost claim returns
+  `(None, CLAIM_LOST)` (`(False, CLAIM_LOST)` for the merge), `CLAIM_LOST = "claim_lost"`. Callers:
   - daemon `_download_single`: the duplicate merge, `move_entry_to_downloaded`, both
-    `mark_download_failed` calls;
-  - the CLI: the duplicate merge, the downloaded and the failed write.
+    `mark_download_failed` calls, with `claimed_by=self.worker_id`;
+  - the CLI: the duplicate merge, the downloaded and the failed write, with `claimed_by=cli_id`;
+  - the enrich writes of D3.
 
   A write whose claim was lost is skipped and logged once:
   `Work <id>: <phase> claim lost before its result was written; result discarded.` The daemon
-  counts it as `skipped` (`action: "claim_lost"`). A downloaded file stays on disk; the current
-  owner writes its own result.
+  counts it as `skipped` (`action: "claim_lost"`).
+- **The guarded merge rechecks its target.** Inside `merge_duplicate_queued_work`'s owned
+  transaction, the duplicate target is re-read: when it no longer exists or is no longer
+  `downloaded`, nothing is merged, it returns `(False, "duplicate_target_gone")`, and the caller
+  downloads the row as usual.
+- **A stale downloader never overwrites the published PDF.** Today all three file writers
+  (`new_dl.py:1120`, `:1468`, `pdf_downloader.py:139-140`) write a deterministic final name, so
+  a late attempt for the same work can overwrite the bytes behind the winner's `file_checksum`.
+  The smallest fix, no per-attempt directories:
+  - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)` puts the
+    suffix into `ref["part_suffix"]`; the three writers write `<final><part_suffix>` in the same
+    directory and report that path as `downloaded_file`. CLI and daemon pass
+    `part_suffix=f".part-{secrets.token_hex(4)}"` per attempt. Other callers pass nothing and keep
+    today's behaviour.
+  - `move_entry_to_downloaded` and `mark_raw_work_downloaded` gain `part_path: str | None = None`.
+    After the ownership check passes, inside the same transaction, they publish it with
+    `download_path.publish_download(part_path) -> str` (`os.replace` to the name without the
+    `.part-…` suffix, atomic in one directory) and store the final path.
+  - On a lost claim or any other failed write, the caller removes its part file with
+    `download_path.discard_download(part_path)` (`missing_ok`). A stale attempt therefore leaves
+    the winner's bytes and checksum untouched; at worst a crash leaves one `*.part-*` file.
 - The CLI's dedupe uses the daemon's rule through a new shared method,
   `DatabaseManager.find_downloaded_duplicate(row: dict, authors) -> tuple[str | None, int | None, str | None]`.
   It runs `check_if_exists(doi, openalex_id, title, authors, editors=row.get("editors"), year,
@@ -320,7 +366,8 @@ not non-issues.
 **D3. A hung item fails after 3 hangs (K-M4), controller call.**
 - **Tracking.** The worker records which items are *running*, not merely claimed:
   `self._running_items: dict[tuple[str, int], float]` (phase, work id → start time from
-  `self._running_clock`, `time.monotonic` by default, a test seam), guarded by
+  `self._running_clock`, `time.monotonic` by default, a test seam that the reporting budget below
+  reads too), guarded by
   `self._running_items_lock`. That lock is only ever held for a dict operation or a copy of at
   most a few dozen entries, never across I/O. The context manager
   `_item_running(phase: str, work_id: int)` adds the entry and removes it in its `finally`. It
@@ -348,8 +395,8 @@ not non-issues.
   not counted, whatever its attempt count. Half rather than the whole deadline, because every item
   starts after its batch's deadline clock: at the win, even an item that hung from the first
   second has run slightly less than the deadline.
-- **Terminal writes are guarded by ownership.** The enrich writes that end a metadata claim go
-  through `owned_claim("enrich", id, self.worker_id)` (D2): `apply_enriched_metadata`,
+- **Terminal writes are guarded by ownership.** The enrich writes that end a metadata claim pass
+  `claimed_by=self.worker_id` (D2): `apply_enriched_metadata`,
   `mark_metadata_failed`, `reset_enrich_claim` in `do_enrich`, and `mark_raw_work_downloaded` in
   `_attempt_raw_download`. The download writes already do (D2). An item that finishes after the
   watchdog failed it therefore writes nothing.
@@ -375,8 +422,8 @@ not non-issues.
   display only.
 - **One shared reporting budget keeps phase 5's exit bound.** Phase 5 bounds the time from the win
   to the exit by 1 s for `heartbeat_lock` and 1 s of SQLite busy wait, about 2 s. That bound is
-  kept, not amended. After the lock is taken, `budget_end = monotonic() + WATCHDOG_BUSY_TIMEOUT_MS
-  / 1000`. Each of the two writes sets `PRAGMA busy_timeout` to the milliseconds left; a write
+  kept, not amended. After the lock is taken, `budget_end = self._running_clock() +
+  WATCHDOG_BUSY_TIMEOUT_MS / 1000`. Each of the two writes sets `PRAGMA busy_timeout` to the milliseconds left; a write
   with less than 1 ms left is skipped with the reason `reporting budget spent`. The prior
   `busy_timeout` is restored afterwards, as today. A failed hung write rolls back
   (`conn.rollback()` when `conn.in_transaction`) before the heartbeat runs. The snapshot is taken
@@ -386,7 +433,11 @@ not non-issues.
   that hangs on every attempt is failed at the win of its third claim, **provided that win's
   write is persisted**. A skipped write (lock timeout, budget spent, SQLite error) costs one more
   restart cycle; if every win's write were skipped, the loop would continue as today. Since the
-  attempt count keeps growing, the first persisted write fails the item.
+  attempt count keeps growing, the first persisted write fails the item. The bound also assumes
+  the item is overdue at the win: an item that hangs but always starts in the second half of its
+  batch (for example behind a full pool, or in a late enrich wave) misses the half-deadline
+  cutoff each time and keeps being retried. That case is accepted; it needs a batch that is
+  nearly full of slow items every time.
 - **Limit:** `env_int("RAG_FEEDER_HUNG_ITEM_MAX_ATTEMPTS", 3, minimum=1)`. The attempt count
   counts claims. A row the user re-queued earlier therefore reaches the limit sooner. That is
   acceptable: the row is blamed only when it has been running past half the deadline at a
@@ -447,9 +498,13 @@ not non-issues.
     locked. A locked entry is never evicted. If every entry is locked, the new key is not
     tracked: `reserve` returns `{ allowed: true, ticket: null }`, and settling a `null` ticket
     does nothing (fail open). The scan runs only at capacity.
-- **The key is the submitted username,** `String(username).trim()`, compared exactly (the
-  lookup's BINARY equality). The limiter runs **before** the user lookup, after the existing `400`
-  for a missing field, and treats every name alike:
+- **The key is the submitted username.** The handler first answers `400 Missing username or
+  password` unless `username` and `password` are both strings and `username.trim()` is not
+  empty. It then uses `name = username.trim()` for **both** the user lookup and the limiter (so
+  ` b ` now signs in as `b`; usernames are stored trimmed). The limiter stores
+  `sha256(name)` as hex (64 characters) as its map key, so a request-sized username costs no
+  more memory than a short one; equality stays exact (BINARY). The limiter runs **before** the
+  user lookup and treats every name alike:
   - `reserve` first; when it is not allowed, the answer is `429` with header
     `Retry-After: <retryAfterSeconds>` and
     `{ error: 'Too many failed sign-ins for this account. Try again in <n> minute(s).' }`. Here
@@ -468,7 +523,7 @@ not non-issues.
   limiter or `createLoginLimiter()`. One limiter lives per app.
 - **In memory, by design.** The backend is one Node process (`index.js`, no cluster), so one map
   sees every sign-in. A restart resets the counts. That costs at most one extra window of 10
-  guesses per restart. The map holds at most `maxKeys` small entries.
+  guesses per restart. The map holds at most `maxKeys` entries of fixed size.
 - **The limit is per username, not per IP.** It needs no client address, so there is no proxy or
   `trust proxy` change. As with any per-account lock, anyone who knows a username can lock that
   account for 15 minutes, the admin included. The owner chose this rule.
@@ -535,13 +590,18 @@ not non-issues.
 
 **D8. A failed preview asks before starting, and a confirmation starts what it describes (FE-55),
 controller call.**
-- **The submitted request.** `runSearch` increments `searchRequestSeq` and stores
-  `submittedSearch = { seq, body: buildSearchBody(searchMaxResults) }`; the preview is sent with
-  that `body`. When the preview answers (or fails), the result is used only while
-  `seq === searchRequestSeq` and the existing session and corpus epochs still match; otherwise it
-  is dropped.
-- **Invalidation.** `invalidateSearchConfirmation()` increments `searchRequestSeq` and clears
-  `submittedSearch`, `searchPreview`, `searchPreviewError` and `searchWarning`. It runs:
+- **One pending request object.** `runSearch` creates
+  `const request = { body: buildSearchBody(searchMaxResults), previewing: true }` and sets
+  `searchRequest = request`; the object's identity is the request's identity. The preview is sent
+  with `request.body`. The Search button is disabled while `searchRequest?.previewing` (instead
+  of the unconditional `searchPreviewBusy`). When the preview settles, only the current request
+  is touched: `if (request === searchRequest) { request.previewing = false; searchRequest = searchRequest }`
+  (the reassignment notifies Svelte). Its result is used only while `request === searchRequest`
+  and the session and corpus epochs still match; otherwise it is dropped.
+- **Invalidation.** `invalidateSearchConfirmation()` sets `searchRequest = null` and clears
+  `searchPreview`, `searchPreviewError` and `searchWarning`, and `searchStatus` when it still
+  says `Checking how many works match...`. A discarded preview therefore no longer keeps the
+  button disabled or the status on an edited form. It runs:
   - from `resetSearchForm`;
   - on any `input` event inside the search form (one `on:input` on the form element covers the
     text fields, the selects and the max-results field);
@@ -559,16 +619,16 @@ controller call.**
   - A successful preview clears `searchPreviewError`.
 - **Every warning button starts the submitted body.** `startSearch({ maxResultsOverride = null, body = null } = {})`
   uses `body` when given (with `maxResults` replaced by the override, if any), else builds one as
-  today. Both warning variants pass `submittedSearch.body`.
-- `searchPreviewError` (`''` by default) is part of `initialWorkspaceState()` and of the
-  `resetFrontendState` destructuring, and so are `searchRequestSeq` and `submittedSearch`.
+  today. Both warning variants pass `searchRequest.body`.
+- `searchPreviewError` (`''` by default) and `searchRequest` (`null`) are part of
+  `initialWorkspaceState()` and of the `resetFrontendState` destructuring.
 - The warning box (`data-testid="search-warning"`, same classes and `role="alert"`) gets a second
   variant, rendered when `searchWarning && !searchPreview && searchPreviewError`:
   - text: `Could not check how many works match (<message>). <cap sentence> Narrow the query, or:`;
   - cap sentence, with `cap = searchResultCap(searchMaxResults)`: when `cap === 0`,
     `This search has no cap, so it may fetch a very large number of works.`; otherwise
     `This search stops at <cap, en-US grouping> works.`;
-  - one primary button, `Search anyway`, which calls `startSearch({ body: submittedSearch.body })`.
+  - one primary button, `Search anyway`, which calls `startSearch({ body: searchRequest.body })`.
 - The rule holds whatever the cap: the count is unknown, and so is the server's threshold, which
   only the preview reports. Submitting the form again runs the preview again.
 
@@ -609,7 +669,7 @@ Tasks are grouped by surface; tasks on different surfaces touch disjoint files.
    - D1;
    - D2;
    - D3, after D2, because both edit `backend/scripts/daemon/worker.py`, and D3 uses D2's
-     `owned_claim`.
+     `claimed_by` writers.
 2. Backend:
    - D4 and D5 (`app.js`, `loginLimiter.js`, `README.md`);
    - D6 and D7 (new module, `index.js`, Jest setup).
@@ -625,7 +685,17 @@ Phase 6 merges into master first; `review-fixes-7` then rebases onto it. Overlap
   D6's call sits next to. Resolve by keeping phase 6's removal and adding D6's line after
   `createApp`.
 - `dl_lit_project/tests/test_identifiers.py` and its fixture: phase 6 drops the `ingest_latest`
-  entries (`:56`, `:199`), D1 the three script entries. Both removals stay.
+  entries from the maps (`:56`, `:199`) but keeps its key in `identifier_cases.json` as a
+  historical record, and rewrites `test_fixture_covers_every_former_copy` to
+  `set(FIXTURE["doi"]) - set(DOI_MAP) == {"backend.scripts.ingest_latest.normalize_doi"}` plus
+  `set(DOI_MAP) <= set(FIXTURE["doi"])`. Resolve by keeping phase 6's historical key and both
+  assertions as they are, and removing D1's three entries from `DOI_MAP` **and** from the
+  fixture, so the set difference stays exactly the `ingest_latest` key.
+- `frontend/src/App.svelte`: phase 6 adds `corpusStageFilter` (and `corpusRowsStage`) to
+  `initialWorkspaceState()` and the restore beside `corpusFilterQuery`; D8 adds
+  `searchPreviewError` and `searchRequest` to the same block and the `resetFrontendState`
+  destructuring, and edits the search reset. Resolve by keeping both sets of fields and both
+  reset changes.
 - `pipeline_jobs`: D6's prune relies on phase 6's index. D6's query-plan test creates the same
   index DDL in its temp DB, so it passes on either base.
 
@@ -673,9 +743,12 @@ phase's Acceptance.
   exit, dedupes only into downloaded works; start-up recovery keeps its live lease, and periodic
   recovery treats it like a daemon worker. The daemon's lease grows to its watchdog timeout plus
   60 s (1860 s by default). A result written after its claim was lost is discarded, with a log
-  line.
+  line; a download is written to `<final>.part-<token>` and moved into place only while the claim
+  is held, so a late attempt never replaces the winner's PDF. A deliberate enrich deferral hands
+  its unstarted rows straight back to the queue.
 - **D3 (K-M4):** an item running for at least half the timeout when a watchdog wins is failed
-  once its attempt count reaches 3 (`RAG_FEEDER_HUNG_ITEM_MAX_ATTEMPTS`); below that it is retried
+  once its attempt count reaches 3 (`RAG_FEEDER_HUNG_ITEM_MAX_ATTEMPTS`); an item that always
+  starts in the second half of its batch keeps missing that cutoff; below the limit it is retried
   after the restart. Claimed rows that had not started, and siblings that started recently, are
   never blamed. The three-attempt bound holds when the win's write is persisted; a skipped write
   costs one more cycle. Phase 5's 2 s exit bound is kept. The error is
@@ -687,7 +760,8 @@ phase's Acceptance.
 - **D5 (BE-40):** 10 failed sign-ins for one username within 15 minutes lock that username until
   the window passes, even for the right password; a successful sign-in clears the settled
   failures; unknown and invited names are counted the same way, so the 429 reveals nothing; in
-  memory, at most 10,000 names, reset by a backend restart. Anyone can lock a known account for
+  memory, at most 10,000 names stored as SHA-256 digests, reset by a backend restart. The
+  username is trimmed for the lookup too, and a non-string username or password answers 400. Anyone can lock a known account for
   15 minutes. The invitation 403 and the timing difference stay (pre-existing).
 - **D6 (BE-46):** the backend deletes `completed`, `failed` and `cancelled` jobs 30 days after they
   finished (or were created, when they never finished), at start-up and then daily, waiting at
