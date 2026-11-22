@@ -312,6 +312,11 @@ const STAGE_STATUSES = {
   failed_download: ['failed_download']
 }
 
+// The statuses a stage filter keeps, or null for all stages (unknown values).
+export function corpusStageStatuses(stage) {
+  return Object.hasOwn(STAGE_STATUSES, stage) ? STAGE_STATUSES[stage] : null
+}
+
 const readTransactions = new WeakMap()
 
 // One read transaction per listing: in WAL mode every statement inside sees the

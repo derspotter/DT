@@ -14,7 +14,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
-import { listCorpus } from './corpusList.js';
+import { listCorpus, corpusStageStatuses } from './corpusList.js';
 import { createPythonRunner } from './pythonProcess.js';
 import { tokenMailContent } from './authMail.js';
 import { getPasswordHasher } from './passwordHasher.js';
@@ -5395,7 +5395,9 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
 
   app.get('/api/corpus', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ items: STUB_RESULTS.corpus, total: STUB_RESULTS.corpus.length, source: 'stub' });
+      const statuses = corpusStageStatuses(String(req.query?.stage || ''));
+      const items = statuses ? STUB_RESULTS.corpus.filter((item) => statuses.includes(item.status)) : STUB_RESULTS.corpus;
+      return res.json({ items, total: STUB_RESULTS.corpus.length, stage_total: items.length, source: 'stub' });
     }
     const limit = Math.min(CORPUS_MAX_LIMIT, Math.max(0, coerceInt(req.query?.limit, 200)));
     const offset = coerceInt(req.query?.offset, 0);

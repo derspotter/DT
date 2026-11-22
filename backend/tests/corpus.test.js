@@ -20,6 +20,20 @@ describe('GET /api/corpus', () => {
     expect(res.body).toHaveProperty('items')
     expect(Array.isArray(res.body.items)).toBe(true)
   })
+
+  test('the stub applies the stage filter and answers stage_total', async () => {
+    const all = await request(app).get('/api/corpus')
+    expect(all.body.stage_total).toBe(all.body.total)
+    const downloaded = await request(app).get('/api/corpus?stage=downloaded')
+    expect(downloaded.body.items).toEqual([])
+    expect(downloaded.body.stage_total).toBe(0)
+    expect(downloaded.body.total).toBe(all.body.total)
+    const metadata = await request(app).get('/api/corpus?stage=metadata')
+    expect(metadata.body.items.map((item) => item.status).sort()).toEqual(['matched', 'queued_download'])
+    expect(metadata.body.stage_total).toBe(2)
+    const bogus = await request(app).get('/api/corpus?stage=bogus')
+    expect(bogus.body.items).toHaveLength(all.body.total)
+  })
 })
 
 describe('GET /api/corpus limit clamp', () => {

@@ -2935,6 +2935,10 @@
       if (epoch !== corpusScopeEpoch) return
       dropCorpusRows((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
       corpusTotal = Math.max(0, corpusTotal - 1)
+      // The follow-up must commit the server's counts even when its first
+      // page matches the last one: a load committed while the unlink ran may
+      // already have counted the removal that was just subtracted again.
+      lastCorpusPageSignature = ''
       await Promise.all([
         loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
@@ -2961,6 +2965,8 @@
       dropCorpusRows((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
       corpusTotal = Math.max(0, corpusTotal - removed.size)
       corpusLoadStatus = `Removed ${removed.size} item(s) from this corpus.`
+      // See handleRemoveCorpusWork: the follow-up always commits its counts.
+      lastCorpusPageSignature = ''
       await Promise.all([
         loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
@@ -3960,8 +3966,10 @@
       applyCorpusCounts(total, stageTotals, stageTotal)
       corpusSource = source
       if (!append) corpusRefreshFailed = false
-      // A quiet stage load still reports: the list now shows other rows.
-      if (!quiet || stageChanged) {
+      // A quiet load that committed rows (a stage change, a poll) keeps the
+      // footer's count in step with the header; other messages stay.
+      const showingStatus = !corpusLoadStatus || corpusLoadStatus.startsWith('Showing ')
+      if (!quiet || stageChanged || (!append && showingStatus)) {
         corpusLoadStatus = corpusHasMore
           ? `Showing ${corpusItems.length} of ${corpusMatchTotal} entries.`
           : `Showing ${corpusItems.length} entries.`

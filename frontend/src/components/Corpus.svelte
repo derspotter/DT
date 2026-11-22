@@ -103,6 +103,7 @@
   }
 
   function clearSelection() {
+    if (corpusRowsStale) return
     selectedWorkIds = []
   }
 
@@ -181,7 +182,7 @@
       <h3 class="workspace-section-title">3. Corpus</h3>
       <p class="muted">
         {#if corpusSource !== 'api'}
-          Corpus not loaded.
+          Corpus not loaded.{corpusRefreshFailed ? ' The last load failed.' : ''}
         {:else if corpusRefreshFailed}
           Refresh failed; showing earlier rows.
         {:else}
@@ -234,7 +235,7 @@
     <button class="secondary" type="button" on:click={toggleSelectAll} disabled={corpusRowsStale || selectableWorkIds.length === 0}>
       {allSelected ? 'Clear' : 'Select all'}
     </button>
-    <button class="secondary" type="button" on:click={clearSelection} disabled={visibleSelection.length === 0}>
+    <button class="secondary" type="button" on:click={clearSelection} disabled={corpusRowsStale || visibleSelection.length === 0}>
       Clear selection
     </button>
     <button class="danger" type="button" on:click={removeSelected} disabled={corpusRowsStale || visibleSelection.length === 0}>

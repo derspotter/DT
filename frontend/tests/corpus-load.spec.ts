@@ -335,6 +335,8 @@ test('a poll keeps the stage and q and drops a row that left it from a loaded se
   expect(after.some((params) => params.offset === 0 && params.limit === 150)).toBe(true)
   expect(after.every((params) => params.stage === 'downloaded' && params.q === 'paper')).toBe(true)
   await expect(header(page)).toContainText('Loaded 149/149.')
+  // The quiet poll's commit updates the footer's count too.
+  await expect(lazyStatus(page)).toContainText('Showing 149 entries.')
   await expect(showMore(page)).toHaveCount(0)
 })
 
@@ -395,9 +397,9 @@ test('counts move only with their rows', async ({ page }) => {
   poll.release()
   await expect(rows(page)).toHaveCount(2)
   await expect(header(page)).toContainText('Loaded 2/2.')
+  // Exactly the poll's first page: no prefix reload of the 1,080 old rows.
   const staged = state.requests.slice(before).filter((params) => params.stage === 'failed_download')
-  expect(staged.length).toBeGreaterThan(0)
-  expect(staged.every((params) => params.offset === 0)).toBe(true)
+  expect(staged.map((params) => `${params.limit}@${params.offset}`)).toEqual(['120@0'])
   retry.release()
 })
 
@@ -492,8 +494,11 @@ test('row actions wait for the rows of the selected stage', async ({ page }) => 
   await boot(page, state)
   await expect(rows(page)).toHaveCount(120)
   await expect(header(page)).toContainText('Loaded 120/300.')
-  // Expand row 1 (downloaded, with a file, DOI and OpenAlex id).
+  // Expand row 1 (downloaded, with a file, DOI and OpenAlex id); select row 3.
   await rows(page).first().click()
+  await rows(page).nth(2).locator('.ingest-select-cell input').check()
+  const clearSelection = panel(page).getByRole('button', { name: 'Clear selection' })
+  await expect(clearSelection).toBeEnabled()
   const pdf = panel(page).locator('.inline-detail-chip--download')
   const links = panel(page).locator('.corpus-inline-detail-row a.inline-detail-link')
   await expect(pdf).toBeEnabled()
@@ -510,6 +515,7 @@ test('row actions wait for the rows of the selected stage', async ({ page }) => 
   await expect(panel(page).locator('.corpus-bulk-bar').getByRole('button', { name: 'Select all' })).toBeDisabled()
   await expect(panel(page).getByRole('button', { name: 'Remove selected' })).toBeDisabled()
   await expect(showMore(page)).toBeDisabled()
+  await expect(clearSelection).toBeDisabled()
   await expect(pdf).toBeDisabled()
   await expect(links.first()).not.toHaveAttribute('href', /.+/)
   await expect(links.nth(1)).not.toHaveAttribute('href', /.+/)
@@ -551,4 +557,59 @@ test('a failed stage load keeps the old rows inert until the user reverts', asyn
   await expect(showMore(page)).toBeEnabled()
   expect(await rowIds(page)).toEqual(range(1, 120))
   gate.release()
+})
+
+for (const bulk of [false, true]) {
+  test(`a ${bulk ? 'bulk ' : ''}removal answered after a stage switch is counted once`, async ({ page }) => {
+    const state = newState()
+    // The unlink commits on arrival; its response is held.
+    const removed = () => new Set(state.unlinks.flat())
+    state.rows = ({ stage, offset, limit }) => {
+      const gone = removed()
+      const all = range(1, 300).filter((id) => !gone.has(id))
+      const stageTotals = { raw: all.length - 150, downloaded: 150 }
+      if (stage === 'downloaded') return { ids: range(501, 150).slice(offset, offset + limit), total: all.length, stageTotal: 150, stageTotals }
+      return { ids: all.slice(offset, offset + limit), total: all.length, stageTotals }
+    }
+    const unlink = deferred()
+    state.unlinkHold = unlink.promise
+    page.on('dialog', (dialog) => dialog.accept())
+    await boot(page, state)
+    await expect(rows(page)).toHaveCount(120)
+    const allLabel = stageSelect(page).locator('option[value="all"]')
+    await expect(allLabel).toHaveText('All stages (300)')
+    if (bulk) {
+      await rows(page).nth(0).locator('.ingest-select-cell input').check()
+      await rows(page).nth(1).locator('.ingest-select-cell input').check()
+      await panel(page).getByRole('button', { name: 'Remove selected' }).click()
+    } else {
+      await rows(page).first().locator('.corpus-remove').click()
+    }
+    await expect.poll(() => state.unlinks.length).toBe(1)
+    const expected = 300 - (bulk ? 2 : 1)
+    // The stage load runs after the unlink committed: it already counts it.
+    await stageSelect(page).selectOption('downloaded')
+    await expect(rows(page).first()).toHaveAttribute('data-work-id', '501')
+    await expect(allLabel).toHaveText(`All stages (${expected})`)
+    const before = state.requests.length
+    unlink.resolve()
+    // The follow-up answers the same first page, and its counts still apply.
+    await expect.poll(() => state.requests.length).toBeGreaterThan(before)
+    await page.waitForTimeout(300)
+    await expect(allLabel).toHaveText(`All stages (${expected})`)
+    await expect(page.getByTestId('workspace-sticky-bar')).toContainText(`3 Corpus (${expected})`)
+  })
+}
+
+test('a stage request that fails before the first rows commit says so', async ({ page }) => {
+  const state = newState({ rows: stageFixture().rows, fail: (params) => params.stage === 'failed_download' })
+  // The boot's first page stays unanswered.
+  const first = hold(state, (params) => !params.stage)
+  await boot(page, state)
+  await expect.poll(() => first.entry.seen).toBe(true)
+  await expect(header(page)).toContainText('Corpus not loaded.')
+  await stageSelect(page).selectOption('failed_download')
+  await expect.poll(() => state.failed).toBeGreaterThan(0)
+  await expect(header(page)).toContainText('Corpus not loaded. The last load failed.')
+  first.release()
 })
