@@ -1378,7 +1378,7 @@ class PipelineDaemon:
                                 }
                             )
                         else:
-                            _, reset_err = self.db.reset_enrich_claim(
+                            reset_ok, reset_err = self.db.reset_enrich_claim(
                                 pending_work_id, state="pending", error=err or "promotion_failed", selected=0,
                                 claimed_by=self.worker_id,
                             )
@@ -1387,6 +1387,11 @@ class PipelineDaemon:
                                 continue
                             failed += 1
                             errors.append(err or f"Promotion failed for pending work {pending_work_id}")
+                            if reset_ok is not True:
+                                # The row keeps its claim until the lease ends: say why (F2).
+                                reset_msg = f"Work {pending_work_id}: could not reset the enrich claim: {reset_err or 'no row'}"
+                                log(reset_msg)
+                                errors.append(reset_msg)
                             results.append({"pending_work_id": pending_work_id, "action": "promotion_failed", "error": err})
                         continue
 
@@ -1498,10 +1503,13 @@ class PipelineDaemon:
         log(f"Work {qid}: download claim lost before its result was written; result discarded.")
         return "skipped", {"queue_id": qid, "action": "claim_lost"}
 
-    def _fail_download(self, qid: int, reason: str, detail: str, attempted_sources: list, trace: list):
-        """Mark the claimed row failed. A write that fails is logged and reported as an error."""
+    def _fail_download(
+        self, qid: int, reason: str, detail: str, attempted_sources: list, trace: list, *, stored: str | None = None
+    ):
+        """Mark the claimed row failed (``stored`` is the row's reason text, default ``reason``).
+        A write that fails is logged and reported as an error."""
         with self.db_lock:
-            marked_id, fail_error = self.db.mark_download_failed(qid, reason, claimed_by=self.worker_id)
+            marked_id, fail_error = self.db.mark_download_failed(qid, stored or reason, claimed_by=self.worker_id)
         if fail_error == CLAIM_LOST:
             return self._download_claim_lost(qid)
         if marked_id is None:
@@ -1562,7 +1570,10 @@ class PipelineDaemon:
             return self._download_claim_lost(qid)
         if move_error or not downloaded_id:
             reason = "checksum_unavailable" if move_error == "checksum_unavailable" else "move_to_downloaded_failed"
-            return self._fail_download(qid, reason, move_error or reason, attempted_sources, trace)
+            # Store and log the real error (F3): a failed row is not claimed again.
+            stored = f"{reason}: {move_error}" if move_error and move_error != reason else reason
+            log(f"Work {qid}: download not recorded ({stored}).")
+            return self._fail_download(qid, reason, move_error or reason, attempted_sources, trace, stored=stored)
 
         return "downloaded", {
             "queue_id": qid,

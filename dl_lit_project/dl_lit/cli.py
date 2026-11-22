@@ -827,9 +827,11 @@ def _cli_download_row(db, enhancer, row, download_dir, cli_id) -> str:
             return "claim_lost"
         if err or not downloaded_id:
             reason = "checksum_unavailable" if err == "checksum_unavailable" else "move_to_downloaded_failed"
+            if err and err != reason:
+                reason = f"{reason}: {err}"  # store the real error (F3)
             outcome = _cli_mark_failed(db, row['id'], reason, cli_id)
             if outcome == "failed":
-                click.echo(f"  ✗ download not recorded: {err or reason}")
+                click.echo(f"  ✗ download not recorded: {reason}")
             return outcome
         click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
         return "downloaded"

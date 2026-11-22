@@ -1276,3 +1276,67 @@ def test_a_failed_claim_is_not_an_empty_queue(tmp_path, mocker):
     assert "claiming a download row failed" in result.output
     assert fake.call_count == 0
     assert _row(db_path, wid)["download_status"] == "queued"
+
+
+def _no_link(monkeypatch):
+    def no_link(src, dst, *args, **kwargs):
+        raise OSError("link refused")
+
+    monkeypatch.setattr(os, "link", no_link)
+
+
+def test_a_failed_publish_stores_its_real_error_in_the_daemon(tmp_path, monkeypatch, capsys):
+    # F3: the row's stored reason says what failed, and the worker log says it too.
+    daemon = _worker_daemon(monkeypatch, tmp_path, _StagingEnhancer(b"%PDF A", name="x.pdf"))
+    wid = _insert_work(daemon.db, "T", year=2020, download_status="queued")
+    row = _claim(daemon.db, wid, daemon.worker_id)
+    _no_link(monkeypatch)
+
+    status, data = daemon._download_single(row)
+
+    assert status == "failed" and data["failure_category"] == "move_to_downloaded_failed"
+    got = _row(tmp_path / "worker.db", wid)
+    assert got["download_status"] == "failed"
+    assert got["download_error"] == "move_to_downloaded_failed: publish failed: link refused"
+    out = capsys.readouterr()
+    assert "publish failed: link refused" in out.out + out.err
+
+
+def test_a_failed_publish_stores_its_real_error_in_the_cli(tmp_path, mocker, monkeypatch):
+    db_path, (wid,) = _setup(tmp_path)
+    mocker.patch("dl_lit.cli.BibliographyEnhancer")
+
+    def fake(enhancer, ref, download_dir, part_suffix=None):
+        part = Path(download_dir) / ("2020_T.pdf" + (part_suffix or ""))
+        part.write_bytes(b"%PDF A")
+        return {"downloaded_file": str(part), "download_source": "mock", "checksum": _sha(b"%PDF A")}, _sha(b"%PDF A"), []
+
+    mocker.patch("dl_lit.cli.download_ref", side_effect=fake)
+    _no_link(monkeypatch)
+    result = _run_cli(db_path, tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert "publish failed: link refused" in result.output
+    got = _row(db_path, wid)
+    assert got["download_status"] == "failed"
+    assert got["download_error"] == "move_to_downloaded_failed: publish failed: link refused"
+
+
+def test_a_failed_enrich_claim_reset_is_reported(tmp_path, monkeypatch, capsys):
+    # F2: a reset_enrich_claim error other than claim_lost reaches the batch errors and the log.
+    from tests.test_worker_recovery import _daemon
+
+    daemon = _daemon(monkeypatch, tmp_path, "enrich")
+    wid = _insert_work(daemon.db, "P", year=2020, metadata_status="pending")
+    daemon.db.conn.execute("INSERT INTO corpus_works (corpus_id, work_id) VALUES (5, ?)", (wid,))
+    daemon.db.conn.commit()
+    monkeypatch.setattr(daemon, "_enrich_single", lambda entry, *a: (int(entry["id"]), {"title": "P"}, {"status": "matched"}))
+    monkeypatch.setattr(daemon.db, "apply_enriched_metadata", lambda *a, **k: (None, "promotion broke"))
+    monkeypatch.setattr(daemon.db, "reset_enrich_claim", lambda *a, **k: (False, "database is locked"))
+
+    result = daemon.do_enrich(5, 1, 1, {})
+
+    assert result["failed"] == 1
+    assert f"Work {wid}: could not reset the enrich claim: database is locked" in result["errors"]
+    out = capsys.readouterr()
+    assert "could not reset the enrich claim: database is locked" in out.out + out.err

@@ -1930,6 +1930,7 @@ class DatabaseManager:
                     published = publish_download(part_path, int(source_id))
                 except OSError as e:
                     self.conn.rollback()
+                    print(f"{RED}[DB Manager] Error publishing the download of work {source_id}: {e}{RESET}")
                     return None, f"publish failed: {e}"
                 file_path = published
                 enriched_metadata = self._retained_download_result(enriched_metadata, published)
@@ -2104,6 +2105,7 @@ class DatabaseManager:
                     published = publish_download(part_path, int(source_id))
                 except OSError as e:
                     self.conn.rollback()
+                    print(f"{RED}[DB Manager] Error publishing the download of work {source_id}: {e}{RESET}")
                     return None, f"publish failed: {e}"
                 file_path = published
                 download_result = self._retained_download_result(download_result, published)
