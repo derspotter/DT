@@ -77,12 +77,12 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from dl_lit.db_manager import DatabaseManager
+from dl_lit.db_manager import CLAIM_LOST, DatabaseManager
 from dl_lit.app_settings import apply_app_settings_env, effective_env, settings_fingerprint
 from dl_lit.utils import env_int, get_global_rate_limiter, reset_global_rate_limiter, set_global_rate_limiter
 from dl_lit.OpenAlexScraper import OpenAlexCrossrefSearcher, process_single_reference
 from dl_lit.new_dl import BibliographyEnhancer
-from dl_lit.download_path import download_ref  # noqa: F401  (worker.download_ref)
+from dl_lit.download_path import discard_download, download_ref, is_staged_path  # noqa: F401  (worker.download_ref)
 from dl_lit.scraper_lab import execute_scraper_job
 
 # Import constants
@@ -305,6 +305,14 @@ class PipelineDaemon:
 
     def _direct_batch_timeout_seconds(self) -> float:
         return env_int("RAG_FEEDER_DIRECT_BATCH_TIMEOUT", self.job_timeout_seconds, minimum=60)
+
+    def _claim_lease_seconds(self) -> int:
+        """Work-row lease of this worker's claims: outlasts both watchdog deadlines (D2).
+
+        Past the deadline the watchdog exits the worker and recovery takes over, so a claim
+        never expires under a batch that is still legitimately running.
+        """
+        return max(900, int(max(self.job_timeout_seconds, self._direct_batch_timeout_seconds())) + 60)
 
     def _log_throttled(self, key, message: str, interval: float = 60.0) -> None:
         now = time.time()
@@ -644,6 +652,7 @@ class PipelineDaemon:
                 " OR claimed_by NOT IN (SELECT worker_id FROM daemon_heartbeat WHERE worker_id IS NOT NULL AND status != 'stopped' AND datetime(last_seen_at) > datetime('now', ?))"
             ),
             params=[self.daemon_name, self.worker_id, f"-{int(heartbeat_stale_seconds)} seconds"],
+            keep_live_cli=True,
         )
         if released:
             log(f"Released {released} work claim(s) held by dead workers.")
@@ -686,11 +695,12 @@ class PipelineDaemon:
     def _periodic_owner_is_dead(self):
         """The owner test of periodic recovery, as a function of a worker_id (1 = dead).
 
-        Positively dead: its heartbeat row says 'stopped'; or it is a daemon worker
-        (daemon:<host>:<pid>:<nonce>) on this host whose pid is gone; or a non-daemon owner
-        without a heartbeat row. A daemon worker on another host is never reclaimed here, and
-        neither is a live pid on this host, even when it shares our daemon_name (a second
-        same-role worker). A predecessor that a container restart replaced (same hostname, PID 1
+        Positively dead: its heartbeat row says 'stopped'; or it is a daemon worker or a
+        `dl_lit download-pdfs` run (daemon:<host>:<pid>:<nonce>, cli:<host>:<pid>:<nonce>) on
+        this host whose pid is gone; or any other owner without a heartbeat row. A daemon or
+        CLI owner on another host is never reclaimed here (a CLI writes no heartbeat; its
+        lease ends its claim), and neither is a live pid on this host, even when it shares
+        our daemon_name (a second same-role worker). A predecessor that a container restart replaced (same hostname, PID 1
         again) is start-up recovery's job.
         """
         beats = {
@@ -707,7 +717,7 @@ class PipelineDaemon:
             if beats.get(owner) == "stopped":
                 return 1
             parts = str(owner).split(":")
-            if len(parts) != 4 or parts[0] != "daemon" or not parts[2].isdigit():
+            if len(parts) != 4 or parts[0] not in ("daemon", "cli") or not parts[2].isdigit():
                 return 0 if owner in beats else 1
             if parts[1] != host:
                 return 0
@@ -755,24 +765,29 @@ class PipelineDaemon:
     }
     ROLE_CLAIMS["all"] = ROLE_CLAIMS["enrich"] + ROLE_CLAIMS["download"]
 
-    def _release_work_claims(self, where_claimed_by: str, params: list) -> int:
+    def _release_work_claims(self, where_claimed_by: str, params: list, *, keep_live_cli: bool = False) -> int:
         """Return in_progress work rows whose claim matches to their queue state.
 
         `where_claimed_by` is an SQL condition over the placeholder `claimed_by`,
-        which is substituted with the role's claimed_by column.
+        which is substituted with the role's claimed_by column. `keep_live_cli` keeps a
+        `cli:` claim whose lease has not ended: a CLI writes no heartbeat row (start-up only).
         """
         total = 0
         cur = self.db.conn.cursor()
         for status_col, by_col, at_col, lease_col, back_to in self.ROLE_CLAIMS.get(self.role, []):
             cond = where_claimed_by.replace("claimed_by", by_col)
+            extra_sql, extra_params = "", []
+            if keep_live_cli:
+                extra_sql = f" AND NOT ({by_col} LIKE 'cli:%' AND COALESCE({lease_col}, 0) > ?)"
+                extra_params = [int(time.time())]
             try:
                 cur.execute(
                     f"""
                     UPDATE works
                        SET {status_col} = ?, {by_col} = NULL, {at_col} = NULL, {lease_col} = NULL
-                     WHERE {status_col} = 'in_progress' AND {by_col} IS NOT NULL AND ({cond})
+                     WHERE {status_col} = 'in_progress' AND {by_col} IS NOT NULL AND ({cond}){extra_sql}
                     """,
-                    [back_to] + list(params),
+                    [back_to] + list(params) + extra_params,
                 )
                 total += int(cur.rowcount or 0)
             except sqlite3.OperationalError as e:
@@ -1052,7 +1067,7 @@ class PipelineDaemon:
             limit=max(1, int(limit or 1)),
             corpus_id=corpus_id,
             claimed_by=self.worker_id,
-            lease_seconds=15 * 60,
+            lease_seconds=self._claim_lease_seconds(),
             target_ids=target_ids,
         )
         for row in to_process:
@@ -1162,6 +1177,9 @@ class PipelineDaemon:
             if remaining_entries and self._has_pending_corpus_download_jobs():
                 deferred_reason = "pending_download"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
+                # Unstarted rows go back now, so the continuation job can claim them at once.
+                with self.db_lock:
+                    self.db.release_enrich_claims(remaining_ids, self.worker_id)
                 log(
                     f"Yielding enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and a corpus download job is pending."
                 )
@@ -1169,6 +1187,8 @@ class PipelineDaemon:
             if corpus_id is None and remaining_entries and self._has_pending_interactive_jobs():
                 deferred_reason = "interactive_backlog"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
+                with self.db_lock:
+                    self.db.release_enrich_claims(remaining_ids, self.worker_id)
                 log(
                     f"Yielding global enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and an interactive corpus job is waiting."
                 )
@@ -1203,19 +1223,15 @@ class PipelineDaemon:
         # DatabaseManager uses a shared sqlite connection. Keep DB mutations and lookups serialized
         # while still allowing network/download work to run in parallel.
         with self.db_lock:
-            dup_table, dup_id, dup_field = self.db.check_if_exists(
-                doi=row.get("doi"), openalex_id=row.get("openalex_id"), title=row.get("title"),
-                authors=authors, editors=row.get("editors"), year=row.get("year"), exclude_id=qid, exclude_table="works"
-            )
-            if dup_table == "works" and dup_id is not None:
-                existing = self.db.get_entry_by_id("works", int(dup_id)) or {}
-                if str(existing.get("download_status") or "").strip().lower() != "downloaded":
-                    dup_table = None
-                    dup_id = None
+            dup_table, dup_id, dup_field = self.db.find_downloaded_duplicate(row, authors)
         if dup_table == "works" and dup_id is not None:
             with self.db_lock:
-                ok, msg = self.db.merge_duplicate_queued_work(qid, dup_table, dup_id, dup_field)
-            return "skipped", {"queue_id": qid, "action": "dropped_duplicate"}
+                ok, msg = self.db.merge_duplicate_queued_work(qid, dup_table, dup_id, dup_field, claimed_by=self.worker_id)
+            if msg == CLAIM_LOST:
+                return self._download_claim_lost(qid)
+            if msg != "duplicate_target_gone":
+                return "skipped", {"queue_id": qid, "action": "dropped_duplicate"}
+            # The target is no longer downloaded: download the row as usual.
 
         ref = {
             "title": row.get("title"),
@@ -1226,9 +1242,23 @@ class PipelineDaemon:
             "open_access_url": row.get("url_source") or row.get("url"),
             "openalex_json": row.get("openalex_json"),
         }
-        
         try:
-            result, checksum, trace = download_ref(self.enhancer, ref, self.download_dir)
+            return self._download_and_record(qid, ref)
+        finally:
+            # The staged file goes on every outcome; a published PDF is a separate hard link.
+            staged = ref.get("downloaded_file")
+            if is_staged_path(staged):
+                discard_download(staged)
+
+    def _download_claim_lost(self, qid: int):
+        log(f"Work {qid}: download claim lost before its result was written; result discarded.")
+        return "skipped", {"queue_id": qid, "action": "claim_lost"}
+
+    def _download_and_record(self, qid: int, ref: dict):
+        try:
+            result, checksum, trace = download_ref(
+                self.enhancer, ref, self.download_dir, part_suffix=f".part-{secrets.token_hex(4)}"
+            )
         except Exception as exc:
             return "error", {
                 "queue_id": qid,
@@ -1247,20 +1277,31 @@ class PipelineDaemon:
 
         if result is not None:
             fp = str(result["downloaded_file"])
+            ref["downloaded_file"] = fp  # what the caller's finally discards
+            # A builder that ignored the suffix wrote its final name: stored as is, as before.
+            part_path = fp if is_staged_path(fp) else None
             with self.db_lock:
-                downloaded_id, move_error = self.db.move_entry_to_downloaded(qid, result, fp, checksum, result.get("download_source", "unknown"))
+                downloaded_id, move_error = self.db.move_entry_to_downloaded(
+                    qid, result, fp, checksum, result.get("download_source", "unknown"),
+                    claimed_by=self.worker_id, part_path=part_path,
+                )
+            if move_error == CLAIM_LOST:
+                return self._download_claim_lost(qid)
             if move_error or not downloaded_id:
+                reason = "checksum_unavailable" if move_error == "checksum_unavailable" else "move_to_downloaded_failed"
                 with self.db_lock:
-                    self.db.mark_download_failed(qid, "move_to_downloaded_failed")
+                    _, fail_error = self.db.mark_download_failed(qid, reason, claimed_by=self.worker_id)
+                if fail_error == CLAIM_LOST:
+                    return self._download_claim_lost(qid)
                 return "failed", {
                     "queue_id": qid,
                     "action": "failed",
-                    "failure_category": "move_to_downloaded_failed",
-                    "failure_detail": move_error or "move_to_downloaded_failed",
+                    "failure_category": reason,
+                    "failure_detail": move_error or reason,
                     "attempted_sources": attempted_sources,
                     "_trace": trace,
                 }
-                
+
             return "downloaded", {
                 "queue_id": qid,
                 "action": "downloaded",
@@ -1269,19 +1310,20 @@ class PipelineDaemon:
                 "route": result.get("download_route"),
                 "_trace": trace,
             }
-        else:
-            failure_category = ref.get("download_failure_category") or "download_failed"
-            failure_detail = ref.get("download_failure_detail") or ref.get("download_reason") or "download_failed"
-            with self.db_lock:
-                self.db.mark_download_failed(qid, failure_category)
-            return "failed", {
-                "queue_id": qid,
-                "action": "failed",
-                "failure_category": failure_category,
-                "failure_detail": failure_detail,
-                "attempted_sources": attempted_sources,
-                "_trace": trace,
-            }
+        failure_category = ref.get("download_failure_category") or "download_failed"
+        failure_detail = ref.get("download_failure_detail") or ref.get("download_reason") or "download_failed"
+        with self.db_lock:
+            _, fail_error = self.db.mark_download_failed(qid, failure_category, claimed_by=self.worker_id)
+        if fail_error == CLAIM_LOST:
+            return self._download_claim_lost(qid)
+        return "failed", {
+            "queue_id": qid,
+            "action": "failed",
+            "failure_category": failure_category,
+            "failure_detail": failure_detail,
+            "attempted_sources": attempted_sources,
+            "_trace": trace,
+        }
 
     # --- DOWNLOAD LOGIC ---
     def do_download(self, corpus_id: int, limit: int):
@@ -1292,7 +1334,7 @@ class PipelineDaemon:
         if effective_limit != limit:
             log(f"Clamped download job batch from {limit} to {effective_limit} (RAG_FEEDER_DOWNLOAD_JOB_MAX={per_job_max})")
 
-        rows = self.db.claim_download_batch(limit=effective_limit, corpus_id=corpus_id, claimed_by=self.worker_id, lease_seconds=900)
+        rows = self.db.claim_download_batch(limit=effective_limit, corpus_id=corpus_id, claimed_by=self.worker_id, lease_seconds=self._claim_lease_seconds())
         if not rows:
             return {"processed": 0, "downloaded": 0, "failed": 0, "skipped": 0, "results": []}
 

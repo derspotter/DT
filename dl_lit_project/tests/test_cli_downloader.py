@@ -11,9 +11,20 @@ def mock_db_manager(mocker):
     """Mocks the DatabaseManager class and its instance methods."""
     mock_db_class = mocker.patch('dl_lit.cli.DatabaseManager', autospec=True)
     instance = mock_db_class.return_value
-    instance.fetch_download_queue.return_value = []  # Default to empty
-    instance.check_if_exists.return_value = (None, None, None)
+    instance.claim_download_batch.return_value = []  # Default to empty
+    instance.find_downloaded_duplicate.return_value = (None, None, None)
+    instance.move_entry_to_downloaded.return_value = (1, None)
+    instance.mark_download_failed.return_value = (1, None)
     return instance
+
+
+def _queue(db, *rows):
+    """claim_download_batch hands out one row per call, then nothing."""
+    db.claim_download_batch.side_effect = [[row] for row in rows] + [[]]
+
+
+def _cli_id(db):
+    return db.claim_download_batch.call_args.kwargs["claimed_by"]
 
 @pytest.fixture
 def mock_enhancer(mocker):
@@ -42,7 +53,9 @@ def test_download_pdfs_empty_queue(mock_db_manager, tmp_path):
 
     assert result.exit_code == 0
     assert "Queue is empty." in result.output
-    mock_db_manager.fetch_download_queue.assert_called_once()
+    mock_db_manager.claim_download_batch.assert_called_once()
+    assert mock_db_manager.claim_download_batch.call_args.kwargs["limit"] == 1
+    mock_db_manager.release_download_claims.assert_called_once_with(_cli_id(mock_db_manager))
     mock_db_manager.close_connection.assert_called_once()
 
 def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hashlib, tmp_path):
@@ -58,7 +71,7 @@ def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hash
         'doi': '10.1000/test',
         'entry_type': 'article'
     }
-    mock_db_manager.fetch_download_queue.return_value = [mock_entry]
+    _queue(mock_db_manager, mock_entry)
 
     enhancer_result = {
         'downloaded_file': str(pdf_file),
@@ -86,14 +99,15 @@ def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hash
     mock_hashlib.file_digest.assert_called_once()
     assert mock_hashlib.file_digest.call_args.args[1] == 'sha256'
     mock_db_manager.move_entry_to_downloaded.assert_called_once_with(
-        1, enhancer_result, str(pdf_file), 'fake_checksum', 'mock_source'
+        1, enhancer_result, str(pdf_file), 'fake_checksum', 'mock_source',
+        claimed_by=_cli_id(mock_db_manager), part_path=None,
     )
 
 def test_download_pdfs_failure(mock_db_manager, mock_enhancer, tmp_path):
     """Test the workflow for a failed download."""
     # 1. Setup Mocks
     mock_entry = {'id': 2, 'title': 'Another Paper'}
-    mock_db_manager.fetch_download_queue.return_value = [mock_entry]
+    _queue(mock_db_manager, mock_entry)
     mock_enhancer.enhance_bibliography.return_value = None  # Simulate failure
 
     # 2. Run Command
@@ -109,4 +123,4 @@ def test_download_pdfs_failure(mock_db_manager, mock_enhancer, tmp_path):
     assert "✗ download failed" in result.output
     assert "Worker finished: 0 downloaded, 1 failed." in result.output
 
-    mock_db_manager.mark_download_failed.assert_called_once_with(2, 'download_failed')
+    mock_db_manager.mark_download_failed.assert_called_once_with(2, 'download_failed', claimed_by=_cli_id(mock_db_manager))
