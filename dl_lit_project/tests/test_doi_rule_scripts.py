@@ -356,3 +356,19 @@ def test_export_writers_never_overwrite_an_existing_file(tmp_path, export_bundle
     with pytest.raises(FileExistsError):
         export_bundle.write_bundle_zip([], existing)
     assert existing.read_text(encoding="utf-8") == "other corpus"
+
+
+def test_export_render_failure_leaves_no_file(tmp_path, monkeypatch, export_bundle):
+    json_path = tmp_path / "out.json"
+    with pytest.raises(TypeError):
+        export_bundle.write_json_export([{"id": 1, "title": "T", "bad": object()}], json_path)
+    assert not json_path.exists()
+
+    def boom(_item):
+        raise RuntimeError("render failed")
+
+    monkeypatch.setattr(export_bundle, "to_bibtex_entry", boom)
+    bib_path = tmp_path / "out.bib"
+    with pytest.raises(RuntimeError):
+        export_bundle.write_bibtex_export([{"id": 1, "title": "T"}], bib_path)
+    assert not bib_path.exists()

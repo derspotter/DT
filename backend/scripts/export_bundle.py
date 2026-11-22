@@ -212,9 +212,9 @@ def render_json_payload(items):
 
 
 def write_json_export(items, out_path: Path):
-    payload = render_json_payload(items)
+    text = json.dumps(render_json_payload(items), ensure_ascii=False, indent=2)  # render before creating the file
     with out_path.open("x", encoding="utf-8") as fh:  # never overwrite another export
-        fh.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        fh.write(text)
     return {"exported_count": len(items)}
 
 
@@ -224,8 +224,9 @@ def render_bibtex_text(items):
 
 
 def write_bibtex_export(items, out_path: Path):
+    text = render_bibtex_text(items)  # render before creating the file
     with out_path.open("x", encoding="utf-8") as fh:  # never overwrite another export
-        fh.write(render_bibtex_text(items))
+        fh.write(text)
     return {"exported_count": len([item for item in items if item.get("title")])}
 
 
