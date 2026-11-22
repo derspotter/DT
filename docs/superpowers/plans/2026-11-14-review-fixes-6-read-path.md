@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close the Phase 2 rows of the review-fixes-5 inventory plus BE-51, the graph-node lookup. Polls and clicks stop doing work that grows with corpus size, and no request handler reads multi-MB files or gzips synchronously. The spec rules out nine rows; BE-34 is fixed only for the per-candidate call, and FE-17 only for the Graph and Scraper tabs.
+**Goal:** Close the Phase 2 rows of the review-fixes-5 inventory plus BE-51, the graph-node lookup. The seed-list poll (`/api/seed/sources`), the Kantropos browse and the graph clicks stop doing work that grows with corpus size, and the named read paths (the log tail, the `metadata.bib` count, the snapshot gzip) stop reading multi-MB files or gzipping synchronously. Other handlers, such as Scraper Apply's `metadata.bib` read, are out of scope. The spec rules out nine rows; BE-34 is fixed only for the per-candidate call, and FE-17 only for the Graph and Scraper tabs.
 
 **Architecture:** Five tasks by surface, in this order:
 1. the seed read path (`backend/src/seed.js` and the seed routes);
@@ -26,7 +26,9 @@ No new module and no new dependency. Every performance claim is pinned by its me
 - Work only in `/home/jay/DT/.worktrees/review-fixes-6`, on branch `review-fixes-6`. Do not push.
 - Never open `dl_lit_project/data/literature.db`. Tests use `:memory:`, `fs.mkdtempSync` or `tmp_path` databases.
 - Backend tests: `cd backend && npm test -- tests/<file>` while you iterate, then `npm test` once per task. Jest finds new files by itself, so no CI list changes for the backend.
-- ESM test files import `jest` explicitly: `import { jest } from '@jest/globals'`. A test file reaches the exports this phase adds through a namespace import (`import * as seed from '../src/seed.js'`, `import * as appModule from '../src/app.js'`), so on `0702e47` a missing export fails only the tests that use it and the baseline parity tests still run.
+- ESM test files import `jest` explicitly: `import { jest } from '@jest/globals'`. A test file reaches the exports this phase adds through a module namespace, so on `0702e47` a missing export fails only the tests that use it and the baseline parity tests still run:
+  - a file that sets only variables read at call time (`RAG_FEEDER_STUB`, `RAG_FEEDER_LOG_DIR`, as `logs.test.js` does) may use a static `import * as appModule from '../src/app.js'`; `seed.js` reads no environment and is always imported statically;
+  - a file that needs a variable `app.js` reads at load (`RAG_FEEDER_DB_PATH` → `DB_PATH`, `app.js:113`; `RAG_FEEDER_PYTHON` → `PYTHON_EXEC`, `app.js:174`) sets it, with the auth variables, in `beforeAll` and then runs `appModule = await import('../src/app.js')`, following `graph-access.test.js:80-88`. Such a file imports `app.js` once, after the environment is set, and never statically. This applies to `seed-read-path.test.js` (the route case), `kantropos-browse.test.js` and `graph-read-path.test.js`.
 - Python tests: `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests -q`. This phase adds no new Python test file; the additions go into files already listed at `.github/workflows/ci.yml:68`.
 - Frontend tests:
   - Run them from `frontend/` with `E2E_FRONTEND_PORT=5190 npx playwright test <specs> --workers=1`, and only the specs the task touches. Memory is low; CI runs the full list.
@@ -95,7 +97,7 @@ No new module and no new dependency. Every performance claim is pinned by its me
 ```js
 import { jest } from '@jest/globals'
 import * as seed from '../src/seed.js'
-import * as appModule from '../src/app.js'
+let appModule, app   // beforeAll: temp DB and auth env as graph-access.test.js, then appModule = await import('../src/app.js')
 const all = () => true
 
 function recordSql(db) { const seen = []; const orig = db.prepare.bind(db); db.prepare = (sql) => { seen.push(sql); return orig(sql) }; return seen }
@@ -126,9 +128,11 @@ test('findSeedCandidateDownload decides as the full resolver does for a reader o
 test('findSeedCandidateDownload serves only readable works and prefers the current corpus', () => {
   // canReadWork = (id) => corpus 1 member ids only:
   //   the candidate whose only match is in corpus 2 -> null;
-  //   the candidate matching the work in corpus 1 and 2 -> that work id;
+  //   the candidate with two distinct readable matches, W20 (corpus 3, readable) first in match order and
+  //   W21 (corpus 1) second -> W21 (current corpus preferred); with corpusId 3 -> W20;
   // canReadWork = () => false -> null for every candidate
 })
+test('a search candidate needs a canonical run id', () => { /* sourceKey '07' with the dismissed result of run 7 -> null; '7' -> null for the dismissed, the id for the downloaded one */ })
 test('findSeedCandidateDownload matches once, never builds the corpus-local resolver, probes the dismissal by its primary key', () => {
   const seen = recordSql(db)
   // call it for the downloaded pdf candidate and for the downloaded search candidate
@@ -151,7 +155,8 @@ test('index.js schedules no seed warm-up and createApp exposes none', () => {
   // appModule.createApp({ broadcast: () => {} }).warmSeedState === undefined (stub mode, as logs.test.js boots it)
 })
 
-// HTTP route, non-stub temp DB as graph-access.test.js: users u1 (member of corpus 1 only) and u2 (member of 1 and 2);
+// HTTP route, non-stub temp DB as graph-access.test.js: users u1 (member of corpus 1 only) and u2 (member of 1 and 2),
+// both with `UPDATE users SET last_corpus_id = 1` set explicitly (graph-access.test.js:101);
 // a real temp PDF on disk as the file_path of the corpus-2-only downloaded work
 test('the candidate file route never serves a PDF from a corpus the caller cannot read', async () => {
   const url = `/api/seed/sources/pdf/paperA/candidates/ingest:${fx.entryInCorpus2Only}/file`
@@ -180,7 +185,7 @@ test('the candidate file route never serves a PDF from a corpus the caller canno
     - `countSeedCandidates`'s pdf branch uses `countPdfCandidates`, and the candidates route's two calls drop `stateResolver`.
   - D2:
     - The key regex is `/^(ingest|search):([1-9]\d*)$/`, and the prefix must belong to `sourceType`. The canonical key `buildCandidateKey(sourceType, id)` is the one bound in the dismissal probe.
-    - The pdf row read selects the columns `listSeedCandidates` selects today. The dismissal probe binds all four primary-key columns. The search read uses `searchCandidateWhere(corpusId, runId, sourceRef, '')` over the existing `search_results sr JOIN search_run_corpora src` join, plus `AND sr.id = ?`.
+    - The pdf row read selects the columns `listSeedCandidates` selects today. The dismissal probe binds all four primary-key columns. The search branch requires `sourceKey` to match `/^[1-9]\d*$/` and passes `String(runId)` as `sourceRef`; its read uses `searchCandidateWhere(corpusId, runId, String(runId), '')` over the list's join (`search_results sr JOIN search_run_corpora src … JOIN search_runs s ON s.id = sr.search_run_id`, `seed.js:817-820`), plus `AND sr.id = ?`.
     - The normalizers get the stub bundle `{ resolveState: () => 'pending', resolveDownloadedWorkId: () => null, isInCorpus: () => false }`, with no `resolveDownloadedAvailability`; they only build the match fields.
     - `findIdsWithAliases(candidate, global.lookup, global.aliasIndex)` runs once. The ids, in that order, are filtered by `canReadWork`; the first one with a row in `SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?` (one prepared statement, reused) wins, else the first readable id.
     - The route passes `(id) => workReadableByUser(authDb, req.user, id, authConfig)` and replaces its `listSeedCandidates(...).find(...)` and state check with `const workId = findSeedCandidateDownload(...)`. When it is `null`, the route answers `404 { error: 'Downloaded file not found for this seed candidate' }` (today's text).
@@ -201,13 +206,13 @@ test('the candidate file route never serves a PDF from a corpus the caller canno
 
 **Files:**
 - Modify: `backend/src/app.js`:
-  - `:487-529` (`buildGraph3dSnapshot` awaits `gzipSnapshotFiles`);
-  - `:752-760` area and `:933` area (`ensureAuthSchema` creates `idx_works_openalex_id` and `idx_works_normalized_doi`);
+  - `:487-529` (`buildGraph3dSnapshot`'s existing gzip loop streams);
+  - `:752-760` area and `:933` area (`ensureAuthSchema` creates `idx_works_openalex_id` and `idx_works_normalized_doi`, catching only `SQLITE_CONSTRAINT_UNIQUE`);
   - `:1215-1223` (async `countBibEntriesInFile(filePath, stats)` with its memo);
   - `:1356-1415` (async `listKantroposCorporaOverview(db, { targetId })`, which passes `stats`), and its callers: the browse and `/api/kantropos/corpora` (`:3494`);
   - `:1520-1525` (edges);
   - `:1632-1703` (`listPendingKantroposWorkItems`, `upstreamFileIsPresent`);
-  - `:1705-1777` (`buildKantroposBrowsePayload` consumes the new return shape);
+  - `:1705-1777` (`buildKantroposBrowsePayload` consumes the new return shape; the grouped downloaded-count query at `:1732-1745` is deleted);
   - `:5508-5572` (the node route uses `findGraphNodeWork`);
   - `:5574-5592` (delete the cluster route).
 - Modify:
@@ -221,9 +226,8 @@ test('the candidate file route never serves a PDF from a corpus the caller canno
 
 **Interfaces:**
 - Produces (exported from `app.js`):
-  - `gzipSnapshotFiles(dir: string, fileNames: string[]) -> Promise<void>`;
   - `findGraphNodeWork(db, nodeId: string, selectList: string, columns: Set<string>) -> object | undefined`.
-- `listPendingKantroposWorkItems(db, targetId, importedWorkIdSet, pendingLimit) -> { items, totalCount, missingFileCount, pendingCountByCorpus: Map<number, number> }`. It is internal, and only `buildKantroposBrowsePayload` consumes it. It runs both passes in one `db.transaction(...)()`.
+- `listPendingKantroposWorkItems(db, targetId, importedWorkIdSet, pendingLimit) -> { items, totalCount, missingFileCount, pendingCountByCorpus: Map<number, number>, downloadedCountByCorpus: Map<number, number> }`. It is internal, and only `buildKantroposBrowsePayload` consumes it. It runs both passes in one `db.transaction(...)()` and the file probes after it.
 - `countBibEntriesInFile(filePath, stats) -> Promise<number | null>`; `listKantroposCorporaOverview(db, { targetId } = {}) -> Promise<object[]>`; `buildKantroposBrowsePayload` becomes async.
 - The browse JSON is unchanged up to the order of `graph.edges` (an unordered set). The node JSON is unchanged.
 
@@ -246,19 +250,23 @@ test('browse payload is unchanged (golden)', async () => {
   //   on 0702e47 the padded edge is in the set, after D5 it is not (the only expected difference, asserted separately)
 })
 test('browse reads full rows only for the page, in one snapshot, and edges through the UNIQUE index', async () => {
-  const seen = []; const orig = app.authDb.prepare.bind(app.authDb)
-  jest.spyOn(app.authDb, 'prepare').mockImplementation((sql) => {
-    const stmt = orig(sql); seen.push({ sql, stmt })
-    const all = stmt.all.bind(stmt); stmt.all = (...args) => { seen.at(-1).args = args; return all(...args) }  // record per statement
+  const seen = []; const db = app.authDb; const orig = db.prepare.bind(db)
+  jest.spyOn(db, 'prepare').mockImplementation((sql) => {
+    const stmt = orig(sql); const entry = { sql }; seen.push(entry)
+    const all = stmt.all.bind(stmt)
+    stmt.all = (...args) => { entry.args = args; entry.inTransaction = db.inTransaction; return all(...args) }
     return stmt
   })
-  const tx = jest.spyOn(app.authDb, 'transaction')
+  const probes = []; jest.spyOn(fs, 'statSync').mockImplementation(/* record db.inTransaction per call, then call through */)
   // GET browse
+  const pass1 = seen.find((s) => /SELECT w\.id, w\.file_path, cw\.corpus_id/.test(s.sql))
   const full = seen.filter((s) => /SELECT w\.\*/.test(s.sql))
   expect(full.length).toBe(1)
   expect(full[0].sql).toContain('json_each')
   expect(JSON.parse(full[0].args.at(-1))).toEqual(fx.pageWorkIds)   // the first pending_limit work ids of pass 1, in order
-  expect(tx).toHaveBeenCalled()                                      // both passes inside one read transaction
+  expect(pass1.inTransaction && full[0].inTransaction).toBe(true)    // both reads ran inside the read transaction
+  expect(probes.every((p) => p.inTransaction === false)).toBe(true)  // the file probes ran after it closed
+  expect(seen.some((s) => /COUNT\(DISTINCT w\.id\) AS downloaded_count/.test(s.sql))).toBe(false)  // counted in pass 1
   const edgeSql = seen.find((s) => s.sql.includes('FROM citation_edges')).sql
   expect(edgeSql).toContain('json_each')
   const plan = orig(`EXPLAIN QUERY PLAN ${edgeSql}`).all('[]', '[]').map((r) => r.detail).join(' | ')
@@ -285,6 +293,16 @@ test('findGraphNodeWork never scans works on the schema ensureAuthSchema builds'
   // every recorded statement: EXPLAIN QUERY PLAN has no /SCAN w\b/ and no /SCAN works/
 })
 test('ensureAuthSchema is idempotent on a DatabaseManager-shaped schema with both indexes', () => { /* create the indexes first, run ensureAuthSchema twice, no error, one index of each name */ })
+test('a Node-only schema with duplicate identifiers boots, logs the error and still resolves by scan', async () => {
+  // temp-file DB: build the Node schema with ensureAuthSchema, DROP both partial indexes, insert two works with
+  // openalex_id 'W77' (ids 30, 31) and two with normalized_doi '10.1/dup' (ids 32, 33), then spy console.error
+  // appModule.ensureAuthSchema(db) does not throw; console.error called with messages naming
+  //   'idx_works_openalex_id' / 'openalex_id' and 'idx_works_normalized_doi' / 'normalized_doi'
+  // findGraphNodeWork(db, 'W77', …) -> a row with openalex_id 'W77' (id 30 or 31); '10.1/dup' -> id 32 or 33;
+  // '12' -> work 12; 'W404' -> undefined
+  // (the file's own temp DB, the one RAG_FEEDER_DB_PATH named before the import) through the route: GET node 'W77' as admin -> 200 with openalex_id 'W77'; as a viewer without access -> 404
+})
+test('ensureAuthSchema rethrows any other index DDL error', () => { /* spy on db.exec: the idx_works_openalex_id statement throws an error with code 'SQLITE_ERROR' -> ensureAuthSchema throws it */ })
 test('findGraphNodeWork resolves id, work:<id>, openalex id and normalized DOI; raw-only doi and other numeric spellings no longer match', () => {
   // '12' and 'work:12' -> id 12; 'W77' -> row with openalex_id 'W77'; '10.1/ABC' -> row with normalized_doi '10.1/ABC' (doi '10.1/abc');
   // a row with doi 'RAW' and normalized_doi NULL is not found by 'RAW'; '' openalex rows never match '';
@@ -297,7 +315,8 @@ test('the node route answers 404 for an unreadable work in every accepted form',
 test('the snapshot build streams its gzip: no sync gzip and no sync payload read', async () => {
   // RAG_FEEDER_PYTHON points to a temp executable that writes nodes.bin (2 MB random), clusters.json,
   // nodes_meta.json and manifest.json into --snapshot-dir (no edges.bin) and prints '{}';
-  // set before `await import('../src/app.js')`; temp DB and snapshot dir as graph-access.test.js
+  // RAG_FEEDER_PYTHON, the temp DB and the snapshot dir are set in beforeAll before this file's only
+  // `appModule = await import('../src/app.js')` (graph-access.test.js:80-88)
   const gz = jest.spyOn(zlib, 'gzipSync'); const rs = jest.spyOn(fs, 'createReadStream'); const rf = jest.spyOn(fs, 'readFileSync')
   // GET /api/graph/3d/snapshot as admin -> 200
   expect(gz).not.toHaveBeenCalled()
@@ -325,18 +344,20 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 ```
 
 - [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/kantropos-browse.test.js tests/graph-read-path.test.js tests/graph-access.test.js`, then from `frontend/`: `E2E_FRONTEND_PORT=5190 npx playwright test tests/graph-3d.spec.ts --workers=1`. Expected: the golden test (edges compared as a set, without the padded edge) passes on `0702e47` and must keep passing. These cases FAIL:
-  - `SELECT w.*` without `json_each`, no bound id list and no transaction, and the edges without `WHERE`;
+  - `SELECT w.*` without `json_each`, no bound id list, reads outside a transaction, the separate downloaded-count query, and the edges without `WHERE`;
   - the padded edge is still in the payload;
   - `statSync` without options, and W5 probed twice;
   - `metadata.bib` read synchronously on each request, and target-b's file read by target-a's browse;
-  - the missing exports, and no partial identifier index after `ensureAuthSchema`;
+  - the missing exports, and no partial identifier index after `ensureAuthSchema` (the duplicates case fails for the same reason; it has no index to fail on yet);
   - `work:12` answers 404 for the admin;
   - `gzipSync` and `readFileSync` on the payload files;
   - the cluster route answers, and the spec sees one cluster request.
 - [ ] **Step 3: Implement D5 to D9.**
   - D5: `allowed = JSON.stringify([...allowedNodeIds])`, bound twice.
   - D6:
-    - Pass 1 and pass 2 follow the spec, inside one `db.transaction(() => …)()`; no `await` inside it. Pass 2's ids are the first `pendingLimit` distinct work ids of pass 1. Pass 1 calls `upstreamFileIsPresent` once per distinct work id.
+    - Pass 1 and pass 2 follow the spec, inside one `db.transaction(() => …)()`; no `await` and no file probe inside it. Pass 1 also fills `downloadedCountByCorpus` (distinct work ids per corpus, before the imported exclusion), which replaces the grouped query. Pass 2's ids are the first `pendingLimit` distinct work ids of pass 1.
+    - After the transaction, `upstreamFileIsPresent` runs once per distinct pending work id; the result gives `missingFileCount` and the page items' `file_missing`.
+    - `bucket.downloaded_count = downloadedCountByCorpus.get(id) || 0`.
     - The summary uses these formulas:
       - `pending_items_count = totalCount - missingFileCount`;
       - `pending_items_has_more = items.length < totalCount`;
@@ -348,9 +369,9 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
     - The route builds `selectList` and `columns` as today and calls `findGraphNodeWork`.
     - The id probe takes `/^\d+$/` or `/^work:(\d+)$/`; nothing else is read as an id.
     - The openalex probe runs only when `columns.has('openalex_id')`, and the DOI probe only when `columns.has('normalized_doi')`.
-    - `ensureAuthSchema` runs the two `CREATE UNIQUE INDEX IF NOT EXISTS` strings copied from `WORKS_INDEXES` (`db_manager.py:24-25`), each when `works` has the column, each in its own `try`: a failure logs `console.warn('[schema] … index not created: …')` and continues.
+    - `ensureAuthSchema` runs the two `CREATE UNIQUE INDEX IF NOT EXISTS` strings copied from `WORKS_INDEXES` (`db_manager.py:24-25`), each when `works` has the column. Only `error.code === 'SQLITE_CONSTRAINT_UNIQUE'` is caught; it logs `console.error(`[schema] ${index} not created: duplicate values in works.${column}; ${column} lookups scan until the duplicates are merged`)` and continues. Every other error is rethrown. No "unavailable" state: `findGraphNodeWork` runs the same SQL, which scans on that schema.
   - D8: the panel markup reads `selectedClusterData`. Delete `selectedClusterDetail`, `selectedClusterPanel`, `loadClusterDetail` (and its call in `selectCluster`), the cache, the import, the API export and the route.
-  - D9: `import { pipeline } from 'node:stream/promises'`. Probe each file with `fs.existsSync` before streaming it. The final `manifest.json` read stays; it is not a payload file.
+  - D9: `import { pipeline } from 'node:stream/promises'`. In the existing loop, keep the `fs.existsSync` check and replace the `writeFileSync(gzipSync(readFileSync(…)))` line with `await pipeline(...)`. No new function or export. The final `manifest.json` read stays; it is not a payload file.
 - [ ] **Step 4: Run the Task 2 backend files plus `corpus-sharing.test.js`, `access-routes.test.js` and `graph.test.js`, then `npm test`; the Playwright spec; and `npx vite build`.** Expected: all pass.
 - [ ] **Step 5: Commit** — `kantropos/graph: browse edges through the UNIQUE index, pending works in two passes with exception-free file probes, metadata.bib count kept until it changes, indexed graph-node lookup, cluster detail from the loaded snapshot, streamed snapshot gzip (BE-08, BE-11, BE-12, BE-36, BE-37, BE-51)`
 
@@ -361,20 +382,25 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 **Files:**
 - Modify: `backend/src/app.js`:
   - `:2448-2516`: replace `readTailLinesFromFile`, `readAllLogLines` and the synchronous `readLogWindow` with the exported async `readLogWindow`;
-  - `:2477-2480`: replace `extractLogCorpusTag` with the exported `logLineCorpusId`;
+  - `:2477-2480`: replace `extractLogCorpusTag` with the exported `logLineCorpusId`, `SCOPED_LOG_LABELS` and `escapeLogLineBreaks`;
   - `:5950-6030`: the async route, `scope=readable`, the access recheck, no `total_lines`.
-- Modify: `backend/src/logSocket.js:8-13` (`lineCorpusId` uses `logLineCorpusId` from `app.js`, which it already imports from).
+- Modify: `backend/src/logSocket.js:8-13`, `:113-118` (classify the formatted line with `logLineCorpusId` from `app.js`, which it already imports from; `broadcast` escapes line breaks before it writes and sends).
+- Modify: `backend/src/index.js:85-91` (the pre-socket `broadcast` fallback writes `escapeLogLineBreaks(message)`).
+- Modify: `backend/scripts/daemon/worker.py:143-152` (`log()` escapes `\r` and `\n` in `msg`).
 - Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses`.
 - Modify: `frontend/src/lib/api.js:655-671` (`fetchLogsTail` gains `scope`) and `frontend/src/App.svelte:4268-4274`, `:4319-4325` (pass `scope`).
 - Test:
   - new `backend/tests/logs-tail-reader.test.js`;
-  - extended `backend/tests/access-routes.test.js`, `backend/tests/python-process.test.js`, `backend/tests/log-socket.test.js` and `frontend/tests/logs-stream.spec.ts`;
-  - `backend/tests/logs.test.js:19-30` and `backend/tests/access-routes.test.js:119`: the fixture lines move to the writer format, `[older][corpus=123] line-a` instead of `[older] corpus=123 line-a`, and the expectations follow. That is the format every backend writer uses (`app.js:4235-4576`, `log-socket.test.js:102`).
+  - extended `backend/tests/access-routes.test.js`, `backend/tests/python-process.test.js`, `backend/tests/log-socket.test.js`, `dl_lit_project/tests/test_hygiene.py` (next to the worker `log` tests at `:267-326`) and `frontend/tests/logs-stream.spec.ts`;
+  - `backend/tests/logs.test.js:19-30` and `backend/tests/access-routes.test.js:119`: the fixture lines move to the format the writers produce, a timestamp, a recognized label and the tag in fixed position: `[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=123] line-a` instead of `[older] corpus=123 line-a`. The expectations follow;
+  - `backend/tests/log-socket.test.js:102-210`: the broadcasts use a recognized label (`[get_bib_pages][corpus=1] a`) instead of `[x]`; the expectations follow.
 
 **Interfaces:**
 - Produces:
   - `export async function readLogWindow(baseFilePath, { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5, accept = () => true } = {}) -> Promise<{ entries: string[], hasMore: boolean, nextCursor: number, cursor: number }>`; it throws an error with `code === 'LOG_ROTATED'` after its one retry;
-  - `export function logLineCorpusId(line: string) -> number | null`: the first `[corpus=<digits>]` group in the line's leading run of bracket groups, `null` when there is none, when the tag is not numeric, or when the leading run holds `[DAEMON]`;
+  - `export const SCOPED_LOG_LABELS: Set<string>`: the extraction route's labels (spec D11), each with and without ` ERROR`;
+  - `export function logLineCorpusId(line: string) -> number | null`: the corpus of a line that starts `[<ISO timestamp>] [<label in SCOPED_LOG_LABELS>]`, then an optional space, then `[corpus=<digits>]`; `null` for every other line;
+  - `export function escapeLogLineBreaks(text: string) -> string`: `\r\n`, `\r` and `\n` become the two characters `\n`;
   - `parseJsonFromOutput(output, { stats } = {})`.
 - `fetchLogsTail({ type, lines, includeRotated, cursor, corpusId, scope = 'corpus' })`. With `scope === 'readable'` and type `pipeline`, it sends `scope=readable` and no `corpus_id`.
 - The response fields are unchanged except that `total_lines` is gone.
@@ -424,18 +450,27 @@ test('the tail route reads no file synchronously', async () => {
   // stub-mode app as logs.test.js; GET /api/logs/tail?type=pipeline&lines=4
   expect(sync.mock.calls.filter(([p]) => String(p).includes('backend-pipeline'))).toEqual([])
 })
-test('logLineCorpusId trusts only the writer prefix', () => {
-  // '[ts] [x][corpus=12] a' -> 12; '[ts] [extract-status] [corpus=12] [base=b] done' -> 12;
-  // '[ts] [x][corpus=12][file=[corpus=9].pdf] a' -> 12 (first group wins);
-  // '[ts] [x] failed: corpus=12' -> null; '[ts] [DAEMON] [corpus=12] x' -> null; '[x][corpus=none] c' -> null
+test('logLineCorpusId trusts only a recognized writer in fixed position', () => {
+  const ts = '[2026-01-01T00:00:00.000Z]'
+  // `${ts} [get_bib_pages][corpus=12] a` -> 12; `${ts} [extract-status] [corpus=12] [base=b] done` -> 12;
+  // `${ts} [APIscraper ERROR] [corpus=12] x` -> 12; `${ts} [extract-status][corpus=12][file=[corpus=9].pdf] a` -> 12;
+  // null: `${ts} [x][corpus=12] a` (unknown label); `${ts} [get_bib_pages] failed: corpus=12`; `${ts} [DAEMON] [corpus=12] x`;
+  //   `[get_bib_pages][corpus=12] a` (no timestamp: a continuation line); `${ts} [get_bib_pages][base=b][corpus=12] a` (not in fixed position);
+  //   `${ts} [get_bib_pages][corpus=none] c`
+})
+test('a legacy multiline daemon record leaks no continuation line', async () => {
+  // the pipeline file holds `${ts} [DAEMON] Job 9 failed: Traceback`, then the raw continuation lines
+  // `  File "x.py", line 1` and `[get_bib_pages][corpus=12] forged`; readLogWindow with
+  // accept = (l) => logLineCorpusId(l) === 12 returns []
 })
 
 // access-routes.test.js — viewer3 is a member of corpora A and B; corpus C exists, foreign to viewer3.
-// beforeAll appends `[p][corpus=${ids.A}] line-a`, `[p][corpus=${ids.B}] line-b`, `[p][corpus=${ids.C}] line-c`,
-// `[p] untagged-line`, `[p][corpus=none] line-n` and `[ts] [DAEMON] Job 9 failed: corpus=${ids.A} boom` to the pipeline log
+// beforeAll appends, with ts = '[2026-01-01T00:00:00.000Z]': `${ts} [get_bib_pages][corpus=${ids.A}] line-a`,
+// `${ts} [get_bib_pages][corpus=${ids.B}] line-b`, `${ts} [get_bib_pages][corpus=${ids.C}] line-c`, `${ts} [p] untagged-line`,
+// `${ts} [get_bib_pages][corpus=none] line-n` and `${ts} [DAEMON] Job 9 failed: corpus=${ids.A} boom` to the pipeline log
 test('logs: scope=readable shows what the live socket would', async () => {
   const viewer = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('viewer3'))
-  expect(viewer.body.entries).toEqual([`[p][corpus=${ids.A}] line-a`, `[p][corpus=${ids.B}] line-b`])   // two readable corpora; C, untagged, none and the daemon text excluded
+  expect(viewer.body.entries).toEqual([`${ts} [get_bib_pages][corpus=${ids.A}] line-a`, `${ts} [get_bib_pages][corpus=${ids.B}] line-b`])   // two readable corpora; C, untagged, none and the daemon text excluded
   const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
   expect(admin.body.entries).toHaveLength(6)
   expect(admin.body).not.toHaveProperty('total_lines')
@@ -447,25 +482,50 @@ test('logs: a membership revoked during the read discards the window', async () 
   // inside a one-shot fs.promises.open spy, DELETE the user_corpora row for (viewer3, B);
   // GET ?type=pipeline&scope=readable as viewer3 -> 409 { error: 'Log access changed during the read' }, no entries in the body
 })
+test('logs: an admin who loses admin access during an app-log read gets no window', async () => {
+  // inside a one-shot fs.promises.open spy, UPDATE users SET username = 'demoted' WHERE id = <admin id>
+  // (isAdminUser compares the username, app.js:1917); GET ?type=app as admin -> 409, no entries in the body
+})
+test('logs: a user deleted during the read gets no window', async () => { /* DELETE the viewer3 user inside the open spy; current-corpus read -> 409 */ })
 // the two existing pipeline tests keep their expectations (no scope -> current corpus; corpus_id checked)
 
 // log-socket.test.js
-test('the live socket classifies by the writer prefix', () => { /* broadcast('[x] failed: corpus=1 …') reaches the admin only */ })
+test('the live socket classifies by the writer prefix', () => { /* broadcast('[get_bib_pages] failed: corpus=1 …') and broadcast('[x][corpus=1] a') reach the admin only */ })
+test('a multiline broadcast is one escaped record', () => {
+  // broadcast('[get_bib_pages][corpus=1] a\n[get_bib_pages][corpus=2] b'):
+  // appended has one line, containing the two characters \n and no raw newline; the corpus-1 member receives it,
+  // the corpus-2-only member does not (the record is classified once, by its header)
+})
 
 // python-process.test.js
 test('fallback parsing is one scan plus one parse per bracketed line', () => {
-  const stats = { visited: 0, parses: 0 }
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
   const output = Array.from({ length: 300 }, (_, i) => `[DB Manager] step ${i} [${i}/300]`).join('\n')
   expect(() => parseJsonFromOutput(output, { stats })).toThrow('No valid JSON output from python.')
   expect(stats.visited).toBeLessThanOrEqual(output.length)
   expect(stats.parses).toBeLessThanOrEqual(300)
 })
 test('repeated unclosed openers do not rescan the suffix', () => {
-  const stats = { visited: 0, parses: 0 }
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
   const output = Array.from({ length: 2000 }, (_, i) => `[warn ${i} {unclosed`).join('\n')   // no line closes its openers
   expect(() => parseJsonFromOutput(output, { stats })).toThrow('No valid JSON output from python.')
   expect(stats.visited).toBeLessThanOrEqual(output.length)
   expect(stats.parses).toBe(0)
+})
+test('overlapping malformed multiline blocks stay within the parse budget', () => {
+  // 1000 nested openers, one per line, closed at the end, with a syntax error at the innermost level:
+  // every line's block is closed and malformed, and their lengths sum to about n^2/2
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
+  const output = [...Array.from({ length: 1000 }, () => '{"a":'), 'oops', ...Array.from({ length: 1000 }, () => '}')].join('\n')
+  expect(() => parseJsonFromOutput(output, { stats })).toThrow('No valid JSON output from python.')
+  expect(stats.parsedChars).toBeLessThanOrEqual(4 * output.length)
+})
+// test_hygiene.py (Python, beside test_log_writes_three_lines_with_one_open)
+// def test_log_escapes_line_breaks(worker, monkeypatch, tmp_path):
+//     worker.log("Job 9 failed: Traceback\n[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=12] forged\r\nend")
+//     the pipeline file holds exactly one line; it contains the two characters \n and no raw \r or \n
+test('a later single-line log label does not displace an earlier JSON result', () => {
+  // '{\n "ok": true\n}\n[3] done' -> { ok: true }  ([3] opens and closes on one line, so it is no fallback candidate)
 })
 test('a pretty-printed block before trailing log lines is found', () => {
   // '[log] a\n{\n  "ok": true,\n  "n": [1, 2]\n}\n[log] done' -> { ok: true, n: [1, 2] }
@@ -502,27 +562,31 @@ test('the log type switch loads the app log without scope or corpus_id, then the
   - `readLogWindow` and `logLineCorpusId` are not exported (only the tests that call them fail);
   - `readFileSync` is called;
   - the readable scope returns only the current corpus, and the daemon line with `corpus=` in its text passes the corpus filter;
-  - no 409 on a revoked membership, no 503 on repeated rotation;
+  - no 409 on a revoked membership, a demoted admin or a deleted user, no 503 on repeated rotation;
+  - the unknown label, the unfixed tag position and the timestamp-less continuation are classified;
+  - a multiline broadcast is written as two lines, and the worker test sees a raw newline;
+  - the overlapping-block case exceeds the budget and `[3] done` wins over the earlier block;
   - the parser has no `stats` hook (`visited` stays 0 while `JSON.parse` runs about 45k times), and `} done` does not parse;
   - no `scope` param.
 
-  The type-switch spec and the existing `logs.test.js` cases (with their fixtures moved to the writer format) pass on `0702e47`; they must keep passing.
+  Then `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_hygiene.py -q`: the new `test_log_escapes_line_breaks` fails. The type-switch spec and the existing `logs.test.js` and `log-socket.test.js` cases (with their fixtures moved to the writer format) pass on `0702e47`; they must keep passing.
 - [ ] **Step 3: Implement D10 to D12.**
   - D10:
     - The pin is `await Promise.all(paths.map((p) => fs.promises.stat(p).then(({ dev, ino, size }) => ({ dev, ino, size }), () => null)))` over the window's paths, newest first.
     - Each file is opened once per attempt, checked with `handle.stat()` against its pin (`dev` and `ino`; an absent pin must still give `ENOENT`), read backwards from its pinned size with `handle.read(buffer, 0, len, position)`, and closed in a `finally`.
     - A mismatch restarts the attempt once with a fresh pin; a second one throws `Object.assign(new Error('Log rotated during the read'), { code: 'LOG_ROTATED' })`. The route maps it to 503.
     - `ENOENT` on open for a file pinned as absent makes it count as empty.
-    - Collected lines are unshifted in the order they are found, so `entries` comes out oldest-first.
+    - Collected lines are pushed in the order they are found (newest first), and the window is reversed once before it is returned, so `entries` comes out oldest-first.
   - D11:
-    - `logLineCorpusId` walks the leading `[...]` groups (spaces between them allowed) and stops at the first other character; it returns the first `corpus=<digits>` group, or `null` when the run holds `[DAEMON]` or no numeric tag.
+    - `logLineCorpusId` matches one anchored regex, `^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]`, and returns the number only when group 1 is in `SCOPED_LOG_LABELS`.
+    - `logSocket.broadcast` formats `[${ts}] ${escapeLogLineBreaks(message)}`, appends it and delivers it with `logLineCorpusId(formatted)`; the `index.js` fallback escapes the same way. The worker's `log()` applies `msg.replace('\r\n', '\\n').replace('\r', '\\n').replace('\n', '\\n')` before formatting.
     - The route decides in the spec's order: `type=app` admin-only; a given `corpus_id` validated and membership-checked (403), then `accept = (l) => logLineCorpusId(l) === corpusId`; exact `scope === 'readable'` without `corpus_id` → admin or stub accepts every line, otherwise `accept = (l) => readable.has(logLineCorpusId(l))`; anything else → today's current-corpus fallback.
-    - After `await readLogWindow(...)`, the route re-runs the same access lookup once (the admin flag and `SELECT corpus_id FROM user_corpora WHERE user_id = ?` for the merged branch; the membership of the filtered corpus otherwise) and answers 409 when it differs. Stub mode skips it.
+    - After `await readLogWindow(...)`, the route reloads the user with `getUserById(authDb, req.user.id)` and re-evaluates the branch it took: `type=app` → `isAdminUser(fresh)`; the merged branch → the same admin flag and the same `user_corpora` set; an explicit or current corpus → the fresh user may still read it. A missing user or any difference answers 409. Stub mode skips it.
     - `logSocket.js`'s `lineCorpusId` becomes `logLineCorpusId`; its `CORPUS_TAG_RE` is deleted.
     - The frontend passes `scope: logsFilterCurrentCorpus ? 'corpus' : 'readable'` from both loaders.
-  - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag reset at `\n`, and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. Then one `tryParse` per bracketed line that has a recorded close, from the last line to the first, counted in `stats.parses`.
+  - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag reset at `\n`, and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
 - [ ] **Step 4: Run the Task 3 backend files, then `npm test`; then `logs-stream.spec.ts` (it holds the type-switch case; `app.spec.ts` is never run); then `npx vite build`.** Expected: all pass. Also check that `grep -n "readFileSync" backend/src/app.js` lists no log reader.
-- [ ] **Step 5: Commit** — `logs/python: the log tail reads backwards in chunks and stops at its window, "Current corpus only" off loads every line the live view may show, corpus tags trusted only in the writer prefix, the JSON fallback follows brackets in one scan instead of trying every line pair (BE-10, FE-59, BE-42)`
+- [ ] **Step 5: Commit** — `logs/python: the log tail reads backwards in chunks and stops at its window, "Current corpus only" off loads every line the live view may show, corpus tags trusted only in a recognized writer's fixed position, line breaks escaped at both pipeline writers, the JSON fallback follows brackets in one scan within a parse budget (BE-10, FE-59, BE-42)`
 
 ---
 
@@ -545,9 +609,9 @@ test('the log type switch loads the app log without scope or corpus_id, then the
     - `:1058-1063` (D14);
     - `:58`, `:69`, `:5567`, `:5794` (D15);
     - `:5488-5515` (Corpus props);
-  - `frontend/src/components/Corpus.svelte:101-112`, `:113-132`, `:216-229`, `:277`, `:368` (props instead of local filtering; row, selection, bulk and "Show more" actions disabled while `corpusRowsStale`).
+  - `frontend/src/components/Corpus.svelte:101-112`, `:113-132`, `:197` (`Loaded N/M` from `corpusMatchTotal`), `:216-229`, `:237-245` (select-all, bulk remove), `:277-285` (row click), `:303`, `:332`, `:345` (checkbox, row remove, the expanded row's PDF button), `:368-379` ("Show more"): props instead of local filtering, and every row action inert while `corpusRowsStale`.
 - Test:
-  - extended `backend/tests/corpus-list.test.js`;
+  - extended `backend/tests/corpus-list.test.js`; its Python-oracle comparisons (`:80-84`, `:87`, `:319`, `:328`, `:357`, `:395` and any other `toEqual(viaScript…)`) compare with `{ ...expected, stage_total: expected.total }` through one helper, `withStageTotal(expected)`, and keep strict `toEqual`;
   - extended `frontend/tests/corpus-load.spec.ts` (the `Params` type gains `stage`), `frontend/tests/dead-code.spec.ts` and `frontend/tests/boot-requests.spec.ts`.
 
 **Interfaces:**
@@ -555,7 +619,7 @@ test('the log type switch loads the app log without scope or corpus_id, then the
   - `listCorpus(db, { …, stage = '' })`, whose result gains `stage_total: number`;
   - `/api/corpus?stage=<value>`;
   - `fetchCorpus` returns `{ data, total, source, stageTotals, statusCounts, stageTotal }`, where `stageTotal = Number(payload.stage_total ?? total)`.
-- Corpus props: `corpusStageFilter: string`, `onStageFilterChange: (value: string) => void`, `corpusRowsStale: boolean`.
+- Corpus props: `corpusStageFilter: string`, `onStageFilterChange: (value: string) => void`, `corpusRowsStale: boolean`, `corpusMatchTotal: number`.
 - App state: `corpusStageFilter` (workspace state, like `corpusFilterQuery`), `corpusRowsStage` (the stage of the committed rows), `corpusMatchTotal` (from `stageTotal`).
 
 - [ ] **Step 1: Write the failing tests.**
@@ -608,14 +672,19 @@ test('the stage filter loads that stage from the server and pages within it', as
   // the final page hides "Show more"; the text reads "Showing 150 entries."
   // the option label still reads "All stages (300)"
 })
-test('a poll keeps the stage and drops a row that left it', async ({ page }) => {
-  // after the stage is chosen, the next quiet poll carries stage=downloaded (Review Focus 5);
-  // the mock then moves id 505 out of 'downloaded' (stage_total 149): after the next poll 505 is gone
+test('a poll keeps the stage and q and drops a row that left it from a loaded second page', async ({ page }) => {
+  // type q 'paper' (every downloaded mock row matches), select 'downloaded', "Show more" -> 150 rows loaded (two pages);
+  // the mock then moves id 630 (on the second page) out of 'downloaded' (stage_total 149) and changes the first page's signature;
+  // the next quiet poll runs the prefix reload: every request carries stage=downloaded and q=paper (Review Focus 5),
+  // the reload's consistency check passes on stage_total 149, 630 is gone and 149 rows remain; the header reads "Loaded 149/149."
 })
 test('row actions wait for the rows of the selected stage', async ({ page }) => {
   // hold the stage=downloaded response behind a deferred gate; select 'downloaded':
-  //   the per-row remove buttons, the selection checkboxes and the bulk remove are disabled; "Show more" is disabled
-  // release the gate -> the downloaded rows render and the actions are enabled
+  //   the per-row remove buttons, the selection checkboxes, select-all, the bulk remove and "Show more" are disabled;
+  //   a row click neither selects nor expands; the PDF button of a row expanded before the change is disabled;
+  //   the header still reads the committed "Loaded 120/300."
+  // release the gate -> the downloaded rows render, the actions are enabled, the header reads "Loaded 120/150."
+  //   and the status reads "Showing 120 of 150 entries." although the stage load was quiet
 })
 test('a failed stage load keeps the old rows inert until the user reverts', async ({ page }) => {
   // the stage=failed_download response answers 500: the old rows stay, the refresh-failed notice shows, the actions stay disabled;
@@ -654,7 +723,7 @@ test('a failed tab import shows the error text and leaves the app usable', async
   - only one of the three completion requests arrives before the first is answered;
   - `ThreeGraph.svelte` is requested at boot, and no error text on a failed import.
 
-  The q-only count expectations and the existing corpus-switch case pass on `0702e47`; they must keep passing.
+  The q-only count expectations, the Python-oracle comparisons (with `withStageTotal`, they fail on `0702e47` only because `stage_total` is missing) and the existing corpus-switch case keep passing after the change.
 - [ ] **Step 3: Implement D13 to D15.**
   - D13:
     - The stage term is built from literals only, so no new parameter is bound.
@@ -664,10 +733,11 @@ test('a failed tab import shows the error text and leaves the app usable', async
     - `handleCorpusStageChange(value)` sets `corpusStageFilter` and runs `loadCorpus({ quiet: true, supersede: true })`.
     - `corpusPageSignature` adds `corpusStageFilter`.
     - `loadCorpus` captures `const requestStage = corpusStageFilter` and sends it on every page of the request, including the prefix reload. When a first-page load commits its rows, it sets `corpusRowsStage = requestStage`. An append returns early while `corpusRowsStage !== corpusStageFilter`.
-    - The "Showing" text, `corpusHasMore` and the prefix reload's `totals` set use `corpusMatchTotal` / `answer.stageTotal` (new state, set from `stageTotal`).
+    - The "Showing" text, `corpusHasMore`, the header's `Loaded N/M` and the prefix reload's `totals` set use `corpusMatchTotal` / `answer.stageTotal` (new state, set from `stageTotal`).
+    - When a first-page load commits rows for a stage different from the previous `corpusRowsStage`, it sets `corpusLoadStatus` to the "Showing N of M" text even when `quiet`.
     - On a failed load the existing catch keeps the rows and sets `corpusRefreshFailed`; `corpusRowsStage` is unchanged, so the actions stay disabled until a load succeeds or the user selects `corpusRowsStage` again.
     - `corpusStageFilter` goes into `initialWorkspaceState()` and the restore beside `corpusFilterQuery`, so it survives a tab switch and resets on a corpus switch; `corpusRowsStage` resets with it. Nothing goes to `localStorage`.
-    - `Corpus.svelte`'s `{#each}`, `selectableWorkIds` and the empty state use `corpusItems`. With `corpusRowsStale`, the row remove buttons, the checkboxes, the bulk remove and "Show more" get `disabled`, and `removeSelected` returns early.
+    - `Corpus.svelte`'s `{#each}`, `selectableWorkIds` and the empty state use `corpusItems`. With `corpusRowsStale`, the row remove buttons, the checkboxes, select-all, the bulk remove, the expanded row's PDF button and "Show more" get `disabled`; `removeSelected`, `toggleSelectAll` and the row click handler (`toggleCorpusItemSelection`, which also expands) return early.
   - D14: `await Promise.all([...])` replaces the three awaits and the two middle `stale()` checks.
   - D15: `{#await import('./components/ThreeGraph.svelte')}<p class="muted">Loading…</p>{:then module}<svelte:component this={module.default} … />{:catch}<p class="muted">Could not load this tab. Reload the page to try again.</p>{/await}`, and the same for `ScraperLab.svelte`. Remove the two static imports. `UpstreamBrowser` stays static (FE-17 in part).
 - [ ] **Step 4: Run `corpus-list.test.js`, then `npm test`; then the three Task 4 specs plus `graph-3d.spec.ts`, `table-columns.spec.ts`, `corpus-reconcile.spec.ts`, `tab-resources.spec.ts` and `refresh-scheduler.spec.ts`, one spec file at a time with `--workers=1`; then `npx vite build`.** Expected: all pass, and the build output has separate chunks for `ThreeGraph` and `ScraperLab`.
@@ -721,5 +791,5 @@ def test_worker_job_probes_use_the_status_index(tmp_path):
 
 - [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/schema-indexes.test.js` and `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_schema_indexes.py tests/test_claim_index_plan.py -q`. Expected: FAIL. The index is missing, and the route answers through the stub fallback instead of 404. Check the stub behaviour first; if it already answers 404, assert that `INGEST_LATEST_SCRIPT` and the route string are absent from `app.js` instead.
 - [ ] **Step 3: Implement D16 and D17.** Use the same DDL string in both places: `CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_status_finished ON pipeline_jobs(status, finished_at)`. Then delete the route, the constant, the script, the export and the README line, and update `test_identifiers.py` and the real-pdf spec.
-- [ ] **Step 4: Run the whole backend suite, the whole Python suite, then `dead-code.spec.ts` with `--workers=1` and `npx vite build`.** Expected: all pass. `grep -rn "ingest/latest\|ingest_latest" backend/src backend/scripts backend/tests frontend/src frontend/tests dl_lit_project/dl_lit dl_lit_project/tests` lists only `frontend/tests/dead-code.spec.ts`, the recorded `dl_lit_project/tests/fixtures/identifier_cases.json` key and the new `test_identifiers.py:127` assertion.
+- [ ] **Step 4: Run the whole backend suite, the whole Python suite, then `dead-code.spec.ts` with `--workers=1` and `npx vite build`.** Expected: all pass. `grep -rn "ingest/latest\|ingest_latest" backend/src backend/scripts backend/tests frontend/src frontend/tests dl_lit_project/dl_lit dl_lit_project/tests` lists only these: `frontend/tests/dead-code.spec.ts`, the new route-gone test in `backend/tests/schema-indexes.test.js`, the recorded `dl_lit_project/tests/fixtures/identifier_cases.json` key and the new `test_identifiers.py:127` assertion.
 - [ ] **Step 5: Commit** — `schema/cleanup: pipeline_jobs indexed by status and finished_at for the daemon, the dedupe and the coming retention prune; the dead /api/ingest/latest route, script and export are deleted (BE-45, BE-06)`

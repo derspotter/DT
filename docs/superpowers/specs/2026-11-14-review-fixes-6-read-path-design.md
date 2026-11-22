@@ -153,12 +153,16 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
 
 ## Goals
 
-- No poll and no click does work that grows with corpus size when the answer does not need it:
-  the seed list endpoint (`/api/seed/sources`), the Kantropos browse, the graph node and
-  cluster clicks. The seed candidate file drops the corpus-local resolver and the full-seed
-  listing; it still uses the cached global index and its fingerprint (D2, D3).
-- No request handler reads a multi-MB file or gzips synchronously. The log tail reads only what
-  the window needs.
+- No poll and no click does work that grows with corpus size when the answer does not need it,
+  on these paths: the seed list endpoint (`/api/seed/sources`), the Kantropos browse, the graph
+  node and cluster clicks. The seed-poll guarantee covers `/api/seed/sources` only: the
+  candidates route, which the expanded seed polls while a search runs, keeps its cost (D3). The
+  seed candidate file drops the corpus-local resolver and the full-seed listing; it still uses
+  the cached global index and its fingerprint (D2, D3).
+- The named read paths read no multi-MB file and gzip nothing synchronously: the log tail
+  (which reads only what the window needs), the Kantropos browse and overview's `metadata.bib`
+  count, and the snapshot build's gzip. Other handlers are out of scope; Scraper Apply, for
+  one, still reads the whole `metadata.bib` synchronously (`app.js:3711`).
 - Every claim is pinned by a test of the mechanism: a query plan, a statement or call count, a
   request count, or an absent sync call. No test uses wall-clock thresholds.
 - Each behaviour change is the minimum the row needs. Each has a parity test where the output
@@ -255,10 +259,13 @@ corpus they belong to. There is no cross-corpus PDF sharing. It works in five st
      is one probe by the table's full primary key: `SELECT 1 FROM seed_candidates_dismissed
      WHERE corpus_id = ? AND source_type = 'pdf' AND source_key = ? AND candidate_key = ?`, bound
      with the canonical key. A hit gives `null`.
-   - search: the join the count and the list already use, `FROM search_results sr JOIN
-     search_run_corpora src ON src.search_run_id = sr.search_run_id WHERE
-     <searchCandidateWhere(corpusId, runId, sourceRef, '')> AND sr.id = ?`. That clause already
-     excludes dismissed rows and other corpora's runs.
+   - search: the source key must be a canonical run id (`/^[1-9]\d*$/`), else `null`, and
+     `String(runId)` is passed as `sourceRef`, so an alternate spelling such as `07` cannot
+     miss the dismissal rows stored under `7`. The read uses the candidate list's join, `FROM
+     search_results sr JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id JOIN
+     search_runs s ON s.id = sr.search_run_id WHERE <searchCandidateWhere(corpusId, runId,
+     String(runId), '')> AND sr.id = ?` (`seed.js:817-820`). That clause already excludes
+     dismissed rows and other corpora's runs.
 3. The row goes through `normalizePdfCandidate` or `normalizeSearchCandidate` only to build the
    match fields, with a stub bundle (`resolveState: () => 'pending'`, `resolveDownloadedWorkId:
    () => null`, `isInCorpus: () => false`).
@@ -323,22 +330,26 @@ drop out.
 (BE-11), controller call (the memo).**
 1. Pass 1 and pass 2 run inside one short read transaction (`db.transaction(fn)()`, as
    `listCorpus` does): in WAL mode both SELECTs see one snapshot, so a worker commit between
-   them cannot make the summary and the page disagree. Nothing asynchronous runs inside it.
+   them cannot make the summary and the page disagree. Nothing asynchronous and no file probe
+   runs inside it.
 2. **Pass 1** reads `w.id, w.file_path, cw.corpus_id`, with the same joins and `WHERE` as today,
-   ordered `COALESCE(w.year, 0) DESC, w.id DESC`. From those rows it computes, in that order and
-   with the imported-set exclusion:
-   - the distinct work ids;
-   - the file-missing set, with one probe per distinct work (a work in several corpora has
-     several rows and is probed once);
-   - each work's corpus ids, for the per-corpus `pending_count`.
+   ordered `COALESCE(w.year, 0) DESC, w.id DESC`. From those rows it computes, in that order:
+   - each assigned corpus's `downloaded_count` (distinct works per corpus), before the
+     imported-set exclusion. This replaces the separate grouped query (`app.js:1732-1745`),
+     which read the same rows again;
+   - with the imported-set exclusion: the distinct work ids with their `file_path`, and each
+     work's corpus ids, for the per-corpus `pending_count`.
 3. **Pass 2** reads today's full `SELECT w.*, c.id AS corpus_id, …` with the extra term `AND
    w.id IN (SELECT value FROM json_each(?))`, bound with the first `pendingLimit` work ids of
    pass 1, in today's order (`…, LOWER(c.name), c.id`). It maps those rows exactly as today.
+4. After the transaction closes, the file-missing set is computed with one probe per distinct
+   work (a work in several corpora has several rows and is probed once), and the page items get
+   their `file_missing` flags.
 
-The function returns `{ items, totalCount, missingFileCount, pendingCountByCorpus }`.
-`buildKantroposBrowsePayload` derives every summary field from these values with today's
-formulas. The JSON payload is unchanged; a fixed-fixture test pins it, including a file-missing
-work outside the page.
+The function returns `{ items, totalCount, missingFileCount, pendingCountByCorpus,
+downloadedCountByCorpus }`. `buildKantroposBrowsePayload` derives every summary field from these
+values with today's formulas. The JSON payload is unchanged; a fixed-fixture test pins it,
+including a file-missing work outside the page.
 
 `upstreamFileIsPresent` uses `fs.statSync(raw, { throwIfNoEntry: false })?.isFile() === true`
 inside its `try`, which drops the exception cost of a missing file (322 → 39 ms per 24k). It
@@ -378,9 +389,15 @@ lowercase.
 The lookup is scan-free on both schemas. `ensureAuthSchema` creates the two partial indexes
 with the same DDL as `db_manager.py`'s `WORKS_INDEXES` (`CREATE UNIQUE INDEX IF NOT EXISTS
 idx_works_openalex_id …` and `… idx_works_normalized_doi …`), each when `works` has the column.
-A database the Python side initialised already has them, so the statements are no-ops there.
-If a statement fails on duplicate values (a Node-only database), `ensureAuthSchema` logs a
-warning and continues; the lookup then still answers, by scan.
+A database the Python side initialised already has them, so the statements are no-ops there;
+production databases are Python-managed.
+
+**Accepted exception to "scan-free".** On a Node-only database with duplicate `openalex_id` or
+`normalized_doi` values, `CREATE UNIQUE INDEX` fails. `ensureAuthSchema` catches only that
+failure (`error.code === 'SQLITE_CONSTRAINT_UNIQUE'`) and logs it with `console.error`, naming
+the index and the duplicated column. Any other DDL error is rethrown. Boot continues, and on
+that schema the symbolic probes run as scans, with the same results: the right work, or 404.
+This is a degraded development case. There is no "unavailable" mode.
 
 The route keeps its 404 for unreadable works, for every accepted form.
 
@@ -397,10 +414,11 @@ The route keeps its 404 for unreadable works, for every accepted form.
 A background rebuild between load and click no longer pairs the rendered graph with a newer
 cluster.
 
-**D9. Streamed gzip (BE-08).** New exported `gzipSnapshotFiles(dir, fileNames) -> Promise<void>`
-in `app.js` runs `await pipeline(fs.createReadStream(p), zlib.createGzip(), fs.createWriteStream(`${p}.gz`))`
-(`node:stream/promises`) for each existing file, one after another. `buildGraph3dSnapshot`
-awaits it with `['nodes_meta.json', 'clusters.json', 'nodes.bin', 'edges.bin']`. The output is
+**D9. Streamed gzip (BE-08).** The existing loop in `buildGraph3dSnapshot` over
+`['nodes_meta.json', 'clusters.json', 'nodes.bin', 'edges.bin']` keeps its `existsSync` check
+and replaces `writeFileSync(gzipSync(readFileSync(…)))` with `await pipeline(fs.createReadStream(p),
+zlib.createGzip(), fs.createWriteStream(`${p}.gz`))` (`node:stream/promises`), one file after
+another. No new function or export. The output is
 byte-compatible: `gunzipSync(gz)` equals the source. The test drives the real
 `buildGraph3dSnapshot` through the snapshot route, with a fake export script, and checks the
 stream calls and the absence of synchronous payload reads.
@@ -435,7 +453,9 @@ It is exported, and it reads as follows:
   fresh pin. A second mismatch throws, and the route answers `503 { error: 'Log rotated during
   the read; retry' }`. A file is therefore never read twice under two names, and the cursor
   never skips older lines.
-- `entries` is in file order, oldest first, as today. `nextCursor = cursor + entries.length`.
+- Lines are pushed in the order they are found (newest first), and the window is reversed once
+  at the end, so `entries` is in file order, oldest first, as today. `nextCursor = cursor +
+  entries.length`.
 - The response drops `total_lines`, which nobody reads: neither the frontend nor any test, and
   computing it needs the full read this removes.
 - A cursor past the end answers `entries: []`, `has_more: false`, and echoes `cursor` and
@@ -458,23 +478,40 @@ It is exported, and it reads as follows:
   4. In the merged branch, an admin or stub mode accepts every line. Any other user accepts a
      line whose trusted tag names a corpus in `SELECT corpus_id FROM user_corpora WHERE user_id
      = ?`.
-- A corpus tag is trusted only in the writer's prefix: a `[corpus=<digits>]` group inside the
-  line's leading run of bracket groups (`[ts] [label][corpus=12] …`,
-  `[extract-status] [corpus=12] [base=…]`), the first such group winning. A `corpus=` inside the
-  message text, or a line whose leading run holds `[DAEMON]` (the worker writes no tags, and its
-  messages carry arbitrary exception text, `worker.py:143-152`, `:1482`), is unclassified, and an
-  unclassified line is admin-only. The new exported `logLineCorpusId(line) -> number | null` in
-  `app.js` implements the rule. It replaces `extractLogCorpusTag` in the tail route (both the
-  `corpus_id` filter and the merged branch), and `logSocket.js` uses it instead of its own
-  regex, so the history and the live view classify a line the same way. Every tag the backend
-  writes today is in that prefix (`app.js:4235-4576`).
-- The read is asynchronous (D10), so the route rechecks access before it answers: it re-runs
-  the lookup the window was built with (the admin flag and the `user_corpora` set in the merged
-  branch; the membership of the given or current corpus otherwise) once. If the result
-  differs, the window is discarded and the route answers `409 { error: 'Log access changed
-  during the read' }`. Stub mode skips the recheck.
+- A corpus tag is trusted only in a fixed position written by a recognized scoped writer. The
+  new exported `logLineCorpusId(line) -> number | null` in `app.js` accepts exactly
+  `^\[<ISO timestamp>\] \[<label>\] ?\[corpus=(<digits>)\]`, where `<label>` is one of the
+  labels the extraction route writes with a corpus tag (`app.js:4235-4576`):
+  `extract-status`, `/api/extract-bibliography`, `get_bib_pages`, `get_bib_pages ERROR`, and
+  `APIscraper`, `APIscraper inline fallback`, `APIscraper (reused pages)`, each also with the
+  ` ERROR` suffix. The labels live in one exported constant, `SCOPED_LOG_LABELS`, next to the
+  writers. Everything else is unclassified and admin-only: a `corpus=` in message text, a
+  `[DAEMON]` line, a line without the timestamp (such as a continuation of an old multiline
+  record), and a tag after another group.
+- Both pipeline writers escape embedded line breaks, so one record is one line and a
+  continuation can never be classified apart from its header:
+  - Node: `logSocket.broadcast` (and the `index.js` fallback before the socket exists) writes
+    `escapeLogLineBreaks(message)`, which turns `\r\n`, `\r` and `\n` into the two
+    characters `\n`. The live frame carries the same escaped text.
+  - The worker: `log()` (`worker.py:143-152`) escapes `\r` and `\n` in `msg` the same way
+    before it formats the line, which covers the traceback text it writes
+    (`worker.py:1482`).
+- `logLineCorpusId` replaces `extractLogCorpusTag` in the tail route (both the `corpus_id`
+  filter and the merged branch). `logSocket.js` classifies the formatted line (timestamp
+  included) with the same function instead of its own regex, so the history and the live view
+  classify a line the same way.
+- The read is asynchronous (D10), so the route rechecks access before it answers. It reloads
+  the user (`getUserById(authDb, req.user.id)`; `req.user` was loaded before the await, and the
+  admin flag derives from the username) and re-evaluates the branch the window was built with:
+  - `type=app`: the reloaded user is still the admin;
+  - the merged branch: the same admin flag and the same `user_corpora` set;
+  - an explicit or current corpus: the reloaded user may still read that corpus.
 
-**D12. The fallback parser follows brackets in one pass (BE-42), controller call.**
+  A missing user or any difference discards the window, and the route answers `409 { error:
+  'Log access changed during the read' }`. Stub mode skips the recheck.
+
+**D12. The fallback parser follows brackets in one pass, within a parse budget (BE-42),
+controller call.**
 - The fast path is unchanged.
 - The fallback joins the trimmed lines with `\n` once into `text`, then makes one structural
   scan over it: `bracketCloses(text) -> Map<number, number>`, opener index → matching close
@@ -483,15 +520,23 @@ It is exported, and it reads as follows:
   raw newline), so an unbalanced quote in a log line cannot swallow the rest of the output. A
   close that does not match the top of the stack clears the stack. Each character is visited
   once; an opener that never closes has no entry.
-- From the last line to the first, at each line's first `[` or `{`, a recorded close gives one
-  `JSON.parse(text.slice(start, close + 1))`. Total work is one scan plus at most one parse per
-  bracketed line.
+- Only multiline blocks are candidates: a block whose open and close are on the same line is
+  skipped, since the fast path already tried that line. A later single-line log label such as
+  `[3] done` therefore cannot displace an earlier pretty-printed result.
+- From the last line to the first, at each line's first `[` or `{`, a recorded multiline close
+  gives one `JSON.parse(text.slice(start, close + 1))`.
+- Nested malformed blocks overlap, so the sum of their lengths can still be quadratic. The
+  fallback therefore has a budget: the sum of the candidate lengths it slices and parses is at
+  most `FALLBACK_PARSE_BUDGET_FACTOR * text.length`, with the factor 4. A candidate that would
+  exceed the budget ends the fallback, which then throws the unchanged error. Total work is one
+  scan plus at most four times the text in parse input.
 - The first block that parses wins, as today.
-- A block followed by text on its last line (`} done`) now parses; today it is skipped.
+- A multiline block followed by text on its last line (`} done`) now parses; today it is
+  skipped.
 - The thrown error text is unchanged.
 - `parseJsonFromOutput(output, { stats } = {})` takes an optional test hook: when `stats` is
-  given, the fallback adds the characters its scan visited to `stats.visited` and its parse
-  attempts to `stats.parses`.
+  given, the fallback adds the characters its scan visited to `stats.visited`, its parse
+  attempts to `stats.parses` and the candidate lengths it parsed to `stats.parsedChars`.
 
 ### Backend and frontend: Corpus and workspace loads (Task 4)
 
@@ -526,16 +571,23 @@ It is exported, and it reads as follows:
 - Stale rows stay inert. `corpusRowsStage` is the stage the committed `corpusItems` were loaded
   for; it is set when a first-page load replaces the rows. `corpusRowsStale = corpusRowsStage
   !== corpusStageFilter`. While it is true:
-  - the per-row remove, the selection checkboxes, the bulk remove and "Show more" (and the
-    scroll trigger) are disabled;
+  - the per-row remove, the selection checkboxes, select-all, the bulk remove, the row click
+    (selection and expansion), the expanded row's PDF button and "Show more" (and the scroll
+    trigger) are disabled or ignored;
   - an append request returns early, because its offset belongs to the old stage.
+- The counts shown are the committed ones: the header's `Loaded N/M` uses the committed
+  `stage_total` (`corpusMatchTotal`) instead of `corpusTotal`, and when a quiet stage load
+  commits, it sets the "Showing N of M" status as a non-quiet load does.
 - When the stage load fails, the old rows stay, the existing `corpusRefreshFailed` notice
   shows, and the actions stay disabled until a load for the selected stage succeeds or the user
   selects the committed stage again.
 - `fetchCorpus` sends `stage` unless it is `'all'`. The poll's prefix reload sends it too.
   `corpusPageSignature` includes it.
-- `applyCorpusCounts` takes `stageTotal`. `corpusHasMore`, the "Showing N of M" text and the
-  prefix reload's consistency check (`totals.size === 1`) use it.
+- `applyCorpusCounts` takes `stageTotal`. `corpusHasMore`, the "Showing N of M" text, the
+  header's `Loaded N/M` and the prefix reload's consistency check (`totals.size === 1`) use it.
+- The Python oracle (`corpus_list.py`) has no `stage_total`. The parity tests compare
+  `listCorpus` with `{ ...expected, stage_total: expected.total }` and keep strict equality on
+  every field.
 
 **D14. Completion loads in parallel (FE-18).** In `finalizeExtractionAfterBackendCompletion`,
 the three awaits become `await Promise.all([focusSeedSource('pdf', baseName),
@@ -634,13 +686,16 @@ The tasks run serially in this order: every task edits `app.js`, and Tasks 2–5
   the caller; the current corpus's copy is preferred. A match that lies only in another user's
   corpus answers 404, where today it was served.
 - **D3 (BE-09):** the boot warm-up is removed. The first seed expand, promote or candidate file
-  after a deploy waits about 1.5 s for the downloaded index. Polls never do.
+  after a deploy waits about 1.5 s for the downloaded index. The seed-list poll
+  (`/api/seed/sources`) never does; the expanded seed's candidates reload while a search runs
+  can, like any candidates request after a fingerprint change.
 - **D6 (BE-11):** each Kantropos target's `metadata.bib` entry count is remembered until the
   file's size or mtime changes. The cache is bounded by the configured targets.
 - **D7 (BE-36/BE-51):** a DOI node id resolves through `normalized_doi`, the key the graph
   export generates, instead of the raw `doi` text. Plain digits and the exporter's `work:<id>`
   resolve as work ids; `12.0`, `1e1` and `0x0c` no longer do. The Node schema bootstrap creates
-  the two partial identifier indexes.
+  the two partial identifier indexes. On a Node-only database with duplicate identifiers it
+  logs an error and boots; the lookup scans there (the one accepted exception).
 - **D8 (BE-37):** the cluster panel uses the cluster loaded with the graph, and the
   cluster-detail route is removed.
 - **D10 (BE-10):** `/api/logs/tail` no longer returns `total_lines`. A cursor past the end
@@ -648,9 +703,11 @@ The tasks run serially in this order: every task edits `app.js`, and Tasks 2–5
   one answers 503.
 - **D11 (FE-59):** with "current corpus only" off, the history shows what the live view may
   show: everything for admins, and the user's own corpora for members. A corpus tag counts only
-  in the line's writer prefix, in the tail and in the live socket; any other line is
-  admin-only. Access that changes during the read answers 409.
-- **D12 (BE-42):** a JSON block followed by text on its closing line now parses.
+  right after the timestamp and a recognized extraction label, in the tail and in the live
+  socket; any other line is admin-only. Both pipeline writers escape line breaks inside a
+  record. Access that changes during the read answers 409.
+- **D12 (BE-42):** a multiline JSON block followed by text on its closing line now parses. The
+  fallback gives up, with the unchanged error, after parse input of four times the output.
 - **D13 (FE-14):** the stage filter is applied by the server. "Show more" and the scroll
   trigger page within the stage, and the stage labels keep their totals. Row actions wait until
   the rows of the selected stage have loaded. The stage persists like the `q` filter: across
