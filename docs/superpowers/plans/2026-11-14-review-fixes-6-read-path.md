@@ -394,7 +394,15 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 - Modify: `backend/src/logSocket.js:8-13`, `:113-118` (classify the formatted line with `logLineCorpusId` from `app.js`, which it already imports from; `broadcast` escapes line breaks before it writes and sends).
 - Modify: `backend/src/index.js:13` (`backend-pipeline-v2.log`) and `:85-91` (the pre-socket `broadcast` fallback writes `escapeLogLineBreaks(message)`).
 - Modify: `backend/scripts/daemon/worker.py:125` (`backend-pipeline-v2.log`) and `:143-152` (`log()` escapes `\r` and `\n` in `msg`).
-- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history), plus one deploy step in the runbook: `docker compose up -d --force-recreate rag_backend rag_enrich_worker rag_download_worker`, then `tail -n 20 logs/backend-pipeline-v2.log` shows a fresh `[DAEMON]` record from the enrich worker and one from the download worker, and `logs/backend-pipeline.log` gains no new line.
+- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history), plus one deploy step in the runbook, run from the repo root:
+  ```
+  BEFORE=$(docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log)
+  docker compose restart rag_backend rag_enrich_worker rag_download_worker
+  docker compose exec -T rag_backend grep -c "enrich daemon starting\|download daemon starting" \
+    /usr/src/app/logs/backend-pipeline-v2.log
+  docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
+  ```
+  Expected: both startup records are in v2 (count at least 2, one per role), and the legacy size equals `$BEFORE`.
 - Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses`.
 - Modify: `frontend/src/lib/api.js:655-671` (`fetchLogsTail` gains `scope`) and `frontend/src/App.svelte:4268-4274`, `:4319-4325` (pass `scope`).
 - Test:
@@ -501,17 +509,17 @@ test('logs: a scoped admin read never includes the old generation', async () => 
 })
 test('logs: an admin demoted during a merged read that includes the old generation gets no window', async () => {
   // admin, scope=readable; inside the open spy, when the legacy file is opened, UPDATE users SET username = 'demoted'
-  // -> 409, no entries in the body
+  // -> 409, no entries in the body; afterEach restores the admin username
 })
 test('logs: an explicit foreign corpus_id with scope=readable is still 403', async () => { /* ?type=pipeline&scope=readable&corpus_id=${ids.G} as member9 -> 403 */ })
 test('logs: a scope value other than readable keeps the current-corpus fallback', async () => { /* scope=READABLE, scope=all -> same entries as no scope */ })
 test('logs: type=app stays admin-only with scope=readable', async () => { /* member9 ?type=app&scope=readable -> 403 */ })
 test('logs: a membership revoked during the read discards the window', async () => {
-  // inside a one-shot fs.promises.open spy, DELETE the user_corpora row for (member9, B);
+  // inside a one-shot fs.promises.open spy, DELETE the user_corpora row for (member9, F) (afterEach re-inserts it);
   // GET ?type=pipeline&scope=readable as member9 -> 409 { error: 'Log access changed during the read' }, no entries in the body
 })
 test('logs: an admin who loses admin access during an app-log read gets no window', async () => {
-  // inside a one-shot fs.promises.open spy, UPDATE users SET username = 'demoted' WHERE id = <admin id>
+  // inside a one-shot fs.promises.open spy, UPDATE users SET username = 'demoted' WHERE id = <admin id> (afterEach restores it)
   // (isAdminUser compares the username, app.js:1917); GET ?type=app as admin -> 409, no entries in the body
 })
 test('logs: a user deleted during the read gets no window', async () => { /* a separate user member10 of A; DELETE it inside the open spy; current-corpus read -> 409 */ })
@@ -617,7 +625,7 @@ test('the log type switch loads the app log without scope or corpus_id, then the
   - the extraction labels carry the model in the label (`APIscraper inline (adm-cheap-x)`) and `[APIscraper (page mode)]` is not classified;
   - the member's readable tail includes the legacy file's forged line;
 
-  The two `parity:` parser cases pass on `0702e47` and must keep passing.
+  The three `parity:` parser cases (`[3] done`, the nested array, the quote before the first opener) pass on `0702e47` and must keep passing.
   - the parser has no `stats` hook (`visited` stays 0 while `JSON.parse` runs about 45k times), and `} done` does not parse;
   - no `scope` param.
 
@@ -635,11 +643,11 @@ test('the log type switch loads the app log without scope or corpus_id, then the
     - `logLineCorpusId` matches one anchored regex, `^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]`, and returns the number only when group 1 is in `SCOPED_LOG_LABELS`.
     - `logSocket.broadcast` formats `[${ts}] ${escapeLogLineBreaks(message)}`, appends it and delivers it with `logLineCorpusId(formatted)`; the `index.js` fallback escapes the same way. The worker's `log()` applies `msg.replace('\r\n', '\\n').replace('\r', '\\n').replace('\n', '\\n')` before formatting.
     - The route decides in the spec's order: `type=app` admin-only; a given `corpus_id` validated and membership-checked (403), then `accept = (l) => logLineCorpusId(l) === corpusId`; exact `scope === 'readable'` without `corpus_id` → admin or stub accepts every line, otherwise `accept = (l) => readable.has(logLineCorpusId(l))`; anything else → today's current-corpus fallback.
-    - After `await readLogWindow(...)`, the route reloads the user with `getUserById(authDb, req.user.id)` and re-evaluates the branch it took: `type=app` → `isAdminUser(fresh)`; the merged branch → the same admin flag and the same `user_corpora` set; an explicit or current corpus → the fresh user may still read it. A missing user or any difference answers 409. Stub mode skips it.
+    - After `await readLogWindow(...)`, the route reloads the user with `getUserById(authDb, req.user.id)` and re-evaluates the branch it took: `type=app` → `isAdminUser(fresh)`; the merged branch → for an admin `isAdminUser(fresh)` only, for a member not admin and the same `user_corpora` set; an explicit or current corpus → the fresh user may still read it. A missing user or any difference answers 409. Stub mode skips it.
     - `logSocket.js`'s `lineCorpusId` becomes `logLineCorpusId`; its `CORPUS_TAG_RE` is deleted.
     - The frontend passes `scope: logsFilterCurrentCorpus ? 'corpus' : 'readable'` from both loaders.
   - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag (set only while the stack is non-empty, reset at `\n`), and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. `bracketCloses` also records whether each opener was outer (empty stack). Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`, provided that the close ends its line or the block is outer. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
-- [ ] **Step 4: Run the Task 3 backend files, then `npm test`; then `logs-stream.spec.ts` (it holds the type-switch case; `app.spec.ts` is never run); then `npx vite build`.** Expected: all pass. Also check that `grep -n "readFileSync" backend/src/app.js` lists no log reader.
+- [ ] **Step 4: Run the Task 3 backend files, then `npm test`; then `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_hygiene.py tests/test_worker_enrich_no_expansion.py -q` (both changed log test files); then `logs-stream.spec.ts` (it holds the type-switch case; `app.spec.ts` is never run); then `npx vite build`.** Expected: all pass. Also check that `grep -n "readFileSync" backend/src/app.js` lists no log reader.
 - [ ] **Step 5: Commit** — `logs/python: the log tail reads backwards in chunks and stops at its window, "Current corpus only" off loads every line the live view may show, corpus tags trusted only in a recognized writer's fixed position, line breaks escaped at both pipeline writers, the JSON fallback follows brackets in one scan within a parse budget (BE-10, FE-59, BE-42)`
 
 ---
@@ -746,6 +754,11 @@ test('counts move only with their rows', async ({ page }) => {
   // (b) a stage change to 'failed_download' that answers 500, then a quiet poll for that stage: it requests only the
   //     first page (no prefix reload, offset 0 only) and, once it answers, commits rows and header count together
 })
+test('a removal answered after a corpus switch leaves the new corpus alone', async ({ page }) => {
+  // work 501 is in corpus 1 and corpus 2; hold the DELETE for corpus 1, switch to corpus 2 (501 listed), release:
+  // 501 stays in corpus 2's list and its header count is unchanged; no corpus-1 reconciliation request follows
+  // same scope: a quiet poll begun before the unlink answers after the superseding reload and is discarded
+})
 test('a removal updates the committed counts even when the follow-up refresh fails', async ({ page }) => {
   // stage 'downloaded', 120 of 150 loaded ("Loaded 120/150."); remove one row (the DELETE answers 200), the follow-up
   // /api/corpus answers 500: the row is gone, the header reads "Loaded 119/149.", "Show more" is still offered;
@@ -813,7 +826,8 @@ test('a failed tab import shows the error text and leaves the app usable', async
     - On a failed load the existing catch keeps the rows and sets `corpusRefreshFailed`; `corpusRowsStage` is unchanged, so the actions stay disabled until a load succeeds or the user selects `corpusRowsStage` again.
     - `corpusStageFilter` goes into `initialWorkspaceState()` and the restore beside `corpusFilterQuery`, so it survives a tab switch and resets on a corpus switch; `corpusRowsStage` resets with it. Nothing goes to `localStorage`.
     - `Corpus.svelte`'s `{#each}`, `selectableWorkIds` and the empty state use `corpusItems`. With `corpusRowsStale`, the row remove buttons, the checkboxes, select-all, the bulk remove, the expanded row's PDF button and "Show more" get `disabled`; `removeSelected`, `toggleSelectAll` and the row click handler (`toggleCorpusItemSelection`, which also expands) return early.
-    - `handleRemoveCorpusWork` and `handleRemoveSelectedCorpusWorks` count the rows their filter actually drops from `corpusItems`, subtract that from `corpusMatchTotal`, and recompute `corpusHasMore = corpusItems.length < corpusMatchTotal`, beside today's `corpusTotal` update; the follow-up `loadCorpus` reconciles.
+    - `handleRemoveCorpusWork` and `handleRemoveSelectedCorpusWorks` count the rows their filter actually drops from `corpusItems`, subtract that from `corpusMatchTotal`, and recompute `corpusHasMore = corpusItems.length < corpusMatchTotal`, beside today's `corpusTotal` update; the follow-up `loadCorpus` reconciles with `supersede: true`.
+    - Both handlers read `const epoch = corpusScopeEpoch` before the unlink request and return without touching rows, counts or status when `epoch !== corpusScopeEpoch` after it.
   - D14: `await Promise.all([...])` replaces the three awaits and the two middle `stale()` checks.
   - D15: `{#await import('./components/ThreeGraph.svelte')}<p class="muted">Loading…</p>{:then module}<svelte:component this={module.default} … />{:catch}<p class="muted">Could not load this tab. Reload the page to try again.</p>{/await}`, and the same for `ScraperLab.svelte`. Remove the two static imports. `UpstreamBrowser` stays static (FE-17 in part).
 - [ ] **Step 4: Run `corpus-list.test.js`, then `npm test`; then the three Task 4 specs plus `graph-3d.spec.ts`, `table-columns.spec.ts`, `corpus-reconcile.spec.ts`, `tab-resources.spec.ts` and `refresh-scheduler.spec.ts`, one spec file at a time with `--workers=1`; then `npx vite build`.** Expected: all pass, and the build output has separate chunks for `ThreeGraph` and `ScraperLab`.

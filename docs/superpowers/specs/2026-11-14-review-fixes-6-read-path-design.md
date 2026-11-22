@@ -221,6 +221,9 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
   the table holds 30 days of jobs, so the scan is bounded.
 - **A tail with "current corpus only" on still excludes untagged lines, which the admin's live
   view shows.** This admin-only difference predates FE-59 and stays.
+- **Parked: "Load older" counts its cursor from a moving head.** This is pre-existing (phase 5
+  paging behaviour): an admin's unfiltered history can repeat one boundary row when the daemon
+  appends between two pages; no data leaks, and no server-issued continuation is built.
 - No README change beyond the dead `/api/ingest/latest` line and the pipeline log file name
   (D11; `README.md:175`, `dl_lit_project/docs/OPS_RUNBOOK.md:184-268`).
 
@@ -518,13 +521,16 @@ It is exported, and it reads as follows:
   an admin too) and every member read reads only the new generation. Only an unscoped pipeline
   read, the merged branch (`scope=readable` without `corpus_id`) by an admin or in stub mode,
   passes `olderBase: legacyPipelineLogFile`, so the old files stay readable for admins only,
-  and the post-read recheck of that branch is the admin flag. There is no content-based legacy
+  and the post-read recheck of that admin branch is the admin flag alone. There is no content-based legacy
   detection. Nothing writes the old files any more; they age out by hand.
 - Cutover: the enrich and download workers are separate long-running processes
   (`docker-compose.yml:75`, `:119`). Until they restart on the new code they keep writing the
-  legacy file. The runbook (`OPS_RUNBOOK.md`) gains one deploy step: restart the backend and
-  both workers, then check that a fresh record from each worker appears in
-  `backend-pipeline-v2.log` and none in `backend-pipeline.log`.
+  legacy file. The runbook (`OPS_RUNBOOK.md`) gains one deploy step: note the legacy file's
+  size, restart the backend and both workers (the code is bind-mounted, so a restart suffices),
+  then check inside `rag_backend` (the logs are a named volume at `/usr/src/app/logs`) that
+  `backend-pipeline-v2.log` holds both startup records, `enrich daemon starting.` and
+  `download daemon starting.` (`worker.py:1560`), and that the legacy file's size is
+  unchanged.
 - `logLineCorpusId` replaces `extractLogCorpusTag` in the tail route (both the `corpus_id`
   filter and the merged branch). `logSocket.js` classifies the formatted line (timestamp
   included) with the same function instead of its own regex, so the history and the live view
@@ -533,7 +539,9 @@ It is exported, and it reads as follows:
   the user (`getUserById(authDb, req.user.id)`; `req.user` was loaded before the await, and the
   admin flag derives from the username) and re-evaluates the branch the window was built with:
   - `type=app`: the reloaded user is still the admin;
-  - the merged branch: the same admin flag and the same `user_corpora` set;
+  - the merged branch: for an admin, the reloaded user is still the admin (no membership
+    query); for a member, the reloaded user is still no admin and has the same `user_corpora`
+    set;
   - an explicit or current corpus: the reloaded user may still read that corpus.
 
   A missing user or any difference discards the window, and the route answers `409 { error:
@@ -624,6 +632,11 @@ controller call.**
   selects the committed stage again.
 - `fetchCorpus` sends `stage` unless it is `'all'`. The poll's prefix reload sends it too.
   `corpusPageSignature` includes it.
+- A removal captures `corpusScopeEpoch` before its unlink request(s); if the epoch changed
+  when the response arrives (a corpus switch), the response handling is skipped, so the old
+  corpus's unlink never touches the new corpus's rows or counts. A successful same-scope
+  removal reconciles with a superseding load (`supersede: true`), so a page request begun
+  before the unlink cannot overwrite the result.
 - A successful single or bulk removal updates the committed counts with the rows actually
   removed from the current view: `corpusMatchTotal` drops by that number and `corpusHasMore`
   is recomputed, next to today's `corpusTotal` update (`App.svelte:2905-2935`); the follow-up
