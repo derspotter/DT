@@ -394,13 +394,13 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 - Modify: `backend/src/logSocket.js:8-13`, `:113-118` (classify the formatted line with `logLineCorpusId` from `app.js`, which it already imports from; `broadcast` escapes line breaks before it writes and sends).
 - Modify: `backend/src/index.js:13` (`backend-pipeline-v2.log`) and `:85-91` (the pre-socket `broadcast` fallback writes `escapeLogLineBreaks(message)`).
 - Modify: `backend/scripts/daemon/worker.py:125` (`backend-pipeline-v2.log`) and `:143-152` (`log()` escapes `\r` and `\n` in `msg`).
-- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history).
+- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history), plus one deploy step in the runbook: `docker compose up -d --force-recreate rag_backend rag_enrich_worker rag_download_worker`, then `tail -n 20 logs/backend-pipeline-v2.log` shows a fresh `[DAEMON]` record from the enrich worker and one from the download worker, and `logs/backend-pipeline.log` gains no new line.
 - Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses`.
 - Modify: `frontend/src/lib/api.js:655-671` (`fetchLogsTail` gains `scope`) and `frontend/src/App.svelte:4268-4274`, `:4319-4325` (pass `scope`).
 - Test:
   - new `backend/tests/logs-tail-reader.test.js`;
   - extended `backend/tests/access-routes.test.js` (a new `describe` with its own log dir and users for the merged, legacy and revocation cases), `backend/tests/python-process.test.js`, `backend/tests/log-socket.test.js`, `backend/tests/extraction-models-route.test.js`, `dl_lit_project/tests/test_hygiene.py` (next to the worker `log` tests at `:267-326`) and `frontend/tests/logs-stream.spec.ts`;
-  - the file name `backend-pipeline.log` becomes `backend-pipeline-v2.log` in `backend/tests/logs.test.js:17`, `:26`, `backend/tests/access-routes.test.js:118`, `dl_lit_project/tests/test_hygiene.py:269-321` and `dl_lit_project/tests/test_worker_enrich_no_expansion.py:42`;
+  - the file name `backend-pipeline.log` becomes `backend-pipeline-v2.log` in `backend/tests/logs.test.js:17`, `:26`, `backend/tests/access-routes.test.js:118`, `dl_lit_project/tests/test_hygiene.py:269-321` and `dl_lit_project/tests/test_worker_enrich_no_expansion.py:42`. These existing fixtures move in Step 3, together with the reader and writer cutover, not in Step 1;
   - `backend/tests/logs.test.js:19-30` and `backend/tests/access-routes.test.js:119`: the fixture lines move to the format the writers produce, a timestamp, a recognized label and the tag in fixed position: `[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=123] line-a` instead of `[older] corpus=123 line-a`. The expectations follow;
   - `backend/tests/log-socket.test.js:102-210`: the broadcasts use a recognized label (`[get_bib_pages][corpus=1] a`) instead of `[x]`; the expectations follow.
 
@@ -473,26 +473,37 @@ test('readLogWindow continues into olderBase only when asked', async () => {
 })
 
 // access-routes.test.js — the existing describe keeps its users, corpora and two-line pipeline log (moved to the v2 name
-// and the writer format); its tests keep their expectations, including viewer3's 403 on the foreign corpus B.
-// A new describe('logs: readable scope and log generations') has its own temp DB and log dir: member9 belongs to
-// corpora A and B, corpus C is foreign to it; admin as usual.
-// The v2 file holds, with ts = '[2026-01-01T00:00:00.000Z]': `${ts} [get_bib_pages][corpus=${ids.A}] line-a`,
-// `${ts} [get_bib_pages][corpus=${ids.B}] line-b`, `${ts} [get_bib_pages][corpus=${ids.C}] line-c`, `${ts} [p] untagged-line`,
-// `${ts} [get_bib_pages][corpus=none] line-n` and `${ts} [DAEMON] Job 9 failed: corpus=${ids.A} boom` (six lines, nothing else).
+// and the writer format in Step 3); its tests keep their expectations, including viewer3's 403 on the foreign corpus B.
+// The new cases reuse the module's temp DB (DB_PATH is fixed at import) with their own users and corpora, inserted
+// in a beforeAll: corpora E, F, G; member9 belongs to E and F (last_corpus_id E), G is foreign to it. Each test
+// writes its own log dir (fs.mkdtempSync) and sets RAG_FEEDER_LOG_DIR, which getLogSettings reads per call.
+// The v2 file holds, with ts = '[2026-01-01T00:00:00.000Z]': `${ts} [get_bib_pages][corpus=${ids.E}] line-e`,
+// `${ts} [get_bib_pages][corpus=${ids.F}] line-f`, `${ts} [get_bib_pages][corpus=${ids.G}] line-g`, `${ts} [p] untagged-line`,
+// `${ts} [get_bib_pages][corpus=none] line-n` and `${ts} [DAEMON] Job 9 failed: corpus=${ids.E} boom` (six lines, nothing else).
 // The legacy `backend-pipeline.log` holds `${ts} [DAEMON] Job 8 failed: Traceback` followed by the raw continuation
-// `${ts} [get_bib_pages][corpus=${ids.A}] forged-legacy` (a complete recognized prefix).
+// `${ts} [get_bib_pages][corpus=${ids.E}] forged-legacy` (a complete recognized prefix).
 test('logs: scope=readable shows what the live socket would', async () => {
   const viewer = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('member9'))
-  expect(viewer.body.entries).toEqual([`${ts} [get_bib_pages][corpus=${ids.A}] line-a`, `${ts} [get_bib_pages][corpus=${ids.B}] line-b`])   // two readable corpora; C, untagged, none and the daemon text excluded
+  expect(viewer.body.entries).toEqual([`${ts} [get_bib_pages][corpus=${ids.E}] line-e`, `${ts} [get_bib_pages][corpus=${ids.F}] line-f`])   // two readable corpora; G, untagged, none and the daemon text excluded
   const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
   expect(admin.body.entries).toHaveLength(8)   // the six v2 lines plus the two legacy lines, legacy first
   expect(admin.body).not.toHaveProperty('total_lines')
 })
 test('logs: a legacy continuation with a complete recognized prefix never reaches a member', async () => {
-  // as member9: scope=readable, corpus_id=${ids.A} and the current-corpus fallback (last_corpus_id A), each with
-  // include_rotated=1 and a cursor past the v2 lines -> no entry contains 'forged-legacy'
+  // as member9, include_rotated=1, cursor 0, exact entries:
+  //   scope=readable          -> [line-e, line-f]
+  //   corpus_id=${ids.E}      -> [line-e]
+  //   no scope (fallback, E)  -> [line-e]
+  // each response has has_more false, so the reader saw every v2 line and nothing more ('forged-legacy' is absent)
 })
-test('logs: an explicit foreign corpus_id with scope=readable is still 403', async () => { /* ?type=pipeline&scope=readable&corpus_id=${ids.C} as member9 -> 403 */ })
+test('logs: a scoped admin read never includes the old generation', async () => {
+  // as admin, corpus_id=${ids.E}, include_rotated=1, cursor 0 -> exactly [line-e], has_more false
+})
+test('logs: an admin demoted during a merged read that includes the old generation gets no window', async () => {
+  // admin, scope=readable; inside the open spy, when the legacy file is opened, UPDATE users SET username = 'demoted'
+  // -> 409, no entries in the body
+})
+test('logs: an explicit foreign corpus_id with scope=readable is still 403', async () => { /* ?type=pipeline&scope=readable&corpus_id=${ids.G} as member9 -> 403 */ })
 test('logs: a scope value other than readable keeps the current-corpus fallback', async () => { /* scope=READABLE, scope=all -> same entries as no scope */ })
 test('logs: type=app stays admin-only with scope=readable', async () => { /* member9 ?type=app&scope=readable -> 403 */ })
 test('logs: a membership revoked during the read discards the window', async () => {
@@ -565,8 +576,11 @@ test('a pretty-printed block before trailing log lines is found', () => {
   // '[log] a\n{\n  "ok": true,\n  "n": [1, 2]\n}\n[log] done' -> { ok: true, n: [1, 2] }
   // '{\n "s": "a } ] {"\n}' -> { s: 'a } ] {' }  (brackets inside strings)
   // '{\n "q": "say \\"hi\\" \\\\"\n}' -> escaped quotes and backslashes inside a string
-  // '[log] it said "unterminated\n{\n "a": 1\n}' -> { a: 1 }  (a stray quote ends at the newline)
+  // '[log] it said "unterminated\n{\n "a": 1\n}' -> { a: 1 }  (a quote outside a block is ignored)
   // '{\n "a": 1\n} done' -> { a: 1 }  (D12 controller call: an outer block may have trailing text)
+})
+test('parity: diagnostic text with a quote before the first opener does not hide the block', () => {
+  // passes on 0702e47 and after, strict toEqual: 'warning " opening {\n  "ok": true\n}' -> { ok: true }
 })
 ```
 
@@ -592,7 +606,7 @@ test('the log type switch loads the app log without scope or corpus_id, then the
 })
 ```
 
-- [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/logs-tail-reader.test.js tests/access-routes.test.js tests/python-process.test.js tests/logs.test.js tests/log-socket.test.js`, then from `frontend/`: `E2E_FRONTEND_PORT=5190 npx playwright test tests/logs-stream.spec.ts --workers=1`. Expected: FAIL on these cases:
+- [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/logs-tail-reader.test.js tests/access-routes.test.js tests/python-process.test.js tests/logs.test.js tests/log-socket.test.js tests/extraction-models-route.test.js`, then from `frontend/`: `E2E_FRONTEND_PORT=5190 npx playwright test tests/logs-stream.spec.ts --workers=1`. Expected: FAIL on these cases:
   - `readLogWindow` and `logLineCorpusId` are not exported (only the tests that call them fail);
   - `readFileSync` is called;
   - the readable scope returns only the current corpus, and the daemon line with `corpus=` in its text passes the corpus filter;
@@ -607,7 +621,7 @@ test('the log type switch loads the app log without scope or corpus_id, then the
   - the parser has no `stats` hook (`visited` stays 0 while `JSON.parse` runs about 45k times), and `} done` does not parse;
   - no `scope` param.
 
-  Then `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_hygiene.py -q`: the new `test_log_escapes_line_breaks` fails. The type-switch spec and the existing `logs.test.js` and `log-socket.test.js` cases (with their fixtures moved to the writer format) pass on `0702e47`; they must keep passing.
+  Then `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_hygiene.py -q`: the new `test_log_escapes_line_breaks` fails. The type-switch spec and the existing `logs.test.js`, `log-socket.test.js` and `extraction-models-route.test.js` cases still use their old fixtures at this point and pass on `0702e47`. Step 3 moves those fixtures to the v2 file name and the writer format together with the cutover; after that they must pass again with their expectations unchanged in substance.
 - [ ] **Step 3: Implement D10 to D12.**
   - D10:
     - The pin is `await Promise.all(paths.map((p) => fs.promises.stat(p).then(({ dev, ino, size }) => ({ dev, ino, size }), () => null)))` over the window's paths, newest first.
@@ -616,14 +630,15 @@ test('the log type switch loads the app log without scope or corpus_id, then the
     - `ENOENT` on open for a file pinned as absent makes it count as empty.
     - Collected lines are pushed in the order they are found (newest first), and the window is reversed once before it is returned, so `entries` comes out oldest-first.
   - D11:
-    - The route passes `olderBase: legacyPipelineLogFile` only for a pipeline read by an admin (or in stub mode); every member or scoped read reads the v2 generation only.
+    - The route passes `olderBase: legacyPipelineLogFile` only in the merged branch for an admin or in stub mode; every scoped read (explicit or current corpus, for an admin too) and every member read reads the v2 generation only.
+    - Move the existing fixtures to `backend-pipeline-v2.log` and the writer format in the same step (see Files).
     - `logLineCorpusId` matches one anchored regex, `^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]`, and returns the number only when group 1 is in `SCOPED_LOG_LABELS`.
     - `logSocket.broadcast` formats `[${ts}] ${escapeLogLineBreaks(message)}`, appends it and delivers it with `logLineCorpusId(formatted)`; the `index.js` fallback escapes the same way. The worker's `log()` applies `msg.replace('\r\n', '\\n').replace('\r', '\\n').replace('\n', '\\n')` before formatting.
     - The route decides in the spec's order: `type=app` admin-only; a given `corpus_id` validated and membership-checked (403), then `accept = (l) => logLineCorpusId(l) === corpusId`; exact `scope === 'readable'` without `corpus_id` → admin or stub accepts every line, otherwise `accept = (l) => readable.has(logLineCorpusId(l))`; anything else → today's current-corpus fallback.
     - After `await readLogWindow(...)`, the route reloads the user with `getUserById(authDb, req.user.id)` and re-evaluates the branch it took: `type=app` → `isAdminUser(fresh)`; the merged branch → the same admin flag and the same `user_corpora` set; an explicit or current corpus → the fresh user may still read it. A missing user or any difference answers 409. Stub mode skips it.
     - `logSocket.js`'s `lineCorpusId` becomes `logLineCorpusId`; its `CORPUS_TAG_RE` is deleted.
     - The frontend passes `scope: logsFilterCurrentCorpus ? 'corpus' : 'readable'` from both loaders.
-  - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag reset at `\n`, and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. `bracketCloses` also records whether each opener was outer (empty stack). Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`, provided that the close ends its line or the block is outer. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
+  - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag (set only while the stack is non-empty, reset at `\n`), and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. `bracketCloses` also records whether each opener was outer (empty stack). Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`, provided that the close ends its line or the block is outer. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
 - [ ] **Step 4: Run the Task 3 backend files, then `npm test`; then `logs-stream.spec.ts` (it holds the type-switch case; `app.spec.ts` is never run); then `npx vite build`.** Expected: all pass. Also check that `grep -n "readFileSync" backend/src/app.js` lists no log reader.
 - [ ] **Step 5: Commit** — `logs/python: the log tail reads backwards in chunks and stops at its window, "Current corpus only" off loads every line the live view may show, corpus tags trusted only in a recognized writer's fixed position, line breaks escaped at both pipeline writers, the JSON fallback follows brackets in one scan within a parse budget (BE-10, FE-59, BE-42)`
 
@@ -724,10 +739,17 @@ test('two prefix responses whose stage_total disagree are rejected', async ({ pa
   // the rows stay as they were, "Refresh failed; showing earlier rows." shows, the header still reads "Loaded 1080/1100."
 })
 test('counts move only with their rows', async ({ page }) => {
-  // (a) committed stage 'downloaded' with 1,080 rows loaded; a quiet poll whose second prefix request answers 500:
-  //     rows and the header's "Loaded 1080/1100." stay unchanged;
+  // (a) committed stage 'downloaded' with 1,080 rows loaded (stage_total 1100); the next poll's first page has a changed
+  //     signature and stage_total 1101, so it triggers the prefix reload (and would expose the old early count update);
+  //     the second prefix request answers 500 (the route handler counts it: exactly one 500 served);
+  //     the rows stay the same 1,080 ids and the header still reads "Loaded 1080/1100.";
   // (b) a stage change to 'failed_download' that answers 500, then a quiet poll for that stage: it requests only the
   //     first page (no prefix reload, offset 0 only) and, once it answers, commits rows and header count together
+})
+test('a removal updates the committed counts even when the follow-up refresh fails', async ({ page }) => {
+  // stage 'downloaded', 120 of 150 loaded ("Loaded 120/150."); remove one row (the DELETE answers 200), the follow-up
+  // /api/corpus answers 500: the row is gone, the header reads "Loaded 119/149.", "Show more" is still offered;
+  // bulk-remove two more rows with the same failing follow-up: "Loaded 117/147."
 })
 test('row actions wait for the rows of the selected stage', async ({ page }) => {
   // hold the stage=downloaded response behind a deferred gate; select 'downloaded':
@@ -791,6 +813,7 @@ test('a failed tab import shows the error text and leaves the app usable', async
     - On a failed load the existing catch keeps the rows and sets `corpusRefreshFailed`; `corpusRowsStage` is unchanged, so the actions stay disabled until a load succeeds or the user selects `corpusRowsStage` again.
     - `corpusStageFilter` goes into `initialWorkspaceState()` and the restore beside `corpusFilterQuery`, so it survives a tab switch and resets on a corpus switch; `corpusRowsStage` resets with it. Nothing goes to `localStorage`.
     - `Corpus.svelte`'s `{#each}`, `selectableWorkIds` and the empty state use `corpusItems`. With `corpusRowsStale`, the row remove buttons, the checkboxes, select-all, the bulk remove, the expanded row's PDF button and "Show more" get `disabled`; `removeSelected`, `toggleSelectAll` and the row click handler (`toggleCorpusItemSelection`, which also expands) return early.
+    - `handleRemoveCorpusWork` and `handleRemoveSelectedCorpusWorks` count the rows their filter actually drops from `corpusItems`, subtract that from `corpusMatchTotal`, and recompute `corpusHasMore = corpusItems.length < corpusMatchTotal`, beside today's `corpusTotal` update; the follow-up `loadCorpus` reconciles.
   - D14: `await Promise.all([...])` replaces the three awaits and the two middle `stale()` checks.
   - D15: `{#await import('./components/ThreeGraph.svelte')}<p class="muted">Loading…</p>{:then module}<svelte:component this={module.default} … />{:catch}<p class="muted">Could not load this tab. Reload the page to try again.</p>{/await}`, and the same for `ScraperLab.svelte`. Remove the two static imports. `UpstreamBrowser` stays static (FE-17 in part).
 - [ ] **Step 4: Run `corpus-list.test.js`, then `npm test`; then the three Task 4 specs plus `graph-3d.spec.ts`, `table-columns.spec.ts`, `corpus-reconcile.spec.ts`, `tab-resources.spec.ts` and `refresh-scheduler.spec.ts`, one spec file at a time with `--workers=1`; then `npx vite build`.** Expected: all pass, and the build output has separate chunks for `ThreeGraph` and `ScraperLab`.

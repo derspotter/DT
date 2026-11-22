@@ -514,11 +514,17 @@ It is exported, and it reads as follows:
   `backend-pipeline-v2.log` (rotated as `.1` … `.5` by the same `index.js` code), in
   `index.js:13`, `getLogSettings` (`app.js:2444`) and the worker (`worker.py:125`).
   `getLogSettings` also names the old generation, `legacyPipelineLogFile =
-  backend-pipeline.log`. Member and scoped reads (a `corpus_id`, the current-corpus fallback, and
-  `scope=readable` for a non-admin) read only the new generation. An admin's pipeline read (or
-  stub mode) passes `olderBase: legacyPipelineLogFile`, so the old files stay readable for
-  admins only. There is no content-based legacy detection. Nothing writes the old files any
-  more; they age out by hand.
+  backend-pipeline.log`. Every scoped read (a `corpus_id` or the current-corpus fallback, for
+  an admin too) and every member read reads only the new generation. Only an unscoped pipeline
+  read, the merged branch (`scope=readable` without `corpus_id`) by an admin or in stub mode,
+  passes `olderBase: legacyPipelineLogFile`, so the old files stay readable for admins only,
+  and the post-read recheck of that branch is the admin flag. There is no content-based legacy
+  detection. Nothing writes the old files any more; they age out by hand.
+- Cutover: the enrich and download workers are separate long-running processes
+  (`docker-compose.yml:75`, `:119`). Until they restart on the new code they keep writing the
+  legacy file. The runbook (`OPS_RUNBOOK.md`) gains one deploy step: restart the backend and
+  both workers, then check that a fresh record from each worker appears in
+  `backend-pipeline-v2.log` and none in `backend-pipeline.log`.
 - `logLineCorpusId` replaces `extractLogCorpusTag` in the tail route (both the `corpus_id`
   filter and the merged branch). `logSocket.js` classifies the formatted line (timestamp
   included) with the same function instead of its own regex, so the history and the live view
@@ -538,8 +544,11 @@ controller call.**
 - The fast path is unchanged.
 - The fallback joins the trimmed lines with `\n` once into `text`, then makes one structural
   scan over it: `bracketCloses(text) -> Map<number, number>`, opener index → matching close
-  index. The scan keeps a stack of open `[`/`{` positions and skips JSON strings, honouring
-  `\"` and `\\`. A string ends at the next newline at the latest (a JSON string cannot hold a
+  index. The scan keeps a stack of open `[`/`{` positions and, inside an open block only,
+  skips JSON strings, honouring `\"` and `\\`. Outside any block (empty stack) it ignores
+  everything but openers, so diagnostic text before the first opener, such as `warning "
+  opening {`, cannot start a string. That case is a strict parity test: `warning " opening {\n
+  "ok": true\n}` gives `{ ok: true }` today and after. A string ends at the next newline at the latest (a JSON string cannot hold a
   raw newline), so an unbalanced quote in a log line cannot swallow the rest of the output. A
   close that does not match the top of the stack clears the stack. Each character is visited
   once; an opener that never closes has no entry.
@@ -615,6 +624,10 @@ controller call.**
   selects the committed stage again.
 - `fetchCorpus` sends `stage` unless it is `'all'`. The poll's prefix reload sends it too.
   `corpusPageSignature` includes it.
+- A successful single or bulk removal updates the committed counts with the rows actually
+  removed from the current view: `corpusMatchTotal` drops by that number and `corpusHasMore`
+  is recomputed, next to today's `corpusTotal` update (`App.svelte:2905-2935`); the follow-up
+  load then reconciles from the server. A failed follow-up leaves those values.
 - `applyCorpusCounts` takes `stageTotal`. `corpusHasMore`, the "Showing N of M" text, the
   header's `Loaded N/M` and the prefix reload's consistency check (`totals.size === 1`) use it.
 - The Python oracle (`corpus_list.py`) has no `stage_total`. The parity tests compare
