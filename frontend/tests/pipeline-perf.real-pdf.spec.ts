@@ -224,10 +224,23 @@ test.describe('Real PDF pipeline performance', () => {
     const extractedCount = Math.max(entryIds.length, extractionSettled.finalCount)
     expect(extractedCount).toBeGreaterThan(0)
 
-    const requestedBatch = Math.min(10, entryIds.length)
-    const enqueuePayload = await authedJson(request, token, '/api/ingest/enqueue', 'POST', {
-      entryIds: entryIds.slice(0, requestedBatch),
-    })
+    // The candidates endpoint ranks downloaded entries first, and enqueue skips those; only entries
+    // that can still be enriched (not downloaded, not already queued) are submitted.
+    const ENRICHABLE_STATES = new Set(['staged_raw', 'pending', 'failed_enrichment'])
+    const enrichableIds = entries
+      .filter((item: any) => ENRICHABLE_STATES.has(String(item.state || '')))
+      .map((item: any) => Number(item.id))
+      .filter((value: number) => Number.isFinite(value))
+      .slice(0, 10)
+    const requestedBatch = enrichableIds.length
+    let enqueuePayload: any = {}
+    if (requestedBatch === 0) {
+      console.log('[pipeline-perf] enrichment skipped: no candidate is eligible for enrichment (all downloaded or already queued)')
+    } else {
+      enqueuePayload = await authedJson(request, token, '/api/ingest/enqueue', 'POST', {
+        entryIds: enrichableIds,
+      })
+    }
     const markedBatch = Number(enqueuePayload?.marked || 0)
 
     let enrichPayload: any = { processed: 0, promoted: 0, failed: 0, queued: 0 }
