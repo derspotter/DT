@@ -38,6 +38,8 @@ type State = {
   unlinks: number[][]
   unlinkHold: Promise<void> | null
   onUnlink: (ids: number[]) => void
+  // The bulk unlink's removed_work_ids, when not every requested id.
+  removedIds: number[] | null
 }
 
 // The default corpus: 300 works with ids 1-300, paged by offset; `q` answers
@@ -104,7 +106,7 @@ async function boot(page: Page, state: State) {
       state.unlinks.push(ids)
       if (state.unlinkHold) await state.unlinkHold
       state.onUnlink(ids)
-      return fulfil(route, unlink ? { success: true } : { success: true, removed_work_ids: ids })
+      return fulfil(route, unlink ? { success: true } : { success: true, removed_work_ids: state.removedIds ?? ids })
     }
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
     if (path === '/api/openalex/quota') return fulfil(route, { available: false })
@@ -121,7 +123,7 @@ async function boot(page: Page, state: State) {
 function newState(overrides: Partial<State> = {}): State {
   return {
     corpusId: 1, requests: [], holds: [], rows: defaultRows, status: 'downloaded',
-    fail: () => false, failed: 0, tag: '', unlinks: [], unlinkHold: null, onUnlink: () => {},
+    fail: () => false, failed: 0, tag: '', unlinks: [], unlinkHold: null, onUnlink: () => {}, removedIds: null,
     ...overrides,
   }
 }
@@ -559,8 +561,8 @@ test('a failed stage load keeps the old rows inert until the user reverts', asyn
   gate.release()
 })
 
-for (const bulk of [false, true]) {
-  test(`a ${bulk ? 'bulk ' : ''}removal answered after a stage switch is counted once`, async ({ page }) => {
+for (const [bulk, followUpFails] of [[false, false], [true, false], [false, true], [true, true]]) {
+  test(`a ${bulk ? 'bulk ' : ''}removal answered after a stage switch is counted once${followUpFails ? ', also when the follow-up fails' : ''}`, async ({ page }) => {
     const state = newState()
     // The unlink commits on arrival; its response is held.
     const removed = () => new Set(state.unlinks.flat())
@@ -592,9 +594,12 @@ for (const bulk of [false, true]) {
     await expect(rows(page).first()).toHaveAttribute('data-work-id', '501')
     await expect(allLabel).toHaveText(`All stages (${expected})`)
     const before = state.requests.length
+    if (followUpFails) state.fail = () => true
     unlink.resolve()
-    // The follow-up answers the same first page, and its counts still apply.
+    // The follow-up answers the same first page, and its counts still apply;
+    // when it fails, the stage load's counts already hold the removal.
     await expect.poll(() => state.requests.length).toBeGreaterThan(before)
+    if (followUpFails) await expect.poll(() => state.failed).toBeGreaterThan(0)
     await page.waitForTimeout(300)
     await expect(allLabel).toHaveText(`All stages (${expected})`)
     await expect(page.getByTestId('workspace-sticky-bar')).toContainText(`3 Corpus (${expected})`)
@@ -612,4 +617,23 @@ test('a stage request that fails before the first rows commit says so', async ({
   await expect.poll(() => state.failed).toBeGreaterThan(0)
   await expect(header(page)).toContainText('Corpus not loaded. The last load failed.')
   first.release()
+})
+
+test('a bulk removal that removed nothing does not reload the loaded rows', async ({ page }) => {
+  const state = newState({ removedIds: [] })
+  page.on('dialog', (dialog) => dialog.accept())
+  await boot(page, state)
+  await expect(rows(page)).toHaveCount(120)
+  await showMore(page).click()
+  await expect(rows(page)).toHaveCount(240)
+  await rows(page).nth(0).locator('.ingest-select-cell input').check()
+  const before = state.requests.length
+  await panel(page).getByRole('button', { name: 'Remove selected' }).click()
+  await expect.poll(() => state.unlinks.length).toBe(1)
+  await expect.poll(() => state.requests.length).toBeGreaterThan(before)
+  await page.waitForTimeout(500)
+  // The follow-up's first page is unchanged: no prefix reload of the 240 rows.
+  expect(state.requests.slice(before).filter((params) => params.limit > 120)).toEqual([])
+  await expect(rows(page)).toHaveCount(240)
+  await expect(header(page)).toContainText('Live corpus from API.')
 })

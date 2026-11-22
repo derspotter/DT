@@ -421,6 +421,8 @@
   let corpusRowsStage = 'all'
   // Rows matching filter and stage: the paging total ("Show more", Loaded N/M).
   let corpusMatchTotal = 0
+  // Bumped whenever a corpus load commits rows and counts (removals compare it).
+  let corpusCommitGeneration = 0
   $: corpusRowsStale = corpusRowsStage !== corpusStageFilter
   let seedFilterDebounce = null
   let corpusFilterDebounce = null
@@ -2914,13 +2916,18 @@
     loadCorpus({ quiet: true, supersede: true })
   }
 
-  // A removal drops rows from the committed view: the paging total moves with
-  // them, so "Show more" and Loaded N/M stay right if the follow-up fails.
-  function dropCorpusRows(keep) {
+  // A removal drops rows from the committed view. The counts move with them,
+  // so "Show more" and Loaded N/M stay right if the follow-up fails, unless
+  // a corpus load committed after the unlink began (`generation` is
+  // corpusCommitGeneration then): its counts already reflect the deletion, so
+  // subtracting again would count it twice. Returns whether it subtracted.
+  function dropCorpusRows(keep, generation) {
     const before = corpusItems.length
     corpusItems = corpusItems.filter(keep)
-    corpusMatchTotal = Math.max(0, corpusMatchTotal - (before - corpusItems.length))
+    const subtract = generation === corpusCommitGeneration
+    if (subtract) corpusMatchTotal = Math.max(0, corpusMatchTotal - (before - corpusItems.length))
     corpusHasMore = corpusItems.length < corpusMatchTotal
+    return subtract
   }
 
   // Unlinks the work from this corpus only — the work row and its PDF survive,
@@ -2930,14 +2937,15 @@
     if (!Number.isFinite(workId) || workId <= 0) return
     // A corpus switch while the unlink runs: its answer is the old corpus's.
     const epoch = corpusScopeEpoch
+    const generation = corpusCommitGeneration
     try {
       await removeCorpusWork(workId)
       if (epoch !== corpusScopeEpoch) return
-      dropCorpusRows((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
-      corpusTotal = Math.max(0, corpusTotal - 1)
-      // The follow-up must commit the server's counts even when its first
-      // page matches the last one: a load committed while the unlink ran may
-      // already have counted the removal that was just subtracted again.
+      if (dropCorpusRows((entry) => Number(entry?.work_id ?? entry?.id) !== workId, generation)) {
+        corpusTotal = Math.max(0, corpusTotal - 1)
+      }
+      // The follow-up commits the server's counts even when its first page
+      // matches the last one.
       lastCorpusPageSignature = ''
       await Promise.all([
         loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
@@ -2958,15 +2966,18 @@
       .filter((value) => Number.isFinite(value) && value > 0)
     if (ids.length === 0) return
     const epoch = corpusScopeEpoch
+    const generation = corpusCommitGeneration
     try {
       const result = await removeCorpusWorks(ids)
       if (epoch !== corpusScopeEpoch) return
       const removed = new Set((result?.removed_work_ids || ids).map((value) => Number(value)))
-      dropCorpusRows((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
-      corpusTotal = Math.max(0, corpusTotal - removed.size)
+      if (dropCorpusRows((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)), generation)) {
+        corpusTotal = Math.max(0, corpusTotal - removed.size)
+      }
       corpusLoadStatus = `Removed ${removed.size} item(s) from this corpus.`
-      // See handleRemoveCorpusWork: the follow-up always commits its counts.
-      lastCorpusPageSignature = ''
+      // See handleRemoveCorpusWork. Nothing removed: the page did not change,
+      // so the signature shortcut may stand.
+      if (removed.size > 0) lastCorpusPageSignature = ''
       await Promise.all([
         loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
@@ -3964,6 +3975,7 @@
       if (!append) corpusRowsStage = requestStage
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
       applyCorpusCounts(total, stageTotals, stageTotal)
+      corpusCommitGeneration += 1
       corpusSource = source
       if (!append) corpusRefreshFailed = false
       // A quiet load that committed rows (a stage change, a poll) keeps the
