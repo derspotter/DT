@@ -710,7 +710,7 @@ controller call.**
 
 **D10. Worker errors are text (FE-23, error-text half).**
 - A local function in `App.svelte`, `workerErrorText(details) -> string`, returns the first
-  non-empty string of `details.error` and `details.message`, then `details.state`. With none of
+  non-blank (not whitespace-only) string of `details.error` and `details.message`, then `details.state`. With none of
   them, it returns `JSON.stringify(details || {})`. It has one caller, so it stays in
   `App.svelte`; no new module.
 - `loadPipelineWorkerStatus` uses it for both `last_error` values.
