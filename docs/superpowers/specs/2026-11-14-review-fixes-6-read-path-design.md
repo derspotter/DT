@@ -28,7 +28,8 @@ inventory also uses the id BE-51 for an unrelated Phase 3 row (stale `/tmp/dt-je
 directories). This spec uses BE-51 only for the graph-node lookup.
 
 **Ruled out (non-goals, with reasons):** BE-03, BE-35, BE-38, BE-39, BE-47, FE-20, FE-21,
-PY-25, PY-31. BE-34 is fixed only in part, where the call runs once per candidate. Where a
+PY-25, PY-31. BE-34 is fixed only in part, where the call runs once per candidate. FE-17 is
+fixed only in part: `UpstreamBrowser` stays in the main chunk (D15). Where a
 decision is a product choice, it says **controller call**. Those calls go to the owner as a
 list at the end.
 
@@ -153,8 +154,9 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
 ## Goals
 
 - No poll and no click does work that grows with corpus size when the answer does not need it:
-  the seed list, the seed candidate file, the Kantropos browse, the graph node and cluster
-  clicks.
+  the seed list endpoint (`/api/seed/sources`), the Kantropos browse, the graph node and
+  cluster clicks. The seed candidate file drops the corpus-local resolver and the full-seed
+  listing; it still uses the cached global index and its fingerprint (D2, D3).
 - No request handler reads a multi-MB file or gzips synchronously. The log tail reads only what
   the window needs.
 - Every claim is pinned by a test of the mechanism: a query plan, a statement or call count, a
@@ -181,20 +183,29 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
   (1.6 ms per 100 lines). In exchange, the rotation would change, and the worker's `samestat`
   handle check (`worker.py:114-120`) depends on that rotation.
 - **BE-39 is ruled out.** Log-driven refreshes already coalesce: `scheduleRefresh` keeps the
-  earliest pending timer (`App.svelte:1343-1346`). Log volume therefore triggers at most one
-  refresh per 1.5 s window per tab. Structured refresh events would be a refactor with no
-  measured gain.
+  earliest pending timer (`App.svelte:1343-1346`). A log line asks for a refresh in 1.5 s, a
+  worker tick line in 300 ms (`REFRESH_WORKER_TICK_MS`, `App.svelte:4474`). Log volume
+  therefore triggers at most one refresh per pending timer per tab: at most one per 300 ms
+  while worker ticks arrive, else one per 1.5 s. That rate does not grow with log volume.
+  Structured refresh events would be a refactor with no measured gain.
 - **FE-20 and FE-21 are ruled out.** Uploads persist a few hundred bytes a handful of times per
   file. The handlers are event-driven, not per log line. The Korpus Management filter runs over
   at most 1,000 loaded rows; the server clamps each list at 500.
 - **PY-25 is ruled out.** The quota snapshot costs about five metadata syscalls, with no fsync,
   against an OpenAlex round trip of 100 ms or more.
 - **PY-31 is ruled out.** The export runs out of process, at low priority and hourly, and the
-  previous snapshot is served while it runs. It streams the edges through a cursor and does not
-  materialise them. The all-corpora snapshot needs every edge.
+  previous snapshot is served while it runs. It streams the SQLite rows through a cursor, but it
+  materialises the accepted edges (those among the allowed nodes) before the node cap
+  (`graph_3d_export.py:923-925`). The cap selects nodes by degree, which needs every accepted
+  edge, so trimming that list would change the node selection. The out-of-process, hourly
+  cadence keeps the cost off the request path; the work stays deferred.
 - **The candidates route still builds the corpus-local resolver.** After D1 it runs only on a
-  user's expand, page, sort or filter, and on the expanded seed while a search runs
-  (`App.svelte:3194-3198`). Two fixes were rejected:
+  user's expand, page, sort or filter, and on the expanded seed's background reload while a
+  search runs (`App.svelte:3194-3198`). It also calls `loadGlobalDownloaded`, which computes
+  the works fingerprint (a grouped count over `works`, `MAX(id)` and an alias count,
+  `seed.js:301-310`) before it consults its cache, and rebuilds the index when the fingerprint
+  changes or the 5-minute max age expires. The fingerprint design is unchanged in this phase.
+  Two fixes were rejected:
   - A per-corpus cache would need a fingerprint, which misses same-count state swaps (the global
     cache accepts 5 minutes of staleness for that).
   - Per-candidate indexed matching would need the JS and Python title normalisations to agree.
@@ -228,36 +239,49 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
 - The search branch is unchanged (SQL count). The comment at `seed.js:295-297` is corrected:
   the corpus-local half holds every corpus row.
 
-**D2. The candidate file route resolves one candidate (BE-05).** New
-`findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, candidateKey) -> number | null`
-in `seed.js` returns the work id to serve, or `null` for 404. It works in four steps:
+**D2. The candidate file route resolves one candidate and serves only a readable work
+(BE-05).** New
+`findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork) -> number | null`
+in `seed.js` returns the work id to serve, or `null` for 404. `canReadWork(workId) -> boolean`
+is the existing work-read rule, passed in by the route as `(id) => workReadableByUser(authDb,
+req.user, id, authConfig)` (`app.js:468`): an admin reads every work, anyone else only works in a
+corpus they belong to. There is no cross-corpus PDF sharing. It works in five steps:
 
-1. The `candidateKey` must be `ingest:<id>` for `pdf` or `search:<id>` for `search`, with a
-   positive integer id. Anything else gives `null`.
+1. The `candidateKey` must match `/^(ingest|search):([1-9]\d*)$/`, with the prefix that belongs
+   to `sourceType` (`ingest` for `pdf`, `search` for `search`). Anything else gives `null`. The
+   key bound below is the canonical `buildCandidateKey(sourceType, id)`.
 2. The one row is read with today's scoping:
-   - pdf: `ingest_entries WHERE id = ? AND corpus_id = ? AND ingest_source = ?`, and `null`
-     when its key is dismissed;
-   - search: the `searchCandidateWhere(corpusId, runId, sourceRef, '')` clause plus
-     `AND sr.id = ?`. That clause already excludes dismissed rows and other corpora's runs.
-3. The row goes through `normalizePdfCandidate` or `normalizeSearchCandidate` with a reduced
-   resolver bundle, built from `loadGlobalDownloaded(db)` (the cached half):
-   - `resolveState` gives `'downloaded'` when `findIdsWithAliases` finds a match, else
-     `'pending'`;
-   - `isInCorpus` gives `false`;
-   - `resolveDownloadedWorkId` iterates the matched ids in order and returns the first one for
-     which `SELECT 1 FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE cw.corpus_id
-     = ? AND cw.work_id = ? AND lower(trim(w.download_status)) = 'downloaded'` finds a row.
-     Otherwise it returns the first matched id.
-4. The function returns that id when it is positive and the state is `'downloaded'`, else
-   `null`.
+   - pdf: `ingest_entries WHERE id = ? AND corpus_id = ? AND ingest_source = ?`. The dismissal
+     is one probe by the table's full primary key: `SELECT 1 FROM seed_candidates_dismissed
+     WHERE corpus_id = ? AND source_type = 'pdf' AND source_key = ? AND candidate_key = ?`, bound
+     with the canonical key. A hit gives `null`.
+   - search: the join the count and the list already use, `FROM search_results sr JOIN
+     search_run_corpora src ON src.search_run_id = sr.search_run_id WHERE
+     <searchCandidateWhere(corpusId, runId, sourceRef, '')> AND sr.id = ?`. That clause already
+     excludes dismissed rows and other corpora's runs.
+3. The row goes through `normalizePdfCandidate` or `normalizeSearchCandidate` only to build the
+   match fields, with a stub bundle (`resolveState: () => 'pending'`, `resolveDownloadedWorkId:
+   () => null`, `isInCorpus: () => false`).
+4. The matched ids are computed once: `findIdsWithAliases(candidate, global.lookup,
+   global.aliasIndex)` with `global = loadGlobalDownloaded(db)` (the cached half). The global
+   index holds downloaded works only, so every matched id is a downloaded work.
+5. The matched ids, in match order, are filtered through `canReadWork`. Among the readable ids,
+   the first one in the current corpus wins (one prepared probe, `SELECT 1 FROM corpus_works
+   WHERE corpus_id = ? AND work_id = ?`, reused per id). Otherwise the first readable id wins.
+   No readable id gives `null`.
 
-The result is the same decision the full resolver makes today; a parity test pins it. The
-route keeps its read-only row fetch, path resolution and `res.download`.
+For every match the caller may read, the decision is the one the full resolver makes today; a
+parity test pins it for an admin. A match that lies only in corpora the caller cannot read now
+gives 404, where today the route served that file. The route keeps its read-only row fetch, path
+resolution and `res.download`.
 
 **D3. No boot warm-up (BE-09), controller call.** `app.warmSeedState` and the `index.js` timer
-are removed. After D1, no poll builds the global index. The first expand, promote or candidate
-file after a deploy pays for the build, about 1.5 s live, once per fingerprint change, which
-the existing cache already decides.
+are removed. After D1, the seed-list poll builds no index. The candidates route and the
+candidate file still call `loadGlobalDownloaded`: they pay the fingerprint on every call and the
+build when the fingerprint changes or the max age expires, which the existing cache already
+decides. The candidates route also runs from the expanded seed's background reload while a
+search runs (`App.svelte:3194-3198`). The first such call after a deploy pays for the build,
+about 1.5 s live.
 
 **D4. One probe per path (BE-48, BE-34 in part).**
 - `app.js` gains `downloadedFilePathCandidates(storedPath, context) -> string[]`: today's
@@ -283,51 +307,90 @@ WHERE source_id IN (SELECT value FROM json_each(?)) AND target_id IN (SELECT val
 
 Both parameters are `JSON.stringify([...allowedNodeIds])`. The plan uses the table's UNIQUE
 autoindex (`sqlite_autoindex_citation_edges_1 (source_id=? AND target_id=?)`, 23 ms). No new
-index is needed. `addEdge` keeps its checks, so the payload is unchanged.
+index is needed. `addEdge` keeps its checks.
 
-**D6. Pending works in two passes; cheap stats; bib count keyed by stat (BE-11), controller
-call (the memo).**
-1. **Pass 1** reads `w.id, w.file_path, cw.corpus_id`, with the same joins and `WHERE` as today,
+The contract changes in two ways, and both are documented as the contract:
+- Endpoint ids are canonical (trimmed) node ids. The index compares stored values exactly, so a
+  stored endpoint with surrounding whitespace, which `addEdge` trimmed before, no longer
+  matches.
+- `graph.edges` is an unordered set. Its order follows the index instead of the table's rowid
+  order.
+
+The golden test compares the edges as sets and includes a padded endpoint that is expected to
+drop out.
+
+**D6. Pending works in two passes in one snapshot; cheap stats; bib count keyed by stat
+(BE-11), controller call (the memo).**
+1. Pass 1 and pass 2 run inside one short read transaction (`db.transaction(fn)()`, as
+   `listCorpus` does): in WAL mode both SELECTs see one snapshot, so a worker commit between
+   them cannot make the summary and the page disagree. Nothing asynchronous runs inside it.
+2. **Pass 1** reads `w.id, w.file_path, cw.corpus_id`, with the same joins and `WHERE` as today,
    ordered `COALESCE(w.year, 0) DESC, w.id DESC`. From those rows it computes, in that order and
    with the imported-set exclusion:
    - the distinct work ids;
-   - the file-missing set;
+   - the file-missing set, with one probe per distinct work (a work in several corpora has
+     several rows and is probed once);
    - each work's corpus ids, for the per-corpus `pending_count`.
-2. **Pass 2** reads today's full `SELECT w.*, c.id AS corpus_id, …` with the extra term `AND
-   w.id IN (SELECT value FROM json_each(?))`, restricted to the first `pendingLimit` work ids,
-   in today's order (`…, LOWER(c.name), c.id`). It maps those rows exactly as today.
+3. **Pass 2** reads today's full `SELECT w.*, c.id AS corpus_id, …` with the extra term `AND
+   w.id IN (SELECT value FROM json_each(?))`, bound with the first `pendingLimit` work ids of
+   pass 1, in today's order (`…, LOWER(c.name), c.id`). It maps those rows exactly as today.
 
 The function returns `{ items, totalCount, missingFileCount, pendingCountByCorpus }`.
 `buildKantroposBrowsePayload` derives every summary field from these values with today's
-formulas. The JSON payload is unchanged; a fixed-fixture test pins it.
+formulas. The JSON payload is unchanged; a fixed-fixture test pins it, including a file-missing
+work outside the page.
 
 `upstreamFileIsPresent` uses `fs.statSync(raw, { throwIfNoEntry: false })?.isFile() === true`
 inside its `try`, which drops the exception cost of a missing file (322 → 39 ms per 24k). It
 stays synchronous: async `stat` takes 1.4 s of wall time for the same set.
 
-`countBibEntriesInFile(filePath, stats)` keeps a module-level `Map` of `path → { mtimeMs, size,
-count }`. It reads the file again only when `mtimeMs` or `size` changed. The overview passes
-the `stats` it already holds. The map is bounded by the configured Kantropos targets.
+`countBibEntriesInFile(filePath, stats) -> Promise<number | null>` keeps a module-level `Map` of
+`path → { mtimeMs, size, count }`. A hit (same `mtimeMs` and `size`) returns the count without a
+read. A miss reads the file with `fs.promises.readFile`, counts, and stores the entry only when
+the read succeeded; a failed read returns `null` and stores nothing. The map is bounded by the
+configured Kantropos targets.
+
+`listKantroposCorporaOverview(db, { targetId } = {})` becomes async. With `targetId` it stats
+and counts only that target; the browse passes its own target, so it no longer counts the other
+targets' files. `/api/kantropos/corpora` passes none and counts every target, each through the
+memo. The bib count runs after the read transaction.
 
 **D7. Graph node lookup by index (BE-36 = BE-51), controller call.** New exported
 `findGraphNodeWork(db, nodeId, selectList, columns) -> row | undefined` in `app.js` makes at
-most one probe per form:
-- `/^\d+$/` gives `WHERE w.id = ?`;
+most one probe per form. The node id is trimmed by the route, as today. The accepted forms are:
+- plain decimal digits (`/^\d+$/`, for example `12`; leading zeros are read as `Number` does)
+  give `WHERE w.id = ?`;
+- the exporter's fallback id `work:<digits>` (`derive_node_id`, `graph_3d_export.py:148`) gives
+  the same `WHERE w.id = ?` probe; today it always answers 404;
 - any other id first tries `WHERE w.openalex_id = ? AND w.openalex_id != ''` (the partial
   unique index `idx_works_openalex_id`);
 - after that it tries `WHERE w.normalized_doi = ? AND w.normalized_doi != ''`
   (`idx_works_normalized_doi`) when the column exists.
 
+Other numeric spellings that `Number()` accepted today (`12.0`, `1e1`, `0x0c`) no longer resolve
+as ids; they fall through to the openalex and DOI probes and answer 404.
+
 The explicit `!= ''` term is what lets SQLite use the partial indexes (the PY-02 lesson).
 Raw `w.doi = ?` is dropped. A DOI node id is `normalize_doi(doi)` (`graph_3d_export.py:148-149`),
 which is the `normalized_doi` key. Today's raw comparison misses most stored DOIs, which are
-lowercase. The route keeps its 404 for unreadable works.
+lowercase.
+
+The lookup is scan-free on both schemas. `ensureAuthSchema` creates the two partial indexes
+with the same DDL as `db_manager.py`'s `WORKS_INDEXES` (`CREATE UNIQUE INDEX IF NOT EXISTS
+idx_works_openalex_id …` and `… idx_works_normalized_doi …`), each when `works` has the column.
+A database the Python side initialised already has them, so the statements are no-ops there.
+If a statement fails on duplicate values (a Node-only database), `ensureAuthSchema` logs a
+warning and continues; the lookup then still answers, by scan.
+
+The route keeps its 404 for unreadable works, for every accepted form.
 
 **D8. Cluster detail from the loaded snapshot (BE-37), controller call.**
-- `loadClusterDetail` sets `selectedClusterDetail = cluster`, the object from
-  `graphData.clusters`, which is the same `clusters.json` content. It sends no request.
-- `clusterDetailCache`, `fetchGraph3DClusterDetail` and the route
-  `/api/graph/3d/cluster/:snapshotKey/:clusterId` (`app.js:5574-5592`) are removed.
+- The cluster panel renders `selectedClusterData`, which `ThreeGraph` already derives from the
+  selected cluster and `graphData.clusters` (`ThreeGraph.svelte:1838`), the same
+  `clusters.json` content. It sends no request.
+- `selectedClusterDetail`, `selectedClusterPanel`, `loadClusterDetail`, `clusterDetailCache`,
+  `fetchGraph3DClusterDetail` and the route `/api/graph/3d/cluster/:snapshotKey/:clusterId`
+  (`app.js:5574-5592`) are removed. A request to the old route answers 404.
 - `graph-access.test.js` keeps the scope checks on the snapshot file route
   (`/api/graph/3d/snapshot/:key/clusters.json`).
 
@@ -338,7 +401,9 @@ cluster.
 in `app.js` runs `await pipeline(fs.createReadStream(p), zlib.createGzip(), fs.createWriteStream(`${p}.gz`))`
 (`node:stream/promises`) for each existing file, one after another. `buildGraph3dSnapshot`
 awaits it with `['nodes_meta.json', 'clusters.json', 'nodes.bin', 'edges.bin']`. The output is
-byte-compatible: `gunzipSync(gz)` equals the source.
+byte-compatible: `gunzipSync(gz)` equals the source. The test drives the real
+`buildGraph3dSnapshot` through the snapshot route, with a fake export script, and checks the
+stream calls and the absence of synchronous payload reads.
 
 ### Backend and frontend: logs and child output (Task 3)
 
@@ -361,6 +426,15 @@ It is exported, and it reads as follows:
   window. Reading stops once line `cursor + limit` has been seen (that is `hasMore`) or the
   files are exhausted.
 - A missing file counts as empty, as `readTailLinesFromFile` does today.
+- The window is pinned against rotation (`index.js:25-41` renames `base` to `base.1` and shifts
+  the backups). Before the first read, the reader stats every file of the window and keeps
+  `{ dev, ino, size }` per path (a missing file pins as absent). Each file is read only up to its
+  pinned size, so a line appended meanwhile is not counted. After each `open`, `handle.stat()`
+  must show the pinned `dev` and `ino`; an absent pin must still be absent. A mismatch means a
+  rotation ran during the read: the reader drops what it collected and starts over once with a
+  fresh pin. A second mismatch throws, and the route answers `503 { error: 'Log rotated during
+  the read; retry' }`. A file is therefore never read twice under two names, and the cursor
+  never skips older lines.
 - `entries` is in file order, oldest first, as today. `nextCursor = cursor + entries.length`.
 - The response drops `total_lines`, which nobody reads: neither the frontend nor any test, and
   computing it needs the full read this removes.
@@ -374,23 +448,50 @@ It is exported, and it reads as follows:
   sends `scope=readable` and no `corpus_id`.
 - The App sends `scope: logsFilterCurrentCorpus ? 'corpus' : 'readable'` from
   `hydrateLogsFromTail` and `loadOlderLogs` (`App.svelte:4268-4274`, `:4319-4325`).
-- With `scope=readable` and no `corpus_id`, the tail route applies the socket's rule:
-  - an admin, or stub mode, accepts every line;
-  - any other user accepts a line whose `corpus=<n>` tag is numeric and names a corpus in
-    `SELECT corpus_id FROM user_corpora WHERE user_id = ?`.
-- Without `scope`, the route keeps today's fallback to the current corpus. A given
-  `corpus_id` still wins and is checked as today. App logs stay admin-only.
+- The route decides in this order:
+  1. `type=app` stays admin-only, as today; `scope` is ignored for it.
+  2. A given `corpus_id` always goes through today's validation and membership check (403 for a
+     foreign corpus), also when `scope=readable` is sent with it. It then filters on that
+     corpus's tag.
+  3. Only the exact value `scope=readable` without a `corpus_id` reaches the merged branch. Any
+     other `scope` value, or none, keeps today's fallback to the current corpus.
+  4. In the merged branch, an admin or stub mode accepts every line. Any other user accepts a
+     line whose trusted tag names a corpus in `SELECT corpus_id FROM user_corpora WHERE user_id
+     = ?`.
+- A corpus tag is trusted only in the writer's prefix: a `[corpus=<digits>]` group inside the
+  line's leading run of bracket groups (`[ts] [label][corpus=12] …`,
+  `[extract-status] [corpus=12] [base=…]`), the first such group winning. A `corpus=` inside the
+  message text, or a line whose leading run holds `[DAEMON]` (the worker writes no tags, and its
+  messages carry arbitrary exception text, `worker.py:143-152`, `:1482`), is unclassified, and an
+  unclassified line is admin-only. The new exported `logLineCorpusId(line) -> number | null` in
+  `app.js` implements the rule. It replaces `extractLogCorpusTag` in the tail route (both the
+  `corpus_id` filter and the merged branch), and `logSocket.js` uses it instead of its own
+  regex, so the history and the live view classify a line the same way. Every tag the backend
+  writes today is in that prefix (`app.js:4235-4576`).
+- The read is asynchronous (D10), so the route rechecks access before it answers: it re-runs
+  the lookup the window was built with (the admin flag and the `user_corpora` set in the merged
+  branch; the membership of the given or current corpus otherwise) once. If the result
+  differs, the window is discarded and the route answers `409 { error: 'Log access changed
+  during the read' }`. Stub mode skips the recheck.
 
-**D12. The fallback parser follows brackets (BE-42), controller call.**
+**D12. The fallback parser follows brackets in one pass (BE-42), controller call.**
 - The fast path is unchanged.
-- The fallback joins the trimmed lines with `\n` once into `text`. From the last line to the
-  first, at each line's first `[` or `{`, it finds the matching close with
-  `matchingCloseIndex(text, start) -> number`: a depth counter over `[{` and `]}` that skips
-  JSON strings, honouring `\"` and `\\`. It returns `-1` when the bracket is unclosed. When a
-  close exists, it tries `JSON.parse(text.slice(start, close + 1))` once.
+- The fallback joins the trimmed lines with `\n` once into `text`, then makes one structural
+  scan over it: `bracketCloses(text) -> Map<number, number>`, opener index → matching close
+  index. The scan keeps a stack of open `[`/`{` positions and skips JSON strings, honouring
+  `\"` and `\\`. A string ends at the next newline at the latest (a JSON string cannot hold a
+  raw newline), so an unbalanced quote in a log line cannot swallow the rest of the output. A
+  close that does not match the top of the stack clears the stack. Each character is visited
+  once; an opener that never closes has no entry.
+- From the last line to the first, at each line's first `[` or `{`, a recorded close gives one
+  `JSON.parse(text.slice(start, close + 1))`. Total work is one scan plus at most one parse per
+  bracketed line.
 - The first block that parses wins, as today.
 - A block followed by text on its last line (`} done`) now parses; today it is skipped.
 - The thrown error text is unchanged.
+- `parseJsonFromOutput(output, { stats } = {})` takes an optional test hook: when `stats` is
+  given, the fallback adds the characters its scan visited to `stats.visited` and its parse
+  attempts to `stats.parses`.
 
 ### Backend and frontend: Corpus and workspace loads (Task 4)
 
@@ -401,21 +502,40 @@ It is exported, and it reads as follows:
   - `raw` → `raw`;
   - `metadata` → `matched`, `queued_download`, `enriching`;
   - each of the other stages → its own name.
-- The stage adds the term `${STATUS_SQL} IN (<literals>)` to `where`. The fast year-index path
-  appends every non-corpus term, not just the last one (`rest`, `corpusList.js:408`).
+- The counts keep their scope: corpus plus `q`, never the stage. `readCorpus` builds two
+  fragments:
+  - `countFrom` holds the corpus and `q` terms. The `q` counts' `GROUP BY` uses it, so every
+    stage label keeps its count and "All stages" keeps the `q` total.
+  - The page queries add the stage term `${STATUS_SQL} IN (<literals>)`. Those are the seed-sort
+    light select and its id fetch, the `added` path, the generic sort and the fast year-index
+    path. The year-index path appends every non-corpus term, not just the last one (`rest`,
+    `corpusList.js:408`).
 - The response adds `stage_total`: `stageTotals(statusCounts)[stage]` when a stage is set,
-  else `total`. `total`, `stage_totals` and `status_counts` keep their meaning, so the labels
-  and the "3 Corpus (N)" count do not change.
+  else `total`. The empty-schema response returns `stage_total: 0`. `total`, `stage_totals`
+  and `status_counts` keep their meaning, so the labels and the "3 Corpus (N)" count do not
+  change.
 - `/api/corpus` passes `req.query.stage`.
-- The frontend moves the stage filter into App state. `corpusStageFilter` lives in
-  `initialWorkspaceState()` and in `resetFrontendState()`'s restore, so a corpus switch still
-  resets it to "All" (phase 5 D3).
-- `Corpus.svelte` receives `corpusStageFilter` and `onStageFilterChange`. It drops
-  `filteredItems` and renders `corpusItems`.
+- The frontend moves the stage filter into App state, beside `corpusFilterQuery`.
+  `corpusStageFilter` lives in `initialWorkspaceState()` and in `resetFrontendState()`'s
+  restore. It therefore behaves as the `q` filter does today: it survives leaving and reopening
+  the Workspace tab within the session, a corpus switch resets it to "All" (phase 5 D3), and a
+  reload starts at "All". It is not written to `localStorage`.
+- `Corpus.svelte` receives `corpusStageFilter`, `onStageFilterChange` and `corpusRowsStale`. It
+  drops `filteredItems` and renders `corpusItems`.
 - A stage change calls `loadCorpus({ quiet: true, supersede: true })`, as the sort does.
+- Stale rows stay inert. `corpusRowsStage` is the stage the committed `corpusItems` were loaded
+  for; it is set when a first-page load replaces the rows. `corpusRowsStale = corpusRowsStage
+  !== corpusStageFilter`. While it is true:
+  - the per-row remove, the selection checkboxes, the bulk remove and "Show more" (and the
+    scroll trigger) are disabled;
+  - an append request returns early, because its offset belongs to the old stage.
+- When the stage load fails, the old rows stay, the existing `corpusRefreshFailed` notice
+  shows, and the actions stay disabled until a load for the selected stage succeeds or the user
+  selects the committed stage again.
 - `fetchCorpus` sends `stage` unless it is `'all'`. The poll's prefix reload sends it too.
   `corpusPageSignature` includes it.
-- `applyCorpusCounts` takes `stageTotal`. `corpusHasMore` and the "Showing N of M" text use it.
+- `applyCorpusCounts` takes `stageTotal`. `corpusHasMore`, the "Showing N of M" text and the
+  prefix reload's consistency check (`totals.size === 1`) use it.
 
 **D14. Completion loads in parallel (FE-18).** In `finalizeExtractionAfterBackendCompletion`,
 the three awaits become `await Promise.all([focusSeedSource('pdf', baseName),
@@ -428,7 +548,9 @@ is unchanged; a 401 from any of them still finishes the card.
   … />{/await}`, with the same props. While the import loads, the tab shows a muted `Loading…`.
   The same pattern is used for ScraperLab.
 - `UpstreamBrowser` stays static. It is the Korpus Management tab, used by most users, and it
-  takes `bind:` props.
+  takes `bind:` props. FE-17 is therefore fixed in part.
+- A failed import shows `{:catch}` text, `Could not load this tab. Reload the page to try
+  again.`, in the tab's place. The navigation and the other tabs keep working.
 
 ### Schema and dead code (Task 5)
 
@@ -451,7 +573,10 @@ The summary route's `corpus_id IS ? ORDER BY created_at DESC` still scans; see t
 - `fetchBibliographyEntries`;
 - the README line;
 - the two `test_identifiers.py` entries, the `DOI_MAP` key and the `_script("ingest_latest")`
-  assertion.
+  assertion. The recorded fixture `tests/fixtures/identifier_cases.json` keeps its
+  `ingest_latest` key (it records the old functions); `test_fixture_covers_every_former_copy`
+  (`test_identifiers.py:126-128`) then asserts that `set(FIXTURE["doi"]) - set(DOI_MAP)` is
+  exactly that key, as it already does for the deleted inverted-index copy.
 
 `pipeline-perf.real-pdf.spec.ts` reads the entry ids from
 `/api/seed/sources/pdf/<runName>/candidates?limit=1000`: the candidate `id`, which is the
@@ -466,11 +591,21 @@ keeps asserting that the frontend never calls the route.
 4. Corpus stage filter and workspace loads (D13–D15).
 5. `pipeline_jobs` index and the dead ingest route (D16, D17).
 
+The tasks run serially in this order: every task edits `app.js`, and Tasks 2–5 share
+`App.svelte` or `api.js`. Phase 6 merges before phase 7, and phase 7 rebases onto it.
+
 ## Acceptance
 
-- Each fixed row has a test that fails on `0702e47` and passes after its task. The exceptions
-  are the parity tests (D1, D2, D6, D10), which must pass both before and after. Each task's
-  commit names its rows.
+- Each fixed row has a test that fails on `0702e47` and passes after its task. Each task's
+  commit names its rows. The parity tests come in two kinds:
+  - D1 and D6 compare with today's code path (the full resolver, the golden browse payload) and
+    must pass both before and after;
+  - D2 and D10 compare the new export with a reference computed in the test (the full resolver,
+    a full-read reference); they fail on `0702e47` only because the export is missing.
+
+  Test files reach new exports through a namespace import (`import * as seed from …`), so a
+  missing export fails only the tests that use it, and ESM test files import `jest` from
+  `@jest/globals`.
 - Backend: `cd backend && npm test` is green. Jest picks up new test files without a CI list
   change.
 - Python: `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests -q` is green.
@@ -478,13 +613,16 @@ keeps asserting that the frontend never calls the route.
   `test_claim_index_plan.py`, which are already in the `ci.yml:68` list.
 - Frontend: `npx vite build` succeeds. The touched specs pass from `frontend/` with
   `E2E_FRONTEND_PORT=5190 … --workers=1`: `graph-3d`, `logs-stream`, `corpus-load`, `dead-code`
-  and `boot-requests`. All of them are already in the `ci.yml:54` list, and CI runs the whole
-  list.
+  and `boot-requests`. All of them are mocked and already in the `ci.yml:54` list, and CI runs
+  the whole list. No spec that talks to a backend runs: `app.spec.ts` logs in and creates a
+  corpus, and port 5190 moves only the frontend (Vite still proxies to `:4000`).
 - After the change, `grep -n "gzipSync\|readFileSync(filePath, 'utf8')" backend/src/app.js`
   shows no snapshot gzip and no log reader.
 - `literature.db` is never opened.
-- After merge, check on the dev stack, comparing with the previous deploy:
-  - `/api/seed/sources` on the 72k corpus;
+- After merge, smoke-check against a backend started with `RAG_FEEDER_DB_PATH` set to a temp
+  synthetic database (built with `DatabaseManager`'s schema, as for the measurements), never
+  against the dev stack or `literature.db`:
+  - `/api/seed/sources` on the synthetic 72k corpus;
   - a Korpus Management browse;
   - the Logs tab, with and without "current corpus only";
   - a 3D graph node click and a cluster click;
@@ -492,23 +630,34 @@ keeps asserting that the frontend never calls the route.
 
 ## Controller calls (for the owner)
 
+- **D2 (BE-05):** a seed candidate's PDF is served only when the matched work is readable by
+  the caller; the current corpus's copy is preferred. A match that lies only in another user's
+  corpus answers 404, where today it was served.
 - **D3 (BE-09):** the boot warm-up is removed. The first seed expand, promote or candidate file
   after a deploy waits about 1.5 s for the downloaded index. Polls never do.
 - **D6 (BE-11):** each Kantropos target's `metadata.bib` entry count is remembered until the
   file's size or mtime changes. The cache is bounded by the configured targets.
 - **D7 (BE-36/BE-51):** a DOI node id resolves through `normalized_doi`, the key the graph
-  export generates, instead of the raw `doi` text.
+  export generates, instead of the raw `doi` text. Plain digits and the exporter's `work:<id>`
+  resolve as work ids; `12.0`, `1e1` and `0x0c` no longer do. The Node schema bootstrap creates
+  the two partial identifier indexes.
 - **D8 (BE-37):** the cluster panel uses the cluster loaded with the graph, and the
   cluster-detail route is removed.
 - **D10 (BE-10):** `/api/logs/tail` no longer returns `total_lines`. A cursor past the end
-  returns nothing and echoes the cursor.
+  returns nothing and echoes the cursor. A rotation during the read is retried once; a second
+  one answers 503.
 - **D11 (FE-59):** with "current corpus only" off, the history shows what the live view may
-  show: everything for admins, and the user's own corpora for members.
+  show: everything for admins, and the user's own corpora for members. A corpus tag counts only
+  in the line's writer prefix, in the tail and in the live socket; any other line is
+  admin-only. Access that changes during the read answers 409.
 - **D12 (BE-42):** a JSON block followed by text on its closing line now parses.
 - **D13 (FE-14):** the stage filter is applied by the server. "Show more" and the scroll
-  trigger page within the stage, and the stage labels keep their totals.
-- **D15 (FE-17):** the Graph and Scraper tabs load their code on first open, with a short
-  "Loading…".
+  trigger page within the stage, and the stage labels keep their totals. Row actions wait until
+  the rows of the selected stage have loaded. The stage persists like the `q` filter: across
+  tab switches, not across a corpus switch or a reload.
+- **D15 (FE-17, in part):** the Graph and Scraper tabs load their code on first open, with a
+  short "Loading…" and an error text if the load fails. `UpstreamBrowser` stays in the main
+  chunk.
 - **D16 (BE-45):** a single index on `pipeline_jobs(status, finished_at)` serves the daemon, the
   dedupe and phase 7's 30-day prune. The summary route gets no index.
 - **D17 (BE-06):** `/api/ingest/latest`, its script and its frontend export are deleted.
