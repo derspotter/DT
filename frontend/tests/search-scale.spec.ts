@@ -273,11 +273,12 @@ function heldAnswer() {
 type PreviewAnswer = { status: number, body: any } | Promise<{ status: number, body: any }>
 
 async function routeSearch(page: import('@playwright/test').Page, answers: PreviewAnswer[]) {
-  const seen = { previews: 0, searchBodies: [] as any[] }
+  const seen = { previews: 0, previewBodies: [] as any[], searchBodies: [] as any[] }
   await page.addInitScript(() => window.localStorage.setItem('rag_feeder_token', 'playwright-token'))
   await page.route('**/api/**', async (route) => {
     const pathname = new URL(route.request().url()).pathname
     if (pathname === '/api/keyword-search/preview') {
+      seen.previewBodies.push(route.request().postDataJSON())
       const answer = await (answers[seen.previews++] ?? answers[answers.length - 1])
       return route.fulfill({ status: answer.status, contentType: 'application/json', body: JSON.stringify(answer.body) })
     }
@@ -420,9 +421,20 @@ test('"Cap at" starts the submitted body with only the cap replaced', async ({ p
   await ui.maxResults.fill('0')
   await ui.searchButton.click()
   await expect(ui.warning).toContainText('This search matches 342,118 works')
+  // Move the live form away from the submitted search without an `input`
+  // event (the Sort select binds on `change`), so the confirmation stays open:
+  // a button that rebuilt the body from the fields would send 'newest'.
+  await ui.card.getByRole('combobox', { name: 'Sort' }).evaluate((select: HTMLSelectElement) => {
+    select.value = 'newest'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await expect(ui.warning).toContainText('This search matches 342,118 works')
   await ui.warning.getByRole('button', { name: 'Cap at 10,000' }).click()
   await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
-  expect(ui.seen.searchBodies[0]).toMatchObject({ query: 'economics', maxResults: 10000 })
+  const submitted = ui.seen.previewBodies[0]
+  expect(submitted).toMatchObject({ query: 'economics', maxResults: 0, sort: 'relevance' })
+  // The launch wrapper adds `enqueue: false`; every other field is the submitted one.
+  expect(ui.seen.searchBodies[0]).toEqual({ ...submitted, maxResults: 10000, enqueue: false })
 })
 
 for (const status of [400, 403]) {
