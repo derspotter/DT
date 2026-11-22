@@ -516,18 +516,22 @@ export async function fetchOpenAlexQuota() {
   return requestJson('/api/openalex/quota', { errorMessage: 'Failed to load OpenAlex quota' })
 }
 
-export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' } = {}) {
+export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '', stage = 'all' } = {}) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   params.set('offset', String(offset))
   if (q) params.set('q', q)
   if (sort) params.set('sort', sort)
+  if (stage && stage !== 'all') params.set('stage', stage)
   const payload = await requestJson(`/api/corpus?${params.toString()}`, { errorMessage: 'Failed to load corpus' })
   const data = Array.isArray(payload) ? payload : payload.items || []
   const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
   const stageTotals = payload?.stage_totals || null
   const statusCounts = payload?.status_counts || null
-  return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
+  // The count of rows matching the stage filter too (the paging total);
+  // equals total when no stage is set.
+  const stageTotal = Number(payload?.stage_total ?? total)
+  return { data, total, source: payload.source || 'api', stageTotals, statusCounts, stageTotal }
 }
 
 // Fetched as a blob rather than linked directly: this route is behind the

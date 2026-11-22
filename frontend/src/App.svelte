@@ -55,7 +55,6 @@
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
-  import ThreeGraph from './components/ThreeGraph.svelte'
   import Corpus from './components/Corpus.svelte'
   import ColumnPicker from './components/ColumnPicker.svelte'
   import {
@@ -66,7 +65,6 @@
   } from './lib/tableColumns'
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
-  import ScraperLab from './components/ScraperLab.svelte'
   import { searchRunSubtitle, seedActivity, seedPromotionStatus } from './lib/seedStatus'
   import {
     workState,
@@ -416,6 +414,14 @@
   let appSettingsError = false
   let seedFilterQuery = ''
   let corpusFilterQuery = ''
+  // Pipeline stage filter, applied server-side like the text filter (D13).
+  // corpusRowsStage is the stage the rows on screen were loaded for; until a
+  // load for the selected stage commits, those rows are stale and inert.
+  let corpusStageFilter = 'all'
+  let corpusRowsStage = 'all'
+  // Rows matching filter and stage: the paging total ("Show more", Loaded N/M).
+  let corpusMatchTotal = 0
+  $: corpusRowsStale = corpusRowsStage !== corpusStageFilter
   let seedFilterDebounce = null
   let corpusFilterDebounce = null
   let corpusSort = ''
@@ -1055,11 +1061,8 @@
           percent: 100,
           indeterminate: false,
         })
-        await focusSeedSource('pdf', baseName)
-        if (stale()) return
-        await loadIngestStats()
-        if (stale()) return
-        await loadIngestRuns()
+        // Independent loads (D14): run together, check once.
+        await Promise.all([focusSeedSource('pdf', baseName), loadIngestStats(), loadIngestRuns()])
         if (stale()) return
         setTimeout(() => {
           if (extractionProgress.active && extractionProgress.runId === runId) {
@@ -2129,6 +2132,9 @@
       corpusTotal: 0,
       corpusHasMore: false,
       corpusFilterQuery: '',
+      corpusStageFilter: 'all',
+      corpusRowsStage: 'all',
+      corpusMatchTotal: 0,
       corpusLoadStatus: '',
       corpusSource: '',
       corpusRefreshFailed: false,
@@ -2194,6 +2200,9 @@
       corpusTotal,
       corpusHasMore,
       corpusFilterQuery,
+      corpusStageFilter,
+      corpusRowsStage,
+      corpusMatchTotal,
       corpusLoadStatus,
       corpusSource,
       corpusRefreshFailed,
@@ -2900,22 +2909,39 @@
     }, 300)
   }
 
+  function handleCorpusStageChange(value) {
+    corpusStageFilter = String(value || 'all')
+    loadCorpus({ quiet: true, supersede: true })
+  }
+
+  // A removal drops rows from the committed view: the paging total moves with
+  // them, so "Show more" and Loaded N/M stay right if the follow-up fails.
+  function dropCorpusRows(keep) {
+    const before = corpusItems.length
+    corpusItems = corpusItems.filter(keep)
+    corpusMatchTotal = Math.max(0, corpusMatchTotal - (before - corpusItems.length))
+    corpusHasMore = corpusItems.length < corpusMatchTotal
+  }
+
   // Unlinks the work from this corpus only — the work row and its PDF survive,
   // so it stays reusable and can be promoted again (spec line 23).
   async function handleRemoveCorpusWork(item) {
     const workId = Number(item?.work_id ?? item?.id)
     if (!Number.isFinite(workId) || workId <= 0) return
+    // A corpus switch while the unlink runs: its answer is the old corpus's.
+    const epoch = corpusScopeEpoch
     try {
       await removeCorpusWork(workId)
-      corpusItems = corpusItems.filter((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
+      if (epoch !== corpusScopeEpoch) return
+      dropCorpusRows((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
       corpusTotal = Math.max(0, corpusTotal - 1)
       await Promise.all([
-        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
       corpusLoadStatus = error?.message || 'Failed to remove the item from this corpus.'
     }
   }
@@ -2927,19 +2953,21 @@
       .map((value) => Number(value))
       .filter((value) => Number.isFinite(value) && value > 0)
     if (ids.length === 0) return
+    const epoch = corpusScopeEpoch
     try {
       const result = await removeCorpusWorks(ids)
+      if (epoch !== corpusScopeEpoch) return
       const removed = new Set((result?.removed_work_ids || ids).map((value) => Number(value)))
-      corpusItems = corpusItems.filter((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
+      dropCorpusRows((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
       corpusTotal = Math.max(0, corpusTotal - removed.size)
       corpusLoadStatus = `Removed ${removed.size} item(s) from this corpus.`
       await Promise.all([
-        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
       corpusLoadStatus = error?.message || 'Failed to remove the selected items.'
     }
   }
@@ -3782,12 +3810,14 @@
   }
 
   function corpusPageSignature(data, total, stageTotals) {
-    return JSON.stringify([corpusFilterQuery, corpusSort, total, stageTotals, data])
+    return JSON.stringify([corpusFilterQuery, corpusSort, corpusStageFilter, total, stageTotals, data])
   }
 
-  function applyCorpusCounts(total, stageTotals) {
+  // Applied only together with the rows they describe (D13).
+  function applyCorpusCounts(total, stageTotals, stageTotal) {
     corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
-    corpusHasMore = corpusItems.length < corpusTotal
+    corpusMatchTotal = Number.isFinite(Number(stageTotal)) ? Number(stageTotal) : corpusTotal
+    corpusHasMore = corpusItems.length < corpusMatchTotal
     if (stageTotals && typeof stageTotals === 'object') {
       corpusStageTotals = {
         raw: Number(stageTotals.raw || 0),
@@ -3807,6 +3837,9 @@
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false, supersede = false } = {}) {
     if (append) {
       if (corpusLoadingMore || !corpusHasMore) return
+      // The loaded rows belong to another stage: their count is no offset
+      // into the selected one.
+      if (corpusRowsStage !== corpusStageFilter) return
       if (corpusLoading) {
         corpusAppendQueued = true
         return
@@ -3825,6 +3858,7 @@
     // null until the auth payload names the corpus (the initial value is 0):
     // the backend then answers for the token's corpus, which is that one.
     const requestCorpusId = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
+    const requestStage = corpusStageFilter
     if (append) {
       corpusLoadingMore = true
       if (!quiet) corpusLoadStatus = 'Loading more corpus entries...'
@@ -3838,8 +3872,8 @@
       const offset = append ? corpusItems.length : 0
       // The poll asks for the first page only, also when more rows are loaded.
       const poll = !append && quiet && preserveSelection
-      const query = { q: corpusFilterQuery, sort: corpusSort }
-      let { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
+      const query = { q: corpusFilterQuery, sort: corpusSort, stage: requestStage }
+      let { data, total, source, stageTotals, stageTotal } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
       // answered for the token's corpus, which is the one fetchMe reports.
@@ -3859,8 +3893,6 @@
           corpusRefreshFailed = false
           return
         }
-        // The first page's counts hold whatever the reload below does.
-        applyCorpusCounts(total, stageTotals)
         // The first page changed while more pages are loaded: a fresh page in
         // front of the old tail would shift the offsets (rows lost or doubled
         // on the next "Show more"), so reload every loaded row, in sequential
@@ -3873,7 +3905,9 @@
         // attempt is retried once, and a second inconsistent one leaves rows
         // and signature for the next poll. Two writes that cancel out exactly
         // at a boundary stay invisible until the first page next changes.
-        if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
+        // Only within the committed stage: a load for another stage replaces
+        // the rows with its first page.
+        if (poll && requestStage === corpusRowsStage && corpusItems.length > CORPUS_PAGE_SIZE) {
           const loadedRows = corpusItems.length
           let prefix = null
           for (let attempt = 0; attempt < 2 && !prefix; attempt += 1) {
@@ -3890,7 +3924,7 @@
               const pageRows = Array.isArray(answer.data) ? answer.data : []
               aligned = !overlap || pageRows[0]?.id === rows[rows.length - 1]?.id
               rows.push(...pageRows.slice(overlap))
-              totals.add(Number(answer.total))
+              totals.add(Number(answer.stageTotal))
               last = answer
               // The corpus ends before the loaded count (rows were removed).
               if (pageRows.length < pageLimit) break
@@ -3899,7 +3933,7 @@
             const ids = rows.map((row) => row?.id)
             if (aligned && totals.size === 1 && new Set(ids).size === ids.length) {
               prefix = rows
-              ;({ total, source, stageTotals } = last)
+              ;({ total, source, stageTotals, stageTotal } = last)
             }
           }
           if (!prefix) {
@@ -3919,14 +3953,17 @@
         const loadedIds = new Set(corpusItems.map((item) => item?.id))
         incoming = incoming.filter((item) => !loadedIds.has(item?.id))
       }
+      const stageChanged = !append && requestStage !== corpusRowsStage
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
+      if (!append) corpusRowsStage = requestStage
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
-      applyCorpusCounts(total, stageTotals)
+      applyCorpusCounts(total, stageTotals, stageTotal)
       corpusSource = source
       if (!append) corpusRefreshFailed = false
-      if (!quiet) {
+      // A quiet stage load still reports: the list now shows other rows.
+      if (!quiet || stageChanged) {
         corpusLoadStatus = corpusHasMore
-          ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
+          ? `Showing ${corpusItems.length} of ${corpusMatchTotal} entries.`
           : `Showing ${corpusItems.length} entries.`
       }
     } catch (error) {
@@ -5501,6 +5538,10 @@
                   {bucketLabel}
                   {corpusFilterQuery}
                   {handleCorpusFilterInput}
+                  {corpusStageFilter}
+                  onStageFilterChange={handleCorpusStageChange}
+                  {corpusRowsStale}
+                  {corpusMatchTotal}
                   {handleRemoveCorpusWork}
                   {handleRemoveSelectedCorpusWorks}
                   {toggleCorpusSort}
@@ -5566,7 +5607,14 @@
       {/if}
 
       {#if activeTab === 'scraper'}
-        <ScraperLab />
+        <!-- Loaded on first open (D15); the module is cached after that. -->
+        {#await import('./components/ScraperLab.svelte')}
+          <p class="muted">Loading…</p>
+        {:then module}
+          <svelte:component this={module.default} />
+        {:catch}
+          <p class="muted">Could not load this tab. Reload the page to try again.</p>
+        {/await}
       {/if}
 
       {#if activeTab === 'admin'}
@@ -5793,7 +5841,14 @@
       {/if}
 
       {#if activeTab === 'graph'}
-        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+        <!-- Loaded on first open (D15); the module is cached after that. -->
+        {#await import('./components/ThreeGraph.svelte')}
+          <p class="muted">Loading…</p>
+        {:then module}
+          <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+        {:catch}
+          <p class="muted">Could not load this tab. Reload the page to try again.</p>
+        {/await}
       {/if}
     </section>
   </div>

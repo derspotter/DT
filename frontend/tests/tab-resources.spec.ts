@@ -325,13 +325,13 @@ test('a failed prefix reload is retried by the next poll', async ({ page }) => {
   const prefixReloads = () => log.filter((e) => e.path === '/api/corpus' && Number(e.search.get('limit')) > CORPUS_PAGE_SIZE).length
   await expect(panel).toContainText('Live corpus from API.')
   // First poll: the first page changed, its prefix reload answers 503. The
-  // user is told, and the first page's counts still apply.
+  // user is told; counts move only with their rows (D13), so neither changes.
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect.poll(prefixReloads).toBe(1)
   await expect(panel).toContainText(STALE_CORPUS_NOTE)
   await expect(panel).not.toContainText('Live corpus from API.')
-  await expect(panel).toContainText(`Loaded ${CORPUS_PAGE_SIZE * 2}/301`)
-  await expect(page.locator('.header-stats')).toContainText('301 items promoted')
+  await expect(panel).toContainText(`Loaded ${CORPUS_PAGE_SIZE * 2}/300`)
+  await expect(page.locator('.header-stats')).toContainText('300 items promoted')
   // Second, identical poll: retries the reload, which now succeeds.
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect.poll(prefixReloads).toBe(2)
@@ -384,8 +384,8 @@ test('a changed first page reloads every loaded row in bounded pages', async ({ 
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
   await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999'])
   await expect(panel).toContainText(STALE_CORPUS_NOTE)
-  // Rows and signature untouched: the old rows stay, the next poll retries.
-  await expect(panel).toContainText('Loaded 1320/1401')
+  // Rows, counts and signature untouched: the old rows stay, the next poll retries.
+  await expect(panel).toContainText('Loaded 1320/1400')
   expect((await tableIds())[0]).toBe('1')
 
   reset()
@@ -425,8 +425,8 @@ test('a prefix reload whose pages disagree is retried once, then left alone', as
   await expect.poll(corpusRequests).toEqual(prefixRequests)
   await expect(panel).toContainText(STALE_CORPUS_NOTE)
   await expect(panel).not.toContainText('Live corpus from API.')
-  // The rows stay; the counts are the first page's.
-  await expect(panel).toContainText('Loaded 1320/1401')
+  // The rows stay, and so do their counts (D13).
+  await expect(panel).toContainText('Loaded 1320/1400')
   expect((await tableIds())[0]).toBe('1')
   expect(errors).toEqual([])
 

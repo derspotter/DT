@@ -5401,9 +5401,10 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
+    const stage = String(req.query?.stage || '');
     try {
       // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
-      return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort }));
+      return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort, stage }));
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });

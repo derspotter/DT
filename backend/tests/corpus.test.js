@@ -79,4 +79,15 @@ describe('GET /api/corpus limit clamp', () => {
     expect(res.body.items).toHaveLength(7)
     expect(res.body.total).toBe(1005)
   })
+  test('the stage query parameter reaches the listing', async () => {
+    const auth = { Authorization: `Bearer ${token}` }
+    const empty = await request(app).get('/api/corpus?limit=7&stage=downloaded').set(auth)
+    expect(empty.status).toBe(200)
+    expect(empty.body.items).toHaveLength(0)
+    expect(empty.body.stage_total).toBe(0)
+    expect(empty.body.total).toBe(1005)
+    const metadata = await request(app).get('/api/corpus?limit=7&stage=metadata').set(auth)
+    expect(metadata.body.items).toHaveLength(7)
+    expect(metadata.body.stage_total).toBe(1005)
+  })
 })

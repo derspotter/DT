@@ -1,7 +1,6 @@
 <script>
   import {
     RAW_STATUSES,
-    METADATA_STATUSES,
     FAILED_ENRICHMENT_STATUSES,
     FAILED_DOWNLOAD_STATUSES,
     DOWNLOADED_STATUSES,
@@ -39,6 +38,14 @@
   export let toggleCorpusSort = () => {};
   export let corpusSort = '';
   export let handleRemoveCorpusWork = () => {};
+  // The stage filter is server-side too (D13): App loads the rows of the
+  // selected stage. Until they arrive, the rows shown belong to the previous
+  // stage (corpusRowsStale) and every row action is inert.
+  export let corpusStageFilter = 'all';
+  export let onStageFilterChange = () => {};
+  export let corpusRowsStale = false;
+  // Rows matching the filter and the stage, as committed with corpusItems.
+  export let corpusMatchTotal = 0;
 
   import ColumnPicker from './ColumnPicker.svelte'
   import { gridTemplate, loadVisibility, saveVisibility, visibleColumns } from '../lib/tableColumns'
@@ -67,11 +74,11 @@
     return Number.isFinite(raw) && raw > 0 ? raw : null
   }
 
-  $: selectableWorkIds = filteredItems.map(workIdOf).filter((id) => id !== null)
+  $: selectableWorkIds = corpusItems.map(workIdOf).filter((id) => id !== null)
   // Derived rather than written back into selectedWorkIds: a reactive statement
-  // that assigns to its own dependency loops. Ids hidden by the stage filter are
-  // ignored here so the count never claims more than the table can act on, but
-  // they survive in selectedWorkIds if the filter is cleared again.
+  // that assigns to its own dependency loops. Ids not in the loaded rows (another
+  // stage or filter) are ignored here so the count never claims more than the
+  // table can act on, but they survive in selectedWorkIds if those rows return.
   $: selectableWorkIdSet = new Set(selectableWorkIds)
   $: visibleSelection = selectedWorkIds.filter((id) => selectableWorkIdSet.has(id))
   $: allSelected = selectableWorkIds.length > 0 && visibleSelection.length === selectableWorkIds.length
@@ -91,6 +98,7 @@
   }
 
   function toggleSelectAll() {
+    if (corpusRowsStale) return
     selectedWorkIds = allSelected ? [] : [...selectableWorkIds]
   }
 
@@ -99,6 +107,7 @@
   }
 
   async function removeSelected() {
+    if (corpusRowsStale) return
     const targets = visibleSelection
     if (targets.length === 0) return
     // Light confirm on bulk (spec line 177); the per-row cross stays immediate.
@@ -110,24 +119,7 @@
     await handleRemoveSelectedCorpusWorks([...targets])
     selectedWorkIds = []
   }
-  let stageFilter = 'all';
   let activeCorpusKey = '';
-
-  $: filteredItems = corpusItems.filter(item => {
-    if (stageFilter === 'raw') {
-      if (item.status && !RAW_STATUSES.has(item.status)) return false;
-    } else if (stageFilter === 'metadata') {
-      if (!METADATA_STATUSES.has(item.status)) return false;
-    } else if (stageFilter === 'failed_enrichment') {
-      if (!FAILED_ENRICHMENT_STATUSES.has(item.status)) return false;
-    } else if (stageFilter === 'failed_download') {
-      if (!FAILED_DOWNLOAD_STATUSES.has(item.status)) return false;
-    } else if (stageFilter === 'downloaded') {
-      if (!DOWNLOADED_STATUSES.has(item.status)) return false;
-    }
-
-    return true;
-  });
 
   function getBucketForItem(item) {
     return bucketForStatus(item?.status);
@@ -170,6 +162,7 @@
   }
 
   function toggleCorpusItemSelection(item, bucket) {
+    if (corpusRowsStale) return
     const key = corpusItemKey(item, bucket)
     if (!key) return
     activeCorpusKey = activeCorpusKey === key ? '' : key
@@ -177,7 +170,7 @@
 
   $: if (activeCorpusKey) {
     const activeKey = activeCorpusKey
-    const stillExists = filteredItems.some((item) => corpusItemKey(item, getBucketForItem(item)) === activeKey)
+    const stillExists = corpusItems.some((item) => corpusItemKey(item, getBucketForItem(item)) === activeKey)
     if (!stillExists) activeCorpusKey = ''
   }
 </script>
@@ -194,7 +187,7 @@
         {:else}
           Live corpus from API.
         {/if}
-        {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusTotal}.{/if}
+        {#if corpusTotal > 0} Loaded {corpusItems.length}/{corpusMatchTotal}.{/if}
       </p>
     </div>
   </div>
@@ -213,7 +206,11 @@
       </label>
       <label class="corpus-filter corpus-filter--stage">
         <span class="muted small">Pipeline Stage</span>
-        <select bind:value={stageFilter}>
+        <select
+          value={corpusStageFilter}
+          on:change={(event) => onStageFilterChange(event.currentTarget.value)}
+          data-testid="corpus-stage-filter"
+        >
           <option value="all">All stages ({corpusTotal || corpusItems.length})</option>
           <optgroup label="Seed stage">
             <option value="raw">Seed / raw ({rawTotal || 0})</option>
@@ -234,13 +231,13 @@
 
   <div class="corpus-bulk-bar">
     <span class="muted small">Selected: {visibleSelection.length} / {selectableWorkIds.length}</span>
-    <button class="secondary" type="button" on:click={toggleSelectAll} disabled={selectableWorkIds.length === 0}>
+    <button class="secondary" type="button" on:click={toggleSelectAll} disabled={corpusRowsStale || selectableWorkIds.length === 0}>
       {allSelected ? 'Clear' : 'Select all'}
     </button>
     <button class="secondary" type="button" on:click={clearSelection} disabled={visibleSelection.length === 0}>
       Clear selection
     </button>
-    <button class="danger" type="button" on:click={removeSelected} disabled={visibleSelection.length === 0}>
+    <button class="danger" type="button" on:click={removeSelected} disabled={corpusRowsStale || visibleSelection.length === 0}>
       Remove selected
     </button>
   </div>
@@ -255,7 +252,7 @@
           <input
             type="checkbox"
             checked={allSelected}
-            disabled={selectableWorkIds.length === 0}
+            disabled={corpusRowsStale || selectableWorkIds.length === 0}
             on:change={toggleSelectAll}
             aria-label={allSelected ? 'Clear selection' : 'Select all visible corpus items'}
             title={allSelected ? 'Clear selection' : 'Select all visible corpus items'}
@@ -274,7 +271,7 @@
         {/each}
         <span class="corpus-actions-cell" aria-hidden="true"></span>
       </div>
-      {#each filteredItems as item (item.id)}
+      {#each corpusItems as item (item.id)}
         {@const bucket = getBucketForItem(item)}
         {@const itemKey = corpusItemKey(item, bucket)}
         {@const selected = itemKey !== '' && itemKey === activeCorpusKey}
@@ -300,6 +297,7 @@
             <input
               type="checkbox"
               checked={isRowSelected(item)}
+              disabled={corpusRowsStale}
               on:click|stopPropagation
               on:change={() => toggleRowSelection(item)}
               aria-label={`Select ${item.title || 'item'}`}
@@ -329,6 +327,7 @@
               type="button"
               title="Remove from this corpus (keeps the work and its PDF)"
               aria-label={`Remove ${item.title || 'item'} from this corpus`}
+              disabled={corpusRowsStale}
               on:click|stopPropagation={() => handleRemoveCorpusWork(item)}
             >✕</button>
           </span>
@@ -342,6 +341,7 @@
                     <button
                       class="inline-detail-chip inline-detail-chip--download"
                       type="button"
+                      disabled={corpusRowsStale}
                       on:click|stopPropagation={() => handleDownloadedCorpusFile(item)}
                       title="Download the stored file"
                     >
@@ -354,10 +354,10 @@
                   <span class="inline-detail-chip">Source: {workSource(item) || '-'}</span>
                   <span class="inline-detail-chip">Author: {corpusItemAuthorsFull(item) || '-'}</span>
                   {#if item.doi}
-                    <a class="inline-detail-link" href={doiHref(item.doi)} target="_blank" rel="noreferrer">DOI</a>
+                    <a class="inline-detail-link" href={corpusRowsStale ? undefined : doiHref(item.doi)} target="_blank" rel="noreferrer">DOI</a>
                   {/if}
                   {#if item.openalex_id}
-                    <a class="inline-detail-link" href={openAlexHref(item.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
+                    <a class="inline-detail-link" href={corpusRowsStale ? undefined : openAlexHref(item.openalex_id)} target="_blank" rel="noreferrer">OpenAlex</a>
                   {/if}
                 </div>
               </div>
@@ -365,7 +365,7 @@
           </div>
         {/if}
       {/each}
-      {#if filteredItems.length === 0}
+      {#if corpusItems.length === 0}
         <div class="table-row muted corpus-empty-state">
           No items match your filters.
         </div>
@@ -376,7 +376,7 @@
   <div class="corpus-lazy-status">
     <span class="muted">{corpusLoadStatus}</span>
     {#if corpusHasMore}
-      <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusLoadingMore}>
+      <button class="secondary" type="button" on:click={() => loadCorpus({ append: true })} disabled={corpusRowsStale || corpusLoadingMore}>
         {corpusLoadingMore ? 'Loading…' : 'Show more'}
       </button>
     {/if}
