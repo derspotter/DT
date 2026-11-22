@@ -1303,6 +1303,35 @@
     return match[1] === String(corpusFilter)
   }
 
+  // Mirrors the backend's logLineCorpusId (app.js, D11): a corpus tag counts
+  // only right after the timestamp and one of the fixed writer labels, so the
+  // live "Current corpus only" view shows the lines a refresh from file shows.
+  const SCOPED_LOG_LABELS = new Set(
+    [
+      'extract-status',
+      '/api/extract-bibliography',
+      'get_bib_pages',
+      'APIscraper',
+      'APIscraper inline fallback',
+      'APIscraper (reused pages)',
+      'APIscraper (page mode)',
+      'APIscraper inline',
+    ].flatMap((label) => [label, `${label} ERROR`])
+  )
+  const LOG_LINE_CORPUS_RE = /^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]/
+
+  function logLineCorpusId(line) {
+    const match = LOG_LINE_CORPUS_RE.exec(String(line ?? ''))
+    if (!match || !SCOPED_LOG_LABELS.has(match[1])) return null
+    return Number(match[2])
+  }
+
+  function isLogLineShownForCurrentCorpus(logLine) {
+    const corpusFilter = getLogsCorpusId()
+    if (corpusFilter === null) return true
+    return logLineCorpusId(logLine) === corpusFilter
+  }
+
   function refreshReason() {
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
     if (authStatus !== 'authenticated') return 'none'
@@ -4511,7 +4540,7 @@
         if (!isLogLineForCurrentCorpus(line)) return
         updateExtractionProgressFromLog(line)
         if (logsType !== 'pipeline') return
-        pushLogLine(line)
+        if (isLogLineShownForCurrentCorpus(line)) pushLogLine(line)
         if (shouldTriggerPipelineRefresh(line)) {
           const isWorkerTick =
             String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
