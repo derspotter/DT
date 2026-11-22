@@ -3,9 +3,20 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
+
+from _bootstrap import ensure_import_paths
+
+ensure_import_paths(__file__)
+ROOT = Path(__file__).resolve().parents[2]
+DL_LIT_PROJECT = ROOT / "dl_lit_project"
+if str(DL_LIT_PROJECT) not in sys.path:
+    sys.path.insert(0, str(DL_LIT_PROJECT))
+
+from dl_lit.identifiers import normalize_doi  # noqa: E402
 
 
 VALID_STATUSES = {
@@ -17,19 +28,6 @@ VALID_STATUSES = {
     "failed_download",
     "enriching",
 }
-
-
-def _normalize_doi(value):
-    """Lowercase, drop an http(s) doi.org URL or ``doi:`` prefix; no trim of ``.;,``.
-
-    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
-    """
-    if not value:
-        return None
-    text = str(value).strip().lower()
-    text = re.sub(r"^(https?://(dx\.)?doi\.org/)", "", text)
-    text = re.sub(r"^doi:\s*", "", text)
-    return text or None
 
 
 def normalize_text(value):
@@ -125,7 +123,7 @@ def load_items(conn: sqlite3.Connection, corpus_id: int | None):
             "authors": parse_authors(data.get("authors")),
             "year": data.get("year"),
             "doi": data.get("doi"),
-            "normalized_doi": _normalize_doi(data.get("doi") or data.get("normalized_doi")),
+            "normalized_doi": data.get("normalized_doi") or normalize_doi(data.get("doi")),
             "openalex_id": data.get("openalex_id"),
             "source": build_source(data),
             "entry_type": data.get("type") or "misc",

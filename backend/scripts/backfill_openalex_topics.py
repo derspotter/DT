@@ -16,7 +16,6 @@ Usage:
 
 import argparse
 import json
-import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -29,7 +28,13 @@ DL_LIT_PROJECT = ROOT / "dl_lit_project"
 if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 
-from dl_lit.identifiers import normalize_openalex_id  # noqa: E402
+from dl_lit.identifiers import (  # noqa: E402
+    _DOI_IN_TEXT_RE,
+    _DOI_SCHEME_PREFIX_RE,
+    _DOI_URL_PREFIX_RE,
+    normalize_doi,
+    normalize_openalex_id,
+)
 from dl_lit.utils import (  # noqa: E402
     OpenAlexRateLimitExceeded,
     get_openalex_mailto,
@@ -52,16 +57,52 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def _normalize_doi(value):
-    """Lowercase and drop an http(s) doi.org prefix only (no ``doi:`` strip, no trim).
+def bare_doi(raw):
+    """A whole bare DOI in lowercase, or ``None``.
 
-    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
+    Strips whitespace, rejects non-ASCII input (before any case change, so a
+    Kelvin sign never folds into ``k``), lowercases, drops only a ``doi.org``
+    URL or ``doi:`` prefix, and keeps the token only when the entire rest is a
+    DOI under the DB rule's pattern. Unlike ``normalize_doi`` it never takes a
+    key out of a longer text: ``10.1000/ABC+123`` is ``None``, not ``10.1000/abc``.
+    Trailing punctuation stays part of the DOI, as it does in the DB key.
     """
-    if not value:
+    if raw is None:
         return None
-    text = str(value).strip()
-    text = re.sub(r"^https?://(dx\.)?doi\.org/", "", text, flags=re.IGNORECASE)
-    return text.lower() or None
+    text = str(raw).strip()
+    if not text or not text.isascii():
+        return None
+    text = text.lower()
+    text = _DOI_URL_PREFIX_RE.sub("", text)
+    text = _DOI_SCHEME_PREFIX_RE.sub("", text)
+    token = text.strip()
+    return token if _DOI_IN_TEXT_RE.fullmatch(token) else None
+
+
+def doi_filter(tokens):
+    return "doi:" + "|".join(token.lower() for token in tokens)
+
+
+def doi_rows(conn, *, scope_clause, limit_clause):
+    """Pass 2's candidates as ``(work_id, DB key)`` pairs, plus how many were not a whole DOI."""
+    rows = []
+    skipped = 0
+    for row in conn.execute(
+        f"""
+        SELECT id, doi FROM works
+        WHERE {scope_clause}
+          AND (openalex_id IS NULL OR openalex_id = '')
+          AND doi IS NOT NULL AND doi <> ''
+          AND (topics_fetched IS NULL OR topics_fetched = 0)
+        ORDER BY id{limit_clause}
+        """
+    ):
+        bare = bare_doi(row[1])
+        if bare:
+            rows.append((row[0], bare.upper()))  # == normalize_doi(bare), the DB key
+        else:
+            skipped += 1
+    return rows, skipped
 
 
 def ensure_columns(conn):
@@ -232,26 +273,13 @@ def main():
 
     # Pass 2: matched works without an OpenAlex ID but with a DOI.
     if not args.no_doi_fallback:
-        doi_rows = []
-        for row in conn.execute(
-            f"""
-            SELECT id, doi FROM works
-            WHERE {scope_clause}
-              AND (openalex_id IS NULL OR openalex_id = '')
-              AND doi IS NOT NULL AND doi <> ''
-              AND (topics_fetched IS NULL OR topics_fetched = 0)
-            ORDER BY id{limit_clause}
-            """
-        ):
-            token = _normalize_doi(row["doi"])
-            if token:
-                doi_rows.append((row["id"], token))
-        log(f"Pass 2 (by doi): {len(doi_rows)} works")
+        rows, skipped = doi_rows(conn, scope_clause=scope_clause, limit_clause=limit_clause)
+        log(f"Pass 2 (by doi): {len(rows)} works, {skipped} skipped (not a whole DOI)")
         run_pass(
             conn,
-            doi_rows,
-            key=lambda work: _normalize_doi(work.get("doi")),
-            build_filter=lambda tokens: "doi:" + "|".join(tokens),
+            rows,
+            key=lambda work: (bare_doi(work.get("doi")) or "").upper() or None,
+            build_filter=doi_filter,
             mailto=mailto,
             batch_size=batch_size,
             label="doi",

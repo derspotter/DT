@@ -7,11 +7,15 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / 'backend' / 'scripts'
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))  # upstream_update imports _bootstrap from its own folder
 SPEC = importlib.util.spec_from_file_location('upstream_recovery', REPO / 'backend/scripts/upstream_update.py')
 upstream = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(upstream)
