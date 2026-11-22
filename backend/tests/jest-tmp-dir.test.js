@@ -55,16 +55,43 @@ test('global setup points TMPDIR at its run dir and teardown restores it', () =>
     expect(out.after).toBe(base)
     expect(out.rootExistsAfter).toBe(false)
     expect(fs.existsSync(base)).toBe(true)
+
+    // TMPDIR unset: TMP keeps os.tmpdir() (and so the probe's run dir) in base.
+    const env = { ...cleanEnv(), TMP: base }
+    delete env.TMPDIR
+    delete env.TEMP
+    const unset = runProbe(env)
+    expect(path.dirname(unset.root)).toBe(base)
+    expect(unset.during).toBe(unset.root)
+    expect(unset.after).toBeUndefined()
+    expect(unset.rootExistsAfter).toBe(false)
   } finally {
     fs.rmSync(base, { recursive: true, force: true })
   }
+})
 
-  const env = cleanEnv()
-  delete env.TMPDIR
-  const unset = runProbe(env)
-  expect(unset.during).toBe(unset.root)
-  expect(unset.after).toBeUndefined()
-  expect(unset.rootExistsAfter).toBe(false)
+test('a teardown without its own setup deletes and changes nothing', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dt-tmpdir-base-'))
+  try {
+    const inherited = fs.mkdtempSync(path.join(base, 'dt-jest-run-'))
+    fs.writeFileSync(path.join(inherited, 'literature.db'), '')
+    const probe = `
+import globalTeardown from './tests/global-teardown.js'
+await globalTeardown()
+console.log(JSON.stringify({ tmpdir: process.env.TMPDIR, prior: process.env.DT_JEST_PRIOR_TMPDIR }))
+`
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
+      cwd: backendDir,
+      env: { ...cleanEnv(), TMPDIR: inherited, DT_JEST_TMP_ROOT: inherited, DT_JEST_PRIOR_TMPDIR: base },
+      encoding: 'utf8',
+    })
+    expect(result.stderr).toBe('')
+    expect(result.status).toBe(0)
+    expect(JSON.parse(result.stdout.trim())).toEqual({ tmpdir: inherited, prior: base })
+    expect(fs.existsSync(path.join(inherited, 'literature.db'))).toBe(true)
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test('setup-env refuses to run without the run dir', () => {

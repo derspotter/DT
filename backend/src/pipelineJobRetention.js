@@ -16,18 +16,20 @@ export const PRUNE_BUSY_TIMEOUT_MS = 250;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export function pruneFinishedPipelineJobs(db, { days = 30 } = {}) {
-  const table = db
-    .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_jobs'")
-    .get();
-  if (!table) return 0;
-  const modifier = `-${days} days`;
-  const statements = PRUNE_STATEMENTS.map((sql) => db.prepare(sql));
-  const prune = db.transaction(() =>
-    statements.reduce((sum, statement) => sum + statement.run(modifier).changes, 0)
-  );
+  // The short budget covers every step, the schema read included: in
+  // rollback-journal mode an exclusive lock already blocks that read.
   const priorBusyTimeout = db.pragma('busy_timeout', { simple: true });
   db.pragma(`busy_timeout = ${PRUNE_BUSY_TIMEOUT_MS}`);
   try {
+    const table = db
+      .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_jobs'")
+      .get();
+    if (!table) return 0;
+    const modifier = `-${days} days`;
+    const statements = PRUNE_STATEMENTS.map((sql) => db.prepare(sql));
+    const prune = db.transaction(() =>
+      statements.reduce((sum, statement) => sum + statement.run(modifier).changes, 0)
+    );
     return prune();
   } finally {
     db.pragma(`busy_timeout = ${Number(priorBusyTimeout)}`);

@@ -116,6 +116,26 @@ test('a locked database fails the prune within its busy budget and restores busy
   expect(db.prepare('SELECT COUNT(*) AS n FROM pipeline_jobs').get().n).toBe(1)
 })
 
+test('an exclusive lock in rollback-journal mode fails the prune within its busy budget', () => {
+  insertJob(db, { status: 'completed', finished: '-31 days', created: '-40 days' })
+  db.pragma('journal_mode = DELETE')
+  expect(db.pragma('journal_mode', { simple: true })).toBe('delete')
+  db.pragma('busy_timeout = 15000')
+  const other = new Database(dbPath)
+  try {
+    // Blocks readers too, so even the schema read waits on the busy handler.
+    other.exec('BEGIN EXCLUSIVE')
+    const started = Date.now()
+    expect(() => pruneFinishedPipelineJobs(db)).toThrow(/locked|busy/i)
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(db.pragma('busy_timeout', { simple: true })).toBe(15000)
+    other.exec('ROLLBACK')
+  } finally {
+    other.close()
+  }
+  expect(db.prepare('SELECT COUNT(*) AS n FROM pipeline_jobs').get().n).toBe(1)
+})
+
 test('retention prunes at once, then daily, logs, never throws, and stops', () => {
   jest.useFakeTimers()
   const log = jest.spyOn(console, 'log').mockImplementation(() => {})
