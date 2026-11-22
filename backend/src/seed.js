@@ -294,7 +294,8 @@ function findIdsWithAliases(row, lookup, aliasIndex) {
 // about 1.5 s of normalisation — and it changed only when a worker finishes.
 // Cache it per DB handle, keyed by a cheap fingerprint of the works table,
 // with a max age as a backstop for edits the fingerprint cannot see. The
-// corpus-local half (a few hundred rows) is rebuilt on every call.
+// corpus-local half loads every row of the corpus and is rebuilt on every
+// call.
 const GLOBAL_DOWNLOADED_MAX_AGE_MS = 5 * 60_000
 const globalDownloadedCache = new WeakMap()
 
@@ -329,6 +330,7 @@ function loadGlobalDownloaded(db) {
 
 export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
   const globalDownloaded = loadGlobalDownloaded(db)
+  const worksTable = tableExists(db, 'works')
   const localRows = loadMatchRows(db, 'works', { corpusId })
   const localDownloadedRows = localRows.filter((row) => String(row?.download_status || '').trim().toLowerCase() === 'downloaded')
   const localRawRows = localRows.filter((row) => String(row?.metadata_status || '').trim().toLowerCase() === 'pending')
@@ -403,7 +405,7 @@ export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = 
     }
     let filePath = null
     let originKey = null
-    if (tableExists(db, 'works')) {
+    if (worksTable) {
       try {
         const record = db.prepare('SELECT file_path, origin_key FROM works WHERE id = ? AND download_status = ?').get(Number(workId), 'downloaded')
         filePath = record?.file_path || null
@@ -763,16 +765,38 @@ function searchCandidateWhere(corpusId, runId, sourceRef, needle) {
   return { where: where.join(' AND '), params }
 }
 
-export function countSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '', stateResolver = null } = {}) {
+// The pdf candidate count depends only on the row text, the dismissals and
+// the needle, so it needs no state resolver. It drops the same keys as
+// loadDismissedCandidateKeySet and matches the fields normalizePdfCandidate
+// builds, so it equals listSeedCandidates(...).length.
+export function countPdfCandidates(db, corpusId, sourceKey, needle) {
+  const sourceRef = String(sourceKey || '').trim()
+  if (!sourceRef) return 0
+  const dismissed = loadDismissedCandidateKeySet(db, corpusId, 'pdf', sourceRef)
+  const rows = db.prepare(
+    `SELECT id, title, authors, source, publisher
+     FROM ingest_entries
+     WHERE corpus_id = ? AND ingest_source = ?`
+  ).all(corpusId, sourceRef)
+  let count = 0
+  rows.forEach((row) => {
+    if (dismissed.has(buildCandidateKey('pdf', row.id))) return
+    const fields = {
+      title: row.title || '',
+      authors: parseNameList(row.authors),
+      source: row.source || null,
+      publisher: row.publisher || null,
+    }
+    if (matchesSeedQuery(fields, needle)) count += 1
+  })
+  return count
+}
+
+export function countSeedCandidates(db, corpusId, sourceType, sourceKey, { q = '' } = {}) {
   const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
-  if (sourceKind === 'pdf') {
-    // The pdf branch has no cheap SQL count (state/dismissal filtering happens
-    // in JS); forward the caller's resolver so a route that already built one
-    // doesn't pay to build a second.
-    return listSeedCandidates(db, corpusId, 'pdf', sourceRef, { q, stateResolver }).length
-  }
+  if (sourceKind === 'pdf') return countPdfCandidates(db, corpusId, sourceRef, needle)
   const runId = Number(sourceRef)
   if (!Number.isFinite(runId) || runId <= 0) return 0
   const { where, params } = searchCandidateWhere(corpusId, runId, sourceRef, needle)
@@ -851,6 +875,71 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
   return candidates
 }
 
+const CANDIDATE_KEY_PATTERN = /^(ingest|search):([1-9]\d*)$/
+const CANDIDATE_KEY_PREFIX = { pdf: 'ingest', search: 'search' }
+// Only the match fields are needed; no state or availability is resolved.
+const MATCH_FIELDS_ONLY_BUNDLE = {
+  resolveState: () => 'pending',
+  resolveDownloadedWorkId: () => null,
+  isInCorpus: () => false,
+}
+
+// The work id to serve for one seed candidate's file, or null. Reads the one
+// candidate row with the candidate list's corpus and dismissal scoping,
+// matches it once against the cached cross-corpus downloaded index, and keeps
+// only works the caller may read; a match in the current corpus wins, else
+// the first readable match.
+export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork) {
+  const sourceKind = String(sourceType || '').trim().toLowerCase()
+  const sourceRef = String(sourceKey || '').trim()
+  const keyMatch = CANDIDATE_KEY_PATTERN.exec(String(candidateKey || '').trim())
+  if (!sourceRef || !keyMatch || keyMatch[1] !== CANDIDATE_KEY_PREFIX[sourceKind]) return null
+  const rowId = Number(keyMatch[2])
+  if (!Number.isSafeInteger(rowId)) return null
+  const canonicalKey = buildCandidateKey(sourceKind, rowId)
+
+  let candidate
+  if (sourceKind === 'pdf') {
+    const row = db.prepare(
+      `SELECT id, title, authors, year, doi, source, publisher, url, source_pdf, created_at
+       FROM ingest_entries
+       WHERE id = ? AND corpus_id = ? AND ingest_source = ?`
+    ).get(rowId, corpusId, sourceRef)
+    if (!row) return null
+    if (tableExists(db, 'seed_candidates_dismissed')) {
+      const dismissed = db.prepare(
+        `SELECT 1 FROM seed_candidates_dismissed
+         WHERE corpus_id = ? AND source_type = 'pdf' AND source_key = ? AND candidate_key = ?`
+      ).get(corpusId, sourceRef, canonicalKey)
+      if (dismissed) return null
+    }
+    candidate = normalizePdfCandidate(row, sourceRef, MATCH_FIELDS_ONLY_BUNDLE)
+  } else {
+    // A non-canonical run id such as `07` would miss the dismissals stored
+    // under `7`.
+    if (!/^[1-9]\d*$/.test(sourceRef)) return null
+    const runId = Number(sourceRef)
+    const { where, params } = searchCandidateWhere(corpusId, runId, String(runId), '')
+    const row = db.prepare(
+      `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at
+       FROM search_results sr
+       JOIN search_run_corpora src ON src.search_run_id = sr.search_run_id
+       JOIN search_runs s ON s.id = sr.search_run_id
+       WHERE ${where} AND sr.id = ?`
+    ).get(...params, rowId)
+    if (!row) return null
+    candidate = normalizeSearchCandidate(row, MATCH_FIELDS_ONLY_BUNDLE)
+  }
+
+  // The global index holds downloaded works only.
+  const globalDownloaded = loadGlobalDownloaded(db)
+  const readable = [...findIdsWithAliases(candidate, globalDownloaded.lookup, globalDownloaded.aliasIndex)]
+    .filter((workId) => canReadWork(workId))
+  if (readable.length === 0) return null
+  const inCorpus = db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+  return readable.find((workId) => inCorpus.get(corpusId, workId)) ?? readable[0]
+}
+
 function summarizeStates(candidates) {
   const stateCounts = {
     in_corpus: 0,
@@ -899,7 +988,11 @@ export function listSeedSources(db, corpusId, {
   // `only` and keeps the counts.
   withStateCounts = true,
 } = {}) {
-  const resolver = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
+  // Built on first use only: the light list (withStateCounts: false) never
+  // needs it.
+  let resolver = stateResolver
+  const getResolver = () => (resolver ??= createStateResolver(db, corpusId, { resolveDownloadedFilePath }))
+  const needle = String(q || '').trim().toLowerCase()
   const onlyType = only ? String(only.sourceType || '').trim().toLowerCase() : ''
   const onlyKey = only ? String(only.sourceKey || '').trim() : ''
   const wanted = (type, key) => !only || (onlyType === type && onlyKey === String(key || '').trim())
@@ -969,8 +1062,11 @@ export function listSeedSources(db, corpusId, {
       source: row.seed_source,
       publisher: row.seed_publisher,
     }
-    const candidates = listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: resolver, q })
-    if (candidates.length === 0) return
+    const candidates = withStateCounts
+      ? listSeedCandidates(db, corpusId, 'pdf', sourceKey, { stateResolver: getResolver(), q })
+      : null
+    const candidateCount = candidates ? candidates.length : countPdfCandidates(db, corpusId, sourceKey, needle)
+    if (candidateCount === 0) return
     sources.push({
       id: buildSourceId('pdf', sourceKey),
       source_type: 'pdf',
@@ -979,8 +1075,8 @@ export function listSeedSources(db, corpusId, {
       label: row.seed_title || sourceKey,
       subtitle: formatPdfSubtitle(meta) || (row.source_pdf || ''),
       created_at: row.created_at,
-      candidate_count: candidates.length,
-      state_counts: withStateCounts ? summarizeStates(candidates) : null,
+      candidate_count: candidateCount,
+      state_counts: candidates ? summarizeStates(candidates) : null,
       removable: true,
       meta,
     })
@@ -995,7 +1091,7 @@ export function listSeedSources(db, corpusId, {
       : null
     if (total === 0 && run?.status !== 'running') return
     const withinLimit = withStateCounts && total <= seedStateCountLimit()
-    const candidates = withinLimit ? listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: resolver, q }) : []
+    const candidates = withinLimit ? listSeedCandidates(db, corpusId, 'search', sourceKey, { stateResolver: getResolver(), q }) : []
     const filters = parseJson(row.filters_json, {}) || {}
     const direction = String(filters.expansion_direction || '').trim().toLowerCase()
     const isSnowball = direction === 'downstream' || direction === 'upstream'

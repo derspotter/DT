@@ -29,6 +29,7 @@ import {
   dismissAllSeedCandidates,
   resolveSeedDocumentPath,
   createStateResolver,
+  findSeedCandidateDownload,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1946,9 +1947,11 @@ function requireAuth(db, authConfig = resolveAuthConfig()) {
   };
 }
 
-function resolveDownloadedFilePath(storedPath, context = {}) {
+// Every place a stored file path may live, most likely first. Builds the
+// list only; it probes nothing.
+function downloadedFilePathCandidates(storedPath, context = {}) {
   const rawPath = String(storedPath || '').trim();
-  if (!rawPath) return null;
+  if (!rawPath) return [];
 
   const candidates = [];
   const addCandidate = (candidate) => {
@@ -1979,12 +1982,19 @@ function resolveDownloadedFilePath(storedPath, context = {}) {
     if (baseName && baseName !== relativeRaw) addCandidate(path.join(originDir, baseName));
   }
 
+  return candidates;
+}
+
+// The first existing candidate, else the first candidate (callers report it
+// as missing), else null.
+function resolveDownloadedFilePath(storedPath, context = {}) {
+  const candidates = downloadedFilePathCandidates(storedPath, context);
   return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || null;
 }
 
-function findDownloadedFilePath(storedPath, context = {}) {
-  const resolved = resolveDownloadedFilePath(storedPath, context);
-  return resolved && fs.existsSync(resolved) ? resolved : null;
+// The first existing candidate or null; each path is probed once.
+export function findDownloadedFilePath(storedPath, context = {}) {
+  return downloadedFilePathCandidates(storedPath, context).find((candidate) => fs.existsSync(candidate)) || null;
 }
 
 function normalizeIngestSourceMetadata(value) {
@@ -2604,17 +2614,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
   assertNoLegacyLibraryData(authDb);
   ensureAuthSchema(authDb);
   ensureSeedSchema(authDb);
-  // Warm the cross-corpus downloaded-works lookup once the server is up, so
-  // the first workspace load does not pay the ~1.5 s index build. Best effort.
-  app.warmSeedState = () => {
-    if (!isStubMode()) {
-      try {
-        createStateResolver(authDb, 0, { resolveDownloadedFilePath: findDownloadedFilePath });
-      } catch (error) {
-        console.warn('[seed-state] Cache warm-up failed:', error?.message || error);
-      }
-    }
-  };
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
@@ -4783,7 +4782,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       // request cannot make the backend resolve an unbounded seed.
       let total = null;
       if (SEED_STATE_SORTS.has(sort)) {
-        total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+        total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
         const stateSortLimit = seedStateCountLimit();
         if (total > stateSortLimit) {
           return res.status(400).json({
@@ -4800,7 +4799,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         sort,
         dir,
       });
-      if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+      if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
       // `summary=light` drops the summary's state counts, which cost a
       // full-seed state resolution. Background polls send it (they never read
       // them); the initial expand and user-driven reloads do not.
@@ -4840,14 +4839,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         return res.status(400).json({ error: 'Invalid seed candidate' });
       }
 
-      const candidate = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
-        stateResolver: null,
-        resolveDownloadedFilePath: findDownloadedFilePath,
-      })
-        .find((item) => String(item?.candidate_key || '') === candidateKey);
-      const state = String(candidate?.state || '').trim().toLowerCase();
-      const workId = coerceInt(candidate?.downloaded_work_id, null);
-      if (!candidate || !['downloaded', 'downloaded_elsewhere'].includes(state) || !Number.isFinite(workId) || workId <= 0) {
+      // Only a work the caller may read is served; a match in another
+      // corpus the caller cannot read is a 404.
+      const workId = findSeedCandidateDownload(authDb, req.corpusId, sourceType, sourceKey, candidateKey,
+        (id) => workReadableByUser(authDb, req.user, id, authConfig));
+      if (workId === null) {
         return res.status(404).json({ error: 'Downloaded file not found for this seed candidate' });
       }
 
@@ -4865,8 +4861,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         return res.status(404).json({ error: 'Downloaded file not found' });
       }
 
-      const filePath = resolveDownloadedFilePath(row.file_path, { originKey: row.origin_key });
-      if (!filePath || !fs.existsSync(filePath)) {
+      const filePath = findDownloadedFilePath(row.file_path, { originKey: row.origin_key });
+      if (!filePath) {
         return res.status(404).json({ error: 'Downloaded file is missing on disk' });
       }
 
