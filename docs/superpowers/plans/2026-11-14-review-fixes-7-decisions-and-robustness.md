@@ -173,8 +173,8 @@ def test_backfill_pass2_keeps_punctuated_and_plain_dois_apart(tmp_path, monkeypa
     # one batch: row 1 doi "10.1000/ABC", row 2 doi "10.1000/ABC.", row 3 doi "10.1000/XYZ;"
     # mocked OpenAlex returns works with dois "https://doi.org/10.1000/abc" (topic T1) and "https://doi.org/10.1000/abc." (topic T2)
     # -> row 1 gets T1, row 2 gets T2, row 3 unchanged; the filter holds the three tokens as stored (lowercased)
-    # row 4 doi "10.1000/\u212a" (Kelvin sign) is skipped and counted; a returned work with doi "https://doi.org/10.1000/k"
-    # updates no row; a returned work whose doi is non-ASCII matches nothing
+    # row 4 doi "10.1000/\u212a" (Kelvin sign) is skipped and counted; row 5 doi "10.1000/K" (ASCII) is in the requested batch,
+    # and the mocked answer for it carries only the Kelvin spelling "https://doi.org/10.1000/\u212a" -> row 5 stays unchanged
 def test_backfill_pass2_sends_only_whole_dois_and_updates_the_row(tmp_path, monkeypatch, capsys):
     # DatabaseManager(tmp db) creates works; rows (all openalex_id NULL, metadata_status 'matched'):
     #   1 doi "https://doi.org/10.1000/ABC"; 2 doi "10.bogus|xyz"; 3 doi "10.1/abc"; 4 doi "10.1000/DEF" with topics_fetched 1
@@ -216,7 +216,7 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
   - the claim-ending writers gain keyword-only `claimed_by` (spec D2): `apply_enriched_metadata` (`:1573`), `mark_metadata_failed` (`:747`), `reset_enrich_claim` (`:1825`), `move_entry_to_downloaded` (`:1891`, also `part_path`), `mark_raw_work_downloaded` (`:2013`, also `part_path`), `move_entry_to_failed` (`:2057`) / `mark_download_failed` (`:2762`), `merge_duplicate_queued_work` (`:2766`, also the target recheck);
   - delete `fetch_download_queue` (`:1855`).
 - Modify: `dl_lit_project/dl_lit/download_path.py` (`download_ref` gains `part_suffix`; new `publish_download`, `discard_download`).
-- Modify: the two live filename builders only, `dl_lit_project/dl_lit/new_dl.py` `try_download_url` (`:1402`, written at `:1468`) and `dl_lit_project/dl_lit/pdf_downloader.py` (`:171-180`, written at `:139-140`): write `<final><part_suffix>` when `ref["part_suffix"]` / the new `part_suffix` argument of `PDFDownloader.attempt_download` is set; `new_dl.py:1234` passes it on. `download_paper` (`new_dl.py:1076`, no production caller) is not touched.
+- Modify: the two live filename builders only, `dl_lit_project/dl_lit/new_dl.py` `try_download_url` (`:1402`, written at `:1468`) and `dl_lit_project/dl_lit/pdf_downloader.py` (`:171-180`, written at `:139-140`): write `<final><part_suffix>` when `ref["part_suffix"]` / the new `part_suffix` argument of `PDFDownloader.attempt_download` is set, opened with `'xb'` (exclusive; on `FileExistsError` one fresh `.part-<8 hex>`, then a failed attempt), and remove a staged file they created if they fail before returning its path; `new_dl.py:1234` passes it on. `download_paper` (`new_dl.py:1076`, no production caller) is not touched.
 - Modify: `dl_lit_project/dl_lit/cli.py:649-736` (`download_pdfs_command`).
 - Modify: `backend/scripts/daemon/worker.py`:
   - `:1050` and `:1290` (claims use `self._claim_lease_seconds()`); new `_claim_lease_seconds` next to `_direct_batch_timeout_seconds` (`:301`);
@@ -229,7 +229,7 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
 - Modify: `dl_lit_project/tests/test_cli_downloader.py` (the mocks move from `fetch_download_queue`/`check_if_exists` to `claim_download_batch`/`find_downloaded_duplicate`/`release_download_claims`, and the writers are called with `claimed_by`).
 - Modify: `dl_lit_project/tests/test_download_path.py`:
   - `:198-221` (the same switch in `test_cli_downloaded_count_ignores_the_duplicate_merge_result`);
-  - `:245-256` (`_worker_daemon`): set `daemon.worker_id = "daemon:test:1:abc"` and call `daemon._init_work_state()`; every test that calls `_download_single` or `_attempt_raw_download` first claims its row through the real `claim_download_batch` / `claim_enrich_batch` with `claimed_by=daemon.worker_id` and passes the returned row, instead of a queued row read directly. The successful enhancer fakes (`:260` on) write their bytes to `<final> + ref["part_suffix"]` and return that path, so the real publisher runs.
+  - `:245-256` (`_worker_daemon`): set `daemon.worker_id = "daemon:test:1:abc"` and call `daemon._init_work_state()`; every test that calls `_download_single` or `_attempt_raw_download` first claims its row through the real `claim_download_batch` / `claim_enrich_batch` with `claimed_by=daemon.worker_id` and passes the returned row, instead of a queued row read directly. The successful enhancer fakes (`:260` on) write their bytes to `<final> + ref.get("part_suffix", "")` and return that path, so the real publisher runs once a caller passes a suffix (the raw-download caller only switches in Task 3, whose test asserts the suffix).
 - Test: `dl_lit_project/tests/test_cli_download_leases.py` (new)
 
 **Interfaces:**
@@ -240,7 +240,7 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
   - `merge_duplicate_queued_work(..., claimed_by=…)` re-reads the target inside that transaction and returns `(False, "duplicate_target_gone")` when it is missing or not `downloaded`; the caller then downloads the row.
   - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)`; `publish_download(part_path: str, work_id: int) -> str`: never overwrites. `os.link(part, final)` (`final` = the name without the `.part-…` suffix); on `FileExistsError` retry once with `<stem>-<work id>.pdf`, then `<stem>-<work id>-<8 hex>.pdf`; the successful link is the last fallible operation and it returns the path at once (the part is **not** unlinked here). No `os.replace`; `fit_stem(name: str, reserve: int = 32, limit: int = 255) -> str` (shortens only a stem whose UTF-8-encoded name plus `reserve` exceeds `limit`, on a character boundary; used by the two builders when a part suffix is set); `discard_download(part_path: str | None) -> None` (`unlink(missing_ok=True)`).
   - `move_entry_to_downloaded(..., *, claimed_by=None, part_path=None)` and `mark_raw_work_downloaded(..., *, claimed_by=None, part_path=None)`: after the claim check, `file_path = publish_download(part_path, work_id)` inside the same transaction, stored with the downloader's checksum. An empty checksum with a `part_path` returns `(None, "checksum_unavailable")` before publishing; a link failure returns `(None, "publish failed: <error>")` after the rollback. If the transaction then fails, the writer unlinks that published file; if `mark_raw_work_downloaded` merges into a canonical whose own PDF is kept, it unlinks the published file after the commit and only logs a failure of that unlink. Before serialising the result into `bibtex_entry_json`, the writer sets `downloaded_file` to the retained PDF and drops `part_suffix`.
-  - Callers (CLI, `_download_single`, `_attempt_raw_download`) call `discard_download(part_path)` in their own `finally` on every outcome, logging (never raising) a failed unlink; on `checksum_unavailable` they mark the download failed with that reason.
+  - Callers (CLI, `_download_single`, `_attempt_raw_download`) call `discard_download(part_path)` in their own `finally` on every outcome, logging (never raising) a failed unlink; on `checksum_unavailable` the download callers (CLI, `_download_single`) mark the download failed with that reason; the raw caller is Task 3's.
   - Every owned writer runs in `try/finally` and rolls back in the `finally` while `self.conn.in_transaction` (covers the early `duplicate_target_gone` return and `OSError` from publishing).
   - `DatabaseManager.release_enrich_claims(work_ids: list[int], claimed_by: str) -> int` (spec D2: back to `pending`, claim columns cleared, `metadata_attempt_count` minus 1, floor 0; only rows still `in_progress` with that owner).
   - `DatabaseManager.find_downloaded_duplicate(row: dict, authors) -> tuple[str | None, int | None, str | None]`. It calls `check_if_exists` with the arguments listed in spec D2 and returns the hit only for a `works` row whose `download_status` is `downloaded`.
@@ -315,10 +315,14 @@ def test_a_failed_part_unlink_never_orphans_or_fails_the_publish(tmp_path, monke
 def test_an_unreadable_staged_pdf_is_not_published(tmp_path, monkeypatch):
     # successful fake whose checksum comes back "" -> no PDF published, the part file removed,
     # the row 'failed' with 'checksum_unavailable'
+def test_staged_files_are_created_exclusively(tmp_path, monkeypatch):
+    # a file already at "<final>.part-x" (hard-linked to a published PDF) -> the builder does not truncate it; it uses a fresh
+    # stage name, and the published PDF keeps its bytes; a forced mid-write error -> the builder leaves no staged file behind
 def test_stored_metadata_names_the_retained_pdf(tmp_path, monkeypatch):
-    # move_entry_to_downloaded: bibtex_entry_json["downloaded_file"] == file_path, no "part_suffix", no ".part-" anywhere;
+    # move_entry_to_downloaded: bibtex_entry_json["downloaded_file"] == file_path and it has no "part_suffix" field
+    # (diagnostic trace text may still mention the staged path);
     # mark_raw_work_downloaded merged into a canonical that keeps its PDF: downloaded_file == the canonical's file_path,
-    # and the newly published file is gone
+    # any serialised "checksum" equals the retained file's checksum, and the newly published file is gone
 def test_long_names_are_shortened_only_when_the_suffixes_do_not_fit():
     # fit_stem("a" * 200 + ".pdf") is unchanged; fit_stem("ä" * 120 + ".pdf") (244 bytes) is shortened so that
     # len(os.fsencode(result)) + 32 <= 255 and it still ends in ".pdf" and decodes cleanly
@@ -380,7 +384,7 @@ def test_periodic_recovery_treats_a_cli_owner_like_a_daemon(tmp_path, monkeypatc
   - `_job_deadline_reached` (`:503-525`) and `_direct_batch_deadline_reached` (`:527-537`): take the snapshot in the latch section and pass `deadline` and `running` on.
   - `_finish_after_win` (`:539-563`): new signature; hung write first, then the heartbeat, under one busy budget.
   - `do_enrich` (`:1086-1150`): track each submitted `_enrich_single`; pass `claimed_by=self.worker_id` to `apply_enriched_metadata`, `mark_metadata_failed` and `reset_enrich_claim`.
-  - `_attempt_raw_download` (`:988-1040`): track the call with phase `"enrich"` and pass `claimed_by=self.worker_id` and `part_path` to `mark_raw_work_downloaded` (downloading with a part suffix, discarding it on failure).
+  - `_attempt_raw_download` (`:988-1040`): track the call with phase `"enrich"` and pass `claimed_by=self.worker_id` and `part_path` to `mark_raw_work_downloaded` (downloading with a part suffix, discarding it on failure). On `checksum_unavailable` it returns that reason, and `do_enrich` passes it to the ownership-guarded `mark_metadata_failed` (instead of `Metadata fetch failed`); the download columns are not touched.
   - `do_download` (`:1304-1305`): track each submitted `_download_single`.
 - Modify: `dl_lit_project/tests/test_worker_watchdog.py:701`, `:720` (the two `_finish_after_win` callers pass `deadline=0.3, running={}, now=0.0`).
 - Rely on: Task 2's `_worker_daemon` fixture in `test_download_path.py` (it calls `_init_work_state()`, so the wrappers find `_running_items`); its raw-download tests enter through `claim_enrich_batch`.
@@ -460,6 +464,10 @@ def test_a_locked_database_keeps_the_phase5_exit_bound(tmp_path, monkeypatch):
 def test_a_skipped_hung_write_on_lock_timeout_still_exits(tmp_path, monkeypatch):
     # WATCHDOG_LOCK_TIMEOUT_SECONDS patched to 0.05; another thread holds daemon.heartbeat_lock;
     # win -> log contains 'Watchdog: hung items not recorded (' ; exits == [75]; the running row stays in_progress
+def test_a_raw_download_without_checksum_fails_the_metadata_claim(tmp_path, monkeypatch):
+    # role enrich; one pending row claimed via claim_enrich_batch; _enrich_single fails; the raw fake asserts ref["part_suffix"]
+    # is set and returns a staged file with checksum "" -> metadata_status 'failed', metadata_error 'checksum_unavailable',
+    # download_status and the download_* columns unchanged, no PDF published, no part file left
 def test_hung_item_limit_reads_env_with_minimum(tmp_path, monkeypatch):
     # unset -> 3; "0" -> 1; "5" -> 5
 ```

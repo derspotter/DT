@@ -350,8 +350,15 @@ not non-issues.
     directory and report that path as `downloaded_file`. They keep their chosen name; only a stem
     without room for the planned suffixes is shortened: `download_path.fit_stem(name, reserve=32)`
     truncates the stem, on a character boundary, until the UTF-8-encoded name plus 32 bytes (the
-    14-byte part suffix, or `-<work id>-<8 hex>`) fits the 255-byte component limit. Names that
-    fit today are unchanged; `PDFDownloader` can derive an unbounded name from a DOI. CLI and daemon pass
+    14-byte part suffix, or `-<work id>-<8 hex>`) fits the 255-byte component limit. Names with
+    room for the reserved suffixes are unchanged (some names that fit today are shortened on
+    purpose); `PDFDownloader` can derive an unbounded name from a DOI.
+  - **Staged files are created exclusively.** The builders open the staged name with `'xb'`, never
+    `'wb'`: a stage name left behind (for example a part whose unlink failed and that is still
+    hard-linked to a committed PDF) must never be truncated. On `FileExistsError` the builder picks
+    a fresh stage name (new `secrets.token_hex(4)`) once, then reports the collision as a failed
+    attempt. A builder that fails after creating its staged file (a mid-write error) removes that
+    file before it returns, since the caller never received its path. CLI and daemon pass
     `part_suffix=f".part-{secrets.token_hex(4)}"` per attempt. Other callers pass nothing and keep
     today's behaviour.
   - `move_entry_to_downloaded` and `mark_raw_work_downloaded` gain `part_path: str | None = None`.
@@ -366,8 +373,12 @@ not non-issues.
     with the downloader's checksum of those bytes, in the same transaction.
   - **A checksum is required.** `download_ref` can return a result with an empty checksum when it
     could not read the file. A writer given `part_path` with an empty checksum publishes nothing
-    and returns `(None, "checksum_unavailable")`; the caller marks the download failed with that
-    reason and discards the part.
+    and returns `(None, "checksum_unavailable")`, and the caller discards the part. The download
+    callers (CLI, `_download_single`) mark the download failed with that reason. The raw fallback
+    in `_attempt_raw_download` holds a metadata claim, not a download claim: it returns
+    `checksum_unavailable` to `do_enrich`, which passes it as the reason to the ownership-guarded
+    `mark_metadata_failed` (instead of `Metadata fetch failed`) and leaves the row's download state
+    untouched.
   - **The stored metadata names the retained PDF.** Before the download result is serialised into
     `bibtex_entry_json`, the writer sets its `downloaded_file` to the PDF the row keeps (the
     published path, or the canonical's own file after a raw merge) and drops `part_suffix`.
