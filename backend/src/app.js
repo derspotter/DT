@@ -3350,25 +3350,28 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     if (!name || typeof password !== 'string') {
       return res.status(400).json({ error: 'Missing username or password' });
     }
-    // The slot is reserved before the lookup, and every name is treated
-    // alike, so the 429 does not tell which usernames exist.
-    const gate = signInLimiter.reserve(name);
+    // The exact name first, so a legacy account stored with surrounding
+    // whitespace still signs in; the trimmed name only when that finds no row.
+    let user;
+    try {
+      const lookup = authDb.prepare(
+        'SELECT id, username, email, password_hash, account_status, last_corpus_id FROM users WHERE username = ?'
+      );
+      user = lookup.get(username);
+      if (!user && name !== username) user = lookup.get(name);
+    } catch (error) {
+      console.error('[auth login] User lookup failed:', error);
+      return res.status(500).json({ error: 'Login failed' });
+    }
+    // Every name gets the same 429 after the same failures; a name with a row
+    // is tracked in the uncapped map, so flooding junk names cannot evict it.
+    const gate = signInLimiter.reserve(name, { known: Boolean(user) });
     if (!gate.allowed) {
       const minutes = Math.ceil(gate.retryAfterSeconds / 60);
       res.set('Retry-After', String(gate.retryAfterSeconds));
       return res.status(429).json({
         error: `Too many failed sign-ins for this account. Try again in ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}.`,
       });
-    }
-    let user;
-    try {
-      user = authDb
-        .prepare('SELECT id, username, email, password_hash, account_status, last_corpus_id FROM users WHERE username = ?')
-        .get(name);
-    } catch (error) {
-      signInLimiter.refund(gate.ticket);
-      console.error('[auth login] User lookup failed:', error);
-      return res.status(500).json({ error: 'Login failed' });
     }
     if (user?.account_status === 'invited') {
       signInLimiter.fail(gate.ticket);

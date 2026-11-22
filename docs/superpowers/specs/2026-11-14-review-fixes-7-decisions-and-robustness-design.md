@@ -546,26 +546,34 @@ not non-issues.
       counted and settle on their own.
 
     An entry with `failures + inFlight === 0` is deleted; no ticket refers to it then.
-  - **Bounded map.** When a new key arrives and the map holds `maxKeys` entries: first delete the
-    entries whose window has passed; if none was deleted, delete the oldest entry that is not
-    locked. A locked entry is never evicted. If every entry is locked, the new key is not
-    tracked: `reserve` returns `{ allowed: true, ticket: null }`, and settling a `null` ticket
-    does nothing (fail open). The scan runs only at capacity.
+  - **Two maps (review fix, controller call).** `reserve(name, { known })` takes whether the
+    name matched a user row (active or invited); the handler therefore runs the user lookup
+    first and then reserves. Known names live in an uncapped map: its size is bounded by the
+    user count, so an existing account is never evicted and never untracked. Names with no
+    row live in a map capped at `maxKeys`: when a new key arrives at capacity, it first deletes
+    the entries whose window has passed, and if none was deleted, its oldest entry, locked or
+    not. Neither map fails open. Both use the same threshold, window, 429 body, `Retry-After`,
+    digest keys and window-bound tickets (`{ key, windowId, known }`; one `windowId` counter
+    for both). A lookup error answers `500 Login failed` before any slot is reserved.
+    Accepted residual: flooding junk names can evict the lock of an unknown name, and an
+    attacker who floods and then probes a locked name can tell whether it had a row.
 - **The key is the submitted username.** The handler first answers `400 Missing username or
   password` unless `username` and `password` are both strings and `username.trim()` is not
-  empty. It then uses `name = username.trim()` for **both** the user lookup and the limiter (so
-  ` b ` now signs in as `b`; usernames are stored trimmed). The limiter stores
+  empty. It then uses `name = username.trim()` for the limiter. The lookup (review fix) tries the exact
+  submitted `username` first and, only when no row matches and `name` differs, `name`, so a legacy
+  account stored with surrounding whitespace still signs in and the exact row wins when both
+  exist; ` b ` signs in as `b` when no ` b ` row exists. The limiter stores
   `sha256(name)` as hex (64 characters) as its map key, so a request-sized username costs no
-  more memory than a short one; equality stays exact (BINARY). The limiter runs **before** the
-  user lookup and treats every name alike:
+  more memory than a short one; equality stays exact (BINARY). The limiter runs right after the
+  user lookup, **before** any answer that depends on it, and treats every name alike:
   - `reserve` first; when it is not allowed, the answer is `429` with header
     `Retry-After: <retryAfterSeconds>` and
     `{ error: 'Too many failed sign-ins for this account. Try again in <n> minute(s).' }`. Here
     `<n> = Math.ceil(retryAfterSeconds / 60)`, and the text is "minute" when `n === 1`, else
     "minutes". A correct password is refused too until the window passes.
   - an unknown username (`401`) and an invited account (`403`) call `fail`;
-  - an error in the user lookup itself (`prepare` or `get` throwing) calls `refund` and answers
-    the existing `500 Login failed`, so no slot stays reserved until the rollover;
+  - an error in the user lookup itself (`prepare` or `get` throwing) answers the existing
+    `500 Login failed` before `reserve`, so no slot is taken;
   - a hasher failure (`HASHER_BUSY` 503 or the 500) calls `refund`;
   - a wrong password calls `fail` (`401` as today);
   - a correct password calls `succeed`.

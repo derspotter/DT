@@ -41,9 +41,9 @@ describe('createLoginLimiter', () => {
   let t
   let limiter
   const make = (options = {}) => createLoginLimiter({ now: () => t, ...options })
-  const failTimes = (lim, key, n) => {
+  const failTimes = (lim, key, n, options) => {
     for (let i = 0; i < n; i += 1) {
-      const gate = lim.reserve(key)
+      const gate = lim.reserve(key, options)
       expect(gate.allowed).toBe(true)
       lim.fail(gate.ticket)
     }
@@ -67,7 +67,7 @@ describe('createLoginLimiter', () => {
     t = 900_000
     const gate = limiter.reserve('u')
     expect(gate.allowed).toBe(true)
-    expect(gate.ticket).toEqual({ key: loginLimiterKey('u'), windowId: expect.any(Number) })
+    expect(gate.ticket).toEqual({ key: loginLimiterKey('u'), windowId: expect.any(Number), known: false })
   })
 
   test('reservations in flight count against the limit', () => {
@@ -108,28 +108,35 @@ describe('createLoginLimiter', () => {
     expect(allowedCount(limiter, 'u')).toBe(1)
   })
 
-  test('a full map never evicts a locked entry and fails open when all are locked', () => {
+  test('a full unknown map evicts its oldest entry, locked or not, and never fails open', () => {
     limiter = make({ maxKeys: 2 })
     failTimes(limiter, 'a', 10)
-    failTimes(limiter, 'b', 1)
-    const c = limiter.reserve('c') // evicts 'b', the oldest unlocked entry
-    expect(c.allowed).toBe(true)
+    failTimes(limiter, 'b', 10)
     expect(limiter.reserve('a').allowed).toBe(false)
+    const c = limiter.reserve('c') // evicts 'a', the oldest entry, although it is locked
+    expect(c.allowed).toBe(true)
+    expect(c.ticket).not.toBeNull()
     limiter.fail(c.ticket)
-    failTimes(limiter, 'c', 9)
-    expect(limiter.reserve('c').allowed).toBe(false)
-    const d = limiter.reserve('d')
-    expect(d).toEqual({ allowed: true, ticket: null })
+    expect(allowedCount(limiter, 'a', 10)).toBe(10) // 'a' starts over (and evicts 'b')
+    expect(limiter.reserve('a').allowed).toBe(false)
     limiter.fail(null)
     limiter.refund(null)
     limiter.succeed(null)
-    expect(limiter.reserve('a').allowed).toBe(false)
-    expect(limiter.reserve('c').allowed).toBe(false)
-    // 'b' was evicted rather than kept: a fresh window allows the full 10
-    expect(limiter.reserve('b')).toEqual({ allowed: true, ticket: null })
   })
 
-  test('an expired entry is deleted before any unlocked one', () => {
+  test('a known name is tracked outside the cap and stays locked however many unknown names arrive', () => {
+    limiter = make({ maxKeys: 2 })
+    failTimes(limiter, 'alice', 10, { known: true })
+    for (const junk of ['j1', 'j2', 'j3', 'j4']) failTimes(limiter, junk, 10)
+    expect(limiter.reserve('alice', { known: true })).toEqual({ allowed: false, retryAfterSeconds: 900 })
+    // the two maps count apart: the same name without a row has its own entry
+    expect(limiter.reserve('alice').allowed).toBe(true)
+    // many known names are all tracked, with no cap
+    for (let i = 0; i < 5; i += 1) failTimes(limiter, `user-${i}`, 10, { known: true })
+    for (let i = 0; i < 5; i += 1) expect(limiter.reserve(`user-${i}`, { known: true }).allowed).toBe(false)
+  })
+
+  test('an expired entry is deleted before the oldest one', () => {
     limiter = make({ maxKeys: 2 })
     failTimes(limiter, 'x', 1) // oldest by insertion
     t = 500_000
@@ -200,6 +207,10 @@ describe('/api/auth/login with the per-username limit', () => {
       )
       insert.run('b', bcrypt.hashSync('pw-b', 4), 'b@example.test', 'active')
       insert.run('c', bcrypt.hashSync('pw-b', 4), 'c@example.test', 'invited')
+      // legacy rows stored with surrounding whitespace
+      insert.run(' alice ', bcrypt.hashSync('pw-alice', 4), 'alice@example.test', 'active')
+      insert.run('dup', bcrypt.hashSync('pw-dup', 4), 'dup@example.test', 'active')
+      insert.run(' dup ', bcrypt.hashSync('pw-spaced-dup', 4), 'spaced-dup@example.test', 'active')
     } finally {
       db.close()
     }
@@ -276,7 +287,7 @@ describe('/api/auth/login with the per-username limit', () => {
     expect((await login(ADMIN, ADMIN_PASSWORD)).status).toBe(200)
   })
 
-  test('a failed user lookup gives its slot back', async () => {
+  test('a failed user lookup takes no slot', async () => {
     const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
     jest.spyOn(app.authDb, 'prepare').mockImplementationOnce(() => {
       throw new Error('boom')
@@ -305,6 +316,48 @@ describe('/api/auth/login with the per-username limit', () => {
     const ok = await login(' b ', 'pw-b')
     expect(ok.status).toBe(200)
     expect(ok.body.user.username).toBe('b')
+
+    // an empty password is a string: it is checked, answers 401 and counts
+    const empty = await login('b', '')
+    expect(empty.status).toBe(401)
+    expect(empty.body.error).toBe('Invalid credentials')
+    expect(await statuses(9, 'b', 'wrong')).toEqual(Array(9).fill(401))
+    expect((await login('b', 'wrong')).status).toBe(429)
+  })
+
+  test('a legacy name stored with whitespace signs in exactly; the exact row wins over the trimmed one', async () => {
+    const legacy = await login(' alice ', 'pw-alice')
+    expect(legacy.status).toBe(200)
+    expect(legacy.body.user.username).toBe(' alice ')
+    expect((await login('alice', 'pw-alice')).status).toBe(401) // no 'alice' row
+
+    const spaced = await login(' dup ', 'pw-spaced-dup')
+    expect(spaced.status).toBe(200)
+    expect(spaced.body.user.username).toBe(' dup ')
+    const plain = await login('dup', 'pw-dup')
+    expect(plain.status).toBe(200)
+    expect(plain.body.user.username).toBe('dup')
+    expect((await login(' dup ', 'pw-dup')).status).toBe(401) // the exact row is checked, not 'dup'
+  })
+
+  test('with the unknown map full of locked junk names, existing accounts still lock after 10 failures', async () => {
+    app = createApp({ broadcast() {}, loginLimiter: createLoginLimiter({ now: () => clock, maxKeys: 2 }) })
+    for (const junk of ['junk-1', 'junk-2']) {
+      expect(await statuses(10, junk, 'x')).toEqual(Array(10).fill(401))
+      expect((await login(junk, 'x')).status).toBe(429)
+    }
+    // a third unknown name evicts the oldest lock (the accepted residual)
+    expect(await statuses(10, 'junk-3', 'x')).toEqual(Array(10).fill(401))
+    expect((await login('junk-3', 'x')).status).toBe(429)
+    expect((await login('junk-1', 'x')).status).toBe(401)
+
+    expect(await statuses(10, 'b', 'wrong')).toEqual(Array(10).fill(401))
+    expect(await statuses(10, 'c', 'pw-b')).toEqual(Array(10).fill(403))
+    for (const junk of ['junk-4', 'junk-5', 'junk-6']) await statuses(10, junk, 'x')
+    const locked = [await login('b', 'pw-b'), await login('c', 'pw-b'), await login('junk-6', 'x')]
+    expect(locked.map((r) => r.status)).toEqual([429, 429, 429])
+    expect(new Set(locked.map((r) => r.body.error))).toEqual(new Set([LOCKED_15]))
+    expect(new Set(locked.map((r) => r.headers['retry-after']))).toEqual(new Set(['900']))
   })
 
   describe('deferred compares', () => {
