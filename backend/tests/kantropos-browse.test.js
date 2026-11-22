@@ -294,7 +294,13 @@ describe('Kantropos browse read path', () => {
       stmt.all = (...args) => {
         entry.args = args
         entry.inTransaction = db.inTransaction
-        return all(...args)
+        const rows = all(...args)
+        // A worker commit between the passes (second connection): the page work
+        // 201 stops being downloaded. One read snapshot keeps it in pass 2.
+        if (/SELECT w\.id, w\.file_path, cw\.corpus_id/.test(sql)) {
+          withDb((other) => other.prepare("UPDATE works SET download_status = 'failed' WHERE id = 201").run())
+        }
+        return rows
       }
       return stmt
     })
@@ -305,8 +311,15 @@ describe('Kantropos browse read path', () => {
       return statSync(...args)
     })
 
-    const res = await browse()
+    let res
+    try {
+      res = await browse()
+    } finally {
+      withDb((other) => other.prepare("UPDATE works SET download_status = 'downloaded' WHERE id = 201").run())
+    }
     expect(res.status).toBe(200)
+    expect(res.body.pending_items.map((item) => item.work_id)).toEqual(fx.pageWorkIds)
+    expect(res.body.summary.pending_items_count).toBe(5)
 
     const pass1 = seen.find((s) => /SELECT w\.id, w\.file_path, cw\.corpus_id/.test(s.sql))
     expect(pass1).toBeDefined()
@@ -346,7 +359,8 @@ describe('Kantropos browse read path', () => {
     fs.appendFileSync(fx.bibA, '\n')
     fs.appendFileSync(fx.bibB, '\n')
     const readSync = jest.spyOn(fs, 'readFileSync')
-    const readAsync = jest.spyOn(fs.promises, 'readFile')
+    // The count reads through one handle (fs.promises.open), never fs.readFileSync.
+    const readAsync = jest.spyOn(fs.promises, 'open')
     const bibCalls = (spy, file) => spy.mock.calls.filter(([arg]) => String(arg) === file).length
 
     const first = await get('/api/kantropos/corpora')
@@ -382,5 +396,63 @@ describe('Kantropos browse read path', () => {
     const retried = await get('/api/kantropos/corpora')
     expect(countOf(retried.body, 'target-b')).toBeNull()
     expect(bibCalls(readAsync, fx.bibB)).toBe(2)
+  })
+
+  test('an atomic replace between the stat and the read never caches the new count under the old fingerprint', async () => {
+    // Old version: 3 entries, fixed whole-second mtime so it can be restored exactly.
+    const oldContent = ['a1', 'a2', 'a3'].map(bibEntry).join('\n')
+    const newContent = ['a1', 'a2', 'a3', 'a4', 'a5'].map(bibEntry).join('\n')
+    const oldTime = 1_700_000_000
+    const writeVersion = (content, seconds) => {
+      const tmp = `${fx.bibA}.tmp`
+      fs.writeFileSync(tmp, content)
+      fs.utimesSync(tmp, seconds, seconds)
+      fs.renameSync(tmp, fx.bibA)
+    }
+    writeVersion(oldContent, oldTime)
+
+    const open = fs.promises.open.bind(fs.promises)
+    let replaced = false
+    jest.spyOn(fs.promises, 'open').mockImplementation(async (file, ...rest) => {
+      if (String(file) === fx.bibA && !replaced) {
+        replaced = true
+        writeVersion(newContent, oldTime + 100)
+      }
+      return open(file, ...rest)
+    })
+    const countOf = (body) => body.corpora.find((entry) => entry.id === 'target-a').metadata_entry_count
+
+    const raced = await get('/api/kantropos/corpora')
+    expect(raced.status).toBe(200)
+    expect(replaced).toBe(true)
+    expect(countOf(raced.body)).toBe(5)
+
+    // The old version comes back with its old size and mtime: its count must be
+    // read again, not answered from a count cached under its fingerprint.
+    writeVersion(oldContent, oldTime)
+    const restored = await get('/api/kantropos/corpora')
+    expect(countOf(restored.body)).toBe(3)
+  })
+
+  test('concurrent cold requests read metadata.bib once', async () => {
+    fs.appendFileSync(fx.bibA, '\n')
+    const open = fs.promises.open.bind(fs.promises)
+    let release
+    const gate = new Promise((resolve) => {
+      release = resolve
+    })
+    const spy = jest.spyOn(fs.promises, 'open').mockImplementation(async (file, ...rest) => {
+      if (String(file) === fx.bibA) await gate
+      return open(file, ...rest)
+    })
+    const first = get('/api/kantropos/corpora').then((res) => res)
+    const second = get('/api/kantropos/corpora').then((res) => res)
+    // Let both requests reach the count before the first read may finish.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    release()
+    const [a, b] = await Promise.all([first, second])
+    const countOf = (body) => body.corpora.find((entry) => entry.id === 'target-a').metadata_entry_count
+    expect([countOf(a.body), countOf(b.body)]).toEqual([3, 3])
+    expect(spy.mock.calls.filter(([file]) => String(file) === fx.bibA).length).toBe(1)
   })
 })

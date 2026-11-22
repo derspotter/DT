@@ -1267,23 +1267,44 @@ function getKantroposTargetById(targetId) {
 
 // path -> { mtimeMs, size, count }. Bounded by the configured Kantropos targets.
 const bibEntryCountMemo = new Map();
+// `${path}\0${mtimeMs}\0${size}` -> the in-flight read, so concurrent cold
+// requests for the same file version share one read.
+const bibEntryCountReads = new Map();
 
-// Counts the entries of a metadata.bib. `stats` is the caller's stat of the file:
-// a memo entry with the same mtimeMs and size is reused without a read. Only a
-// successful read is remembered, so a failed one (null) is retried next time.
+// Reads and counts through one handle. The fingerprint is the handle's own stat,
+// so the stored count always belongs to the version that was read, even when
+// the file is atomically replaced after the caller's stat of the path. Only a
+// successful read is stored.
+async function readBibEntryCount(filePath) {
+  let handle = null;
+  try {
+    handle = await fs.promises.open(filePath, 'r');
+    const stats = await handle.stat();
+    const content = await handle.readFile('utf8');
+    const matches = content.match(/@[A-Za-z]+\s*\{/g);
+    const count = Array.isArray(matches) ? matches.length : 0;
+    bibEntryCountMemo.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, count });
+    return count;
+  } catch {
+    return null;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+// Counts the entries of a metadata.bib. `stats` is the caller's stat of the path:
+// a memo entry with the same mtimeMs and size is reused without a read. A failed
+// read answers null and is retried next time.
 async function countBibEntriesInFile(filePath, stats) {
   const cached = stats ? bibEntryCountMemo.get(filePath) : null;
   if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) return cached.count;
-  let content;
-  try {
-    content = await fs.promises.readFile(filePath, 'utf8');
-  } catch {
-    return null;
+  const key = stats ? `${filePath}\0${stats.mtimeMs}\0${stats.size}` : `${filePath}\0`;
+  let read = bibEntryCountReads.get(key);
+  if (!read) {
+    read = readBibEntryCount(filePath).finally(() => bibEntryCountReads.delete(key));
+    bibEntryCountReads.set(key, read);
   }
-  const matches = content.match(/@[A-Za-z]+\s*\{/g);
-  const count = Array.isArray(matches) ? matches.length : 0;
-  if (stats) bibEntryCountMemo.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, count });
-  return count;
+  return read;
 }
 
 function safeJsonParse(value, fallback = null) {

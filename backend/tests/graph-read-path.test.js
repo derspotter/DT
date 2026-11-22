@@ -310,7 +310,6 @@ process.stdout.write('{}')
     const rf = jest.spyOn(fs, 'readFileSync')
     const res = await get('/api/graph/3d/snapshot', fx.adminToken)
     expect(res.status).toBe(200)
-    fx.snapshotKey = res.body.snapshot_key
     expect(gz).not.toHaveBeenCalled()
     const streamed = rs.mock.calls.map(([arg]) => path.basename(String(arg))).sort()
     expect(streamed).toEqual(['clusters.json', 'nodes.bin', 'nodes_meta.json'])
@@ -318,7 +317,7 @@ process.stdout.write('{}')
     expect(rf.mock.calls.some(([arg]) => payloadNames.has(path.basename(String(arg))))).toBe(false)
     jest.restoreAllMocks()
 
-    const dir = path.join(snapshotDir, fx.snapshotKey)
+    const dir = path.join(snapshotDir, res.body.snapshot_key)
     const written = fs.readFileSync(path.join(dir, 'nodes.bin'))
     expect(written.length).toBe(2 * 1024 * 1024)
     // Buffer.equals: a deep toEqual over 2 MB takes seconds.
@@ -327,8 +326,15 @@ process.stdout.write('{}')
   })
 
   test('the cluster detail route is gone', async () => {
-    expect(fx.snapshotKey).toMatch(/^[a-f0-9]{20}$/)
-    const res = await get(`/api/graph/3d/cluster/${fx.snapshotKey}/0`, fx.adminToken)
+    // Its own snapshot, so this test does not depend on the build test.
+    const key = 'e5e5e5e5e5e5e5e5e5e5'
+    const dir = path.join(snapshotDir, key)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ schema_version: 2, generated_at: 'cluster-test', files: {} }))
+    fs.writeFileSync(path.join(dir, 'clusters.json'), JSON.stringify([{ id: 0, label: 'cluster zero' }]))
+    const file = await get(`/api/graph/3d/snapshot/${key}/clusters.json`, fx.adminToken)
+    expect(file.status).toBe(200)
+    const res = await get(`/api/graph/3d/cluster/${key}/0`, fx.adminToken)
     expect(res.status).toBe(404)
   })
 })
