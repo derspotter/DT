@@ -206,10 +206,14 @@ SINCE=$(docker compose exec -T rag_enrich_worker \
   python -c "from datetime import datetime; print(datetime.now().isoformat())")
 docker compose restart rag_backend rag_enrich_worker rag_download_worker
 # Give both workers time to start, then count fresh startup records per role.
+# A record counts only in the worker's exact format (worker.py log() and the
+# daemon's start line): "[<isoformat>] [DAEMON] <role> daemon starting. Waiting for work..."
 LOG=/usr/src/app/logs/backend-pipeline-v2.log
 for ROLE in enrich download; do
-  docker compose exec -T rag_backend awk -v since="[$SINCE]" -v pat="$ROLE daemon starting" \
-    '$1 > since && index($0, pat) { n++ } END { print ROLE ": " n+0 }' ROLE="$ROLE" "$LOG"
+  docker compose exec -T rag_backend awk -v since="[$SINCE]" -v role="$ROLE" '
+    BEGIN { want = "^\\[[0-9T:.-]+\\] \\[DAEMON\\] " role " daemon starting\\. Waiting for work\\.\\.\\.$" }
+    $1 > since && $0 ~ want { n++ }
+    END { print role ": " n+0 }' "$LOG"
 done
 docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
 ```

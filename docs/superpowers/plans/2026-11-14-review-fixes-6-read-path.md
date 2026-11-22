@@ -394,15 +394,7 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 - Modify: `backend/src/logSocket.js:8-13`, `:113-118` (classify the formatted line with `logLineCorpusId` from `app.js`, which it already imports from; `broadcast` escapes line breaks before it writes and sends).
 - Modify: `backend/src/index.js:13` (`backend-pipeline-v2.log`) and `:85-91` (the pre-socket `broadcast` fallback writes `escapeLogLineBreaks(message)`).
 - Modify: `backend/scripts/daemon/worker.py:125` (`backend-pipeline-v2.log`) and `:143-152` (`log()` escapes `\r` and `\n` in `msg`).
-- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history), plus one deploy step in the runbook, run from the repo root:
-  ```
-  BEFORE=$(docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log)
-  docker compose restart rag_backend rag_enrich_worker rag_download_worker
-  docker compose exec -T rag_backend grep -c "enrich daemon starting\|download daemon starting" \
-    /usr/src/app/logs/backend-pipeline-v2.log
-  docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
-  ```
-  Expected: both startup records are in v2 (count at least 2, one per role), and the legacy size equals `$BEFORE`.
+- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history), plus one deploy step in the runbook. Superseded by the final review: the combined `grep -c` count is replaced by the runbook's check (`dl_lit_project/docs/OPS_RUNBOOK.md`, "Deploy step for the switch to `backend-pipeline-v2.log`"), which counts one fresh startup record per worker role in the worker's exact `[<isoformat>] [DAEMON] <role> daemon starting. Waiting for work...` format, and checks that the legacy size equals `$BEFORE`.
 - Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses` (superseded by controller ruling, see spec D12).
 - Modify: `frontend/src/lib/api.js:655-671` (`fetchLogsTail` gains `scope`) and `frontend/src/App.svelte:4268-4274`, `:4319-4325` (pass `scope`).
 - Test:
