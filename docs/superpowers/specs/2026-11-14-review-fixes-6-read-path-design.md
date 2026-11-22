@@ -663,9 +663,19 @@ controller call.**
   reload (`App.svelte:3862`) goes, so a failed reload changes neither rows nor counts.
 - The prefix reload runs only when the request's stage is the committed stage
   (`corpusRowsStage`); a load for another stage replaces the rows with its first page.
-- When the stage load fails, the old rows stay, the existing `corpusRefreshFailed` notice
-  shows, and the actions stay disabled until a load for the selected stage succeeds or the user
-  selects the committed stage again.
+- Final review: with one page loaded a poll is one first-page request, as before. With more
+  than one page loaded (within the committed stage) the poll goes straight to the prefix
+  reload of every loaded row, in pages of at most `CORPUS_POLL_PAGE_ROWS` (1,000), so a row
+  that leaves the stage on page 2 or later goes on the next poll even when the first page and
+  every count are unchanged. The poll's skip compares the signature of what it read (the first
+  page, or the whole prefix) with the last committed one.
+- When the stage load fails, the old rows stay, and the actions stay disabled until a load for
+  the selected stage succeeds or the user selects the committed stage again. The header names
+  the selected stage instead of the generic refresh-failed notice: `Could not load the <stage>
+  stage; showing the previous rows.`, where `<stage>` is the stage's option name without its
+  count (`Seed / raw`, `Fetching bibliographic metadata`, `Metadata not confirmed`,
+  `Downloaded`, `Not retrievable`); for `all` the text is `Could not load all stages; showing
+  the previous rows.`
 - `fetchCorpus` sends `stage` unless it is `'all'`. The poll's prefix reload sends it too.
   `corpusPageSignature` includes it.
 - A removal captures `corpusScopeEpoch` before its unlink request(s); if the epoch changed

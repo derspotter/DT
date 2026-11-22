@@ -419,6 +419,8 @@
   // load for the selected stage commits, those rows are stale and inert.
   let corpusStageFilter = 'all'
   let corpusRowsStage = 'all'
+  // The stage whose load failed while other rows are shown; null otherwise.
+  let corpusFailedStage = null
   // Rows matching filter and stage: the paging total ("Show more", Loaded N/M).
   let corpusMatchTotal = 0
   $: corpusRowsStale = corpusRowsStage !== corpusStageFilter
@@ -2170,6 +2172,7 @@
       corpusFilterQuery: '',
       corpusStageFilter: 'all',
       corpusRowsStage: 'all',
+      corpusFailedStage: null,
       corpusMatchTotal: 0,
       corpusLoadStatus: '',
       corpusSource: '',
@@ -2238,6 +2241,7 @@
       corpusFilterQuery,
       corpusStageFilter,
       corpusRowsStage,
+      corpusFailedStage,
       corpusMatchTotal,
       corpusLoadStatus,
       corpusSource,
@@ -3909,10 +3913,12 @@
     }
     try {
       const offset = append ? corpusItems.length : 0
-      // The poll asks for the first page only, also when more rows are loaded.
+      // With one page loaded the poll asks for the first page only. With more
+      // loaded, within the committed stage, it reloads the whole loaded prefix
+      // (below), so a row that left the stage on page 2+ goes on this poll.
       const poll = !append && quiet && preserveSelection
+      const prefixPoll = poll && requestStage === corpusRowsStage && corpusItems.length > CORPUS_PAGE_SIZE
       const query = { q: corpusFilterQuery, sort: corpusSort, stage: requestStage }
-      let { data, total, source, stageTotals, stageTotal } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
       // answered for the token's corpus, which is the one fetchMe reports.
@@ -3920,22 +3926,22 @@
         const nowCorpus = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
         return requestCorpusId !== null && requestCorpusId !== nowCorpus
       }
-      if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) {
-        return
+      let data, total, source, stageTotals, stageTotal
+      if (!prefixPoll) {
+        ;({ data, total, source, stageTotals, stageTotal } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query }))
+        if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) {
+          return
+        }
       }
       // Committed only once the rows are replaced: a failed prefix reload
       // keeps the old signature (and rows), so the next poll retries it.
       let pageSignature = null
       if (!append) {
-        pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
-        if (poll && pageSignature === lastCorpusPageSignature) {
-          corpusRefreshFailed = false
-          return
-        }
-        // The first page changed while more pages are loaded: a fresh page in
-        // front of the old tail would shift the offsets (rows lost or doubled
-        // on the next "Show more"), so reload every loaded row, in sequential
-        // pages of at most CORPUS_POLL_PAGE_ROWS. The rows are replaced only
+        // More pages are loaded: a fresh first page in front of the old tail
+        // would shift the offsets (rows lost or doubled on the next "Show
+        // more") and a page-2 row that left the stage would stay, so the poll
+        // reloads every loaded row, in sequential pages of at most
+        // CORPUS_POLL_PAGE_ROWS. The rows are replaced only
         // once every page answered; a failed page throws and changes nothing.
         // A write between two pages shifts the offsets (a row doubled or
         // skipped at the boundary). Each page after the first starts on the
@@ -3946,7 +3952,7 @@
         // at a boundary stay invisible until the first page next changes.
         // Only within the committed stage: a load for another stage replaces
         // the rows with its first page.
-        if (poll && requestStage === corpusRowsStage && corpusItems.length > CORPUS_PAGE_SIZE) {
+        if (prefixPoll) {
           const loadedRows = corpusItems.length
           let prefix = null
           for (let attempt = 0; attempt < 2 && !prefix; attempt += 1) {
@@ -3982,6 +3988,13 @@
           }
           data = prefix
         }
+        // A poll whose rows (the first page, or the whole prefix) and counts
+        // are unchanged commits nothing.
+        pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
+        if (poll && pageSignature === lastCorpusPageSignature) {
+          corpusRefreshFailed = false
+          return
+        }
       }
       let incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
       if (append) {
@@ -3994,7 +4007,10 @@
       }
       const stageChanged = !append && requestStage !== corpusRowsStage
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
-      if (!append) corpusRowsStage = requestStage
+      if (!append) {
+        corpusRowsStage = requestStage
+        corpusFailedStage = null
+      }
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
       applyCorpusCounts(total, stageTotals, stageTotal)
       corpusSource = source
@@ -4015,6 +4031,8 @@
       if (!append) {
         console.warn('Corpus refresh failed', error)
         corpusRefreshFailed = true
+        // A load for another stage than the rows shown failed: say which (D13).
+        if (requestStage !== corpusRowsStage) corpusFailedStage = requestStage
       }
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
@@ -5569,6 +5587,7 @@
                 <Corpus
                   {corpusSource}
                   {corpusRefreshFailed}
+                  {corpusFailedStage}
                   {corpusTotal}
                   {corpusItems}
                   {rawTotal}

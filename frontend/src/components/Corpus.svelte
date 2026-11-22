@@ -44,6 +44,21 @@
   export let corpusStageFilter = 'all';
   export let onStageFilterChange = () => {};
   export let corpusRowsStale = false;
+  // The stage whose load failed while the previous stage's rows are shown.
+  export let corpusFailedStage = null;
+  const STAGE_NAMES = {
+    raw: 'Seed / raw',
+    metadata: 'Fetching bibliographic metadata',
+    failed_enrichment: 'Metadata not confirmed',
+    downloaded: 'Downloaded',
+    failed_download: 'Not retrievable',
+  };
+  $: failedStageNotice =
+    corpusRowsStale && corpusFailedStage && corpusFailedStage === corpusStageFilter
+      ? corpusFailedStage === 'all'
+        ? 'Could not load all stages; showing the previous rows.'
+        : `Could not load the ${STAGE_NAMES[corpusFailedStage] || corpusFailedStage} stage; showing the previous rows.`
+      : '';
   // Rows matching the filter and the stage, as committed with corpusItems.
   export let corpusMatchTotal = 0;
 
@@ -183,6 +198,8 @@
       <p class="muted">
         {#if corpusSource !== 'api'}
           Corpus not loaded.{corpusRefreshFailed ? ' The last load failed.' : ''}
+        {:else if failedStageNotice}
+          {failedStageNotice}
         {:else if corpusRefreshFailed}
           Refresh failed; showing earlier rows.
         {:else}

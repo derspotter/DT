@@ -548,7 +548,7 @@ test('a failed stage load keeps the old rows inert until the user reverts', asyn
   await expect(rows(page)).toHaveCount(120)
   await stageSelect(page).selectOption('failed_download')
   await expect.poll(() => state.failed).toBeGreaterThan(0)
-  await expect(header(page)).toContainText('Refresh failed; showing earlier rows.')
+  await expect(header(page)).toContainText('Could not load the Not retrievable stage; showing the previous rows.')
   await expect(rows(page)).toHaveCount(120)
   await expect(rows(page).first()).toHaveAttribute('data-work-id', '1')
   await expect(rows(page).first().locator('.corpus-remove')).toBeDisabled()
@@ -627,7 +627,7 @@ test('a stage request that fails before the first rows commit says so', async ({
   first.release()
 })
 
-test('a bulk removal that removed nothing does not reload the loaded rows', async ({ page }) => {
+test('a bulk removal that removed nothing keeps the loaded rows', async ({ page }) => {
   const state = newState({ removedIds: [] })
   page.on('dialog', (dialog) => dialog.accept())
   await boot(page, state)
@@ -640,8 +640,61 @@ test('a bulk removal that removed nothing does not reload the loaded rows', asyn
   await expect.poll(() => state.unlinks.length).toBe(1)
   await expect.poll(() => state.requests.length).toBeGreaterThan(before)
   await page.waitForTimeout(500)
-  // The follow-up's first page is unchanged: no prefix reload of the 240 rows.
-  expect(state.requests.slice(before).filter((params) => params.limit > 120)).toEqual([])
+  // With two pages loaded the follow-up (and any poll) reads the loaded prefix
+  // in one request (D13, final review); nothing changed, so the rows stay.
+  const after = state.requests.slice(before).map((params) => `${params.limit}@${params.offset}`)
+  expect(after.length).toBeGreaterThan(0)
+  expect(after.every((request) => request === '240@0')).toBe(true)
   await expect(rows(page)).toHaveCount(240)
   await expect(header(page)).toContainText('Live corpus from API.')
+})
+
+// FE-14 / D13 (final review): with more than one page loaded, a poll reloads
+// the whole loaded prefix, so a row that leaves the stage on page 2 goes on
+// the next poll even when the first page and every count stay the same.
+test('a poll with two pages loaded drops a page-2 row that left the stage and shows the one that entered', async ({ page }) => {
+  const { fx, rows: stageRows } = stageFixture(range(501, 121))
+  const state = newState({ rows: stageRows })
+  await boot(page, state)
+  await loadDownloadedRows(page, 121)
+  await showMore(page).click()
+  await expect(rows(page)).toHaveCount(121)
+  expect((await rowIds(page)).at(-1)).toBe(621)
+  const before = state.requests.length
+  // Row 621 leaves the stage and 622 enters it: first page and counts unchanged.
+  fx.downloaded = [...range(501, 120), 622]
+  await expect.poll(async () => (await rowIds(page)).at(-1), { timeout: 8000 }).toBe(622)
+  expect(await rowIds(page)).not.toContain(621)
+  await expect(rows(page)).toHaveCount(121)
+  const polls = state.requests.slice(before).filter((params) => params.stage === 'downloaded')
+  expect(polls[0]).toMatchObject({ offset: 0, limit: 121 })
+})
+
+test('with one page loaded a poll stays one first-page request', async ({ page }) => {
+  const state = newState({ rows: stageFixture().rows })
+  await boot(page, state)
+  await expect(rows(page)).toHaveCount(120)
+  await stageSelect(page).selectOption('downloaded')
+  await expect(rows(page).first()).toHaveAttribute('data-work-id', '501')
+  const before = state.requests.length
+  await expect.poll(() => state.requests.length, { timeout: 8000 }).toBeGreaterThan(before + 1)
+  const polls = state.requests.slice(before)
+  expect(polls.every((params) => params.offset === 0 && params.limit === 120)).toBe(true)
+})
+
+// A failed stage change names the selected stage (spec D13).
+test('a failed stage change names the selected stage', async ({ page }) => {
+  const state = newState({ rows: stageFixture().rows })
+  state.fail = (params) => params.stage === 'failed_download'
+  await boot(page, state)
+  await expect(rows(page)).toHaveCount(120)
+  await stageSelect(page).selectOption('failed_download')
+  await expect.poll(() => state.failed).toBeGreaterThan(0)
+  await expect(header(page)).toContainText('Could not load the Not retrievable stage; showing the previous rows.')
+  await expect(header(page)).not.toContainText('Refresh failed; showing earlier rows.')
+  // Back on the committed stage the generic notes apply again.
+  state.fail = () => false
+  await stageSelect(page).selectOption('all')
+  await expect(header(page)).toContainText('Live corpus from API.')
+  await expect(header(page)).not.toContainText('Could not load the')
 })

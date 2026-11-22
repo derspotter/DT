@@ -215,7 +215,7 @@ test('a resource in flight is not requested twice', async ({ page }) => {
   expect(count('/api/seed/sources')).toBe(1)
 })
 
-test('the corpus poll asks for one page and skips unchanged pages', async ({ page }) => {
+test('the corpus poll asks for the loaded prefix in one request and skips unchanged pages', async ({ page }) => {
   const { log, count, reset } = await boot(page, { running: true, corpusTotal: 300 })
   const panel = page.getByTestId('corpus-panel')
   await panel.getByRole('button', { name: 'Show more' }).click()
@@ -237,8 +237,9 @@ test('the corpus poll asks for one page and skips unchanged pages', async ({ pag
   await expect.poll(() => count('/api/corpus'), { timeout: 4000 }).toBeGreaterThan(before)
   await page.waitForTimeout(300)
   expect(await page.evaluate(() => (window as any).__corpusMutations)).toBe(0)
+  // Two pages loaded: each poll is one request for the loaded prefix (D13).
   for (const entry of log.filter((e) => e.path === '/api/corpus')) {
-    expect(entry.search.get('limit')).toBe(String(CORPUS_PAGE_SIZE))
+    expect(entry.search.get('limit')).toBe(String(CORPUS_PAGE_SIZE * 2))
     expect(entry.search.get('offset')).toBe('0')
   }
   // The appended rows survive the poll.
@@ -363,7 +364,7 @@ async function showMoreUntil(panel: Locator, rows: number, total: number) {
   }
 }
 
-test('a changed first page reloads every loaded row in bounded pages', async ({ page }) => {
+test('a poll with more pages loaded reloads every loaded row in bounded pages', async ({ page }) => {
   test.setTimeout(90_000)
   const errors: string[] = []
   page.on('pageerror', (error) => errors.push(String(error)))
@@ -382,7 +383,7 @@ test('a changed first page reloads every loaded row in bounded pages', async ({ 
   state.failOffset = 999
   reset()
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
-  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999'])
+  await expect.poll(corpusRequests).toEqual(['1000@0', '321@999'])
   await expect(panel).toContainText(STALE_CORPUS_NOTE)
   // Rows, counts and signature untouched: the old rows stay, the next poll retries.
   await expect(panel).toContainText('Loaded 1320/1400')
@@ -390,7 +391,7 @@ test('a changed first page reloads every loaded row in bounded pages', async ({ 
 
   reset()
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
-  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999'])
+  await expect.poll(corpusRequests).toEqual(['1000@0', '321@999'])
   await expect(panel).toContainText('Live corpus from API.')
   await expect(panel).toContainText('Loaded 1320/1401')
   const ids = await tableIds()
@@ -414,7 +415,7 @@ test('a prefix reload whose pages disagree is retried once, then left alone', as
   const corpusRequests = () => log
     .filter((e) => e.path === '/api/corpus')
     .map((e) => `${e.search.get('limit')}@${e.search.get('offset')}`)
-  const prefixRequests = [`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999', '1000@0', '321@999']
+  const prefixRequests = ['1000@0', '321@999', '1000@0', '321@999']
 
   // A row lands in front between the pages of the reload and again during
   // its retry: both attempts are inconsistent, so nothing changes.
@@ -463,7 +464,7 @@ test('a row that leaves the loaded range mid-reload (no id repeats, total unchan
   state.moveAfterPrefixStart = [10]
   reset()
   await page.evaluate(() => (window as any).__dtRefresh.requestRefreshSoon(10))
-  await expect.poll(corpusRequests).toEqual([`${CORPUS_PAGE_SIZE}@0`, '1000@0', '321@999', '1000@0', '321@999'])
+  await expect.poll(corpusRequests).toEqual(['1000@0', '321@999', '1000@0', '321@999'])
   await expect(panel).toContainText('Live corpus from API.')
   const ids = await panel.locator('.corpus-table').evaluate((table) =>
     [...table.textContent!.matchAll(/Work (\d+)/g)].map((match) => match[1]),
