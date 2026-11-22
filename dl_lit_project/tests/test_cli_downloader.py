@@ -97,7 +97,7 @@ def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hash
     # 3. Assertions
     assert result.exit_code == 0
     assert "✓ downloaded via mock_source" in result.output
-    assert "Worker finished: 1 downloaded, 0 failed." in result.output
+    assert "Worker finished: 1 downloaded, 0 failed, 0 duplicate(s) merged, 0 claim(s) lost (result discarded)." in result.output
 
     mock_enhancer.enhance_bibliography.assert_called_once()
     mock_hashlib.file_digest.assert_called_once()
@@ -124,7 +124,7 @@ def test_download_pdfs_unstaged_result_is_a_failed_download(mock_db_manager, moc
 
     assert result.exit_code == 0, result.output
     assert "unstaged file" in result.output
-    assert "Worker finished: 0 downloaded, 1 failed." in result.output
+    assert "Worker finished: 0 downloaded, 1 failed, 0 duplicate(s) merged, 0 claim(s) lost (result discarded)." in result.output
     mock_db_manager.move_entry_to_downloaded.assert_not_called()
     mock_db_manager.mark_download_failed.assert_called_once_with(3, 'unstaged_download', claimed_by=_cli_id(mock_db_manager))
     assert pdf.read_bytes() == b"%PDF published elsewhere"  # never removed: not a staged file
@@ -147,6 +147,6 @@ def test_download_pdfs_failure(mock_db_manager, mock_enhancer, tmp_path):
     # 3. Assertions
     assert result.exit_code == 0
     assert "✗ download failed" in result.output
-    assert "Worker finished: 0 downloaded, 1 failed." in result.output
+    assert "Worker finished: 0 downloaded, 1 failed, 0 duplicate(s) merged, 0 claim(s) lost (result discarded)." in result.output
 
     mock_db_manager.mark_download_failed.assert_called_once_with(2, 'download_failed', claimed_by=_cli_id(mock_db_manager))

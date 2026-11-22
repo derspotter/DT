@@ -2847,8 +2847,13 @@ class DatabaseManager:
         claimed_by: str,
         lease_seconds: int = 15 * 60,
         max_attempts: int | None = None,
+        raise_errors: bool = False,
     ) -> list[dict]:
-        """Atomically claim queued works for download processing."""
+        """Atomically claim queued works for download processing.
+
+        A SQLite error rolls back and answers ``[]`` (the daemon retries on its next poll),
+        or, with ``raise_errors``, re-raises so a caller can tell it from an empty queue.
+        """
         if limit <= 0:
             return []
 
@@ -2961,6 +2966,8 @@ class DatabaseManager:
                 self.conn.rollback()
             except Exception:
                 pass
+            if raise_errors:
+                raise
             return []
 
     def mark_download_failed(self, queue_id: int, reason: str, *, claimed_by: str | None = None) -> tuple[int | None, str | None]:

@@ -671,12 +671,21 @@ def download_pdfs_command(db_path, limit, download_dir):
     cli_id = f"cli:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"
     ok = 0
     failed = 0
+    duplicates = 0
+    lost = 0
     claimed = 0
     try:
         # One row per claim, one lease per download: a long run holds no lease on rows it has
         # not reached. A negative --limit means no limit, 0 claims nothing.
         while limit < 0 or claimed < limit:
-            rows = db.claim_download_batch(limit=1, corpus_id=None, claimed_by=cli_id, lease_seconds=CLI_DOWNLOAD_LEASE_SECONDS)
+            try:
+                rows = db.claim_download_batch(
+                    limit=1, corpus_id=None, claimed_by=cli_id,
+                    lease_seconds=CLI_DOWNLOAD_LEASE_SECONDS, raise_errors=True,
+                )
+            except sqlite3.Error as e:
+                # Not an empty queue: say so and exit 1 (PY-35); the finally releases our claims.
+                raise click.ClickException(f"claiming a download row failed: {e}")
             if not rows:
                 break
             claimed += 1
@@ -685,10 +694,17 @@ def download_pdfs_command(db_path, limit, download_dir):
                 ok += 1
             elif outcome == "failed":
                 failed += 1
+            elif outcome == "duplicate":
+                duplicates += 1
+            elif outcome == "claim_lost":
+                lost += 1
         if not claimed:
             click.echo("Queue is empty.")
             return
-        click.echo(f"\nWorker finished: {ok} downloaded, {failed} failed.")
+        click.echo(
+            f"\nWorker finished: {ok} downloaded, {failed} failed, {duplicates} duplicate(s) merged, "
+            f"{lost} claim(s) lost (result discarded)."
+        )
     finally:
         try:
             db.release_download_claims(cli_id)

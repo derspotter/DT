@@ -221,7 +221,7 @@ def test_cli_downloaded_count_ignores_the_duplicate_merge_result(mocker, tmp_pat
     result = CliRunner().invoke(cli, ["download-pdfs", "--db-path", str(tmp_path / "t.db"), "--download-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert "Worker finished: 1 downloaded, 0 failed." in result.output
+    assert "Worker finished: 1 downloaded, 0 failed, 1 duplicate(s) merged, 0 claim(s) lost (result discarded)." in result.output
     cli_id = db.claim_download_batch.call_args.kwargs["claimed_by"]
     fp = staged["result"]["downloaded_file"]
     db.move_entry_to_downloaded.assert_called_once_with(2, staged["result"], fp, "abc", "mock", claimed_by=cli_id, part_path=fp)

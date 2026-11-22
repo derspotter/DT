@@ -219,6 +219,7 @@ def test_a_stale_cli_completion_writes_nothing(tmp_path, mocker, monkeypatch):
     row = _row(db_path, wid)
     assert (row["download_status"], row["download_claimed_by"]) == ("in_progress", DAEMON)
     assert f"Work {wid}: download {LOST_LINE}" in result.output
+    assert "0 downloaded, 0 failed, 0 duplicate(s) merged, 1 claim(s) lost (result discarded)." in result.output
     assert parts and not parts[0].exists()
     assert not (tmp_path / "2020_T.pdf").exists()
 
@@ -259,6 +260,7 @@ def test_cli_merges_only_into_a_downloaded_duplicate(tmp_path, mocker, other_sta
     assert result.exit_code == 0, result.output
     if merged:
         assert "duplicate detected" in result.output
+        assert "0 downloaded, 0 failed, 1 duplicate(s) merged, 0 claim(s) lost" in result.output
         assert fake.call_count == 0
         assert _row(db_path, qid) is None and _row(db_path, other) is not None
     else:
@@ -1220,3 +1222,50 @@ def test_a_symlink_at_the_final_name_never_moves_the_stage(tmp_path, monkeypatch
     assert Path(published).read_bytes() == b"%PDF-1.4 new"
     assert sorted(p.name for p in elsewhere.iterdir()) == ["target.pdf"]
     assert (elsewhere / "target.pdf").read_bytes() == b"%PDF-1.4 elsewhere"
+
+
+# --- final-review fixes -----------------------------------------------------------------------
+
+def _deny_next_begin(db):
+    """Deny the next BEGIN on this connection (an authorizer), as a locked or read-only DB would."""
+    armed = [True]
+
+    def authorizer(action, arg1, *rest):
+        if action == sqlite3.SQLITE_TRANSACTION and arg1 == "BEGIN" and armed[0]:
+            armed[0] = False
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    db.conn.set_authorizer(authorizer)
+
+
+def test_a_failed_claim_is_not_an_empty_queue(tmp_path, mocker):
+    # PY-35: the claimer can raise instead of answering [] when BEGIN IMMEDIATE fails.
+    db_path, (wid,) = _setup(tmp_path)
+    db = DatabaseManager(str(db_path))
+    _deny_next_begin(db)
+    assert db.claim_download_batch(limit=1, corpus_id=None, claimed_by=DAEMON) == []  # the daemon's contract
+    _deny_next_begin(db)
+    with pytest.raises(sqlite3.Error):
+        db.claim_download_batch(limit=1, corpus_id=None, claimed_by=DAEMON, raise_errors=True)
+    assert not db.conn.in_transaction
+    db.close_connection()
+
+    # The CLI reports the error and exits 1 instead of "Queue is empty.".
+    real = DatabaseManager
+
+    def denied(*args, **kwargs):
+        inst = real(*args, **kwargs)
+        _deny_next_begin(inst)
+        return inst
+
+    mocker.patch("dl_lit.cli.DatabaseManager", side_effect=denied)
+    mocker.patch("dl_lit.cli.BibliographyEnhancer")
+    fake = mocker.patch("dl_lit.cli.download_ref", return_value=(None, "", []))
+    result = _run_cli(db_path, tmp_path)
+
+    assert result.exit_code == 1, result.output
+    assert "Queue is empty." not in result.output
+    assert "claiming a download row failed" in result.output
+    assert fake.call_count == 0
+    assert _row(db_path, wid)["download_status"] == "queued"
