@@ -278,6 +278,36 @@ describe('seed read path (unit)', () => {
     expect(seed.findSeedCandidateDownload(db, 2, 'pdf', 'paperB', 'ingest:21', all)).toBe(1)
   })
 
+  test('a cached match that is no longer downloaded does not hide another downloaded local match', () => {
+    addEntry(db, 17, 1, 'paperA', 'Twin Work', '2010')
+    addWork(db, 60, 'Twin Work', '2010', [1])
+    addWork(db, 61, 'Twin Work', '2010', [1])
+    addWork(db, 62, 'Unrelated Work', '2009', [1], { status: 'queued' })
+    expect(seed.findSeedCandidateDownload(db, 1, 'pdf', 'paperA', 'ingest:17', all)).toBe(60)
+    // Requeue W60 while W62 finishes: the works fingerprint stays the same,
+    // so the cached downloaded index still lists W60.
+    db.prepare("UPDATE works SET download_status = 'queued' WHERE id = 60").run()
+    db.prepare("UPDATE works SET download_status = 'downloaded' WHERE id = 62").run()
+    const full = seed.listSeedCandidates(db, 1, 'pdf', 'paperA').find((c) => c.candidate_key === 'ingest:17')
+    expect(expectedDownload(full)).toBe(61)
+    expect(seed.findSeedCandidateDownload(db, 1, 'pdf', 'paperA', 'ingest:17', all)).toBe(61)
+    // With no downloaded match left, nothing is served.
+    db.prepare("UPDATE works SET download_status = 'queued' WHERE id = 61").run()
+    expect(seed.findSeedCandidateDownload(db, 1, 'pdf', 'paperA', 'ingest:17', all)).toBeNull()
+  })
+
+  test('an id beyond the safe integer range answers null instead of rounding to another row', () => {
+    const big = 9007199254740992n // 2^53; 2^53 + 1 rounds to it as a Number
+    db.prepare(`INSERT INTO search_runs (id, query, status) VALUES (?, 'big run', 'completed')`).run(big)
+    db.prepare('INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (?, 1)').run(big)
+    db.prepare(`INSERT INTO search_results (id, search_run_id, title, year, raw_json) VALUES (34, ?, 'Search Hit Work', '2021', '{}')`).run(big)
+    expect(seed.findSeedCandidateDownload(db, 1, 'search', '9007199254740993', 'search:34', all)).toBeNull()
+    expect(seed.findSeedCandidateDownload(db, 1, 'search', '9007199254740992', 'search:34', all)).toBeNull()
+    db.prepare(`INSERT INTO ingest_entries (id, corpus_id, ingest_source, title, year) VALUES (?, 1, 'paperA', 'Shared Work', '2020')`).run(big)
+    expect(seed.findSeedCandidateDownload(db, 1, 'pdf', 'paperA', 'ingest:9007199254740993', all)).toBeNull()
+    expect(seed.findSeedCandidateDownload(db, 1, 'pdf', 'paperA', 'ingest:9007199254740992', all)).toBeNull()
+  })
+
   test('createStateResolver probes sqlite_master for works once, whatever the candidate count', () => {
     addWork(db, 5, 'Fifth Download', '2015', [1])
     addWork(db, 6, 'Sixth Download', '2014', [1])
@@ -365,6 +395,8 @@ describe('seed read path (app)', () => {
       member.run(u2, fx.corpus1)
       member.run(u2, fx.corpus2)
       db.prepare('UPDATE users SET last_corpus_id = ? WHERE id IN (?, ?)').run(fx.corpus1, u1, u2)
+      // The admin is a member of no fixture corpus; it reads through the admin rule.
+      db.prepare('UPDATE users SET last_corpus_id = ? WHERE username = ?').run(fx.corpus1, process.env.RAG_ADMIN_USER)
 
       const workId = Number(
         db
@@ -389,6 +421,7 @@ describe('seed read path (app)', () => {
 
     tokens.u1 = await login('seed-u1', 'seed-u1-password')
     tokens.u2 = await login('seed-u2', 'seed-u2-password')
+    tokens.admin = await login(process.env.RAG_ADMIN_USER, process.env.RAG_ADMIN_PASSWORD)
   }, 30_000)
 
   afterAll(() => {
@@ -437,5 +470,8 @@ describe('seed read path (app)', () => {
       })
     expect(allowed.status).toBe(200)
     expect(Buffer.compare(allowed.body, fs.readFileSync(fx.pdfPath))).toBe(0)
+    // The admin reads every work (the row query has no membership clause for it).
+    const admin = await request(app).get(url).set(as('admin'))
+    expect(admin.status).toBe(200)
   })
 })

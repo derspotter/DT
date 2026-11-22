@@ -4847,15 +4847,29 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         return res.status(404).json({ error: 'Downloaded file not found for this seed candidate' });
       }
 
-      const db = new Database(DB_PATH, { readonly: true });
-      const row = db.prepare(
-        `SELECT id, title, file_path, origin_key
-           FROM works
-          WHERE id = ?
-            AND download_status = 'downloaded'
-          LIMIT 1`
-      ).get(workId);
-      db.close();
+      // The read rule is checked again in the row query, so the file row and
+      // its authorization come from one snapshot even if another writer
+      // changes corpus membership in between (workReadableByUser's rule).
+      const isAdmin = isAdminUser(req.user, authConfig);
+      let row = null;
+      let db = null;
+      try {
+        db = new Database(DB_PATH, { readonly: true });
+        row = db.prepare(
+          `SELECT w.id, w.title, w.file_path, w.origin_key
+             FROM works w
+            WHERE w.id = ?
+              AND w.download_status = 'downloaded'
+              ${isAdmin ? '' : `AND EXISTS (
+                SELECT 1 FROM corpus_works cw
+                JOIN user_corpora uc ON uc.corpus_id = cw.corpus_id
+                WHERE cw.work_id = w.id AND uc.user_id = ?
+              )`}
+            LIMIT 1`
+        ).get(...(isAdmin ? [workId] : [workId, req.user.id]));
+      } finally {
+        db?.close();
+      }
 
       if (!row) {
         return res.status(404).json({ error: 'Downloaded file not found' });

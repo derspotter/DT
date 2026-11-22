@@ -887,8 +887,9 @@ const MATCH_FIELDS_ONLY_BUNDLE = {
 // The work id to serve for one seed candidate's file, or null. Reads the one
 // candidate row with the candidate list's corpus and dismissal scoping,
 // matches it once against the cached cross-corpus downloaded index, and keeps
-// only works the caller may read; a match in the current corpus wins, else
-// the first readable match.
+// only works that are downloaded now (the cache may be stale) and that the
+// caller may read; a match in the current corpus wins, else the first such
+// match. The caller re-checks both when it reads the file row.
 export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork) {
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
@@ -917,8 +918,10 @@ export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, c
   } else {
     // A non-canonical run id such as `07` would miss the dismissals stored
     // under `7`.
+    // A run id beyond 2^53 would round to a different run.
     if (!/^[1-9]\d*$/.test(sourceRef)) return null
     const runId = Number(sourceRef)
+    if (!Number.isSafeInteger(runId)) return null
     const { where, params } = searchCandidateWhere(corpusId, runId, String(runId), '')
     const row = db.prepare(
       `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at
@@ -931,10 +934,13 @@ export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, c
     candidate = normalizeSearchCandidate(row, MATCH_FIELDS_ONLY_BUNDLE)
   }
 
-  // The global index holds downloaded works only.
+  // The global index holds the works that were downloaded when it was built;
+  // its fingerprint cannot see a requeue balanced by another download, so the
+  // status is checked live.
   const globalDownloaded = loadGlobalDownloaded(db)
+  const downloadedNow = db.prepare("SELECT 1 FROM works WHERE id = ? AND download_status = 'downloaded'")
   const readable = [...findIdsWithAliases(candidate, globalDownloaded.lookup, globalDownloaded.aliasIndex)]
-    .filter((workId) => canReadWork(workId))
+    .filter((workId) => downloadedNow.get(workId) && canReadWork(workId))
   if (readable.length === 0) return null
   const inCorpus = db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
   return readable.find((workId) => inCorpus.get(corpusId, workId)) ?? readable[0]

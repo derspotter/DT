@@ -5401,7 +5401,7 @@
                                       <button
                                         class="link seed-download-link"
                                         type="button"
-                                        title={`Download the file from work ${candidate.downloaded_work_id}`}
+                                        title="Download the file for this item"
                                         on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
                                       >{text} ⤓</button>
                                     </span>
