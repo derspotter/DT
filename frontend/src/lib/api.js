@@ -466,6 +466,7 @@ export async function runKeywordSearch({
   maxRelated = 30,
   enqueue = false,
   topics = [],
+  corpusId = null,
 }) {
   const response = await requestJson('/api/keyword-search', {
     method: 'POST',
@@ -485,6 +486,7 @@ export async function runKeywordSearch({
       maxRelated,
       enqueue,
       topics,
+      corpusId,
     },
     timeout: PIPELINE_TIMEOUT,
     errorMessage: 'Search failed',

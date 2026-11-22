@@ -212,6 +212,23 @@ def test_count_openalex_uses_per_page_one(monkeypatch):
     assert "cursor" not in captured
 
 
+@pytest.mark.parametrize("payload,expected", [
+    ({"meta": {"count": 0}}, 0),
+    ({"meta": {"count": 7}}, 7),
+    ({"meta": {"count": None}}, None),
+    ({"meta": {}}, None),
+    ({}, None),
+    (None, None),
+    ({"meta": {"count": "12"}}, None),
+    ({"meta": {"count": -1}}, None),
+    ({"meta": {"count": True}}, None),
+])
+def test_count_openalex_keeps_an_unknown_count_unknown(monkeypatch, payload, expected):
+    # FE-55: a missing or invalid meta.count is None (unknown), never 0; a genuine 0 stays 0.
+    monkeypatch.setattr(keyword_search, "_openalex_request", lambda *a, **k: payload)
+    assert keyword_search.count_openalex(query="labour") == expected
+
+
 def test_effective_max_results():
     assert keyword_search.effective_max_results(0) is None
     assert keyword_search.effective_max_results(-5) is None

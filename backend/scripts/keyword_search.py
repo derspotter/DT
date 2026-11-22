@@ -768,7 +768,9 @@ def main():
             return
         count = count_openalex(query=args.query or '', year_from=args.year_from, year_to=args.year_to,
                                author=args.author, field=args.field, mailto=args.mailto, topics=topics)
-        print(json.dumps({'count': int(count), 'credits_per_page': search_credits_per_page(args.query)}))
+        # None (unknown) stays null: the frontend then asks before starting (FE-55).
+        print(json.dumps({'count': None if count is None else int(count),
+                          'credits_per_page': search_credits_per_page(args.query)}))
         return
 
     db_path = Path(args.db_path)

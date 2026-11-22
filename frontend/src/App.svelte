@@ -3647,6 +3647,9 @@
       maxResults: searchResultCap(maxResults), sort: searchSort,
       includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
       maxRelated: 30,
+      // The preview and the launch run in the corpus the search was submitted
+      // from, even if a switch is saved meanwhile (FE-62).
+      corpusId: currentCorpusId,
     }
   }
 
@@ -3833,6 +3836,10 @@
     searchRequest = searchRequest
     // The preview costs OpenAlex credits too.
     void refreshQuota()
+    // A missing or invalid count is unknown, never 0: ask first (FE-55).
+    if (!previewError && !(Number.isInteger(preview?.count) && preview.count >= 0)) {
+      previewError = 'the server reported no count'
+    }
     if (previewError) {
       searchPreview = null
       searchPreviewError = previewError
@@ -3859,6 +3866,12 @@
     const requestBody = body
       ? (maxResultsOverride !== null ? { ...body, maxResults: maxResultsOverride } : body)
       : buildSearchBody(searchMaxResults)
+    // A search submitted under another corpus than the one now shown is
+    // dropped (FE-62): its confirmation belonged to that corpus.
+    if ((requestBody.corpusId ?? null) !== (currentCorpusId ?? null)) {
+      searchStatus = ''
+      return
+    }
     searchStatus = 'Starting search...'
     try {
       const { data, expansion, runId, running } = await runKeywordSearch(requestBody)
@@ -5212,10 +5225,11 @@
                     {/if}
                     {#if searchWarning && searchPreview}
                       {@const est = searchEstimate(searchPreview.count, openalexQuota, creditsPerPageFor(searchPreview))}
+                      {@const warnCap = Math.max(1, Math.floor(searchPreview.threshold / 10))}
                       <div class="search-warning" role="alert" data-testid="search-warning">
                         <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests ({est.credits.toLocaleString('en-US')} credits) and {est.duration}.{#if est.budgetSentence} {est.budgetSentence}{/if} Narrow the query, or:</p>
                         <div class="search-warning__actions">
-                          <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: Math.floor(searchPreview.threshold / 10), body: searchRequest?.body })}>Cap at {Math.floor(searchPreview.threshold / 10).toLocaleString('en-US')}</button>
+                          <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: warnCap, body: searchRequest?.body })}>Cap at {warnCap.toLocaleString('en-US')}</button>
                           {#if est.canCapAtBudget}
                             <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.capAtBudget, body: searchRequest?.body })}>Cap at budget</button>
                           {/if}

@@ -437,6 +437,44 @@ test('"Cap at" starts the submitted body with only the cap replaced', async ({ p
   expect(ui.seen.searchBodies[0]).toEqual({ ...submitted, maxResults: 10000, enqueue: false })
 })
 
+// FE-55: a preview without a valid count is unknown, never 0.
+for (const body of [{ count: null, threshold: 100000 }, { threshold: 100000 }]) {
+  test(`a preview without a count (${JSON.stringify(body)}) asks before starting`, async ({ page }) => {
+    const ui = await routeSearch(page, [{ status: 200, body }])
+    await ui.query.fill('climate')
+    await ui.maxResults.fill('0')
+    await ui.searchButton.click()
+    await expect(ui.warning).toContainText('Could not check how many works match (the server reported no count).')
+    await expect(ui.warning).toContainText('This search has no cap, so it may fetch a very large number of works.')
+    await page.waitForTimeout(200)
+    expect(ui.seen.searchBodies).toHaveLength(0)
+    await ui.warning.getByRole('button', { name: 'Search anyway' }).click()
+    await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  })
+}
+
+test('a genuine zero count starts the search without asking', async ({ page }) => {
+  const ui = await routeSearch(page, [{ status: 200, body: { count: 0, threshold: 100000 } }])
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+})
+
+// FE-55 minor: a threshold below 10 never offers "Cap at 0", which the
+// backend would read as no cap.
+test('"Cap at" never goes below 1', async ({ page }) => {
+  const ui = await routeSearch(page, [{ status: 200, body: { count: 50, threshold: 5 } }])
+  await ui.query.fill('climate')
+  await ui.maxResults.fill('0')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('This search matches 50 works')
+  await expect(ui.warning.getByRole('button', { name: 'Cap at 0' })).toHaveCount(0)
+  await ui.warning.getByRole('button', { name: 'Cap at 1', exact: true }).click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  expect(ui.seen.searchBodies[0].maxResults).toBe(1)
+})
+
 for (const status of [400, 403]) {
   test(`a ${status} preview shows its message and starts nothing`, async ({ page }) => {
     const ui = await routeSearch(page, [{ status, body: { error: 'denied or invalid' } }])

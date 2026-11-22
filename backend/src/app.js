@@ -2946,6 +2946,19 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     }
     return next();
   };
+  // The search preview and launch carry the corpus the user submitted from
+  // (FE-62): a corpus switch saved meanwhile must not move the search. The
+  // caller's access to that corpus is then checked by requireCorpusWriteAccess.
+  const bindSubmittedCorpus = (req, res, next) => {
+    if (isStubMode()) return next();
+    const submitted = req.body?.corpusId;
+    if (submitted === undefined || submitted === null) return next();
+    const corpusId = normalizeCorpusId(submitted);
+    if (!corpusId) return res.status(400).json({ error: 'Invalid corpusId' });
+    req.corpusId = corpusId;
+    req.corpusRole = resolveCorpusRole(authDb, req.user, corpusId, authConfig);
+    return next();
+  };
   // Corpus-scoped readers treat a null corpusId as "all corpora", so every
   // read route that hands them req.corpusId needs a resolved, accessible corpus.
   // Resolves the caller's role on getCorpusId(req) and sets req.corpusRole;
@@ -4871,7 +4884,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
 
   // Legacy `/api/bibliographies/consolidate` endpoint removed (DB-first pipeline).
 
-  app.post('/api/keyword-search/preview', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+  app.post('/api/keyword-search/preview', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, async (req, res) => {
     const built = buildKeywordSearchArgs(req);
     if (built.error) return res.status(400).json({ error: built.error });
     const threshold = searchWarnThreshold();
@@ -4882,7 +4895,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, [...built.args, '--count-only'], { dbPath: DB_PATH, corpusId: req.corpusId });
       return res.json({
-        count: Number(payload?.count || 0),
+        // An unknown count stays null, never 0: the frontend then asks first (FE-55).
+        count: Number.isInteger(payload?.count) && payload.count >= 0 ? payload.count : null,
         threshold,
         creditsPerPage: Number(payload?.credits_per_page) > 0 ? Number(payload.credits_per_page) : creditsPerPage,
       });
@@ -4893,7 +4907,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     }
   });
 
-  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+  app.post('/api/keyword-search', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, (req, res) => {
     const built = buildKeywordSearchArgs(req);
     if (built.error) return res.status(400).json({ error: built.error });
     if (process.env.RAG_FEEDER_STUB === '1') {

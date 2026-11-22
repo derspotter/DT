@@ -53,6 +53,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // The keyword-search preview's answer.
     previewCount: 5,
     previewDelayMs: 0,
+    // Bodies of the preview and launch requests, in order.
+    previewBodies: [] as any[],
+    searchBodies: [] as any[],
     // Daemon workers; a running batch puts an admin on the 2 s cadence.
     workers: {} as Record<string, unknown>,
     ingestRuns: [] as Record<string, unknown>[],
@@ -112,7 +115,12 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
       }
       return
     }
+    if (path === '/api/keyword-search' && route.request().method() === 'POST') {
+      state.searchBodies.push(route.request().postDataJSON())
+      return fulfil(route, { runId: 55, status: 'running' }, 202)
+    }
     if (path === '/api/keyword-search/preview') {
+      state.previewBodies.push(route.request().postDataJSON())
       await new Promise((resolve) => setTimeout(resolve, state.previewDelayMs))
       return fulfil(route, { count: state.previewCount, threshold: 100000 })
     }
@@ -613,6 +621,26 @@ for (const { count, name } of [{ count: 5, name: 'small' }, { count: 342118, nam
     await expect(card.getByRole('button', { name: 'Search', exact: true })).toBeEnabled()
   })
 }
+
+// FE-62: the server saves the switch before the browser's /me answers. A
+// small preview answering in that gap launches at once; preview and launch
+// both carry the corpus the search was submitted from, so the server runs it
+// there and not in the corpus it now calls current.
+test('a preview answered between the saved switch and its /me launches in the submitted corpus', async ({ page }) => {
+  const { state, delays, count: requests } = await boot(page)
+  state.previewCount = 5
+  state.previewDelayMs = 800
+  delays.me = 2500
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect.poll(() => requests('/api/keyword-search/preview')).toBe(1)
+  await page.locator('.header-corpus-picker select').selectOption('2')
+  await expect.poll(() => state.lastCorpusId).toBe(2) // saved on the server, /me still pending
+  await expect.poll(() => state.searchBodies.length).toBe(1)
+  expect(state.previewBodies[0].corpusId).toBe(1)
+  expect(state.searchBodies[0].corpusId).toBe(1)
+})
 
 test('poll cycles load ingest runs only when dirty, and never flash their status', async ({ page }) => {
   const { count, reset } = await boot(page, {
