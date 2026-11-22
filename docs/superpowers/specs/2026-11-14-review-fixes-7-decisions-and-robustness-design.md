@@ -562,13 +562,14 @@ not non-issues.
     account; a name with no row keeps the trimmed-name key. Expired entries of both maps are
     swept on `reserve` at most once per window (one full scan per `windowMs`), so an entry
     whose key never returns, such as a deleted invitation, does not stay until restart.
-- **The key is the submitted username.** The handler first answers `400 Missing username or
+- **The key is the resolved account, else the submitted username.** The handler first answers `400 Missing username or
   password` unless `username` and `password` are both strings and `username.trim()` is not
-  empty. It then uses `name = username.trim()` for the limiter. The lookup (review fix) tries the exact
+  empty. It then computes `name = username.trim()`. The lookup (review fix) tries the exact
   submitted `username` first and, only when no row matches and `name` differs, `name`, so a legacy
   account stored with surrounding whitespace still signs in and the exact row wins when both
-  exist; ` b ` signs in as `b` when no ` b ` row exists. The limiter stores
-  `sha256(name)` as hex (64 characters) as its map key, so a request-sized username costs no
+  exist; ` b ` signs in as `b` when no ` b ` row exists. The limiter key is
+  `id:<user.id>` when the lookup found a row and `name` otherwise, stored as its `sha256` hex
+  digest (64 characters), so a request-sized username costs no
   more memory than a short one; equality stays exact (BINARY). The limiter runs right after the
   user lookup, **before** any answer that depends on it, and treats every name alike:
   - `reserve` first; when it is not allowed, the answer is `429` with header
