@@ -18,6 +18,7 @@ import { listCorpus, corpusStageStatuses } from './corpusList.js';
 import { createPythonRunner } from './pythonProcess.js';
 import { tokenMailContent } from './authMail.js';
 import { getPasswordHasher } from './passwordHasher.js';
+import { createLoginLimiter } from './loginLimiter.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -1255,10 +1256,6 @@ export function ensureLastCorpus(db, user, authConfig = resolveAuthConfig()) {
     db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(next, user.id);
   }
   return next;
-}
-
-function canConfigureCorpus(role) {
-  return role === 'owner' || role === 'editor';
 }
 
 function getKantroposTargetById(targetId) {
@@ -2807,8 +2804,9 @@ function spentTokenError() {
   return error;
 }
 
-export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
+export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimiter } = {}) {
   const app = express();
+  const signInLimiter = loginLimiter || createLoginLimiter();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const corpusDownloadTickets = new Map(); // token -> { userId, corpusId, itemId, expiresAt }
@@ -3348,29 +3346,52 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
   // --- Auth endpoints ---
   app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};
-    if (!username || !password) {
+    const name = typeof username === 'string' ? username.trim() : '';
+    if (!name || typeof password !== 'string') {
       return res.status(400).json({ error: 'Missing username or password' });
     }
-    const user = authDb
-      .prepare('SELECT id, username, email, password_hash, account_status, last_corpus_id FROM users WHERE username = ?')
-      .get(username);
+    // The slot is reserved before the lookup, and every name is treated
+    // alike, so the 429 does not tell which usernames exist.
+    const gate = signInLimiter.reserve(name);
+    if (!gate.allowed) {
+      const minutes = Math.ceil(gate.retryAfterSeconds / 60);
+      res.set('Retry-After', String(gate.retryAfterSeconds));
+      return res.status(429).json({
+        error: `Too many failed sign-ins for this account. Try again in ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}.`,
+      });
+    }
+    let user;
+    try {
+      user = authDb
+        .prepare('SELECT id, username, email, password_hash, account_status, last_corpus_id FROM users WHERE username = ?')
+        .get(name);
+    } catch (error) {
+      signInLimiter.refund(gate.ticket);
+      console.error('[auth login] User lookup failed:', error);
+      return res.status(500).json({ error: 'Login failed' });
+    }
     if (user?.account_status === 'invited') {
+      signInLimiter.fail(gate.ticket);
       return res.status(403).json({ error: 'Invitation pending. Use the link from your email to set your password.' });
     }
     if (!user) {
+      signInLimiter.fail(gate.ticket);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     let valid = false;
     try {
       valid = await getPasswordHasher().compare(password, user.password_hash);
     } catch (error) {
+      signInLimiter.refund(gate.ticket);
       if (answerHasherBusy(res, error)) return undefined;
       console.error('[auth login] Password check failed:', error);
       return res.status(500).json({ error: 'Login failed' });
     }
     if (!valid) {
+      signInLimiter.fail(gate.ticket);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    signInLimiter.succeed(gate.ticket);
     const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       token: issueAuthToken(user, authConfig),
@@ -4160,19 +4181,22 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
 
   app.get('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
     const corpusId = Number(req.params.id);
-    const role = req.corpusRole;
     return res.json({
       assignment: getCorpusKantroposAssignment(authDb, corpusId),
       corpora: KANTROPOS_TARGETS,
       root_path: KANTROPOS_CORPORA_ROOT,
-      can_edit: canConfigureCorpus(role) || role === 'admin',
+      can_edit: isAdminUser(req.user, authConfig),
     });
   });
 
-  const requireCorpusConfigurer = requireCorpusRole(['owner', 'editor'], corpusIdFromParams, {
-    forbiddenError: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus',
+  // Only the admin assigns a Kantropos corpus (BE-19): an assignment grants the
+  // corpus's owners and editors rights on the target (canUseKantroposTarget).
+  // With no roles listed, only the corpus role 'admin' passes; a non-member
+  // still gets 'No access to this corpus' first.
+  const requireKantroposAssigner = requireCorpusRole([], corpusIdFromParams, {
+    forbiddenError: 'Only the global admin can assign a Kantropos corpus',
   });
-  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusConfigurer, (req, res) => {
+  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireKantroposAssigner, (req, res) => {
     const corpusId = Number(req.params.id);
     const nextTargetIdRaw = req.body?.targetId;
     const nextTargetId = nextTargetIdRaw === null || nextTargetIdRaw === undefined || nextTargetIdRaw === ''
