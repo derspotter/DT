@@ -252,11 +252,14 @@ not non-issues.
   (`normalize_doi`) on both sides. Pass 2 keeps its query: the `--scope` clause, the `--limit`
   clause and `topics_fetched IS NULL OR topics_fetched = 0`.
   - **The whole DOI is validated before the key is taken.** In the existing pass-2 loop, each
-    row's `doi` is first stripped of its recognised wrappers with the shared
-    `normalize_doi_lower` (a `doi.org` URL or `doi:` prefix, surrounding ` .;,`). The row is
-    sent only when that **bare value as a whole** has the DOI shape
-    (`_DOI_IN_TEXT_RE.fullmatch`): `10.`, 4 to 9 digits, `/`, then the pattern's character
-    class, which has no `|`, `,` or `+`. Its key is then `normalize_doi(bare)`.
+    row's `doi` is lowercased and stripped of **only** whitespace and the recognised prefixes
+    (`identifiers._DOI_URL_PREFIX_RE`, a `doi.org` URL; `_DOI_SCHEME_PREFIX_RE`, `doi:`), then
+    whitespace again. No punctuation is trimmed: `normalize_doi_lower` would turn `10.1000/ABC.`
+    and `10.1000/ABC;` into `10.1000/abc`, while the DB key keeps the suffix. The row is sent only
+    when that **remaining token as a whole** has the DOI shape (`_DOI_IN_TEXT_RE.fullmatch`):
+    `10.`, 4 to 9 digits, `/`, then the pattern's character class, which has no `|`, `,` or `+`.
+    Its key is then the token uppercased, which equals `normalize_doi` of it. Returned works go
+    through the same function, so a returned DOI that is not a whole DOI matches nothing.
   - Validating after `normalize_doi` would not do: the rule extracts the first DOI-shaped run, so
     `10.1000/ABC+123` and `10.1000/ABC|xyz` would both become the valid-looking `10.1000/ABC` and
     fetch (and write) another work's topics. Embedded citation text is skipped too.
@@ -274,7 +277,9 @@ not non-issues.
 **D2. The CLI claims rows like the daemon, one at a time (PY-16), controller call.**
 - **Claim.** `download-pdfs` loops up to `--limit` times, each time claiming one row with
   `db.claim_download_batch(limit=1, corpus_id=None, claimed_by=cli_id, lease_seconds=900)`, and
-  stops at the first empty claim (`Queue is empty.` when the first claim is empty).
+  stops at the first empty claim (`Queue is empty.` when the first claim is empty). `--limit`
+  keeps today's SQLite meaning: a negative value is unbounded (loop until the queue is empty),
+  and `0` claims nothing and prints `Queue is empty.`.
   `cli_id = f"cli:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"`. One lease covers
   one download, so a long run never holds leases on rows it has not reached yet. A single download
   that outlasts its lease loses the row to the next claimant, and its result is discarded (below).
@@ -304,6 +309,11 @@ not non-issues.
     `_begin_owned(phase, work_id, claimed_by)`: `BEGIN IMMEDIATE` (unless a transaction is open),
     then the check, and a rollback when it fails. Their existing commit and rollback then end
     that one transaction.
+  - **Every exit ends the transaction.** Each owned writer wraps its body in `try/finally`; the
+    `finally` rolls back when `self.conn.in_transaction` is still true. That covers the early
+    `duplicate_target_gone` return, a file error from publishing (`OSError`, which the existing
+    `sqlite3.Error` handlers do not catch) and any other exception, so the write lock is never
+    held into the fallback download.
 
   `_claim_held` checks `<status> = 'in_progress' AND <claimed_by> = ?` for the phase's columns
   (`download_*` or `metadata_*`). The write lock is held from the check through the write, so no
@@ -324,22 +334,32 @@ not non-issues.
   transaction, the duplicate target is re-read: when it no longer exists or is no longer
   `downloaded`, nothing is merged, it returns `(False, "duplicate_target_gone")`, and the caller
   downloads the row as usual.
-- **A stale downloader never overwrites the published PDF.** Today all three file writers
-  (`new_dl.py:1120`, `:1468`, `pdf_downloader.py:139-140`) write a deterministic final name, so
-  a late attempt for the same work can overwrite the bytes behind the winner's `file_checksum`.
-  The smallest fix, no per-attempt directories:
+- **No download ever overwrites a published PDF.** Today the two live filename builders,
+  `try_download_url` (`new_dl.py:1402`, written at `:1468`) and `PDFDownloader` (`pdf_downloader.py:171-180`,
+  written at `:139-140`), write a deterministic final name. A late attempt for the same work can
+  overwrite the bytes behind the winner's `file_checksum`, and two unrelated works can derive the
+  same name (a URL-only OpenAlex payload gives `untitled.pdf`). (`download_paper`, `new_dl.py:1076`,
+  has no production caller and is not changed.) The smallest fix, no per-attempt directories:
   - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)` puts the
-    suffix into `ref["part_suffix"]`; the three writers write `<final><part_suffix>` in the same
+    suffix into `ref["part_suffix"]`; the two builders write `<final><part_suffix>` in the same
     directory and report that path as `downloaded_file`. CLI and daemon pass
     `part_suffix=f".part-{secrets.token_hex(4)}"` per attempt. Other callers pass nothing and keep
     today's behaviour.
   - `move_entry_to_downloaded` and `mark_raw_work_downloaded` gain `part_path: str | None = None`.
     After the ownership check passes, inside the same transaction, they publish it with
-    `download_path.publish_download(part_path) -> str` (`os.replace` to the name without the
-    `.part-…` suffix, atomic in one directory) and store the final path.
-  - On a lost claim or any other failed write, the caller removes its part file with
+    `download_path.publish_download(part_path, work_id) -> str`, which never overwrites:
+    `os.link(part, final)` (the name without the `.part-…` suffix), then unlink the part; on
+    `FileExistsError` it retries once with `<stem>-<work id>.pdf`, then with
+    `<stem>-<work id>-<8 hex>.pdf`. `os.replace` is never used on a PDF name. The writer stores
+    the path actually published, together with the downloader's checksum of those bytes, in the
+    same transaction.
+  - **Cleanup.** When the transaction then fails (rollback), the writer unlinks the file it just
+    published. When `mark_raw_work_downloaded` merges into a canonical work whose own PDF is kept
+    (its resulting `file_path` is not the published path), the published file is unlinked after
+    the commit. On a lost claim or any other failed write, the caller removes its part file with
     `download_path.discard_download(part_path)` (`missing_ok`). A stale attempt therefore leaves
-    the winner's bytes and checksum untouched; at worst a crash leaves one `*.part-*` file.
+    the winner's bytes and checksum untouched, and an earlier file of another work is never
+    touched; at worst a crash leaves one `*.part-*` file or one unreferenced PDF.
 - The CLI's dedupe uses the daemon's rule through a new shared method,
   `DatabaseManager.find_downloaded_duplicate(row: dict, authors) -> tuple[str | None, int | None, str | None]`.
   It runs `check_if_exists(doi, openalex_id, title, authors, editors=row.get("editors"), year,
@@ -393,8 +413,9 @@ not non-issues.
   running for at least half the deadline: `now - started >= deadline * HUNG_ITEM_MIN_RUN_FRACTION`
   (`0.5`), with `now` read from `_running_clock` at the latch. A sibling that started recently is
   not counted, whatever its attempt count. Half rather than the whole deadline, because every item
-  starts after its batch's deadline clock: at the win, even an item that hung from the first
-  second has run slightly less than the deadline.
+  starts after its batch's deadline clock: at a timely win, even an item that hung from the first
+  second has run slightly less than the deadline (only a delayed watchdog tick would let the
+  full-deadline test hold).
 - **Terminal writes are guarded by ownership.** The enrich writes that end a metadata claim pass
   `claimed_by=self.worker_id` (D2): `apply_enriched_metadata`,
   `mark_metadata_failed`, `reset_enrich_claim` in `do_enrich`, and `mark_raw_work_downloaded` in
@@ -753,7 +774,7 @@ phase's Acceptance.
   never blamed. The three-attempt bound holds when the win's write is persisted; a skipped write
   costs one more cycle. Phase 5's 2 s exit bound is kept. The error is
   `hung past the <N>s timeout; attempt limit 3 reached`. The "half the timeout" criterion
-  replaces the "older than the timeout" wording of the rulings, which no item can meet at the
+  replaces the "older than the timeout" wording of the rulings, which no item meets at a timely
   win (see D3).
 - **D4 (BE-19):** only the admin may assign or clear; existing assignments made by owners or
   editors stay until an admin changes them.

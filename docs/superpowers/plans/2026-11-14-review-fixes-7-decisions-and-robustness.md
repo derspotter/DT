@@ -79,7 +79,7 @@ No other file is touched by two tasks. One behavioural coupling crosses tasks: T
     - the select title `Only admins can change the Kantropos assignment`
     - the save guard `Only admins can change the Kantropos assignment.`
 - These values are fixed by the spec:
-  - D2: CLI claim `limit=1`, lease 900 s, claimant `cli:<host>:<pid>:<6 hex>`; daemon lease `max(900, int(max(job_timeout, direct_batch_timeout)) + 60)` (1860 s by default); part suffix `.part-<8 hex>` per attempt (`secrets.token_hex(4)`), in the final file's directory.
+  - D2: CLI claim `limit=1`, lease 900 s, claimant `cli:<host>:<pid>:<6 hex>`; daemon lease `max(900, int(max(job_timeout, direct_batch_timeout)) + 60)` (1860 s by default); part suffix `.part-<8 hex>` per attempt (`secrets.token_hex(4)`), in the final file's directory. Published names, in order: `<final>`, `<stem>-<work id>.pdf`, `<stem>-<work id>-<8 hex>.pdf` (`os.link`, never `os.replace`).
   - D3: limit `RAG_FEEDER_HUNG_ITEM_MAX_ATTEMPTS`, default 3, minimum 1; `HUNG_ITEM_MIN_RUN_FRACTION = 0.5`; one shared busy budget of `WATCHDOG_BUSY_TIMEOUT_MS` (1000 ms) for both reporting writes.
   - D5: `maxFailures = 10`, `windowMs = 900000`, `maxKeys = 10000`; map key `sha256(name)` hex.
   - D6: `days = 30`, `intervalMs = 86400000`, `PRUNE_BUSY_TIMEOUT_MS = 250`.
@@ -129,8 +129,8 @@ No other file is touched by two tasks. One behavioural coupling crosses tasks: T
 **Interfaces:**
 - Produces:
   - `upstream_update.display_doi(value) -> str`: `normalize_doi(value, case="lower") or ""`.
-  - `backfill_openalex_topics.bare_doi(raw) -> str | None`: `bare = identifiers.normalize_doi_lower(raw)` (wrappers stripped); returns `bare` when `identifiers._DOI_IN_TEXT_RE.fullmatch(bare)`, else `None`. The whole DOI is validated **before** any key is extracted.
-  - `backfill_openalex_topics.doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[int, str]], int]`: pass 2's query unchanged (scope clause, `openalex_id` empty, `doi` non-empty, `topics_fetched IS NULL OR topics_fetched = 0`, `ORDER BY id` plus the limit clause); for each row `bare = bare_doi(doi)`, key `normalize_doi(bare)`; returns the `(work_id, key)` pairs of the valid rows and the count skipped.
+  - `backfill_openalex_topics.bare_doi(raw) -> str | None`: lowercases `str(raw)`, strips whitespace, removes **only** the prefixes `identifiers._DOI_URL_PREFIX_RE` and `_DOI_SCHEME_PREFIX_RE`, strips whitespace again (no punctuation trim, so not `normalize_doi_lower`); returns the token when `identifiers._DOI_IN_TEXT_RE.fullmatch(token)`, else `None`. The whole DOI is validated **before** any key is extracted.
+  - `backfill_openalex_topics.doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[int, str]], int]`: pass 2's query unchanged (scope clause, `openalex_id` empty, `doi` non-empty, `topics_fetched IS NULL OR topics_fetched = 0`, `ORDER BY id` plus the limit clause); for each row `bare = bare_doi(doi)`, key `bare.upper()` (equal to `normalize_doi(bare)`); returns the `(work_id, key)` pairs of the valid rows and the count skipped.
   - `backfill_openalex_topics.doi_filter(tokens: list[str]) -> str`: `"doi:" + "|".join(t.lower() for t in tokens)`.
   - Each of the three modules exposes `normalize_doi`, which is `dl_lit.identifiers.normalize_doi`.
 
@@ -167,7 +167,12 @@ def test_backfill_validates_the_whole_doi_before_taking_the_key():
     assert backfill.bare_doi("https://doi.org/10.1000/ABC") == "10.1000/abc"
     for raw in ("10.1000/ABC+123", "10.1000/ABC|xyz", "10.bogus|xyz", "10.1/abc", "Smith 2020, doi 10.1000/ABC", None):
         assert backfill.bare_doi(raw) is None   # normalize_doi would turn the first two into the valid-looking 10.1000/ABC
+    assert backfill.bare_doi(" doi:10.1000/ABC. ") == "10.1000/abc."   # punctuation is part of the DOI, as in the DB key
     assert backfill.doi_filter(["10.1000/ABC"]) == "doi:10.1000/abc"
+def test_backfill_pass2_keeps_punctuated_and_plain_dois_apart(tmp_path, monkeypatch):
+    # one batch: row 1 doi "10.1000/ABC", row 2 doi "10.1000/ABC.", row 3 doi "10.1000/XYZ;"
+    # mocked OpenAlex returns works with dois "https://doi.org/10.1000/abc" (topic T1) and "https://doi.org/10.1000/abc." (topic T2)
+    # -> row 1 gets T1, row 2 gets T2, row 3 unchanged; the filter holds the three tokens as stored (lowercased)
 def test_backfill_pass2_sends_only_whole_dois_and_updates_the_row(tmp_path, monkeypatch, capsys):
     # DatabaseManager(tmp db) creates works; rows (all openalex_id NULL, metadata_status 'matched'):
     #   1 doi "https://doi.org/10.1000/ABC"; 2 doi "10.bogus|xyz"; 3 doi "10.1/abc"; 4 doi "10.1000/DEF" with topics_fetched 1
@@ -195,7 +200,7 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
   - `upstream_update`:
     - `:307` uses `normalize_doi(...)` for the key candidate;
     - `:379` and `:831` use `display_doi(...)`.
-  - `backfill`: pass 2 builds its rows with `doi_rows(conn, scope_clause=…, limit_clause=…)`, matches with `key=lambda work: normalize_doi(work.get("doi"))` and filters with `doi_filter`, and adds `<skipped> skipped (not a whole DOI)` to the `Pass 2 (by doi)` log line.
+  - `backfill`: pass 2 builds its rows with `doi_rows(conn, scope_clause=…, limit_clause=…)`, matches returned works with `key=lambda work: (bare_doi(work.get("doi")) or "").upper() or None` (the same function on both sides) and filters with `doi_filter`, and adds `<skipped> skipped (not a whole DOI)` to the `Pass 2 (by doi)` log line.
 - [ ] **Step 4: Run the suites.** Run `test_doi_rule_scripts.py`, `test_identifiers.py` and `test_backend_helper_scripts.py` together; then `test_upstream_recovery.py` alone and `test_upstream_text_scan.py` alone, each in its own `python -m pytest` process (a fresh interpreter, so a loader that only works after another suite fixed `sys.path` is caught); then the whole suite. Expected: all passed.
 - [ ] **Step 5: Commit** — `scripts: export_bundle, upstream_update and backfill_openalex_topics use the DB's DOI rule (PY-14)`
 
@@ -209,7 +214,7 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
   - the claim-ending writers gain keyword-only `claimed_by` (spec D2): `apply_enriched_metadata` (`:1573`), `mark_metadata_failed` (`:747`), `reset_enrich_claim` (`:1825`), `move_entry_to_downloaded` (`:1891`, also `part_path`), `mark_raw_work_downloaded` (`:2013`, also `part_path`), `move_entry_to_failed` (`:2057`) / `mark_download_failed` (`:2762`), `merge_duplicate_queued_work` (`:2766`, also the target recheck);
   - delete `fetch_download_queue` (`:1855`).
 - Modify: `dl_lit_project/dl_lit/download_path.py` (`download_ref` gains `part_suffix`; new `publish_download`, `discard_download`).
-- Modify: `dl_lit_project/dl_lit/new_dl.py:1120`, `:1468` and `dl_lit_project/dl_lit/pdf_downloader.py:139-140` (write `<final><part_suffix>` when `ref["part_suffix"]` / the new `part_suffix` argument of `PDFDownloader.attempt_download` is set; `new_dl.py:1234` passes it on).
+- Modify: the two live filename builders only, `dl_lit_project/dl_lit/new_dl.py` `try_download_url` (`:1402`, written at `:1468`) and `dl_lit_project/dl_lit/pdf_downloader.py` (`:171-180`, written at `:139-140`): write `<final><part_suffix>` when `ref["part_suffix"]` / the new `part_suffix` argument of `PDFDownloader.attempt_download` is set; `new_dl.py:1234` passes it on. `download_paper` (`new_dl.py:1076`, no production caller) is not touched.
 - Modify: `dl_lit_project/dl_lit/cli.py:649-736` (`download_pdfs_command`).
 - Modify: `backend/scripts/daemon/worker.py`:
   - `:1050` and `:1290` (claims use `self._claim_lease_seconds()`); new `_claim_lease_seconds` next to `_direct_batch_timeout_seconds` (`:301`);
@@ -222,7 +227,7 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
 - Modify: `dl_lit_project/tests/test_cli_downloader.py` (the mocks move from `fetch_download_queue`/`check_if_exists` to `claim_download_batch`/`find_downloaded_duplicate`/`release_download_claims`, and the writers are called with `claimed_by`).
 - Modify: `dl_lit_project/tests/test_download_path.py`:
   - `:198-221` (the same switch in `test_cli_downloaded_count_ignores_the_duplicate_merge_result`);
-  - `:245-256` (`_worker_daemon`): set `daemon.worker_id = "daemon:test:1:abc"` and call `daemon._init_work_state()`; every test that calls `_download_single` or `_attempt_raw_download` first claims its row through the real `claim_download_batch` / `claim_enrich_batch` with `claimed_by=daemon.worker_id` and passes the returned row, instead of a queued row read directly.
+  - `:245-256` (`_worker_daemon`): set `daemon.worker_id = "daemon:test:1:abc"` and call `daemon._init_work_state()`; every test that calls `_download_single` or `_attempt_raw_download` first claims its row through the real `claim_download_batch` / `claim_enrich_batch` with `claimed_by=daemon.worker_id` and passes the returned row, instead of a queued row read directly. The successful enhancer fakes (`:260` on) write their bytes to `<final> + ref["part_suffix"]` and return that path, so the real publisher runs.
 - Test: `dl_lit_project/tests/test_cli_download_leases.py` (new)
 
 **Interfaces:**
@@ -231,8 +236,9 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
   - `DatabaseManager._begin_owned(phase, work_id, claimed_by) -> bool`: `BEGIN IMMEDIATE` unless a transaction is open, then `_claim_held`; rolls back and returns `False` when it fails. For the self-committing writers; their existing commit/rollback ends the same transaction.
   - The writers listed in Files take `claimed_by: str | None = None` (`None` keeps today's behaviour). `apply_enriched_metadata` runs `_claim_held` as the first statement inside its own `with self.transaction():`; the others start with `_begin_owned`. A lost claim returns `(None, CLAIM_LOST)` (`(False, CLAIM_LOST)` for the merge). No outer wrapper, so a writer's own rollback always covers all of its writes.
   - `merge_duplicate_queued_work(..., claimed_by=…)` re-reads the target inside that transaction and returns `(False, "duplicate_target_gone")` when it is missing or not `downloaded`; the caller then downloads the row.
-  - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)`; `publish_download(part_path: str) -> str` (`os.replace` to the name without the `.part-…` suffix, returns it); `discard_download(part_path: str | None) -> None` (`unlink(missing_ok=True)`).
-  - `move_entry_to_downloaded(..., *, claimed_by=None, part_path=None)` and `mark_raw_work_downloaded(..., *, claimed_by=None, part_path=None)`: after the claim check, `file_path = publish_download(part_path)` inside the same transaction.
+  - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)`; `publish_download(part_path: str, work_id: int) -> str`: never overwrites. `os.link(part, final)` (`final` = the name without the `.part-…` suffix), then unlink the part; on `FileExistsError` retry once with `<stem>-<work id>.pdf`, then `<stem>-<work id>-<8 hex>.pdf`; returns the path actually published. No `os.replace`; `discard_download(part_path: str | None) -> None` (`unlink(missing_ok=True)`).
+  - `move_entry_to_downloaded(..., *, claimed_by=None, part_path=None)` and `mark_raw_work_downloaded(..., *, claimed_by=None, part_path=None)`: after the claim check, `file_path = publish_download(part_path, work_id)` inside the same transaction, stored with the downloader's checksum. If the transaction then fails, the writer unlinks that published file; if `mark_raw_work_downloaded` merges into a canonical whose own PDF is kept, it unlinks the published file after the commit.
+  - Every owned writer runs in `try/finally` and rolls back in the `finally` while `self.conn.in_transaction` (covers the early `duplicate_target_gone` return and `OSError` from publishing).
   - `DatabaseManager.release_enrich_claims(work_ids: list[int], claimed_by: str) -> int` (spec D2: back to `pending`, claim columns cleared, `metadata_attempt_count` minus 1, floor 0; only rows still `in_progress` with that owner).
   - `DatabaseManager.find_downloaded_duplicate(row: dict, authors) -> tuple[str | None, int | None, str | None]`. It calls `check_if_exists` with the arguments listed in spec D2 and returns the hit only for a `works` row whose `download_status` is `downloaded`.
   - `DatabaseManager.release_download_claims(claimed_by: str) -> int`. It sets every `in_progress` row with that `download_claimed_by` back to `queued`, clears `download_claimed_by`, `download_claimed_at` and `download_lease_expires_at`, commits, and returns the count.
@@ -253,6 +259,9 @@ def test_the_daemon_cannot_claim_a_row_the_cli_is_downloading(tmp_path, mocker):
 def test_the_cli_claims_one_row_at_a_time(tmp_path, mocker):
     # three queued rows; download_ref side effect counts rows in_progress with a cli: owner (second connection)
     assert counts == [1, 1, 1]
+@pytest.mark.parametrize("limit,calls,empty", [("-1", 3, False), ("0", 0, True)])
+def test_cli_limit_keeps_its_sqlite_meaning(tmp_path, mocker, limit, calls, empty):
+    # three queued rows; --limit -1 -> all three downloaded (unbounded); --limit 0 -> "Queue is empty." and download_ref not called
 def test_cli_takes_a_daemon_row_only_after_its_lease_expires(tmp_path, mocker, monkeypatch):
     # row in_progress, download_claimed_by 'daemon:h:1:abc', lease = now + 10
     # first run: "Queue is empty." and download_ref not called; fake clock +11 s: second run claims and downloads it
@@ -288,10 +297,21 @@ def test_a_late_attempt_leaves_the_winning_pdf_intact(tmp_path, mocker, monkeypa
     # the CLI's attempt (bytes A) is held inside its enhancer call; meanwhile: fake clock past its lease, a daemon claims the row
     # and _download_single runs to completion with bytes B; then the CLI's attempt finishes
     # -> 2020_T.pdf holds B, works.file_checksum == sha256(B), no "*.part-*" file remains, the CLI printed the claim-lost line
+def test_two_works_with_the_same_derived_name_keep_separate_files(tmp_path, monkeypatch):
+    # two works whose fakes derive "untitled.pdf" (URL-only OpenAlex payload), bytes A and B, downloaded one after the other
+    # -> work 1: untitled.pdf, checksum(A); work 2: untitled-<id2>.pdf, checksum(B); both files hold their own bytes
+    # a third publish onto both taken names -> untitled-<id>-<8 hex>.pdf
+def test_a_failed_write_after_publishing_leaves_no_orphan(tmp_path, monkeypatch):
+    # untitled.pdf already published for work 1; work 2's move_entry_to_downloaded with _update_work_record patched to raise
+    # sqlite3.OperationalError after the publish -> (None, err); untitled-<id2>.pdf does not exist; untitled.pdf still holds A;
+    # work 2 still in_progress with its claim; not db.conn.in_transaction
+def test_owned_writers_end_their_transaction_on_every_exit(tmp_path, monkeypatch):
+    # (a) merge returns duplicate_target_gone -> a second connection's BEGIN IMMEDIATE (timeout 0) succeeds while the fallback download runs
+    # (b) os.link patched to raise OSError -> the writer returns an error, not db.conn.in_transaction, the row keeps its claim, no PDF published
 def test_the_writers_write_part_files(tmp_path, monkeypatch):
-    # new_dl direct download (both sites) and PDFDownloader.attempt_download, with a mocked valid PDF response and part_suffix ".part-x":
+    # try_download_url and PDFDownloader.attempt_download, with a mocked valid PDF response and part_suffix ".part-x":
     # the file is "<final>.part-x", downloaded_file names it, "<final>" does not exist; without a suffix: "<final>" as today
-    # publish_download("<final>.part-x") -> "<final>" exists with the bytes, the part file is gone
+    # publish_download("<final>.part-x", 7) -> "<final>" exists with the bytes, the part file is gone
 def test_the_guarded_merge_rechecks_its_target(tmp_path, mocker):
     # duplicate target downloaded when find_downloaded_duplicate runs; download_ref-free path: a hook between the find and the merge
     # (second connection) sets the target's download_status 'failed' -> merge returns (False, "duplicate_target_gone"), the row is downloaded as usual
@@ -404,10 +424,10 @@ def test_a_job_win_blames_running_items_too(tmp_path, monkeypatch):
 def test_reporting_shares_one_busy_budget(tmp_path, monkeypatch):
     # fake monotonic clock: daemon._running_clock = lambda: clock[0] (the budget reads it too)
     # heartbeat_conn wrapped in a _ConnProxy-style fake that records every "PRAGMA busy_timeout = N"; on the hung UPDATE it
-    # runs the real UPDATE on the wrapped connection (an actual uncommitted mutation), advances clock by 0.8, and raises
+    # runs the real UPDATE on the wrapped connection (an actual uncommitted mutation), advances clock by exactly 0.75, and raises
     # sqlite3.OperationalError("database is locked") from the following commit
     # one overdue running row at the limit; win
-    assert busy_values[:2] == [1000, 200]     # the heartbeat gets what is left, not a fresh 1000; then the prior value is restored
+    assert busy_values[:2] == [1000, 250]     # the heartbeat gets what is left, not a fresh 1000; 0.75 avoids float rounding (1.0 - 0.8 gives 199)
     # a second connection still sees the row in_progress (the mutation was rolled back); not conn.in_transaction;
     # log contains 'Watchdog: hung items not recorded (database is locked).'; exits == [75]
 def test_a_spent_budget_skips_the_heartbeat(tmp_path, monkeypatch):
@@ -521,9 +541,12 @@ test('a late success clears settled failures but keeps in-flight reservations', 
   // 3 wrong (401); hold 2 wrong and 1 right; release the right one first -> 200; release the 2 wrong -> 401 each;
   // then 8 wrong -> 401; the next -> 429
 })
-test('a late rejection after a rollover does not count in the new window', async () => {
-  // clock 0: hold 1 wrong; clock 900_000: 9 wrong (401); release the held one (401, old window);
-  // the 10th new-window wrong -> 401 and only the 11th -> 429 (it would be the 10th if the old one leaked)
+test('a late rejection after a rollover touches neither counter of the new window', async () => {
+  // clock 0: hold 1 wrong (old window); clock 900_000: hold 1 wrong and 1 right (new window);
+  // release the old wrong (401); release the new right (200: clears settled failures, keeps the held wrong)
+  // with that one compare still pending, exactly 9 fresh wrong attempts answer 401 and the next answers 429.
+  // A stale fail that leaked into the new window (inFlight - 1, failures + 1, then cleared) would let 10 through.
+  // Finally release the last held wrong (401).
 })
 test('a late success after a rollover does not clear the new window', async () => {
   // clock 0: 5 wrong; hold 1 right; clock 900_000: 9 wrong; release the right one (200, old window);
