@@ -1340,3 +1340,27 @@ def test_a_failed_enrich_claim_reset_is_reported(tmp_path, monkeypatch, capsys):
     assert f"Work {wid}: could not reset the enrich claim: database is locked" in result["errors"]
     out = capsys.readouterr()
     assert "could not reset the enrich claim: database is locked" in out.out + out.err
+
+
+@pytest.mark.parametrize("writer", ["move_entry_to_failed", "reset_enrich_claim"])
+def test_an_owned_writer_never_joins_an_open_transaction(tmp_path, writer):
+    # F4: like apply_enriched_metadata, an owned writer refuses a caller's open transaction
+    # instead of committing or rolling back the caller's work.
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    phase = "download" if writer == "move_entry_to_failed" else "enrich"
+    cols = {"download_status": "queued"} if phase == "download" else {"metadata_status": "pending"}
+    wid = _insert_work(db, "T", year=2020, **cols)
+    other = _insert_work(db, "U", year=2021)
+    _claim(db, wid, DAEMON, phase=phase)
+    db.conn.execute("BEGIN")
+    db.conn.execute("UPDATE works SET title = 'caller' WHERE id = ?", (other,))
+    call = {
+        "move_entry_to_failed": lambda: db.move_entry_to_failed(wid, "x", claimed_by=DAEMON),
+        "reset_enrich_claim": lambda: db.reset_enrich_claim(wid, state="pending", claimed_by=DAEMON),
+    }[writer]
+    with pytest.raises(RuntimeError):
+        call()
+    assert db.conn.in_transaction  # the caller's transaction is untouched
+    assert db.conn.execute("SELECT title FROM works WHERE id = ?", (other,)).fetchone()[0] == "caller"
+    db.conn.rollback()
+    db.close_connection()

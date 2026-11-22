@@ -767,6 +767,7 @@ class DatabaseManager:
         With ``claimed_by`` it writes only while that owner holds the metadata claim.
         """
         cur = self.conn.cursor()
+        self._refuse_open_transaction(claimed_by)
         try:
             if claimed_by is not None and not self._begin_owned("enrich", work_id, claimed_by):
                 return None, CLAIM_LOST
@@ -1859,6 +1860,7 @@ class DatabaseManager:
 
     def reset_enrich_claim(self, no_meta_id: int, *, state: str = "pending", error: str | None = None, selected: int = 0, claimed_by: str | None = None) -> tuple[bool | None, str | None]:
         cur = self.conn.cursor()
+        self._refuse_open_transaction(claimed_by)
         try:
             if claimed_by is not None and not self._begin_owned("enrich", no_meta_id, claimed_by):
                 return None, CLAIM_LOST
@@ -1916,6 +1918,7 @@ class DatabaseManager:
             raise ValueError("part_path needs claimed_by: publishing runs inside the owned transaction")
         published = None
         committed = False
+        self._refuse_open_transaction(claimed_by)
         try:
             if claimed_by is not None and not self._begin_owned("download", source_id, claimed_by):
                 return None, CLAIM_LOST
@@ -2091,6 +2094,7 @@ class DatabaseManager:
         published = None
         committed = False
         drop_after_commit = None
+        self._refuse_open_transaction(claimed_by)
         try:
             if claimed_by is not None and not self._begin_owned("enrich", source_id, claimed_by):
                 return None, CLAIM_LOST
@@ -2157,6 +2161,7 @@ class DatabaseManager:
 
     def move_entry_to_failed(self, source_id: int, reason: str, *, claimed_by: str | None = None) -> tuple[int | None, str | None]:
         """Mark a canonical work as failed during download (guarded by ``claimed_by`` when given)."""
+        self._refuse_open_transaction(claimed_by)
         try:
             if claimed_by is not None and not self._begin_owned("download", source_id, claimed_by):
                 return None, CLAIM_LOST
@@ -2748,8 +2753,16 @@ class DatabaseManager:
         ).fetchone()
         return row is not None
 
+    def _refuse_open_transaction(self, claimed_by: str | None) -> None:
+        """An owned writer never joins a caller's open transaction (as ``apply_enriched_metadata``):
+        its claim check must be the first statement of its own transaction, and its commit or
+        rollback must not take the caller's pending writes with it. Called before the writer's
+        ``try``, so its ``finally`` leaves the caller's transaction alone."""
+        if claimed_by is not None and self.conn.in_transaction:
+            raise RuntimeError("an owned writer (claimed_by=...) must not run inside an open transaction")
+
     def _begin_owned(self, phase: str, work_id: int, claimed_by: str) -> bool:
-        """BEGIN IMMEDIATE (unless a transaction is open), then the claim check.
+        """BEGIN IMMEDIATE, then the claim check (an open transaction was refused before).
 
         For writers that commit themselves: the write lock is held from the check through
         their own commit or rollback. Rolls back and returns False when the claim is lost.
@@ -2991,6 +3004,7 @@ class DatabaseManager:
         and only into a target that is still ``downloaded`` when re-read inside the same
         transaction (else ``duplicate_target_gone``, and the caller downloads the row).
         """
+        self._refuse_open_transaction(claimed_by)
         try:
             if claimed_by is not None and not self._begin_owned("download", queue_id, claimed_by):
                 return False, CLAIM_LOST
