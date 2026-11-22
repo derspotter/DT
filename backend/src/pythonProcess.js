@@ -9,18 +9,40 @@ import { spawn } from 'child_process';
 // D12: the fallback's parse input is at most this many times the text.
 const FALLBACK_PARSE_BUDGET_FACTOR = 4;
 
+// Whether valid JSON could continue from `last`, the previous line's last
+// significant character outside strings, onto the line starting at `j`.
+// Pretty-printed JSON breaks lines only after `[`, `{`, `,` or `:`, or before
+// a `,`, `]` or `}`; a diagnostic line inside a dangling block does not.
+function jsonValueStarts(text, j) {
+  const c = text[j];
+  if (c === '"' || c === '{' || c === '[' || c === '-' || (c >= '0' && c <= '9')) return true;
+  return text.startsWith('true', j) || text.startsWith('false', j) || text.startsWith('null', j);
+}
+function jsonContinues(last, text, j) {
+  const c = text[j];
+  if (last === '[') return c === ']' || jsonValueStarts(text, j);
+  if (last === '{') return c === '"' || c === '}';
+  if (last === ',' || last === ':') return jsonValueStarts(text, j);
+  return c === ',' || c === ']' || c === '}';
+}
+
 // One structural scan over `text`: opener index -> matching close index, and
 // the openers that opened with an empty stack (outer blocks). Inside an open
 // block JSON strings are skipped (honouring \" and \\); a string ends at the
 // next newline at the latest. Outside any block only openers count, so a quote
-// in diagnostic text cannot start a string. A close that does not match the
-// top of the stack clears the stack. An opener that never closes has no entry.
+// in diagnostic text cannot start a string. On a line that valid JSON could not
+// continue onto from the open block (a diagnostic after a dangling `[`), quotes
+// start no strings either, so its openers still count. A close that does not
+// match the top of the stack clears the stack. An opener that never closes has
+// no entry.
 function bracketCloses(text, stats = null) {
   const closes = new Map();
   const outer = new Set();
   const stack = [];
   let inString = false;
   let escaped = false;
+  let quotesOff = false;
+  let last = '';
   let visited = 0;
   for (let i = 0; i < text.length; i += 1) {
     visited += 1;
@@ -28,14 +50,19 @@ function bracketCloses(text, stats = null) {
     if (ch === '\n') {
       inString = false;
       escaped = false;
+      quotesOff = stack.length > 0 && !jsonContinues(last, text, i + 1);
       continue;
     }
     if (inString) {
       if (escaped) escaped = false;
       else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
+      else if (ch === '"') {
+        inString = false;
+        last = '"';
+      }
       continue;
     }
+    if (ch !== ' ' && ch !== '\t') last = ch;
     if (ch === '[' || ch === '{') {
       if (stack.length === 0) outer.add(i);
       stack.push(i);
@@ -47,7 +74,7 @@ function bracketCloses(text, stats = null) {
       } else {
         stack.length = 0;
       }
-    } else if (ch === '"' && stack.length > 0) {
+    } else if (ch === '"' && stack.length > 0 && !quotesOff) {
       inString = true;
     }
   }
@@ -55,6 +82,10 @@ function bracketCloses(text, stats = null) {
   return { closes, outer };
 }
 
+// `stats` (tests only): the fallback adds the characters its structural scan
+// visited to `stats.visited`, the characters its candidate loop read to
+// `stats.lineScan`, its parse attempts to `stats.parses` and the candidate
+// lengths it parsed to `stats.parsedChars`.
 export function parseJsonFromOutput(output, { stats } = {}) {
   const lines = String(output || '')
     .split(/\r?\n/)
@@ -93,15 +124,19 @@ export function parseJsonFromOutput(output, { stats } = {}) {
     offset += lines[i].length + 1;
   }
   let budget = FALLBACK_PARSE_BUDGET_FACTOR * text.length;
+  let lineScan = 0;
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const bracketIndex = lines[i].search(/[\[{]/);
+    // The search reads the line up to its first opener (or all of it).
+    lineScan += bracketIndex < 0 ? lines[i].length : bracketIndex + 1;
     if (bracketIndex < 0) continue;
     const start = lineStarts[i] + bracketIndex;
     const close = closes.get(start);
     const lineEnd = lineStarts[i] + lines[i].length;
     if (close === undefined || close < lineEnd) continue; // unclosed or single-line
-    const closeLineEnd = text.indexOf('\n', close);
-    const endsLine = close + 1 === (closeLineEnd < 0 ? text.length : closeLineEnd);
+    // The lines are trimmed and joined with '\n': a close ends its line when
+    // the next character is the separator or the end of the text.
+    const endsLine = close + 1 === text.length || text[close + 1] === '\n';
     if (!endsLine && !outer.has(start)) continue;
     budget -= close + 1 - start;
     if (budget < 0) break;
@@ -110,8 +145,12 @@ export function parseJsonFromOutput(output, { stats } = {}) {
       stats.parsedChars += close + 1 - start;
     }
     const parsedBlock = tryParse(text.slice(start, close + 1));
-    if (parsedBlock !== null) return parsedBlock;
+    if (parsedBlock !== null) {
+      if (stats) stats.lineScan = (stats.lineScan || 0) + lineScan;
+      return parsedBlock;
+    }
   }
+  if (stats) stats.lineScan = (stats.lineScan || 0) + lineScan;
 
   throw new Error(`No valid JSON output from python. Output was: ${output}`);
 }

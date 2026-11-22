@@ -209,15 +209,17 @@ describe('readLogWindow', () => {
         fs.rmSync(`${base}.2`)
       }
     }
-    countReads(onOpen)
+    const first = countReads(onOpen)
     const expected = ['three a', 'three b', 'one a', 'one b', 'zero a', 'zero b']
     const got = await appModule.readLogWindow(base, { limit: 2000, cursor: 0 })
     expect(got).toEqual({ entries: expected, hasMore: false, cursor: 0, nextCursor: 6 })
+    // The retry ran: the newest file was opened again after the restart.
+    expect(first.open.mock.calls.filter(([p]) => String(p) === base)).toHaveLength(2)
 
     jest.restoreAllMocks()
     seed()
     deleted = false
-    countReads(onOpen)
+    const second = countReads(onOpen)
     process.env.RAG_FEEDER_STUB = '1'
     process.env.RAG_FEEDER_LOG_DIR = dir
     const app = appModule.createApp({ broadcast: () => {} })
@@ -225,6 +227,63 @@ describe('readLogWindow', () => {
     expect(res.status).toBe(200)
     expect(res.body.entries).toEqual(expected)
     expect(res.body.has_more).toBe(false)
+    expect(second.open.mock.calls.filter(([p]) => String(p) === base)).toHaveLength(2)
+  })
+
+  test('short reads keep records separate', async () => {
+    // Every read returns at most `cap` bytes, so record boundaries fall inside
+    // and between short reads (and, for the big files, across 64 KiB chunks).
+    let cap = 0
+    jest.spyOn(fs.promises, 'open').mockImplementation(async (...args) => {
+      const handle = await realOpen(...args)
+      const realRead = handle.read.bind(handle)
+      handle.read = (buffer, offset, length, position) => realRead(buffer, offset, Math.min(cap, length), position)
+      return handle
+    })
+    for (const [size, readCap] of [[150 * 1024, 4093], [2 * 1024, 3]]) {
+      cap = readCap
+      const dir = freshDir()
+      const base = path.join(dir, BASE_NAME)
+      fs.writeFileSync(`${base}.1`, makeFileText('s1', { targetBytes: size }))
+      fs.writeFileSync(base, makeFileText('s0', { crlf: true, targetBytes: size }))
+      const files = filesOldestFirst(base)
+      for (const [limit, cursor] of [[200, 0], [2000, 15], [5000, 0]]) {
+        const got = await appModule.readLogWindow(base, { limit, cursor })
+        expect(got).toMatchObject(reference(files, { limit, cursor }))
+      }
+    }
+  })
+
+  test('a failing read fails the request instead of answering a partial page', async () => {
+    const dir = freshDir()
+    const base = path.join(dir, BASE_NAME)
+    fs.writeFileSync(`${base}.1`, makeFileText('e1'))
+    fs.writeFileSync(base, 'newest a\nnewest b\n')
+    jest.spyOn(fs.promises, 'open').mockImplementation(async (...args) => {
+      const handle = await realOpen(...args)
+      if (String(args[0]) === `${base}.1`) {
+        let reads = 0
+        const realRead = handle.read.bind(handle)
+        handle.read = async (...readArgs) => {
+          reads += 1
+          if (reads === 2) throw Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' })
+          return realRead(...readArgs)
+        }
+      }
+      return handle
+    })
+    await expect(appModule.readLogWindow(base, { limit: 5000, cursor: 0 })).rejects.toMatchObject({ code: 'EIO' })
+
+    process.env.RAG_FEEDER_STUB = '1'
+    process.env.RAG_FEEDER_LOG_DIR = dir
+    const app = appModule.createApp({ broadcast: () => {} })
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+    const res = await request(app).get('/api/logs/tail?type=pipeline&lines=2000')
+    expect(res.status).toBe(500)
+    expect(res.body).toEqual({ error: 'EIO: i/o error, read' })
+    expect(res.body).not.toHaveProperty('entries')
+    expect(res.body).not.toHaveProperty('next_cursor')
+    consoleError.mockRestore()
   })
 
   test('the tail route reads no file synchronously', async () => {

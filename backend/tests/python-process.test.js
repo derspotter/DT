@@ -195,8 +195,10 @@ test('parity: a pretty-printed object with a nested array returns the whole obje
 })
 
 test('a pretty-printed block before trailing log lines is found', () => {
-  // The nested array is not alone on its line: a line ending '[1, 2]' would be
-  // taken by the unchanged fast path before the fallback runs.
+  // Ruling: the unchanged fast path wins over this fixture's original order.
+  // With '"n": [1, 2]' on its own line the fast path returns [1, 2] (on 0702e47
+  // too), so the nested array line ends with a comma here and the fallback is
+  // what finds the block.
   expect(parseJsonFromOutput('[log] a\n{\n  "n": [1, 2],\n  "ok": true\n}\n[log] done')).toEqual({ ok: true, n: [1, 2] })
   expect(parseJsonFromOutput('{\n "s": "a } ] {"\n}')).toEqual({ s: 'a } ] {' })
   expect(parseJsonFromOutput('{\n "q": "say \\"hi\\" \\\\"\n}')).toEqual({ q: 'say "hi" \\' })
@@ -206,4 +208,28 @@ test('a pretty-printed block before trailing log lines is found', () => {
 
 test('parity: diagnostic text with a quote before the first opener does not hide the block', () => {
   expect(parseJsonFromOutput('warning " opening {\n  "ok": true\n}')).toEqual({ ok: true })
+})
+
+test('nested blocks closing on one long line cost linear work', () => {
+  // Every opener closes on the last line; only the outermost close ends it.
+  const run = (n) => {
+    const stats = { visited: 0, parses: 0, parsedChars: 0, lineScan: 0 }
+    const output = [...Array.from({ length: n }, () => '{"a":'), 'oops', '}'.repeat(n)].join('\n')
+    expect(() => parseJsonFromOutput(output, { stats })).toThrow(NO_JSON)
+    expect(stats.visited).toBeLessThanOrEqual(output.length)
+    expect(stats.lineScan).toBeGreaterThan(0) // the candidate loop reports what it reads
+    expect(stats.lineScan).toBeLessThanOrEqual(output.length)
+    expect(stats.parsedChars).toBeLessThanOrEqual(4 * output.length)
+    return stats.visited + stats.lineScan + stats.parsedChars
+  }
+  const small = run(8000)
+  const large = run(16000)
+  expect(large).toBeLessThanOrEqual(2.2 * small)
+})
+
+test('parity: a dangling [ in a diagnostic does not hide a later multiline result', () => {
+  // On 95d861e the base parser recovers each of these.
+  expect(parseJsonFromOutput('[warn] items: [\nmsg: "oops {\n  "ok": true\n}')).toEqual({ ok: true })
+  expect(parseJsonFromOutput('[warn] unmatched [ here\nnote "quoted" then {\n  "ok": true\n}')).toEqual({ ok: true })
+  expect(parseJsonFromOutput('[warn] items: [\nnote: "oops {\n  "ok": true\n}')).toEqual({ ok: true })
 })

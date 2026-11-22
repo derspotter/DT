@@ -2635,16 +2635,17 @@ function logWindowPaths(baseFilePath, { includeRotated, maxFiles }) {
 
 // Reads one file backwards from its pinned size and hands each complete line,
 // newest first, to `onLine`; `onLine` returns true to stop. Returns
-// LOG_ROTATED when the file is not the one pinned (a rotation ran), true when
-// `onLine` stopped the walk, false when the file was read to its start.
+// LOG_ROTATED when the file is not the one pinned (a rotation ran) or shrank
+// under the read, true when `onLine` stopped the walk, false when the file was
+// read to its start. Any other open or read error rejects: the request fails
+// rather than answering a partial window.
 async function readLogFileBackwards(filePath, pin, onLine) {
   let handle;
   try {
     handle = await fs.promises.open(filePath, 'r');
   } catch (error) {
     if (error?.code === 'ENOENT') return pin === null ? false : LOG_ROTATED;
-    console.warn(`[logs/tail] Failed reading ${filePath}: ${error?.message || error}`);
-    return false;
+    throw error;
   }
   try {
     const stat = await handle.stat();
@@ -2655,8 +2656,15 @@ async function readLogFileBackwards(filePath, pin, onLine) {
     while (position > 0) {
       const len = Math.min(LOG_READ_CHUNK_BYTES, position);
       position -= len;
-      const { bytesRead } = await handle.read(chunk, 0, len, position);
-      const buf = carry.length ? Buffer.concat([chunk.subarray(0, bytesRead), carry]) : Buffer.from(chunk.subarray(0, bytesRead));
+      // A read may return fewer bytes than asked: keep reading until the chunk
+      // is full. End of file before that means the file shrank under the read.
+      let got = 0;
+      while (got < len) {
+        const { bytesRead } = await handle.read(chunk, got, len - got, position + got);
+        if (bytesRead <= 0) return LOG_ROTATED;
+        got += bytesRead;
+      }
+      const buf = carry.length ? Buffer.concat([chunk.subarray(0, len), carry]) : Buffer.from(chunk.subarray(0, len));
       let lineEnd = buf.length;
       for (let i = buf.length - 1; i >= 0; i -= 1) {
         if (buf[i] !== 0x0a) continue;
@@ -2666,9 +2674,6 @@ async function readLogFileBackwards(filePath, pin, onLine) {
       carry = buf.subarray(0, lineEnd);
     }
     if (carry.length && onLine(carry.toString('utf8'))) return true;
-    return false;
-  } catch (error) {
-    console.warn(`[logs/tail] Failed reading ${filePath}: ${error?.message || error}`);
     return false;
   } finally {
     await handle.close().catch(() => {});

@@ -79,7 +79,7 @@ function patchConsoleForFileLogs() {
 
 patchConsoleForFileLogs();
 logWithTimestamp(appLogFile, 'INFO', `Persistent logging enabled: ${appLogFile}`);
-logWithTimestamp(pipelineLogFile, 'INFO', `Pipeline logging enabled: ${pipelineLogFile}`);
+logWithTimestamp(pipelineLogFile, 'INFO', escapeLogLineBreaks(`Pipeline logging enabled: ${pipelineLogFile}`));
 
 // The log socket needs the HTTP server and app.authDb, both of which exist
 // only after createApp(); these forwarders are handed to createApp first and

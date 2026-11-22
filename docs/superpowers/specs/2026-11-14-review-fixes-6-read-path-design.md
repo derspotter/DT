@@ -224,6 +224,10 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
 - **Parked: "Load older" counts its cursor from a moving head.** This is pre-existing (phase 5
   paging behaviour): an admin's unfiltered history can repeat one boundary row when the daemon
   appends between two pages; no data leaks, and no server-issued continuation is built.
+- **Accepted risk: a failed partial append followed by a successful one.** If disk pressure
+  leaves a partial scoped record without its newline and a later append (Node or worker)
+  succeeds, the later text joins that record's physical line in the history; escaping line
+  breaks cannot prevent it, and no writer repairs a failed append.
 - No README change beyond the dead `/api/ingest/latest` line and the pipeline log file name
   (D11; `README.md:175`, `dl_lit_project/docs/OPS_RUNBOOK.md:184-268`).
 
