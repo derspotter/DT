@@ -295,12 +295,6 @@ export async function extractBibliography(filename) {
   })
 }
 
-export async function fetchBibliographyEntries(baseName) {
-  return requestJson(`/api/ingest/latest?baseName=${encodeURIComponent(baseName)}&limit=5000`, {
-    errorMessage: 'Failed to load ingest entries',
-  })
-}
-
 export async function fetchIngestStats({ global = false } = {}) {
   return requestJson(`/api/ingest/stats${global ? '?global=1' : ''}`, { errorMessage: 'Failed to load ingest stats' })
 }

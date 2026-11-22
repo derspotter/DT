@@ -23,3 +23,18 @@ def test_claim_sql_has_no_coalesce_on_status_columns():
     assert "COALESCE(metadata_status" not in src
     assert "COALESCE(nm.download_status" not in src
     assert "COALESCE(download_status" not in src
+
+
+def test_worker_job_probes_use_the_status_index(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    statements = [
+        ("SELECT id, corpus_id, job_type, parameters_json FROM pipeline_jobs WHERE status = 'pending' "
+         "AND job_type = 'download' ORDER BY id LIMIT 1", ()),
+        ("SELECT 1 FROM pipeline_jobs WHERE status = 'pending' AND corpus_id IS NOT NULL "
+         "AND job_type IN ('enrich', 'download') LIMIT 1", ()),
+        ("UPDATE pipeline_jobs SET status='pending' WHERE status='running' AND worker_id=?", ("w1",)),
+    ]
+    for sql, params in statements:
+        rows = db.conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+        plan = " ".join(str(r[-1]) for r in rows)
+        assert "idx_pipeline_jobs_status_finished" in plan, (sql, plan)

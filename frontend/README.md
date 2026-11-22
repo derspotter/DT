@@ -20,7 +20,6 @@ In Docker compose this is already configured.
 
 - Upload PDFs via `/api/process_pdf`
 - Trigger extraction via `/api/extract-bibliography/:filename`
-- Load staged ingest rows via `/api/ingest/latest`
 - Mark entries via `/api/ingest/enqueue`
 - Queue enrichment via `/api/ingest/process-marked`
 - Queue downloads via `/api/downloads/worker/start` or `/api/downloads/worker/run-once`

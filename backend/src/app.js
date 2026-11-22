@@ -163,7 +163,6 @@ const GRAPH_3D_SNAPSHOT_TTL_MS = 60 * 60 * 1000;
 const graph3dBuilds = new Map();
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
-const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_seed.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
@@ -937,6 +936,7 @@ export function ensureAuthSchema(db) {
   }
   if (tableExists(db, 'pipeline_jobs')) {
     ensureColumn(db, 'pipeline_jobs', 'worker_id', 'TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_status_finished ON pipeline_jobs(status, finished_at)');
   }
   if (tableExists(db, 'scraper_apply_events')) {
     ensureColumn(db, 'scraper_apply_events', 'generated_bib_path', 'TEXT');
@@ -5827,24 +5827,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       return stream.pipe(res);
     }
     return res.sendFile(filePath);
-  });
-
-  app.get('/api/ingest/latest', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
-    const baseName = req.query?.baseName || '';
-    const limit = coerceInt(req.query?.limit, 200);
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--limit', String(limit)];
-    if (baseName) {
-      args.push('--base-name', String(baseName));
-    }
-    try {
-      const payload = await runPythonJson(INGEST_LATEST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      return res.json(payload);
-    } catch (error) {
-      console.error('[/api/ingest/latest] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch ingest entries' });
-    }
   });
 
   app.post('/api/ingest/import-seed', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {

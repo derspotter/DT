@@ -215,9 +215,9 @@ test.describe('Real PDF pipeline performance', () => {
     const entriesPayload = await authedJson(
       request,
       token,
-      `/api/ingest/latest?baseName=${encodeURIComponent(runName)}&limit=1000`
+      `/api/seed/sources/pdf/${encodeURIComponent(runName)}/candidates?limit=1000`
     )
-    const entries = Array.isArray(entriesPayload?.items) ? entriesPayload.items : []
+    const entries = Array.isArray(entriesPayload?.candidates) ? entriesPayload.candidates : []
     const entryIds = entries
       .map((item: any) => Number(item.id))
       .filter((value: number) => Number.isFinite(value))
