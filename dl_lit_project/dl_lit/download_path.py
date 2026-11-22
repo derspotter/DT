@@ -53,10 +53,13 @@ def fit_stem(name: str, reserve: int = 32, limit: int = 255) -> str:
     ``-<work id>-<8 hex>`` when publishing). A name with room for them is returned unchanged.
     Cuts on a character boundary.
     """
-    if len(os.fsencode(name)) + reserve <= limit:
+    def size(text):
+        return len(text.encode("utf-8", "surrogateescape"))
+
+    if size(name) + reserve <= limit:
         return name
     stem, ext = os.path.splitext(name)
-    while stem and len(os.fsencode(stem + ext)) + reserve > limit:
+    while stem and size(stem + ext) + reserve > limit:
         stem = stem[:-1]
     return stem + ext
 

@@ -463,7 +463,7 @@ def test_a_failed_part_unlink_never_orphans_or_fails_the_publish(tmp_path, monke
         raise sqlite3.OperationalError("disk I/O error")
 
     monkeypatch.setattr(daemon.db, "_update_work_record", boom)
-    assert daemon._download_single(row)[0] == "failed"
+    assert daemon._download_single(row)[0] == "error"  # the failed mark could not be written either
     assert not (tmp_path / "y.pdf").exists()
 
 
@@ -835,3 +835,302 @@ def test_periodic_recovery_treats_a_cli_owner_like_a_daemon(tmp_path, monkeypatc
         assert (row["download_status"], row["download_claimed_by"]) == ("queued", None)
     else:
         assert (row["download_status"], row["download_claimed_by"]) == ("in_progress", owner)
+
+
+# --- review round 1 -------------------------------------------------------------------------
+
+class _ValidDownloader:
+    """Accepts every payload as a PDF; the PDFDownloader stage finds nothing."""
+
+    def validate_pdf(self, content, ref_type=None):
+        return True
+
+    def attempt_download(self, metadata, ref_type=None, part_suffix=None):
+        return None, None, None, []
+
+
+def _direct_enhancer(monkeypatch):
+    import dl_lit.new_dl as new_dl
+
+    enhancer = new_dl.BibliographyEnhancer(db_manager=None, rate_limiter=None, llm_optional=True)
+    monkeypatch.setattr(enhancer, "_request_get", lambda url, **kw: (_Response(b"%PDF-1.4 " + url.encode()), "direct"))
+    monkeypatch.setattr(enhancer, "_get_pdf_downloader", lambda d: _ValidDownloader())
+    return enhancer
+
+
+def test_a_staged_attempt_stops_at_its_first_direct_download(tmp_path, monkeypatch):
+    enhancer = _direct_enhancer(monkeypatch)
+    ref = {"title": "Two", "year": 2020, "url": "https://a.example/1.pdf",
+           "open_access_url": "https://b.example/2.pdf", "part_suffix": ".part-z"}
+
+    result = enhancer.enhance_bibliography(ref, tmp_path)
+
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == ["2020_Two.pdf.part-z"]
+    assert result["downloaded_file"] == str(tmp_path / "2020_Two.pdf.part-z")
+
+
+def _raising_print(monkeypatch, marker):
+    import builtins
+
+    real = builtins.print
+
+    def fake(*args, **kwargs):
+        if any(marker in str(a) for a in args):
+            raise OSError("stdout closed")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "print", fake)
+
+
+def test_a_builder_never_leaks_a_stage_it_did_not_hand_back(tmp_path, monkeypatch):
+    # The direct builder: a failure right after the write removes its own stage.
+    enhancer = _direct_enhancer(monkeypatch)
+    ref = {"title": "Leak", "year": 2020, "part_suffix": ".part-l"}
+    _raising_print(monkeypatch, "Direct download successful")
+    assert enhancer.try_download_url("https://a.example/1.pdf", "Direct URL", ref, tmp_path) is False
+    assert _parts(tmp_path) == [] and "downloaded_file" not in ref
+    monkeypatch.undo()
+
+    # PDFDownloader: a failing success log removes the stage before the exception leaves.
+    downloader = _pdf_downloader(tmp_path, monkeypatch)
+    _raising_print(monkeypatch, "staged as")
+    with pytest.raises(OSError):
+        downloader.attempt_download(URL_ONLY, part_suffix=".part-m")
+    assert _parts(tmp_path) == []
+    monkeypatch.undo()
+
+    # The enhancer records a staged path in the ref before it logs anything about it.
+    import dl_lit.new_dl as new_dl
+
+    staged = tmp_path / "x.pdf.part-n"
+    staged.write_bytes(b"%PDF")
+
+    class _Staging(_ValidDownloader):
+        def attempt_download(self, metadata, ref_type=None, part_suffix=None):
+            return staged, "abc", "OpenAlex OA URL", [{"source": "OpenAlex OA URL", "outcome": "success"}]
+
+    enhancer = new_dl.BibliographyEnhancer(db_manager=None, rate_limiter=None, llm_optional=True)
+    monkeypatch.setattr(enhancer, "_get_pdf_downloader", lambda d: _Staging())
+
+    def boom(*args, **kwargs):
+        raise OSError("log closed")
+
+    monkeypatch.setattr(enhancer, "_record_download_event", boom)
+    ref = {"title": "Leak", "year": 2020, "open_access_url": "https://b.example/2.pdf", "part_suffix": ".part-n"}
+    with pytest.raises(OSError):
+        enhancer.enhance_bibliography(ref, tmp_path)
+    assert ref["downloaded_file"] == str(staged)  # the caller's finally removes it from here
+
+
+def test_publishing_needs_an_owner_and_links_under_the_write_lock(tmp_path, monkeypatch):
+    db, first, second, part = _published_first(tmp_path)
+    with pytest.raises(ValueError):
+        db.move_entry_to_downloaded(second, {}, str(part), "abc", "mock", part_path=str(part))
+    with pytest.raises(ValueError):
+        db.mark_raw_work_downloaded(second, {}, str(part), "abc", "mock", part_path=str(part))
+
+    real_link = os.link
+    locked = []
+
+    def link(src, dst, *args, **kwargs):
+        c = sqlite3.connect(str(tmp_path / "lit.db"), timeout=0, isolation_level=None)
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("ROLLBACK")
+            locked.append(False)
+        except sqlite3.OperationalError:
+            locked.append(True)
+        finally:
+            c.close()
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", link)
+    got, err = db.move_entry_to_downloaded(second, {}, str(part), _sha(b"%PDF B"), "mock",
+                                           claimed_by=DAEMON, part_path=str(part))
+    assert (got, err) == (second, None) and locked and all(locked)  # untitled.pdf taken: two link calls
+
+    # A source row deleted by another connection: nothing is published.
+    third = _insert_work(db, "Three", year=2022, download_status="queued")
+    _claim(db, third, DAEMON)
+    c = sqlite3.connect(str(tmp_path / "lit.db"))
+    c.execute("DELETE FROM works WHERE id = ?", (third,))
+    c.commit()
+    c.close()
+    part3 = tmp_path / "three.pdf.part-33333333"
+    part3.write_bytes(b"%PDF C")
+    got, err = db.move_entry_to_downloaded(third, {}, str(part3), _sha(b"%PDF C"), "mock",
+                                           claimed_by=DAEMON, part_path=str(part3))
+    assert (got, err) == (None, CLAIM_LOST)
+    assert not (tmp_path / "three.pdf").exists()
+
+
+def test_an_owned_enrich_write_never_joins_an_open_transaction(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    _insert_work(db, "Canon", year=2020, doi="10.1000/canon", metadata_status="matched")
+    row_id = _insert_work(db, "Canon", year=2020, metadata_status="pending")
+    _claim(db, row_id, "daemon:t:1:a", phase="enrich")
+    before = _row(tmp_path / "lit.db", row_id)
+    db.conn.execute("BEGIN")
+    try:
+        with pytest.raises(RuntimeError):
+            db.apply_enriched_metadata(row_id, {"title": "Canon", "year": 2020}, claimed_by="daemon:t:1:a")
+    finally:
+        db.conn.rollback()
+    assert _row(tmp_path / "lit.db", row_id) == before
+
+
+def _reject(db, sql):
+    db.conn.execute(sql)
+    db.conn.commit()
+
+
+def test_a_rejected_merge_is_a_failure_in_the_daemon(tmp_path, monkeypatch):
+    daemon = _worker_daemon(monkeypatch, tmp_path, _StagingEnhancer(b"%PDF"))
+    wid = _insert_work(daemon.db, "Same Title", year=2020, download_status="queued")
+    _insert_work(daemon.db, "Same Title", year=2020, doi="10.1000/t", download_status="downloaded")
+    row = _claim(daemon.db, wid, daemon.worker_id)
+    _reject(daemon.db, f"CREATE TRIGGER no_merge BEFORE DELETE ON works WHEN OLD.id = {wid} "
+                       "BEGIN SELECT RAISE(ABORT, 'merge rejected'); END")
+
+    status, data = daemon._download_single(row)
+
+    assert (status, data["action"], data["failure_category"]) == ("failed", "failed", "duplicate_merge_failed")
+    assert "merge rejected" in data["failure_detail"]
+    got = _row(tmp_path / "worker.db", wid)
+    assert (got["download_status"], got["download_claimed_by"]) == ("failed", None)
+
+    # When the failed mark is rejected too, the result is an error, never a dropped duplicate.
+    other = _insert_work(daemon.db, "Second Title", year=2021, download_status="queued")
+    _insert_work(daemon.db, "Second Title", year=2021, doi="10.1000/s", download_status="downloaded")
+    row = _claim(daemon.db, other, daemon.worker_id)
+    _reject(daemon.db, f"CREATE TRIGGER no_merge2 BEFORE DELETE ON works WHEN OLD.id = {other} "
+                       "BEGIN SELECT RAISE(ABORT, 'merge rejected'); END")
+    _reject(daemon.db, f"CREATE TRIGGER no_fail BEFORE UPDATE ON works WHEN OLD.id = {other} AND NEW.download_status = 'failed' "
+                       "BEGIN SELECT RAISE(ABORT, 'update rejected'); END")
+    status, data = daemon._download_single(row)
+    assert status == "error" and "update rejected" in data["failure_detail"]
+
+
+def test_a_rejected_merge_is_a_failure_in_the_cli(tmp_path, mocker):
+    db_path = tmp_path / "lit.db"
+    db = DatabaseManager(str(db_path))
+    first = _insert_work(db, "Same Title", year=2020, download_status="queued")
+    _insert_work(db, "Same Title", year=2020, doi="10.1000/t", download_status="downloaded")
+    second = _insert_work(db, "Fresh", year=2021, download_status="queued")
+    _reject(db, f"CREATE TRIGGER no_merge BEFORE DELETE ON works WHEN OLD.id = {first} "
+                "BEGIN SELECT RAISE(ABORT, 'merge rejected'); END")
+    db.close_connection()
+    mocker.patch("dl_lit.cli.BibliographyEnhancer")
+    mocker.patch("dl_lit.cli.download_ref", return_value=(None, "", []))
+
+    result = _run_cli(db_path, tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert "duplicate detected" not in result.output and "duplicate merge failed" in result.output
+    assert _row(db_path, first)["download_status"] == "failed"
+    assert _row(db_path, second)["download_status"] == "failed"  # the run went on normally
+
+
+def test_the_cli_stops_when_it_cannot_record_a_failure(tmp_path, mocker):
+    db_path = tmp_path / "lit.db"
+    db = DatabaseManager(str(db_path))
+    first = _insert_work(db, "Same Title", year=2020, download_status="queued")
+    _insert_work(db, "Same Title", year=2020, doi="10.1000/t", download_status="downloaded")
+    second = _insert_work(db, "Fresh", year=2021, download_status="queued")
+    _reject(db, f"CREATE TRIGGER no_merge BEFORE DELETE ON works WHEN OLD.id = {first} "
+                "BEGIN SELECT RAISE(ABORT, 'merge rejected'); END")
+    _reject(db, f"CREATE TRIGGER no_fail BEFORE UPDATE ON works WHEN OLD.id = {first} AND NEW.download_status = 'failed' "
+                "BEGIN SELECT RAISE(ABORT, 'update rejected'); END")
+    db.close_connection()
+    mocker.patch("dl_lit.cli.BibliographyEnhancer")
+    fake = mocker.patch("dl_lit.cli.download_ref", return_value=(None, "", []))
+
+    result = _run_cli(db_path, tmp_path)
+
+    assert result.exit_code != 0 and "update rejected" in result.output
+    assert fake.call_count == 0
+    row = _row(db_path, first)
+    assert (row["download_status"], row["download_claimed_by"]) == ("queued", None)  # released by the finally
+    row = _row(db_path, second)
+    assert (row["download_status"], row["download_attempt_count"]) == ("queued", 0)  # never claimed
+
+
+class _CommitFails:
+    """A connection proxy whose commit fails (sqlite3.Connection attributes are read-only)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def commit(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_releasing_enrich_claims_rolls_back_a_failed_commit(tmp_path, monkeypatch):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    wid = _insert_work(db, "P", year=2020, metadata_status="pending")
+    _claim(db, wid, DAEMON, phase="enrich")
+    before = _row(tmp_path / "lit.db", wid)
+    real = db.conn
+    db.conn = _CommitFails(real)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            db.release_enrich_claims([wid], DAEMON)
+        assert not real.in_transaction
+    finally:
+        db.conn = real
+    assert _row(tmp_path / "lit.db", wid) == before
+
+    # The daemon logs the failure and carries on with its deferral.
+    from tests.test_worker_recovery import _daemon
+
+    daemon = _daemon(monkeypatch, tmp_path, "enrich")
+    lines = []
+    monkeypatch.setitem(type(daemon)._release_deferred_enrich_rows.__globals__, "log", lines.append)
+
+    def locked(ids, by):
+        raise sqlite3.OperationalError("locked")
+
+    monkeypatch.setattr(daemon.db, "release_enrich_claims", locked)
+    daemon._release_deferred_enrich_rows([wid])
+    assert lines == [f"Could not release 1 deferred enrich row(s): locked; they wait for their lease."]
+
+
+def test_writer_edge_cases_of_review_round_1(tmp_path, monkeypatch):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    # A stale caller with an empty checksum learns that its claim is gone, not the checksum.
+    wid = _insert_work(db, "Mine", year=2020, download_status="in_progress", download_claimed_by="other")
+    part = tmp_path / "mine.pdf.part-55555555"
+    part.write_bytes(b"%PDF")
+    assert db.move_entry_to_downloaded(wid, {}, str(part), "", "mock", claimed_by="me", part_path=str(part)) == (None, CLAIM_LOST)
+
+    # A raw merge into a canonical whose kept PDF has no checksum stores none for it.
+    (tmp_path / "canon.pdf").write_bytes(b"%PDF canon")
+    canonical = _insert_work(db, "Canon", year=2020, doi="10.1000/canon", download_status="downloaded",
+                             file_path=str(tmp_path / "canon.pdf"))
+    raw = _insert_work(db, "Canon", year=2020, metadata_status="pending", download_status="not_requested")
+    _claim(db, raw, DAEMON, phase="enrich")
+    part = tmp_path / "raw.pdf.part-66666666"
+    part.write_bytes(b"%PDF raw")
+    raw_result = {"title": "Canon", "year": 2020, "downloaded_file": str(part), "checksum": _sha(b"%PDF raw")}
+    assert db.mark_raw_work_downloaded(raw, raw_result, str(part), _sha(b"%PDF raw"), "mock",
+                                       claimed_by=DAEMON, part_path=str(part)) == (canonical, None)
+    stored = __import__("json").loads(db.get_entry_by_id("works", canonical)["bibtex_entry_json"])
+    assert stored["checksum"] is None and stored["downloaded_file"] == str(tmp_path / "canon.pdf")
+
+    # A guarded merge never moves the duplicate's claim onto the canonical.
+    target = _insert_work(db, "Merge Me", year=2019, doi="10.1000/m", download_status="downloaded")
+    queued = _insert_work(db, "Merge Me", year=2019, download_status="queued")
+    _claim(db, queued, DAEMON)
+    ok, _ = db.merge_duplicate_queued_work(queued, "works", target, "title", claimed_by=DAEMON)
+    assert ok
+    row = db.get_entry_by_id("works", target)
+    assert (row["download_claimed_by"], row["download_claimed_at"], row["download_lease_expires_at"]) == (None, None, None)
+
+    # fit_stem counts UTF-8 bytes whatever the filesystem encoding.
+    monkeypatch.setattr(download_path.os, "fsencode", lambda name: name.encode("latin-1"))
+    fitted = download_path.fit_stem("ä" * 120 + ".pdf")
+    assert len(fitted.encode("utf-8")) + 32 <= 255

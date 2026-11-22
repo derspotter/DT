@@ -209,18 +209,22 @@ def test_cli_downloaded_count_ignores_the_duplicate_merge_result(mocker, tmp_pat
     db.find_downloaded_duplicate.side_effect = [("works", 9, "normalized_title"), (None, None, None)]
     db.merge_duplicate_queued_work.return_value = (True, "merged into 9")
     db.move_entry_to_downloaded.return_value = (2, None)
-    enhancer.enhance_bibliography.return_value = {
-        "downloaded_file": str(pdf), "download_source": "mock", "checksum": "abc",
-    }
+    db.mark_download_failed.return_value = (2, None)
+    staged = {}
+
+    def stage(ref, download_dir):
+        staged["result"] = {"downloaded_file": str(pdf) + ref["part_suffix"], "download_source": "mock", "checksum": "abc"}
+        return staged["result"]
+
+    enhancer.enhance_bibliography.side_effect = stage
 
     result = CliRunner().invoke(cli, ["download-pdfs", "--db-path", str(tmp_path / "t.db"), "--download-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
     assert "Worker finished: 1 downloaded, 0 failed." in result.output
     cli_id = db.claim_download_batch.call_args.kwargs["claimed_by"]
-    db.move_entry_to_downloaded.assert_called_once_with(
-        2, enhancer.enhance_bibliography.return_value, str(pdf), "abc", "mock", claimed_by=cli_id, part_path=None,
-    )
+    fp = staged["result"]["downloaded_file"]
+    db.move_entry_to_downloaded.assert_called_once_with(2, staged["result"], fp, "abc", "mock", claimed_by=cli_id, part_path=fp)
     db.release_download_claims.assert_called_once_with(cli_id)
 
 

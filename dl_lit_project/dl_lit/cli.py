@@ -701,10 +701,14 @@ def _cli_claim_lost(work_id) -> None:
 
 
 def _cli_mark_failed(db, work_id, reason, cli_id) -> str:
+    """Mark the claimed row failed. If that write fails the run stops: the row stays claimed
+    until the ``finally`` releases it, and no further row is claimed meanwhile."""
     _, err = db.mark_download_failed(work_id, reason, claimed_by=cli_id)
     if err == CLAIM_LOST:
         _cli_claim_lost(work_id)
         return "claim_lost"
+    if err:
+        raise click.ClickException(f"Work {work_id}: could not mark the download failed ({err}); stopping.")
     return "failed"
 
 
@@ -757,9 +761,12 @@ def _cli_download_row(db, enhancer, row, download_dir, cli_id) -> str:
         if msg == CLAIM_LOST:
             _cli_claim_lost(row['id'])
             return "claim_lost"
-        if msg != "duplicate_target_gone":
+        if merged:
             click.echo(f"  ↺ duplicate detected: {msg}")
             return "duplicate"
+        if msg != "duplicate_target_gone":
+            click.echo(f"  ✗ duplicate merge failed: {msg}")
+            return _cli_mark_failed(db, row['id'], 'duplicate_merge_failed', cli_id)
 
     # Update the user on progress
     click.echo(f"\n[QID {row['id']}] {(row.get('title') or '')[:80]}")
@@ -788,8 +795,11 @@ def _cli_download_row(db, enhancer, row, download_dir, cli_id) -> str:
             click.echo("  ✗ download failed")
             return "failed"
         fp = str(result['downloaded_file'])
-        # A builder that ignored the suffix wrote its final name: stored as is, as before.
-        part_path = fp if is_staged_path(fp) else None
+        if not is_staged_path(fp):
+            # A staged request must come back staged: anything else bypasses the exclusive publish.
+            click.echo(f"  ✗ the downloader returned an unstaged file ({fp}); not recorded")
+            return _cli_mark_failed(db, row['id'], 'unstaged_download', cli_id)
+        part_path = fp
         downloaded_id, err = db.move_entry_to_downloaded(
             row['id'], result, fp, checksum, result.get('download_source', 'unknown'),
             claimed_by=cli_id, part_path=part_path,

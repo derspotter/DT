@@ -73,11 +73,15 @@ def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hash
     }
     _queue(mock_db_manager, mock_entry)
 
-    enhancer_result = {
-        'downloaded_file': str(pdf_file),
-        'download_source': 'mock_source',
-    }
-    mock_enhancer.enhance_bibliography.return_value = enhancer_result
+    staged = {}
+
+    def stage(ref, download_dir):
+        # Like the real builders: the staged name <final><part_suffix>.
+        staged['path'] = str(pdf_file) + ref['part_suffix']
+        staged['result'] = {'downloaded_file': staged['path'], 'download_source': 'mock_source'}
+        return staged['result']
+
+    mock_enhancer.enhance_bibliography.side_effect = stage
 
     # Mock `open` to simulate reading the downloaded file for checksum
     mocker.patch('builtins.open', mocker.mock_open(read_data=b'pdf content'))
@@ -98,10 +102,32 @@ def test_download_pdfs_success(mocker, mock_db_manager, mock_enhancer, mock_hash
     mock_enhancer.enhance_bibliography.assert_called_once()
     mock_hashlib.file_digest.assert_called_once()
     assert mock_hashlib.file_digest.call_args.args[1] == 'sha256'
+    assert staged['path'].startswith(str(pdf_file) + '.part-')
     mock_db_manager.move_entry_to_downloaded.assert_called_once_with(
-        1, enhancer_result, str(pdf_file), 'fake_checksum', 'mock_source',
-        claimed_by=_cli_id(mock_db_manager), part_path=None,
+        1, staged['result'], staged['path'], 'fake_checksum', 'mock_source',
+        claimed_by=_cli_id(mock_db_manager), part_path=staged['path'],
     )
+
+
+def test_download_pdfs_unstaged_result_is_a_failed_download(mock_db_manager, mock_enhancer, tmp_path):
+    """A downloader that ignores the requested suffix is not recorded: the row fails, under the claim."""
+    pdf = tmp_path / "paper.pdf"
+    pdf.write_bytes(b"%PDF published elsewhere")
+    _queue(mock_db_manager, {'id': 3, 'title': 'Unstaged'})
+    mock_enhancer.enhance_bibliography.return_value = {
+        'downloaded_file': str(pdf), 'download_source': 'mock', 'checksum': 'abc',
+    }
+
+    result = CliRunner().invoke(cli, [
+        'download-pdfs', '--db-path', str(tmp_path / 'test.db'), '--download-dir', str(tmp_path)
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "unstaged file" in result.output
+    assert "Worker finished: 0 downloaded, 1 failed." in result.output
+    mock_db_manager.move_entry_to_downloaded.assert_not_called()
+    mock_db_manager.mark_download_failed.assert_called_once_with(3, 'unstaged_download', claimed_by=_cli_id(mock_db_manager))
+    assert pdf.read_bytes() == b"%PDF published elsewhere"  # never removed: not a staged file
 
 def test_download_pdfs_failure(mock_db_manager, mock_enhancer, tmp_path):
     """Test the workflow for a failed download."""

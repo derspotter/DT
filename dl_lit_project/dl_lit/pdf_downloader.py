@@ -2,7 +2,7 @@ import requests
 import hashlib
 from pathlib import Path
 from .utils import ServiceRateLimiter, get_thread_session
-from .download_path import write_staged
+from .download_path import discard_download, write_staged
 try:
     import fitz  # PyMuPDF
     PYMUPDF_AVAILABLE = True
@@ -142,7 +142,9 @@ class PDFDownloader:
 
             if part_suffix:
                 try:
-                    destination_path = Path(write_staged(destination_path, pdf_content, part_suffix))
+                    # Resolved before the write: nothing fallible runs between creating the
+                    # staged file and handing its path back (or removing it).
+                    destination_path = Path(write_staged(destination_path.resolve(), pdf_content, part_suffix))
                 except FileExistsError as e:
                     error = f"Staged file name for {source} already taken: {e}"
                     return None, None, error, {
@@ -156,6 +158,18 @@ class PDFDownloader:
                 with open(destination_path, 'wb') as f:
                     f.write(pdf_content)
             
+            if part_suffix:
+                try:
+                    print(f"{GREEN}[Downloader] Successfully downloaded from {source} and staged as: {destination_path}{RESET}")
+                except BaseException:
+                    discard_download(str(destination_path))
+                    raise
+                return destination_path, checksum, None, {
+                    "source": source,
+                    "url": pdf_url,
+                    "outcome": "success",
+                    "detail": str(destination_path),
+                }
             print(f"{GREEN}[Downloader] Successfully downloaded from {source} and saved to: {destination_path}{RESET}")
             return destination_path.resolve(), checksum, None, {
                 "source": source,

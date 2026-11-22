@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 
 from .db_manager import DatabaseManager
 from .identifiers import inverted_index_to_text_lenient
-from .download_path import write_staged
+from .download_path import discard_download, write_staged
 from .pdf_downloader import PDFDownloader
 from .utils import (
     FetchResult,
@@ -1149,8 +1149,7 @@ class BibliographyEnhancer:
             return False
         except Exception as e:
             print(f"  Unexpected error: {str(e)}")
-            # A staged write cleans up after itself; never remove a name it did not create.
-            if not part_suffix and filename.exists():
+            if filename.exists():
                 filename.unlink()
             return False
 
@@ -1237,6 +1236,9 @@ class BibliographyEnhancer:
             path, checksum, source, attempts = downloader.attempt_download(
                 openalex_payload, ref_type=ref_type, part_suffix=ref.get('part_suffix')
             )
+            if path:
+                # Recorded first, so the caller can always remove a staged file it never got back.
+                ref['downloaded_file'] = str(path)
             for attempt in attempts:
                 self._record_download_event(
                     ref,
@@ -1253,7 +1255,8 @@ class BibliographyEnhancer:
                 ref['download_reason'] = 'Downloaded via PDFDownloader'
                 ref['checksum'] = checksum
                 download_success = True
-                if not force_download:
+                # A staged attempt stops at its first file: a second one would be left behind.
+                if not force_download or ref.get('part_suffix'):
                     return ref
 
         # 1. Try direct URL first if it exists
@@ -1321,6 +1324,8 @@ class BibliographyEnhancer:
                 download_success = True
                 file_path = ref.get('downloaded_file', 'UNKNOWN_PATH')
                 print(f"{GREEN}✓ Downloaded from: {ref['download_source']} as {Path(file_path).name}{RESET}")
+                if ref.get('part_suffix'):
+                    break  # one staged file per attempt: the caller publishes and removes only that one
 
         # 2. If direct methods fail, try Sci-Hub (using DOI)
         if not download_success and ref.get('doi'):
@@ -1407,6 +1412,7 @@ class BibliographyEnhancer:
         # With a part suffix the bytes go to a new staged file (see download_path.write_staged);
         # the writer publishes it under the final name. Without one: the final name, as before.
         part_suffix = ref.get('part_suffix')
+        written = None
         ref_type = ref.get('type', '')
         
         print(f"\nTrying {source}: {url}")
@@ -1474,17 +1480,19 @@ class BibliographyEnhancer:
             if downloader.validate_pdf(content, ref_type):
                 if part_suffix:
                     try:
-                        written = write_staged(filename, content, part_suffix)
+                        staged = write_staged(filename, content, part_suffix)
                     except FileExistsError as e:
                         print(f"  {YELLOW}Staged file name already taken: {e}{RESET}")
                         self._record_download_event(ref, source=source, outcome="failure", category="stage_name_taken", detail=str(e), url=url, route=route_used, duration_ms=(time.monotonic() - started_at) * 1000)
                         return False
+                    # Into the ref before anything can fail, so the caller can always remove it.
+                    written = str(staged)
+                    ref['downloaded_file'] = written
                 else:
                     with open(filename, 'wb') as f:
                         f.write(content)
-                    written = filename
+                    ref['downloaded_file'] = str(filename)
                 print("  Direct download successful - Valid complete PDF")
-                ref['downloaded_file'] = str(written)
                 normalized_source = self._normalize_download_source_label(source, fallback="Direct URL")
                 effective_source = normalized_source if route_used == "direct" else f"{normalized_source} (via VPN)"
                 ref['download_source'] = effective_source
@@ -1581,7 +1589,11 @@ class BibliographyEnhancer:
             return False
         except Exception as e:
             print(f"  Unexpected error: {str(e)}")
-            # A staged write cleans up after itself; never remove a name it did not create.
+            if written:
+                # This attempt's own staged file; never a name it did not create.
+                discard_download(written)
+                if ref.get('downloaded_file') == written:
+                    ref.pop('downloaded_file', None)
             if not part_suffix and filename.exists():
                 try:
                     filename.unlink()

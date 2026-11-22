@@ -1178,8 +1178,7 @@ class PipelineDaemon:
                 deferred_reason = "pending_download"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
                 # Unstarted rows go back now, so the continuation job can claim them at once.
-                with self.db_lock:
-                    self.db.release_enrich_claims(remaining_ids, self.worker_id)
+                self._release_deferred_enrich_rows(remaining_ids)
                 log(
                     f"Yielding enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and a corpus download job is pending."
                 )
@@ -1187,8 +1186,7 @@ class PipelineDaemon:
             if corpus_id is None and remaining_entries and self._has_pending_interactive_jobs():
                 deferred_reason = "interactive_backlog"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
-                with self.db_lock:
-                    self.db.release_enrich_claims(remaining_ids, self.worker_id)
+                self._release_deferred_enrich_rows(remaining_ids)
                 log(
                     f"Yielding global enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and an interactive corpus job is waiting."
                 )
@@ -1207,6 +1205,15 @@ class PipelineDaemon:
             "errors": errors,
             "results": results,
         }
+
+    def _release_deferred_enrich_rows(self, remaining_ids: list[int]) -> None:
+        """Hand the unstarted rows of a deferred enrich batch back at once (D2). On a failure
+        they stay claimed until their lease ends; the deferral itself still goes ahead."""
+        try:
+            with self.db_lock:
+                self.db.release_enrich_claims(remaining_ids, self.worker_id)
+        except sqlite3.Error as exc:
+            log(f"Could not release {len(remaining_ids)} deferred enrich row(s): {exc}; they wait for their lease.")
 
     def _download_single(self, row):
         qid = int(row["id"])
@@ -1229,8 +1236,11 @@ class PipelineDaemon:
                 ok, msg = self.db.merge_duplicate_queued_work(qid, dup_table, dup_id, dup_field, claimed_by=self.worker_id)
             if msg == CLAIM_LOST:
                 return self._download_claim_lost(qid)
-            if msg != "duplicate_target_gone":
+            if ok:
                 return "skipped", {"queue_id": qid, "action": "dropped_duplicate"}
+            if msg != "duplicate_target_gone":
+                log(f"Work {qid}: duplicate merge into works {dup_id} failed: {msg}")
+                return self._fail_download(qid, "duplicate_merge_failed", msg or "duplicate_merge_failed", [], [])
             # The target is no longer downloaded: download the row as usual.
 
         ref = {
@@ -1254,6 +1264,26 @@ class PipelineDaemon:
         log(f"Work {qid}: download claim lost before its result was written; result discarded.")
         return "skipped", {"queue_id": qid, "action": "claim_lost"}
 
+    def _fail_download(self, qid: int, reason: str, detail: str, attempted_sources: list, trace: list):
+        """Mark the claimed row failed. A write that fails is logged and reported as an error."""
+        with self.db_lock:
+            _, fail_error = self.db.mark_download_failed(qid, reason, claimed_by=self.worker_id)
+        if fail_error == CLAIM_LOST:
+            return self._download_claim_lost(qid)
+        data = {
+            "queue_id": qid,
+            "action": "failed",
+            "failure_category": reason,
+            "failure_detail": detail,
+            "attempted_sources": attempted_sources,
+            "_trace": trace,
+        }
+        if fail_error:
+            log(f"Work {qid}: could not mark the download failed ({fail_error}); its claim stays until recovery.")
+            data["failure_detail"] = f"{detail}; marking it failed also failed: {fail_error}"
+            return "error", data
+        return "failed", data
+
     def _download_and_record(self, qid: int, ref: dict):
         try:
             result, checksum, trace = download_ref(
@@ -1275,53 +1305,34 @@ class PipelineDaemon:
             if source_name and source_name not in attempted_sources:
                 attempted_sources.append(source_name)
 
-        if result is not None:
-            fp = str(result["downloaded_file"])
-            ref["downloaded_file"] = fp  # what the caller's finally discards
-            # A builder that ignored the suffix wrote its final name: stored as is, as before.
-            part_path = fp if is_staged_path(fp) else None
-            with self.db_lock:
-                downloaded_id, move_error = self.db.move_entry_to_downloaded(
-                    qid, result, fp, checksum, result.get("download_source", "unknown"),
-                    claimed_by=self.worker_id, part_path=part_path,
-                )
-            if move_error == CLAIM_LOST:
-                return self._download_claim_lost(qid)
-            if move_error or not downloaded_id:
-                reason = "checksum_unavailable" if move_error == "checksum_unavailable" else "move_to_downloaded_failed"
-                with self.db_lock:
-                    _, fail_error = self.db.mark_download_failed(qid, reason, claimed_by=self.worker_id)
-                if fail_error == CLAIM_LOST:
-                    return self._download_claim_lost(qid)
-                return "failed", {
-                    "queue_id": qid,
-                    "action": "failed",
-                    "failure_category": reason,
-                    "failure_detail": move_error or reason,
-                    "attempted_sources": attempted_sources,
-                    "_trace": trace,
-                }
+        if result is None:
+            failure_category = ref.get("download_failure_category") or "download_failed"
+            failure_detail = ref.get("download_failure_detail") or ref.get("download_reason") or "download_failed"
+            return self._fail_download(qid, failure_category, failure_detail, attempted_sources, trace)
 
-            return "downloaded", {
-                "queue_id": qid,
-                "action": "downloaded",
-                "downloaded_id": int(downloaded_id),
-                "source": result.get("download_source", "unknown"),
-                "route": result.get("download_route"),
-                "_trace": trace,
-            }
-        failure_category = ref.get("download_failure_category") or "download_failed"
-        failure_detail = ref.get("download_failure_detail") or ref.get("download_reason") or "download_failed"
+        fp = str(result["downloaded_file"])
+        if not is_staged_path(fp):
+            # A staged request must come back staged: anything else bypasses the exclusive publish.
+            log(f"Work {qid}: the downloader returned an unstaged file ({fp}); not recorded.")
+            return self._fail_download(qid, "unstaged_download", f"unstaged file {fp}", attempted_sources, trace)
+        ref["downloaded_file"] = fp  # what the caller's finally discards
         with self.db_lock:
-            _, fail_error = self.db.mark_download_failed(qid, failure_category, claimed_by=self.worker_id)
-        if fail_error == CLAIM_LOST:
+            downloaded_id, move_error = self.db.move_entry_to_downloaded(
+                qid, result, fp, checksum, result.get("download_source", "unknown"),
+                claimed_by=self.worker_id, part_path=fp,
+            )
+        if move_error == CLAIM_LOST:
             return self._download_claim_lost(qid)
-        return "failed", {
+        if move_error or not downloaded_id:
+            reason = "checksum_unavailable" if move_error == "checksum_unavailable" else "move_to_downloaded_failed"
+            return self._fail_download(qid, reason, move_error or reason, attempted_sources, trace)
+
+        return "downloaded", {
             "queue_id": qid,
-            "action": "failed",
-            "failure_category": failure_category,
-            "failure_detail": failure_detail,
-            "attempted_sources": attempted_sources,
+            "action": "downloaded",
+            "downloaded_id": int(downloaded_id),
+            "source": result.get("download_source", "unknown"),
+            "route": result.get("download_route"),
             "_trace": trace,
         }
 
