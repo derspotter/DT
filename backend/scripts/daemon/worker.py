@@ -644,6 +644,8 @@ class PipelineDaemon:
             hung_line = None
             hung_skipped = None
             skipped = None
+            poisoned = False  # the connection still holds the unrecorded hung write
+            close_error = None
             if self.heartbeat_lock.acquire(timeout=WATCHDOG_LOCK_TIMEOUT_SECONDS):
                 try:
                     conn = self.heartbeat_conn
@@ -679,7 +681,9 @@ class PipelineDaemon:
                                     except Exception:  # noqa: BLE001
                                         still_open = True
                                     if still_open:
-                                        # The heartbeat's commit would persist the unrecorded write.
+                                        # Any later commit on this connection (our heartbeat, or the
+                                        # main thread's next one) would persist the unrecorded write.
+                                        poisoned = True
                                         skipped = "hung-item rollback failed; connection not reused"
                             left = budget_left_ms()
                             if skipped:
@@ -698,7 +702,15 @@ class PipelineDaemon:
                             except Exception:  # noqa: BLE001
                                 pass
                 finally:
-                    self.heartbeat_lock.release()
+                    if poisoned:
+                        # Close the connection (discarding its open transaction) and keep
+                        # heartbeat_lock until the exit, so no other thread can reach it.
+                        try:
+                            self.heartbeat_conn.close()
+                        except Exception as exc:  # noqa: BLE001 - the exit must not wait on reporting
+                            close_error = f"{exc.__class__.__name__}: {exc}"
+                    else:
+                        self.heartbeat_lock.release()
             else:
                 skipped = f"heartbeat lock not free within {WATCHDOG_LOCK_TIMEOUT_SECONDS:g}s"
                 hung_skipped = skipped
@@ -708,6 +720,8 @@ class PipelineDaemon:
                 log(f"Watchdog: hung items not recorded ({hung_skipped}).")
             if skipped:
                 log(f"Watchdog: terminal error heartbeat skipped ({skipped}).")
+            if close_error:
+                log(f"Watchdog: closing the heartbeat connection failed ({close_error}).")
             log(message)
         finally:
             self._exit(JOB_TIMEOUT_EXIT_CODE)

@@ -304,6 +304,9 @@ def test_a_spent_budget_skips_the_heartbeat(tmp_path, monkeypatch):
 
 
 def test_a_failed_rollback_never_reuses_the_connection(tmp_path, monkeypatch):
+    """The hung UPDATE's commit fails and so does its rollback: the watchdog closes the
+    connection and keeps heartbeat_lock until the exit, so the main thread's next heartbeat can
+    neither commit the unrecorded write nor run at all."""
     mod, daemon, exits, clock, lines = _daemon(monkeypatch, tmp_path, "download")
     a = _claimed_download(daemon, "A", 3)
     real = daemon.heartbeat_conn
@@ -312,26 +315,70 @@ def test_a_failed_rollback_never_reuses_the_connection(tmp_path, monkeypatch):
     class Broken(_ConnProxy):
         def commit(self):
             commits.append(1)
-            raise sqlite3.OperationalError("disk I/O error")
+            if len(commits) == 1:  # the hung write's commit; a later one would persist it
+                raise sqlite3.OperationalError("disk I/O error")
+            self._conn.commit()
 
         def rollback(self):
             raise sqlite3.OperationalError("disk I/O error")
 
     daemon.heartbeat_conn = Broken(real)
+    inner = daemon.heartbeat_lock
+    main_beat_waits = threading.Event()
+
+    class SpyLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "main-beat":
+                main_beat_waits.set()
+            return inner.acquire(*args, **kwargs)
+
+        def release(self):
+            inner.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            inner.release()
+
+    daemon.heartbeat_lock = SpyLock()
     gen = daemon._begin_work()
+    with daemon._item_running("download", a):
+        clock[0] = DEADLINE
+        # The watchdog runs on its heartbeat thread, as in the daemon.
+        watchdog = threading.Thread(
+            target=daemon._direct_batch_deadline_reached, args=(gen, {"phase": "download"}, DEADLINE),
+        )
+        watchdog.start()
+        watchdog.join(5)
+    assert not watchdog.is_alive() and exits == [75]
+
+    # The main thread's next heartbeat (as after a processed batch) blocks on heartbeat_lock.
+    main_beat = threading.Thread(
+        target=daemon._heartbeat, args=("running", {"state": "processed_batch"}), kwargs={"force": True},
+        name="main-beat", daemon=True,
+    )
+    main_beat.start()
+    assert main_beat_waits.wait(5)
+    # Still held by the (finished) watchdog thread until the process exits: the C RLock's repr
+    # names its owner, so this needs no timed wait.
+    assert f"owner={watchdog.ident} " in repr(inner)
+    assert main_beat.is_alive()
+
+    assert commits == [1]
+    with pytest.raises(sqlite3.ProgrammingError):
+        real.execute("SELECT 1")  # closed: its open transaction is discarded
+    other = _connect(tmp_path)
     try:
-        with daemon._item_running("download", a):
-            clock[0] = DEADLINE
-            daemon._direct_batch_deadline_reached(gen, {"phase": "download"}, DEADLINE)
-        assert real.in_transaction  # the hung UPDATE is still pending
-        assert commits == [1]  # only the hung write's commit: the heartbeat never committed it
+        other.execute("BEGIN IMMEDIATE")  # the write lock is free again
+        assert other.execute("SELECT download_status FROM works WHERE id = ?", (a,)).fetchone()[0] == "in_progress"
+        other.rollback()
     finally:
-        real.rollback()
-    assert exits == [75]
+        other.close()
     assert "Watchdog: hung items not recorded (disk I/O error)." in lines
     assert any(line.startswith("Watchdog: terminal error heartbeat skipped (") for line in lines)
-    assert _download_row(tmp_path, a)[0] == "in_progress"
-    assert _heartbeat_status(tmp_path, daemon) != "error"
+    assert _heartbeat_status(tmp_path, daemon) not in ("error", "running")
 
 
 def test_a_locked_database_keeps_the_phase5_exit_bound(tmp_path, monkeypatch):
