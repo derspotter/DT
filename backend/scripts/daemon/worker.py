@@ -142,16 +142,17 @@ def _append_log_line(log_dir: str, line: str) -> None:
 
 
 def log(msg: str):
-    # One record per line: a traceback's continuation lines must never stand
-    # apart from their header in the pipeline log (D11).
-    msg = str(msg).replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
+    # stdout (docker logs) keeps the raw text, tracebacks stay readable.
     print(formatted_msg, flush=True)
-    # Also append to the same pipeline log file that Node.js uses, so the UI can read it
+    # Also append to the same pipeline log file that Node.js uses, so the UI can read it.
+    # One record per line there: a traceback's continuation lines must never stand
+    # apart from their header in the pipeline log (D11).
+    file_line = formatted_msg.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
     log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
     try:
-        _append_log_line(log_dir, formatted_msg)
+        _append_log_line(log_dir, file_line)
     except Exception as e:
         print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 

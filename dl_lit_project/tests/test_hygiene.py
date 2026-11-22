@@ -294,6 +294,16 @@ def test_log_escapes_line_breaks(worker, monkeypatch, tmp_path):
     )
 
 
+def test_log_prints_the_raw_text_and_escapes_only_the_log_file_line(worker, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path))
+    worker.log("Traceback\n  File x\nValueError")
+    out = capsys.readouterr().out
+    assert out.endswith("[DAEMON] Traceback\n  File x\nValueError\n")
+    raw = (tmp_path / "backend-pipeline-v2.log").read_text()
+    assert raw.count("\n") == 1
+    assert raw.rstrip("\n").endswith("[DAEMON] Traceback\\n  File x\\nValueError")
+
+
 def test_log_follows_a_changed_log_dir_and_a_rotated_file(worker, monkeypatch, tmp_path):
     first, second = tmp_path / "a", tmp_path / "b"
     monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(first))
