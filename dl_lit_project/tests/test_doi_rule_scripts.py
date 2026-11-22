@@ -76,9 +76,10 @@ def test_scripts_use_the_db_doi_rule():
 def test_export_uses_the_stored_db_key(tmp_path, export_bundle):
     conn = _connect(_make_db(tmp_path))
     doi = "https://doi.org/10.1000/Ab.C"
-    _insert(conn, doi=doi, normalized_doi=normalize_doi(doi))
+    assert normalize_doi(doi) != "10.1000/STORED"
+    _insert(conn, doi=doi, normalized_doi="10.1000/STORED")
     item = export_bundle.load_items(conn, None)[0]
-    assert item["normalized_doi"] == "10.1000/AB.C" and item["doi"] == "https://doi.org/10.1000/Ab.C"
+    assert item["normalized_doi"] == "10.1000/STORED" and item["doi"] == "https://doi.org/10.1000/Ab.C"
 
 
 def test_export_falls_back_to_the_rule_when_the_key_is_empty(tmp_path, export_bundle):
@@ -153,6 +154,18 @@ def test_backfill_validates_the_whole_doi_before_taking_the_key(backfill):
     assert backfill.doi_filter(["10.1000/ABC"]) == "doi:10.1000/abc"
 
 
+def test_backfill_helpers_carry_the_specified_annotations(backfill):
+    import typing
+
+    assert typing.get_type_hints(backfill.bare_doi) == {"return": typing.Optional[str]}
+    assert typing.get_type_hints(backfill.doi_filter) == {"tokens": list[str], "return": str}
+    assert typing.get_type_hints(backfill.doi_rows) == {
+        "scope_clause": str,
+        "limit_clause": str,
+        "return": tuple[list[tuple[int, str]], int],
+    }
+
+
 def _backfill_db(tmp_path, backfill):
     path = _make_db(tmp_path)
     conn = _connect(path)
@@ -195,7 +208,7 @@ def _topic_row(db_path, work_id):
     return tuple(row)
 
 
-def test_backfill_pass2_keeps_punctuated_and_plain_dois_apart(tmp_path, monkeypatch, backfill):
+def test_backfill_pass2_keeps_punctuated_and_plain_dois_apart(tmp_path, monkeypatch, capsys, backfill):
     db_path, conn = _backfill_db(tmp_path, backfill)
     for doi in ("10.1000/ABC", "10.1000/ABC.", "10.1000/XYZ;", "10.1000/K", "10.1000/K"):
         _insert(conn, doi=doi, metadata_status="matched")
@@ -217,6 +230,7 @@ def test_backfill_pass2_keeps_punctuated_and_plain_dois_apart(tmp_path, monkeypa
     assert _topic_row(db_path, 3) == (None, None, None)
     assert _topic_row(db_path, 4) == (None, None, None)
     assert _topic_row(db_path, 5) == (None, None, None)
+    assert "1 skipped (not a whole DOI)" in capsys.readouterr().err
 
 
 def test_backfill_pass2_sends_only_whole_dois_and_updates_the_row(tmp_path, monkeypatch, capsys, backfill):
@@ -272,6 +286,10 @@ def test_backfill_pass2_keeps_scope_and_limit(tmp_path, monkeypatch, backfill):
     filters = _fake_openalex(monkeypatch, backfill, lambda _f: [])
     _run(monkeypatch, backfill, db_path, "--limit", "1")
     assert filters == ["doi:10.1000/one"]
+
+    filters.clear()
+    _run(monkeypatch, backfill, db_path)
+    assert filters == ["doi:10.1000/one|10.1000/two"]
 
     filters.clear()
     _run(monkeypatch, backfill, db_path, "--scope", "all")

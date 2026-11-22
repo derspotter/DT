@@ -57,7 +57,7 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def bare_doi(raw):
+def bare_doi(raw) -> str | None:
     """A whole bare DOI in lowercase, or ``None``.
 
     Strips whitespace, rejects non-ASCII input (before any case change, so a
@@ -79,11 +79,11 @@ def bare_doi(raw):
     return token if _DOI_IN_TEXT_RE.fullmatch(token) else None
 
 
-def doi_filter(tokens):
+def doi_filter(tokens: list[str]) -> str:
     return "doi:" + "|".join(token.lower() for token in tokens)
 
 
-def doi_rows(conn, *, scope_clause, limit_clause):
+def doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[int, str]], int]:
     """Pass 2's candidates as ``(work_id, DB key)`` pairs, plus how many were not a whole DOI."""
     rows = []
     skipped = 0
