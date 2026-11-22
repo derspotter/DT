@@ -675,10 +675,16 @@ class PipelineDaemon:
                                     try:
                                         if conn.in_transaction:
                                             conn.rollback()
-                                    except sqlite3.Error:
-                                        pass
+                                        still_open = conn.in_transaction
+                                    except Exception:  # noqa: BLE001
+                                        still_open = True
+                                    if still_open:
+                                        # The heartbeat's commit would persist the unrecorded write.
+                                        skipped = "hung-item rollback failed; connection not reused"
                             left = budget_left_ms()
-                            if left < 1:
+                            if skipped:
+                                pass  # the connection is not reused
+                            elif left < 1:
                                 skipped = "reporting budget spent"
                             else:
                                 try:
@@ -1245,11 +1251,19 @@ class PipelineDaemon:
                 "promoted": 0,
                 "queued": 0,
                 "failed": 0,
+                "skipped": 0,
                 "duplicates_merged": 0,
                 "results": [],
             }
 
         processed, promoted, queued, failed, duplicates_merged = 0, 0, 0, 0, 0
+        skipped = 0  # results discarded because the claim was lost (D2)
+
+        def claim_lost(work_id):
+            nonlocal skipped
+            self._enrich_claim_lost(work_id)
+            skipped += 1
+            results.append({"pending_work_id": work_id, "action": CLAIM_LOST})
         results, errors = [], []
         
         rel_down = max(0, int(expansion.get("relatedDepthDownstream", 0) or 0))
@@ -1279,6 +1293,11 @@ class PipelineDaemon:
                 for future in as_completed(futures):
                     entry = futures[future]
                     pending_work_id = int(entry["id"])
+                    if latched or self._items_latched:
+                        # A watchdog won: leave the batch. No further result is written; the
+                        # rows keep their claims for start-up recovery, and the exit follows.
+                        latched = True
+                        continue
                     processed += 1
                     try:
                         _, enriched, enrich_meta = future.result()
@@ -1299,6 +1318,7 @@ class PipelineDaemon:
                             results.append(raw_download_result)
                             continue
                         if (raw_download_result or {}).get("action") == CLAIM_LOST:
+                            skipped += 1  # _attempt_raw_download logged the claim-lost line
                             results.append(raw_download_result)
                             continue
                         reason = "Metadata fetch failed"
@@ -1306,8 +1326,7 @@ class PipelineDaemon:
                             reason = "checksum_unavailable"
                         moved_id, err = self.db.mark_metadata_failed(pending_work_id, reason, claimed_by=self.worker_id)
                         if err == CLAIM_LOST:
-                            self._enrich_claim_lost(pending_work_id)
-                            results.append({"pending_work_id": pending_work_id, "action": CLAIM_LOST})
+                            claim_lost(pending_work_id)
                             continue
                         failed += 1
                         if moved_id is None:
@@ -1320,8 +1339,7 @@ class PipelineDaemon:
 
                     wid, err = self.db.apply_enriched_metadata(pending_work_id, enriched, claimed_by=self.worker_id)
                     if err == CLAIM_LOST:
-                        self._enrich_claim_lost(pending_work_id)
-                        results.append({"pending_work_id": pending_work_id, "action": CLAIM_LOST})
+                        claim_lost(pending_work_id)
                         continue
                     if not wid:
                         dup = parse_duplicate_merge_marker(err)
@@ -1344,14 +1362,15 @@ class PipelineDaemon:
                                 }
                             )
                         else:
-                            failed += 1
-                            errors.append(err or f"Promotion failed for pending work {pending_work_id}")
                             _, reset_err = self.db.reset_enrich_claim(
                                 pending_work_id, state="pending", error=err or "promotion_failed", selected=0,
                                 claimed_by=self.worker_id,
                             )
                             if reset_err == CLAIM_LOST:
-                                self._enrich_claim_lost(pending_work_id)
+                                claim_lost(pending_work_id)
+                                continue
+                            failed += 1
+                            errors.append(err or f"Promotion failed for pending work {pending_work_id}")
                             results.append({"pending_work_id": pending_work_id, "action": "promotion_failed", "error": err})
                         continue
 
@@ -1390,6 +1409,7 @@ class PipelineDaemon:
             "promoted": promoted,
             "queued": queued,
             "failed": failed,
+            "skipped": skipped,
             "duplicates_merged": duplicates_merged,
             "targeted_ids": target_ids,
             "deferred": bool(deferred_reason),

@@ -155,23 +155,27 @@ def test_win_fails_only_overdue_running_items_at_the_limit(tmp_path, monkeypatch
     c = _claimed_download(daemon, "C", 3)
     d = _claimed_download(daemon, "D", 3, owner="daemon:x:1:zzz")
     e = _claimed_download(daemon, "E", 3)
+    f = _claimed_download(daemon, "F", 3)  # ran exactly half the deadline: counted
+    g = _claimed_download(daemon, "G", 3)  # ran just under half: spared
     d_before = _download_row(tmp_path, d)
     gen = daemon._begin_work()
     with contextlib.ExitStack() as stack:
         for wid in (a, b, d):
             stack.enter_context(daemon._item_running("download", wid))
-        clock[0] = 0.29
-        stack.enter_context(daemon._item_running("download", e))
+        for start, wid in ((DEADLINE * 0.5, f), (0.16, g), (0.29, e)):
+            clock[0] = start
+            stack.enter_context(daemon._item_running("download", wid))
         clock[0] = DEADLINE
         assert daemon._direct_batch_deadline_reached(gen, {"phase": "download"}, DEADLINE) is True
 
     assert exits == [75]
     assert _download_row(tmp_path, a) == ("failed", LIMIT_ERROR, None)
-    for wid in (b, c, e):
+    assert _download_row(tmp_path, f) == ("failed", LIMIT_ERROR, None)
+    for wid in (b, c, e, g):
         assert _download_row(tmp_path, wid)[0] == "in_progress"
         assert _download_row(tmp_path, wid)[2] == daemon.worker_id
     assert _download_row(tmp_path, d) == d_before
-    assert "Watchdog: 1 hung item(s) failed at the attempt limit, 3 left for a retry after the restart." in lines
+    assert "Watchdog: 2 hung item(s) failed at the attempt limit, 4 left for a retry after the restart." in lines
 
 
 def test_a_late_result_after_the_win_writes_nothing(tmp_path, monkeypatch):
@@ -299,6 +303,37 @@ def test_a_spent_budget_skips_the_heartbeat(tmp_path, monkeypatch):
     assert exits == [75]
 
 
+def test_a_failed_rollback_never_reuses_the_connection(tmp_path, monkeypatch):
+    mod, daemon, exits, clock, lines = _daemon(monkeypatch, tmp_path, "download")
+    a = _claimed_download(daemon, "A", 3)
+    real = daemon.heartbeat_conn
+    commits = []
+
+    class Broken(_ConnProxy):
+        def commit(self):
+            commits.append(1)
+            raise sqlite3.OperationalError("disk I/O error")
+
+        def rollback(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    daemon.heartbeat_conn = Broken(real)
+    gen = daemon._begin_work()
+    try:
+        with daemon._item_running("download", a):
+            clock[0] = DEADLINE
+            daemon._direct_batch_deadline_reached(gen, {"phase": "download"}, DEADLINE)
+        assert real.in_transaction  # the hung UPDATE is still pending
+        assert commits == [1]  # only the hung write's commit: the heartbeat never committed it
+    finally:
+        real.rollback()
+    assert exits == [75]
+    assert "Watchdog: hung items not recorded (disk I/O error)." in lines
+    assert any(line.startswith("Watchdog: terminal error heartbeat skipped (") for line in lines)
+    assert _download_row(tmp_path, a)[0] == "in_progress"
+    assert _heartbeat_status(tmp_path, daemon) != "error"
+
+
 def test_a_locked_database_keeps_the_phase5_exit_bound(tmp_path, monkeypatch):
     mod, daemon, exits, clock, lines = _daemon(monkeypatch, tmp_path, "download")
     daemon._running_clock = time.monotonic
@@ -377,4 +412,88 @@ def test_a_raw_download_without_checksum_fails_the_metadata_claim(tmp_path, monk
     assert daemon.db.conn.execute(f"SELECT {cols} FROM works WHERE id = ?", (wid,)).fetchone() == before
     assert staged and not any(p.exists() for p in staged)
     assert not (tmp_path / "raw.pdf").exists()
+    assert sorted(p.name for p in tmp_path.glob("*.pdf*")) == []
+
+
+# --- enrichment after the latch, enrich claim loss ------------------------------------------------
+
+def _enrich_rows(daemon, n):
+    return [_insert_work(daemon.db, f"P{i}", year=2020, metadata_status="pending") for i in range(n)]
+
+
+def test_enrichment_leaves_the_batch_once_the_latch_is_observed(tmp_path, monkeypatch):
+    mod, daemon, exits, clock, lines = _daemon(monkeypatch, tmp_path, "enrich")
+    monkeypatch.setenv("RAG_FEEDER_ENRICH_WAVE_SIZE", "2")
+    first, second = _enrich_rows(daemon, 2)
+    second_running, latched = threading.Event(), threading.Event()
+
+    def enrich_single(entry, *args):
+        # Both items run when the watchdog latches; the second returns its enrichment afterwards.
+        if int(entry["id"]) == first:
+            assert second_running.wait(5)
+            daemon._latch_running_items()
+            latched.set()
+            return first, None, {"status": "no_match"}
+        second_running.set()
+        assert latched.wait(5)
+        return second, {"title": "Enriched", "doi": "10.1/enriched"}, {"status": "matched"}
+
+    monkeypatch.setattr(daemon, "_enrich_single", enrich_single)
+    result = daemon.do_enrich(None, 5, 2, {})
+
+    assert result["promoted"] == 0 and result["queued"] == 0
+    for wid in (first, second):
+        row = daemon.db.get_entry_by_id("works", wid)
+        assert (row["metadata_status"], row["metadata_claimed_by"]) == ("in_progress", daemon.worker_id)
+        assert row["download_status"] != "queued" and row["title"] != "Enriched"
+
+
+def _steal(tmp_path, wid, phase="metadata"):
+    c = _connect(tmp_path)
+    c.execute(f"UPDATE works SET {phase}_claimed_by = 'daemon:other:1:aaa' WHERE id = ?", (wid,))
+    c.commit()
+    c.close()
+
+
+def test_a_lost_claim_at_the_promotion_reset_is_skipped_not_failed(tmp_path, monkeypatch):
+    mod, daemon, exits, clock, lines = _daemon(monkeypatch, tmp_path, "enrich")
+    (wid,) = _enrich_rows(daemon, 1)
+
+    def apply(work_id, enriched, *, claimed_by=None):
+        _steal(tmp_path, work_id)
+        return None, "boom"
+
+    monkeypatch.setattr(daemon, "_enrich_single", lambda entry, *a: (int(entry["id"]), {"title": "T"}, {}))
+    monkeypatch.setattr(daemon.db, "apply_enriched_metadata", apply)
+    result = daemon.do_enrich(None, 5, 2, {})
+
+    assert (result["failed"], result["skipped"], result["errors"]) == (0, 1, [])
+    assert result["results"] == [{"pending_work_id": wid, "action": "claim_lost"}]
+    assert _metadata_row(tmp_path, wid) == ("in_progress", None, "daemon:other:1:aaa")
+    assert f"Work {wid}: enrich claim lost before its result was written; result discarded." in lines
+
+
+@pytest.mark.parametrize("where", ["apply", "mark_failed", "raw"])
+def test_every_enrich_claim_loss_counts_as_skipped(tmp_path, monkeypatch, where):
+    mod, daemon, exits, clock, lines = _daemon(monkeypatch, tmp_path, "enrich")
+    (wid,) = _enrich_rows(daemon, 1)
+
+    def enrich_single(entry, *args):
+        _steal(tmp_path, wid)
+        return wid, ({"title": "T"} if where == "apply" else None), {"status": "no_match"}
+
+    def raw(enhancer, ref, download_dir, *, part_suffix=None):
+        if where != "raw":
+            return None, "", []
+        path = tmp_path / f"raw.pdf{part_suffix}"
+        path.write_bytes(b"%PDF")
+        return {"downloaded_file": str(path), "download_source": "mock"}, "abc", []
+
+    monkeypatch.setattr(daemon, "_enrich_single", enrich_single)
+    monkeypatch.setattr(mod, "download_ref", raw)
+    result = daemon.do_enrich(None, 5, 2, {})
+
+    assert (result["failed"], result["skipped"]) == (0, 1)
+    assert [r["action"] for r in result["results"]] == ["claim_lost"]
+    assert _metadata_row(tmp_path, wid) == ("in_progress", None, "daemon:other:1:aaa")
     assert sorted(p.name for p in tmp_path.glob("*.pdf*")) == []
