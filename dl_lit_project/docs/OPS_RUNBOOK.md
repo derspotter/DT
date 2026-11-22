@@ -201,14 +201,22 @@ writing the old file until they restart on the new code.
 
 ```bash
 BEFORE=$(docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log)
+# The worker's own clock and format (datetime.now().isoformat()), taken before the restart.
+SINCE=$(docker compose exec -T rag_enrich_worker \
+  python -c "from datetime import datetime; print(datetime.now().isoformat())")
 docker compose restart rag_backend rag_enrich_worker rag_download_worker
-docker compose exec -T rag_backend grep -c "enrich daemon starting\|download daemon starting" \
-  /usr/src/app/logs/backend-pipeline-v2.log
+# Give both workers time to start, then count fresh startup records per role.
+LOG=/usr/src/app/logs/backend-pipeline-v2.log
+for ROLE in enrich download; do
+  docker compose exec -T rag_backend awk -v since="[$SINCE]" -v pat="$ROLE daemon starting" \
+    '$1 > since && index($0, pat) { n++ } END { print ROLE ": " n+0 }' ROLE="$ROLE" "$LOG"
+done
 docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
 ```
 
-Expected: both startup records are in v2 (count at least 2, one per role), and
-the legacy size equals `$BEFORE`.
+Expected: `enrich: 1` and `download: 1` (one startup record per worker role
+written after `$SINCE`; rerun the loop after a few seconds if a worker is still
+starting), and the legacy size equals `$BEFORE`.
 
 Log API examples:
 
