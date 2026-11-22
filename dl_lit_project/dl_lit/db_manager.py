@@ -1980,7 +1980,7 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error moving entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
         finally:
-            self._end_owned(claimed_by)
+            self._end_owned(claimed_by if claimed_by is not None else part_path)
             if published and not committed:
                 remove_published(published)
 
@@ -2129,7 +2129,7 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] Error moving raw entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
         finally:
-            self._end_owned(claimed_by)
+            self._end_owned(claimed_by if claimed_by is not None else part_path)
             if published and not committed:
                 remove_published(published)
 
@@ -2739,9 +2739,13 @@ class DatabaseManager:
         self.conn.rollback()
         return False
 
-    def _end_owned(self, claimed_by: str | None) -> None:
-        """The ``finally`` of an owned writer: never leave its transaction open on any exit."""
-        if claimed_by is not None and self.conn is not None and self.conn.in_transaction:
+    def _end_owned(self, owner: str | None) -> None:
+        """The ``finally`` of an owned (or publishing) writer: never leave its transaction open.
+
+        ``owner`` is the writer's ``claimed_by`` (or its ``part_path``); None means a writer
+        called the old way, whose behaviour is unchanged.
+        """
+        if owner is not None and self.conn is not None and self.conn.in_transaction:
             self.conn.rollback()
 
     def find_downloaded_duplicate(self, row: dict, authors) -> tuple[str | None, int | None, str | None]:
