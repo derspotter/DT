@@ -384,6 +384,15 @@ describe('seed read path (app)', () => {
           source_pdf TEXT,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS search_runs (
+          id INTEGER PRIMARY KEY, query TEXT, filters_json TEXT, status TEXT,
+          fetched_count INTEGER, expected_count INTEGER, error TEXT, finished_at TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS search_results (
+          id INTEGER PRIMARY KEY, search_run_id INTEGER NOT NULL, title TEXT,
+          doi TEXT, openalex_id TEXT, year TEXT, raw_json TEXT
+        );
       `)
       const u1 = insertUser(db, 'seed-u1', 'seed-u1-password')
       const u2 = insertUser(db, 'seed-u2', 'seed-u2-password')
@@ -412,6 +421,32 @@ describe('seed read path (app)', () => {
           .prepare(
             `INSERT INTO ingest_entries (corpus_id, ingest_source, title, authors, year)
              VALUES (?, 'paperA', 'Corpus Two Only Work', '["X Author"]', '2019')`
+          )
+          .run(fx.corpus1).lastInsertRowid
+      )
+      // D2/D5: two downloaded copies u2 can read; the current-corpus copy's
+      // file is gone, the corpus-2 copy's file is on disk.
+      fx.twoCopiesPdf = path.join(tmpDir, 'two-copies.pdf')
+      fs.writeFileSync(fx.twoCopiesPdf, Buffer.from('%PDF-1.4\n% two copies fixture\n%%EOF\n'))
+      const addCopy = (filePath, corpusId) => {
+        const id = Number(
+          db
+            .prepare(
+              `INSERT INTO works (title, normalized_title, authors, year, metadata_status, download_status, file_path)
+               VALUES ('Two Copies Work', 'two copies work', '["X Author"]', 2018, 'matched', 'downloaded', ?)`
+            )
+            .run(filePath).lastInsertRowid
+        )
+        db.prepare('INSERT INTO corpus_works (corpus_id, work_id) VALUES (?, ?)').run(corpusId, id)
+        return id
+      }
+      fx.missingCopy = addCopy(path.join(tmpDir, 'gone.pdf'), fx.corpus1)
+      fx.presentCopy = addCopy(fx.twoCopiesPdf, fx.corpus2)
+      fx.entryTwoCopies = Number(
+        db
+          .prepare(
+            `INSERT INTO ingest_entries (corpus_id, ingest_source, title, authors, year)
+             VALUES (?, 'paperA', 'Two Copies Work', '["X Author"]', '2018')`
           )
           .run(fx.corpus1).lastInsertRowid
       )
@@ -473,5 +508,58 @@ describe('seed read path (app)', () => {
     // The admin reads every work (the row query has no membership clause for it).
     const admin = await request(app).get(url).set(as('admin'))
     expect(admin.status).toBe(200)
+  })
+
+  const candidateRow = async (who, entryId) => {
+    const res = await request(app).get('/api/seed/sources/pdf/paperA/candidates').set(as(who))
+    expect(res.status).toBe(200)
+    return { body: res.body, row: res.body.candidates.find((c) => c.candidate_key === `ingest:${entryId}`) }
+  }
+
+  test('the candidate list shows a download only where the file route serves one; non-admins get no paths', async () => {
+    // u1 cannot read the corpus-2 work: the match counts as not downloaded.
+    const u1 = await candidateRow('u1', fx.entryInCorpus2Only)
+    expect(u1.row.state).not.toBe('downloaded_elsewhere')
+    expect(u1.row.state).not.toBe('downloaded')
+    expect(u1.row.downloaded_work_id).toBeNull()
+    expect(u1.row.file_available).toBe(false)
+    expect(u1.row).not.toHaveProperty('downloaded_file_path')
+    expect(u1.body.source_summary.state_counts.downloaded_elsewhere_available).toBe(0)
+    expect(u1.body.candidates.every((c) => !('downloaded_file_path' in c))).toBe(true)
+
+    // u2 reads it: downloadable, but the absolute path stays server-side.
+    const u2 = await candidateRow('u2', fx.entryInCorpus2Only)
+    expect(u2.row.state).toBe('downloaded_elsewhere')
+    expect(u2.row.file_available).toBe(true)
+    expect(u2.row.downloaded_work_id).toBeGreaterThan(0)
+    expect(u2.row).not.toHaveProperty('downloaded_file_path')
+
+    // The admin keeps the id and the path.
+    const admin = await candidateRow('admin', fx.entryInCorpus2Only)
+    expect(admin.row.downloaded_work_id).toBe(u2.row.downloaded_work_id)
+    expect(admin.row.downloaded_file_path).toBe(fx.pdfPath)
+  })
+
+  test('list and file route both pick the first readable match whose file is on disk', async () => {
+    const { row } = await candidateRow('u2', fx.entryTwoCopies)
+    expect(row.downloaded_work_id).toBe(fx.presentCopy)
+    expect(row.file_available).toBe(true)
+    const res = await request(app)
+      .get(`/api/seed/sources/pdf/paperA/candidates/ingest:${fx.entryTwoCopies}/file`)
+      .set(as('u2'))
+      .buffer(true)
+      .parse((r, cb) => {
+        const chunks = []
+        r.on('data', (chunk) => chunks.push(chunk))
+        r.on('end', () => cb(null, Buffer.concat(chunks)))
+      })
+    expect(res.status).toBe(200)
+    expect(Buffer.compare(res.body, fs.readFileSync(fx.twoCopiesPdf))).toBe(0)
+    // u1 reads only the corpus-1 copy, whose file is gone.
+    const u1 = await candidateRow('u1', fx.entryTwoCopies)
+    expect(u1.row.downloaded_work_id).toBe(fx.missingCopy)
+    expect(u1.row.file_available).toBe(false)
+    const missing = await request(app).get(`/api/seed/sources/pdf/paperA/candidates/ingest:${fx.entryTwoCopies}/file`).set(as('u1'))
+    expect(missing.status).toBe(404)
   })
 })

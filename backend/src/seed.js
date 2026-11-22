@@ -328,7 +328,10 @@ function loadGlobalDownloaded(db) {
   return value
 }
 
-export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null } = {}) {
+// `canReadWork(workId)`, when given, is the file route's read rule: a
+// downloaded match the caller cannot read counts as not downloaded, so the
+// list never offers a download the route would refuse (D2).
+export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = null, canReadWork = null } = {}) {
   const globalDownloaded = loadGlobalDownloaded(db)
   const worksTable = tableExists(db, 'works')
   const localRows = loadMatchRows(db, 'works', { corpusId })
@@ -357,6 +360,17 @@ export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = 
   const localFailedDownloadIds = new Set(localFailedDownloadRows.map((row) => Number(row?.id)).filter((id) => Number.isFinite(id)))
   const downloadedAliasIndex = globalDownloaded.aliasIndex
   const failedDownloadAliasIndex = loadAliasIndex(db, 'works', localFailedDownloadIds)
+  const readableMemo = new Map()
+  const isReadable = (workId) => {
+    if (!canReadWork || localDownloadedIds.has(workId)) return true
+    if (!readableMemo.has(workId)) readableMemo.set(workId, Boolean(canReadWork(workId)))
+    return readableMemo.get(workId)
+  }
+  // The readable downloaded matches, current corpus first.
+  const readableDownloadedIds = (row) => {
+    const ids = [...findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)].filter(isReadable)
+    return [...ids.filter((id) => localDownloadedIds.has(id)), ...ids.filter((id) => !localDownloadedIds.has(id))]
+  }
   const isInCorpus = (row) => {
     const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
     for (const matchedId of downloadedIds) {
@@ -373,8 +387,8 @@ export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = 
     return false
   }
   const resolveState = (row) => {
-    const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
-    if (downloadedIds.size > 0) {
+    const downloadedIds = readableDownloadedIds(row)
+    if (downloadedIds.length > 0) {
       for (const matchedId of downloadedIds) {
         if (localDownloadedIds.has(matchedId)) return 'downloaded'
       }
@@ -391,18 +405,10 @@ export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = 
     return 'pending'
   }
   const resolveDownloadedWorkId = (row) => {
-    const downloadedIds = findIdsWithAliases(row, indexes.downloaded, downloadedAliasIndex)
-    for (const matchedId of downloadedIds) {
-      if (localDownloadedIds.has(matchedId)) return Number(matchedId)
-    }
-    const firstDownloadedId = [...downloadedIds][0]
-    return Number.isFinite(Number(firstDownloadedId)) ? Number(firstDownloadedId) : null
+    const first = readableDownloadedIds(row)[0]
+    return Number.isFinite(Number(first)) ? Number(first) : null
   }
-  const resolveDownloadedAvailability = (row) => {
-    const workId = resolveDownloadedWorkId(row)
-    if (!Number.isFinite(Number(workId)) || Number(workId) <= 0) {
-      return { downloaded_work_id: null, file_available: false, file_path: null }
-    }
+  const lookupDownloaded = (workId) => {
     let filePath = null
     let originKey = null
     if (worksTable) {
@@ -419,11 +425,19 @@ export function createStateResolver(db, corpusId, { resolveDownloadedFilePath = 
     if (filePath && typeof resolveDownloadedFilePath === 'function') {
       fileAvailable = Boolean(resolveDownloadedFilePath(filePath, { originKey, origin_key: originKey }))
     }
-    return {
-      downloaded_work_id: Number(workId),
-      file_available: fileAvailable,
-      file_path: filePath,
+    return { downloaded_work_id: Number(workId), file_available: fileAvailable, file_path: filePath }
+  }
+  // D5: the first readable match whose file is on disk, current corpus first
+  // (the file route's rule); without one, the first readable match.
+  const resolveDownloadedAvailability = (row) => {
+    const ids = readableDownloadedIds(row).filter((id) => Number.isFinite(Number(id)) && Number(id) > 0)
+    let first = null
+    for (const workId of ids) {
+      const availability = lookupDownloaded(workId)
+      if (availability.file_available) return availability
+      first ??= availability
     }
+    return first || { downloaded_work_id: null, file_available: false, file_path: null }
   }
   return {
     resolveState,
@@ -884,19 +898,20 @@ const MATCH_FIELDS_ONLY_BUNDLE = {
   isInCorpus: () => false,
 }
 
-// The work id to serve for one seed candidate's file, or null. Reads the one
-// candidate row with the candidate list's corpus and dismissal scoping,
-// matches it once against the cached cross-corpus downloaded index, and keeps
-// only works that are downloaded now (the cache may be stale) and that the
-// caller may read; a match in the current corpus wins, else the first such
-// match. The caller re-checks both when it reads the file row.
-export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork) {
+// The work ids that may serve one seed candidate's file, in the order the
+// file route tries them (empty when none). Reads the one candidate row with
+// the candidate list's corpus and dismissal scoping, matches it once against
+// the cached cross-corpus downloaded index, and keeps only works that are
+// downloaded now (the cache may be stale) and that the caller may read;
+// matches in the current corpus come first. The caller re-checks both when it
+// reads the file row, and serves the first whose file is on disk (D5).
+export function findSeedCandidateDownloads(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork) {
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
   const keyMatch = CANDIDATE_KEY_PATTERN.exec(String(candidateKey || '').trim())
-  if (!sourceRef || !keyMatch || keyMatch[1] !== CANDIDATE_KEY_PREFIX[sourceKind]) return null
+  if (!sourceRef || !keyMatch || keyMatch[1] !== CANDIDATE_KEY_PREFIX[sourceKind]) return []
   const rowId = Number(keyMatch[2])
-  if (!Number.isSafeInteger(rowId)) return null
+  if (!Number.isSafeInteger(rowId)) return []
   const canonicalKey = buildCandidateKey(sourceKind, rowId)
 
   let candidate
@@ -906,22 +921,22 @@ export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, c
        FROM ingest_entries
        WHERE id = ? AND corpus_id = ? AND ingest_source = ?`
     ).get(rowId, corpusId, sourceRef)
-    if (!row) return null
+    if (!row) return []
     if (tableExists(db, 'seed_candidates_dismissed')) {
       const dismissed = db.prepare(
         `SELECT 1 FROM seed_candidates_dismissed
          WHERE corpus_id = ? AND source_type = 'pdf' AND source_key = ? AND candidate_key = ?`
       ).get(corpusId, sourceRef, canonicalKey)
-      if (dismissed) return null
+      if (dismissed) return []
     }
     candidate = normalizePdfCandidate(row, sourceRef, MATCH_FIELDS_ONLY_BUNDLE)
   } else {
     // A non-canonical run id such as `07` would miss the dismissals stored
     // under `7`.
     // A run id beyond 2^53 would round to a different run.
-    if (!/^[1-9]\d*$/.test(sourceRef)) return null
+    if (!/^[1-9]\d*$/.test(sourceRef)) return []
     const runId = Number(sourceRef)
-    if (!Number.isSafeInteger(runId)) return null
+    if (!Number.isSafeInteger(runId)) return []
     const { where, params } = searchCandidateWhere(corpusId, runId, String(runId), '')
     const row = db.prepare(
       `SELECT sr.id, sr.search_run_id, sr.title, sr.doi, sr.openalex_id, sr.year, sr.raw_json, s.created_at
@@ -930,7 +945,7 @@ export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, c
        JOIN search_runs s ON s.id = sr.search_run_id
        WHERE ${where} AND sr.id = ?`
     ).get(...params, rowId)
-    if (!row) return null
+    if (!row) return []
     candidate = normalizeSearchCandidate(row, MATCH_FIELDS_ONLY_BUNDLE)
   }
 
@@ -941,9 +956,14 @@ export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, c
   const downloadedNow = db.prepare("SELECT 1 FROM works WHERE id = ? AND download_status = 'downloaded'")
   const readable = [...findIdsWithAliases(candidate, globalDownloaded.lookup, globalDownloaded.aliasIndex)]
     .filter((workId) => downloadedNow.get(workId) && canReadWork(workId))
-  if (readable.length === 0) return null
   const inCorpus = db.prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
-  return readable.find((workId) => inCorpus.get(corpusId, workId)) ?? readable[0]
+  const local = readable.filter((workId) => inCorpus.get(corpusId, workId))
+  return [...local, ...readable.filter((workId) => !local.includes(workId))]
+}
+
+// The work the file route tries first, or null (see findSeedCandidateDownloads).
+export function findSeedCandidateDownload(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork) {
+  return findSeedCandidateDownloads(db, corpusId, sourceType, sourceKey, candidateKey, canReadWork)[0] ?? null
 }
 
 function summarizeStates(candidates) {

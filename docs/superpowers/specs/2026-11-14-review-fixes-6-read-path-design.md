@@ -259,7 +259,10 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
 in `seed.js` returns the work id to serve, or `null` for 404. `canReadWork(workId) -> boolean`
 is the existing work-read rule, passed in by the route as `(id) => workReadableByUser(authDb,
 req.user, id, authConfig)` (`app.js:468`): an admin reads every work, anyone else only works in a
-corpus they belong to. There is no cross-corpus PDF sharing. It works in five steps:
+corpus they belong to. The file route serves no PDF of a work the caller cannot read.
+Promotion shares works on purpose: works are global and de-duplicated, so promoting a candidate
+links the existing work and its PDF into the caller's corpus, and from then on the work is
+readable and the route serves it (controller ruling, final review). It works in five steps:
 
 1. The `candidateKey` must match `/^(ingest|search):([1-9]\d*)$/`, with the prefix that belongs
    to `sourceType` (`ingest` for `pdf`, `search` for `search`). Anything else gives `null`. The
@@ -286,6 +289,17 @@ corpus they belong to. There is no cross-corpus PDF sharing. It works in five st
    the first one in the current corpus wins (one prepared probe, `SELECT 1 FROM corpus_works
    WHERE corpus_id = ? AND work_id = ?`, reused per id). Otherwise the first readable id wins.
    No readable id gives `null`.
+
+Final review (D2/D5): the helper is `findSeedCandidateDownloads(...) -> number[]`, the readable
+ids in that order (current corpus first), and `findSeedCandidateDownload` returns its first
+entry or `null`. The route serves the first id whose row passes the read check and whose file is
+on disk; it answers `Downloaded file is missing on disk` only when no readable file exists.
+The candidate list applies the same rule: the candidates route builds its resolver with
+`canReadWork` (`null` for an admin), so a downloaded match the caller cannot read does not make
+the candidate `downloaded`/`downloaded_elsewhere` and gives no work id and no Download button;
+`downloaded_work_id`/`file_available` come from the first readable match whose file exists, else
+the first readable match. Such a match shows as not downloaded until a promotion links it. For a
+non-admin the candidate rows omit `downloaded_file_path`; an admin keeps it.
 
 For every match the caller may read, the decision is the one the full resolver makes today; a
 parity test pins it for an admin. A match that lies only in corpora the caller cannot read now

@@ -30,7 +30,7 @@ import {
   dismissAllSeedCandidates,
   resolveSeedDocumentPath,
   createStateResolver,
-  findSeedCandidateDownload,
+  findSeedCandidateDownloads,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -4996,8 +4996,14 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
-      // One resolver for both calls: building it is the expensive part.
-      const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
+      // One resolver for both calls: building it is the expensive part. It
+      // applies the file route's read rule (D2), so a match the caller cannot
+      // read is not shown as downloaded.
+      const isAdmin = isAdminUser(req.user, authConfig);
+      const stateResolver = createStateResolver(authDb, req.corpusId, {
+        resolveDownloadedFilePath: findDownloadedFilePath,
+        canReadWork: isAdmin ? null : (id) => workReadableByUser(authDb, req.user, id, authConfig),
+      });
       const q = String(req.query?.q || '').trim();
       const { limit, offset, sort, dir } = parseCandidatePaging(req.query);
       // Sorting by state is done in JS over the whole seed (SQL cannot see a
@@ -5014,7 +5020,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           });
         }
       }
-      const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
+      let candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
         q,
@@ -5023,6 +5029,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         sort,
         dir,
       });
+      // The absolute server path is admin-only (as the logs' source_file).
+      if (!isAdmin) candidates = candidates.map(({ downloaded_file_path: _path, ...rest }) => rest);
       if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
       // `summary=light` drops the summary's state counts, which cost a
       // full-seed state resolution. Background polls send it (they never read
@@ -5065,21 +5073,24 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
 
       // Only a work the caller may read is served; a match in another
       // corpus the caller cannot read is a 404.
-      const workId = findSeedCandidateDownload(authDb, req.corpusId, sourceType, sourceKey, candidateKey,
+      const workIds = findSeedCandidateDownloads(authDb, req.corpusId, sourceType, sourceKey, candidateKey,
         (id) => workReadableByUser(authDb, req.user, id, authConfig));
-      if (workId === null) {
+      if (workIds.length === 0) {
         return res.status(404).json({ error: 'Downloaded file not found for this seed candidate' });
       }
 
       // The read rule is checked again in the row query, so the file row and
       // its authorization come from one snapshot even if another writer
       // changes corpus membership in between (workReadableByUser's rule).
+      // The first readable match whose file is on disk is served, the rule
+      // the candidate list uses (D5).
       const isAdmin = isAdminUser(req.user, authConfig);
-      let row = null;
+      let filePath = null;
+      let sawRow = false;
       let db = null;
       try {
         db = new Database(DB_PATH, { readonly: true });
-        row = db.prepare(
+        const fileRow = db.prepare(
           `SELECT w.id, w.title, w.file_path, w.origin_key
              FROM works w
             WHERE w.id = ?
@@ -5090,16 +5101,21 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                 WHERE cw.work_id = w.id AND uc.user_id = ?
               )`}
             LIMIT 1`
-        ).get(...(isAdmin ? [workId] : [workId, req.user.id]));
+        );
+        for (const workId of workIds) {
+          const row = fileRow.get(...(isAdmin ? [workId] : [workId, req.user.id]));
+          if (!row) continue;
+          sawRow = true;
+          filePath = findDownloadedFilePath(row.file_path, { originKey: row.origin_key });
+          if (filePath) break;
+        }
       } finally {
         db?.close();
       }
 
-      if (!row) {
+      if (!sawRow) {
         return res.status(404).json({ error: 'Downloaded file not found' });
       }
-
-      const filePath = findDownloadedFilePath(row.file_path, { originKey: row.origin_key });
       if (!filePath) {
         return res.status(404).json({ error: 'Downloaded file is missing on disk' });
       }
