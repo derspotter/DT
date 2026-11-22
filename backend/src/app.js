@@ -1227,6 +1227,7 @@ function getCorpusRoleForUser(db, userId, corpusId) {
 // Positive integer corpus id (numeric strings accepted, as route params arrive
 // as strings), else null.
 function normalizeCorpusId(corpusId) {
+  if (typeof corpusId !== 'number' && typeof corpusId !== 'string') return null;
   if (typeof corpusId === 'string' && !/^\d+$/.test(corpusId.trim())) return null;
   const n = Number(corpusId);
   return Number.isInteger(n) && n > 0 ? n : null;

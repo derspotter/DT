@@ -129,8 +129,10 @@ if (process.argv.includes('--count-only')) {
         const res = await request(app).post(route).set(as('editor')).send({ query: 'labour', corpusId })
         expect(res.status).toBe(403)
       }
-      const bad = await request(app).post(route).set(as('editor')).send({ query: 'labour', corpusId: 'x' })
-      expect(bad.status).toBe(400)
+      for (const corpusId of ['x', true, [ids.a], { valueOf: null, toString: null }]) {
+        const bad = await request(app).post(route).set(as('editor')).send({ query: 'labour', corpusId })
+        expect(bad.status).toBe(400)
+      }
     }
     expect(corpusArgs()).toEqual([])
   })
