@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
 import zlib from 'zlib';
+import { pipeline } from 'node:stream/promises';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -482,6 +483,31 @@ export function workReadableByUser(db, user, workId, authConfig = resolveAuthCon
   );
 }
 
+// Resolves a 3D graph node id to its works row, one probe per accepted form:
+// digits or the exporter's fallback `work:<digits>` read the primary key; any
+// other id tries openalex_id, then normalized_doi (the DOI node id is
+// normalize_doi(doi)). The `!= ''` terms let SQLite use the partial unique
+// indexes idx_works_openalex_id / idx_works_normalized_doi.
+export function findGraphNodeWork(db, nodeId, selectList, columns) {
+  const text = String(nodeId ?? '');
+  const idMatch = text.match(/^\d+$/) || text.match(/^work:(\d+)$/);
+  if (idMatch) {
+    return db.prepare(`SELECT ${selectList} FROM works w WHERE w.id = ? LIMIT 1`).get(Number(idMatch[1] ?? idMatch[0]));
+  }
+  if (columns.has('openalex_id')) {
+    const row = db
+      .prepare(`SELECT ${selectList} FROM works w WHERE w.openalex_id = ? AND w.openalex_id != '' LIMIT 1`)
+      .get(text);
+    if (row) return row;
+  }
+  if (columns.has('normalized_doi')) {
+    return db
+      .prepare(`SELECT ${selectList} FROM works w WHERE w.normalized_doi = ? AND w.normalized_doi != '' LIMIT 1`)
+      .get(text);
+  }
+  return undefined;
+}
+
 // Build a snapshot into a temp dir, then swap it into place, so readers never
 // see a half-written snapshot. Concurrent callers for the same key share one
 // build. Returns the manifest object.
@@ -505,7 +531,8 @@ function buildGraph3dSnapshot(options, key) {
       for (const fileName of ['nodes_meta.json', 'clusters.json', 'nodes.bin', 'edges.bin']) {
         const filePath = path.join(buildDir, fileName);
         if (fs.existsSync(filePath)) {
-          fs.writeFileSync(`${filePath}.gz`, zlib.gzipSync(fs.readFileSync(filePath)));
+          // Streamed, one file after another, so a multi-MB payload never blocks the event loop.
+          await pipeline(fs.createReadStream(filePath), zlib.createGzip(), fs.createWriteStream(`${filePath}.gz`));
         }
       }
       const backupDir = `${finalDir}.old-${Date.now()}`;
@@ -933,6 +960,31 @@ export function ensureAuthSchema(db) {
   ensureColumn(db, 'works', 'download_lease_expires_at', 'INTEGER');
   db.exec(`CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id);`);
+  // The graph node lookup's identifier indexes, same DDL as WORKS_INDEXES in
+  // db_manager.py (no-ops on a Python-initialised database). On a Node-only
+  // database with duplicate identifiers the unique index cannot be built: boot
+  // continues and those lookups scan until the duplicates are merged.
+  const worksColumns = new Set(listTableColumns(db, 'works'));
+  for (const [index, column, ddl] of [
+    [
+      'idx_works_openalex_id',
+      'openalex_id',
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''",
+    ],
+    [
+      'idx_works_normalized_doi',
+      'normalized_doi',
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''",
+    ],
+  ]) {
+    if (!worksColumns.has(column)) continue;
+    try {
+      db.exec(ddl);
+    } catch (error) {
+      if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
+      console.error(`[schema] ${index} not created: duplicate values in works.${column}; ${column} lookups scan until the duplicates are merged`);
+    }
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id);`);
   for (const name of [
     'idx_corpus_works_lookup',
@@ -1213,14 +1265,25 @@ function getKantroposTargetById(targetId) {
   return KANTROPOS_TARGETS.find((target) => String(target.id) === String(targetId)) || null;
 }
 
-function countBibEntriesInFile(filePath) {
+// path -> { mtimeMs, size, count }. Bounded by the configured Kantropos targets.
+const bibEntryCountMemo = new Map();
+
+// Counts the entries of a metadata.bib. `stats` is the caller's stat of the file:
+// a memo entry with the same mtimeMs and size is reused without a read. Only a
+// successful read is remembered, so a failed one (null) is retried next time.
+async function countBibEntriesInFile(filePath, stats) {
+  const cached = stats ? bibEntryCountMemo.get(filePath) : null;
+  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) return cached.count;
+  let content;
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
-    const matches = content.match(/@[A-Za-z]+\s*\{/g);
-    return Array.isArray(matches) ? matches.length : 0;
+    content = await fs.promises.readFile(filePath, 'utf8');
   } catch {
     return null;
   }
+  const matches = content.match(/@[A-Za-z]+\s*\{/g);
+  const count = Array.isArray(matches) ? matches.length : 0;
+  if (stats) bibEntryCountMemo.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, count });
+  return count;
 }
 
 function safeJsonParse(value, fallback = null) {
@@ -1354,7 +1417,8 @@ function mapScraperArtifactRow(row) {
   };
 }
 
-function listKantroposCorporaOverview(db) {
+// With targetId only that target is stat'ed and counted (the browse passes its own).
+async function listKantroposCorporaOverview(db, { targetId } = {}) {
   const assignmentRows = tableExists(db, 'corpus_kantropos_assignments')
     ? db
         .prepare(
@@ -1385,16 +1449,22 @@ function listKantroposCorporaOverview(db) {
     return map;
   }, new Map());
 
-  return KANTROPOS_TARGETS.map((target) => {
+  const targets =
+    targetId === undefined || targetId === null
+      ? KANTROPOS_TARGETS
+      : KANTROPOS_TARGETS.filter((target) => String(target.id) === String(targetId));
+  return Promise.all(targets.map(async (target) => {
     const targetPath = String(target.path || '').trim();
     const directoryExists = Boolean(targetPath) && fs.existsSync(targetPath);
     const metadataBibPath = targetPath ? path.join(targetPath, 'metadata.bib') : '';
     const metadataBibExists = Boolean(metadataBibPath) && fs.existsSync(metadataBibPath);
     let metadataBibSize = null;
     let metadataBibModifiedAt = '';
+    let metadataBibStats = null;
     if (metadataBibExists) {
       try {
         const stats = fs.statSync(metadataBibPath);
+        metadataBibStats = stats;
         metadataBibSize = Number(stats.size || 0);
         metadataBibModifiedAt = stats.mtime?.toISOString?.() || '';
       } catch {
@@ -1410,11 +1480,11 @@ function listKantroposCorporaOverview(db) {
       metadata_bib_path: metadataBibExists ? metadataBibPath : '',
       metadata_bib_size: metadataBibSize,
       metadata_bib_modified_at: metadataBibModifiedAt,
-      metadata_entry_count: metadataBibExists ? countBibEntriesInFile(metadataBibPath) : null,
+      metadata_entry_count: metadataBibExists ? await countBibEntriesInFile(metadataBibPath, metadataBibStats) : null,
       assignment_count: assignments.length,
       assigned_corpora: assignments,
     };
-  });
+  }));
 }
 
 function normalizeGraphOpenAlexId(value) {
@@ -1519,7 +1589,16 @@ function buildKantroposGraphPayload(db, currentItems = [], pendingItems = []) {
   };
 
   if (tableExists(db, 'citation_edges') && allowedNodeIds.size > 0) {
-    const rows = db.prepare('SELECT source_id, target_id, relationship_type FROM citation_edges').all();
+    // Only the edges among the nodes, through the UNIQUE(source_id, target_id, ...)
+    // autoindex. Stored endpoints are compared exactly, so a padded one no longer
+    // matches, and the edge order follows the index (graph.edges is a set).
+    const allowed = JSON.stringify([...allowedNodeIds]);
+    const rows = db
+      .prepare(
+        `SELECT source_id, target_id, relationship_type FROM citation_edges
+         WHERE source_id IN (SELECT value FROM json_each(?)) AND target_id IN (SELECT value FROM json_each(?))`
+      )
+      .all(allowed, allowed);
     for (const row of rows) {
       addEdge(row.source_id, row.target_id, row.relationship_type);
     }
@@ -1630,34 +1709,74 @@ function listImportedKantroposWorkItems(db, target, limit = null) {
   return rows.map((row) => mapWorkRowToBrowserItem(row));
 }
 
-function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
-  if (!tableExists(db, 'corpus_kantropos_assignments')) return [];
-  const rows = db
-    .prepare(
-      `SELECT w.*, c.id AS corpus_id, c.name AS corpus_name, u.username AS owner_username
-       FROM works w
-       JOIN corpus_works cw ON cw.work_id = w.id
-       JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
-       JOIN corpora c ON c.id = cw.corpus_id
-       LEFT JOIN users u ON u.id = c.owner_user_id
-       WHERE a.target_id = ?
-         AND w.download_status = 'downloaded'
-       ORDER BY COALESCE(w.year, 0) DESC, w.id DESC, LOWER(c.name), c.id`
-    )
-    .all(String(targetId || ''));
+// Two passes in one read transaction, so a worker commit in between cannot make
+// the summary and the page disagree. Pass 1 reads only ids, paths and corpora of
+// every downloaded work of the assigned corpora and counts them; pass 2 reads the
+// full rows of the first pendingLimit pending works. The file probes run after
+// the transaction, once per distinct work.
+function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet, pendingLimit) {
+  const pendingCountByCorpus = new Map();
+  const downloadedCountByCorpus = new Map();
+  if (!tableExists(db, 'corpus_kantropos_assignments')) {
+    return { items: [], totalCount: 0, missingFileCount: 0, pendingCountByCorpus, downloadedCountByCorpus };
+  }
+  const target = String(targetId || '');
+  // work id -> file_path, in page order.
+  const pendingFiles = new Map();
+  const pageRows = db.transaction(() => {
+    const rows = db
+      .prepare(
+        `SELECT w.id, w.file_path, cw.corpus_id
+         FROM works w
+         JOIN corpus_works cw ON cw.work_id = w.id
+         JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
+         JOIN corpora c ON c.id = cw.corpus_id
+         LEFT JOIN users u ON u.id = c.owner_user_id
+         WHERE a.target_id = ?
+           AND w.download_status = 'downloaded'
+         ORDER BY COALESCE(w.year, 0) DESC, w.id DESC`
+      )
+      .all(target);
+    for (const row of rows) {
+      // Each (corpus_id, work_id) pair is unique, so a plain count is distinct.
+      const corpusId = Number(row.corpus_id);
+      downloadedCountByCorpus.set(corpusId, (downloadedCountByCorpus.get(corpusId) || 0) + 1);
+      const workId = Number(row.id);
+      if (!Number.isFinite(workId) || workId <= 0) continue;
+      if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
+      pendingCountByCorpus.set(corpusId, (pendingCountByCorpus.get(corpusId) || 0) + 1);
+      if (!pendingFiles.has(workId)) pendingFiles.set(workId, row.file_path);
+    }
+    const pageIds = [...pendingFiles.keys()].slice(0, pendingLimit);
+    if (!pageIds.length) return [];
+    return db
+      .prepare(
+        `SELECT w.*, c.id AS corpus_id, c.name AS corpus_name, u.username AS owner_username
+         FROM works w
+         JOIN corpus_works cw ON cw.work_id = w.id
+         JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
+         JOIN corpora c ON c.id = cw.corpus_id
+         LEFT JOIN users u ON u.id = c.owner_user_id
+         WHERE a.target_id = ?
+           AND w.download_status = 'downloaded'
+           AND w.id IN (SELECT value FROM json_each(?))
+         ORDER BY COALESCE(w.year, 0) DESC, w.id DESC, LOWER(c.name), c.id`
+      )
+      .all(target, JSON.stringify(pageIds));
+  })();
+
+  // upstream_update.py skips works whose PDF is not physically present, so a
+  // status-only count promises more than actually reaches the RAG (spec 24).
+  // Flag rather than hide them: they stay visible and in the graph, but do
+  // not count towards the "N pending" promise.
+  const missingFileWorkIds = new Set();
+  for (const [workId, filePath] of pendingFiles) {
+    if (!upstreamFileIsPresent(filePath)) missingFileWorkIds.add(workId);
+  }
 
   const itemsByWorkId = new Map();
-  const missingFileWorkIds = new Set();
-  for (const row of rows) {
+  for (const row of pageRows) {
     const workId = Number(row.id);
-    if (!Number.isFinite(workId) || workId <= 0) continue;
-    if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
-    // upstream_update.py skips works whose PDF is not physically present, so a
-    // status-only count promises more than actually reaches the RAG (spec 24).
-    // Flag rather than hide them: they stay visible and in the graph, but do
-    // not count towards the "N pending" promise.
-    if (!upstreamFileIsPresent(row.file_path)) missingFileWorkIds.add(workId);
-
     const sourceCorpus = {
       id: Number(row.corpus_id),
       name: String(row.corpus_name || '').trim() || `Corpus ${row.corpus_id}`,
@@ -1689,64 +1808,56 @@ function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
     ...item,
     file_missing: missingFileWorkIds.has(Number(item.work_id ?? item.id)),
   }));
-  items.missingFileCount = missingFileWorkIds.size;
-  return items;
+  return {
+    items,
+    totalCount: pendingFiles.size,
+    missingFileCount: missingFileWorkIds.size,
+    pendingCountByCorpus,
+    downloadedCountByCorpus,
+  };
 }
 
 function upstreamFileIsPresent(filePath) {
   const raw = String(filePath || '').trim();
   if (!raw) return false;
   try {
-    return fs.statSync(raw).isFile();
+    return fs.statSync(raw, { throwIfNoEntry: false })?.isFile() === true;
   } catch {
     return false;
   }
 }
 
-function buildKantroposBrowsePayload(db, targetId, options = {}) {
+async function buildKantroposBrowsePayload(db, targetId, options = {}) {
   const target = getKantroposTargetById(targetId);
   if (!target) return null;
 
   const currentLimit = Math.max(1, Math.min(500, coerceInt(options.currentLimit, 120) || 120));
   const pendingLimit = Math.max(1, Math.min(500, coerceInt(options.pendingLimit, 120) || 120));
 
-  const overview = listKantroposCorporaOverview(db).find((entry) => String(entry.id) === String(targetId)) || null;
   const assignedCorpora = listAssignedCorporaForKantroposTarget(db, targetId);
   const currentItemsCount = listImportedKantroposWorkItemCount(db, target);
   const importedWorkIdSet = listImportedKantroposWorkIdSet(db, target);
   const currentItems = listImportedKantroposWorkItems(db, target, currentLimit);
-  const pendingItemsAll = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet);
-  const pendingMissingFileCount = Number(pendingItemsAll.missingFileCount || 0);
+  const pending = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet, pendingLimit);
+  const pendingMissingFileCount = pending.missingFileCount;
   // "N pending" promises what will actually reach the RAG, so it excludes works
   // whose PDF is gone; those are reported separately (spec line 24).
-  const pendingItemsCount = pendingItemsAll.length - pendingMissingFileCount;
-  const pendingItems = pendingItemsAll.slice(0, pendingLimit);
+  const pendingItemsCount = pending.totalCount - pendingMissingFileCount;
+  const pendingItems = pending.items;
 
-  const assignedById = new Map(assignedCorpora.map((corpus) => [Number(corpus.id), { ...corpus }]));
-  for (const item of pendingItemsAll) {
-    for (const sourceCorpus of item.source_corpora || []) {
-      const bucket = assignedById.get(Number(sourceCorpus.id));
-      if (!bucket) continue;
-      bucket.pending_count += 1;
-    }
-  }
-  const downloadedRows = db
-    .prepare(
-      `SELECT cw.corpus_id, COUNT(DISTINCT w.id) AS downloaded_count
-       FROM corpus_works cw
-       JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
-       JOIN works w ON w.id = cw.work_id
-       WHERE a.target_id = ?
-         AND w.download_status = 'downloaded'
-       GROUP BY cw.corpus_id`
-    )
-    .all(String(targetId || ''));
-  for (const row of downloadedRows) {
-    const bucket = assignedById.get(Number(row.corpus_id));
-    if (bucket) {
-      bucket.downloaded_count = Number(row.downloaded_count || 0);
-    }
-  }
+  const assignedById = new Map(
+    assignedCorpora.map((corpus) => [
+      Number(corpus.id),
+      {
+        ...corpus,
+        downloaded_count: pending.downloadedCountByCorpus.get(Number(corpus.id)) || 0,
+        pending_count: pending.pendingCountByCorpus.get(Number(corpus.id)) || 0,
+      },
+    ])
+  );
+
+  // Stats and counts only this target's metadata.bib, after the read transaction.
+  const overview = (await listKantroposCorporaOverview(db, { targetId })).find((entry) => String(entry.id) === String(targetId)) || null;
 
   return {
     source: 'api',
@@ -1769,7 +1880,7 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
       current_items_has_more: currentItems.length < currentItemsCount,
       // Paging compares against the full list, which still includes the
       // file-missing rows; pendingItemsCount deliberately excludes them.
-      pending_items_has_more: pendingItems.length < pendingItemsAll.length,
+      pending_items_has_more: pendingItems.length < pending.totalCount,
     },
     assigned_corpora: [...assignedById.values()],
     current_items: currentItems,
@@ -3490,21 +3601,21 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     return res.json({ corpora });
   });
 
-  app.get('/api/kantropos/corpora', requireAuthMiddleware, (_req, res) => {
-    const corpora = listKantroposCorporaOverview(authDb);
+  app.get('/api/kantropos/corpora', requireAuthMiddleware, async (_req, res) => {
+    const corpora = await listKantroposCorporaOverview(authDb);
     return res.json({
       root_path: KANTROPOS_CORPORA_ROOT,
       corpora,
     });
   });
 
-  app.get('/api/kantropos/corpora/:id/browse', requireAuthMiddleware, (req, res) => {
+  app.get('/api/kantropos/corpora/:id/browse', requireAuthMiddleware, async (req, res) => {
     try {
       const targetId = String(req.params?.id || '').trim();
       if (!targetId) {
         return res.status(400).json({ error: 'Missing Kantropos corpus id' });
       }
-      const payload = buildKantroposBrowsePayload(authDb, targetId, {
+      const payload = await buildKantroposBrowsePayload(authDb, targetId, {
         currentLimit: req.query?.current_limit ?? req.query?.currentLimit,
         pendingLimit: req.query?.pending_limit ?? req.query?.pendingLimit,
       });
@@ -5553,14 +5664,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           return res.status(404).json({ error: 'Works table not found' });
         }
         const selectList = wanted.map((column) => `w.${column}`).join(', ');
-        const numericId = Number(nodeId);
-        const query = columns.has('openalex_id') && columns.has('doi')
-          ? `SELECT ${selectList} FROM works w WHERE w.id = ? OR w.openalex_id = ? OR w.doi = ? LIMIT 1`
-          : `SELECT ${selectList} FROM works w WHERE w.id = ? LIMIT 1`;
-        const params = columns.has('openalex_id') && columns.has('doi')
-          ? [Number.isFinite(numericId) ? numericId : -1, nodeId, nodeId]
-          : [Number.isFinite(numericId) ? numericId : -1];
-        const row = db.prepare(query).get(...params);
+        const row = findGraphNodeWork(db, nodeId, selectList, columns);
         // 404 rather than 403 so node ids do not reveal works in foreign corpora.
         if (!row || !workReadableByUser(authDb, req.user, row.id, authConfig)) {
           return res.status(404).json({ error: 'Node not found' });
@@ -5578,26 +5682,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     } catch (error) {
       console.error('[/api/graph/3d/node/:nodeId] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to load node detail' });
-    }
-  });
-
-  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, requireGraph3dScopeAccess, async (req, res) => {
-    const key = String(req.params.snapshotKey || '').trim();
-    const clusterId = Number(req.params.clusterId);
-    if (!/^[a-f0-9]{20}$/.test(key) || !Number.isFinite(clusterId)) {
-      return res.status(400).json({ error: 'Invalid cluster request' });
-    }
-    try {
-      const clustersPath = graph3dSnapshotPath(key, 'clusters.json');
-      if (!fs.existsSync(clustersPath)) {
-        return res.status(404).json({ error: 'Cluster snapshot not found' });
-      }
-      const clusters = JSON.parse(fs.readFileSync(clustersPath, 'utf-8'));
-      const cluster = clusters.find((item) => Number(item.id) === clusterId);
-      return cluster ? res.json(cluster) : res.status(404).json({ error: 'Cluster not found' });
-    } catch (error) {
-      console.error('[/api/graph/3d/cluster/:snapshotKey/:clusterId] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to load cluster detail' });
     }
   });
 

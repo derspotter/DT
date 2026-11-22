@@ -436,3 +436,16 @@ test('selected work exposes a clickable link to open the paper', async ({ page }
     'https://doi.org/10.1000/example'
   )
 })
+
+test('selecting a cluster shows its detail without a request', async ({ page }) => {
+  let clusterRequests = 0
+  await page.route('**/api/**', async (route) => {
+    if (new URL(route.request().url()).pathname.startsWith('/api/graph/3d/cluster/')) clusterRequests += 1
+    await mockApi(route)
+  })
+  const panel = await openLoadedGraphPanel(page)
+  await panel.locator('.graph-3d-cluster-label').first().click()
+  await expect(panel.getByText('Economic sociology / seed').first()).toBeVisible()
+  await expect(panel.getByText('Countries: DE')).toBeVisible()
+  expect(clusterRequests).toBe(0)
+})

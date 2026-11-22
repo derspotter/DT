@@ -815,9 +815,3 @@ export async function fetchGraph3DNodeDetail(nodeId) {
   })
 }
 
-export async function fetchGraph3DClusterDetail(snapshotKey, clusterId) {
-  return requestJson(
-    `/api/graph/3d/cluster/${encodeURIComponent(String(snapshotKey || ''))}/${encodeURIComponent(String(clusterId || ''))}`,
-    { timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to load graph cluster' }
-  )
-}
