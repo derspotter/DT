@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import util from 'node:util';
 import { createApp, escapeLogLineBreaks } from './app.js';
 import { attachLogSocket } from './logSocket.js';
+import { startPipelineJobRetention } from './pipelineJobRetention.js';
 
 const port = process.env.PORT || 4000;
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -100,6 +101,7 @@ function broadcastEvent(payload) {
 }
 
 const app = createApp({ broadcast, broadcastEvent });
+startPipelineJobRetention(app.authDb);
 const server = app.listen(port, () => {
   console.log(`HTTP server listening on port ${port}`);
   // Pre-build the default 3D graph snapshot so the first Graph-tab open is
