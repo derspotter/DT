@@ -703,12 +703,14 @@ def _cli_claim_lost(work_id) -> None:
 def _cli_mark_failed(db, work_id, reason, cli_id) -> str:
     """Mark the claimed row failed. If that write fails the run stops: the row stays claimed
     until the ``finally`` releases it, and no further row is claimed meanwhile."""
-    _, err = db.mark_download_failed(work_id, reason, claimed_by=cli_id)
+    marked_id, err = db.mark_download_failed(work_id, reason, claimed_by=cli_id)
     if err == CLAIM_LOST:
         _cli_claim_lost(work_id)
         return "claim_lost"
-    if err:
-        raise click.ClickException(f"Work {work_id}: could not mark the download failed ({err}); stopping.")
+    if marked_id is None:
+        # Success is the returned row id: an error text can be empty (RAISE(ABORT, '')).
+        detail = err or "mark_download_failed returned no row"
+        raise click.ClickException(f"Work {work_id}: could not mark the download failed ({detail}); stopping.")
     return "failed"
 
 

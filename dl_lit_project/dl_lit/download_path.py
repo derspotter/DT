@@ -98,14 +98,20 @@ def publish_download(part_path: str, work_id: int) -> str:
     staged file is left for the caller's :func:`discard_download`.
     """
     part = os.fspath(part_path)
-    final = _PART_SUFFIX_RE.sub("", part)
-    if final == part:
+    # Every candidate sits in the stage's own directory (never resolved through a symlink); a
+    # symlink already at a candidate name is an existing name like any other.
+    directory, part_name = os.path.split(part)
+    final_name = _PART_SUFFIX_RE.sub("", part_name)
+    if final_name == part_name:
         raise ValueError(f"not a staged download path: {part}")
-    stem, _ext = os.path.splitext(final)
-    candidates = [final, f"{stem}-{int(work_id)}.pdf", f"{stem}-{int(work_id)}-{secrets.token_hex(4)}.pdf"]
+    stem, _ext = os.path.splitext(final_name)
+    candidates = [
+        os.path.join(directory, name)
+        for name in (final_name, f"{stem}-{int(work_id)}.pdf", f"{stem}-{int(work_id)}-{secrets.token_hex(4)}.pdf")
+    ]
     for index, candidate in enumerate(candidates):
         try:
-            os.link(part, candidate)
+            os.link(part, candidate, follow_symlinks=False)
         except FileExistsError:
             if index == len(candidates) - 1:
                 raise

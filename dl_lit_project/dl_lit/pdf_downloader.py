@@ -1,3 +1,4 @@
+import os
 import requests
 import hashlib
 from pathlib import Path
@@ -142,9 +143,10 @@ class PDFDownloader:
 
             if part_suffix:
                 try:
-                    # Resolved before the write: nothing fallible runs between creating the
-                    # staged file and handing its path back (or removing it).
-                    destination_path = Path(write_staged(destination_path.resolve(), pdf_content, part_suffix))
+                    # Absolute but unresolved: a symlink at the final name must not move the
+                    # stage (and so the published name) into another directory. Nothing
+                    # fallible runs between creating the stage and handing its path back.
+                    destination_path = Path(write_staged(os.path.abspath(destination_path), pdf_content, part_suffix))
                 except FileExistsError as e:
                     error = f"Staged file name for {source} already taken: {e}"
                     return None, None, error, {

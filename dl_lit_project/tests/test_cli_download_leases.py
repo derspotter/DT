@@ -1095,8 +1095,8 @@ def test_releasing_enrich_claims_rolls_back_a_failed_commit(tmp_path, monkeypatc
         raise sqlite3.OperationalError("locked")
 
     monkeypatch.setattr(daemon.db, "release_enrich_claims", locked)
-    daemon._release_deferred_enrich_rows([wid])
-    assert lines == [f"Could not release 1 deferred enrich row(s): locked; they wait for their lease."]
+    assert daemon._release_deferred_enrich_rows([wid]) is False
+    assert lines == [f"Could not release 1 deferred enrich row(s): locked; no continuation job, they wait for their lease."]
 
 
 def test_writer_edge_cases_of_review_round_1(tmp_path, monkeypatch):
@@ -1134,3 +1134,89 @@ def test_writer_edge_cases_of_review_round_1(tmp_path, monkeypatch):
     monkeypatch.setattr(download_path.os, "fsencode", lambda name: name.encode("latin-1"))
     fitted = download_path.fit_stem("ä" * 120 + ".pdf")
     assert len(fitted.encode("utf-8")) + 32 <= 255
+
+
+# --- review round 2 -------------------------------------------------------------------------
+
+EMPTY_ABORT = "BEGIN SELECT RAISE(ABORT, ''); END"
+
+
+def test_an_empty_error_text_still_takes_the_failure_path_in_the_daemon(tmp_path, monkeypatch):
+    daemon = _worker_daemon(monkeypatch, tmp_path, _StagingEnhancer(b"%PDF"))
+    wid = _insert_work(daemon.db, "Same Title", year=2020, download_status="queued")
+    _insert_work(daemon.db, "Same Title", year=2020, doi="10.1000/t", download_status="downloaded")
+    row = _claim(daemon.db, wid, daemon.worker_id)
+    _reject(daemon.db, f"CREATE TRIGGER no_merge BEFORE DELETE ON works WHEN OLD.id = {wid} {EMPTY_ABORT}")
+    _reject(daemon.db, f"CREATE TRIGGER no_fail BEFORE UPDATE ON works WHEN OLD.id = {wid} "
+                       f"AND NEW.download_status = 'failed' {EMPTY_ABORT}")
+
+    status, data = daemon._download_single(row)
+
+    assert status == "error" and data["action"] == "failed"
+    got = _row(tmp_path / "worker.db", wid)
+    assert (got["download_status"], got["download_claimed_by"]) == ("in_progress", daemon.worker_id)
+
+
+def test_an_empty_error_text_still_stops_the_cli(tmp_path, mocker):
+    db_path = tmp_path / "lit.db"
+    db = DatabaseManager(str(db_path))
+    first = _insert_work(db, "Same Title", year=2020, download_status="queued")
+    _insert_work(db, "Same Title", year=2020, doi="10.1000/t", download_status="downloaded")
+    second = _insert_work(db, "Fresh", year=2021, download_status="queued")
+    _reject(db, f"CREATE TRIGGER no_merge BEFORE DELETE ON works WHEN OLD.id = {first} {EMPTY_ABORT}")
+    _reject(db, f"CREATE TRIGGER no_fail BEFORE UPDATE ON works WHEN OLD.id = {first} "
+                f"AND NEW.download_status = 'failed' {EMPTY_ABORT}")
+    db.close_connection()
+    mocker.patch("dl_lit.cli.BibliographyEnhancer")
+    fake = mocker.patch("dl_lit.cli.download_ref", return_value=(None, "", []))
+
+    result = _run_cli(db_path, tmp_path)
+
+    assert result.exit_code != 0 and "could not mark the download failed" in result.output
+    assert fake.call_count == 0
+    assert (_row(db_path, first)["download_status"], _row(db_path, first)["download_claimed_by"]) == ("queued", None)
+    assert (_row(db_path, second)["download_status"], _row(db_path, second)["download_attempt_count"]) == ("queued", 0)
+
+
+def test_a_failed_release_enqueues_no_empty_continuation(tmp_path, monkeypatch):
+    from tests.test_worker_recovery import _daemon
+
+    monkeypatch.setenv("RAG_FEEDER_ENRICH_WAVE_SIZE", "2")
+    daemon = _daemon(monkeypatch, tmp_path, "enrich")
+    ids = [_insert_work(daemon.db, f"P{i}", year=2020, metadata_status="pending") for i in range(4)]
+    for wid in ids:
+        daemon.db.conn.execute("INSERT INTO corpus_works (corpus_id, work_id) VALUES (5, ?)", (wid,))
+    daemon.db.conn.commit()
+    monkeypatch.setattr(daemon, "_enrich_single", lambda entry, *a: (int(entry["id"]), None, {"status": "no_match"}))
+    monkeypatch.setattr(daemon, "_attempt_raw_download", lambda entry: (False, {}))
+    monkeypatch.setattr(daemon, "_has_pending_corpus_download_jobs", lambda: True)
+
+    def locked(ids_, by):
+        raise sqlite3.OperationalError("locked")
+
+    monkeypatch.setattr(daemon.db, "release_enrich_claims", locked)
+    result = daemon.do_enrich(5, 4, 2, {})
+
+    assert result["deferred"] is True and result["deferred_reason"] == "pending_download"
+    assert result["remaining_pending_work_ids"] == []  # so _process_job enqueues no continuation
+    for wid in ids[2:]:
+        assert daemon.db.get_entry_by_id("works", wid)["metadata_status"] == "in_progress"  # the lease hands them back
+
+
+def test_a_symlink_at_the_final_name_never_moves_the_stage(tmp_path, monkeypatch):
+    download_dir = tmp_path / "library"
+    elsewhere = tmp_path / "elsewhere"
+    download_dir.mkdir()
+    elsewhere.mkdir()
+    (elsewhere / "target.pdf").write_bytes(b"%PDF-1.4 elsewhere")
+    os.symlink(elsewhere / "target.pdf", download_dir / "untitled.pdf")
+    downloader = _pdf_downloader(download_dir, monkeypatch)
+
+    path, _, _, _ = downloader.attempt_download(URL_ONLY, part_suffix=".part-s")
+
+    assert Path(path) == download_dir / "untitled.pdf.part-s"
+    published = download_path.publish_download(str(path), 4)
+    assert Path(published) == download_dir / "untitled-4.pdf"
+    assert Path(published).read_bytes() == b"%PDF-1.4 new"
+    assert sorted(p.name for p in elsewhere.iterdir()) == ["target.pdf"]
+    assert (elsewhere / "target.pdf").read_bytes() == b"%PDF-1.4 elsewhere"

@@ -1178,7 +1178,8 @@ class PipelineDaemon:
                 deferred_reason = "pending_download"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
                 # Unstarted rows go back now, so the continuation job can claim them at once.
-                self._release_deferred_enrich_rows(remaining_ids)
+                if not self._release_deferred_enrich_rows(remaining_ids):
+                    remaining_ids = []  # still claimed: no continuation, the lease hands them back
                 log(
                     f"Yielding enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and a corpus download job is pending."
                 )
@@ -1186,7 +1187,8 @@ class PipelineDaemon:
             if corpus_id is None and remaining_entries and self._has_pending_interactive_jobs():
                 deferred_reason = "interactive_backlog"
                 remaining_ids = [int(entry["id"]) for entry in remaining_entries]
-                self._release_deferred_enrich_rows(remaining_ids)
+                if not self._release_deferred_enrich_rows(remaining_ids):
+                    remaining_ids = []  # still claimed: no continuation, the lease hands them back
                 log(
                     f"Yielding global enrich batch after {processed} item(s); {len(remaining_ids)} pending work row(s) remain and an interactive corpus job is waiting."
                 )
@@ -1199,21 +1201,26 @@ class PipelineDaemon:
             "failed": failed,
             "duplicates_merged": duplicates_merged,
             "targeted_ids": target_ids,
-            "deferred": bool(remaining_ids),
+            "deferred": bool(deferred_reason),
             "deferred_reason": deferred_reason,
             "remaining_pending_work_ids": remaining_ids,
             "errors": errors,
             "results": results,
         }
 
-    def _release_deferred_enrich_rows(self, remaining_ids: list[int]) -> None:
-        """Hand the unstarted rows of a deferred enrich batch back at once (D2). On a failure
-        they stay claimed until their lease ends; the deferral itself still goes ahead."""
+    def _release_deferred_enrich_rows(self, remaining_ids: list[int]) -> bool:
+        """Hand the unstarted rows of a deferred enrich batch back at once (D2).
+
+        False when the release failed: the rows stay claimed until their lease ends (then
+        recovery or any claim takes them), so the caller enqueues no continuation for them,
+        which would find none of them eligible and complete empty. The deferral goes ahead."""
         try:
             with self.db_lock:
                 self.db.release_enrich_claims(remaining_ids, self.worker_id)
         except sqlite3.Error as exc:
-            log(f"Could not release {len(remaining_ids)} deferred enrich row(s): {exc}; they wait for their lease.")
+            log(f"Could not release {len(remaining_ids)} deferred enrich row(s): {exc}; no continuation job, they wait for their lease.")
+            return False
+        return True
 
     def _download_single(self, row):
         qid = int(row["id"])
@@ -1267,9 +1274,12 @@ class PipelineDaemon:
     def _fail_download(self, qid: int, reason: str, detail: str, attempted_sources: list, trace: list):
         """Mark the claimed row failed. A write that fails is logged and reported as an error."""
         with self.db_lock:
-            _, fail_error = self.db.mark_download_failed(qid, reason, claimed_by=self.worker_id)
+            marked_id, fail_error = self.db.mark_download_failed(qid, reason, claimed_by=self.worker_id)
         if fail_error == CLAIM_LOST:
             return self._download_claim_lost(qid)
+        if marked_id is None:
+            # Success is the returned row id: an error text can be empty (RAISE(ABORT, '')).
+            fail_error = fail_error or "mark_download_failed returned no row"
         data = {
             "queue_id": qid,
             "action": "failed",
@@ -1278,7 +1288,7 @@ class PipelineDaemon:
             "attempted_sources": attempted_sources,
             "_trace": trace,
         }
-        if fail_error:
+        if marked_id is None:
             log(f"Work {qid}: could not mark the download failed ({fail_error}); its claim stays until recovery.")
             data["failure_detail"] = f"{detail}; marking it failed also failed: {fail_error}"
             return "error", data
