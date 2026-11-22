@@ -436,7 +436,13 @@ test('the live corpus filter uses the tail\'s fixed-position tag rule', async ({
     `${ts} [get_bib_pages][corpus=2] other corpus`,
     `${ts} [x][corpus=1] unknown label`,
     `${ts} [extract-status] [corpus=1] [base=b] kept`,
+    // The tag value is compared as a number, as the server does.
+    `${ts} [get_bib_pages][corpus=001] padded kept`,
+    `${ts} [get_bib_pages][corpus=010] padded other`,
   ]) handle.socket!.send(text)
   await page.waitForTimeout(600)
-  expect(await renderedTexts(page)).toEqual([`${ts} [extract-status] [corpus=1] [base=b] kept`])
+  expect(await renderedTexts(page)).toEqual([
+    `${ts} [extract-status] [corpus=1] [base=b] kept`,
+    `${ts} [get_bib_pages][corpus=001] padded kept`,
+  ])
 })

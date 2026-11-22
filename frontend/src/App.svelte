@@ -1300,6 +1300,9 @@
     const corpusFilter = getLogsCorpusId()
     if (!corpusFilter) return true
     const text = String(logLine || '')
+    // A trusted fixed-position tag decides as the server does (numeric).
+    const taggedCorpusId = logLineCorpusId(text)
+    if (taggedCorpusId !== null) return taggedCorpusId === Number(corpusFilter)
     const match = text.match(/corpus=([a-zA-Z0-9_-]+)/)
     if (!match) return true
     return match[1] === String(corpusFilter)
