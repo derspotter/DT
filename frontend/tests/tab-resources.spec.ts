@@ -766,3 +766,23 @@ test('global stats and daemon answers from before a sign-out do not reach the ne
   await expect(overview.locator('.pipeline-stage', { hasText: 'Enriching' }).locator('strong')).toHaveText('2')
   await expect(page.getByText(GLOBAL_UNAVAILABLE)).toHaveCount(0)
 })
+
+// FE-23 (spec D10): an error heartbeat reads as its error text, not as JSON.
+test('an error heartbeat shows its error text on the download worker card', async ({ page }) => {
+  await boot(page, {
+    admin: true,
+    hash: '#/downloads',
+    setup: (state) => {
+      state.workers = {
+        download: {
+          online: false,
+          status: 'error',
+          details: { phase: 'download', state: 'direct_batch_timeout', error: 'timed out after 1800s; worker restarted' },
+        },
+      }
+    },
+  })
+  const card = page.locator('.worker-card', { has: page.getByText('Download worker', { exact: true }) })
+  await expect(card.locator('.error')).toHaveText('timed out after 1800s; worker restarted')
+  await expect(card).not.toContainText('{"phase"')
+})

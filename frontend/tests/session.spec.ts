@@ -513,6 +513,30 @@ test('a network failure and a timeout reach the login form as readable text', as
   await expect(error).toHaveText('The server did not answer in time.', { timeout: 10_000 })
 })
 
+// BE-40 UI (spec D11): the login limit's 429 text reaches the sign-in form as
+// is. No code change; this pins the path from the response body to the form.
+test('a locked account shows the 429 text on the sign-in form', async ({ page }) => {
+  const lockedText = 'Too many failed sign-ins for this account. Try again in 15 minutes.'
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/login') {
+      return route.fulfill({
+        status: 429,
+        contentType: 'application/json',
+        headers: { 'Retry-After': '900' },
+        body: JSON.stringify({ error: lockedText }),
+      })
+    }
+    return fulfil(route, { error: 'Unauthorized' }, 401)
+  })
+
+  await page.goto('/#/workspace')
+  await logIn(page, 'alice')
+  await expect(page.getByTestId('login-form').locator('.error')).toHaveText(lockedText)
+  expect(await page.evaluate(() => window.localStorage.getItem('rag_feeder_token'))).toBeNull()
+})
+
 test('the request timeout also covers reading the response body', async ({ page }) => {
   // A real stall: the headers and half a body arrive, the rest never does.
   const server = createServer((_request, response) => {
