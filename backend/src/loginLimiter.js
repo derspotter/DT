@@ -8,9 +8,10 @@
 // or succeed (clears the settled failures). Settlement is bound to the
 // reservation's window: after a rollover or an eviction it does nothing.
 //
-// Two maps: names that match a user row (`known`) live in an uncapped map,
-// whose size is bounded by the user count, so an existing account is never
-// evicted or left untracked. Names with no row live in a map capped at
+// Two maps: an account that matched a user row (`known`, keyed by the caller
+// as `id:<user id>`, so two rows never share a counter) lives in an uncapped
+// map, whose size is bounded by the user count, so an existing account is
+// never evicted or left untracked. Names with no row live in a map capped at
 // `maxKeys`; at capacity it deletes its expired entries, or else its oldest
 // entry, locked or not. Flooding junk names can therefore only evict the lock
 // of another unknown name.
@@ -33,6 +34,10 @@ export function createLoginLimiter({
   const unknownEntries = new Map();
   // One counter for both maps: two windows never share an id.
   let nextWindowId = 1;
+  // Expired entries are swept from both maps at most once per window, so an
+  // entry whose key is never seen again (e.g. a deleted invitation) does not
+  // stay until restart. A full scan per window keeps the cost amortized O(1).
+  let lastSweepAt = null;
 
   const mapFor = (known) => (known ? knownEntries : unknownEntries);
   const expired = (entry, at) => at - entry.windowStart >= windowMs;
@@ -62,11 +67,22 @@ export function createLoginLimiter({
     }
   };
 
-  // `known`: the name matched a user row (active or invited).
+  const sweepExpired = (at) => {
+    if (lastSweepAt !== null && at - lastSweepAt < windowMs) return;
+    lastSweepAt = at;
+    for (const entries of [knownEntries, unknownEntries]) {
+      for (const [key, entry] of entries) {
+        if (expired(entry, at)) entries.delete(key);
+      }
+    }
+  };
+
+  // `known`: the key names a user row (active or invited).
   const reserve = (name, { known = false } = {}) => {
     const key = loginLimiterKey(name);
     const entries = mapFor(known);
     const at = now();
+    sweepExpired(at);
     let entry = entries.get(key);
     if (!entry) {
       if (!known && unknownEntries.size >= maxKeys) makeRoomForUnknown(at);
@@ -97,6 +113,10 @@ export function createLoginLimiter({
 
   return {
     reserve,
+    // Tracked entry counts, for diagnostics and tests.
+    size() {
+      return { known: knownEntries.size, unknown: unknownEntries.size };
+    },
     fail(ticket) {
       settle(ticket, (entry) => {
         entry.failures += 1;

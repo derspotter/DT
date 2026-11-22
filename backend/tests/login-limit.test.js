@@ -138,15 +138,32 @@ describe('createLoginLimiter', () => {
 
   test('an expired entry is deleted before the oldest one', () => {
     limiter = make({ maxKeys: 2 })
+    const warm = () => limiter.refund(limiter.reserve('warm', { known: true }).ticket) // runs the sweep
+    warm() // t=0: sweep
+    t = 100
     failTimes(limiter, 'x', 1) // oldest by insertion
-    t = 500_000
+    t = 200
     failTimes(limiter, 'y', 1)
     t = 900_000
-    failTimes(limiter, 'x', 1) // x starts a new window in place
-    t = 1_400_000 // y's window has passed, x's has not
+    warm() // sweep: nothing has expired yet
+    t = 900_100
+    failTimes(limiter, 'x', 1) // x's window passed: it starts a new one in place, no sweep due
+    t = 900_200 // y's window has passed, x's has not
     expect(limiter.reserve('z').allowed).toBe(true) // must delete y, not x
     // x kept its one failure: 9 more are allowed, then refused
     expect(allowedCount(limiter, 'x')).toBe(9)
+  })
+
+  test('expired entries of both maps are swept without a later reserve of the same key', () => {
+    failTimes(limiter, 'id:1', 3, { known: true })
+    failTimes(limiter, 'stranger', 2)
+    expect(limiter.size()).toEqual({ known: 1, unknown: 1 })
+    t = 899_999
+    limiter.refund(limiter.reserve('other').ticket)
+    expect(limiter.size()).toEqual({ known: 1, unknown: 1 })
+    t = 900_000
+    limiter.refund(limiter.reserve('other').ticket)
+    expect(limiter.size()).toEqual({ known: 0, unknown: 0 })
   })
 
   test('map keys are fixed-size digests', () => {
@@ -338,6 +355,14 @@ describe('/api/auth/login with the per-username limit', () => {
     expect(plain.status).toBe(200)
     expect(plain.body.user.username).toBe('dup')
     expect((await login(' dup ', 'pw-dup')).status).toBe(401) // the exact row is checked, not 'dup'
+  })
+
+  test('two accounts that differ only by whitespace keep separate counters', async () => {
+    expect(await statuses(9, 'dup', 'wrong')).toEqual(Array(9).fill(401))
+    expect((await login(' dup ', 'pw-spaced-dup')).status).toBe(200) // does not clear 'dup'
+    expect((await login('dup', 'wrong')).status).toBe(401) // the 10th for 'dup'
+    expect((await login('dup', 'pw-dup')).status).toBe(429)
+    expect((await login(' dup ', 'pw-spaced-dup')).status).toBe(200) // not locked by 'dup'
   })
 
   test('with the unknown map full of locked junk names, existing accounts still lock after 10 failures', async () => {

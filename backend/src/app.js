@@ -3363,9 +3363,13 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       console.error('[auth login] User lookup failed:', error);
       return res.status(500).json({ error: 'Login failed' });
     }
-    // Every name gets the same 429 after the same failures; a name with a row
-    // is tracked in the uncapped map, so flooding junk names cannot evict it.
-    const gate = signInLimiter.reserve(name, { known: Boolean(user) });
+    // Every name gets the same 429 after the same failures. A resolved account
+    // is keyed by its id in the uncapped map (flooding junk names cannot evict
+    // it, and two rows such as 'dup' and ' dup ' never share a counter); a name
+    // with no row is keyed by the trimmed name in the capped map.
+    const gate = user
+      ? signInLimiter.reserve(`id:${user.id}`, { known: true })
+      : signInLimiter.reserve(name);
     if (!gate.allowed) {
       const minutes = Math.ceil(gate.retryAfterSeconds / 60);
       res.set('Retry-After', String(gate.retryAfterSeconds));

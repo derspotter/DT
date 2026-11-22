@@ -557,6 +557,11 @@ not non-issues.
     for both). A lookup error answers `500 Login failed` before any slot is reserved.
     Accepted residual: flooding junk names can evict the lock of an unknown name, and an
     attacker who floods and then probes a locked name can tell whether it had a row.
+    A resolved account is keyed by `id:<user.id>` (digested like any key), not by the name, so
+    two rows such as `dup` and ` dup ` never share a counter and a success clears only its own
+    account; a name with no row keeps the trimmed-name key. Expired entries of both maps are
+    swept on `reserve` at most once per window (one full scan per `windowMs`), so an entry
+    whose key never returns, such as a deleted invitation, does not stay until restart.
 - **The key is the submitted username.** The handler first answers `400 Missing username or
   password` unless `username` and `password` are both strings and `username.trim()` is not
   empty. It then uses `name = username.trim()` for the limiter. The lookup (review fix) tries the exact
