@@ -6,86 +6,16 @@ import { spawn } from 'child_process';
 // their output line by line and parses their JSON results, so every child sees
 // the same PYTHONPATH and the Admin-tab settings.
 
-// D12: the fallback's parse input is at most this many times the text.
-const FALLBACK_PARSE_BUDGET_FACTOR = 4;
+// D12: the multiline fallback is the original search (every line's first
+// opener, every later line as an end), capped by a cumulative work budget so
+// a child printing thousands of tagged lines and no JSON cannot pin a core.
+const FALLBACK_WORK_FACTOR = 4;
+const FALLBACK_WORK_SLACK = 64 * 1024;
 
-// Whether valid JSON could continue from `last`, the previous line's last
-// significant character outside strings, onto the line starting at `j`.
-// Pretty-printed JSON breaks lines only after `[`, `{`, `,` or `:`, or before
-// a `,`, `]` or `}`; a diagnostic line inside a dangling block does not.
-function jsonValueStarts(text, j) {
-  const c = text[j];
-  if (c === '"' || c === '{' || c === '[' || c === '-' || (c >= '0' && c <= '9')) return true;
-  return text.startsWith('true', j) || text.startsWith('false', j) || text.startsWith('null', j);
-}
-function jsonContinues(last, text, j) {
-  const c = text[j];
-  if (last === '[') return c === ']' || jsonValueStarts(text, j);
-  if (last === '{') return c === '"' || c === '}';
-  if (last === ',' || last === ':') return jsonValueStarts(text, j);
-  return c === ',' || c === ']' || c === '}';
-}
-
-// One structural scan over `text`: opener index -> matching close index, and
-// the openers that opened with an empty stack (outer blocks). Inside an open
-// block JSON strings are skipped (honouring \" and \\); a string ends at the
-// next newline at the latest. Outside any block only openers count, so a quote
-// in diagnostic text cannot start a string. On a line that valid JSON could not
-// continue onto from the open block (a diagnostic after a dangling `[`), quotes
-// start no strings either, so its openers still count. A close that does not
-// match the top of the stack clears the stack. An opener that never closes has
-// no entry.
-function bracketCloses(text, stats = null) {
-  const closes = new Map();
-  const outer = new Set();
-  const stack = [];
-  let inString = false;
-  let escaped = false;
-  let quotesOff = false;
-  let last = '';
-  let visited = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    visited += 1;
-    const ch = text[i];
-    if (ch === '\n') {
-      inString = false;
-      escaped = false;
-      quotesOff = stack.length > 0 && !jsonContinues(last, text, i + 1);
-      continue;
-    }
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') {
-        inString = false;
-        last = '"';
-      }
-      continue;
-    }
-    if (ch !== ' ' && ch !== '\t') last = ch;
-    if (ch === '[' || ch === '{') {
-      if (stack.length === 0) outer.add(i);
-      stack.push(i);
-    } else if (ch === ']' || ch === '}') {
-      const top = stack.length ? stack[stack.length - 1] : -1;
-      if (top >= 0 && text[top] === (ch === ']' ? '[' : '{')) {
-        stack.pop();
-        closes.set(top, i);
-      } else {
-        stack.length = 0;
-      }
-    } else if (ch === '"' && stack.length > 0 && !quotesOff) {
-      inString = true;
-    }
-  }
-  if (stats) stats.visited += visited;
-  return { closes, outer };
-}
-
-// `stats` (tests only): the fallback adds the characters its structural scan
-// visited to `stats.visited`, the characters its candidate loop read to
-// `stats.lineScan`, its parse attempts to `stats.parses` and the candidate
-// lengths it parsed to `stats.parsedChars`.
+// `stats` (tests only): the fallback adds every character it scans or joins to
+// `stats.visited`, its parse attempts to `stats.parses`, the characters it
+// hands to JSON.parse to `stats.parsedChars`, and its cap to `stats.cap`.
+// visited + parsedChars never exceeds the cap.
 export function parseJsonFromOutput(output, { stats } = {}) {
   const lines = String(output || '')
     .split(/\r?\n/)
@@ -112,47 +42,54 @@ export function parseJsonFromOutput(output, { stats } = {}) {
     if (parsedInline !== null) return parsedInline;
   }
 
-  // Fallback: recover pretty-printed/multiline JSON blocks. One scan pairs the
-  // brackets; then, from the last line to the first, a line's first opener
-  // whose block closes on a later line is tried once, provided the close ends
-  // its line or the block is outer. The parsed input is capped by a budget.
-  const text = lines.join('\n');
-  const { closes, outer } = bracketCloses(text, stats);
-  const lineStarts = new Array(lines.length);
-  for (let i = 0, offset = 0; i < lines.length; i += 1) {
-    lineStarts[i] = offset;
-    offset += lines[i].length + 1;
-  }
-  let budget = FALLBACK_PARSE_BUDGET_FACTOR * text.length;
-  let lineScan = 0;
+  // Fallback: recover pretty-printed/multiline JSON blocks from stdout, in the
+  // original order and with the original results. Each candidate's length is
+  // known from prefix sums before it is built, so the budget is checked first:
+  // building and parsing a candidate both count, and so does every scan.
+  const noJson = () => new Error(`No valid JSON output from python. Output was: ${output}`);
+  const cap = FALLBACK_WORK_FACTOR * String(output || '').length + FALLBACK_WORK_SLACK;
+  let visited = 0;
+  let parses = 0;
+  let parsedChars = 0;
+  const report = () => {
+    if (!stats) return;
+    stats.visited += visited;
+    stats.parses += parses;
+    stats.parsedChars += parsedChars;
+    stats.cap = cap;
+  };
+  // prefix[k]: characters of lines[0..k-1] joined with '\n' plus a trailing one.
+  const prefix = new Array(lines.length + 1);
+  prefix[0] = 0;
+  for (let k = 0; k < lines.length; k += 1) prefix[k + 1] = prefix[k] + lines[k].length + 1;
+  visited += lines.length;
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const bracketIndex = lines[i].search(/[\[{]/);
-    // The search reads the line up to its first opener (or all of it).
-    lineScan += bracketIndex < 0 ? lines[i].length : bracketIndex + 1;
+    const line = lines[i];
+    const bracketIndex = line.search(/[\[{]/);
+    visited += bracketIndex < 0 ? line.length : bracketIndex + 1;
     if (bracketIndex < 0) continue;
-    const start = lineStarts[i] + bracketIndex;
-    const close = closes.get(start);
-    const lineEnd = lineStarts[i] + lines[i].length;
-    if (close === undefined || close < lineEnd) continue; // unclosed or single-line
-    // The lines are trimmed and joined with '\n': a close ends its line when
-    // the next character is the separator or the end of the text.
-    const endsLine = close + 1 === text.length || text[close + 1] === '\n';
-    if (!endsLine && !outer.has(start)) continue;
-    budget -= close + 1 - start;
-    if (budget < 0) break;
-    if (stats) {
-      stats.parses += 1;
-      stats.parsedChars += close + 1 - start;
-    }
-    const parsedBlock = tryParse(text.slice(start, close + 1));
-    if (parsedBlock !== null) {
-      if (stats) stats.lineScan = (stats.lineScan || 0) + lineScan;
-      return parsedBlock;
+    for (let j = lines.length; j > i; j -= 1) {
+      const length = prefix[j] - prefix[i] - 1 - bracketIndex;
+      if (visited + parsedChars + 2 * length > cap) {
+        report();
+        throw noJson();
+      }
+      const segment = lines.slice(i, j);
+      segment[0] = segment[0].slice(bracketIndex);
+      const candidate = segment.join('\n');
+      visited += length;
+      parses += 1;
+      parsedChars += length;
+      const parsedSegment = tryParse(candidate);
+      if (parsedSegment !== null) {
+        report();
+        return parsedSegment;
+      }
     }
   }
-  if (stats) stats.lineScan = (stats.lineScan || 0) + lineScan;
 
-  throw new Error(`No valid JSON output from python. Output was: ${output}`);
+  report();
+  throw noJson();
 }
 
 // Split buffered output into trimmed, non-empty complete lines for `handler`

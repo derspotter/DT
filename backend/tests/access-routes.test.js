@@ -581,6 +581,34 @@ describe('explicit-corpus routes enforce corpus roles', () => {
       expect(res.body).toEqual({ error: 'Log access changed during the read' })
     })
 
+    test('logs: a member response names no server path; the admin keeps source_file', async () => {
+      for (const url of ['/api/logs/tail?type=pipeline&scope=readable', `/api/logs/tail?type=pipeline&corpus_id=${ids.E}`, '/api/logs/tail?type=pipeline']) {
+        const member = await request(app).get(url).set(as('member9'))
+        expect([url, member.status, Object.prototype.hasOwnProperty.call(member.body, 'source_file')]).toEqual([url, 200, false])
+        expect(JSON.stringify(member.body)).not.toContain(caseDir)
+      }
+      const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
+      expect(admin.body.source_file).toBe(path.join(caseDir, 'backend-pipeline-v2.log'))
+    })
+
+    test('logs: a read error answers a member with a generic message, the admin with the detail', async () => {
+      const failOpen = () =>
+        jest.spyOn(fs.promises, 'open').mockImplementation(async (p) => {
+          throw Object.assign(new Error(`EACCES: permission denied, open '${p}'`), { code: 'EACCES' })
+        })
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+      failOpen()
+      for (const url of ['/api/logs/tail?type=pipeline&scope=readable', `/api/logs/tail?type=pipeline&corpus_id=${ids.E}`, '/api/logs/tail?type=pipeline']) {
+        const member = await request(app).get(url).set(as('member9'))
+        expect([url, member.status, member.body]).toEqual([url, 500, { error: 'Could not read the log' }])
+      }
+      const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
+      expect(admin.status).toBe(500)
+      expect(admin.body.error).toContain('EACCES')
+      expect(admin.body.error).toContain(caseDir)
+      expect(consoleError).toHaveBeenCalledWith('[/api/logs/tail] Error:', expect.objectContaining({ code: 'EACCES' }))
+    })
+
     test('logs: a user deleted during the read gets no window', async () => {
       onOpen(
         () => true,

@@ -553,6 +553,15 @@ It is exported, and it reads as follows:
 
 **D12. The fallback parser follows brackets in one pass, within a parse budget (BE-42),
 controller call.**
+
+> **Controller ruling (Task 3 review, supersedes the structural scan below):** the fast path
+> and the original multiline fallback of `0702e47`/`95d861e` stay unchanged in order and
+> results; the fallback only gains a cumulative work budget of `4 × output length + 64 KiB`
+> characters (every candidate counted once as built and once as parsed, plus the per-line
+> scans), checked before each candidate, after which it throws the unchanged error. Within the
+> budget every result equals the old parser's (`} done` still does not parse); the bracket scan
+> described below was dropped because its heuristics lost results the old parser recovered.
+
 - The fast path is unchanged.
 - The fallback joins the trimmed lines with `\n` once into `text`, then makes one structural
   scan over it: `bracketCloses(text) -> Map<number, number>`, opener index → matching close
@@ -770,8 +779,8 @@ The tasks run serially in this order: every task edits `app.js`, and Tasks 2–5
   record (shown as a literal `\n`) and write a new file, `backend-pipeline-v2.log`; the old
   `backend-pipeline.log` generation is readable by admins only. Access that changes during the
   read answers 409.
-- **D12 (BE-42):** a multiline JSON block followed by text on its closing line now parses. The
-  fallback gives up, with the unchanged error, after parse input of four times the output.
+- **D12 (BE-42):** results are unchanged within the budget. The fallback gives up, with the
+  unchanged error, after work of four times the output plus 64 KiB.
 - **D13 (FE-14):** the stage filter is applied by the server. "Show more" and the scroll
   trigger page within the stage, and the stage labels keep their totals. Row actions wait until
   the rows of the selected stage have loaded. The stage persists like the `q` filter: across

@@ -6141,6 +6141,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
   const sameIdSet = (a, b) => a.size === b.size && [...a].every((id) => b.has(id));
 
   app.get('/api/logs/tail', requireAuthMiddleware, async (req, res) => {
+    // Server paths (source_file, error messages) are for the admin only.
+    const detailed = isStubMode() || isAdminUser(req.user, authConfig);
     try {
       const type = String(req.query?.type || 'pipeline').trim().toLowerCase();
       const corpusIdRaw = req.query?.corpus_id ?? req.query?.corpusId;
@@ -6214,7 +6216,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           next_cursor: cursor,
           has_more: false,
           include_rotated: includeRotated,
-          source_file: sourceFile,
+          ...(detailed ? { source_file: sourceFile } : {}),
           source_exists: false,
         });
       }
@@ -6259,11 +6261,12 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         next_cursor: window.nextCursor,
         has_more: window.hasMore,
         include_rotated: includeRotated,
-        source_file: sourceFile,
+        ...(detailed ? { source_file: sourceFile } : {}),
         source_exists: fs.existsSync(sourceFile),
       });
     } catch (error) {
       console.error('[/api/logs/tail] Error:', error);
+      if (!detailed) return res.status(500).json({ error: 'Could not read the log' });
       return res.status(500).json({ error: error?.message || 'Failed to tail logs' });
     }
   });
