@@ -1332,6 +1332,13 @@
     return logLineCorpusId(logLine) === corpusFilter
   }
 
+  // A lazy tab's failed import (D15): the message stays generic, the error
+  // goes to the console. Renders nothing.
+  function logTabImportError(tab, error) {
+    console.error(`[tab-import] ${tab}`, error)
+    return ''
+  }
+
   function refreshReason() {
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return 'hidden'
     if (authStatus !== 'authenticated') return 'none'
@@ -5646,8 +5653,8 @@
           <p class="muted">Loading…</p>
         {:then module}
           <svelte:component this={module.default} />
-        {:catch}
-          <p class="muted">Could not load this tab. Reload the page to try again.</p>
+        {:catch error}
+          {logTabImportError('ScraperLab', error)}<p class="muted">Could not load this tab. Reload the page to try again.</p>
         {/await}
       {/if}
 
@@ -5880,8 +5887,8 @@
           <p class="muted">Loading…</p>
         {:then module}
           <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
-        {:catch}
-          <p class="muted">Could not load this tab. Reload the page to try again.</p>
+        {:catch error}
+          {logTabImportError('ThreeGraph', error)}<p class="muted">Could not load this tab. Reload the page to try again.</p>
         {/await}
       {/if}
     </section>

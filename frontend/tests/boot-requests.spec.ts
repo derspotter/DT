@@ -87,10 +87,16 @@ test('the graph and scraper code loads on first open only', async ({ page }) => 
 
 test('a failed tab import shows the error text and leaves the app usable', async ({ page }) => {
   const urls: string[] = []
+  const consoleErrors: string[] = []
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text())
+  })
   await page.route('**/src/components/ThreeGraph.svelte*', (route) => route.abort())
   await bootWorkspace(page, urls)
   await page.getByTestId('tab-graph').click()
   await expect(page.getByText('Could not load this tab. Reload the page to try again.')).toBeVisible()
+  // The import error itself reaches the console once, with the tab's name.
+  await expect.poll(() => consoleErrors.filter((text) => text.includes('[tab-import] ThreeGraph')).length).toBe(1)
   await expect(page.getByTestId('graph-3d-panel')).toHaveCount(0)
   await page.getByTestId('tab-workspace').click()
   await expect(page.getByTestId('corpus-panel')).toBeVisible()
