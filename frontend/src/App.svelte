@@ -4271,6 +4271,7 @@
         includeRotated: true,
         cursor: 0,
         corpusId: getLogsCorpusId(),
+        scope: logsFilterCurrentCorpus ? 'corpus' : 'readable',
       })
       if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
@@ -4322,6 +4323,7 @@
         includeRotated: true,
         cursor: cursorAtRequest,
         corpusId: getLogsCorpusId(),
+        scope: logsFilterCurrentCorpus ? 'corpus' : 'readable',
       })
       if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []

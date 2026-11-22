@@ -24,9 +24,10 @@ async function boot(page: Page, hash: string, file: string[] | null = null) {
     answer: (() => Promise<TailBody>) | null
     cursors: string[]
     lines: string[]
+    params: URLSearchParams[]
     file: string[] | null
     hold: Promise<void> | null
-  } = { answer: null, cursors: [], lines: [], file, hold: null }
+  } = { answer: null, cursors: [], lines: [], params: [], file, hold: null }
   page.on('pageerror', (error) => errors.push(error.message))
   await mockLogSocket(page, (ws) => {
     handle.socket = ws
@@ -42,6 +43,7 @@ async function boot(page: Page, hash: string, file: string[] | null = null) {
       return fulfil(route, mePayload())
     }
     if (path === '/api/logs/tail') {
+      tail.params.push(new URLSearchParams(url.searchParams))
       tail.cursors.push(url.searchParams.get('cursor') || '')
       tail.lines.push(url.searchParams.get('lines') || '')
       if (tail.file) {
@@ -397,4 +399,23 @@ test('a tail requested before a reconnect gap does not clear the gap (K-M1 round
   await expect.poll(() => tail.cursors.length).toBe(3)
   await expect(older).toBeEnabled()
   await expect(page.getByTestId('logs-older-hint')).toHaveCount(0)
+})
+
+test('turning "Current corpus only" off loads the readable scope', async ({ page }) => {
+  const { tail } = await boot(page, '#/logs')
+  await panel(page).getByLabel('Current corpus only').uncheck()
+  await expect.poll(() => tail.params.at(-1)?.get('scope')).toBe('readable')
+  expect(tail.params.at(-1)?.has('corpus_id')).toBe(false)
+  expect(tail.params[0].get('corpus_id')).toBe('1')
+})
+
+test('the log type switch loads the app log without scope or corpus_id, then the pipeline log again', async ({ page }) => {
+  const { tail } = await boot(page, '#/logs')
+  await page.getByTestId('logs-type-select').selectOption('app')
+  await expect.poll(() => tail.params.at(-1)?.get('type')).toBe('app')
+  expect(tail.params.at(-1)?.has('scope')).toBe(false)
+  expect(tail.params.at(-1)?.has('corpus_id')).toBe(false)
+  await page.getByTestId('logs-type-select').selectOption('pipeline')
+  await expect.poll(() => tail.params.at(-1)?.get('type')).toBe('pipeline')
+  await expect(panel(page).getByRole('button', { name: 'Refresh from file' })).toBeVisible()
 })

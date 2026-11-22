@@ -122,7 +122,8 @@ def _log_handle_is_current(log_file: str) -> bool:
 
 
 def _append_log_line(log_dir: str, line: str) -> None:
-    log_file = os.path.join(log_dir, "backend-pipeline.log")
+    # The escaped-format generation (D11); backend-pipeline.log is admin-only history.
+    log_file = os.path.join(log_dir, "backend-pipeline-v2.log")
     with _LOG_LOCK:
         for attempt in range(2):
             try:
@@ -141,6 +142,9 @@ def _append_log_line(log_dir: str, line: str) -> None:
 
 
 def log(msg: str):
+    # One record per line: a traceback's continuation lines must never stand
+    # apart from their header in the pipeline log (D11).
+    msg = str(msg).replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
     print(formatted_msg, flush=True)

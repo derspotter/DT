@@ -6,7 +6,56 @@ import { spawn } from 'child_process';
 // their output line by line and parses their JSON results, so every child sees
 // the same PYTHONPATH and the Admin-tab settings.
 
-export function parseJsonFromOutput(output) {
+// D12: the fallback's parse input is at most this many times the text.
+const FALLBACK_PARSE_BUDGET_FACTOR = 4;
+
+// One structural scan over `text`: opener index -> matching close index, and
+// the openers that opened with an empty stack (outer blocks). Inside an open
+// block JSON strings are skipped (honouring \" and \\); a string ends at the
+// next newline at the latest. Outside any block only openers count, so a quote
+// in diagnostic text cannot start a string. A close that does not match the
+// top of the stack clears the stack. An opener that never closes has no entry.
+function bracketCloses(text, stats = null) {
+  const closes = new Map();
+  const outer = new Set();
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  let visited = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    visited += 1;
+    const ch = text[i];
+    if (ch === '\n') {
+      inString = false;
+      escaped = false;
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '[' || ch === '{') {
+      if (stack.length === 0) outer.add(i);
+      stack.push(i);
+    } else if (ch === ']' || ch === '}') {
+      const top = stack.length ? stack[stack.length - 1] : -1;
+      if (top >= 0 && text[top] === (ch === ']' ? '[' : '{')) {
+        stack.pop();
+        closes.set(top, i);
+      } else {
+        stack.length = 0;
+      }
+    } else if (ch === '"' && stack.length > 0) {
+      inString = true;
+    }
+  }
+  if (stats) stats.visited += visited;
+  return { closes, outer };
+}
+
+export function parseJsonFromOutput(output, { stats } = {}) {
   const lines = String(output || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -32,17 +81,36 @@ export function parseJsonFromOutput(output) {
     if (parsedInline !== null) return parsedInline;
   }
 
-  // Fallback: recover pretty-printed/multiline JSON blocks from stdout.
+  // Fallback: recover pretty-printed/multiline JSON blocks. One scan pairs the
+  // brackets; then, from the last line to the first, a line's first opener
+  // whose block closes on a later line is tried once, provided the close ends
+  // its line or the block is outer. The parsed input is capped by a budget.
+  const text = lines.join('\n');
+  const { closes, outer } = bracketCloses(text, stats);
+  const lineStarts = new Array(lines.length);
+  for (let i = 0, offset = 0; i < lines.length; i += 1) {
+    lineStarts[i] = offset;
+    offset += lines[i].length + 1;
+  }
+  let budget = FALLBACK_PARSE_BUDGET_FACTOR * text.length;
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const line = lines[i];
-    const bracketIndex = line.search(/[\[{]/);
+    const bracketIndex = lines[i].search(/[\[{]/);
     if (bracketIndex < 0) continue;
-    for (let j = lines.length; j > i; j -= 1) {
-      const segment = lines.slice(i, j);
-      segment[0] = segment[0].slice(bracketIndex);
-      const parsedSegment = tryParse(segment.join('\n'));
-      if (parsedSegment !== null) return parsedSegment;
+    const start = lineStarts[i] + bracketIndex;
+    const close = closes.get(start);
+    const lineEnd = lineStarts[i] + lines[i].length;
+    if (close === undefined || close < lineEnd) continue; // unclosed or single-line
+    const closeLineEnd = text.indexOf('\n', close);
+    const endsLine = close + 1 === (closeLineEnd < 0 ? text.length : closeLineEnd);
+    if (!endsLine && !outer.has(start)) continue;
+    budget -= close + 1 - start;
+    if (budget < 0) break;
+    if (stats) {
+      stats.parses += 1;
+      stats.parsedChars += close + 1 - start;
     }
+    const parsedBlock = tryParse(text.slice(start, close + 1));
+    if (parsedBlock !== null) return parsedBlock;
   }
 
   throw new Error(`No valid JSON output from python. Output was: ${output}`);

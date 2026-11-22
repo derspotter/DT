@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createPythonRunner } from '../src/pythonProcess.js'
+import { createPythonRunner, parseJsonFromOutput } from '../src/pythonProcess.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const VENV_PYTHON = '/home/jay/DT/venv/bin/python'
@@ -150,4 +150,60 @@ test('the import-seed route leaves --corpus-id to spawnPython', () => {
   expect(start).toBeGreaterThan(0)
   const body = src.slice(start, src.indexOf('app.post(', start + 10))
   expect(body).not.toMatch(/--corpus-id/)
+})
+
+// D12 (BE-42): the JSON fallback follows brackets in one scan within a parse budget.
+const NO_JSON = 'No valid JSON output from python.'
+
+test('fallback parsing is one scan plus one parse per bracketed line', () => {
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
+  const output = Array.from({ length: 300 }, (_, i) => `[DB Manager] step ${i} [${i}/300]`).join('\n')
+  expect(() => parseJsonFromOutput(output, { stats })).toThrow(NO_JSON)
+  expect(stats.visited).toBeGreaterThan(0)
+  expect(stats.visited).toBeLessThanOrEqual(output.length)
+  expect(stats.parses).toBe(0)
+})
+
+test('repeated unclosed openers do not rescan the suffix', () => {
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
+  const output = Array.from({ length: 2000 }, (_, i) => `[warn ${i} {unclosed`).join('\n')
+  expect(() => parseJsonFromOutput(output, { stats })).toThrow(NO_JSON)
+  expect(stats.visited).toBeGreaterThan(0)
+  expect(stats.visited).toBeLessThanOrEqual(output.length)
+  expect(stats.parses).toBe(0)
+})
+
+test('overlapping malformed multiline blocks stay within the parse budget', () => {
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
+  const output = [...Array.from({ length: 1000 }, () => '{"a":'), 'oops', ...Array.from({ length: 1000 }, () => '}')].join('\n')
+  expect(() => parseJsonFromOutput(output, { stats })).toThrow(NO_JSON)
+  expect(stats.parses).toBeGreaterThan(0)
+  expect(stats.parsedChars).toBeGreaterThan(0)
+  expect(stats.parsedChars).toBeLessThanOrEqual(4 * output.length)
+})
+
+test('the thrown error text is unchanged', () => {
+  expect(() => parseJsonFromOutput('[log] nothing')).toThrow('No valid JSON output from python. Output was: [log] nothing')
+})
+
+test('parity: a later single-line log label does not displace an earlier JSON result', () => {
+  expect(parseJsonFromOutput('{\n "ok": true\n}\n[3] done')).toEqual({ ok: true })
+})
+
+test('parity: a pretty-printed object with a nested array returns the whole object', () => {
+  expect(parseJsonFromOutput(JSON.stringify({ items: [1], ok: true }, null, 2))).toEqual({ items: [1], ok: true })
+})
+
+test('a pretty-printed block before trailing log lines is found', () => {
+  // The nested array is not alone on its line: a line ending '[1, 2]' would be
+  // taken by the unchanged fast path before the fallback runs.
+  expect(parseJsonFromOutput('[log] a\n{\n  "n": [1, 2],\n  "ok": true\n}\n[log] done')).toEqual({ ok: true, n: [1, 2] })
+  expect(parseJsonFromOutput('{\n "s": "a } ] {"\n}')).toEqual({ s: 'a } ] {' })
+  expect(parseJsonFromOutput('{\n "q": "say \\"hi\\" \\\\"\n}')).toEqual({ q: 'say "hi" \\' })
+  expect(parseJsonFromOutput('[log] it said "unterminated\n{\n "a": 1\n}')).toEqual({ a: 1 })
+  expect(parseJsonFromOutput('{\n "a": 1\n} done')).toEqual({ a: 1 })
+})
+
+test('parity: diagnostic text with a quote before the first opener does not hide the block', () => {
+  expect(parseJsonFromOutput('warning " opening {\n  "ok": true\n}')).toEqual({ ok: true })
 })

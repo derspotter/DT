@@ -53,6 +53,8 @@ describe('/api/extract-bibliography inline models', () => {
   let uploadsDir = ''
   let logPath = ''
   const events = []
+  const sent = []
+  let appModule
   const saved = {}
   const ENV_KEYS = [
     'RAG_FEEDER_PYTHON',
@@ -85,8 +87,8 @@ describe('/api/extract-bibliography inline models', () => {
     process.env.RAG_FEEDER_JWT_SECRET = 'extraction-models-secret'
     process.env.RAG_ADMIN_USER = 'extraction-models-admin'
     process.env.RAG_ADMIN_PASSWORD = 'extraction-models-password'
-    const { createApp } = await import('../src/app.js')
-    app = createApp({ broadcast() {}, broadcastEvent: (event) => events.push(event) })
+    appModule = await import('../src/app.js')
+    app = appModule.createApp({ broadcast: (message) => sent.push(message), broadcastEvent: (event) => events.push(event) })
     const login = await request(app).post('/api/auth/login').send({
       username: 'extraction-models-admin',
       password: 'extraction-models-password',
@@ -106,6 +108,7 @@ describe('/api/extract-bibliography inline models', () => {
   beforeEach(() => {
     fs.writeFileSync(logPath, '')
     events.length = 0
+    sent.length = 0
   })
 
   const putSettings = async (settings) => {
@@ -172,6 +175,26 @@ describe('/api/extract-bibliography inline models', () => {
     const pageRuns = scraperRuns().filter((entry) => entry.args.includes('page'))
     expect(pageRuns).toHaveLength(1)
     expect(inlineRuns().map((entry) => entry.inline)).toEqual(['adm-cheap-x', 'adm-pro-x'])
+  }, 15_000)
+
+  test('every extraction child line carries a fixed label and is classified to its corpus', async () => {
+    await putSettings({ inline_model: 'adm-pro-x', inline_cheap_model: 'adm-cheap-x' })
+    process.env.FAKE_GET_BIB_EXIT = '0'
+    await extract('escalation-labels')
+    const corpusId = events.find((e) => e.kind === 'extraction' && e.base_name === 'escalation-labels')?.corpus_id
+    expect(Number.isInteger(corpusId) && corpusId > 0).toBe(true)
+    expect(sent).toEqual(
+      expect.arrayContaining([
+        `[APIscraper (page mode)] [corpus=${corpusId}] fake APIscraper: no entries`,
+        `[APIscraper inline] [corpus=${corpusId}] [model=adm-cheap-x] fake APIscraper: no entries`,
+        `[APIscraper inline] [corpus=${corpusId}] [model=adm-pro-x] fake APIscraper: no entries`,
+      ])
+    )
+    const naming = sent.filter((m) => m.includes(`corpus=${corpusId}`))
+    expect(naming.length).toBeGreaterThan(3)
+    for (const m of naming) {
+      expect([m, appModule.logLineCorpusId?.(`[2026-01-01T00:00:00.000Z] ${m}`)]).toEqual([m, corpusId])
+    }
   }, 15_000)
 
   test('without Admin settings the env, then the defaults, apply', async () => {

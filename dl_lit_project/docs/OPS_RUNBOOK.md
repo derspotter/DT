@@ -181,14 +181,34 @@ docker logs -f rag_feeder_frontend
 Persistent log files:
 
 - `logs/backend-app.log`
-- `logs/backend-pipeline.log`
+- `logs/backend-pipeline-v2.log`
+
+The pipeline log writers escape embedded line breaks, so every record is one
+line. They write `backend-pipeline-v2.log` (rotated as `.1` … `.5`). The old
+`logs/backend-pipeline.log` generation is no longer written: the Logs view shows
+it only to the admin, in the unfiltered view, and it ages out by hand.
 
 Tail them directly:
 
 ```bash
 tail -f logs/backend-app.log
-tail -f logs/backend-pipeline.log
+tail -f logs/backend-pipeline-v2.log
 ```
+
+Deploy step for the switch to `backend-pipeline-v2.log` (run once, from the repo
+root): the enrich and download workers are long-running processes and keep
+writing the old file until they restart on the new code.
+
+```bash
+BEFORE=$(docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log)
+docker compose restart rag_backend rag_enrich_worker rag_download_worker
+docker compose exec -T rag_backend grep -c "enrich daemon starting\|download daemon starting" \
+  /usr/src/app/logs/backend-pipeline-v2.log
+docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
+```
+
+Expected: both startup records are in v2 (count at least 2, one per role), and
+the legacy size equals `$BEFORE`.
 
 Log API examples:
 
@@ -265,7 +285,7 @@ Typical causes:
 
 Actions:
 
-1. check `logs/backend-pipeline.log`
+1. check `logs/backend-pipeline-v2.log`
 2. check backend container logs
 3. confirm whether extraction actually finished and the issue is only UI status
 

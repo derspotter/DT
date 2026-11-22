@@ -172,7 +172,7 @@ Production serves the built `dist` from a small Caddy image instead of the Vite 
 - Uploaded PDFs inside container: `/usr/src/app/uploads`
 - Upload volume: `rag_feeder_uploads`
 - Logs volume: `rag_feeder_logs`
-- Pipeline log file: `/usr/src/app/logs/backend-pipeline.log`
+- Pipeline log file: `/usr/src/app/logs/backend-pipeline-v2.log` (one record per line; the old `backend-pipeline.log` is admin-only history and is no longer written)
 
 ## Important Implementation Note
 

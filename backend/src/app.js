@@ -2583,78 +2583,142 @@ function getLogSettings() {
     logDir,
     maxFiles,
     appLogFile: path.join(logDir, 'backend-app.log'),
-    pipelineLogFile: path.join(logDir, 'backend-pipeline.log'),
+    // The escaped-format generation (D11); the old file is admin-only history.
+    pipelineLogFile: path.join(logDir, 'backend-pipeline-v2.log'),
+    legacyPipelineLogFile: path.join(logDir, 'backend-pipeline.log'),
   };
 }
 
-function readTailLinesFromFile(filePath, maxLines) {
+// D11: a corpus tag is trusted only in the fixed position the extraction
+// route writes it, right after the timestamp and one of these fixed labels
+// (each also with the ` ERROR` suffix). Anything else -- `corpus=` in message
+// text, a [DAEMON] line, a line without the timestamp, a tag after another
+// group -- is unclassified and admin-only, in the tail and on the live socket.
+const SCOPED_LOG_LABEL_BASES = [
+  'extract-status',
+  '/api/extract-bibliography',
+  'get_bib_pages',
+  'APIscraper',
+  'APIscraper inline fallback',
+  'APIscraper (reused pages)',
+  'APIscraper (page mode)',
+  'APIscraper inline',
+];
+export const SCOPED_LOG_LABELS = new Set(
+  SCOPED_LOG_LABEL_BASES.flatMap((label) => [label, `${label} ERROR`])
+);
+const LOG_LINE_CORPUS_RE = /^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]/;
+
+export function logLineCorpusId(line) {
+  const match = LOG_LINE_CORPUS_RE.exec(String(line ?? ''));
+  if (!match || !SCOPED_LOG_LABELS.has(match[1])) return null;
+  return Number(match[2]);
+}
+
+// Both pipeline writers (logSocket.broadcast, the index.js fallback, the
+// worker's log()) write one record per line: a continuation can never be
+// classified apart from its header.
+export function escapeLogLineBreaks(text) {
+  return String(text ?? '').replace(/\r\n|\r|\n/g, '\\n');
+}
+
+const LOG_READ_CHUNK_BYTES = 64 * 1024;
+const LOG_ROTATED = Symbol('log rotated');
+
+function logWindowPaths(baseFilePath, { includeRotated, maxFiles }) {
+  const paths = [baseFilePath];
+  if (includeRotated) {
+    for (let i = 1; i <= maxFiles; i += 1) paths.push(`${baseFilePath}.${i}`);
+  }
+  return paths;
+}
+
+// Reads one file backwards from its pinned size and hands each complete line,
+// newest first, to `onLine`; `onLine` returns true to stop. Returns
+// LOG_ROTATED when the file is not the one pinned (a rotation ran), true when
+// `onLine` stopped the walk, false when the file was read to its start.
+async function readLogFileBackwards(filePath, pin, onLine) {
+  let handle;
   try {
-    if (!filePath || !fs.existsSync(filePath) || maxLines <= 0) return [];
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw) return [];
-    const lines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trimEnd())
-      .filter(Boolean);
-    return lines.slice(-maxLines);
+    handle = await fs.promises.open(filePath, 'r');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return pin === null ? false : LOG_ROTATED;
+    console.warn(`[logs/tail] Failed reading ${filePath}: ${error?.message || error}`);
+    return false;
+  }
+  try {
+    const stat = await handle.stat();
+    if (pin === null || stat.dev !== pin.dev || stat.ino !== pin.ino) return LOG_ROTATED;
+    let position = Math.min(pin.size, stat.size);
+    let carry = Buffer.alloc(0);
+    const chunk = Buffer.alloc(LOG_READ_CHUNK_BYTES);
+    while (position > 0) {
+      const len = Math.min(LOG_READ_CHUNK_BYTES, position);
+      position -= len;
+      const { bytesRead } = await handle.read(chunk, 0, len, position);
+      const buf = carry.length ? Buffer.concat([chunk.subarray(0, bytesRead), carry]) : Buffer.from(chunk.subarray(0, bytesRead));
+      let lineEnd = buf.length;
+      for (let i = buf.length - 1; i >= 0; i -= 1) {
+        if (buf[i] !== 0x0a) continue;
+        if (onLine(buf.toString('utf8', i + 1, lineEnd))) return true;
+        lineEnd = i;
+      }
+      carry = buf.subarray(0, lineEnd);
+    }
+    if (carry.length && onLine(carry.toString('utf8'))) return true;
+    return false;
   } catch (error) {
     console.warn(`[logs/tail] Failed reading ${filePath}: ${error?.message || error}`);
-    return [];
+    return false;
+  } finally {
+    await handle.close().catch(() => {});
   }
 }
 
-function readAllLogLines(baseFilePath, { includeRotated = true, maxFiles = 5 } = {}) {
-  const lines = [];
-  if (includeRotated) {
-    // Load oldest rotated files first for chronological order.
-    for (let i = maxFiles; i >= 1; i -= 1) {
-      const backupFile = `${baseFilePath}.${i}`;
-      lines.push(...readTailLinesFromFile(backupFile, Number.MAX_SAFE_INTEGER));
+async function readLogWindowAttempt(paths, { safeLimit, safeCursor, accept }) {
+  const pins = await Promise.all(
+    paths.map((p) => fs.promises.stat(p).then(({ dev, ino, size }) => ({ dev, ino, size }), () => null))
+  );
+  const collected = [];
+  let seen = 0;
+  let hasMore = false;
+  const onLine = (raw) => {
+    const line = raw.trimEnd();
+    if (!line || !accept(line)) return false;
+    if (seen === safeCursor + safeLimit) {
+      hasMore = true;
+      return true;
     }
-  }
-  lines.push(...readTailLinesFromFile(baseFilePath, Number.MAX_SAFE_INTEGER));
-  return lines;
-}
-
-function extractLogCorpusTag(line) {
-  const match = String(line || '').match(/\bcorpus=([a-zA-Z0-9_-]+)/);
-  return match ? match[1] : '';
-}
-
-function readLogWindow(
-  baseFilePath,
-  {
-    limit = 200,
-    cursor = 0,
-    includeRotated = true,
-    maxFiles = 5,
-    corpusId = null,
-  } = {}
-) {
-  let allLines = readAllLogLines(baseFilePath, { includeRotated, maxFiles });
-  const requestedCorpusTag = String(corpusId ?? '').trim();
-  if (requestedCorpusTag) {
-    allLines = allLines.filter((line) => {
-      const tag = extractLogCorpusTag(line);
-      if (!tag) {
-        return false;
-      }
-      return tag === requestedCorpusTag;
-    });
-  }
-  const totalLines = allLines.length;
-  const safeLimit = Math.max(1, Number(limit) || 200);
-  const safeCursor = Math.max(0, Math.min(Number(cursor) || 0, totalLines));
-  const end = Math.max(0, totalLines - safeCursor);
-  const start = Math.max(0, end - safeLimit);
-  const entries = allLines.slice(start, end);
-  return {
-    entries,
-    totalLines,
-    hasMore: start > 0,
-    nextCursor: safeCursor + entries.length,
-    cursor: safeCursor,
+    if (seen >= safeCursor) collected.push(line);
+    seen += 1;
+    return false;
   };
+  for (let i = 0; i < paths.length; i += 1) {
+    const result = await readLogFileBackwards(paths[i], pins[i], onLine);
+    if (result === LOG_ROTATED) return LOG_ROTATED;
+    if (result) break;
+  }
+  collected.reverse();
+  return { entries: collected, hasMore, nextCursor: safeCursor + collected.length, cursor: safeCursor };
+}
+
+// D10: the newest files first (base, base.1 … base.<maxFiles>, then the same
+// for `olderBase`), each read backwards in chunks, stopping once the window and
+// one more accepted line are seen. The window is pinned against rotation; a
+// rotation during the read restarts it once, a second one throws LOG_ROTATED.
+export async function readLogWindow(
+  baseFilePath,
+  { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5, accept = () => true, olderBase = null } = {}
+) {
+  const paths = logWindowPaths(baseFilePath, { includeRotated, maxFiles });
+  if (olderBase) paths.push(...logWindowPaths(olderBase, { includeRotated, maxFiles }));
+  const safeLimit = Math.max(1, Math.trunc(Number(limit)) || 200);
+  const safeCursor = Math.max(0, Math.trunc(Number(cursor)) || 0);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await readLogWindowAttempt(paths, { safeLimit, safeCursor, accept });
+    if (result !== LOG_ROTATED) return result;
+  }
+  throw Object.assign(new Error('Log rotated during the read'), { code: 'LOG_ROTATED' });
 }
 
 async function getPdfPageCount(pdfPath) {
@@ -4438,7 +4502,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
             inlineModelOverride = null,
             extractModelOverride = null,
             label = 'APIscraper',
+            model = null,
           }) => {
+            // The label is one of SCOPED_LOG_LABELS (a fixed string); a model
+            // goes after the corpus tag, so logLineCorpusId still classifies.
+            const modelTag = model ? ` [model=${model}]` : '';
             const dbPath = DB_PATH;
             const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
             if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
@@ -4449,7 +4517,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
             if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
 
             console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
-            send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}${model ? ` (${model})` : ''}...`);
             const { done } = spawnPython(API_SCRAPER_SCRIPT, scrapeApiArgs, {
               label,
               env: {
@@ -4459,11 +4527,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
               },
               onStdoutLine: (line) => {
                 console.log(`[${label} stdout]: ${line}`);
-                send(`[${label}] [corpus=${corpusTag}] ${line}`);
+                send(`[${label}] [corpus=${corpusTag}]${modelTag} ${line}`);
               },
               onStderrLine: (line) => {
                 console.error(`[${label} stderr]: ${line}`);
-                send(`[${label} ERROR] [corpus=${corpusTag}] ${line}`);
+                send(`[${label} ERROR] [corpus=${corpusTag}]${modelTag} ${line}`);
               },
             });
             try {
@@ -4673,6 +4741,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                     uploadedFileName: chunkPages > 0 ? null : sharedUploadedFileName,
                     inlineModelOverride: inlineModel,
                     label: inlineLabel,
+                    model: inlineModel,
                   });
                   return countIngestEntries() - beforeCount;
                 };
@@ -4686,7 +4755,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                 if (produced <= 0) {
                   const cheapInline = inlineModels.cheap;
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Page mode produced 0 references; retrying with cheap inline (${cheapInline}).`);
-                  produced = await runInlineMode(`APIscraper inline (${cheapInline})`, cheapInline);
+                  produced = await runInlineMode('APIscraper inline', cheapInline);
                   producedMode = 'inline';
                 }
 
@@ -4694,7 +4763,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                 if (produced <= 0) {
                   const proInline = inlineModels.pro;
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Still 0 references; final fallback to inline (${proInline}).`);
-                  produced = await runInlineMode(`APIscraper inline (${proInline})`, proInline);
+                  produced = await runInlineMode('APIscraper inline', proInline);
                   producedMode = 'inline';
                 }
 
@@ -6062,19 +6131,21 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     }
   });
 
-  app.get('/api/logs/tail', requireAuthMiddleware, (req, res) => {
+  const userCorpusIdsStmt = authDb.prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ?');
+  const userCorpusIds = (userId) => new Set(userCorpusIdsStmt.all(userId).map((row) => Number(row.corpus_id)));
+  const sameIdSet = (a, b) => a.size === b.size && [...a].every((id) => b.has(id));
+
+  app.get('/api/logs/tail', requireAuthMiddleware, async (req, res) => {
     try {
       const type = String(req.query?.type || 'pipeline').trim().toLowerCase();
       const corpusIdRaw = req.query?.corpus_id ?? req.query?.corpusId;
-      const parsedCorpusId =
-        corpusIdRaw === undefined || corpusIdRaw === null || String(corpusIdRaw).trim() === ''
-          ? null
-          : coerceInt(corpusIdRaw, null);
+      const hasCorpusId = corpusIdRaw !== undefined && corpusIdRaw !== null && String(corpusIdRaw).trim() !== '';
+      const parsedCorpusId = hasCorpusId ? coerceInt(corpusIdRaw, null) : null;
       const lines = Math.min(2000, Math.max(1, coerceInt(req.query?.lines, 200) || 200));
       const cursor = Math.max(0, coerceInt(req.query?.cursor, 0) || 0);
       const includeRotatedRaw = String(req.query?.include_rotated ?? req.query?.includeRotated ?? '1').trim().toLowerCase();
       const includeRotated = !['0', 'false', 'no'].includes(includeRotatedRaw);
-      const { logDir, maxFiles, appLogFile, pipelineLogFile } = getLogSettings();
+      const { logDir, maxFiles, appLogFile, pipelineLogFile, legacyPipelineLogFile } = getLogSettings();
 
       let sourceFile = null;
       if (type === 'pipeline') {
@@ -6085,20 +6156,46 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         return res.status(400).json({ error: "Invalid log type. Use 'pipeline' or 'app'." });
       }
 
-      // App logs span every corpus: admin only. Pipeline logs are filtered to
-      // one corpus the caller belongs to (?corpus_id, else the current corpus).
+      // D11, in this order: app logs span every corpus and are admin only. A
+      // given corpus_id is validated and membership-checked, then filtered on
+      // that corpus's trusted tag. Only the exact scope=readable without a
+      // corpus_id is the merged view: every line for the admin and in stub
+      // mode (the only reads that continue into the old generation), the lines
+      // tagged with one of a member's corpora otherwise. Anything else falls
+      // back to the current corpus and reads the new generation only.
+      const stub = isStubMode();
+      const scope = String(req.query?.scope ?? '');
+      let branch = 'all';
       let logCorpusId = Number.isFinite(parsedCorpusId) ? parsedCorpusId : null;
-      if (!isStubMode()) {
-        if (type === 'app') {
-          if (!isAdminUser(req.user, authConfig)) {
-            return res.status(403).json({ error: 'Admin access required' });
-          }
-        } else {
-          if (corpusIdRaw !== undefined && corpusIdRaw !== null && String(corpusIdRaw).trim() !== '' && logCorpusId === null) {
+      let accept = () => true;
+      let olderBase = null;
+      let readable = null;
+      let wasAdmin = false;
+      if (type === 'app') {
+        branch = 'app';
+        if (!stub && !isAdminUser(req.user, authConfig)) {
+          return res.status(403).json({ error: 'Admin access required' });
+        }
+      } else if (hasCorpusId || scope !== 'readable') {
+        branch = 'corpus';
+        if (!stub) {
+          if (hasCorpusId && logCorpusId === null) {
             return res.status(400).json({ error: 'Invalid corpus_id' });
           }
           logCorpusId = logCorpusId ?? req.corpusId ?? null;
           if (!resolveRequestCorpusRole(req, res, () => logCorpusId)) return undefined;
+        }
+        // Stub mode without a (valid) corpus_id reads every line, as before.
+        const wanted = logCorpusId;
+        if (wanted !== null) accept = (line) => logLineCorpusId(line) === wanted;
+      } else {
+        branch = 'merged';
+        wasAdmin = !stub && isAdminUser(req.user, authConfig);
+        if (stub || wasAdmin) {
+          olderBase = legacyPipelineLogFile;
+        } else {
+          readable = userCorpusIds(req.user.id);
+          accept = (line) => readable.has(logLineCorpusId(line));
         }
       }
 
@@ -6111,20 +6208,43 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           cursor,
           next_cursor: cursor,
           has_more: false,
-          total_lines: 0,
           include_rotated: includeRotated,
           source_file: sourceFile,
           source_exists: false,
         });
       }
 
-      const window = readLogWindow(sourceFile, {
-        limit: lines,
-        cursor,
-        includeRotated,
-        maxFiles,
-        corpusId: type === 'pipeline' ? logCorpusId : null,
-      });
+      let window;
+      try {
+        window = await readLogWindow(sourceFile, { limit: lines, cursor, includeRotated, maxFiles, accept, olderBase });
+      } catch (error) {
+        if (error?.code === 'LOG_ROTATED') {
+          return res.status(503).json({ error: 'Log rotated during the read; retry' });
+        }
+        throw error;
+      }
+
+      // The read awaited: re-evaluate the branch the window was built with
+      // against the user as it is now (D11).
+      if (!stub) {
+        const fresh = getUserById(authDb, req.user.id);
+        let still = false;
+        if (fresh) {
+          if (branch === 'app') {
+            still = isAdminUser(fresh, authConfig);
+          } else if (branch === 'merged') {
+            still = wasAdmin
+              ? isAdminUser(fresh, authConfig)
+              : !isAdminUser(fresh, authConfig) && sameIdSet(readable, userCorpusIds(fresh.id));
+          } else {
+            still = Boolean(resolveCorpusRole(authDb, fresh, logCorpusId, authConfig));
+          }
+        }
+        if (!still) {
+          return res.status(409).json({ error: 'Log access changed during the read' });
+        }
+      }
+
       return res.json({
         type,
         entries: window.entries,
@@ -6133,7 +6253,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         cursor: window.cursor,
         next_cursor: window.nextCursor,
         has_more: window.hasMore,
-        total_lines: window.totalLines,
         include_rotated: includeRotated,
         source_file: sourceFile,
         source_exists: fs.existsSync(sourceFile),

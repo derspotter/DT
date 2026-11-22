@@ -658,13 +658,17 @@ export async function fetchLogsTail({
   includeRotated = true,
   cursor = 0,
   corpusId = null,
+  scope = 'corpus',
 } = {}) {
   const params = new URLSearchParams()
   params.set('type', String(type || 'pipeline'))
   params.set('lines', String(lines || 200))
   params.set('cursor', String(cursor || 0))
   params.set('include_rotated', includeRotated ? '1' : '0')
-  if (type === 'pipeline' && corpusId !== undefined && corpusId !== null) {
+  // `readable`: every pipeline line the live view may show (filter off).
+  if (type === 'pipeline' && scope === 'readable') {
+    params.set('scope', 'readable')
+  } else if (type === 'pipeline' && corpusId !== undefined && corpusId !== null) {
     params.set('corpus_id', String(corpusId))
   }
   return requestJson(`/api/logs/tail?${params.toString()}`, { errorMessage: 'Failed to fetch log tail' })

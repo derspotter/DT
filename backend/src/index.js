@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import util from 'node:util';
-import { createApp } from './app.js';
+import { createApp, escapeLogLineBreaks } from './app.js';
 import { attachLogSocket } from './logSocket.js';
 
 const port = process.env.PORT || 4000;
@@ -10,7 +10,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '..', '..');
 const logDir = process.env.RAG_FEEDER_LOG_DIR || path.join(repoRoot, 'logs');
 const appLogFile = path.join(logDir, 'backend-app.log');
-const pipelineLogFile = path.join(logDir, 'backend-pipeline.log');
+// The escaped-format generation (D11); backend-pipeline.log is admin-only history.
+const pipelineLogFile = path.join(logDir, 'backend-pipeline-v2.log');
 const maxLogBytes = Number(process.env.RAG_FEEDER_LOG_MAX_BYTES || 10 * 1024 * 1024);
 const maxLogBackups = Number(process.env.RAG_FEEDER_LOG_MAX_FILES || 5);
 
@@ -91,7 +92,7 @@ function broadcast(message) {
     logSocket.broadcast(message);
     return;
   }
-  appendLogLine(pipelineLogFile, `[${new Date().toISOString()}] ${message}`);
+  appendLogLine(pipelineLogFile, `[${new Date().toISOString()}] ${escapeLogLineBreaks(message)}`);
 }
 
 function broadcastEvent(payload) {

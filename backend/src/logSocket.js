@@ -1,16 +1,6 @@
 import { WebSocketServer } from 'ws';
 import jwt from 'jsonwebtoken';
-import { getUserById, isAdminUser } from './app.js';
-
-// Same tag the log tail filter reads (extractLogCorpusTag in app.js and the
-// frontend's isLogLineForCurrentCorpus). Only numeric ids name a corpus;
-// `corpus=none` or any other value is admin-only.
-const CORPUS_TAG_RE = /\bcorpus=([a-zA-Z0-9_-]+)/;
-
-function lineCorpusId(line) {
-  const match = String(line || '').match(CORPUS_TAG_RE);
-  return match && /^\d+$/.test(match[1]) ? Number(match[1]) : null;
-}
+import { escapeLogLineBreaks, getUserById, isAdminUser, logLineCorpusId } from './app.js';
 
 function eventCorpusId(payload) {
   const id = payload?.corpus_id;
@@ -113,9 +103,10 @@ export function attachLogSocket(
   return {
     clients,
     broadcast(message) {
-      const formatted = `[${new Date().toISOString()}] ${message}`;
+      // One record per line; classified once, by its header, as the tail does.
+      const formatted = `[${new Date().toISOString()}] ${escapeLogLineBreaks(message)}`;
       appendLogLine(formatted);
-      deliver(formatted, lineCorpusId(message));
+      deliver(formatted, logLineCorpusId(formatted));
     },
     broadcastEvent(payload) {
       if (!payload || typeof payload !== 'object') return;
