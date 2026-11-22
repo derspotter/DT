@@ -294,3 +294,65 @@ def test_backfill_pass2_keeps_scope_and_limit(tmp_path, monkeypatch, backfill):
     filters.clear()
     _run(monkeypatch, backfill, db_path, "--scope", "all")
     assert len(filters) == 1 and "10.1000/three" in filters[0].split(":", 1)[1].split("|")
+
+
+# --- export_bundle output names (BE-53) --------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["json", "bibtex", "bundle_zip"])
+def test_two_exports_in_the_same_second_get_their_own_files(tmp_path, monkeypatch, capsys, export_bundle, fmt):
+    import datetime as real_datetime
+    import zipfile
+
+    db_path = _make_db(tmp_path)
+    conn = _connect(db_path)
+    first = _insert(conn, title="Corpus one work", doi="10.1000/ONE")
+    second = _insert(conn, title="Corpus two work", doi="10.1000/TWO")
+    conn.execute("INSERT INTO corpus_works (corpus_id, work_id) VALUES (1, ?), (2, ?)", (first, second))
+    conn.commit()
+    conn.close()
+
+    class FrozenDatetime(real_datetime.datetime):
+        @classmethod
+        def utcnow(cls):
+            return cls(2026, 11, 22, 12, 0, 0)
+
+    monkeypatch.setattr(export_bundle, "datetime", FrozenDatetime)
+    out_dir = tmp_path / "exports"
+    capsys.readouterr()  # drop DatabaseManager setup output
+    payloads = []
+    for corpus_id in (1, 2):
+        monkeypatch.setattr(sys, "argv", [
+            "export_bundle", "--db-path", str(db_path), "--output-dir", str(out_dir),
+            "--format", fmt, "--corpus-id", str(corpus_id),
+        ])
+        export_bundle.main()
+        payloads.append(json.loads(capsys.readouterr().out))
+
+    paths = [Path(p["output_path"]) for p in payloads]
+    assert paths[0] != paths[1]
+    ext = {"json": ".json", "bibtex": ".bib", "bundle_zip": ".zip"}[fmt]
+    for payload, path in zip(payloads, paths):
+        assert payload["filename"] == f"export_20261122_120000{ext}"  # the download name stays as before
+        assert path.name.startswith("export_20261122_120000_") and path.suffix == ext
+
+    def text(path):
+        if fmt == "bundle_zip":
+            with zipfile.ZipFile(path) as zf:
+                return zf.read("metadata.json").decode("utf-8")
+        return path.read_text(encoding="utf-8")
+
+    assert "Corpus one work" in text(paths[0]) and "Corpus two work" not in text(paths[0])
+    assert "Corpus two work" in text(paths[1]) and "Corpus one work" not in text(paths[1])
+
+
+def test_export_writers_never_overwrite_an_existing_file(tmp_path, export_bundle):
+    existing = tmp_path / "taken.json"
+    existing.write_text("other corpus", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        export_bundle.write_json_export([], existing)
+    with pytest.raises(FileExistsError):
+        export_bundle.write_bibtex_export([], existing)
+    with pytest.raises(FileExistsError):
+        export_bundle.write_bundle_zip([], existing)
+    assert existing.read_text(encoding="utf-8") == "other corpus"
