@@ -6,6 +6,7 @@ import secrets
 import sqlite3
 import sys
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -211,9 +212,22 @@ def render_json_payload(items):
     }
 
 
+@contextmanager
+def _created(out_path: Path, opener):
+    """Open a new export file with ``opener`` (exclusive: an existing file is another export
+    and raises before anything is created). A write that fails removes the partial file."""
+    handle = opener()
+    try:
+        with handle:
+            yield handle
+    except BaseException:
+        out_path.unlink(missing_ok=True)
+        raise
+
+
 def write_json_export(items, out_path: Path):
     text = json.dumps(render_json_payload(items), ensure_ascii=False, indent=2)  # render before creating the file
-    with out_path.open("x", encoding="utf-8") as fh:  # never overwrite another export
+    with _created(out_path, lambda: out_path.open("x", encoding="utf-8")) as fh:  # never overwrite another export
         fh.write(text)
     return {"exported_count": len(items)}
 
@@ -225,7 +239,7 @@ def render_bibtex_text(items):
 
 def write_bibtex_export(items, out_path: Path):
     text = render_bibtex_text(items)  # render before creating the file
-    with out_path.open("x", encoding="utf-8") as fh:  # never overwrite another export
+    with _created(out_path, lambda: out_path.open("x", encoding="utf-8")) as fh:  # never overwrite another export
         fh.write(text)
     return {"exported_count": len([item for item in items if item.get("title")])}
 
@@ -247,7 +261,7 @@ def collect_pdf_files(items):
 
 def write_pdf_zip(items, out_path: Path):
     files, missing = collect_pdf_files(items)
-    with zipfile.ZipFile(out_path, "x", compression=zipfile.ZIP_DEFLATED) as zf:
+    with _created(out_path, lambda: zipfile.ZipFile(out_path, "x", compression=zipfile.ZIP_DEFLATED)) as zf:
         for item, pdf_path in files:
             zf.write(pdf_path, arcname=pdf_path.name)
     return {"exported_count": len(files), "missing_files": missing}
@@ -257,7 +271,7 @@ def write_bundle_zip(items, out_path: Path):
     files, missing = collect_pdf_files(items)
     json_payload = json.dumps(render_json_payload(items), ensure_ascii=False, indent=2)
     bibtex_text = render_bibtex_text(items)
-    with zipfile.ZipFile(out_path, "x", compression=zipfile.ZIP_DEFLATED) as zf:
+    with _created(out_path, lambda: zipfile.ZipFile(out_path, "x", compression=zipfile.ZIP_DEFLATED)) as zf:
         zf.writestr("metadata.json", json_payload)
         zf.writestr("references.bib", bibtex_text)
         for item, pdf_path in files:

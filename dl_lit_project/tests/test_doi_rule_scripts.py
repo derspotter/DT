@@ -372,3 +372,65 @@ def test_export_render_failure_leaves_no_file(tmp_path, monkeypatch, export_bund
     with pytest.raises(RuntimeError):
         export_bundle.write_bibtex_export([{"id": 1, "title": "T"}], bib_path)
     assert not bib_path.exists()
+
+
+# --- a failed export write removes its own partial file (F5) ------------------
+
+
+def test_a_failed_export_write_removes_its_partial_file(tmp_path, export_bundle):
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF")
+    items = [{"title": "T", "file_path": str(pdf)}]
+    gone = tmp_path / "gone.pdf"
+    gone.write_bytes(b"%PDF")
+    vanishing = items + [{"title": "U", "file_path": str(gone)}]
+
+    for writer in (export_bundle.write_pdf_zip, export_bundle.write_bundle_zip):
+        out = tmp_path / f"{writer.__name__}.zip"
+        real_collect = export_bundle.collect_pdf_files
+
+        def collect(its):
+            got = real_collect(its)
+            gone.unlink()  # vanishes between collecting and writing
+            return got
+
+        export_bundle.collect_pdf_files = collect
+        try:
+            with pytest.raises(OSError):
+                writer(vanishing, out)
+        finally:
+            export_bundle.collect_pdf_files = real_collect
+        assert not out.exists()
+        gone.write_bytes(b"%PDF")
+
+    out = tmp_path / "x.json"
+    with pytest.raises(TypeError):
+        export_bundle.write_json_export([{"title": object()}], out)  # rendering fails before the file
+    assert not out.exists()
+
+    # An existing file under the name is someone else's export: never removed.
+    taken = tmp_path / "taken.zip"
+    taken.write_bytes(b"other")
+    with pytest.raises(FileExistsError):
+        export_bundle.write_pdf_zip(items, taken)
+    assert taken.read_bytes() == b"other"
+
+
+def test_a_failed_text_export_write_removes_its_partial_file(tmp_path, export_bundle):
+    class _FullDisk(type(tmp_path)):
+        def open(self, *args, **kwargs):
+            fh = super().open(*args, **kwargs)
+            real_write = fh.write
+
+            def write(text):
+                real_write(text[:3])
+                raise OSError(28, "No space left on device")
+
+            fh.write = write
+            return fh
+
+    for writer in (export_bundle.write_json_export, export_bundle.write_bibtex_export):
+        out = _FullDisk(tmp_path / f"{writer.__name__}.out")
+        with pytest.raises(OSError):
+            writer([{"title": "T"}], out)
+        assert not out.exists()
