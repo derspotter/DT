@@ -337,9 +337,11 @@ class PipelineDaemon:
         """Work-row lease of this worker's claims: outlasts both watchdog deadlines (D2).
 
         Past the deadline the watchdog exits the worker and recovery takes over, so a claim
-        never expires under a batch that is still legitimately running.
+        never expires under a batch that is still legitimately running. The watchdog checks
+        the deadline on a heartbeat tick, so the lease also covers one heartbeat interval.
         """
-        return max(900, int(max(self.job_timeout_seconds, self._direct_batch_timeout_seconds())) + 60)
+        deadline = max(self.job_timeout_seconds, self._direct_batch_timeout_seconds())
+        return max(900, int(deadline) + int(self.heartbeat_interval_seconds) + 60)
 
     def _log_throttled(self, key, message: str, interval: float = 60.0) -> None:
         now = time.time()

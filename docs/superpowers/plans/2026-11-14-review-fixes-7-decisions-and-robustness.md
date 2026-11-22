@@ -79,7 +79,7 @@ No other file is touched by two tasks. One behavioural coupling crosses tasks: T
     - the select title `Only admins can change the Kantropos assignment`
     - the save guard `Only admins can change the Kantropos assignment.`
 - These values are fixed by the spec:
-  - D2: CLI claim `limit=1`, lease 900 s, claimant `cli:<host>:<pid>:<6 hex>`; daemon lease `max(900, int(max(job_timeout, direct_batch_timeout)) + 60)` (1860 s by default); part suffix `.part-<8 hex>` per attempt (`secrets.token_hex(4)`), in the final file's directory. Published names, in order: `<final>`, `<stem>-<work id>.pdf`, `<stem>-<work id>-<8 hex>.pdf` (`os.link`, never `os.replace`).
+  - D2: CLI claim `limit=1`, lease 900 s, claimant `cli:<host>:<pid>:<6 hex>`; daemon lease `max(900, int(max(job_timeout, direct_batch_timeout)) + heartbeat_interval + 60)` (1863 s by default; final-review fix); part suffix `.part-<8 hex>` per attempt (`secrets.token_hex(4)`), in the final file's directory. Published names, in order: `<final>`, `<stem>-<work id>.pdf`, `<stem>-<work id>-<8 hex>.pdf` (`os.link`, never `os.replace`).
   - D3: limit `RAG_FEEDER_HUNG_ITEM_MAX_ATTEMPTS`, default 3, minimum 1; `HUNG_ITEM_MIN_RUN_FRACTION = 0.5`; one shared busy budget of `WATCHDOG_BUSY_TIMEOUT_MS` (1000 ms) for both reporting writes.
   - D5: `maxFailures = 10`, `windowMs = 900000`, `maxKeys = 10000`; map key `sha256(name)` hex.
   - D6: `days = 30`, `intervalMs = 86400000`, `PRUNE_BUSY_TIMEOUT_MS = 250`.

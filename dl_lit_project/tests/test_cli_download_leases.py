@@ -327,8 +327,15 @@ def test_daemon_leases_outlast_its_watchdog(tmp_path, monkeypatch):
 
     monkeypatch.delenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", raising=False)
     monkeypatch.delenv("RAG_FEEDER_DIRECT_BATCH_TIMEOUT", raising=False)
+    monkeypatch.delenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", raising=False)
     daemon = _daemon(monkeypatch, tmp_path, "all")
-    assert daemon._claim_lease_seconds() == 1860
+    assert daemon._claim_lease_seconds() == 1800 + 3 + 60  # deadline + heartbeat tick + margin
+
+    # The watchdog checks the deadline on a heartbeat tick, so the lease covers one tick more.
+    monkeypatch.setenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS", "500")
+    slow = _daemon(monkeypatch, tmp_path, "all")
+    assert slow._claim_lease_seconds() == 1800 + 500 + 60
+    monkeypatch.delenv("RAG_FEEDER_DAEMON_HEARTBEAT_SECONDS")
 
     monkeypatch.setenv("RAG_FEEDER_PIPELINE_JOB_TIMEOUT", "60")
     monkeypatch.setenv("RAG_FEEDER_DIRECT_BATCH_TIMEOUT", "60")

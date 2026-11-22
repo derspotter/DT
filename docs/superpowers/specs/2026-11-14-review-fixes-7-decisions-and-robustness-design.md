@@ -289,8 +289,9 @@ not non-issues.
   one download, so a long run never holds leases on rows it has not reached yet. A single download
   that outlasts its lease loses the row to the next claimant, and its result is discarded (below).
 - **Daemon lease matches its watchdog.** New `PipelineDaemon._claim_lease_seconds() -> int`:
-  `max(900, int(max(self.job_timeout_seconds, self._direct_batch_timeout_seconds())) + 60)`.
-  Both `do_enrich` (`:1050`) and `do_download` (`:1290`) claim with it. Claims happen after the
+  `max(900, int(max(self.job_timeout_seconds, self._direct_batch_timeout_seconds())) + int(self.heartbeat_interval_seconds) + 60)`
+  (final-review fix: the watchdog checks its deadline on a heartbeat tick, so the lease covers one
+  interval more). Both `do_enrich` (`:1050`) and `do_download` (`:1290`) claim with it. Claims happen after the
   heartbeat thread (and so the deadline clock) starts (`:1394`, `:1525`), so a daemon lease
   outlasts its watchdog's deadline; past the deadline, the watchdog exits the worker and recovery
   takes over. This is the smaller change than renewing leases from the heartbeat.
@@ -812,7 +813,7 @@ phase's Acceptance.
 - **D2 (PY-16):** the CLI claims one row at a time as `cli:<host>:<pid>:<nonce>`, releases it on
   exit, dedupes only into downloaded works; start-up recovery keeps its live lease, and periodic
   recovery treats it like a daemon worker. The daemon's lease grows to its watchdog timeout plus
-  60 s (1860 s by default). A result written after its claim was lost is discarded, with a log
+  its heartbeat interval plus 60 s (1863 s by default, floor 900 s). A result written after its claim was lost is discarded, with a log
   line; a download is written to `<final>.part-<token>` and moved into place only while the claim
   is held, so a late attempt never replaces the winner's PDF. A deliberate enrich deferral hands
   its unstarted rows straight back to the queue.
