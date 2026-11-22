@@ -575,6 +575,15 @@ controller call.**
 > scans), checked before each candidate, after which it throws the unchanged error. Within the
 > budget every result equals the old parser's (`} done` still does not parse); the bracket scan
 > described below was dropped because its heuristics lost results the old parser recovered.
+>
+> **Compatibility cost (final review):** the budget is not only reached by very large malformed
+> output. Every trailing line that contains `[` or `{` (for example `[DB Manager] …`) starts
+> candidates that run to every later line, so a valid multiline (pretty-printed) result
+> followed by many bracketed diagnostic lines can exhaust the budget before the search reaches
+> the result: about 15 trailing 80-character tagged lines after a small `indent=2` object, or
+> 100 short ones after a 1.2 KB one, already throw where the old parser recovered the result.
+> No backend-invoked child prints multiline JSON to stdout today (they print one-line results,
+> which the fast path takes), so this is a fallback-only risk, accepted by the owner.
 
 - The fast path is unchanged.
 - The fallback joins the trimmed lines with `\n` once into `text`, then makes one structural

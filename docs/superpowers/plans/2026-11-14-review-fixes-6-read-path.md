@@ -403,7 +403,7 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
   docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
   ```
   Expected: both startup records are in v2 (count at least 2, one per role), and the legacy size equals `$BEFORE`.
-- Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses`.
+- Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses` (superseded by controller ruling, see spec D12).
 - Modify: `frontend/src/lib/api.js:655-671` (`fetchLogsTail` gains `scope`) and `frontend/src/App.svelte:4268-4274`, `:4319-4325` (pass `scope`).
 - Test:
   - new `backend/tests/logs-tail-reader.test.js`;
@@ -646,6 +646,7 @@ test('the log type switch loads the app log without scope or corpus_id, then the
     - After `await readLogWindow(...)`, the route reloads the user with `getUserById(authDb, req.user.id)` and re-evaluates the branch it took: `type=app` → `isAdminUser(fresh)`; the merged branch → for an admin `isAdminUser(fresh)` only, for a member not admin and the same `user_corpora` set; an explicit or current corpus → the fresh user may still read it. A missing user or any difference answers 409. Stub mode skips it.
     - `logSocket.js`'s `lineCorpusId` becomes `logLineCorpusId`; its `CORPUS_TAG_RE` is deleted.
     - The frontend passes `scope: logsFilterCurrentCorpus ? 'corpus' : 'readable'` from both loaders.
+  - (Superseded by controller ruling, see spec D12: the original fallback stays, with a work budget; no `bracketCloses`.)
   - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag (set only while the stack is non-empty, reset at `\n`), and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. `bracketCloses` also records whether each opener was outer (empty stack). Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`, provided that the close ends its line or the block is outer. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
 - [ ] **Step 4: Run the Task 3 backend files, then `npm test`; then `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_hygiene.py tests/test_worker_enrich_no_expansion.py -q` (both changed log test files); then `logs-stream.spec.ts` (it holds the type-switch case; `app.spec.ts` is never run); then `npx vite build`.** Expected: all pass. Also check that `grep -n "readFileSync" backend/src/app.js` lists no log reader.
 - [ ] **Step 5: Commit** — `logs/python: the log tail reads backwards in chunks and stops at its window, "Current corpus only" off loads every line the live view may show, corpus tags trusted only in a recognized writer's fixed position, line breaks escaped at both pipeline writers, the JSON fallback follows brackets in one scan within a parse budget (BE-10, FE-59, BE-42)`
@@ -760,6 +761,8 @@ test('a removal answered after a corpus switch leaves the new corpus alone', asy
   // same scope: a quiet poll begun before the unlink answers after the superseding reload and is discarded
 })
 test('a removal updates the committed counts even when the follow-up refresh fails', async ({ page }) => {
+  // Superseded by controller ruling, see spec D13 (removal rule): the counts stay at the last committed answer,
+  // e.g. "Loaded 119/150." with the refresh-failed notice, not "Loaded 119/149."
   // stage 'downloaded', 120 of 150 loaded ("Loaded 120/150."); remove one row (the DELETE answers 200), the follow-up
   // /api/corpus answers 500: the row is gone, the header reads "Loaded 119/149.", "Show more" is still offered;
   // bulk-remove two more rows with the same failing follow-up: "Loaded 117/147."
