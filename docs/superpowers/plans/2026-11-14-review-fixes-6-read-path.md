@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Close the Phase 2 rows of the review-fixes-5 inventory plus BE-51, the graph-node lookup. The seed-list poll (`/api/seed/sources`), the Kantropos browse and the graph clicks stop doing work that grows with corpus size, and the named read paths (the log tail, the `metadata.bib` count, the snapshot gzip) stop reading multi-MB files or gzipping synchronously. Other handlers, such as Scraper Apply's `metadata.bib` read, are out of scope. The spec rules out nine rows; BE-34 is fixed only for the per-candidate call, and FE-17 only for the Graph and Scraper tabs.
+**Goal:** Close the Phase 2 rows of the review-fixes-5 inventory plus BE-51, the graph-node lookup. The seed-list poll (`/api/seed/sources`) and the graph clicks stop doing work that grows with corpus size, the Kantropos browse reads full rows and probes files only for what it needs (it still visits every matching membership for exact totals), and the named read paths (the log tail, the `metadata.bib` count, the snapshot gzip) stop reading multi-MB files or gzipping synchronously. Other handlers, such as Scraper Apply's `metadata.bib` read, are out of scope. The spec rules out nine rows; BE-34 is fixed only for the per-candidate call, and FE-17 only for the Graph and Scraper tabs.
 
 **Architecture:** Five tasks by surface, in this order:
 1. the seed read path (`backend/src/seed.js` and the seed routes);
@@ -126,10 +126,13 @@ test('findSeedCandidateDownload decides as the full resolver does for a reader o
   // (paperB's key, the malformed and non-canonical keys expect null)
 })
 test('findSeedCandidateDownload serves only readable works and prefers the current corpus', () => {
-  // canReadWork = (id) => corpus 1 member ids only:
-  //   the candidate whose only match is in corpus 2 -> null;
-  //   the candidate with two distinct readable matches, W20 (corpus 3, readable) first in match order and
-  //   W21 (corpus 1) second -> W21 (current corpus preferred); with corpusId 3 -> W20;
+  // fixture addition: corpus 3 with pdf seed `paperC`; one entry `pref` with the same title in paperA (corpus 1) and
+  // paperC (corpus 3); it matches two distinct downloaded works, W20 (member of corpus 3 only) first in match order
+  // and W21 (member of corpus 1 only) second.
+  // reader of corpora 1 and 3: canReadWork = (id) => membership of id in corpus 1 or 3:
+  //   paperA's `pref` with corpusId 1 -> W21 (current corpus preferred over the earlier W20);
+  //   paperC's `pref` with corpusId 3 -> W20;
+  // reader of corpus 1 only: the paperA candidate whose only match is in corpus 2 -> null; paperA's `pref` -> W21;
   // canReadWork = () => false -> null for every candidate
 })
 test('a search candidate needs a canonical run id', () => { /* sourceKey '07' with the dismissed result of run 7 -> null; '7' -> null for the dismissed, the id for the downloaded one */ })
@@ -288,7 +291,9 @@ test('metadata.bib is read once until it changes, asynchronously, and only for t
 // graph-read-path.test.js
 test('findGraphNodeWork never scans works on the schema ensureAuthSchema builds', () => {
   // temp-file DB: appModule.ensureAuthSchema(db) creates works (Node DDL) and the two partial indexes;
-  // the index DDL read from sqlite_master equals the strings in dl_lit_project/dl_lit/db_manager.py:24-25;
+  // the index DDL read from sqlite_master equals the strings in dl_lit_project/dl_lit/db_manager.py:24-25 after
+  // normalization: SQLite stores the statement without `IF NOT EXISTS`, so compare
+  // ddl.replace(' IF NOT EXISTS', '') with the stored sql, whitespace collapsed on both sides;
   // record SQL via a prepare wrapper; call with '12', 'work:12', 'W77', '10.1/ABC'
   // every recorded statement: EXPLAIN QUERY PLAN has no /SCAN w\b/ and no /SCAN works/
 })
@@ -355,7 +360,7 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 - [ ] **Step 3: Implement D5 to D9.**
   - D5: `allowed = JSON.stringify([...allowedNodeIds])`, bound twice.
   - D6:
-    - Pass 1 and pass 2 follow the spec, inside one `db.transaction(() => …)()`; no `await` and no file probe inside it. Pass 1 also fills `downloadedCountByCorpus` (distinct work ids per corpus, before the imported exclusion), which replaces the grouped query. Pass 2's ids are the first `pendingLimit` distinct work ids of pass 1.
+    - Pass 1 and pass 2 follow the spec, inside one `db.transaction(() => …)()`; no `await` and no file probe inside it. Per pass-1 row, `downloadedCountByCorpus` is incremented before the imported exclusion and `pendingCountByCorpus` after it (each `(corpus_id, work_id)` pair is unique, so no sets); this replaces the grouped query. Pass 1 keeps one `{ id, file_path }` per pending work, in order. Pass 2's ids are the first `pendingLimit` of them, and pass 2 builds the page items' `source_corpora` as today.
     - After the transaction, `upstreamFileIsPresent` runs once per distinct pending work id; the result gives `missingFileCount` and the page items' `file_missing`.
     - `bucket.downloaded_count = downloadedCountByCorpus.get(id) || 0`.
     - The summary uses these formulas:
@@ -381,24 +386,28 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 
 **Files:**
 - Modify: `backend/src/app.js`:
-  - `:2448-2516`: replace `readTailLinesFromFile`, `readAllLogLines` and the synchronous `readLogWindow` with the exported async `readLogWindow`;
+  - `:2448-2516`: replace `readTailLinesFromFile`, `readAllLogLines` and the synchronous `readLogWindow` with the exported async `readLogWindow` (with the `olderBase` option);
+  - `:2440-2446` (`getLogSettings`: `pipelineLogFile` becomes `backend-pipeline-v2.log`, new `legacyPipelineLogFile = backend-pipeline.log`);
+  - `:4300-4345`, `:4369`, `:4527-4566` (the child runner's line writer emits `[${label}] [corpus=${corpusTag}]${model ? ` [model=${model}]` : ''} ${line}`; the two zero-yield retries pass the fixed label `APIscraper inline` and their model);
   - `:2477-2480`: replace `extractLogCorpusTag` with the exported `logLineCorpusId`, `SCOPED_LOG_LABELS` and `escapeLogLineBreaks`;
   - `:5950-6030`: the async route, `scope=readable`, the access recheck, no `total_lines`.
 - Modify: `backend/src/logSocket.js:8-13`, `:113-118` (classify the formatted line with `logLineCorpusId` from `app.js`, which it already imports from; `broadcast` escapes line breaks before it writes and sends).
-- Modify: `backend/src/index.js:85-91` (the pre-socket `broadcast` fallback writes `escapeLogLineBreaks(message)`).
-- Modify: `backend/scripts/daemon/worker.py:143-152` (`log()` escapes `\r` and `\n` in `msg`).
+- Modify: `backend/src/index.js:13` (`backend-pipeline-v2.log`) and `:85-91` (the pre-socket `broadcast` fallback writes `escapeLogLineBreaks(message)`).
+- Modify: `backend/scripts/daemon/worker.py:125` (`backend-pipeline-v2.log`) and `:143-152` (`log()` escapes `\r` and `\n` in `msg`).
+- Modify: `README.md:175` and `dl_lit_project/docs/OPS_RUNBOOK.md:184`, `:190`, `:268` (the new file name; the old one is admin-only history).
 - Modify: `backend/src/pythonProcess.js:35-46` (the fallback, the optional `stats` hook) and a new internal `bracketCloses`.
 - Modify: `frontend/src/lib/api.js:655-671` (`fetchLogsTail` gains `scope`) and `frontend/src/App.svelte:4268-4274`, `:4319-4325` (pass `scope`).
 - Test:
   - new `backend/tests/logs-tail-reader.test.js`;
-  - extended `backend/tests/access-routes.test.js`, `backend/tests/python-process.test.js`, `backend/tests/log-socket.test.js`, `dl_lit_project/tests/test_hygiene.py` (next to the worker `log` tests at `:267-326`) and `frontend/tests/logs-stream.spec.ts`;
+  - extended `backend/tests/access-routes.test.js` (a new `describe` with its own log dir and users for the merged, legacy and revocation cases), `backend/tests/python-process.test.js`, `backend/tests/log-socket.test.js`, `backend/tests/extraction-models-route.test.js`, `dl_lit_project/tests/test_hygiene.py` (next to the worker `log` tests at `:267-326`) and `frontend/tests/logs-stream.spec.ts`;
+  - the file name `backend-pipeline.log` becomes `backend-pipeline-v2.log` in `backend/tests/logs.test.js:17`, `:26`, `backend/tests/access-routes.test.js:118`, `dl_lit_project/tests/test_hygiene.py:269-321` and `dl_lit_project/tests/test_worker_enrich_no_expansion.py:42`;
   - `backend/tests/logs.test.js:19-30` and `backend/tests/access-routes.test.js:119`: the fixture lines move to the format the writers produce, a timestamp, a recognized label and the tag in fixed position: `[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=123] line-a` instead of `[older] corpus=123 line-a`. The expectations follow;
   - `backend/tests/log-socket.test.js:102-210`: the broadcasts use a recognized label (`[get_bib_pages][corpus=1] a`) instead of `[x]`; the expectations follow.
 
 **Interfaces:**
 - Produces:
-  - `export async function readLogWindow(baseFilePath, { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5, accept = () => true } = {}) -> Promise<{ entries: string[], hasMore: boolean, nextCursor: number, cursor: number }>`; it throws an error with `code === 'LOG_ROTATED'` after its one retry;
-  - `export const SCOPED_LOG_LABELS: Set<string>`: the extraction route's labels (spec D11), each with and without ` ERROR`;
+  - `export async function readLogWindow(baseFilePath, { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5, accept = () => true, olderBase = null } = {}) -> Promise<{ entries: string[], hasMore: boolean, nextCursor: number, cursor: number }>`; it throws an error with `code === 'LOG_ROTATED'` after its one retry;
+  - `export const SCOPED_LOG_LABELS: Set<string>`: the extraction route's fixed labels (spec D11: `extract-status`, `/api/extract-bibliography`, `get_bib_pages`, `APIscraper`, `APIscraper inline fallback`, `APIscraper (reused pages)`, `APIscraper (page mode)`, `APIscraper inline`), each with and without ` ERROR`;
   - `export function logLineCorpusId(line: string) -> number | null`: the corpus of a line that starts `[<ISO timestamp>] [<label in SCOPED_LOG_LABELS>]`, then an optional space, then `[corpus=<digits>]`; `null` for every other line;
   - `export function escapeLogLineBreaks(text: string) -> string`: `\r\n`, `\r` and `\n` become the two characters `\n`;
   - `parseJsonFromOutput(output, { stats } = {})`.
@@ -429,7 +438,7 @@ test('a default tail reads one chunk of the newest file when it holds enough lin
   // the newest file is 1 MiB, with more than 200 lines in its last 64 KiB
   const open = jest.spyOn(fs.promises, 'open'); const bytes = countReads()
   await appModule.readLogWindow(base, { limit: 200, cursor: 0 })
-  expect(open.mock.calls.map(([p]) => path.basename(p))).toEqual(['backend-pipeline.log'])
+  expect(open.mock.calls.map(([p]) => path.basename(p))).toEqual(['backend-pipeline-v2.log'])
   expect(bytes.total).toBeLessThanOrEqual(64 * 1024)
 })
 test('a rotation between two opens is read once, without duplicates or a skipped cursor', async () => {
@@ -458,35 +467,51 @@ test('logLineCorpusId trusts only a recognized writer in fixed position', () => 
   //   `[get_bib_pages][corpus=12] a` (no timestamp: a continuation line); `${ts} [get_bib_pages][base=b][corpus=12] a` (not in fixed position);
   //   `${ts} [get_bib_pages][corpus=none] c`
 })
-test('a legacy multiline daemon record leaks no continuation line', async () => {
-  // the pipeline file holds `${ts} [DAEMON] Job 9 failed: Traceback`, then the raw continuation lines
-  // `  File "x.py", line 1` and `[get_bib_pages][corpus=12] forged`; readLogWindow with
-  // accept = (l) => logLineCorpusId(l) === 12 returns []
+test('readLogWindow continues into olderBase only when asked', async () => {
+  // v2 base + .1 and legacy base + .1 with numbered lines: without olderBase only the v2 lines are read
+  // (the legacy files are never opened); with olderBase the legacy lines follow, oldest first, and the cursor runs on
 })
 
-// access-routes.test.js — viewer3 is a member of corpora A and B; corpus C exists, foreign to viewer3.
-// beforeAll appends, with ts = '[2026-01-01T00:00:00.000Z]': `${ts} [get_bib_pages][corpus=${ids.A}] line-a`,
+// access-routes.test.js — the existing describe keeps its users, corpora and two-line pipeline log (moved to the v2 name
+// and the writer format); its tests keep their expectations, including viewer3's 403 on the foreign corpus B.
+// A new describe('logs: readable scope and log generations') has its own temp DB and log dir: member9 belongs to
+// corpora A and B, corpus C is foreign to it; admin as usual.
+// The v2 file holds, with ts = '[2026-01-01T00:00:00.000Z]': `${ts} [get_bib_pages][corpus=${ids.A}] line-a`,
 // `${ts} [get_bib_pages][corpus=${ids.B}] line-b`, `${ts} [get_bib_pages][corpus=${ids.C}] line-c`, `${ts} [p] untagged-line`,
-// `${ts} [get_bib_pages][corpus=none] line-n` and `${ts} [DAEMON] Job 9 failed: corpus=${ids.A} boom` to the pipeline log
+// `${ts} [get_bib_pages][corpus=none] line-n` and `${ts} [DAEMON] Job 9 failed: corpus=${ids.A} boom` (six lines, nothing else).
+// The legacy `backend-pipeline.log` holds `${ts} [DAEMON] Job 8 failed: Traceback` followed by the raw continuation
+// `${ts} [get_bib_pages][corpus=${ids.A}] forged-legacy` (a complete recognized prefix).
 test('logs: scope=readable shows what the live socket would', async () => {
-  const viewer = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('viewer3'))
+  const viewer = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('member9'))
   expect(viewer.body.entries).toEqual([`${ts} [get_bib_pages][corpus=${ids.A}] line-a`, `${ts} [get_bib_pages][corpus=${ids.B}] line-b`])   // two readable corpora; C, untagged, none and the daemon text excluded
   const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
-  expect(admin.body.entries).toHaveLength(6)
+  expect(admin.body.entries).toHaveLength(8)   // the six v2 lines plus the two legacy lines, legacy first
   expect(admin.body).not.toHaveProperty('total_lines')
 })
-test('logs: an explicit foreign corpus_id with scope=readable is still 403', async () => { /* ?type=pipeline&scope=readable&corpus_id=${ids.C} as viewer3 -> 403 */ })
+test('logs: a legacy continuation with a complete recognized prefix never reaches a member', async () => {
+  // as member9: scope=readable, corpus_id=${ids.A} and the current-corpus fallback (last_corpus_id A), each with
+  // include_rotated=1 and a cursor past the v2 lines -> no entry contains 'forged-legacy'
+})
+test('logs: an explicit foreign corpus_id with scope=readable is still 403', async () => { /* ?type=pipeline&scope=readable&corpus_id=${ids.C} as member9 -> 403 */ })
 test('logs: a scope value other than readable keeps the current-corpus fallback', async () => { /* scope=READABLE, scope=all -> same entries as no scope */ })
-test('logs: type=app stays admin-only with scope=readable', async () => { /* viewer3 ?type=app&scope=readable -> 403 */ })
+test('logs: type=app stays admin-only with scope=readable', async () => { /* member9 ?type=app&scope=readable -> 403 */ })
 test('logs: a membership revoked during the read discards the window', async () => {
-  // inside a one-shot fs.promises.open spy, DELETE the user_corpora row for (viewer3, B);
-  // GET ?type=pipeline&scope=readable as viewer3 -> 409 { error: 'Log access changed during the read' }, no entries in the body
+  // inside a one-shot fs.promises.open spy, DELETE the user_corpora row for (member9, B);
+  // GET ?type=pipeline&scope=readable as member9 -> 409 { error: 'Log access changed during the read' }, no entries in the body
 })
 test('logs: an admin who loses admin access during an app-log read gets no window', async () => {
   // inside a one-shot fs.promises.open spy, UPDATE users SET username = 'demoted' WHERE id = <admin id>
   // (isAdminUser compares the username, app.js:1917); GET ?type=app as admin -> 409, no entries in the body
 })
-test('logs: a user deleted during the read gets no window', async () => { /* DELETE the viewer3 user inside the open spy; current-corpus read -> 409 */ })
+test('logs: a user deleted during the read gets no window', async () => { /* a separate user member10 of A; DELETE it inside the open spy; current-corpus read -> 409 */ })
+
+// extraction-models-route.test.js — the existing zero-yield escalation case (page mode, then cheap inline, then pro inline)
+test('every extraction child line carries a fixed label and is classified to its corpus', async () => {
+  // capture the broadcast messages (createApp({ broadcast: (m) => sent.push(m), … })); run the zero-yield escalation:
+  // the fake scraper's stdout line arrives as `[APIscraper (page mode)] [corpus=<id>] fake APIscraper: no entries`,
+  // then twice as `[APIscraper inline] [corpus=<id>] [model=adm-cheap-x] …` and `… [model=adm-pro-x] …`;
+  // for every message m that names the corpus: logLineCorpusId(`[2026-01-01T00:00:00.000Z] ${m}`) === <id>
+})
 // the two existing pipeline tests keep their expectations (no scope -> current corpus; corpus_id checked)
 
 // log-socket.test.js
@@ -502,13 +527,15 @@ test('fallback parsing is one scan plus one parse per bracketed line', () => {
   const stats = { visited: 0, parses: 0, parsedChars: 0 }
   const output = Array.from({ length: 300 }, (_, i) => `[DB Manager] step ${i} [${i}/300]`).join('\n')
   expect(() => parseJsonFromOutput(output, { stats })).toThrow('No valid JSON output from python.')
+  expect(stats.visited).toBeGreaterThan(0)                 // the hook ran (it does not exist on 0702e47)
   expect(stats.visited).toBeLessThanOrEqual(output.length)
-  expect(stats.parses).toBeLessThanOrEqual(300)
+  expect(stats.parses).toBe(0)                             // single-line blocks are no fallback candidates
 })
 test('repeated unclosed openers do not rescan the suffix', () => {
   const stats = { visited: 0, parses: 0, parsedChars: 0 }
   const output = Array.from({ length: 2000 }, (_, i) => `[warn ${i} {unclosed`).join('\n')   // no line closes its openers
   expect(() => parseJsonFromOutput(output, { stats })).toThrow('No valid JSON output from python.')
+  expect(stats.visited).toBeGreaterThan(0)
   expect(stats.visited).toBeLessThanOrEqual(output.length)
   expect(stats.parses).toBe(0)
 })
@@ -518,21 +545,28 @@ test('overlapping malformed multiline blocks stay within the parse budget', () =
   const stats = { visited: 0, parses: 0, parsedChars: 0 }
   const output = [...Array.from({ length: 1000 }, () => '{"a":'), 'oops', ...Array.from({ length: 1000 }, () => '}')].join('\n')
   expect(() => parseJsonFromOutput(output, { stats })).toThrow('No valid JSON output from python.')
+  expect(stats.parses).toBeGreaterThan(0)
+  expect(stats.parsedChars).toBeGreaterThan(0)
   expect(stats.parsedChars).toBeLessThanOrEqual(4 * output.length)
 })
 // test_hygiene.py (Python, beside test_log_writes_three_lines_with_one_open)
 // def test_log_escapes_line_breaks(worker, monkeypatch, tmp_path):
 //     worker.log("Job 9 failed: Traceback\n[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=12] forged\r\nend")
 //     the pipeline file holds exactly one line; it contains the two characters \n and no raw \r or \n
-test('a later single-line log label does not displace an earlier JSON result', () => {
-  // '{\n "ok": true\n}\n[3] done' -> { ok: true }  ([3] opens and closes on one line, so it is no fallback candidate)
+test('parity: a later single-line log label does not displace an earlier JSON result', () => {
+  // passes on 0702e47 and after: '{\n "ok": true\n}\n[3] done' -> { ok: true }
+})
+test('parity: a pretty-printed object with a nested array returns the whole object', () => {
+  // passes on 0702e47 and after, strict toEqual:
+  // JSON.stringify({ items: [1], ok: true }, null, 2) -> { items: [1], ok: true }
+  // (the inner '[ … ],' closes before a comma, is nested, and is no candidate)
 })
 test('a pretty-printed block before trailing log lines is found', () => {
   // '[log] a\n{\n  "ok": true,\n  "n": [1, 2]\n}\n[log] done' -> { ok: true, n: [1, 2] }
   // '{\n "s": "a } ] {"\n}' -> { s: 'a } ] {' }  (brackets inside strings)
   // '{\n "q": "say \\"hi\\" \\\\"\n}' -> escaped quotes and backslashes inside a string
   // '[log] it said "unterminated\n{\n "a": 1\n}' -> { a: 1 }  (a stray quote ends at the newline)
-  // '{\n "a": 1\n} done' -> { a: 1 }  (D12 controller call)
+  // '{\n "a": 1\n} done' -> { a: 1 }  (D12 controller call: an outer block may have trailing text)
 })
 ```
 
@@ -565,7 +599,11 @@ test('the log type switch loads the app log without scope or corpus_id, then the
   - no 409 on a revoked membership, a demoted admin or a deleted user, no 503 on repeated rotation;
   - the unknown label, the unfixed tag position and the timestamp-less continuation are classified;
   - a multiline broadcast is written as two lines, and the worker test sees a raw newline;
-  - the overlapping-block case exceeds the budget and `[3] done` wins over the earlier block;
+  - the stats counters stay 0 (no hook), and the overlapping-block case has no budget;
+  - the extraction labels carry the model in the label (`APIscraper inline (adm-cheap-x)`) and `[APIscraper (page mode)]` is not classified;
+  - the member's readable tail includes the legacy file's forged line;
+
+  The two `parity:` parser cases pass on `0702e47` and must keep passing.
   - the parser has no `stats` hook (`visited` stays 0 while `JSON.parse` runs about 45k times), and `} done` does not parse;
   - no `scope` param.
 
@@ -578,13 +616,14 @@ test('the log type switch loads the app log without scope or corpus_id, then the
     - `ENOENT` on open for a file pinned as absent makes it count as empty.
     - Collected lines are pushed in the order they are found (newest first), and the window is reversed once before it is returned, so `entries` comes out oldest-first.
   - D11:
+    - The route passes `olderBase: legacyPipelineLogFile` only for a pipeline read by an admin (or in stub mode); every member or scoped read reads the v2 generation only.
     - `logLineCorpusId` matches one anchored regex, `^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]`, and returns the number only when group 1 is in `SCOPED_LOG_LABELS`.
     - `logSocket.broadcast` formats `[${ts}] ${escapeLogLineBreaks(message)}`, appends it and delivers it with `logLineCorpusId(formatted)`; the `index.js` fallback escapes the same way. The worker's `log()` applies `msg.replace('\r\n', '\\n').replace('\r', '\\n').replace('\n', '\\n')` before formatting.
     - The route decides in the spec's order: `type=app` admin-only; a given `corpus_id` validated and membership-checked (403), then `accept = (l) => logLineCorpusId(l) === corpusId`; exact `scope === 'readable'` without `corpus_id` → admin or stub accepts every line, otherwise `accept = (l) => readable.has(logLineCorpusId(l))`; anything else → today's current-corpus fallback.
     - After `await readLogWindow(...)`, the route reloads the user with `getUserById(authDb, req.user.id)` and re-evaluates the branch it took: `type=app` → `isAdminUser(fresh)`; the merged branch → the same admin flag and the same `user_corpora` set; an explicit or current corpus → the fresh user may still read it. A missing user or any difference answers 409. Stub mode skips it.
     - `logSocket.js`'s `lineCorpusId` becomes `logLineCorpusId`; its `CORPUS_TAG_RE` is deleted.
     - The frontend passes `scope: logsFilterCurrentCorpus ? 'corpus' : 'readable'` from both loaders.
-  - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag reset at `\n`, and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
+  - D12: `bracketCloses(text) -> Map<number, number>` is one loop over `text` with a stack, an in-string flag reset at `\n`, and the escape handling; it adds its loop count to `stats.visited` when `stats` is given. `bracketCloses` also records whether each opener was outer (empty stack). Then, from the last line to the first, a line's first opener with a recorded close on a later line gives one `tryParse`, counted in `stats.parses`, provided that the close ends its line or the block is outer. Before each slice, `budget -= close + 1 - start`, with `budget = 4 * text.length` (`FALLBACK_PARSE_BUDGET_FACTOR = 4`); a negative budget stops the fallback, which then throws the unchanged error. The parsed length goes to `stats.parsedChars`.
 - [ ] **Step 4: Run the Task 3 backend files, then `npm test`; then `logs-stream.spec.ts` (it holds the type-switch case; `app.spec.ts` is never run); then `npx vite build`.** Expected: all pass. Also check that `grep -n "readFileSync" backend/src/app.js` lists no log reader.
 - [ ] **Step 5: Commit** — `logs/python: the log tail reads backwards in chunks and stops at its window, "Current corpus only" off loads every line the live view may show, corpus tags trusted only in a recognized writer's fixed position, line breaks escaped at both pipeline writers, the JSON fallback follows brackets in one scan within a parse budget (BE-10, FE-59, BE-42)`
 
@@ -605,13 +644,13 @@ test('the log type switch loads the app log without scope or corpus_id, then the
     - `:2099-2140`, `:2158-2205` (`corpusStageFilter: 'all'` in `initialWorkspaceState` and its restore);
     - `:2947` area (new `handleCorpusStageChange(value)`);
     - `:3784-3800` (signature and `applyCorpusCounts(total, stageTotals, stageTotal)`);
-    - `:3807-3953` (`loadCorpus` sends `stage`, also in the prefix reload; `corpusRowsStage`; the append guard; the prefix check on `stageTotal`);
+    - `:3807-3953` (`loadCorpus` sends `stage`, also in the prefix reload; `corpusRowsStage`; the append guard; the prefix check on `stageTotal`; the early `applyCorpusCounts` at `:3862` removed; prefix reload only for the committed stage);
     - `:1058-1063` (D14);
     - `:58`, `:69`, `:5567`, `:5794` (D15);
     - `:5488-5515` (Corpus props);
-  - `frontend/src/components/Corpus.svelte:101-112`, `:113-132`, `:197` (`Loaded N/M` from `corpusMatchTotal`), `:216-229`, `:237-245` (select-all, bulk remove), `:277-285` (row click), `:303`, `:332`, `:345` (checkbox, row remove, the expanded row's PDF button), `:368-379` ("Show more"): props instead of local filtering, and every row action inert while `corpusRowsStale`.
+  - `frontend/src/components/Corpus.svelte:101-112`, `:113-132`, `:197` (`Loaded N/M` from `corpusMatchTotal`), `:216-229`, `:237-245` (select-all, bulk remove), `:277-285` (row click), `:303`, `:332`, `:345`, `:357`, `:360` (checkbox, row remove, the expanded row's PDF button, DOI and OpenAlex links), `:368-379` ("Show more"): props instead of local filtering, and every row action inert while `corpusRowsStale`.
 - Test:
-  - extended `backend/tests/corpus-list.test.js`; its Python-oracle comparisons (`:80-84`, `:87`, `:319`, `:328`, `:357`, `:395` and any other `toEqual(viaScript…)`) compare with `{ ...expected, stage_total: expected.total }` through one helper, `withStageTotal(expected)`, and keep strict `toEqual`;
+  - extended `backend/tests/corpus-list.test.js`; its Python-oracle comparisons (`:80-84`, `:87`, the large seed-sort test's direct `toEqual(expected)` at `:262-266`, `:319`, `:328`, `:357`, `:395` and any other `toEqual(viaScript…)`) compare with `{ ...expected, stage_total: expected.total }` through one helper, `withStageTotal(expected)`, and keep strict `toEqual`;
   - extended `frontend/tests/corpus-load.spec.ts` (the `Params` type gains `stage`), `frontend/tests/dead-code.spec.ts` and `frontend/tests/boot-requests.spec.ts`.
 
 **Interfaces:**
@@ -678,6 +717,18 @@ test('a poll keeps the stage and q and drops a row that left it from a loaded se
   // the next quiet poll runs the prefix reload: every request carries stage=downloaded and q=paper (Review Focus 5),
   // the reload's consistency check passes on stage_total 149, 630 is gone and 149 rows remain; the header reads "Loaded 149/149."
 })
+test('two prefix responses whose stage_total disagree are rejected', async ({ page }) => {
+  // the 'downloaded' stage holds 1,100 rows; "Show more" until 1,080 rows are loaded, so the prefix reload needs two
+  // requests (CORPUS_POLL_PAGE_ROWS = 1000, App.svelte:406); then change the first page's signature;
+  // on both attempts the first prefix response says stage_total 1100 and the second 1099, with total unchanged:
+  // the rows stay as they were, "Refresh failed; showing earlier rows." shows, the header still reads "Loaded 1080/1100."
+})
+test('counts move only with their rows', async ({ page }) => {
+  // (a) committed stage 'downloaded' with 1,080 rows loaded; a quiet poll whose second prefix request answers 500:
+  //     rows and the header's "Loaded 1080/1100." stay unchanged;
+  // (b) a stage change to 'failed_download' that answers 500, then a quiet poll for that stage: it requests only the
+  //     first page (no prefix reload, offset 0 only) and, once it answers, commits rows and header count together
+})
 test('row actions wait for the rows of the selected stage', async ({ page }) => {
   // hold the stage=downloaded response behind a deferred gate; select 'downloaded':
   //   the per-row remove buttons, the selection checkboxes, select-all, the bulk remove and "Show more" are disabled;
@@ -733,6 +784,8 @@ test('a failed tab import shows the error text and leaves the app usable', async
     - `handleCorpusStageChange(value)` sets `corpusStageFilter` and runs `loadCorpus({ quiet: true, supersede: true })`.
     - `corpusPageSignature` adds `corpusStageFilter`.
     - `loadCorpus` captures `const requestStage = corpusStageFilter` and sends it on every page of the request, including the prefix reload. When a first-page load commits its rows, it sets `corpusRowsStage = requestStage`. An append returns early while `corpusRowsStage !== corpusStageFilter`.
+    - The early `applyCorpusCounts(total, stageTotals)` before the prefix reload goes; the counts are applied once, where `corpusItems` is replaced. The prefix reload runs only when `requestStage === corpusRowsStage`.
+    - While `corpusRowsStale`, the expanded row's DOI and OpenAlex anchors render without `href`.
     - The "Showing" text, `corpusHasMore`, the header's `Loaded N/M` and the prefix reload's `totals` set use `corpusMatchTotal` / `answer.stageTotal` (new state, set from `stageTotal`).
     - When a first-page load commits rows for a stage different from the previous `corpusRowsStage`, it sets `corpusLoadStatus` to the "Showing N of M" text even when `quiet`.
     - On a failed load the existing catch keeps the rows and sets `corpusRefreshFailed`; `corpusRowsStage` is unchanged, so the actions stay disabled until a load succeeds or the user selects `corpusRowsStage` again.

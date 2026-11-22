@@ -154,8 +154,10 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
 ## Goals
 
 - No poll and no click does work that grows with corpus size when the answer does not need it,
-  on these paths: the seed list endpoint (`/api/seed/sources`), the Kantropos browse, the graph
-  node and cluster clicks. The seed-poll guarantee covers `/api/seed/sources` only: the
+  on these paths: the seed list endpoint (`/api/seed/sources`), the graph node and cluster
+  clicks. The Kantropos browse reads full rows and probes files only for what it needs (the
+  page, and one probe per pending work); it still visits every matching downloaded membership
+  for exact totals. The seed-poll guarantee covers `/api/seed/sources` only: the
   candidates route, which the expanded seed polls while a search runs, keeps its cost (D3). The
   seed candidate file drops the corpus-local resolver and the full-seed listing; it still uses
   the cached global index and its fingerprint (D2, D3).
@@ -219,7 +221,8 @@ is slower. Treat the numbers as ratios; the absolute values are only indicative.
   the table holds 30 days of jobs, so the scan is bounded.
 - **A tail with "current corpus only" on still excludes untagged lines, which the admin's live
   view shows.** This admin-only difference predates FE-59 and stays.
-- No README change beyond the dead `/api/ingest/latest` line.
+- No README change beyond the dead `/api/ingest/latest` line and the pipeline log file name
+  (D11; `README.md:175`, `dl_lit_project/docs/OPS_RUNBOOK.md:184-268`).
 
 ## Decisions
 
@@ -334,11 +337,13 @@ drop out.
    runs inside it.
 2. **Pass 1** reads `w.id, w.file_path, cw.corpus_id`, with the same joins and `WHERE` as today,
    ordered `COALESCE(w.year, 0) DESC, w.id DESC`. From those rows it computes, in that order:
-   - each assigned corpus's `downloaded_count` (distinct works per corpus), before the
-     imported-set exclusion. This replaces the separate grouped query (`app.js:1732-1745`),
-     which read the same rows again;
-   - with the imported-set exclusion: the distinct work ids with their `file_path`, and each
-     work's corpus ids, for the per-corpus `pending_count`.
+   - per row, before the imported-set exclusion, `downloaded_count` of its corpus is
+     incremented. The join keys make each `(corpus_id, work_id)` pair unique, so no distinct set
+     is needed. This replaces the separate grouped query (`app.js:1732-1745`), which read the
+     same rows again;
+   - per row, after the exclusion, `pending_count` of its corpus is incremented, and the work's
+     id and `file_path` are kept once, in order, for the page ids and the file probes. Pass 2
+     builds the page items' corpus lists.
 3. **Pass 2** reads today's full `SELECT w.*, c.id AS corpus_id, …` with the extra term `AND
    w.id IN (SELECT value FROM json_each(?))`, bound with the first `pendingLimit` work ids of
    pass 1, in today's order (`…, LOWER(c.name), c.id`). It maps those rows exactly as today.
@@ -435,7 +440,8 @@ async readLogWindow(baseFilePath, { limit, cursor, includeRotated, maxFiles, acc
 
 It is exported, and it reads as follows:
 - It walks the files newest first: `base`, `base.1`, …, `base.<maxFiles>` (the rotated ones
-  only with `includeRotated`).
+  only with `includeRotated`). With the option `olderBase`, it continues with `olderBase`,
+  `olderBase.1`, …, `olderBase.<maxFiles>` after them (D11's old generation).
 - It reads each file backwards in `LOG_READ_CHUNK_BYTES = 64 * 1024` chunks through
   `fs.promises.open` and `handle.read`. It splits on the byte `0x0A`, carries a partial line's
   bytes across chunks, and decodes each complete line as UTF-8. `trimEnd` removes `\r`, as
@@ -481,21 +487,38 @@ It is exported, and it reads as follows:
 - A corpus tag is trusted only in a fixed position written by a recognized scoped writer. The
   new exported `logLineCorpusId(line) -> number | null` in `app.js` accepts exactly
   `^\[<ISO timestamp>\] \[<label>\] ?\[corpus=(<digits>)\]`, where `<label>` is one of the
-  labels the extraction route writes with a corpus tag (`app.js:4235-4576`):
-  `extract-status`, `/api/extract-bibliography`, `get_bib_pages`, `get_bib_pages ERROR`, and
-  `APIscraper`, `APIscraper inline fallback`, `APIscraper (reused pages)`, each also with the
-  ` ERROR` suffix. The labels live in one exported constant, `SCOPED_LOG_LABELS`, next to the
-  writers. Everything else is unclassified and admin-only: a `corpus=` in message text, a
+  fixed labels the extraction route writes with a corpus tag (`app.js:4235-4576`):
+  `extract-status`, `/api/extract-bibliography`, `get_bib_pages`, and `APIscraper`,
+  `APIscraper inline fallback`, `APIscraper (reused pages)`, `APIscraper (page mode)`,
+  `APIscraper inline`, each also with the ` ERROR` suffix. Labels are fixed strings: the two
+  zero-yield retries (`app.js:4558`, `:4566`) used `APIscraper inline (<model>)`; they now use
+  the label `APIscraper inline`, and their child lines carry the model after the tag,
+  `[APIscraper inline] [corpus=12] [model=<model>] <line>`. The frontend's progress parsing
+  matches `[APIscraper` and keeps working (`App.svelte:1106-1288`). The labels live in one
+  exported constant, `SCOPED_LOG_LABELS`, next to the writers. Everything else is unclassified and admin-only: a `corpus=` in message text, a
   `[DAEMON]` line, a line without the timestamp (such as a continuation of an old multiline
   record), and a tag after another group.
 - Both pipeline writers escape embedded line breaks, so one record is one line and a
   continuation can never be classified apart from its header:
   - Node: `logSocket.broadcast` (and the `index.js` fallback before the socket exists) writes
     `escapeLogLineBreaks(message)`, which turns `\r\n`, `\r` and `\n` into the two
-    characters `\n`. The live frame carries the same escaped text.
+    characters `\n`. The live frame carries the same escaped text, so multiline diagnostic
+    text (an interpolated error message, worker exception text) now shows as one line with a
+    literal `\n` in the Logs view, live and in the history.
   - The worker: `log()` (`worker.py:143-152`) escapes `\r` and `\n` in `msg` the same way
     before it formats the line, which covers the traceback text it writes
     (`worker.py:1482`).
+- **A new log generation.** Lines written before the escaping may hold verbatim multiline
+  worker text whose continuation lines can carry a complete recognized prefix, so the old file
+  cannot be trusted line by line. The escaped-format writers therefore write a new file,
+  `backend-pipeline-v2.log` (rotated as `.1` … `.5` by the same `index.js` code), in
+  `index.js:13`, `getLogSettings` (`app.js:2444`) and the worker (`worker.py:125`).
+  `getLogSettings` also names the old generation, `legacyPipelineLogFile =
+  backend-pipeline.log`. Member and scoped reads (a `corpus_id`, the current-corpus fallback, and
+  `scope=readable` for a non-admin) read only the new generation. An admin's pipeline read (or
+  stub mode) passes `olderBase: legacyPipelineLogFile`, so the old files stay readable for
+  admins only. There is no content-based legacy detection. Nothing writes the old files any
+  more; they age out by hand.
 - `logLineCorpusId` replaces `extractLogCorpusTag` in the tail route (both the `corpus_id`
   filter and the merged branch). `logSocket.js` classifies the formatted line (timestamp
   included) with the same function instead of its own regex, so the history and the live view
@@ -522,7 +545,12 @@ controller call.**
   once; an opener that never closes has no entry.
 - Only multiline blocks are candidates: a block whose open and close are on the same line is
   skipped, since the fast path already tried that line. A later single-line log label such as
-  `[3] done` therefore cannot displace an earlier pretty-printed result.
+  `[3] done` therefore cannot displace an earlier pretty-printed result (today's fallback
+  returns the earlier block too; the case is a parity test).
+- Text after the close on its line is allowed only for an outer block (one opened with an empty
+  stack). A nested block must close at the end of its line, as today's line-end segments do.
+  For a pretty-printed `{"items":[1],"ok":true}`, the inner `[ … ],` is therefore no candidate
+  and the whole object is returned, as today (a strict parity case).
 - From the last line to the first, at each line's first `[` or `{`, a recorded multiline close
   gives one `JSON.parse(text.slice(start, close + 1))`.
 - Nested malformed blocks overlap, so the sum of their lengths can still be quadratic. The
@@ -531,8 +559,8 @@ controller call.**
   exceed the budget ends the fallback, which then throws the unchanged error. Total work is one
   scan plus at most four times the text in parse input.
 - The first block that parses wins, as today.
-- A multiline block followed by text on its last line (`} done`) now parses; today it is
-  skipped.
+- An outer multiline block followed by text on its last line (`} done`) now parses; today it
+  is skipped.
 - The thrown error text is unchanged.
 - `parseJsonFromOutput(output, { stats } = {})` takes an optional test hook: when `stats` is
   given, the fallback adds the characters its scan visited to `stats.visited`, its parse
@@ -572,12 +600,16 @@ controller call.**
   for; it is set when a first-page load replaces the rows. `corpusRowsStale = corpusRowsStage
   !== corpusStageFilter`. While it is true:
   - the per-row remove, the selection checkboxes, select-all, the bulk remove, the row click
-    (selection and expansion), the expanded row's PDF button and "Show more" (and the scroll
-    trigger) are disabled or ignored;
+    (selection and expansion), the expanded row's PDF button, DOI and OpenAlex links, and "Show
+    more" (and the scroll trigger) are disabled or ignored; the links render without `href`;
   - an append request returns early, because its offset belongs to the old stage.
 - The counts shown are the committed ones: the header's `Loaded N/M` uses the committed
   `stage_total` (`corpusMatchTotal`) instead of `corpusTotal`, and when a quiet stage load
-  commits, it sets the "Showing N of M" status as a non-quiet load does.
+  commits, it sets the "Showing N of M" status as a non-quiet load does. Counts are applied
+  only together with the rows they describe: the early `applyCorpusCounts` before the prefix
+  reload (`App.svelte:3862`) goes, so a failed reload changes neither rows nor counts.
+- The prefix reload runs only when the request's stage is the committed stage
+  (`corpusRowsStage`); a load for another stage replaces the rows with its first page.
 - When the stage load fails, the old rows stay, the existing `corpusRefreshFailed` notice
   shows, and the actions stay disabled until a load for the selected stage succeeds or the user
   selects the committed stage again.
@@ -705,7 +737,9 @@ The tasks run serially in this order: every task edits `app.js`, and Tasks 2–5
   show: everything for admins, and the user's own corpora for members. A corpus tag counts only
   right after the timestamp and a recognized extraction label, in the tail and in the live
   socket; any other line is admin-only. Both pipeline writers escape line breaks inside a
-  record. Access that changes during the read answers 409.
+  record (shown as a literal `\n`) and write a new file, `backend-pipeline-v2.log`; the old
+  `backend-pipeline.log` generation is readable by admins only. Access that changes during the
+  read answers 409.
 - **D12 (BE-42):** a multiline JSON block followed by text on its closing line now parses. The
   fallback gives up, with the unchanged error, after parse input of four times the output.
 - **D13 (FE-14):** the stage filter is applied by the server. "Show more" and the scroll
