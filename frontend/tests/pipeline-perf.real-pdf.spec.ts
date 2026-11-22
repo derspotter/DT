@@ -212,30 +212,35 @@ test.describe('Real PDF pipeline performance', () => {
     const extractCompleteSeconds = (Date.now() - extractStart) / 1000
     const extractFirstResultSeconds = extractionSettled.ttfrMs / 1000
 
-    const entriesPayload = await authedJson(
-      request,
-      token,
-      `/api/seed/sources/pdf/${encodeURIComponent(runName)}/candidates?limit=1000`
-    )
-    const entries = Array.isArray(entriesPayload?.candidates) ? entriesPayload.candidates : []
-    const entryIds = entries
-      .map((item: any) => Number(item.id))
-      .filter((value: number) => Number.isFinite(value))
+    // The candidates endpoint ranks downloaded entries first, and enqueue skips those; only entries
+    // that can still be enriched (not downloaded, not already queued) are submitted. The seed is
+    // paged until ten such entries are found or it ends.
+    const ENRICHABLE_STATES = new Set(['staged_raw', 'pending', 'failed_enrichment'])
+    const CANDIDATE_PAGE = 1000
+    const entryIds: number[] = []
+    const enrichableIds: number[] = []
+    for (let offset = 0; enrichableIds.length < 10; offset += CANDIDATE_PAGE) {
+      const entriesPayload = await authedJson(
+        request,
+        token,
+        `/api/seed/sources/pdf/${encodeURIComponent(runName)}/candidates?limit=${CANDIDATE_PAGE}&offset=${offset}`
+      )
+      const entries = Array.isArray(entriesPayload?.candidates) ? entriesPayload.candidates : []
+      for (const item of entries) {
+        const id = Number(item.id)
+        if (!Number.isFinite(id)) continue
+        entryIds.push(id)
+        if (enrichableIds.length < 10 && ENRICHABLE_STATES.has(String(item.state || ''))) enrichableIds.push(id)
+      }
+      const total = Number(entriesPayload?.total)
+      if (entries.length < CANDIDATE_PAGE || (Number.isFinite(total) && offset + entries.length >= total)) break
+    }
     const extractedCount = Math.max(entryIds.length, extractionSettled.finalCount)
     expect(extractedCount).toBeGreaterThan(0)
-
-    // The candidates endpoint ranks downloaded entries first, and enqueue skips those; only entries
-    // that can still be enriched (not downloaded, not already queued) are submitted.
-    const ENRICHABLE_STATES = new Set(['staged_raw', 'pending', 'failed_enrichment'])
-    const enrichableIds = entries
-      .filter((item: any) => ENRICHABLE_STATES.has(String(item.state || '')))
-      .map((item: any) => Number(item.id))
-      .filter((value: number) => Number.isFinite(value))
-      .slice(0, 10)
     const requestedBatch = enrichableIds.length
     let enqueuePayload: any = {}
     if (requestedBatch === 0) {
-      console.log('[pipeline-perf] enrichment skipped: no candidate is eligible for enrichment (all downloaded or already queued)')
+      console.log('[pipeline-perf] enrichment skipped: no eligible candidate in this seed (all downloaded or already queued)')
     } else {
       enqueuePayload = await authedJson(request, token, '/api/ingest/enqueue', 'POST', {
         entryIds: enrichableIds,
