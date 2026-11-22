@@ -2636,7 +2636,7 @@ function logWindowPaths(baseFilePath, { includeRotated, maxFiles }) {
 // Reads one file backwards from its pinned size and hands each complete line,
 // newest first, to `onLine`; `onLine` returns true to stop. Returns
 // LOG_ROTATED when the file is not the one pinned (a rotation ran) or shrank
-// under the read, true when `onLine` stopped the walk, false when the file was
+// before or under the read, true when `onLine` stopped the walk, false when the file was
 // read to its start. Any other open or read error rejects: the request fails
 // rather than answering a partial window.
 async function readLogFileBackwards(filePath, pin, onLine) {
@@ -2650,9 +2650,19 @@ async function readLogFileBackwards(filePath, pin, onLine) {
   try {
     const stat = await handle.stat();
     if (pin === null || stat.dev !== pin.dev || stat.ino !== pin.ino) return LOG_ROTATED;
-    let position = Math.min(pin.size, stat.size);
-    let carry = Buffer.alloc(0);
+    // Same inode but smaller than pinned: truncated under the read.
+    if (stat.size < pin.size) return LOG_ROTATED;
+    let position = pin.size;
+    // The unfinished record's bytes, kept as separate copies in file order and
+    // joined once when the record's start is found, so a long record is
+    // copied O(record size) times, not once per chunk.
+    let pending = [];
     const chunk = Buffer.alloc(LOG_READ_CHUNK_BYTES);
+    const emit = (head) => {
+      const parts = pending.length ? [head, ...pending] : null;
+      pending = [];
+      return onLine(parts ? Buffer.concat(parts).toString('utf8') : head.toString('utf8'));
+    };
     while (position > 0) {
       const len = Math.min(LOG_READ_CHUNK_BYTES, position);
       position -= len;
@@ -2664,16 +2674,15 @@ async function readLogFileBackwards(filePath, pin, onLine) {
         if (bytesRead <= 0) return LOG_ROTATED;
         got += bytesRead;
       }
-      const buf = carry.length ? Buffer.concat([chunk.subarray(0, len), carry]) : Buffer.from(chunk.subarray(0, len));
-      let lineEnd = buf.length;
-      for (let i = buf.length - 1; i >= 0; i -= 1) {
-        if (buf[i] !== 0x0a) continue;
-        if (onLine(buf.toString('utf8', i + 1, lineEnd))) return true;
+      let lineEnd = len;
+      for (let i = len - 1; i >= 0; i -= 1) {
+        if (chunk[i] !== 0x0a) continue;
+        if (emit(chunk.subarray(i + 1, lineEnd))) return true;
         lineEnd = i;
       }
-      carry = buf.subarray(0, lineEnd);
+      if (lineEnd > 0) pending.unshift(Buffer.from(chunk.subarray(0, lineEnd)));
     }
-    if (carry.length && onLine(carry.toString('utf8'))) return true;
+    if (pending.length && emit(Buffer.alloc(0))) return true;
     return false;
   } finally {
     await handle.close().catch(() => {});
@@ -2682,7 +2691,16 @@ async function readLogFileBackwards(filePath, pin, onLine) {
 
 async function readLogWindowAttempt(paths, { safeLimit, safeCursor, accept }) {
   const pins = await Promise.all(
-    paths.map((p) => fs.promises.stat(p).then(({ dev, ino, size }) => ({ dev, ino, size }), () => null))
+    paths.map((p) =>
+      fs.promises.stat(p).then(
+        ({ dev, ino, size }) => ({ dev, ino, size }),
+        // Only a missing file is an empty slot; any other stat error fails the read.
+        (error) => {
+          if (error?.code === 'ENOENT') return null;
+          throw error;
+        }
+      )
+    )
   );
   const collected = [];
   let seen = 0;
@@ -6211,6 +6229,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         window = await readLogWindow(sourceFile, { limit: lines, cursor, includeRotated, maxFiles, accept, olderBase });
       } catch (error) {
         if (error?.code === 'LOG_ROTATED') {
+          console.warn('[logs/tail] window rotated twice', sourceFile);
           return res.status(503).json({ error: 'Log rotated during the read; retry' });
         }
         throw error;

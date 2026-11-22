@@ -300,6 +300,73 @@ describe('readLogWindow', () => {
     expect(sync.mock.calls.filter(([p]) => String(p).includes('backend-pipeline'))).toEqual([])
   })
 
+  test('one 10 MiB record with limit=1 is assembled once: Buffer.concat copies O(record size) bytes', async () => {
+    const dir = freshDir()
+    const base = path.join(dir, BASE_NAME)
+    const record = 'r'.repeat(10 * 1024 * 1024)
+    fs.writeFileSync(base, `first\n${record}\n`)
+    const realConcat = Buffer.concat
+    let copied = 0
+    jest.spyOn(Buffer, 'concat').mockImplementation((list, ...rest) => {
+      for (const b of list) copied += b.length
+      return realConcat.call(Buffer, list, ...rest)
+    })
+    const got = await appModule.readLogWindow(base, { limit: 1, cursor: 0 })
+    expect(got.entries).toHaveLength(1)
+    expect(got.entries[0].length).toBe(record.length)
+    expect(got.hasMore).toBe(true)
+    expect(copied).toBeLessThanOrEqual(2 * record.length)
+  })
+
+  test('a same-inode truncation between the pin and the open counts as a pin mismatch and retries', async () => {
+    const dir = freshDir()
+    const base = path.join(dir, BASE_NAME)
+    fs.writeFileSync(base, 'old a\nold b\nold c\nold d\n')
+    const ino = fs.statSync(base).ino
+    let truncated = false
+    const { open } = countReads((p) => {
+      if (p === base && !truncated) {
+        truncated = true
+        fs.writeFileSync(base, 'new a\n')
+      }
+    })
+    const got = await appModule.readLogWindow(base, { limit: 100, cursor: 0, includeRotated: false })
+    expect(fs.statSync(base).ino).toBe(ino)
+    expect(got.entries).toEqual(['new a'])
+    expect(open.mock.calls.filter(([p]) => String(p) === base)).toHaveLength(2)
+  })
+
+  test('a pin stat error other than ENOENT fails the read instead of counting as a rotation', async () => {
+    const dir = freshDir()
+    const base = path.join(dir, BASE_NAME)
+    fs.writeFileSync(`${base}.1`, 'old\n')
+    fs.writeFileSync(base, 'cur\n')
+    const realStat = fs.promises.stat.bind(fs.promises)
+    jest.spyOn(fs.promises, 'stat').mockImplementation(async (p, ...rest) => {
+      if (String(p) === `${base}.1`) throw Object.assign(new Error('EACCES: permission denied, stat'), { code: 'EACCES' })
+      return realStat(p, ...rest)
+    })
+    await expect(appModule.readLogWindow(base, { limit: 100, cursor: 0 })).rejects.toMatchObject({ code: 'EACCES' })
+  })
+
+  test('a double rotation is logged server-side before the 503', async () => {
+    const dir = freshDir()
+    const base = path.join(dir, BASE_NAME)
+    let counter = 0
+    fs.writeFileSync(`${base}.1`, 'old a\n')
+    fs.writeFileSync(base, 'cur a\n')
+    countReads((p) => {
+      if (p === base) rotate(base, [`new ${counter++}`])
+    })
+    process.env.RAG_FEEDER_STUB = '1'
+    process.env.RAG_FEEDER_LOG_DIR = dir
+    const app = appModule.createApp({ broadcast: () => {} })
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    const res = await request(app).get('/api/logs/tail?type=pipeline')
+    expect(res.status).toBe(503)
+    expect(warn.mock.calls.some((args) => String(args[0]).includes('[logs/tail] window rotated twice'))).toBe(true)
+  })
+
   test('readLogWindow continues into olderBase only when asked', async () => {
     const dir = freshDir()
     const base = path.join(dir, BASE_NAME)
