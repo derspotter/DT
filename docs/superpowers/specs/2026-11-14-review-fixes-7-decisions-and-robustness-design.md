@@ -252,14 +252,19 @@ not non-issues.
   (`normalize_doi`) on both sides. Pass 2 keeps its query: the `--scope` clause, the `--limit`
   clause and `topics_fetched IS NULL OR topics_fetched = 0`.
   - **The whole DOI is validated before the key is taken.** In the existing pass-2 loop, each
-    row's `doi` is lowercased and stripped of **only** whitespace and the recognised prefixes
+    row's `doi` is stripped of whitespace and must then be **ASCII** (`str.isascii()`), checked
+    before any case change: Unicode case mapping would otherwise merge distinct DB keys (the
+    Kelvin sign `K`, U+212A, lowercases to ASCII `k`), so an ASCII `k` answer could update the
+    `K` row. A non-ASCII value is skipped. The value is then lowercased and stripped of **only**
+    whitespace and the recognised prefixes
     (`identifiers._DOI_URL_PREFIX_RE`, a `doi.org` URL; `_DOI_SCHEME_PREFIX_RE`, `doi:`), then
     whitespace again. No punctuation is trimmed: `normalize_doi_lower` would turn `10.1000/ABC.`
     and `10.1000/ABC;` into `10.1000/abc`, while the DB key keeps the suffix. The row is sent only
     when that **remaining token as a whole** has the DOI shape (`_DOI_IN_TEXT_RE.fullmatch`):
     `10.`, 4 to 9 digits, `/`, then the pattern's character class, which has no `|`, `,` or `+`.
     Its key is then the token uppercased, which equals `normalize_doi` of it. Returned works go
-    through the same function, so a returned DOI that is not a whole DOI matches nothing.
+    through the same function (ASCII check included), so a returned DOI that is not a whole
+    ASCII DOI matches nothing.
   - Validating after `normalize_doi` would not do: the rule extracts the first DOI-shaped run, so
     `10.1000/ABC+123` and `10.1000/ABC|xyz` would both become the valid-looking `10.1000/ABC` and
     fetch (and write) another work's topics. Embedded citation text is skipped too.
@@ -342,22 +347,38 @@ not non-issues.
   has no production caller and is not changed.) The smallest fix, no per-attempt directories:
   - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)` puts the
     suffix into `ref["part_suffix"]`; the two builders write `<final><part_suffix>` in the same
-    directory and report that path as `downloaded_file`. CLI and daemon pass
+    directory and report that path as `downloaded_file`. They keep their chosen name; only a stem
+    without room for the planned suffixes is shortened: `download_path.fit_stem(name, reserve=32)`
+    truncates the stem, on a character boundary, until the UTF-8-encoded name plus 32 bytes (the
+    14-byte part suffix, or `-<work id>-<8 hex>`) fits the 255-byte component limit. Names that
+    fit today are unchanged; `PDFDownloader` can derive an unbounded name from a DOI. CLI and daemon pass
     `part_suffix=f".part-{secrets.token_hex(4)}"` per attempt. Other callers pass nothing and keep
     today's behaviour.
   - `move_entry_to_downloaded` and `mark_raw_work_downloaded` gain `part_path: str | None = None`.
     After the ownership check passes, inside the same transaction, they publish it with
     `download_path.publish_download(part_path, work_id) -> str`, which never overwrites:
-    `os.link(part, final)` (the name without the `.part-…` suffix), then unlink the part; on
-    `FileExistsError` it retries once with `<stem>-<work id>.pdf`, then with
-    `<stem>-<work id>-<8 hex>.pdf`. `os.replace` is never used on a PDF name. The writer stores
-    the path actually published, together with the downloader's checksum of those bytes, in the
-    same transaction.
+    `os.link(part, final)` (the name without the `.part-…` suffix); on `FileExistsError` it
+    retries once with `<stem>-<work id>.pdf`, then with `<stem>-<work id>-<8 hex>.pdf`. The
+    successful link is its **last fallible operation**: it returns the published path at once and
+    does not unlink the part, so a writer always knows what it published. `os.replace` is never
+    used on a PDF name. A link failure before the commit makes the writer roll back and return
+    `(None, "publish failed: <error>")`. The writer stores the path actually published, together
+    with the downloader's checksum of those bytes, in the same transaction.
+  - **A checksum is required.** `download_ref` can return a result with an empty checksum when it
+    could not read the file. A writer given `part_path` with an empty checksum publishes nothing
+    and returns `(None, "checksum_unavailable")`; the caller marks the download failed with that
+    reason and discards the part.
+  - **The stored metadata names the retained PDF.** Before the download result is serialised into
+    `bibtex_entry_json`, the writer sets its `downloaded_file` to the PDF the row keeps (the
+    published path, or the canonical's own file after a raw merge) and drops `part_suffix`.
   - **Cleanup.** When the transaction then fails (rollback), the writer unlinks the file it just
     published. When `mark_raw_work_downloaded` merges into a canonical work whose own PDF is kept
     (its resulting `file_path` is not the published path), the published file is unlinked after
-    the commit. On a lost claim or any other failed write, the caller removes its part file with
-    `download_path.discard_download(part_path)` (`missing_ok`). A stale attempt therefore leaves
+    the commit; a failure of that unlink is logged and does not turn the committed merge into a
+    failure. The **caller** removes the part file in its own `finally`, on every outcome
+    (published, lost claim, failed write, or an exception from publishing), with
+    `download_path.discard_download(part_path)` (`missing_ok`); a failed part unlink is logged and
+    never undoes or fails a committed write. A stale attempt therefore leaves
     the winner's bytes and checksum untouched, and an earlier file of another work is never
     touched; at worst a crash leaves one `*.part-*` file or one unreferenced PDF.
 - The CLI's dedupe uses the daemon's rule through a new shared method,
@@ -532,6 +553,8 @@ not non-issues.
     `<n> = Math.ceil(retryAfterSeconds / 60)`, and the text is "minute" when `n === 1`, else
     "minutes". A correct password is refused too until the window passes.
   - an unknown username (`401`) and an invited account (`403`) call `fail`;
+  - an error in the user lookup itself (`prepare` or `get` throwing) calls `refund` and answers
+    the existing `500 Login failed`, so no slot stays reserved until the rollover;
   - a hasher failure (`HASHER_BUSY` 503 or the 500) calls `refund`;
   - a wrong password calls `fail` (`401` as today);
   - a correct password calls `succeed`.

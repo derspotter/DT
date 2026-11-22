@@ -129,7 +129,7 @@ No other file is touched by two tasks. One behavioural coupling crosses tasks: T
 **Interfaces:**
 - Produces:
   - `upstream_update.display_doi(value) -> str`: `normalize_doi(value, case="lower") or ""`.
-  - `backfill_openalex_topics.bare_doi(raw) -> str | None`: lowercases `str(raw)`, strips whitespace, removes **only** the prefixes `identifiers._DOI_URL_PREFIX_RE` and `_DOI_SCHEME_PREFIX_RE`, strips whitespace again (no punctuation trim, so not `normalize_doi_lower`); returns the token when `identifiers._DOI_IN_TEXT_RE.fullmatch(token)`, else `None`. The whole DOI is validated **before** any key is extracted.
+  - `backfill_openalex_topics.bare_doi(raw) -> str | None`: strips whitespace from `str(raw)` and returns `None` unless it `isascii()` (checked before any case change), then lowercases, removes **only** the prefixes `identifiers._DOI_URL_PREFIX_RE` and `_DOI_SCHEME_PREFIX_RE`, strips whitespace again (no punctuation trim, so not `normalize_doi_lower`); returns the token when `identifiers._DOI_IN_TEXT_RE.fullmatch(token)`, else `None`. The whole DOI is validated **before** any key is extracted.
   - `backfill_openalex_topics.doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[int, str]], int]`: pass 2's query unchanged (scope clause, `openalex_id` empty, `doi` non-empty, `topics_fetched IS NULL OR topics_fetched = 0`, `ORDER BY id` plus the limit clause); for each row `bare = bare_doi(doi)`, key `bare.upper()` (equal to `normalize_doi(bare)`); returns the `(work_id, key)` pairs of the valid rows and the count skipped.
   - `backfill_openalex_topics.doi_filter(tokens: list[str]) -> str`: `"doi:" + "|".join(t.lower() for t in tokens)`.
   - Each of the three modules exposes `normalize_doi`, which is `dl_lit.identifiers.normalize_doi`.
@@ -173,6 +173,8 @@ def test_backfill_pass2_keeps_punctuated_and_plain_dois_apart(tmp_path, monkeypa
     # one batch: row 1 doi "10.1000/ABC", row 2 doi "10.1000/ABC.", row 3 doi "10.1000/XYZ;"
     # mocked OpenAlex returns works with dois "https://doi.org/10.1000/abc" (topic T1) and "https://doi.org/10.1000/abc." (topic T2)
     # -> row 1 gets T1, row 2 gets T2, row 3 unchanged; the filter holds the three tokens as stored (lowercased)
+    # row 4 doi "10.1000/\u212a" (Kelvin sign) is skipped and counted; a returned work with doi "https://doi.org/10.1000/k"
+    # updates no row; a returned work whose doi is non-ASCII matches nothing
 def test_backfill_pass2_sends_only_whole_dois_and_updates_the_row(tmp_path, monkeypatch, capsys):
     # DatabaseManager(tmp db) creates works; rows (all openalex_id NULL, metadata_status 'matched'):
     #   1 doi "https://doi.org/10.1000/ABC"; 2 doi "10.bogus|xyz"; 3 doi "10.1/abc"; 4 doi "10.1000/DEF" with topics_fetched 1
@@ -236,8 +238,9 @@ In `test_identifiers.py`, remove the three entries from `DOI_MAP` and from the f
   - `DatabaseManager._begin_owned(phase, work_id, claimed_by) -> bool`: `BEGIN IMMEDIATE` unless a transaction is open, then `_claim_held`; rolls back and returns `False` when it fails. For the self-committing writers; their existing commit/rollback ends the same transaction.
   - The writers listed in Files take `claimed_by: str | None = None` (`None` keeps today's behaviour). `apply_enriched_metadata` runs `_claim_held` as the first statement inside its own `with self.transaction():`; the others start with `_begin_owned`. A lost claim returns `(None, CLAIM_LOST)` (`(False, CLAIM_LOST)` for the merge). No outer wrapper, so a writer's own rollback always covers all of its writes.
   - `merge_duplicate_queued_work(..., claimed_by=…)` re-reads the target inside that transaction and returns `(False, "duplicate_target_gone")` when it is missing or not `downloaded`; the caller then downloads the row.
-  - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)`; `publish_download(part_path: str, work_id: int) -> str`: never overwrites. `os.link(part, final)` (`final` = the name without the `.part-…` suffix), then unlink the part; on `FileExistsError` retry once with `<stem>-<work id>.pdf`, then `<stem>-<work id>-<8 hex>.pdf`; returns the path actually published. No `os.replace`; `discard_download(part_path: str | None) -> None` (`unlink(missing_ok=True)`).
-  - `move_entry_to_downloaded(..., *, claimed_by=None, part_path=None)` and `mark_raw_work_downloaded(..., *, claimed_by=None, part_path=None)`: after the claim check, `file_path = publish_download(part_path, work_id)` inside the same transaction, stored with the downloader's checksum. If the transaction then fails, the writer unlinks that published file; if `mark_raw_work_downloaded` merges into a canonical whose own PDF is kept, it unlinks the published file after the commit.
+  - `download_ref(enhancer, ref, download_dir, *, part_suffix: str | None = None)`; `publish_download(part_path: str, work_id: int) -> str`: never overwrites. `os.link(part, final)` (`final` = the name without the `.part-…` suffix); on `FileExistsError` retry once with `<stem>-<work id>.pdf`, then `<stem>-<work id>-<8 hex>.pdf`; the successful link is the last fallible operation and it returns the path at once (the part is **not** unlinked here). No `os.replace`; `fit_stem(name: str, reserve: int = 32, limit: int = 255) -> str` (shortens only a stem whose UTF-8-encoded name plus `reserve` exceeds `limit`, on a character boundary; used by the two builders when a part suffix is set); `discard_download(part_path: str | None) -> None` (`unlink(missing_ok=True)`).
+  - `move_entry_to_downloaded(..., *, claimed_by=None, part_path=None)` and `mark_raw_work_downloaded(..., *, claimed_by=None, part_path=None)`: after the claim check, `file_path = publish_download(part_path, work_id)` inside the same transaction, stored with the downloader's checksum. An empty checksum with a `part_path` returns `(None, "checksum_unavailable")` before publishing; a link failure returns `(None, "publish failed: <error>")` after the rollback. If the transaction then fails, the writer unlinks that published file; if `mark_raw_work_downloaded` merges into a canonical whose own PDF is kept, it unlinks the published file after the commit and only logs a failure of that unlink. Before serialising the result into `bibtex_entry_json`, the writer sets `downloaded_file` to the retained PDF and drops `part_suffix`.
+  - Callers (CLI, `_download_single`, `_attempt_raw_download`) call `discard_download(part_path)` in their own `finally` on every outcome, logging (never raising) a failed unlink; on `checksum_unavailable` they mark the download failed with that reason.
   - Every owned writer runs in `try/finally` and rolls back in the `finally` while `self.conn.in_transaction` (covers the early `duplicate_target_gone` return and `OSError` from publishing).
   - `DatabaseManager.release_enrich_claims(work_ids: list[int], claimed_by: str) -> int` (spec D2: back to `pending`, claim columns cleared, `metadata_attempt_count` minus 1, floor 0; only rows still `in_progress` with that owner).
   - `DatabaseManager.find_downloaded_duplicate(row: dict, authors) -> tuple[str | None, int | None, str | None]`. It calls `check_if_exists` with the arguments listed in spec D2 and returns the hit only for a `works` row whose `download_status` is `downloaded`.
@@ -305,13 +308,27 @@ def test_a_failed_write_after_publishing_leaves_no_orphan(tmp_path, monkeypatch)
     # untitled.pdf already published for work 1; work 2's move_entry_to_downloaded with _update_work_record patched to raise
     # sqlite3.OperationalError after the publish -> (None, err); untitled-<id2>.pdf does not exist; untitled.pdf still holds A;
     # work 2 still in_progress with its claim; not db.conn.in_transaction
+def test_a_failed_part_unlink_never_orphans_or_fails_the_publish(tmp_path, monkeypatch):
+    # os.unlink patched to raise OSError for "*.part-*" paths; _download_single with a successful fake
+    # -> the row is downloaded, file_path names the published PDF, which exists with the right checksum; the failure is logged;
+    # the same patch with a forced DB failure after publishing -> the published PDF is still removed (the writer knew its path)
+def test_an_unreadable_staged_pdf_is_not_published(tmp_path, monkeypatch):
+    # successful fake whose checksum comes back "" -> no PDF published, the part file removed,
+    # the row 'failed' with 'checksum_unavailable'
+def test_stored_metadata_names_the_retained_pdf(tmp_path, monkeypatch):
+    # move_entry_to_downloaded: bibtex_entry_json["downloaded_file"] == file_path, no "part_suffix", no ".part-" anywhere;
+    # mark_raw_work_downloaded merged into a canonical that keeps its PDF: downloaded_file == the canonical's file_path,
+    # and the newly published file is gone
+def test_long_names_are_shortened_only_when_the_suffixes_do_not_fit():
+    # fit_stem("a" * 200 + ".pdf") is unchanged; fit_stem("ä" * 120 + ".pdf") (244 bytes) is shortened so that
+    # len(os.fsencode(result)) + 32 <= 255 and it still ends in ".pdf" and decodes cleanly
 def test_owned_writers_end_their_transaction_on_every_exit(tmp_path, monkeypatch):
     # (a) merge returns duplicate_target_gone -> a second connection's BEGIN IMMEDIATE (timeout 0) succeeds while the fallback download runs
     # (b) os.link patched to raise OSError -> the writer returns an error, not db.conn.in_transaction, the row keeps its claim, no PDF published
 def test_the_writers_write_part_files(tmp_path, monkeypatch):
     # try_download_url and PDFDownloader.attempt_download, with a mocked valid PDF response and part_suffix ".part-x":
     # the file is "<final>.part-x", downloaded_file names it, "<final>" does not exist; without a suffix: "<final>" as today
-    # publish_download("<final>.part-x", 7) -> "<final>" exists with the bytes, the part file is gone
+    # publish_download("<final>.part-x", 7) -> "<final>" exists with the bytes and is returned; the part file is left for the caller's discard_download
 def test_the_guarded_merge_rechecks_its_target(tmp_path, mocker):
     # duplicate target downloaded when find_downloaded_duplicate runs; download_ref-free path: a hook between the find and the merge
     # (second connection) sets the target's download_status 'failed' -> merge returns (False, "duplicate_target_gone"), the row is downloaded as usual
@@ -344,7 +361,7 @@ def test_periodic_recovery_treats_a_cli_owner_like_a_daemon(tmp_path, monkeypatc
 
 - [ ] **Step 2: Run the tests and verify they fail.** Run `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests/test_cli_download_leases.py -q`. Expected: FAIL. The row is not claimed, the daemon can claim the CLI's row, stale completions overwrite the new owner, the CLI merges into an undownloaded work, `find_downloaded_duplicate` is missing, start-up recovery releases a live CLI lease, the daemon's lease is 900 s, the live CLI owner is released periodically, a late attempt overwrites the published PDF, the writers have no `claimed_by`/part files, and a deferred enrich keeps its unstarted rows claimed. `test_cli_releases_its_claims_when_it_fails` may pass already (nothing is claimed on `0702e47`); it guards the `finally`.
 - [ ] **Step 3: Implement D2.**
-  - The CLI builds `cli_id` (spec D2) and loops up to `limit` times over `claim_download_batch(limit=1, …, lease_seconds=900)`, stopping at the first empty claim (keep `'Queue is empty.'` when the first one is empty). It dedupes with `find_downloaded_duplicate`, calls `download_ref(..., part_suffix=f".part-{secrets.token_hex(4)}")`, passes `claimed_by=cli_id` to the merge and its downloaded (with `part_path`) and failed writes, prints the D2 claim-lost line and calls `discard_download` on `CLAIM_LOST` or any failed write, and wraps the loop in `try/finally` that calls `release_download_claims(cli_id)` and then `close_connection()`.
+  - The CLI builds `cli_id` (spec D2) and loops up to `limit` times over `claim_download_batch(limit=1, …, lease_seconds=900)`, stopping at the first empty claim (keep `'Queue is empty.'` when the first one is empty). `--limit` keeps its SQLite meaning: a negative value loops until the queue is empty, and `0` claims nothing and prints `'Queue is empty.'`. It dedupes with `find_downloaded_duplicate`, calls `download_ref(..., part_suffix=f".part-{secrets.token_hex(4)}")`, passes `claimed_by=cli_id` to the merge and its downloaded (with `part_path`) and failed writes, prints the D2 claim-lost line and calls `discard_download` on `CLAIM_LOST` or any failed write, and wraps the loop in `try/finally` that calls `release_download_claims(cli_id)` and then `close_connection()`.
   - `_download_single` replaces its inline check with `self.db.find_downloaded_duplicate(row, authors)`, downloads with a part suffix, and passes `claimed_by=self.worker_id` (and `part_path` for the downloaded write) to the merge, `move_entry_to_downloaded` and both `mark_download_failed` calls, all under `db_lock` as today. `CLAIM_LOST` logs the D2 line, discards the part file and returns `("skipped", {"queue_id": qid, "action": "claim_lost"})`; `duplicate_target_gone` falls through to the download.
   - The writers: `apply_enriched_metadata` puts `_claim_held` first inside its `transaction()` block; the others start with `_begin_owned`. Writers without `claimed_by` are unchanged.
   - `do_enrich`'s two deferral branches call `self.db.release_enrich_claims(remaining_ids, self.worker_id)` before returning `remaining_ids`.
@@ -492,10 +509,6 @@ test('the 11th reservation in a window is refused with the time left', () => {
 test('reservations in flight count against the limit', () => {
   // 10 × reserve('u') without settling -> all allowed; the 11th -> refused
 })
-test('a settlement after a rollover leaves the new window alone', () => {
-  // t=0 reserve A; t=900_000 reserve B (new window); fail(A)
-  // with B still in flight, exactly 9 further reserves are allowed (8 if A had leaked into the new window)
-})
 test('success clears settled failures but keeps reservations in flight', () => {
   // 5 × (reserve, fail); reserve A, reserve B (in flight); reserve C; succeed(C); fail(A); fail(B)
   // -> exactly 8 further reserves allowed, then refused
@@ -531,6 +544,11 @@ test('active, invited and unknown names get the same 429 after 10 failures', asy
 })
 test('other usernames are not affected', async () => {
   // lock 'b'; admin right -> 200
+})
+test('a failed user lookup gives its slot back', async () => {
+  // jest.spyOn(app.authDb, 'prepare').mockImplementationOnce(() => { throw new Error('boom') }) -> login answers 500 'Login failed';
+  // then 10 wrong passwords for that name -> all 401, and only the 11th -> 429 (the 10th would be 429 if the slot had leaked);
+  // a right password after the window -> 200
 })
 test('a username must be a non-empty string, and the lookup uses the trimmed name', async () => {
   // {username: ['b'], password: 'pw-b'} -> 400; {username: 'b', password: 1} -> 400; {username: '   ', password: 'x'} -> 400
@@ -569,6 +587,7 @@ test('kantropos-assignment: GET member, PUT admin only', async () => {
 - [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/login-limit.test.js tests/access-routes.test.js tests/corpus-sharing.test.js tests/auth.test.js`. Expected: FAIL. There is no `loginLimiter.js`, no 429 is answered, and the editor and owner PUTs answer 200.
 - [ ] **Step 3: Implement D4 and D5.**
   - Login: answer 400 unless `typeof username === 'string' && typeof password === 'string'` and `name = username.trim()` is not empty; then `const gate = loginLimiter.reserve(name)`, **before** the user lookup, which now uses `name`. When it is not allowed, set `Retry-After` and answer 429.
+  - The lookup runs in a `try`: an exception calls `refund(gate.ticket)` and answers the existing `500 { error: 'Login failed' }`.
   - Invited (403) and unknown (401) call `fail(gate.ticket)` before answering.
   - The compare's `catch` calls `refund(gate.ticket)` before it answers 503 or 500; `!valid` calls `fail`; success calls `succeed`.
   - D4: `requireKantroposAssigner` (spec D4), GET `can_edit: isAdminUser(req.user, authConfig)`, README line.
