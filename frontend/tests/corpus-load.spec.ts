@@ -463,7 +463,9 @@ test('a quiet poll begun before a removal answers after its superseding reload a
   expect(await rowIds(page)).not.toContain(1)
 })
 
-test('a removal updates the committed counts even when the follow-up refresh fails', async ({ page }) => {
+// Counts change only with a committed server answer: a removal takes its rows
+// off the screen, and a failed follow-up leaves the last committed counts.
+test('a removal whose follow-up refresh fails keeps the last committed counts', async ({ page }) => {
   const state = newState({ rows: stageFixture().rows })
   page.on('dialog', (dialog) => dialog.accept())
   await boot(page, state)
@@ -476,7 +478,8 @@ test('a removal updates the committed counts even when the follow-up refresh fai
   await expect.poll(() => state.unlinks.length).toBe(1)
   await expect(rows(page)).toHaveCount(119)
   await expect.poll(() => state.failed).toBeGreaterThan(0)
-  await expect(header(page)).toContainText('Loaded 119/149.')
+  await expect(header(page)).toContainText('Refresh failed; showing earlier rows.')
+  await expect(header(page)).toContainText('Loaded 119/150.')
   await expect(showMore(page)).toBeVisible()
 
   const failedBefore = state.failed
@@ -487,7 +490,8 @@ test('a removal updates the committed counts even when the follow-up refresh fai
   expect(state.unlinks[1]).toEqual([502, 503])
   await expect(rows(page)).toHaveCount(117)
   await expect.poll(() => state.failed).toBeGreaterThan(failedBefore)
-  await expect(header(page)).toContainText('Loaded 117/147.')
+  await expect(header(page)).toContainText('Refresh failed; showing earlier rows.')
+  await expect(header(page)).toContainText('Loaded 117/150.')
   await expect(showMore(page)).toBeVisible()
 })
 
@@ -601,8 +605,12 @@ for (const [bulk, followUpFails] of [[false, false], [true, false], [false, true
     await expect.poll(() => state.requests.length).toBeGreaterThan(before)
     if (followUpFails) await expect.poll(() => state.failed).toBeGreaterThan(0)
     await page.waitForTimeout(300)
+    // Success: the server's counts. Failure: the last committed ones (the
+    // stage load's, which already hold the removal) under the failed notice.
     await expect(allLabel).toHaveText(`All stages (${expected})`)
     await expect(page.getByTestId('workspace-sticky-bar')).toContainText(`3 Corpus (${expected})`)
+    if (followUpFails) await expect(header(page)).toContainText('Refresh failed; showing earlier rows.')
+    else await expect(header(page)).toContainText('Live corpus from API.')
   })
 }
 

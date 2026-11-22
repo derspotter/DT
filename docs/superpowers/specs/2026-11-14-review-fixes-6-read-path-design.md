@@ -650,10 +650,11 @@ controller call.**
   corpus's unlink never touches the new corpus's rows or counts. A successful same-scope
   removal reconciles with a superseding load (`supersede: true`), so a page request begun
   before the unlink cannot overwrite the result.
-- A successful single or bulk removal updates the committed counts with the rows actually
-  removed from the current view: `corpusMatchTotal` drops by that number and `corpusHasMore`
-  is recomputed, next to today's `corpusTotal` update (`App.svelte:2905-2935`); the follow-up
-  load then reconciles from the server. A failed follow-up leaves those values.
+- A successful single or bulk removal takes the unlinked rows off the screen at once and does
+  no local count arithmetic: `corpusTotal`, the stage totals, `corpusMatchTotal` and paging
+  change only from a committed server answer, the reconcile load that follows. If that load
+  fails, the counts stay as last committed and the refresh-failed notice shows until the next
+  successful poll.
 - `applyCorpusCounts` takes `stageTotal`. `corpusHasMore`, the "Showing N of M" text, the
   header's `Loaded N/M` and the prefix reload's consistency check (`totals.size === 1`) use it.
 - The Python oracle (`corpus_list.py`) has no `stage_total`. The parity tests compare
