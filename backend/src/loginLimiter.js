@@ -12,8 +12,8 @@
 // as `id:<user id>`, so two rows never share a counter) lives in an uncapped
 // map, whose size is bounded by the user count, so an existing account is
 // never evicted or left untracked. Names with no row live in a map capped at
-// `maxKeys`; at capacity it deletes its expired entries, or else its oldest
-// entry, locked or not. Flooding junk names can therefore only evict the lock
+// `maxKeys`; at capacity it deletes its oldest entry (expired if any is),
+// locked or not. Flooding junk names can therefore only evict the lock
 // of another unknown name.
 import crypto from 'crypto';
 
@@ -51,20 +51,13 @@ export function createLoginLimiter({
     return entry;
   };
 
-  // Unknown map at capacity: delete every expired entry; if none was, delete
-  // the oldest entry.
-  const makeRoomForUnknown = (at) => {
-    let removed = false;
-    for (const [key, entry] of unknownEntries) {
-      if (expired(entry, at)) {
-        unknownEntries.delete(key);
-        removed = true;
-      }
-    }
-    if (!removed) {
-      const oldest = unknownEntries.keys().next();
-      if (!oldest.done) unknownEntries.delete(oldest.value);
-    }
+  // Unknown map at capacity: delete its first key. A renewed window moves its
+  // entry to the end, so the first key has the oldest window start, expired
+  // if any entry is. O(1): no scan per insertion; the periodic sweep below
+  // removes the rest of the expired entries.
+  const makeRoomForUnknown = () => {
+    const oldest = unknownEntries.keys().next();
+    if (!oldest.done) unknownEntries.delete(oldest.value);
   };
 
   const sweepExpired = (at) => {
@@ -85,11 +78,13 @@ export function createLoginLimiter({
     sweepExpired(at);
     let entry = entries.get(key);
     if (!entry) {
-      if (!known && unknownEntries.size >= maxKeys) makeRoomForUnknown(at);
+      if (!known && unknownEntries.size >= maxKeys) makeRoomForUnknown();
       entry = newWindow({}, at);
       entries.set(key, entry);
     } else if (expired(entry, at)) {
-      newWindow(entry, at);
+      // re-insert at the end: insertion order stays window-start order
+      entries.delete(key);
+      entries.set(key, newWindow(entry, at));
     }
     if (locked(entry)) {
       return {

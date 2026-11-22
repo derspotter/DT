@@ -550,9 +550,10 @@ not non-issues.
     name matched a user row (active or invited); the handler therefore runs the user lookup
     first and then reserves. Known names live in an uncapped map: its size is bounded by the
     user count, so an existing account is never evicted and never untracked. Names with no
-    row live in a map capped at `maxKeys`: when a new key arrives at capacity, it first deletes
-    the entries whose window has passed, and if none was deleted, its oldest entry, locked or
-    not. Neither map fails open. Both use the same threshold, window, 429 body, `Retry-After`,
+    row live in a map capped at `maxKeys`: when a new key arrives at capacity, it deletes its
+    first key, locked or not (final-review fix: O(1), no scan per insertion). An entry whose
+    window passes and starts again is re-inserted at the end, so the first key always has the
+    oldest window start and is an expired entry whenever one exists. Neither map fails open. Both use the same threshold, window, 429 body, `Retry-After`,
     digest keys and window-bound tickets (`{ key, windowId, known }`; one `windowId` counter
     for both). A lookup error answers `500 Login failed` before any slot is reserved.
     Accepted residual: flooding junk names can evict the lock of an unknown name, and an
@@ -826,11 +827,16 @@ phase's Acceptance.
   win (see D3).
 - **D4 (BE-19):** only the admin may assign or clear; existing assignments made by owners or
   editors stay until an admin changes them.
-- **D5 (BE-40):** 10 failed sign-ins for one username within 15 minutes lock that username until
+- **D5 (BE-40):** 10 failed sign-ins for one account within 15 minutes lock that account until
   the window passes, even for the right password; a successful sign-in clears the settled
-  failures; unknown and invited names are counted the same way, so the 429 reveals nothing; in
-  memory, at most 10,000 names stored as SHA-256 digests, reset by a backend restart. The
-  username is trimmed for the lookup too, and a non-string username or password answers 400. Anyone can lock a known account for
+  failures; unknown and invited names reach the same 429 after the same 10 failures. In memory,
+  stored as SHA-256 digests, reset by a backend restart: accounts with a user row are tracked
+  without a cap (keyed by the account id), and only names with no row are capped at 10,000.
+  At that cap the oldest unknown name is evicted, so flooding junk names can clear another
+  unknown name's lock, and an attacker who floods and then probes can tell whether a locked
+  name had a row (accepted residual, see D5). The lookup tries the exact submitted username
+  first and then the trimmed one, so a legacy account stored with surrounding whitespace still
+  signs in; a non-string username or password answers 400. Anyone can lock a known account for
   15 minutes. The invitation 403 and the timing difference stay (pre-existing).
 - **D6 (BE-46):** the backend deletes `completed`, `failed` and `cancelled` jobs 30 days after they
   finished (or were created, when they never finished), at start-up and then daily, waiting at

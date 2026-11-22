@@ -154,6 +154,41 @@ describe('createLoginLimiter', () => {
     expect(allowedCount(limiter, 'x')).toBe(9)
   })
 
+  test('inserting at capacity touches O(1) entries, not the whole map (BE-40)', () => {
+    const maxKeys = 10_000
+    limiter = make({ maxKeys })
+    for (let i = 0; i < maxKeys; i += 1) limiter.reserve(`fill-${i}`) // fresh, in flight
+    expect(limiter.size().unknown).toBe(maxKeys)
+    // Count every Map iterator step while new names arrive at capacity.
+    let steps = 0
+    const originals = {}
+    for (const name of ['entries', 'keys', 'values']) {
+      originals[name] = Map.prototype[name]
+      Map.prototype[name] = function counted(...args) {
+        const it = originals[name].apply(this, args)
+        return {
+          next() {
+            steps += 1
+            return it.next()
+          },
+          [Symbol.iterator]() {
+            return this
+          },
+        }
+      }
+    }
+    const originalIterator = Map.prototype[Symbol.iterator]
+    Map.prototype[Symbol.iterator] = Map.prototype.entries
+    try {
+      for (let i = 0; i < 100; i += 1) expect(limiter.reserve(`new-${i}`).allowed).toBe(true)
+    } finally {
+      for (const name of Object.keys(originals)) Map.prototype[name] = originals[name]
+      Map.prototype[Symbol.iterator] = originalIterator
+    }
+    expect(limiter.size().unknown).toBe(maxKeys)
+    expect(steps).toBeLessThanOrEqual(100 * 2)
+  })
+
   test('expired entries of both maps are swept without a later reserve of the same key', () => {
     failTimes(limiter, 'id:1', 3, { known: true })
     failTimes(limiter, 'stranger', 2)
