@@ -69,19 +69,24 @@ async function bootWorkspace(page: import('@playwright/test').Page, urls: string
   await expect(page.locator('.corpus-select-row')).toHaveCount(1)
 }
 
+// First open of a lazy tab makes the dev server compile that component; on a
+// cold CI runner this can take longer than the 5 s default.
+const LAZY_TAB_TIMEOUT = 20_000
+
 test('the graph and scraper code loads on first open only', async ({ page }) => {
+  test.setTimeout(60_000)
   const urls: string[] = []
   await bootWorkspace(page, urls)
   expect(componentRequested(urls, 'ThreeGraph'), 'ThreeGraph at boot').toBe(false)
   expect(componentRequested(urls, 'ScraperLab'), 'ScraperLab at boot').toBe(false)
 
   await page.getByTestId('tab-graph').click()
-  await expect(page.getByTestId('graph-3d-panel')).toBeVisible()
+  await expect(page.getByTestId('graph-3d-panel')).toBeVisible({ timeout: LAZY_TAB_TIMEOUT })
   expect(componentRequested(urls, 'ThreeGraph')).toBe(true)
   expect(componentRequested(urls, 'ScraperLab')).toBe(false)
 
   await page.getByTestId('tab-scraper').click()
-  await expect(page.locator('.scraper-lab')).toBeVisible()
+  await expect(page.locator('.scraper-lab')).toBeVisible({ timeout: LAZY_TAB_TIMEOUT })
   expect(componentRequested(urls, 'ScraperLab')).toBe(true)
 })
 
