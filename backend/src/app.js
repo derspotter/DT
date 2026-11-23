@@ -8,12 +8,13 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import crypto from 'crypto';
 import zlib from 'zlib';
+import { pipeline } from 'node:stream/promises';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
-import { listCorpus } from './corpusList.js';
+import { listCorpus, corpusStageStatuses } from './corpusList.js';
 import { createPythonRunner } from './pythonProcess.js';
 import { tokenMailContent } from './authMail.js';
 import { getPasswordHasher } from './passwordHasher.js';
@@ -29,6 +30,7 @@ import {
   dismissAllSeedCandidates,
   resolveSeedDocumentPath,
   createStateResolver,
+  findSeedCandidateDownloads,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -161,7 +163,6 @@ const GRAPH_3D_SNAPSHOT_TTL_MS = 60 * 60 * 1000;
 const graph3dBuilds = new Map();
 const GRAPH_3D_SNAPSHOT_DIR =
   process.env.RAG_FEEDER_GRAPH_3D_SNAPSHOT_DIR || path.join(path.dirname(DB_PATH), 'graph_3d_snapshots');
-const INGEST_LATEST_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_latest.py');
 const INGEST_ENQUEUE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_enqueue.py');
 const INGEST_IMPORT_SEED_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'ingest_import_seed.py');
 const SEED_PROMOTE_SCRIPT = path.join(PYTHON_SCRIPTS_DIR, 'seed_promote.py');
@@ -481,6 +482,31 @@ export function workReadableByUser(db, user, workId, authConfig = resolveAuthCon
   );
 }
 
+// Resolves a 3D graph node id to its works row, one probe per accepted form:
+// digits or the exporter's fallback `work:<digits>` read the primary key; any
+// other id tries openalex_id, then normalized_doi (the DOI node id is
+// normalize_doi(doi)). The `!= ''` terms let SQLite use the partial unique
+// indexes idx_works_openalex_id / idx_works_normalized_doi.
+export function findGraphNodeWork(db, nodeId, selectList, columns) {
+  const text = String(nodeId ?? '');
+  const idMatch = text.match(/^\d+$/) || text.match(/^work:(\d+)$/);
+  if (idMatch) {
+    return db.prepare(`SELECT ${selectList} FROM works w WHERE w.id = ? LIMIT 1`).get(Number(idMatch[1] ?? idMatch[0]));
+  }
+  if (columns.has('openalex_id')) {
+    const row = db
+      .prepare(`SELECT ${selectList} FROM works w WHERE w.openalex_id = ? AND w.openalex_id != '' LIMIT 1`)
+      .get(text);
+    if (row) return row;
+  }
+  if (columns.has('normalized_doi')) {
+    return db
+      .prepare(`SELECT ${selectList} FROM works w WHERE w.normalized_doi = ? AND w.normalized_doi != '' LIMIT 1`)
+      .get(text);
+  }
+  return undefined;
+}
+
 // Build a snapshot into a temp dir, then swap it into place, so readers never
 // see a half-written snapshot. Concurrent callers for the same key share one
 // build. Returns the manifest object.
@@ -504,7 +530,8 @@ function buildGraph3dSnapshot(options, key) {
       for (const fileName of ['nodes_meta.json', 'clusters.json', 'nodes.bin', 'edges.bin']) {
         const filePath = path.join(buildDir, fileName);
         if (fs.existsSync(filePath)) {
-          fs.writeFileSync(`${filePath}.gz`, zlib.gzipSync(fs.readFileSync(filePath)));
+          // Streamed, one file after another, so a multi-MB payload never blocks the event loop.
+          await pipeline(fs.createReadStream(filePath), zlib.createGzip(), fs.createWriteStream(`${filePath}.gz`));
         }
       }
       const backupDir = `${finalDir}.old-${Date.now()}`;
@@ -909,6 +936,7 @@ export function ensureAuthSchema(db) {
   }
   if (tableExists(db, 'pipeline_jobs')) {
     ensureColumn(db, 'pipeline_jobs', 'worker_id', 'TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_status_finished ON pipeline_jobs(status, finished_at)');
   }
   if (tableExists(db, 'scraper_apply_events')) {
     ensureColumn(db, 'scraper_apply_events', 'generated_bib_path', 'TEXT');
@@ -932,6 +960,31 @@ export function ensureAuthSchema(db) {
   ensureColumn(db, 'works', 'download_lease_expires_at', 'INTEGER');
   db.exec(`CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id);`);
+  // The graph node lookup's identifier indexes, same DDL as WORKS_INDEXES in
+  // db_manager.py (no-ops on a Python-initialised database). On a Node-only
+  // database with duplicate identifiers the unique index cannot be built: boot
+  // continues and those lookups scan until the duplicates are merged.
+  const worksColumns = new Set(listTableColumns(db, 'works'));
+  for (const [index, column, ddl] of [
+    [
+      'idx_works_openalex_id',
+      'openalex_id',
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_openalex_id ON works(openalex_id) WHERE openalex_id IS NOT NULL AND openalex_id != ''",
+    ],
+    [
+      'idx_works_normalized_doi',
+      'normalized_doi',
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_works_normalized_doi ON works(normalized_doi) WHERE normalized_doi IS NOT NULL AND normalized_doi != ''",
+    ],
+  ]) {
+    if (!worksColumns.has(column)) continue;
+    try {
+      db.exec(ddl);
+    } catch (error) {
+      if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
+      console.error(`[schema] ${index} not created: duplicate values in works.${column}; ${column} lookups scan until the duplicates are merged`);
+    }
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id);`);
   for (const name of [
     'idx_corpus_works_lookup',
@@ -1212,14 +1265,54 @@ function getKantroposTargetById(targetId) {
   return KANTROPOS_TARGETS.find((target) => String(target.id) === String(targetId)) || null;
 }
 
-function countBibEntriesInFile(filePath) {
+// path -> { mtimeMs, size, count }. Bounded by the configured Kantropos targets.
+const bibEntryCountMemo = new Map();
+// `${path}\0${mtimeMs}\0${size}` -> the in-flight read, so concurrent cold
+// requests for the same file version share one read.
+const bibEntryCountReads = new Map();
+// path -> the fingerprint whose read failure was last logged, so a file that
+// stays unreadable is logged once per version, not on every request.
+const bibEntryCountWarned = new Map();
+
+// Reads and counts through one handle. The fingerprint is the handle's own stat,
+// so the stored count always belongs to the version that was read, even when
+// the file is atomically replaced after the caller's stat of the path. Only a
+// successful read is stored.
+async function readBibEntryCount(filePath, fingerprint = '') {
+  let handle = null;
   try {
-    const content = fs.readFileSync(filePath, 'utf8');
+    handle = await fs.promises.open(filePath, 'r');
+    const stats = await handle.stat();
+    const content = await handle.readFile('utf8');
     const matches = content.match(/@[A-Za-z]+\s*\{/g);
-    return Array.isArray(matches) ? matches.length : 0;
-  } catch {
+    const count = Array.isArray(matches) ? matches.length : 0;
+    bibEntryCountMemo.set(filePath, { mtimeMs: stats.mtimeMs, size: stats.size, count });
+    bibEntryCountWarned.delete(filePath);
+    return count;
+  } catch (error) {
+    if (error?.code !== 'ENOENT' && bibEntryCountWarned.get(filePath) !== fingerprint) {
+      bibEntryCountWarned.set(filePath, fingerprint);
+      console.warn('[kantropos] metadata.bib count failed', filePath, error?.code || error?.message || error);
+    }
     return null;
+  } finally {
+    if (handle) await handle.close().catch(() => {});
   }
+}
+
+// Counts the entries of a metadata.bib. `stats` is the caller's stat of the path:
+// a memo entry with the same mtimeMs and size is reused without a read. A failed
+// read answers null and is retried next time.
+async function countBibEntriesInFile(filePath, stats) {
+  const cached = stats ? bibEntryCountMemo.get(filePath) : null;
+  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) return cached.count;
+  const key = stats ? `${filePath}\0${stats.mtimeMs}\0${stats.size}` : `${filePath}\0`;
+  let read = bibEntryCountReads.get(key);
+  if (!read) {
+    read = readBibEntryCount(filePath, key).finally(() => bibEntryCountReads.delete(key));
+    bibEntryCountReads.set(key, read);
+  }
+  return read;
 }
 
 function safeJsonParse(value, fallback = null) {
@@ -1353,7 +1446,8 @@ function mapScraperArtifactRow(row) {
   };
 }
 
-function listKantroposCorporaOverview(db) {
+// With targetId only that target is stat'ed and counted (the browse passes its own).
+async function listKantroposCorporaOverview(db, { targetId } = {}) {
   const assignmentRows = tableExists(db, 'corpus_kantropos_assignments')
     ? db
         .prepare(
@@ -1384,16 +1478,22 @@ function listKantroposCorporaOverview(db) {
     return map;
   }, new Map());
 
-  return KANTROPOS_TARGETS.map((target) => {
+  const targets =
+    targetId === undefined || targetId === null
+      ? KANTROPOS_TARGETS
+      : KANTROPOS_TARGETS.filter((target) => String(target.id) === String(targetId));
+  return Promise.all(targets.map(async (target) => {
     const targetPath = String(target.path || '').trim();
     const directoryExists = Boolean(targetPath) && fs.existsSync(targetPath);
     const metadataBibPath = targetPath ? path.join(targetPath, 'metadata.bib') : '';
     const metadataBibExists = Boolean(metadataBibPath) && fs.existsSync(metadataBibPath);
     let metadataBibSize = null;
     let metadataBibModifiedAt = '';
+    let metadataBibStats = null;
     if (metadataBibExists) {
       try {
         const stats = fs.statSync(metadataBibPath);
+        metadataBibStats = stats;
         metadataBibSize = Number(stats.size || 0);
         metadataBibModifiedAt = stats.mtime?.toISOString?.() || '';
       } catch {
@@ -1409,11 +1509,11 @@ function listKantroposCorporaOverview(db) {
       metadata_bib_path: metadataBibExists ? metadataBibPath : '',
       metadata_bib_size: metadataBibSize,
       metadata_bib_modified_at: metadataBibModifiedAt,
-      metadata_entry_count: metadataBibExists ? countBibEntriesInFile(metadataBibPath) : null,
+      metadata_entry_count: metadataBibExists ? await countBibEntriesInFile(metadataBibPath, metadataBibStats) : null,
       assignment_count: assignments.length,
       assigned_corpora: assignments,
     };
-  });
+  }));
 }
 
 function normalizeGraphOpenAlexId(value) {
@@ -1518,7 +1618,16 @@ function buildKantroposGraphPayload(db, currentItems = [], pendingItems = []) {
   };
 
   if (tableExists(db, 'citation_edges') && allowedNodeIds.size > 0) {
-    const rows = db.prepare('SELECT source_id, target_id, relationship_type FROM citation_edges').all();
+    // Only the edges among the nodes, through the UNIQUE(source_id, target_id, ...)
+    // autoindex. Stored endpoints are compared exactly, so a padded one no longer
+    // matches, and the edge order follows the index (graph.edges is a set).
+    const allowed = JSON.stringify([...allowedNodeIds]);
+    const rows = db
+      .prepare(
+        `SELECT source_id, target_id, relationship_type FROM citation_edges
+         WHERE source_id IN (SELECT value FROM json_each(?)) AND target_id IN (SELECT value FROM json_each(?))`
+      )
+      .all(allowed, allowed);
     for (const row of rows) {
       addEdge(row.source_id, row.target_id, row.relationship_type);
     }
@@ -1629,34 +1738,74 @@ function listImportedKantroposWorkItems(db, target, limit = null) {
   return rows.map((row) => mapWorkRowToBrowserItem(row));
 }
 
-function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
-  if (!tableExists(db, 'corpus_kantropos_assignments')) return [];
-  const rows = db
-    .prepare(
-      `SELECT w.*, c.id AS corpus_id, c.name AS corpus_name, u.username AS owner_username
-       FROM works w
-       JOIN corpus_works cw ON cw.work_id = w.id
-       JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
-       JOIN corpora c ON c.id = cw.corpus_id
-       LEFT JOIN users u ON u.id = c.owner_user_id
-       WHERE a.target_id = ?
-         AND w.download_status = 'downloaded'
-       ORDER BY COALESCE(w.year, 0) DESC, w.id DESC, LOWER(c.name), c.id`
-    )
-    .all(String(targetId || ''));
+// Two passes in one read transaction, so a worker commit in between cannot make
+// the summary and the page disagree. Pass 1 reads only ids, paths and corpora of
+// every downloaded work of the assigned corpora and counts them; pass 2 reads the
+// full rows of the first pendingLimit pending works. The file probes run after
+// the transaction, once per distinct work.
+function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet, pendingLimit) {
+  const pendingCountByCorpus = new Map();
+  const downloadedCountByCorpus = new Map();
+  if (!tableExists(db, 'corpus_kantropos_assignments')) {
+    return { items: [], totalCount: 0, missingFileCount: 0, pendingCountByCorpus, downloadedCountByCorpus };
+  }
+  const target = String(targetId || '');
+  // work id -> file_path, in page order.
+  const pendingFiles = new Map();
+  const pageRows = db.transaction(() => {
+    const rows = db
+      .prepare(
+        `SELECT w.id, w.file_path, cw.corpus_id
+         FROM works w
+         JOIN corpus_works cw ON cw.work_id = w.id
+         JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
+         JOIN corpora c ON c.id = cw.corpus_id
+         LEFT JOIN users u ON u.id = c.owner_user_id
+         WHERE a.target_id = ?
+           AND w.download_status = 'downloaded'
+         ORDER BY COALESCE(w.year, 0) DESC, w.id DESC`
+      )
+      .all(target);
+    for (const row of rows) {
+      // Each (corpus_id, work_id) pair is unique, so a plain count is distinct.
+      const corpusId = Number(row.corpus_id);
+      downloadedCountByCorpus.set(corpusId, (downloadedCountByCorpus.get(corpusId) || 0) + 1);
+      const workId = Number(row.id);
+      if (!Number.isFinite(workId) || workId <= 0) continue;
+      if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
+      pendingCountByCorpus.set(corpusId, (pendingCountByCorpus.get(corpusId) || 0) + 1);
+      if (!pendingFiles.has(workId)) pendingFiles.set(workId, row.file_path);
+    }
+    const pageIds = [...pendingFiles.keys()].slice(0, pendingLimit);
+    if (!pageIds.length) return [];
+    return db
+      .prepare(
+        `SELECT w.*, c.id AS corpus_id, c.name AS corpus_name, u.username AS owner_username
+         FROM works w
+         JOIN corpus_works cw ON cw.work_id = w.id
+         JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
+         JOIN corpora c ON c.id = cw.corpus_id
+         LEFT JOIN users u ON u.id = c.owner_user_id
+         WHERE a.target_id = ?
+           AND w.download_status = 'downloaded'
+           AND w.id IN (SELECT value FROM json_each(?))
+         ORDER BY COALESCE(w.year, 0) DESC, w.id DESC, LOWER(c.name), c.id`
+      )
+      .all(target, JSON.stringify(pageIds));
+  })();
+
+  // upstream_update.py skips works whose PDF is not physically present, so a
+  // status-only count promises more than actually reaches the RAG (spec 24).
+  // Flag rather than hide them: they stay visible and in the graph, but do
+  // not count towards the "N pending" promise.
+  const missingFileWorkIds = new Set();
+  for (const [workId, filePath] of pendingFiles) {
+    if (!upstreamFileIsPresent(filePath)) missingFileWorkIds.add(workId);
+  }
 
   const itemsByWorkId = new Map();
-  const missingFileWorkIds = new Set();
-  for (const row of rows) {
+  for (const row of pageRows) {
     const workId = Number(row.id);
-    if (!Number.isFinite(workId) || workId <= 0) continue;
-    if (importedWorkIdSet.size > 0 && importedWorkIdSet.has(workId)) continue;
-    // upstream_update.py skips works whose PDF is not physically present, so a
-    // status-only count promises more than actually reaches the RAG (spec 24).
-    // Flag rather than hide them: they stay visible and in the graph, but do
-    // not count towards the "N pending" promise.
-    if (!upstreamFileIsPresent(row.file_path)) missingFileWorkIds.add(workId);
-
     const sourceCorpus = {
       id: Number(row.corpus_id),
       name: String(row.corpus_name || '').trim() || `Corpus ${row.corpus_id}`,
@@ -1688,64 +1837,56 @@ function listPendingKantroposWorkItems(db, targetId, importedWorkIdSet) {
     ...item,
     file_missing: missingFileWorkIds.has(Number(item.work_id ?? item.id)),
   }));
-  items.missingFileCount = missingFileWorkIds.size;
-  return items;
+  return {
+    items,
+    totalCount: pendingFiles.size,
+    missingFileCount: missingFileWorkIds.size,
+    pendingCountByCorpus,
+    downloadedCountByCorpus,
+  };
 }
 
 function upstreamFileIsPresent(filePath) {
   const raw = String(filePath || '').trim();
   if (!raw) return false;
   try {
-    return fs.statSync(raw).isFile();
+    return fs.statSync(raw, { throwIfNoEntry: false })?.isFile() === true;
   } catch {
     return false;
   }
 }
 
-function buildKantroposBrowsePayload(db, targetId, options = {}) {
+async function buildKantroposBrowsePayload(db, targetId, options = {}) {
   const target = getKantroposTargetById(targetId);
   if (!target) return null;
 
   const currentLimit = Math.max(1, Math.min(500, coerceInt(options.currentLimit, 120) || 120));
   const pendingLimit = Math.max(1, Math.min(500, coerceInt(options.pendingLimit, 120) || 120));
 
-  const overview = listKantroposCorporaOverview(db).find((entry) => String(entry.id) === String(targetId)) || null;
   const assignedCorpora = listAssignedCorporaForKantroposTarget(db, targetId);
   const currentItemsCount = listImportedKantroposWorkItemCount(db, target);
   const importedWorkIdSet = listImportedKantroposWorkIdSet(db, target);
   const currentItems = listImportedKantroposWorkItems(db, target, currentLimit);
-  const pendingItemsAll = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet);
-  const pendingMissingFileCount = Number(pendingItemsAll.missingFileCount || 0);
+  const pending = listPendingKantroposWorkItems(db, targetId, importedWorkIdSet, pendingLimit);
+  const pendingMissingFileCount = pending.missingFileCount;
   // "N pending" promises what will actually reach the RAG, so it excludes works
   // whose PDF is gone; those are reported separately (spec line 24).
-  const pendingItemsCount = pendingItemsAll.length - pendingMissingFileCount;
-  const pendingItems = pendingItemsAll.slice(0, pendingLimit);
+  const pendingItemsCount = pending.totalCount - pendingMissingFileCount;
+  const pendingItems = pending.items;
 
-  const assignedById = new Map(assignedCorpora.map((corpus) => [Number(corpus.id), { ...corpus }]));
-  for (const item of pendingItemsAll) {
-    for (const sourceCorpus of item.source_corpora || []) {
-      const bucket = assignedById.get(Number(sourceCorpus.id));
-      if (!bucket) continue;
-      bucket.pending_count += 1;
-    }
-  }
-  const downloadedRows = db
-    .prepare(
-      `SELECT cw.corpus_id, COUNT(DISTINCT w.id) AS downloaded_count
-       FROM corpus_works cw
-       JOIN corpus_kantropos_assignments a ON a.corpus_id = cw.corpus_id
-       JOIN works w ON w.id = cw.work_id
-       WHERE a.target_id = ?
-         AND w.download_status = 'downloaded'
-       GROUP BY cw.corpus_id`
-    )
-    .all(String(targetId || ''));
-  for (const row of downloadedRows) {
-    const bucket = assignedById.get(Number(row.corpus_id));
-    if (bucket) {
-      bucket.downloaded_count = Number(row.downloaded_count || 0);
-    }
-  }
+  const assignedById = new Map(
+    assignedCorpora.map((corpus) => [
+      Number(corpus.id),
+      {
+        ...corpus,
+        downloaded_count: pending.downloadedCountByCorpus.get(Number(corpus.id)) || 0,
+        pending_count: pending.pendingCountByCorpus.get(Number(corpus.id)) || 0,
+      },
+    ])
+  );
+
+  // Stats and counts only this target's metadata.bib, after the read transaction.
+  const overview = (await listKantroposCorporaOverview(db, { targetId })).find((entry) => String(entry.id) === String(targetId)) || null;
 
   return {
     source: 'api',
@@ -1768,7 +1909,7 @@ function buildKantroposBrowsePayload(db, targetId, options = {}) {
       current_items_has_more: currentItems.length < currentItemsCount,
       // Paging compares against the full list, which still includes the
       // file-missing rows; pendingItemsCount deliberately excludes them.
-      pending_items_has_more: pendingItems.length < pendingItemsAll.length,
+      pending_items_has_more: pendingItems.length < pending.totalCount,
     },
     assigned_corpora: [...assignedById.values()],
     current_items: currentItems,
@@ -1946,9 +2087,11 @@ function requireAuth(db, authConfig = resolveAuthConfig()) {
   };
 }
 
-function resolveDownloadedFilePath(storedPath, context = {}) {
+// Every place a stored file path may live, most likely first. Builds the
+// list only; it probes nothing.
+function downloadedFilePathCandidates(storedPath, context = {}) {
   const rawPath = String(storedPath || '').trim();
-  if (!rawPath) return null;
+  if (!rawPath) return [];
 
   const candidates = [];
   const addCandidate = (candidate) => {
@@ -1979,12 +2122,19 @@ function resolveDownloadedFilePath(storedPath, context = {}) {
     if (baseName && baseName !== relativeRaw) addCandidate(path.join(originDir, baseName));
   }
 
+  return candidates;
+}
+
+// The first existing candidate, else the first candidate (callers report it
+// as missing), else null.
+function resolveDownloadedFilePath(storedPath, context = {}) {
+  const candidates = downloadedFilePathCandidates(storedPath, context);
   return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0] || null;
 }
 
-function findDownloadedFilePath(storedPath, context = {}) {
-  const resolved = resolveDownloadedFilePath(storedPath, context);
-  return resolved && fs.existsSync(resolved) ? resolved : null;
+// The first existing candidate or null; each path is probed once.
+export function findDownloadedFilePath(storedPath, context = {}) {
+  return downloadedFilePathCandidates(storedPath, context).find((candidate) => fs.existsSync(candidate)) || null;
 }
 
 function normalizeIngestSourceMetadata(value) {
@@ -2441,78 +2591,165 @@ function getLogSettings() {
     logDir,
     maxFiles,
     appLogFile: path.join(logDir, 'backend-app.log'),
-    pipelineLogFile: path.join(logDir, 'backend-pipeline.log'),
+    // The escaped-format generation (D11); the old file is admin-only history.
+    pipelineLogFile: path.join(logDir, 'backend-pipeline-v2.log'),
+    legacyPipelineLogFile: path.join(logDir, 'backend-pipeline.log'),
   };
 }
 
-function readTailLinesFromFile(filePath, maxLines) {
-  try {
-    if (!filePath || !fs.existsSync(filePath) || maxLines <= 0) return [];
-    const raw = fs.readFileSync(filePath, 'utf8');
-    if (!raw) return [];
-    const lines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trimEnd())
-      .filter(Boolean);
-    return lines.slice(-maxLines);
-  } catch (error) {
-    console.warn(`[logs/tail] Failed reading ${filePath}: ${error?.message || error}`);
-    return [];
-  }
+// D11: a corpus tag is trusted only in the fixed position the extraction
+// route writes it, right after the timestamp and one of these fixed labels
+// (each also with the ` ERROR` suffix). Anything else -- `corpus=` in message
+// text, a [DAEMON] line, a line without the timestamp, a tag after another
+// group -- is unclassified and admin-only, in the tail and on the live socket.
+const SCOPED_LOG_LABEL_BASES = [
+  'extract-status',
+  '/api/extract-bibliography',
+  'get_bib_pages',
+  'APIscraper',
+  'APIscraper inline fallback',
+  'APIscraper (reused pages)',
+  'APIscraper (page mode)',
+  'APIscraper inline',
+];
+export const SCOPED_LOG_LABELS = new Set(
+  SCOPED_LOG_LABEL_BASES.flatMap((label) => [label, `${label} ERROR`])
+);
+const LOG_LINE_CORPUS_RE = /^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]/;
+
+export function logLineCorpusId(line) {
+  const match = LOG_LINE_CORPUS_RE.exec(String(line ?? ''));
+  if (!match || !SCOPED_LOG_LABELS.has(match[1])) return null;
+  return Number(match[2]);
 }
 
-function readAllLogLines(baseFilePath, { includeRotated = true, maxFiles = 5 } = {}) {
-  const lines = [];
+// Both pipeline writers (logSocket.broadcast, the index.js fallback, the
+// worker's log()) write one record per line: a continuation can never be
+// classified apart from its header.
+export function escapeLogLineBreaks(text) {
+  return String(text ?? '').replace(/\r\n|\r|\n/g, '\\n');
+}
+
+const LOG_READ_CHUNK_BYTES = 64 * 1024;
+const LOG_ROTATED = Symbol('log rotated');
+
+function logWindowPaths(baseFilePath, { includeRotated, maxFiles }) {
+  const paths = [baseFilePath];
   if (includeRotated) {
-    // Load oldest rotated files first for chronological order.
-    for (let i = maxFiles; i >= 1; i -= 1) {
-      const backupFile = `${baseFilePath}.${i}`;
-      lines.push(...readTailLinesFromFile(backupFile, Number.MAX_SAFE_INTEGER));
-    }
+    for (let i = 1; i <= maxFiles; i += 1) paths.push(`${baseFilePath}.${i}`);
   }
-  lines.push(...readTailLinesFromFile(baseFilePath, Number.MAX_SAFE_INTEGER));
-  return lines;
+  return paths;
 }
 
-function extractLogCorpusTag(line) {
-  const match = String(line || '').match(/\bcorpus=([a-zA-Z0-9_-]+)/);
-  return match ? match[1] : '';
-}
-
-function readLogWindow(
-  baseFilePath,
-  {
-    limit = 200,
-    cursor = 0,
-    includeRotated = true,
-    maxFiles = 5,
-    corpusId = null,
-  } = {}
-) {
-  let allLines = readAllLogLines(baseFilePath, { includeRotated, maxFiles });
-  const requestedCorpusTag = String(corpusId ?? '').trim();
-  if (requestedCorpusTag) {
-    allLines = allLines.filter((line) => {
-      const tag = extractLogCorpusTag(line);
-      if (!tag) {
-        return false;
+// Reads one file backwards from its pinned size and hands each complete line,
+// newest first, to `onLine`; `onLine` returns true to stop. Returns
+// LOG_ROTATED when the file is not the one pinned (a rotation ran) or shrank
+// before or under the read, true when `onLine` stopped the walk, false when the file was
+// read to its start. Any other open or read error rejects: the request fails
+// rather than answering a partial window.
+async function readLogFileBackwards(filePath, pin, onLine) {
+  let handle;
+  try {
+    handle = await fs.promises.open(filePath, 'r');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return pin === null ? false : LOG_ROTATED;
+    throw error;
+  }
+  try {
+    const stat = await handle.stat();
+    if (pin === null || stat.dev !== pin.dev || stat.ino !== pin.ino) return LOG_ROTATED;
+    // Same inode but smaller than pinned: truncated under the read.
+    if (stat.size < pin.size) return LOG_ROTATED;
+    let position = pin.size;
+    // The unfinished record's bytes, kept as separate copies in file order and
+    // joined once when the record's start is found, so a long record is
+    // copied O(record size) times, not once per chunk.
+    let pending = [];
+    const chunk = Buffer.alloc(LOG_READ_CHUNK_BYTES);
+    const emit = (head) => {
+      const parts = pending.length ? [head, ...pending] : null;
+      pending = [];
+      return onLine(parts ? Buffer.concat(parts).toString('utf8') : head.toString('utf8'));
+    };
+    while (position > 0) {
+      const len = Math.min(LOG_READ_CHUNK_BYTES, position);
+      position -= len;
+      // A read may return fewer bytes than asked: keep reading until the chunk
+      // is full. End of file before that means the file shrank under the read.
+      let got = 0;
+      while (got < len) {
+        const { bytesRead } = await handle.read(chunk, got, len - got, position + got);
+        if (bytesRead <= 0) return LOG_ROTATED;
+        got += bytesRead;
       }
-      return tag === requestedCorpusTag;
-    });
+      let lineEnd = len;
+      for (let i = len - 1; i >= 0; i -= 1) {
+        if (chunk[i] !== 0x0a) continue;
+        if (emit(chunk.subarray(i + 1, lineEnd))) return true;
+        lineEnd = i;
+      }
+      if (lineEnd > 0) pending.unshift(Buffer.from(chunk.subarray(0, lineEnd)));
+    }
+    if (pending.length && emit(Buffer.alloc(0))) return true;
+    return false;
+  } finally {
+    await handle.close().catch(() => {});
   }
-  const totalLines = allLines.length;
-  const safeLimit = Math.max(1, Number(limit) || 200);
-  const safeCursor = Math.max(0, Math.min(Number(cursor) || 0, totalLines));
-  const end = Math.max(0, totalLines - safeCursor);
-  const start = Math.max(0, end - safeLimit);
-  const entries = allLines.slice(start, end);
-  return {
-    entries,
-    totalLines,
-    hasMore: start > 0,
-    nextCursor: safeCursor + entries.length,
-    cursor: safeCursor,
+}
+
+async function readLogWindowAttempt(paths, { safeLimit, safeCursor, accept }) {
+  const pins = await Promise.all(
+    paths.map((p) =>
+      fs.promises.stat(p).then(
+        ({ dev, ino, size }) => ({ dev, ino, size }),
+        // Only a missing file is an empty slot; any other stat error fails the read.
+        (error) => {
+          if (error?.code === 'ENOENT') return null;
+          throw error;
+        }
+      )
+    )
+  );
+  const collected = [];
+  let seen = 0;
+  let hasMore = false;
+  const onLine = (raw) => {
+    const line = raw.trimEnd();
+    if (!line || !accept(line)) return false;
+    if (seen === safeCursor + safeLimit) {
+      hasMore = true;
+      return true;
+    }
+    if (seen >= safeCursor) collected.push(line);
+    seen += 1;
+    return false;
   };
+  for (let i = 0; i < paths.length; i += 1) {
+    const result = await readLogFileBackwards(paths[i], pins[i], onLine);
+    if (result === LOG_ROTATED) return LOG_ROTATED;
+    if (result) break;
+  }
+  collected.reverse();
+  return { entries: collected, hasMore, nextCursor: safeCursor + collected.length, cursor: safeCursor };
+}
+
+// D10: the newest files first (base, base.1 … base.<maxFiles>, then the same
+// for `olderBase`), each read backwards in chunks, stopping once the window and
+// one more accepted line are seen. The window is pinned against rotation; a
+// rotation during the read restarts it once, a second one throws LOG_ROTATED.
+export async function readLogWindow(
+  baseFilePath,
+  { limit = 200, cursor = 0, includeRotated = true, maxFiles = 5, accept = () => true, olderBase = null } = {}
+) {
+  const paths = logWindowPaths(baseFilePath, { includeRotated, maxFiles });
+  if (olderBase) paths.push(...logWindowPaths(olderBase, { includeRotated, maxFiles }));
+  const safeLimit = Math.max(1, Math.trunc(Number(limit)) || 200);
+  const safeCursor = Math.max(0, Math.trunc(Number(cursor)) || 0);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await readLogWindowAttempt(paths, { safeLimit, safeCursor, accept });
+    if (result !== LOG_ROTATED) return result;
+  }
+  throw Object.assign(new Error('Log rotated during the read'), { code: 'LOG_ROTATED' });
 }
 
 async function getPdfPageCount(pdfPath) {
@@ -2604,17 +2841,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
   assertNoLegacyLibraryData(authDb);
   ensureAuthSchema(authDb);
   ensureSeedSchema(authDb);
-  // Warm the cross-corpus downloaded-works lookup once the server is up, so
-  // the first workspace load does not pay the ~1.5 s index build. Best effort.
-  app.warmSeedState = () => {
-    if (!isStubMode()) {
-      try {
-        createStateResolver(authDb, 0, { resolveDownloadedFilePath: findDownloadedFilePath });
-      } catch (error) {
-        console.warn('[seed-state] Cache warm-up failed:', error?.message || error);
-      }
-    }
-  };
   const defaultCorpusId = bootstrapDefaultCorpus(authDb, authConfig);
   migrateExistingToCorpus(authDb, defaultCorpusId);
   pruneStaleCorpusItems(authDb);
@@ -3491,21 +3717,21 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     return res.json({ corpora });
   });
 
-  app.get('/api/kantropos/corpora', requireAuthMiddleware, (_req, res) => {
-    const corpora = listKantroposCorporaOverview(authDb);
+  app.get('/api/kantropos/corpora', requireAuthMiddleware, async (_req, res) => {
+    const corpora = await listKantroposCorporaOverview(authDb);
     return res.json({
       root_path: KANTROPOS_CORPORA_ROOT,
       corpora,
     });
   });
 
-  app.get('/api/kantropos/corpora/:id/browse', requireAuthMiddleware, (req, res) => {
+  app.get('/api/kantropos/corpora/:id/browse', requireAuthMiddleware, async (req, res) => {
     try {
       const targetId = String(req.params?.id || '').trim();
       if (!targetId) {
         return res.status(400).json({ error: 'Missing Kantropos corpus id' });
       }
-      const payload = buildKantroposBrowsePayload(authDb, targetId, {
+      const payload = await buildKantroposBrowsePayload(authDb, targetId, {
         currentLimit: req.query?.current_limit ?? req.query?.currentLimit,
         pendingLimit: req.query?.pending_limit ?? req.query?.pendingLimit,
       });
@@ -4307,7 +4533,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
             inlineModelOverride = null,
             extractModelOverride = null,
             label = 'APIscraper',
+            model = null,
           }) => {
+            // The label is one of SCOPED_LOG_LABELS (a fixed string); a model
+            // goes after the corpus tag, so logLineCorpusId still classifies.
+            const modelTag = model ? ` [model=${model}]` : '';
             const dbPath = DB_PATH;
             const scrapeApiArgs = ['--db-path', dbPath, '--ingest-source', baseName, '--extract-mode', extractMode];
             if (inputDir) scrapeApiArgs.push('--input-dir', inputDir);
@@ -4318,7 +4548,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
             if (corpusId) scrapeApiArgs.push('--corpus-id', String(corpusId));
 
             console.log(`[/api/extract-bibliography] Spawning ${label}: python ${API_SCRAPER_SCRIPT} ${scrapeApiArgs.join(' ')}`);
-            send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}...`);
+            send(`[/api/extract-bibliography][corpus=${corpusTag}] Starting ${label}${model ? ` (${model})` : ''}...`);
             const { done } = spawnPython(API_SCRAPER_SCRIPT, scrapeApiArgs, {
               label,
               env: {
@@ -4328,11 +4558,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
               },
               onStdoutLine: (line) => {
                 console.log(`[${label} stdout]: ${line}`);
-                send(`[${label}] [corpus=${corpusTag}] ${line}`);
+                send(`[${label}] [corpus=${corpusTag}]${modelTag} ${line}`);
               },
               onStderrLine: (line) => {
                 console.error(`[${label} stderr]: ${line}`);
-                send(`[${label} ERROR] [corpus=${corpusTag}] ${line}`);
+                send(`[${label} ERROR] [corpus=${corpusTag}]${modelTag} ${line}`);
               },
             });
             try {
@@ -4542,6 +4772,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                     uploadedFileName: chunkPages > 0 ? null : sharedUploadedFileName,
                     inlineModelOverride: inlineModel,
                     label: inlineLabel,
+                    model: inlineModel,
                   });
                   return countIngestEntries() - beforeCount;
                 };
@@ -4555,7 +4786,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                 if (produced <= 0) {
                   const cheapInline = inlineModels.cheap;
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Page mode produced 0 references; retrying with cheap inline (${cheapInline}).`);
-                  produced = await runInlineMode(`APIscraper inline (${cheapInline})`, cheapInline);
+                  produced = await runInlineMode('APIscraper inline', cheapInline);
                   producedMode = 'inline';
                 }
 
@@ -4563,7 +4794,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
                 if (produced <= 0) {
                   const proInline = inlineModels.pro;
                   send(`[/api/extract-bibliography][corpus=${corpusTag}] Still 0 references; final fallback to inline (${proInline}).`);
-                  produced = await runInlineMode(`APIscraper inline (${proInline})`, proInline);
+                  produced = await runInlineMode('APIscraper inline', proInline);
                   producedMode = 'inline';
                 }
 
@@ -4773,8 +5004,14 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
-      // One resolver for both calls: building it is the expensive part.
-      const stateResolver = createStateResolver(authDb, req.corpusId, { resolveDownloadedFilePath: findDownloadedFilePath });
+      // One resolver for both calls: building it is the expensive part. It
+      // applies the file route's read rule (D2), so a match the caller cannot
+      // read is not shown as downloaded.
+      const isAdmin = isAdminUser(req.user, authConfig);
+      const stateResolver = createStateResolver(authDb, req.corpusId, {
+        resolveDownloadedFilePath: findDownloadedFilePath,
+        canReadWork: isAdmin ? null : (id) => workReadableByUser(authDb, req.user, id, authConfig),
+      });
       const q = String(req.query?.q || '').trim();
       const { limit, offset, sort, dir } = parseCandidatePaging(req.query);
       // Sorting by state is done in JS over the whole seed (SQL cannot see a
@@ -4783,7 +5020,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       // request cannot make the backend resolve an unbounded seed.
       let total = null;
       if (SEED_STATE_SORTS.has(sort)) {
-        total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+        total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
         const stateSortLimit = seedStateCountLimit();
         if (total > stateSortLimit) {
           return res.status(400).json({
@@ -4791,7 +5028,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           });
         }
       }
-      const candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
+      let candidates = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
         stateResolver,
         resolveDownloadedFilePath: findDownloadedFilePath,
         q,
@@ -4800,7 +5037,9 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         sort,
         dir,
       });
-      if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q, stateResolver });
+      // The absolute server path is admin-only (as the logs' source_file).
+      if (!isAdmin) candidates = candidates.map(({ downloaded_file_path: _path, ...rest }) => rest);
+      if (total === null) total = countSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, { q });
       // `summary=light` drops the summary's state counts, which cost a
       // full-seed state resolution. Background polls send it (they never read
       // them); the initial expand and user-driven reloads do not.
@@ -4840,33 +5079,52 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         return res.status(400).json({ error: 'Invalid seed candidate' });
       }
 
-      const candidate = listSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, {
-        stateResolver: null,
-        resolveDownloadedFilePath: findDownloadedFilePath,
-      })
-        .find((item) => String(item?.candidate_key || '') === candidateKey);
-      const state = String(candidate?.state || '').trim().toLowerCase();
-      const workId = coerceInt(candidate?.downloaded_work_id, null);
-      if (!candidate || !['downloaded', 'downloaded_elsewhere'].includes(state) || !Number.isFinite(workId) || workId <= 0) {
+      // Only a work the caller may read is served; a match in another
+      // corpus the caller cannot read is a 404.
+      const workIds = findSeedCandidateDownloads(authDb, req.corpusId, sourceType, sourceKey, candidateKey,
+        (id) => workReadableByUser(authDb, req.user, id, authConfig));
+      if (workIds.length === 0) {
         return res.status(404).json({ error: 'Downloaded file not found for this seed candidate' });
       }
 
-      const db = new Database(DB_PATH, { readonly: true });
-      const row = db.prepare(
-        `SELECT id, title, file_path, origin_key
-           FROM works
-          WHERE id = ?
-            AND download_status = 'downloaded'
-          LIMIT 1`
-      ).get(workId);
-      db.close();
-
-      if (!row) {
-        return res.status(404).json({ error: 'Downloaded file not found' });
+      // The read rule is checked again in the row query, so the file row and
+      // its authorization come from one snapshot even if another writer
+      // changes corpus membership in between (workReadableByUser's rule).
+      // The first readable match whose file is on disk is served, the rule
+      // the candidate list uses (D5).
+      const isAdmin = isAdminUser(req.user, authConfig);
+      let filePath = null;
+      let sawRow = false;
+      let db = null;
+      try {
+        db = new Database(DB_PATH, { readonly: true });
+        const fileRow = db.prepare(
+          `SELECT w.id, w.title, w.file_path, w.origin_key
+             FROM works w
+            WHERE w.id = ?
+              AND w.download_status = 'downloaded'
+              ${isAdmin ? '' : `AND EXISTS (
+                SELECT 1 FROM corpus_works cw
+                JOIN user_corpora uc ON uc.corpus_id = cw.corpus_id
+                WHERE cw.work_id = w.id AND uc.user_id = ?
+              )`}
+            LIMIT 1`
+        );
+        for (const workId of workIds) {
+          const row = fileRow.get(...(isAdmin ? [workId] : [workId, req.user.id]));
+          if (!row) continue;
+          sawRow = true;
+          filePath = findDownloadedFilePath(row.file_path, { originKey: row.origin_key });
+          if (filePath) break;
+        }
+      } finally {
+        db?.close();
       }
 
-      const filePath = resolveDownloadedFilePath(row.file_path, { originKey: row.origin_key });
-      if (!filePath || !fs.existsSync(filePath)) {
+      if (!sawRow) {
+        return res.status(404).json({ error: 'Downloaded file not found' });
+      }
+      if (!filePath) {
         return res.status(404).json({ error: 'Downloaded file is missing on disk' });
       }
 
@@ -5179,15 +5437,18 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
 
   app.get('/api/corpus', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
     if (process.env.RAG_FEEDER_STUB === '1') {
-      return res.json({ items: STUB_RESULTS.corpus, total: STUB_RESULTS.corpus.length, source: 'stub' });
+      const statuses = corpusStageStatuses(String(req.query?.stage || ''));
+      const items = statuses ? STUB_RESULTS.corpus.filter((item) => statuses.includes(item.status)) : STUB_RESULTS.corpus;
+      return res.json({ items, total: STUB_RESULTS.corpus.length, stage_total: items.length, source: 'stub' });
     }
     const limit = Math.min(CORPUS_MAX_LIMIT, Math.max(0, coerceInt(req.query?.limit, 200)));
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
     const sort = String(req.query?.sort || '').trim();
+    const stage = String(req.query?.stage || '');
     try {
       // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
-      return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort }));
+      return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort, stage }));
     } catch (error) {
       console.error('[/api/corpus] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
@@ -5543,14 +5804,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           return res.status(404).json({ error: 'Works table not found' });
         }
         const selectList = wanted.map((column) => `w.${column}`).join(', ');
-        const numericId = Number(nodeId);
-        const query = columns.has('openalex_id') && columns.has('doi')
-          ? `SELECT ${selectList} FROM works w WHERE w.id = ? OR w.openalex_id = ? OR w.doi = ? LIMIT 1`
-          : `SELECT ${selectList} FROM works w WHERE w.id = ? LIMIT 1`;
-        const params = columns.has('openalex_id') && columns.has('doi')
-          ? [Number.isFinite(numericId) ? numericId : -1, nodeId, nodeId]
-          : [Number.isFinite(numericId) ? numericId : -1];
-        const row = db.prepare(query).get(...params);
+        const row = findGraphNodeWork(db, nodeId, selectList, columns);
         // 404 rather than 403 so node ids do not reveal works in foreign corpora.
         if (!row || !workReadableByUser(authDb, req.user, row.id, authConfig)) {
           return res.status(404).json({ error: 'Node not found' });
@@ -5568,26 +5822,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     } catch (error) {
       console.error('[/api/graph/3d/node/:nodeId] Error:', error);
       return res.status(500).json({ error: error.message || 'Failed to load node detail' });
-    }
-  });
-
-  app.get('/api/graph/3d/cluster/:snapshotKey/:clusterId', requireAuthMiddleware, requireGraph3dScopeAccess, async (req, res) => {
-    const key = String(req.params.snapshotKey || '').trim();
-    const clusterId = Number(req.params.clusterId);
-    if (!/^[a-f0-9]{20}$/.test(key) || !Number.isFinite(clusterId)) {
-      return res.status(400).json({ error: 'Invalid cluster request' });
-    }
-    try {
-      const clustersPath = graph3dSnapshotPath(key, 'clusters.json');
-      if (!fs.existsSync(clustersPath)) {
-        return res.status(404).json({ error: 'Cluster snapshot not found' });
-      }
-      const clusters = JSON.parse(fs.readFileSync(clustersPath, 'utf-8'));
-      const cluster = clusters.find((item) => Number(item.id) === clusterId);
-      return cluster ? res.json(cluster) : res.status(404).json({ error: 'Cluster not found' });
-    } catch (error) {
-      console.error('[/api/graph/3d/cluster/:snapshotKey/:clusterId] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to load cluster detail' });
     }
   });
 
@@ -5635,24 +5869,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
       return stream.pipe(res);
     }
     return res.sendFile(filePath);
-  });
-
-  app.get('/api/ingest/latest', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
-    const baseName = req.query?.baseName || '';
-    const limit = coerceInt(req.query?.limit, 200);
-    const dbPath = DB_PATH;
-
-    const args = ['--db-path', dbPath, '--limit', String(limit)];
-    if (baseName) {
-      args.push('--base-name', String(baseName));
-    }
-    try {
-      const payload = await runPythonJson(INGEST_LATEST_SCRIPT, args, { dbPath, corpusId: req.corpusId });
-      return res.json(payload);
-    } catch (error) {
-      console.error('[/api/ingest/latest] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch ingest entries' });
-    }
   });
 
   app.post('/api/ingest/import-seed', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
@@ -5947,19 +6163,23 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     }
   });
 
-  app.get('/api/logs/tail', requireAuthMiddleware, (req, res) => {
+  const userCorpusIdsStmt = authDb.prepare('SELECT corpus_id FROM user_corpora WHERE user_id = ?');
+  const userCorpusIds = (userId) => new Set(userCorpusIdsStmt.all(userId).map((row) => Number(row.corpus_id)));
+  const sameIdSet = (a, b) => a.size === b.size && [...a].every((id) => b.has(id));
+
+  app.get('/api/logs/tail', requireAuthMiddleware, async (req, res) => {
+    // Server paths (source_file, error messages) are for the admin only.
+    const detailed = isStubMode() || isAdminUser(req.user, authConfig);
     try {
       const type = String(req.query?.type || 'pipeline').trim().toLowerCase();
       const corpusIdRaw = req.query?.corpus_id ?? req.query?.corpusId;
-      const parsedCorpusId =
-        corpusIdRaw === undefined || corpusIdRaw === null || String(corpusIdRaw).trim() === ''
-          ? null
-          : coerceInt(corpusIdRaw, null);
+      const hasCorpusId = corpusIdRaw !== undefined && corpusIdRaw !== null && String(corpusIdRaw).trim() !== '';
+      const parsedCorpusId = hasCorpusId ? coerceInt(corpusIdRaw, null) : null;
       const lines = Math.min(2000, Math.max(1, coerceInt(req.query?.lines, 200) || 200));
       const cursor = Math.max(0, coerceInt(req.query?.cursor, 0) || 0);
       const includeRotatedRaw = String(req.query?.include_rotated ?? req.query?.includeRotated ?? '1').trim().toLowerCase();
       const includeRotated = !['0', 'false', 'no'].includes(includeRotatedRaw);
-      const { logDir, maxFiles, appLogFile, pipelineLogFile } = getLogSettings();
+      const { logDir, maxFiles, appLogFile, pipelineLogFile, legacyPipelineLogFile } = getLogSettings();
 
       let sourceFile = null;
       if (type === 'pipeline') {
@@ -5970,20 +6190,46 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         return res.status(400).json({ error: "Invalid log type. Use 'pipeline' or 'app'." });
       }
 
-      // App logs span every corpus: admin only. Pipeline logs are filtered to
-      // one corpus the caller belongs to (?corpus_id, else the current corpus).
+      // D11, in this order: app logs span every corpus and are admin only. A
+      // given corpus_id is validated and membership-checked, then filtered on
+      // that corpus's trusted tag. Only the exact scope=readable without a
+      // corpus_id is the merged view: every line for the admin and in stub
+      // mode (the only reads that continue into the old generation), the lines
+      // tagged with one of a member's corpora otherwise. Anything else falls
+      // back to the current corpus and reads the new generation only.
+      const stub = isStubMode();
+      const scope = String(req.query?.scope ?? '');
+      let branch = 'all';
       let logCorpusId = Number.isFinite(parsedCorpusId) ? parsedCorpusId : null;
-      if (!isStubMode()) {
-        if (type === 'app') {
-          if (!isAdminUser(req.user, authConfig)) {
-            return res.status(403).json({ error: 'Admin access required' });
-          }
-        } else {
-          if (corpusIdRaw !== undefined && corpusIdRaw !== null && String(corpusIdRaw).trim() !== '' && logCorpusId === null) {
+      let accept = () => true;
+      let olderBase = null;
+      let readable = null;
+      let wasAdmin = false;
+      if (type === 'app') {
+        branch = 'app';
+        if (!stub && !isAdminUser(req.user, authConfig)) {
+          return res.status(403).json({ error: 'Admin access required' });
+        }
+      } else if (hasCorpusId || scope !== 'readable') {
+        branch = 'corpus';
+        if (!stub) {
+          if (hasCorpusId && logCorpusId === null) {
             return res.status(400).json({ error: 'Invalid corpus_id' });
           }
           logCorpusId = logCorpusId ?? req.corpusId ?? null;
           if (!resolveRequestCorpusRole(req, res, () => logCorpusId)) return undefined;
+        }
+        // Stub mode without a (valid) corpus_id reads every line, as before.
+        const wanted = logCorpusId;
+        if (wanted !== null) accept = (line) => logLineCorpusId(line) === wanted;
+      } else {
+        branch = 'merged';
+        wasAdmin = !stub && isAdminUser(req.user, authConfig);
+        if (stub || wasAdmin) {
+          olderBase = legacyPipelineLogFile;
+        } else {
+          readable = userCorpusIds(req.user.id);
+          accept = (line) => readable.has(logLineCorpusId(line));
         }
       }
 
@@ -5996,20 +6242,44 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
           cursor,
           next_cursor: cursor,
           has_more: false,
-          total_lines: 0,
           include_rotated: includeRotated,
-          source_file: sourceFile,
+          ...(detailed ? { source_file: sourceFile } : {}),
           source_exists: false,
         });
       }
 
-      const window = readLogWindow(sourceFile, {
-        limit: lines,
-        cursor,
-        includeRotated,
-        maxFiles,
-        corpusId: type === 'pipeline' ? logCorpusId : null,
-      });
+      let window;
+      try {
+        window = await readLogWindow(sourceFile, { limit: lines, cursor, includeRotated, maxFiles, accept, olderBase });
+      } catch (error) {
+        if (error?.code === 'LOG_ROTATED') {
+          console.warn('[logs/tail] window rotated twice', sourceFile);
+          return res.status(503).json({ error: 'Log rotated during the read; retry' });
+        }
+        throw error;
+      }
+
+      // The read awaited: re-evaluate the branch the window was built with
+      // against the user as it is now (D11).
+      if (!stub) {
+        const fresh = getUserById(authDb, req.user.id);
+        let still = false;
+        if (fresh) {
+          if (branch === 'app') {
+            still = isAdminUser(fresh, authConfig);
+          } else if (branch === 'merged') {
+            still = wasAdmin
+              ? isAdminUser(fresh, authConfig)
+              : !isAdminUser(fresh, authConfig) && sameIdSet(readable, userCorpusIds(fresh.id));
+          } else {
+            still = Boolean(resolveCorpusRole(authDb, fresh, logCorpusId, authConfig));
+          }
+        }
+        if (!still) {
+          return res.status(409).json({ error: 'Log access changed during the read' });
+        }
+      }
+
       return res.json({
         type,
         entries: window.entries,
@@ -6018,13 +6288,13 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
         cursor: window.cursor,
         next_cursor: window.nextCursor,
         has_more: window.hasMore,
-        total_lines: window.totalLines,
         include_rotated: includeRotated,
-        source_file: sourceFile,
+        ...(detailed ? { source_file: sourceFile } : {}),
         source_exists: fs.existsSync(sourceFile),
       });
     } catch (error) {
       console.error('[/api/logs/tail] Error:', error);
+      if (!detailed) return res.status(500).json({ error: 'Could not read the log' });
       return res.status(500).json({ error: error?.message || 'Failed to tail logs' });
     }
   });

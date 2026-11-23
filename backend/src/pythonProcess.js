@@ -6,7 +6,17 @@ import { spawn } from 'child_process';
 // their output line by line and parses their JSON results, so every child sees
 // the same PYTHONPATH and the Admin-tab settings.
 
-export function parseJsonFromOutput(output) {
+// D12: the multiline fallback is the original search (every line's first
+// opener, every later line as an end), capped by a cumulative work budget so
+// a child printing thousands of tagged lines and no JSON cannot pin a core.
+const FALLBACK_WORK_FACTOR = 4;
+const FALLBACK_WORK_SLACK = 64 * 1024;
+
+// `stats` (tests only): the fallback adds every character it scans or joins to
+// `stats.visited`, its parse attempts to `stats.parses`, the characters it
+// hands to JSON.parse to `stats.parsedChars`, and its cap to `stats.cap`.
+// visited + parsedChars never exceeds the cap.
+export function parseJsonFromOutput(output, { stats } = {}) {
   const lines = String(output || '')
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -32,20 +42,54 @@ export function parseJsonFromOutput(output) {
     if (parsedInline !== null) return parsedInline;
   }
 
-  // Fallback: recover pretty-printed/multiline JSON blocks from stdout.
+  // Fallback: recover pretty-printed/multiline JSON blocks from stdout, in the
+  // original order and with the original results. Each candidate's length is
+  // known from prefix sums before it is built, so the budget is checked first:
+  // building and parsing a candidate both count, and so does every scan.
+  const noJson = () => new Error(`No valid JSON output from python. Output was: ${output}`);
+  const cap = FALLBACK_WORK_FACTOR * String(output || '').length + FALLBACK_WORK_SLACK;
+  let visited = 0;
+  let parses = 0;
+  let parsedChars = 0;
+  const report = () => {
+    if (!stats) return;
+    stats.visited += visited;
+    stats.parses += parses;
+    stats.parsedChars += parsedChars;
+    stats.cap = cap;
+  };
+  // prefix[k]: characters of lines[0..k-1] joined with '\n' plus a trailing one.
+  const prefix = new Array(lines.length + 1);
+  prefix[0] = 0;
+  for (let k = 0; k < lines.length; k += 1) prefix[k + 1] = prefix[k] + lines[k].length + 1;
+  visited += lines.length;
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const line = lines[i];
     const bracketIndex = line.search(/[\[{]/);
+    visited += bracketIndex < 0 ? line.length : bracketIndex + 1;
     if (bracketIndex < 0) continue;
     for (let j = lines.length; j > i; j -= 1) {
+      const length = prefix[j] - prefix[i] - 1 - bracketIndex;
+      if (visited + parsedChars + 2 * length > cap) {
+        report();
+        throw noJson();
+      }
       const segment = lines.slice(i, j);
       segment[0] = segment[0].slice(bracketIndex);
-      const parsedSegment = tryParse(segment.join('\n'));
-      if (parsedSegment !== null) return parsedSegment;
+      const candidate = segment.join('\n');
+      visited += length;
+      parses += 1;
+      parsedChars += length;
+      const parsedSegment = tryParse(candidate);
+      if (parsedSegment !== null) {
+        report();
+        return parsedSegment;
+      }
     }
   }
 
-  throw new Error(`No valid JSON output from python. Output was: ${output}`);
+  report();
+  throw noJson();
 }
 
 // Split buffered output into trimmed, non-empty complete lines for `handler`

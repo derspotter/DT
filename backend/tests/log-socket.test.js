@@ -36,11 +36,13 @@ describe('log WebSocket', () => {
     ids.member = addUser('member')
     ids.revoked = addUser('revoked')
     ids.deleted = addUser('deleted')
+    ids.member2 = addUser('member2')
     const grant = authDb.prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'viewer')")
     grant.run(ids.member, 1)
     grant.run(ids.revoked, 1)
     grant.run(ids.revoked, 3)
     grant.run(ids.deleted, 1)
+    grant.run(ids.member2, 2)
   })
 
   afterAll(async () => {
@@ -99,9 +101,9 @@ describe('log WebSocket', () => {
   const isSentinel = (m) => m.includes('"sentinel"')
 
   const emitMixed = (logSocket) => {
-    logSocket.broadcast('[x][corpus=1] a')
-    logSocket.broadcast('[x][corpus=2] b')
-    logSocket.broadcast('[x][corpus=none] c')
+    logSocket.broadcast('[get_bib_pages][corpus=1] a')
+    logSocket.broadcast('[get_bib_pages][corpus=2] b')
+    logSocket.broadcast('[get_bib_pages][corpus=none] c')
     logSocket.broadcastEvent({ type: 't', corpus_id: 1 })
     logSocket.broadcastEvent({ type: 't', corpus_id: null })
   }
@@ -161,10 +163,10 @@ describe('log WebSocket', () => {
     await client.waitFor(isSentinel)
     const received = client.messages.filter((m) => !isSentinel(m))
     expect(received).toHaveLength(2)
-    expect(received[0]).toMatch(/^\[\d{4}-\d{2}-\d{2}T[^\]]+\] \[x\]\[corpus=1\] a$/)
+    expect(received[0]).toMatch(/^\[\d{4}-\d{2}-\d{2}T[^\]]+\] \[get_bib_pages\]\[corpus=1\] a$/)
     expect(JSON.parse(received[1])).toEqual({ type: 't', corpus_id: 1 })
     expect(appended).toHaveLength(3)
-    expect(appended[2]).toMatch(/\] \[x\]\[corpus=none\] c$/)
+    expect(appended[2]).toMatch(/\] \[get_bib_pages\]\[corpus=none\] c$/)
   })
 
   test('admin receives everything', async () => {
@@ -177,9 +179,9 @@ describe('log WebSocket', () => {
     const received = client.messages.filter((m) => !isSentinel(m))
     expect(received).toHaveLength(5)
     expect(received.slice(0, 3).map((m) => m.replace(/^\[[^\]]+\] /, ''))).toEqual([
-      '[x][corpus=1] a',
-      '[x][corpus=2] b',
-      '[x][corpus=none] c',
+      '[get_bib_pages][corpus=1] a',
+      '[get_bib_pages][corpus=2] b',
+      '[get_bib_pages][corpus=none] c',
     ])
   })
 
@@ -187,7 +189,7 @@ describe('log WebSocket', () => {
     const { url, logSocket } = await start({ membershipTtlMs: 10 })
     const client = connect(url, ['bearer', sign(ids.revoked)])
     await client.opened
-    logSocket.broadcast('[x][corpus=1] before')
+    logSocket.broadcast('[get_bib_pages][corpus=1] before')
     logSocket.broadcastEvent(SENTINEL(3))
     await client.waitFor(isSentinel)
     expect(client.messages.some((m) => m.endsWith('before'))).toBe(true)
@@ -195,7 +197,7 @@ describe('log WebSocket', () => {
     authDb.prepare('DELETE FROM user_corpora WHERE user_id = ? AND corpus_id = 1').run(ids.revoked)
     await delay(30)
     client.messages.length = 0
-    logSocket.broadcast('[x][corpus=1] after')
+    logSocket.broadcast('[get_bib_pages][corpus=1] after')
     logSocket.broadcastEvent({ type: 't', corpus_id: 1 })
     logSocket.broadcastEvent(SENTINEL(3))
     await client.waitFor(isSentinel)
@@ -207,7 +209,7 @@ describe('log WebSocket', () => {
     const victim = connect(url, ['bearer', sign(ids.deleted)])
     const admin = connect(url, ['bearer', sign(ids.admin)])
     await Promise.all([victim.opened, admin.opened])
-    logSocket.broadcast('[x][corpus=1] before')
+    logSocket.broadcast('[get_bib_pages][corpus=1] before')
     await victim.waitFor((m) => m.endsWith('before'))
 
     authDb.prepare('DELETE FROM users WHERE id = ?').run(ids.deleted)
@@ -218,6 +220,39 @@ describe('log WebSocket', () => {
     await admin.waitFor(isSentinel)
     await delay(50)
     expect(victim.messages).toEqual([])
+  })
+
+  test('the live socket classifies by the writer prefix', async () => {
+    const { url, logSocket } = await start()
+    const member = connect(url, ['bearer', sign(ids.member)])
+    const admin = connect(url, ['bearer', sign(ids.admin)])
+    await Promise.all([member.opened, admin.opened])
+    logSocket.broadcast('[get_bib_pages] failed: corpus=1 boom')
+    logSocket.broadcast('[x][corpus=1] a')
+    logSocket.broadcastEvent(SENTINEL(1))
+    await Promise.all([member.waitFor(isSentinel), admin.waitFor(isSentinel)])
+    expect(member.messages.filter((m) => !isSentinel(m))).toEqual([])
+    expect(admin.messages.filter((m) => !isSentinel(m)).map((m) => m.replace(/^\[[^\]]+\] /, ''))).toEqual([
+      '[get_bib_pages] failed: corpus=1 boom',
+      '[x][corpus=1] a',
+    ])
+  })
+
+  test('a multiline broadcast is one escaped record', async () => {
+    const { url, logSocket, appended } = await start()
+    const one = connect(url, ['bearer', sign(ids.member)])
+    const two = connect(url, ['bearer', sign(ids.member2)])
+    await Promise.all([one.opened, two.opened])
+    logSocket.broadcast('[get_bib_pages][corpus=1] a\n[get_bib_pages][corpus=2] b')
+    logSocket.broadcastEvent(SENTINEL(1))
+    logSocket.broadcastEvent(SENTINEL(2))
+    await Promise.all([one.waitFor(isSentinel), two.waitFor(isSentinel)])
+    expect(appended).toHaveLength(1)
+    expect(appended[0]).toContain('\\n')
+    expect(appended[0]).not.toMatch(/[\r\n]/)
+    expect(appended[0]).toMatch(/\] \[get_bib_pages\]\[corpus=1\] a\\n\[get_bib_pages\]\[corpus=2\] b$/)
+    expect(one.messages.filter((m) => !isSentinel(m))).toEqual([appended[0]])
+    expect(two.messages.filter((m) => !isSentinel(m))).toEqual([])
   })
 
   test('stub mode: no token required, everything delivered', async () => {

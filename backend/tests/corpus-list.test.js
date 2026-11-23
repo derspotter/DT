@@ -22,6 +22,9 @@ function pythonRuns(exe) {
 }
 const HAS_PY = pythonRuns(PY)
 
+// corpus_list.py has no stage_total; with no stage it equals total.
+const withStageTotal = (expected) => ({ ...expected, stage_total: expected.total })
+
 let tempDir
 let dbPath
 let db
@@ -80,19 +83,19 @@ const goldenEach = HAS_PY ? test.each(GOLDEN) : test.skip.each(GOLDEN)
 goldenEach('matches corpus_list.py for %j', (args) => {
   const expected = viaScript(['--corpus-id', '1', ...args])
   const actual = listCorpus(db, parseArgs(args, { corpusId: 1 }))
-  expect(actual).toEqual(expected)
+  expect(actual).toEqual(withStageTotal(expected))
 })
 
 goldenTest('no corpus selected lists every work and uses created_at for added_at', () => {
   const actual = listCorpus(db, { corpusId: null, limit: 200, offset: 0, q: '', sort: '' })
-  expect(actual).toEqual(viaScript([]))
+  expect(actual).toEqual(withStageTotal(viaScript([])))
   expect(actual.total).toBe(18)
   expect(actual.items.find((i) => i.id === 1).added_at).toBe('2025-01-01 00:00:01')
 })
 
 goldenTest('no corpus selected, sorted by seed, matches the script', () => {
   expect(listCorpus(db, { corpusId: null, limit: 200, offset: 0, q: '', sort: 'seed:asc' }))
-    .toEqual(viaScript(['--sort', 'seed:asc']))
+    .toEqual(withStageTotal(viaScript(['--sort', 'seed:asc'])))
 })
 
 test('treats % and _ in q literally', () => {
@@ -263,7 +266,7 @@ describe('a corpus larger than the bound-parameter limit', () => {
     const env = { ...process.env }
     delete env.RAG_FEEDER_STUB
     const expected = JSON.parse(execFileSync(PY, [SCRIPT, '--db-path', bigPath, '--corpus-id', '1', '--sort', 'seed:asc', '--limit', String(PAGE)], { encoding: 'utf8', env, maxBuffer: 1 << 28 }))
-    expect(listCorpus(big, { corpusId: 1, limit: PAGE, offset: 0, q: '', sort: 'seed:asc' })).toEqual(expected)
+    expect(listCorpus(big, { corpusId: 1, limit: PAGE, offset: 0, q: '', sort: 'seed:asc' })).toEqual(withStageTotal(expected))
   }, 60_000)
 })
 
@@ -316,7 +319,7 @@ describe('index-served default and added sorts', () => {
   goldenTest('with integer/NULL years a large corpus\'s default sort is served by idx_works_year_id and matches the Python script', () => {
     const page = capturePageQuery(intDb)
     for (const args of PAGES) {
-      expect(listCorpus(intDb, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(viaScriptOn(intPath, ['--corpus-id', '1', ...args]))
+      expect(listCorpus(intDb, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(withStageTotal(viaScriptOn(intPath, ['--corpus-id', '1', ...args])))
       expect(page.sql).not.toContain('dt_corpus_int')
       expect(page.sql).toContain('WHERE EXISTS')
       const plan = pagePlan(intDb, page)
@@ -326,7 +329,7 @@ describe('index-served default and added sorts', () => {
     // NULL year (work 4) sorts last, as normalize_year's 0 does.
     expect(listCorpus(intDb, { corpusId: 1, smallCorpusLimit: 0 }).items.map((i) => i.id)).toEqual([6, 5, 8, 7, 1, 2, 10, 9, 11, 13, 12, 14, 4, 3])
     // No corpus selected walks the index regardless of corpus sizes.
-    expect(listCorpus(intDb, { corpusId: null })).toEqual(viaScriptOn(intPath, []))
+    expect(listCorpus(intDb, { corpusId: null })).toEqual(withStageTotal(viaScriptOn(intPath, [])))
     expect(page.sql).not.toContain('dt_corpus_int')
     delete intDb.prepare
   })
@@ -334,7 +337,7 @@ describe('index-served default and added sorts', () => {
   goldenTest('with integer/NULL years a small corpus\'s default sort takes the JOIN + YEAR_SQL path and matches the Python script', () => {
     const page = capturePageQuery(intDb)
     for (const args of PAGES) {
-      expect(listCorpus(intDb, parseArgs(args, { corpusId: 1 }))).toEqual(viaScriptOn(intPath, ['--corpus-id', '1', ...args]))
+      expect(listCorpus(intDb, parseArgs(args, { corpusId: 1 }))).toEqual(withStageTotal(viaScriptOn(intPath, ['--corpus-id', '1', ...args])))
       expect(page.sql).toContain('dt_corpus_int')
       expect(page.sql).toContain('JOIN corpus_works cw ON cw.work_id = w.id')
       expect(page.sql).not.toContain('EXISTS')
@@ -354,10 +357,10 @@ describe('index-served default and added sorts', () => {
       zero.prepare('UPDATE works SET year = -5 WHERE id = 12').run()
       const page = capturePageQuery(zero)
       for (const args of PAGES) {
-        expect(listCorpus(zero, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(viaScriptOn(zeroPath, ['--corpus-id', '1', ...args]))
+        expect(listCorpus(zero, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(withStageTotal(viaScriptOn(zeroPath, ['--corpus-id', '1', ...args])))
         expect(page.sql).toContain('dt_corpus_int')
       }
-      expect(listCorpus(zero, { corpusId: null })).toEqual(viaScriptOn(zeroPath, []))
+      expect(listCorpus(zero, { corpusId: null })).toEqual(withStageTotal(viaScriptOn(zeroPath, [])))
       const ids = listCorpus(zero, { corpusId: 1, smallCorpusLimit: 0 }).items.map((i) => i.id)
       // 13 (year 0) ties with NULL-year 4 and 3, id desc; -5 (work 12) is last.
       expect(ids.slice(-4)).toEqual([13, 4, 3, 12])
@@ -371,7 +374,7 @@ describe('index-served default and added sorts', () => {
     try {
       const page = capturePageQuery(copy)
       for (const args of PAGES) {
-        expect(listCorpus(copy, parseArgs(args, { corpusId: 1 }))).toEqual(viaScript(['--corpus-id', '1', ...args]))
+        expect(listCorpus(copy, parseArgs(args, { corpusId: 1 }))).toEqual(withStageTotal(viaScript(['--corpus-id', '1', ...args])))
         expect(page.sql).toContain('dt_corpus_int')
       }
     } finally {
@@ -392,10 +395,10 @@ describe('index-served default and added sorts', () => {
       expect(real.prepare('SELECT typeof(year) AS t FROM works WHERE id = 7').get().t).toBe('real')
       const page = capturePageQuery(real)
       for (const args of PAGES) {
-        expect(listCorpus(real, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(viaScriptOn(realPath, ['--corpus-id', '1', ...args]))
+        expect(listCorpus(real, parseArgs(args, { corpusId: 1, smallCorpusLimit: 0 }))).toEqual(withStageTotal(viaScriptOn(realPath, ['--corpus-id', '1', ...args])))
         expect(page.sql).toContain('dt_corpus_int')
       }
-      expect(listCorpus(real, { corpusId: null })).toEqual(viaScriptOn(realPath, []))
+      expect(listCorpus(real, { corpusId: null })).toEqual(withStageTotal(viaScriptOn(realPath, [])))
       const ids = listCorpus(real, { corpusId: 1, smallCorpusLimit: 0 }).items.map((i) => i.id)
       expect(ids.indexOf(8)).toBeLessThan(ids.indexOf(7))
     } finally {
@@ -413,7 +416,7 @@ describe('index-served default and added sorts', () => {
       for (const sort of ['added:asc', 'added:desc']) {
         for (const args of PAGES) {
           const full = ['--sort', sort, ...args]
-          expect(listCorpus(blank, parseArgs(full, { corpusId: 1 }))).toEqual(viaScriptOn(blankPath, ['--corpus-id', '1', ...full]))
+          expect(listCorpus(blank, parseArgs(full, { corpusId: 1 }))).toEqual(withStageTotal(viaScriptOn(blankPath, ['--corpus-id', '1', ...full])))
           expect(page.sql).toContain("cw.added_at = ''")
         }
       }
@@ -436,7 +439,7 @@ describe('index-served default and added sorts', () => {
       for (const sort of ['added:asc', 'added:desc', 'added']) {
         for (const args of PAGES) {
           const full = ['--sort', sort, ...args]
-          expect(listCorpus(target, parseArgs(full, { corpusId: 1 }))).toEqual(viaScriptOn(file, ['--corpus-id', '1', ...full]))
+          expect(listCorpus(target, parseArgs(full, { corpusId: 1 }))).toEqual(withStageTotal(viaScriptOn(file, ['--corpus-id', '1', ...full])))
           const plan = pagePlan(target, page)
           expect(plan).toContain('idx_corpus_works_added')
           // Rows stream in index order: no full sort of the membership, and
@@ -453,4 +456,123 @@ describe('index-served default and added sorts', () => {
       delete target.prepare
     }
   })
+})
+
+// --- Stage filter (D13) --------------------------------------------------------
+
+const STAGES = {
+  raw: ['raw'],
+  metadata: ['matched', 'queued_download', 'enriching'],
+  downloaded: ['downloaded'],
+  failed_enrichment: ['failed_enrichment'],
+  failed_download: ['failed_download'],
+}
+const STAGE_TERM = (stage) => `IN (${STAGES[stage].map((s) => `'${s}'`).join(', ')})`
+
+describe('the stage filter', () => {
+  let copy
+  beforeAll(() => { copy = freshDb() })
+  afterAll(() => copy?.close())
+
+  test('a stage returns exactly the unfiltered rows of that stage, paged, with its total', () => {
+    const base = listCorpus(copy, { corpusId: 1, limit: 1000 })
+    for (const [stage, statuses] of Object.entries(STAGES)) {
+      const want = base.items.filter((i) => statuses.includes(i.status)).map((i) => i.id)
+      expect(want.length).toBeGreaterThan(0)
+      const got = listCorpus(copy, { corpusId: 1, limit: 1000, stage })
+      expect(got.items.map((i) => i.id)).toEqual(want)
+      expect(got.stage_total).toBe(want.length)
+      expect(got.total).toBe(base.total)
+      expect(got.stage_totals).toEqual(base.stage_totals)
+      expect(got.status_counts).toEqual(base.status_counts)
+      expect(listCorpus(copy, { corpusId: 1, limit: 2, offset: 1, stage }).items.map((i) => i.id)).toEqual(want.slice(1, 3))
+    }
+  })
+
+  test('with q and a stage, the counts are the q counts and only the page is staged', () => {
+    const qOnly = listCorpus(copy, { corpusId: 1, limit: 1000, q: 'labour' })
+    expect(qOnly.total).toBeGreaterThan(0)
+    for (const stage of Object.keys(STAGES)) {
+      const got = listCorpus(copy, { corpusId: 1, limit: 1000, q: 'labour', stage })
+      expect(got.total).toBe(qOnly.total)
+      expect(got.stage_totals).toEqual(qOnly.stage_totals)
+      expect(got.status_counts).toEqual(qOnly.status_counts)
+      expect(got.stage_total).toBe(qOnly.stage_totals[stage])
+      expect(got.items.map((i) => i.id)).toEqual(qOnly.items.filter((i) => STAGES[stage].includes(i.status)).map((i) => i.id))
+    }
+  })
+
+  test('stage combines with q and with every sort', () => {
+    for (const corpusId of [1, null]) {
+      for (const column of CORPUS_SORT_KEYS) {
+        for (const sort of [`${column}:asc`, `${column}:desc`]) {
+          for (const q of ['', 'labour']) {
+            const base = listCorpus(copy, { corpusId, limit: 1000, q, sort })
+            for (const [stage, statuses] of Object.entries(STAGES)) {
+              const want = base.items.filter((i) => statuses.includes(i.status)).map((i) => i.id)
+              const got = listCorpus(copy, { corpusId, limit: 1000, q, sort, stage })
+              expect([corpusId, sort, q, stage, got.items.map((i) => i.id)]).toEqual([corpusId, sort, q, stage, want])
+              expect(got.stage_total).toBe(want.length)
+            }
+          }
+        }
+      }
+    }
+  })
+
+  test('an unknown stage means all stages', () => {
+    const none = listCorpus(copy, { corpusId: 1, limit: 1000 })
+    for (const stage of ['bogus', 'all', '', 'RAW ', null, undefined, 'constructor', '__proto__']) {
+      const got = listCorpus(copy, { corpusId: 1, limit: 1000, stage })
+      expect(got).toEqual(none)
+      expect(got.stage_total).toBe(got.total)
+    }
+  })
+
+  test('the stage term binds no parameter', () => {
+    const page = capturePageQuery(copy)
+    listCorpus(copy, { corpusId: 1, stage: 'metadata' })
+    expect(page.sql).toContain(STAGE_TERM('metadata'))
+    expect(page.args).toEqual([1, 200, 0])
+    delete copy.prepare
+  })
+})
+
+test('the empty schema answers stage_total 0', () => {
+  const empty = new Database(':memory:')
+  try {
+    expect(listCorpus(empty, { stage: 'raw' })).toEqual({
+      items: [], total: 0, stage_total: 0,
+      stage_totals: { raw: 0, metadata: 0, downloaded: 0, failed_enrichment: 0, failed_download: 0 },
+      status_counts: {},
+    })
+  } finally {
+    empty.close()
+  }
+})
+
+test('the large-corpus year-index path keeps both q and stage', () => {
+  const intDb = new Database(':memory:')
+  try {
+    intDb.exec(fs.readFileSync(INT_FIXTURE, 'utf8'))
+    for (const q of ['', 'labour']) {
+      // The reference: the same listing unstaged, filtered in JS.
+      const base = listCorpus(intDb, { corpusId: 1, limit: 1000, q, smallCorpusLimit: 0 })
+      const page = capturePageQuery(intDb)
+      for (const [stage, statuses] of Object.entries(STAGES)) {
+        const want = base.items.filter((i) => statuses.includes(i.status)).map((i) => i.id)
+        const got = listCorpus(intDb, { corpusId: 1, limit: 1000, q, stage, smallCorpusLimit: 0 })
+        expect(got.items.map((i) => i.id)).toEqual(want)
+        expect(page.sql).toContain('WHERE EXISTS')
+        expect(page.sql).toContain('ORDER BY w.year DESC, w.id DESC')
+        expect(page.sql).toContain(STAGE_TERM(stage))
+        if (q) expect(page.sql).toContain('dt_corpus_search_text')
+        else expect(page.sql).not.toContain('dt_corpus_search_text')
+        expect(pagePlan(intDb, page)).toContain('idx_works_year_id')
+      }
+      delete intDb.prepare
+    }
+  } finally {
+    intDb.close()
+  }
 })

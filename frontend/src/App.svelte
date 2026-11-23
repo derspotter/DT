@@ -55,7 +55,6 @@
   } from './lib/api'
   import Dashboard from './components/Dashboard.svelte'
   import Logs from './components/Logs.svelte'
-  import ThreeGraph from './components/ThreeGraph.svelte'
   import Corpus from './components/Corpus.svelte'
   import ColumnPicker from './components/ColumnPicker.svelte'
   import {
@@ -66,7 +65,6 @@
   } from './lib/tableColumns'
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
-  import ScraperLab from './components/ScraperLab.svelte'
   import { searchRunSubtitle, seedActivity, seedPromotionStatus } from './lib/seedStatus'
   import {
     workState,
@@ -416,6 +414,16 @@
   let appSettingsError = false
   let seedFilterQuery = ''
   let corpusFilterQuery = ''
+  // Pipeline stage filter, applied server-side like the text filter (D13).
+  // corpusRowsStage is the stage the rows on screen were loaded for; until a
+  // load for the selected stage commits, those rows are stale and inert.
+  let corpusStageFilter = 'all'
+  let corpusRowsStage = 'all'
+  // The stage whose load failed while other rows are shown; null otherwise.
+  let corpusFailedStage = null
+  // Rows matching filter and stage: the paging total ("Show more", Loaded N/M).
+  let corpusMatchTotal = 0
+  $: corpusRowsStale = corpusRowsStage !== corpusStageFilter
   let seedFilterDebounce = null
   let corpusFilterDebounce = null
   let corpusSort = ''
@@ -1055,11 +1063,8 @@
           percent: 100,
           indeterminate: false,
         })
-        await focusSeedSource('pdf', baseName)
-        if (stale()) return
-        await loadIngestStats()
-        if (stale()) return
-        await loadIngestRuns()
+        // Independent loads (D14): run together, check once.
+        await Promise.all([focusSeedSource('pdf', baseName), loadIngestStats(), loadIngestRuns()])
         if (stale()) return
         setTimeout(() => {
           if (extractionProgress.active && extractionProgress.runId === runId) {
@@ -1295,9 +1300,48 @@
     const corpusFilter = getLogsCorpusId()
     if (!corpusFilter) return true
     const text = String(logLine || '')
+    // A trusted fixed-position tag decides as the server does (numeric).
+    const taggedCorpusId = logLineCorpusId(text)
+    if (taggedCorpusId !== null) return taggedCorpusId === Number(corpusFilter)
     const match = text.match(/corpus=([a-zA-Z0-9_-]+)/)
     if (!match) return true
     return match[1] === String(corpusFilter)
+  }
+
+  // Mirrors the backend's logLineCorpusId (app.js, D11): a corpus tag counts
+  // only right after the timestamp and one of the fixed writer labels, so the
+  // live "Current corpus only" view shows the lines a refresh from file shows.
+  const SCOPED_LOG_LABELS = new Set(
+    [
+      'extract-status',
+      '/api/extract-bibliography',
+      'get_bib_pages',
+      'APIscraper',
+      'APIscraper inline fallback',
+      'APIscraper (reused pages)',
+      'APIscraper (page mode)',
+      'APIscraper inline',
+    ].flatMap((label) => [label, `${label} ERROR`])
+  )
+  const LOG_LINE_CORPUS_RE = /^\[[0-9T:.Z-]+\] \[([^\]]+)\] ?\[corpus=([0-9]+)\]/
+
+  function logLineCorpusId(line) {
+    const match = LOG_LINE_CORPUS_RE.exec(String(line ?? ''))
+    if (!match || !SCOPED_LOG_LABELS.has(match[1])) return null
+    return Number(match[2])
+  }
+
+  function isLogLineShownForCurrentCorpus(logLine) {
+    const corpusFilter = getLogsCorpusId()
+    if (corpusFilter === null) return true
+    return logLineCorpusId(logLine) === corpusFilter
+  }
+
+  // A lazy tab's failed import (D15): the message stays generic, the error
+  // goes to the console. Renders nothing.
+  function logTabImportError(tab, error) {
+    console.error(`[tab-import] ${tab}`, error)
+    return ''
   }
 
   function refreshReason() {
@@ -2129,6 +2173,10 @@
       corpusTotal: 0,
       corpusHasMore: false,
       corpusFilterQuery: '',
+      corpusStageFilter: 'all',
+      corpusRowsStage: 'all',
+      corpusFailedStage: null,
+      corpusMatchTotal: 0,
       corpusLoadStatus: '',
       corpusSource: '',
       corpusRefreshFailed: false,
@@ -2194,6 +2242,10 @@
       corpusTotal,
       corpusHasMore,
       corpusFilterQuery,
+      corpusStageFilter,
+      corpusRowsStage,
+      corpusFailedStage,
+      corpusMatchTotal,
       corpusLoadStatus,
       corpusSource,
       corpusRefreshFailed,
@@ -2900,22 +2952,40 @@
     }, 300)
   }
 
+  function handleCorpusStageChange(value) {
+    corpusStageFilter = String(value || 'all')
+    loadCorpus({ quiet: true, supersede: true })
+  }
+
+  // A removal takes the unlinked rows off the screen at once. The counts
+  // (corpusTotal, stage totals, the match count and paging) change only with a
+  // committed server answer: the reconcile load that follows, or, if it fails,
+  // the next successful poll (the refresh-failed notice shows meanwhile).
+  function dropCorpusRows(keep) {
+    corpusItems = corpusItems.filter(keep)
+  }
+
   // Unlinks the work from this corpus only — the work row and its PDF survive,
   // so it stays reusable and can be promoted again (spec line 23).
   async function handleRemoveCorpusWork(item) {
     const workId = Number(item?.work_id ?? item?.id)
     if (!Number.isFinite(workId) || workId <= 0) return
+    // A corpus switch while the unlink runs: its answer is the old corpus's.
+    const epoch = corpusScopeEpoch
     try {
       await removeCorpusWork(workId)
-      corpusItems = corpusItems.filter((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
-      corpusTotal = Math.max(0, corpusTotal - 1)
+      if (epoch !== corpusScopeEpoch) return
+      dropCorpusRows((entry) => Number(entry?.work_id ?? entry?.id) !== workId)
+      // The follow-up commits the server's counts even when its first page
+      // matches the last one.
+      lastCorpusPageSignature = ''
       await Promise.all([
-        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
       corpusLoadStatus = error?.message || 'Failed to remove the item from this corpus.'
     }
   }
@@ -2927,19 +2997,23 @@
       .map((value) => Number(value))
       .filter((value) => Number.isFinite(value) && value > 0)
     if (ids.length === 0) return
+    const epoch = corpusScopeEpoch
     try {
       const result = await removeCorpusWorks(ids)
+      if (epoch !== corpusScopeEpoch) return
       const removed = new Set((result?.removed_work_ids || ids).map((value) => Number(value)))
-      corpusItems = corpusItems.filter((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
-      corpusTotal = Math.max(0, corpusTotal - removed.size)
+      dropCorpusRows((entry) => !removed.has(Number(entry?.work_id ?? entry?.id)))
       corpusLoadStatus = `Removed ${removed.size} item(s) from this corpus.`
+      // See handleRemoveCorpusWork. Nothing removed: the page did not change,
+      // so the signature shortcut may stand.
+      if (removed.size > 0) lastCorpusPageSignature = ''
       await Promise.all([
-        loadCorpus({ quiet: true, preserveSelection: true }),
+        loadCorpus({ quiet: true, preserveSelection: true, supersede: true }),
         loadSeedSources({ quiet: true }),
         loadIngestStats({ quiet: true }),
       ])
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || epoch !== corpusScopeEpoch) return
       corpusLoadStatus = error?.message || 'Failed to remove the selected items.'
     }
   }
@@ -3782,12 +3856,14 @@
   }
 
   function corpusPageSignature(data, total, stageTotals) {
-    return JSON.stringify([corpusFilterQuery, corpusSort, total, stageTotals, data])
+    return JSON.stringify([corpusFilterQuery, corpusSort, corpusStageFilter, total, stageTotals, data])
   }
 
-  function applyCorpusCounts(total, stageTotals) {
+  // Applied only together with the rows they describe (D13).
+  function applyCorpusCounts(total, stageTotals, stageTotal) {
     corpusTotal = Number.isFinite(Number(total)) ? Number(total) : corpusItems.length
-    corpusHasMore = corpusItems.length < corpusTotal
+    corpusMatchTotal = Number.isFinite(Number(stageTotal)) ? Number(stageTotal) : corpusTotal
+    corpusHasMore = corpusItems.length < corpusMatchTotal
     if (stageTotals && typeof stageTotals === 'object') {
       corpusStageTotals = {
         raw: Number(stageTotals.raw || 0),
@@ -3807,6 +3883,9 @@
   async function loadCorpus({ append = false, preserveSelection = false, quiet = false, supersede = false } = {}) {
     if (append) {
       if (corpusLoadingMore || !corpusHasMore) return
+      // The loaded rows belong to another stage: their count is no offset
+      // into the selected one.
+      if (corpusRowsStage !== corpusStageFilter) return
       if (corpusLoading) {
         corpusAppendQueued = true
         return
@@ -3825,6 +3904,7 @@
     // null until the auth payload names the corpus (the initial value is 0):
     // the backend then answers for the token's corpus, which is that one.
     const requestCorpusId = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
+    const requestStage = corpusStageFilter
     if (append) {
       corpusLoadingMore = true
       if (!quiet) corpusLoadStatus = 'Loading more corpus entries...'
@@ -3836,10 +3916,12 @@
     }
     try {
       const offset = append ? corpusItems.length : 0
-      // The poll asks for the first page only, also when more rows are loaded.
+      // With one page loaded the poll asks for the first page only. With more
+      // loaded, within the committed stage, it reloads the whole loaded prefix
+      // (below), so a row that left the stage on page 2+ goes on this poll.
       const poll = !append && quiet && preserveSelection
-      const query = { q: corpusFilterQuery, sort: corpusSort }
-      let { data, total, source, stageTotals } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query })
+      const prefixPoll = poll && requestStage === corpusRowsStage && corpusItems.length > CORPUS_PAGE_SIZE
+      const query = { q: corpusFilterQuery, sort: corpusSort, stage: requestStage }
       // Drop the response if the user switched corpus meanwhile. A load that
       // started before the corpus was known (requestCorpusId null) was
       // answered for the token's corpus, which is the one fetchMe reports.
@@ -3847,24 +3929,22 @@
         const nowCorpus = Number(currentCorpusId) > 0 ? Number(currentCorpusId) : null
         return requestCorpusId !== null && requestCorpusId !== nowCorpus
       }
-      if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) {
-        return
+      let data, total, source, stageTotals, stageTotal
+      if (!prefixPoll) {
+        ;({ data, total, source, stageTotals, stageTotal } = await fetchCorpus({ limit: CORPUS_PAGE_SIZE, offset, ...query }))
+        if (requestSeq !== corpusLoadRequestSeq || corpusScopeChanged()) {
+          return
+        }
       }
       // Committed only once the rows are replaced: a failed prefix reload
       // keeps the old signature (and rows), so the next poll retries it.
       let pageSignature = null
       if (!append) {
-        pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
-        if (poll && pageSignature === lastCorpusPageSignature) {
-          corpusRefreshFailed = false
-          return
-        }
-        // The first page's counts hold whatever the reload below does.
-        applyCorpusCounts(total, stageTotals)
-        // The first page changed while more pages are loaded: a fresh page in
-        // front of the old tail would shift the offsets (rows lost or doubled
-        // on the next "Show more"), so reload every loaded row, in sequential
-        // pages of at most CORPUS_POLL_PAGE_ROWS. The rows are replaced only
+        // More pages are loaded: a fresh first page in front of the old tail
+        // would shift the offsets (rows lost or doubled on the next "Show
+        // more") and a page-2 row that left the stage would stay, so the poll
+        // reloads every loaded row, in sequential pages of at most
+        // CORPUS_POLL_PAGE_ROWS. The rows are replaced only
         // once every page answered; a failed page throws and changes nothing.
         // A write between two pages shifts the offsets (a row doubled or
         // skipped at the boundary). Each page after the first starts on the
@@ -3873,7 +3953,9 @@
         // attempt is retried once, and a second inconsistent one leaves rows
         // and signature for the next poll. Two writes that cancel out exactly
         // at a boundary stay invisible until the first page next changes.
-        if (poll && corpusItems.length > CORPUS_PAGE_SIZE) {
+        // Only within the committed stage: a load for another stage replaces
+        // the rows with its first page.
+        if (prefixPoll) {
           const loadedRows = corpusItems.length
           let prefix = null
           for (let attempt = 0; attempt < 2 && !prefix; attempt += 1) {
@@ -3890,7 +3972,7 @@
               const pageRows = Array.isArray(answer.data) ? answer.data : []
               aligned = !overlap || pageRows[0]?.id === rows[rows.length - 1]?.id
               rows.push(...pageRows.slice(overlap))
-              totals.add(Number(answer.total))
+              totals.add(Number(answer.stageTotal))
               last = answer
               // The corpus ends before the loaded count (rows were removed).
               if (pageRows.length < pageLimit) break
@@ -3899,7 +3981,7 @@
             const ids = rows.map((row) => row?.id)
             if (aligned && totals.size === 1 && new Set(ids).size === ids.length) {
               prefix = rows
-              ;({ total, source, stageTotals } = last)
+              ;({ total, source, stageTotals, stageTotal } = last)
             }
           }
           if (!prefix) {
@@ -3908,6 +3990,13 @@
             return
           }
           data = prefix
+        }
+        // A poll whose rows (the first page, or the whole prefix) and counts
+        // are unchanged commits nothing.
+        pageSignature = corpusPageSignature(Array.isArray(data) ? data : [], total, stageTotals)
+        if (poll && pageSignature === lastCorpusPageSignature) {
+          corpusRefreshFailed = false
+          return
         }
       }
       let incoming = (Array.isArray(data) ? data : []).map((item) => normalizeCorpusItem(item))
@@ -3919,14 +4008,22 @@
         const loadedIds = new Set(corpusItems.map((item) => item?.id))
         incoming = incoming.filter((item) => !loadedIds.has(item?.id))
       }
+      const stageChanged = !append && requestStage !== corpusRowsStage
       corpusItems = append ? [...corpusItems, ...incoming] : incoming
+      if (!append) {
+        corpusRowsStage = requestStage
+        corpusFailedStage = null
+      }
       if (pageSignature !== null) lastCorpusPageSignature = pageSignature
-      applyCorpusCounts(total, stageTotals)
+      applyCorpusCounts(total, stageTotals, stageTotal)
       corpusSource = source
       if (!append) corpusRefreshFailed = false
-      if (!quiet) {
+      // A quiet load that committed rows (a stage change, a poll) keeps the
+      // footer's count in step with the header; other messages stay.
+      const showingStatus = !corpusLoadStatus || corpusLoadStatus.startsWith('Showing ')
+      if (!quiet || stageChanged || (!append && showingStatus)) {
         corpusLoadStatus = corpusHasMore
-          ? `Showing ${corpusItems.length} of ${corpusTotal} entries.`
+          ? `Showing ${corpusItems.length} of ${corpusMatchTotal} entries.`
           : `Showing ${corpusItems.length} entries.`
       }
     } catch (error) {
@@ -3937,6 +4034,8 @@
       if (!append) {
         console.warn('Corpus refresh failed', error)
         corpusRefreshFailed = true
+        // A load for another stage than the rows shown failed: say which (D13).
+        if (requestStage !== corpusRowsStage) corpusFailedStage = requestStage
       }
       if (!quiet) {
         corpusLoadStatus = error?.message || 'Failed to load corpus.'
@@ -4271,6 +4370,7 @@
         includeRotated: true,
         cursor: 0,
         corpusId: getLogsCorpusId(),
+        scope: logsFilterCurrentCorpus ? 'corpus' : 'readable',
       })
       if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
@@ -4322,6 +4422,7 @@
         includeRotated: true,
         cursor: cursorAtRequest,
         corpusId: getLogsCorpusId(),
+        scope: logsFilterCurrentCorpus ? 'corpus' : 'readable',
       })
       if (epoch !== logsScopeEpoch) return
       const entries = Array.isArray(payload?.entries) ? payload.entries : []
@@ -4467,7 +4568,7 @@
         if (!isLogLineForCurrentCorpus(line)) return
         updateExtractionProgressFromLog(line)
         if (logsType !== 'pipeline') return
-        pushLogLine(line)
+        if (isLogLineShownForCurrentCorpus(line)) pushLogLine(line)
         if (shouldTriggerPipelineRefresh(line)) {
           const isWorkerTick =
             String(line).includes('[pipeline-worker') || String(line).includes('[download-worker')
@@ -5401,7 +5502,7 @@
                                       <button
                                         class="link seed-download-link"
                                         type="button"
-                                        title={`Download the file from work ${candidate.downloaded_work_id}`}
+                                        title="Download the file for this item"
                                         on:click|stopPropagation={() => handleSeedCandidateFile(candidate)}
                                       >{text} ⤓</button>
                                     </span>
@@ -5489,6 +5590,7 @@
                 <Corpus
                   {corpusSource}
                   {corpusRefreshFailed}
+                  {corpusFailedStage}
                   {corpusTotal}
                   {corpusItems}
                   {rawTotal}
@@ -5499,6 +5601,10 @@
                   {bucketLabel}
                   {corpusFilterQuery}
                   {handleCorpusFilterInput}
+                  {corpusStageFilter}
+                  onStageFilterChange={handleCorpusStageChange}
+                  {corpusRowsStale}
+                  {corpusMatchTotal}
                   {handleRemoveCorpusWork}
                   {handleRemoveSelectedCorpusWorks}
                   {toggleCorpusSort}
@@ -5564,7 +5670,14 @@
       {/if}
 
       {#if activeTab === 'scraper'}
-        <ScraperLab />
+        <!-- Loaded on first open (D15); the module is cached after that. -->
+        {#await import('./components/ScraperLab.svelte')}
+          <p class="muted">Loading…</p>
+        {:then module}
+          <svelte:component this={module.default} />
+        {:catch error}
+          {logTabImportError('ScraperLab', error)}<p class="muted">Could not load this tab. Reload the page to try again.</p>
+        {/await}
       {/if}
 
       {#if activeTab === 'admin'}
@@ -5791,7 +5904,14 @@
       {/if}
 
       {#if activeTab === 'graph'}
-        <ThreeGraph {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+        <!-- Loaded on first open (D15); the module is cached after that. -->
+        {#await import('./components/ThreeGraph.svelte')}
+          <p class="muted">Loading…</p>
+        {:then module}
+          <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+        {:catch error}
+          {logTabImportError('ThreeGraph', error)}<p class="muted">Could not load this tab. Reload the page to try again.</p>
+        {/await}
       {/if}
     </section>
   </div>

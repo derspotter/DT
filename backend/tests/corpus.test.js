@@ -20,6 +20,20 @@ describe('GET /api/corpus', () => {
     expect(res.body).toHaveProperty('items')
     expect(Array.isArray(res.body.items)).toBe(true)
   })
+
+  test('the stub applies the stage filter and answers stage_total', async () => {
+    const all = await request(app).get('/api/corpus')
+    expect(all.body.stage_total).toBe(all.body.total)
+    const downloaded = await request(app).get('/api/corpus?stage=downloaded')
+    expect(downloaded.body.items).toEqual([])
+    expect(downloaded.body.stage_total).toBe(0)
+    expect(downloaded.body.total).toBe(all.body.total)
+    const metadata = await request(app).get('/api/corpus?stage=metadata')
+    expect(metadata.body.items.map((item) => item.status).sort()).toEqual(['matched', 'queued_download'])
+    expect(metadata.body.stage_total).toBe(2)
+    const bogus = await request(app).get('/api/corpus?stage=bogus')
+    expect(bogus.body.items).toHaveLength(all.body.total)
+  })
 })
 
 describe('GET /api/corpus limit clamp', () => {
@@ -78,5 +92,16 @@ describe('GET /api/corpus limit clamp', () => {
     expect(res.status).toBe(200)
     expect(res.body.items).toHaveLength(7)
     expect(res.body.total).toBe(1005)
+  })
+  test('the stage query parameter reaches the listing', async () => {
+    const auth = { Authorization: `Bearer ${token}` }
+    const empty = await request(app).get('/api/corpus?limit=7&stage=downloaded').set(auth)
+    expect(empty.status).toBe(200)
+    expect(empty.body.items).toHaveLength(0)
+    expect(empty.body.stage_total).toBe(0)
+    expect(empty.body.total).toBe(1005)
+    const metadata = await request(app).get('/api/corpus?limit=7&stage=metadata').set(auth)
+    expect(metadata.body.items).toHaveLength(7)
+    expect(metadata.body.stage_total).toBe(1005)
   })
 })

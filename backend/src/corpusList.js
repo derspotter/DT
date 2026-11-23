@@ -303,6 +303,20 @@ function stageTotals(counts) {
   }
 }
 
+// The STATUS_SQL buckets each stage filter covers (the stageTotals keys).
+const STAGE_STATUSES = {
+  raw: ['raw'],
+  metadata: ['matched', 'queued_download', 'enriching'],
+  downloaded: ['downloaded'],
+  failed_enrichment: ['failed_enrichment'],
+  failed_download: ['failed_download']
+}
+
+// The statuses a stage filter keeps, or null for all stages (unknown values).
+export function corpusStageStatuses(stage) {
+  return Object.hasOwn(STAGE_STATUSES, stage) ? STAGE_STATUSES[stage] : null
+}
+
 const readTransactions = new WeakMap()
 
 // One read transaction per listing: in WAL mode every statement inside sees the
@@ -324,11 +338,11 @@ export function listCorpus(db, options = {}) {
   return read(db, options)
 }
 
-function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort = '', smallCorpusLimit = SMALL_CORPUS_LIMIT } = {}) {
+function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort = '', stage = '', smallCorpusLimit = SMALL_CORPUS_LIMIT } = {}) {
   const scoped = corpusId !== null && corpusId !== undefined
   const emptyCounts = {}
   if (!tableExists(db, 'works')) {
-    return { items: [], total: 0, stage_totals: stageTotals(emptyCounts), status_counts: emptyCounts }
+    return { items: [], total: 0, stage_total: 0, stage_totals: stageTotals(emptyCounts), status_counts: emptyCounts }
   }
 
   const pageLimit = nonNegInt(limit, 200)
@@ -346,14 +360,22 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
     where.push('instr(dt_corpus_search_text(w.title, w.authors, w.source), ?) > 0')
     params.push(needle)
   }
-  const from = `FROM works w ${scoped ? 'JOIN corpus_works cw ON cw.work_id = w.id' : ''} ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`
+  const fromOf = (terms) => `FROM works w ${scoped ? 'JOIN corpus_works cw ON cw.work_id = w.id' : ''} ${terms.length ? `WHERE ${terms.join(' AND ')}` : ''}`
+  // The counts keep the corpus + q scope; only the page queries take the
+  // stage term, built from literals so it binds no parameter. Any other stage
+  // value means all stages.
+  const stageKey = Object.hasOwn(STAGE_STATUSES, stage) ? stage : ''
+  const stageTerm = stageKey ? `${STATUS_SQL} IN (${STAGE_STATUSES[stageKey].map((s) => `'${s}'`).join(', ')})` : ''
+  const pageWhere = stageTerm ? [...where, stageTerm] : where
+  const countFrom = fromOf(where)
+  const from = fromOf(pageWhere)
 
   let statusCounts = {}
   let total = 0
   if (needle) {
     // The q filter runs through the dt_corpus_search_text UDF on every row, so
     // the filtered counts need their own GROUP BY over the filtered rows.
-    for (const row of db.prepare(`SELECT ${STATUS_SQL} AS status, COUNT(*) AS n ${from} GROUP BY 1`).all(...params)) {
+    for (const row of db.prepare(`SELECT ${STATUS_SQL} AS status, COUNT(*) AS n ${countFrom} GROUP BY 1`).all(...params)) {
       statusCounts[row.status] = row.n
       total += row.n
     }
@@ -395,7 +417,7 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
     } else {
       // One JSON parameter instead of one per id: pages may exceed SQLite's
       // bound-variable limit.
-      const fetched = db.prepare(`SELECT ${columns} ${from} ${where.length ? 'AND' : 'WHERE'} w.id IN (SELECT value FROM json_each(?))`)
+      const fetched = db.prepare(`SELECT ${columns} ${from} ${pageWhere.length ? 'AND' : 'WHERE'} w.id IN (SELECT value FROM json_each(?))`)
         .all(...params, JSON.stringify(ids))
       const byId = new Map(fetched.map((row) => [row.id, row]))
       // filter(Boolean): never throw on a row gone missing (the transaction
@@ -405,7 +427,8 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
   } else {
     const key = sortExpression(column, addedSql)
     const dir = reverse ? 'DESC' : 'ASC'
-    const rest = needle ? ` AND ${where[where.length - 1]}` : ''
+    // Every non-corpus page term (q, stage); the corpus term is first when scoped.
+    const rest = pageWhere.slice(scoped ? 1 : 0).map((t) => ` AND ${t}`).join('')
     let sql
     let args = params
     if (!key && !(scoped && corpusIsSmall(db, corpusId, smallCorpusLimit)) && rawYearOrderMatches(db)) {
@@ -433,7 +456,7 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
       // script ties, so a member with added_at = '' (an index-served probe)
       // sends the sort to the CASE below. Driving from corpus_works lets
       // idx_corpus_works_added serve the order; cw.work_id equals w.id.
-      sql = `SELECT ${columns} FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE ${where.join(' AND ')}
+      sql = `SELECT ${columns} FROM corpus_works cw JOIN works w ON w.id = cw.work_id WHERE ${pageWhere.join(' AND ')}
         ORDER BY cw.added_at ${dir}, cw.work_id DESC`
     } else {
       // Text/REAL/BLOB years take dt_corpus_int via YEAR_SQL. Explicit sorts tie-break
@@ -468,5 +491,6 @@ function readCorpus(db, { corpusId = null, limit = 200, offset = 0, q = '', sort
     }
   })
 
-  return { items, total, stage_totals: stageTotals(statusCounts), status_counts: statusCounts }
+  const totals = stageTotals(statusCounts)
+  return { items, total, stage_total: stageKey ? totals[stageKey] : total, stage_totals: totals, status_counts: statusCounts }
 }

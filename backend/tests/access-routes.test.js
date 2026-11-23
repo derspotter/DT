@@ -4,6 +4,7 @@ import path from 'node:path'
 import Database from 'better-sqlite3'
 import bcrypt from 'bcryptjs'
 import request from 'supertest'
+import { jest } from '@jest/globals'
 
 describe('explicit-corpus routes enforce corpus roles', () => {
   let app
@@ -115,8 +116,11 @@ describe('explicit-corpus routes enforce corpus roles', () => {
     })
 
     fs.writeFileSync(
-      path.join(logDir, 'backend-pipeline.log'),
-      [`[p] corpus=${ids.A} line-a`, `[p] corpus=${ids.B} line-b`].join('\n') + '\n',
+      path.join(logDir, 'backend-pipeline-v2.log'),
+      [
+        `[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=${ids.A}] line-a`,
+        `[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=${ids.B}] line-b`,
+      ].join('\n') + '\n',
       'utf8'
     )
     fs.writeFileSync(path.join(logDir, 'backend-app.log'), '[app] one\n', 'utf8')
@@ -167,13 +171,13 @@ describe('explicit-corpus routes enforce corpus roles', () => {
 
     const own = await request(app).get(`/api/logs/tail?type=pipeline&corpus_id=${ids.A}`).set(as('viewer3'))
     expect(own.status).toBe(200)
-    expect(own.body.entries).toEqual([`[p] corpus=${ids.A} line-a`])
+    expect(own.body.entries).toEqual([`[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=${ids.A}] line-a`])
   })
 
   test('logs: pipeline without corpus_id uses req.corpusId; none -> 403 Select a corpus first', async () => {
     const scoped = await request(app).get('/api/logs/tail?type=pipeline').set(as('viewer3'))
     expect(scoped.status).toBe(200)
-    expect(scoped.body.entries).toEqual([`[p] corpus=${ids.A} line-a`])
+    expect(scoped.body.entries).toEqual([`[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=${ids.A}] line-a`])
 
     const none = await request(app).get('/api/logs/tail?type=pipeline').set(as('nocorpus6'))
     expect(none.status).toBe(403)
@@ -400,5 +404,223 @@ describe('explicit-corpus routes enforce corpus roles', () => {
         db.prepare('SELECT COUNT(*) AS n FROM corpus_kantropos_assignments WHERE corpus_id IN (999999, -1)').get().n
       )
     ).toBe(0)
+  })
+
+  // D11: the readable scope, the corpus-tag trust boundary, the v2 log
+  // generation and the post-read access recheck. Own users, corpora and log dir.
+  describe('logs: readable scope and the post-read recheck', () => {
+    const ts = '[2026-01-01T00:00:00.000Z]'
+    let caseDir = ''
+    const realOpen = fs.promises.open.bind(fs.promises)
+
+    // One-shot: `fn(filePath)` runs right after the first real open whose path
+    // satisfies `match`.
+    const onOpen = (match, fn) => {
+      let fired = false
+      return jest.spyOn(fs.promises, 'open').mockImplementation(async (...args) => {
+        const handle = await realOpen(...args)
+        if (!fired && match(String(args[0]))) {
+          fired = true
+          fn(String(args[0]))
+        }
+        return handle
+      })
+    }
+
+    beforeAll(async () => {
+      withDb((db) => {
+        ids.owner11 = insertUser(db, 'owner11')
+        ids.member9 = insertUser(db, 'member9')
+        ids.member10 = insertUser(db, 'member10')
+        const corpus = (name) =>
+          Number(db.prepare('INSERT INTO corpora (name, owner_user_id) VALUES (?, ?)').run(name, ids.owner11).lastInsertRowid)
+        ids.E = corpus('Corpus E')
+        ids.F = corpus('Corpus F')
+        ids.G = corpus('Corpus G')
+        const grant = db.prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'viewer')")
+        grant.run(ids.member9, ids.E)
+        grant.run(ids.member9, ids.F)
+        grant.run(ids.member10, ids.A)
+        db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(ids.E, ids.member9)
+        db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(ids.A, ids.member10)
+        ids.admin = db.prepare('SELECT id FROM users WHERE username = ?').get(adminUsername).id
+      })
+      tokens.member9 = await login('member9')
+      tokens.member10 = await login('member10')
+    })
+
+    beforeEach(() => {
+      caseDir = fs.mkdtempSync(path.join(tmpDir, 'logs-case-'))
+      process.env.RAG_FEEDER_LOG_DIR = caseDir
+      fs.writeFileSync(
+        path.join(caseDir, 'backend-pipeline-v2.log'),
+        [
+          `${ts} [get_bib_pages][corpus=${ids.E}] line-e`,
+          `${ts} [get_bib_pages][corpus=${ids.F}] line-f`,
+          `${ts} [get_bib_pages][corpus=${ids.G}] line-g`,
+          `${ts} [p] untagged-line`,
+          `${ts} [get_bib_pages][corpus=none] line-n`,
+          `${ts} [DAEMON] Job 9 failed: corpus=${ids.E} boom`,
+        ].join('\n') + '\n',
+        'utf8'
+      )
+      fs.writeFileSync(
+        path.join(caseDir, 'backend-pipeline.log'),
+        [`${ts} [DAEMON] Job 8 failed: Traceback`, `${ts} [get_bib_pages][corpus=${ids.E}] forged-legacy`].join('\n') + '\n',
+        'utf8'
+      )
+      fs.writeFileSync(path.join(caseDir, 'backend-app.log'), '[app] one\n', 'utf8')
+    })
+
+    afterEach(() => {
+      jest.restoreAllMocks()
+      process.env.RAG_FEEDER_LOG_DIR = logDir
+      withDb((db) => {
+        db.prepare('UPDATE users SET username = ? WHERE id = ?').run(adminUsername, ids.admin)
+        db.prepare("INSERT OR IGNORE INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'viewer')").run(
+          ids.member9,
+          ids.F
+        )
+      })
+    })
+
+    const lineE = () => `${ts} [get_bib_pages][corpus=${ids.E}] line-e`
+    const lineF = () => `${ts} [get_bib_pages][corpus=${ids.F}] line-f`
+
+    test('logs: scope=readable shows what the live socket would', async () => {
+      const viewer = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('member9'))
+      expect(viewer.status).toBe(200)
+      expect(viewer.body.entries).toEqual([lineE(), lineF()])
+      const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
+      expect(admin.status).toBe(200)
+      expect(admin.body.entries).toHaveLength(8)
+      expect(admin.body.entries.slice(0, 2)).toEqual([
+        `${ts} [DAEMON] Job 8 failed: Traceback`,
+        `${ts} [get_bib_pages][corpus=${ids.E}] forged-legacy`,
+      ])
+      expect(admin.body.entries.slice(2)[0]).toBe(lineE())
+      expect(admin.body).not.toHaveProperty('total_lines')
+      expect(viewer.body).not.toHaveProperty('total_lines')
+    })
+
+    test('logs: a legacy continuation with a complete recognized prefix never reaches a member', async () => {
+      const base = '/api/logs/tail?type=pipeline&include_rotated=1&cursor=0'
+      const cases = [
+        [`${base}&scope=readable`, [lineE(), lineF()]],
+        [`${base}&corpus_id=${ids.E}`, [lineE()]],
+        [base, [lineE()]],
+      ]
+      for (const [url, expected] of cases) {
+        const res = await request(app).get(url).set(as('member9'))
+        expect([url, res.status, res.body.entries, res.body.has_more]).toEqual([url, 200, expected, false])
+      }
+    })
+
+    test('logs: a scoped admin read never includes the old generation', async () => {
+      const res = await request(app)
+        .get(`/api/logs/tail?type=pipeline&corpus_id=${ids.E}&include_rotated=1&cursor=0`)
+        .set(as('admin'))
+      expect(res.status).toBe(200)
+      expect(res.body.entries).toEqual([lineE()])
+      expect(res.body.has_more).toBe(false)
+    })
+
+    test('logs: an admin demoted during a merged read that includes the old generation gets no window', async () => {
+      onOpen(
+        (p) => path.basename(p) === 'backend-pipeline.log',
+        () => withDb((db) => db.prepare("UPDATE users SET username = 'demoted' WHERE id = ?").run(ids.admin))
+      )
+      const res = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
+      expect(res.status).toBe(409)
+      expect(res.body).toEqual({ error: 'Log access changed during the read' })
+    })
+
+    test('logs: an explicit foreign corpus_id with scope=readable is still 403', async () => {
+      const res = await request(app)
+        .get(`/api/logs/tail?type=pipeline&scope=readable&corpus_id=${ids.G}`)
+        .set(as('member9'))
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('No access to this corpus')
+    })
+
+    test('logs: a scope value other than readable keeps the current-corpus fallback', async () => {
+      const none = await request(app).get('/api/logs/tail?type=pipeline').set(as('member9'))
+      expect(none.body.entries).toEqual([lineE()])
+      for (const scope of ['READABLE', 'all']) {
+        const res = await request(app).get(`/api/logs/tail?type=pipeline&scope=${scope}`).set(as('member9'))
+        expect([scope, res.status, res.body.entries]).toEqual([scope, 200, none.body.entries])
+      }
+    })
+
+    test('logs: type=app stays admin-only with scope=readable', async () => {
+      const res = await request(app).get('/api/logs/tail?type=app&scope=readable').set(as('member9'))
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('Admin access required')
+    })
+
+    test('logs: a membership revoked during the read discards the window', async () => {
+      onOpen(
+        () => true,
+        () =>
+          withDb((db) =>
+            db.prepare('DELETE FROM user_corpora WHERE user_id = ? AND corpus_id = ?').run(ids.member9, ids.F)
+          )
+      )
+      const res = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('member9'))
+      expect(res.status).toBe(409)
+      expect(res.body).toEqual({ error: 'Log access changed during the read' })
+    })
+
+    test('logs: an admin who loses admin access during an app-log read gets no window', async () => {
+      onOpen(
+        () => true,
+        () => withDb((db) => db.prepare("UPDATE users SET username = 'demoted' WHERE id = ?").run(ids.admin))
+      )
+      const res = await request(app).get('/api/logs/tail?type=app').set(as('admin'))
+      expect(res.status).toBe(409)
+      expect(res.body).toEqual({ error: 'Log access changed during the read' })
+    })
+
+    test('logs: a member response names no server path; the admin keeps source_file', async () => {
+      for (const url of ['/api/logs/tail?type=pipeline&scope=readable', `/api/logs/tail?type=pipeline&corpus_id=${ids.E}`, '/api/logs/tail?type=pipeline']) {
+        const member = await request(app).get(url).set(as('member9'))
+        expect([url, member.status, Object.prototype.hasOwnProperty.call(member.body, 'source_file')]).toEqual([url, 200, false])
+        expect(JSON.stringify(member.body)).not.toContain(caseDir)
+      }
+      const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
+      expect(admin.body.source_file).toBe(path.join(caseDir, 'backend-pipeline-v2.log'))
+    })
+
+    test('logs: a read error answers a member with a generic message, the admin with the detail', async () => {
+      const failOpen = () =>
+        jest.spyOn(fs.promises, 'open').mockImplementation(async (p) => {
+          throw Object.assign(new Error(`EACCES: permission denied, open '${p}'`), { code: 'EACCES' })
+        })
+      const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {})
+      failOpen()
+      for (const url of ['/api/logs/tail?type=pipeline&scope=readable', `/api/logs/tail?type=pipeline&corpus_id=${ids.E}`, '/api/logs/tail?type=pipeline']) {
+        const member = await request(app).get(url).set(as('member9'))
+        expect([url, member.status, member.body]).toEqual([url, 500, { error: 'Could not read the log' }])
+      }
+      const admin = await request(app).get('/api/logs/tail?type=pipeline&scope=readable').set(as('admin'))
+      expect(admin.status).toBe(500)
+      expect(admin.body.error).toContain('EACCES')
+      expect(admin.body.error).toContain(caseDir)
+      expect(consoleError).toHaveBeenCalledWith('[/api/logs/tail] Error:', expect.objectContaining({ code: 'EACCES' }))
+    })
+
+    test('logs: a user deleted during the read gets no window', async () => {
+      onOpen(
+        () => true,
+        () =>
+          withDb((db) => {
+            db.prepare('DELETE FROM user_corpora WHERE user_id = ?').run(ids.member10)
+            db.prepare('DELETE FROM users WHERE id = ?').run(ids.member10)
+          })
+      )
+      const res = await request(app).get('/api/logs/tail?type=pipeline').set(as('member10'))
+      expect(res.status).toBe(409)
+      expect(res.body).toEqual({ error: 'Log access changed during the read' })
+    })
   })
 })

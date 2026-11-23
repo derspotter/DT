@@ -24,9 +24,10 @@ async function boot(page: Page, hash: string, file: string[] | null = null) {
     answer: (() => Promise<TailBody>) | null
     cursors: string[]
     lines: string[]
+    params: URLSearchParams[]
     file: string[] | null
     hold: Promise<void> | null
-  } = { answer: null, cursors: [], lines: [], file, hold: null }
+  } = { answer: null, cursors: [], lines: [], params: [], file, hold: null }
   page.on('pageerror', (error) => errors.push(error.message))
   await mockLogSocket(page, (ws) => {
     handle.socket = ws
@@ -42,6 +43,7 @@ async function boot(page: Page, hash: string, file: string[] | null = null) {
       return fulfil(route, mePayload())
     }
     if (path === '/api/logs/tail') {
+      tail.params.push(new URLSearchParams(url.searchParams))
       tail.cursors.push(url.searchParams.get('cursor') || '')
       tail.lines.push(url.searchParams.get('lines') || '')
       if (tail.file) {
@@ -78,6 +80,9 @@ async function boot(page: Page, hash: string, file: string[] | null = null) {
 }
 
 const panel = (page: Page) => page.getByTestId('logs-panel')
+// "Current corpus only" is on by default: a live line shows only with the
+// corpus tag in the server's fixed position (logLineCorpusId), as in the tail.
+const live = (text: string) => `[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=1] ${text}`
 const gapText = /^Connection lost \d\d:\d\d:\d\d–\d\d:\d\d:\d\d\. Lines from that period may be missing\.$/
 // File lines and gap markers in view order.
 const renderedTexts = (page: Page) => page.locator('.log-box').locator('.log-line, .log-gap__text').allTextContents()
@@ -92,30 +97,30 @@ test('a burst of 200 lines is one flush', async ({ page }) => {
       ;(window as any).__logCountChanges += records.length
     }).observe(el, { attributes: true, attributeFilter: ['data-log-count'] })
   })
-  for (let i = 1; i <= 200; i += 1) handle.socket!.send(`[pipeline] burst line ${i}`)
+  for (let i = 1; i <= 200; i += 1) handle.socket!.send(live(`[pipeline] burst line ${i}`))
   await page.waitForTimeout(600)
   await expect(panel(page)).toHaveAttribute('data-log-count', '200')
   const changes = await page.evaluate(() => (window as any).__logCountChanges)
   expect(changes).toBeGreaterThanOrEqual(1)
   expect(changes).toBeLessThanOrEqual(2)
-  await expect(page.locator('.log-line').last()).toHaveText('[pipeline] burst line 200')
+  await expect(page.locator('.log-line').last()).toHaveText(live('[pipeline] burst line 200'))
 })
 
 test('lines received on another tab appear when the logs tab opens, capped at the history', async ({ page }) => {
   expect(maxLogHistory).toBe(5000)
   const { handle } = await boot(page, '#/workspace')
-  for (let i = 1; i <= 6000; i += 1) handle.socket!.send(`[pipeline] line ${i}`)
+  for (let i = 1; i <= 6000; i += 1) handle.socket!.send(live(`[pipeline] line ${i}`))
   // Let every frame reach the page while the logs tab is closed.
   await page.waitForTimeout(1000)
   await page.evaluate(() => { window.location.hash = '#/logs' })
   await expect(panel(page)).toHaveAttribute('data-log-count', String(maxLogHistory))
-  await expect(page.locator('.log-line').first()).toHaveText(`[pipeline] line ${6000 - maxLogHistory + 1}`)
-  await expect(page.getByText('[pipeline] line 6000', { exact: true })).toBeVisible()
+  await expect(page.locator('.log-line').first()).toHaveText(live(`[pipeline] line ${6000 - maxLogHistory + 1}`))
+  await expect(page.getByText(live('[pipeline] line 6000'), { exact: true })).toBeVisible()
 })
 
 test('a JSON extraction frame drives the extraction card and a promotion frame is ignored', async ({ page }) => {
   const { handle, errors } = await boot(page, '#/logs')
-  handle.socket!.send('[pipeline] before frames')
+  handle.socket!.send(live('[pipeline] before frames'))
   await expect(panel(page)).toHaveAttribute('data-log-count', '1')
 
   handle.socket!.send(JSON.stringify({ kind: 'promotion', corpus_id: 1, promoted: 3 }))
@@ -148,7 +153,7 @@ async function reconnect(page: Page, handle: { socket: WebSocketRoute | null; co
 
 test('lines buffered before a socket reconnect survive it and are not re-hydrated', async ({ page }) => {
   const { handle, tail } = await boot(page, '#/workspace')
-  for (const n of [1, 2, 3]) handle.socket!.send(`[pipeline] kept line ${n}`)
+  for (const n of [1, 2, 3]) handle.socket!.send(live(`[pipeline] kept line ${n}`))
   await page.waitForTimeout(300)
   await reconnect(page, handle)
   // Only the first connect hydrated: the reconnect found buffered content.
@@ -157,7 +162,7 @@ test('lines buffered before a socket reconnect survive it and are not re-hydrate
   // The three lines plus the reconnect's gap marker.
   await expect(panel(page)).toHaveAttribute('data-log-count', '4')
   for (const n of [1, 2, 3]) {
-    await expect(page.getByText(`[pipeline] kept line ${n}`, { exact: true })).toHaveCount(1)
+    await expect(page.getByText(live(`[pipeline] kept line ${n}`), { exact: true })).toHaveCount(1)
   }
   await expect(page.locator('.log-gap')).toHaveCount(1)
   await expect(page.locator('.log-gap__text')).toHaveText(gapText)
@@ -166,11 +171,11 @@ test('lines buffered before a socket reconnect survive it and are not re-hydrate
 
 test('500 buffered lines survive a reconnect whole', async ({ page }) => {
   const { handle, tail } = await boot(page, '#/workspace')
-  for (let i = 1; i <= 500; i += 1) handle.socket!.send(`[pipeline] buffered ${i}`)
+  for (let i = 1; i <= 500; i += 1) handle.socket!.send(live(`[pipeline] buffered ${i}`))
   await page.waitForTimeout(500)
   // A tail answer, if one were requested, would be the last 200 file lines.
   tail.answer = async () => ({
-    entries: Array.from({ length: 200 }, (_, i) => `[pipeline] buffered ${301 + i}`),
+    entries: Array.from({ length: 200 }, (_, i) => live(`[pipeline] buffered ${301 + i}`)),
     next_cursor: 200,
     has_more: true,
   })
@@ -179,32 +184,32 @@ test('500 buffered lines survive a reconnect whole', async ({ page }) => {
   // The 500 lines plus the reconnect's gap marker after them.
   await expect(panel(page)).toHaveAttribute('data-log-count', '501')
   await expect(page.locator('.log-line')).toHaveCount(500)
-  await expect(page.locator('.log-line').first()).toHaveText('[pipeline] buffered 1')
-  await expect(page.locator('.log-line').last()).toHaveText('[pipeline] buffered 500')
+  await expect(page.locator('.log-line').first()).toHaveText(live('[pipeline] buffered 1'))
+  await expect(page.locator('.log-line').last()).toHaveText(live('[pipeline] buffered 500'))
   await expect(page.locator('.log-gap')).toHaveCount(1)
   expect(tail.cursors).toHaveLength(1)
 })
 
 test('Refresh from file replaces the rendered lines with the tail and continues from its cursor', async ({ page }) => {
   const { handle, tail } = await boot(page, '#/logs')
-  handle.socket!.send('[pipeline] live line')
+  handle.socket!.send(live('[pipeline] live line'))
   await expect(panel(page)).toHaveAttribute('data-log-count', '1')
   // The backend persists a line before broadcasting it: the tail has it.
   tail.answer = async () => ({
-    entries: ['[pipeline] old a', '[pipeline] old b', '[pipeline] live line'],
+    entries: ['[pipeline] old a', '[pipeline] old b', live('[pipeline] live line')],
     next_cursor: 3,
     has_more: true,
   })
   await page.getByRole('button', { name: 'Refresh from file' }).click()
   await expect(panel(page)).toHaveAttribute('data-log-count', '3')
-  await expect(page.getByText('[pipeline] live line', { exact: true })).toHaveCount(1)
+  await expect(page.getByText(live('[pipeline] live line'), { exact: true })).toHaveCount(1)
   await page.getByRole('button', { name: 'Load older' }).click()
   await expect.poll(() => tail.cursors.length).toBe(3)
   expect(tail.cursors[2]).toBe('3')
 })
 
 test('Load older pages through the file without gaps or duplicates while lines arrive', async ({ page }) => {
-  const line = (n: number) => `[pipeline] file line ${n}`
+  const line = (n: number) => live(`[pipeline] file line ${n}`)
   const file = Array.from({ length: 450 }, (_, i) => line(i + 1))
   const { handle, tail } = await boot(page, '#/logs', file)
   await expect(panel(page)).toHaveAttribute('data-log-count', '200')
@@ -260,7 +265,7 @@ async function fillView(page: Page, shown: number) {
   const file = Array.from({ length: 6000 }, (_, i) => fileLine(i + 1))
   const booted = await boot(page, '#/logs', file)
   await expect(panel(page)).toHaveAttribute('data-log-count', '200')
-  for (let i = 1; i <= shown - 200; i += 1) booted.handle.socket!.send(`[pipeline] live ${i}`)
+  for (let i = 1; i <= shown - 200; i += 1) booted.handle.socket!.send(live(`[pipeline] live ${i}`))
   await expect(panel(page)).toHaveAttribute('data-log-count', String(shown))
   await expect(panel(page)).toHaveAttribute('data-logs-cursor', String(shown))
   return { ...booted, fileLine }
@@ -287,7 +292,7 @@ test('Load older admits only what still fits when the answer arrives', async ({ 
   await expect.poll(() => tail.cursors.length).toBe(2)
   expect(tail.cursors[1]).toBe('4950')
   expect(tail.lines[1]).toBe('50')
-  for (let i = 1; i <= 30; i += 1) handle.socket!.send(`[pipeline] late ${i}`)
+  for (let i = 1; i <= 30; i += 1) handle.socket!.send(live(`[pipeline] late ${i}`))
   await expect(panel(page)).toHaveAttribute('data-log-count', '4980')
   await expect(panel(page)).toHaveAttribute('data-logs-cursor', '4980')
   release()
@@ -296,7 +301,7 @@ test('Load older admits only what still fits when the answer arrives', async ({ 
   // The answer was file lines 1001-1050; the newest 20 sit next to the view.
   await expect(page.locator('.log-line').first()).toHaveText(fileLine(1031))
   await expect(page.getByText(fileLine(1030), { exact: true })).toHaveCount(0)
-  await expect(page.locator('.log-line').last()).toHaveText('[pipeline] late 30')
+  await expect(page.locator('.log-line').last()).toHaveText(live('[pipeline] late 30'))
   // 30 flushed live lines + 20 admitted, not + 50.
   await expect(panel(page)).toHaveAttribute('data-logs-cursor', '5000')
 })
@@ -308,29 +313,29 @@ test('Load older admits nothing when live lines fill the view before the answer'
   await page.getByRole('button', { name: 'Load older' }).click()
   await expect.poll(() => tail.cursors.length).toBe(2)
   expect(tail.lines[1]).toBe('50')
-  for (let i = 1; i <= 50; i += 1) handle.socket!.send(`[pipeline] late ${i}`)
+  for (let i = 1; i <= 50; i += 1) handle.socket!.send(live(`[pipeline] late ${i}`))
   await expect(panel(page)).toHaveAttribute('data-log-count', '5000')
   release()
   await expect(panel(page)).toContainText(fullViewText)
   await expect(panel(page)).toHaveAttribute('data-log-count', '5000')
   await expect(page.getByText(fileLine(1050), { exact: true })).toHaveCount(0)
-  await expect(page.locator('.log-line').last()).toHaveText('[pipeline] late 50')
+  await expect(page.locator('.log-line').last()).toHaveText(live('[pipeline] late 50'))
   await expect(panel(page)).toHaveAttribute('data-logs-cursor', '5000')
 })
 
 test('a reconnect keeps the view and adds one gap marker with Reload logs', async ({ page }) => {
   const { handle, tail } = await boot(page, '#/logs')
-  for (const text of ['a', 'b', 'c']) handle.socket!.send(text)
+  for (const text of ['a', 'b', 'c']) handle.socket!.send(live(text))
   await expect(panel(page)).toHaveAttribute('data-log-count', '3')
   const before = handle.connects
   handle.socket!.close({ code: 1006 })
   await expect.poll(() => handle.connects, { timeout: 8000 }).toBe(before + 1)
-  handle.socket!.send('d')
+  handle.socket!.send(live('d'))
   await expect(panel(page)).toHaveAttribute('data-log-count', '5')
   const texts = await renderedTexts(page)
-  expect(texts.slice(0, 3)).toEqual(['a', 'b', 'c'])
+  expect(texts.slice(0, 3)).toEqual(['a', 'b', 'c'].map(live))
   expect(texts[3]).toMatch(gapText)
-  expect(texts[4]).toBe('d')
+  expect(texts[4]).toBe(live('d'))
   expect(texts).toHaveLength(5)
   expect(tail.cursors).toEqual(['0'])
 
@@ -343,7 +348,7 @@ test('a reconnect keeps the view and adds one gap marker with Reload logs', asyn
 })
 
 test('after a reconnect gap Load older waits for Reload logs (D7, K-M1)', async ({ page }) => {
-  const line = (n: number) => `[pipeline] file line ${n}`
+  const line = (n: number) => live(`[pipeline] file line ${n}`)
   const file = Array.from({ length: 450 }, (_, i) => line(i + 1))
   const { handle, tail } = await boot(page, '#/logs', file)
   await expect(panel(page)).toHaveAttribute('data-log-count', '200')
@@ -375,7 +380,7 @@ test('after a reconnect gap Load older waits for Reload logs (D7, K-M1)', async 
 })
 
 test('a tail requested before a reconnect gap does not clear the gap (K-M1 round 2)', async ({ page }) => {
-  const line = (n: number) => `[pipeline] file line ${n}`
+  const line = (n: number) => live(`[pipeline] file line ${n}`)
   const file = Array.from({ length: 450 }, (_, i) => line(i + 1))
   const { handle, tail } = await boot(page, '#/logs', file)
   await expect(panel(page)).toHaveAttribute('data-log-count', '200')
@@ -397,4 +402,47 @@ test('a tail requested before a reconnect gap does not clear the gap (K-M1 round
   await expect.poll(() => tail.cursors.length).toBe(3)
   await expect(older).toBeEnabled()
   await expect(page.getByTestId('logs-older-hint')).toHaveCount(0)
+})
+
+test('turning "Current corpus only" off loads the readable scope', async ({ page }) => {
+  const { tail } = await boot(page, '#/logs')
+  await panel(page).getByLabel('Current corpus only').uncheck()
+  await expect.poll(() => tail.params.at(-1)?.get('scope')).toBe('readable')
+  expect(tail.params.at(-1)?.has('corpus_id')).toBe(false)
+  expect(tail.params[0].get('corpus_id')).toBe('1')
+})
+
+test('the log type switch loads the app log without scope or corpus_id, then the pipeline log again', async ({ page }) => {
+  const { tail } = await boot(page, '#/logs')
+  await page.getByTestId('logs-type-select').selectOption('app')
+  await expect.poll(() => tail.params.at(-1)?.get('type')).toBe('app')
+  expect(tail.params.at(-1)?.has('scope')).toBe(false)
+  expect(tail.params.at(-1)?.has('corpus_id')).toBe(false)
+  await page.getByTestId('logs-type-select').selectOption('pipeline')
+  await expect.poll(() => tail.params.at(-1)?.get('type')).toBe('pipeline')
+  await expect(panel(page).getByRole('button', { name: 'Refresh from file' })).toBeVisible()
+})
+
+// FE-59 / D11: the admin's live "Current corpus only" view keeps exactly the
+// lines the refreshed tail keeps: the corpus tag counts only in the server's
+// fixed position, untagged and [DAEMON] lines are left out.
+test('the live corpus filter uses the tail\'s fixed-position tag rule', async ({ page }) => {
+  const { handle } = await boot(page, '#/logs')
+  const ts = '[2026-01-01T00:00:00.000Z]'
+  for (const text of [
+    `${ts} [DAEMON] [corpus=1] daemon line`,
+    `${ts} [get_bib_pages] failed: corpus=1`,
+    '[pipeline] untagged line',
+    `${ts} [get_bib_pages][corpus=2] other corpus`,
+    `${ts} [x][corpus=1] unknown label`,
+    `${ts} [extract-status] [corpus=1] [base=b] kept`,
+    // The tag value is compared as a number, as the server does.
+    `${ts} [get_bib_pages][corpus=001] padded kept`,
+    `${ts} [get_bib_pages][corpus=010] padded other`,
+  ]) handle.socket!.send(text)
+  await page.waitForTimeout(600)
+  expect(await renderedTexts(page)).toEqual([
+    `${ts} [extract-status] [corpus=1] [base=b] kept`,
+    `${ts} [get_bib_pages][corpus=001] padded kept`,
+  ])
 })

@@ -211,3 +211,23 @@ test('select-all on a partly promoted paged seed reads checked and clears on the
   for (const index of [0, 1, 2, 3, 4]) await expect(rowCheckbox(page, index)).not.toBeChecked()
   expect(errors).toEqual([])
 })
+
+// D2: the list answers a match the caller cannot read as not downloaded (no
+// work id, no file), so no Download button offers a file the route would 404.
+test('a candidate shows a Download button only when the server marks its file readable', async ({ page }) => {
+  await boot(page, {
+    corpusId: 1,
+    promoteBody: null,
+    holdPromote: null,
+    candidates: [
+      { ...candidates[0], candidate_key: 'readable', title: 'Readable copy', state: 'downloaded_elsewhere', downloaded_work_id: 9, file_available: true } as any,
+      { ...candidates[1], candidate_key: 'unreadable', title: 'Unreadable copy', state: 'pending', downloaded_work_id: null, file_available: false } as any,
+      { ...candidates[2], candidate_key: 'missing', title: 'Missing copy', state: 'downloaded', downloaded_work_id: 8, file_available: false } as any,
+    ],
+  })
+  await expandSeed(page)
+  const row = (title: string) => page.getByTestId('seed-candidate-row').filter({ hasText: title })
+  await expect(row('Readable copy').locator('.seed-download-link')).toHaveCount(1)
+  await expect(row('Unreadable copy').locator('.seed-download-link')).toHaveCount(0)
+  await expect(row('Missing copy').locator('.seed-download-link')).toHaveCount(0)
+})

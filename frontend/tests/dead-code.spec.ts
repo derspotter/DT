@@ -259,3 +259,40 @@ test('a failed count check after the extraction does not report an empty PDF', a
   await expect(page.getByText('Extraction finished.')).toBeVisible()
   await expect(page.getByText('No bibliography entries found in this PDF.')).toHaveCount(0)
 })
+
+test('extraction completion loads the seed, stats and runs in parallel', async ({ page }) => {
+  const ws = await openSocket(page)
+  const gated = ['/api/seed/sources/pdf/paper/candidates', '/api/ingest/stats', '/api/ingest/runs']
+  const gates = new Map(gated.map((path) => [path, deferred()]))
+  const arrived = new Set<string>()
+  let armed = false
+  await mockBackend(page, { latest: 0 }, async (path, route) => {
+    if (path === '/api/seed/sources') {
+      await fulfil(route, pdfSeed(3))
+      return true
+    }
+    if (!armed || !gates.has(path) || arrived.has(path)) {
+      if (path === '/api/seed/sources/pdf/paper/candidates') {
+        await fulfil(route, { candidates: [{ candidate_key: 'c1', title: 'Entry' }], total: 3, limit: 200 })
+        return true
+      }
+      return false
+    }
+    // Only the first request per path after the done frame is held.
+    arrived.add(path)
+    await gates.get(path)!.promise
+    if (path === '/api/seed/sources/pdf/paper/candidates') {
+      await fulfil(route, { candidates: [{ candidate_key: 'c1', title: 'Entry' }], total: 3, limit: 200 })
+      return true
+    }
+    return false
+  })
+  await finishExtraction(page, ws)
+  armed = true
+  ws.socket!.send(frame('paper', { event: 'done', status: 'success' }))
+  await expect(page.getByText('Extraction complete.')).toBeVisible()
+  // All three requested while none has been answered.
+  await expect.poll(() => arrived.size, { timeout: 3000 }).toBe(3)
+  for (const gate of gates.values()) gate.resolve()
+  await expect(page.getByRole('progressbar', { name: 'Extraction progress' })).toHaveCount(0)
+})

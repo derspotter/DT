@@ -295,12 +295,6 @@ export async function extractBibliography(filename) {
   })
 }
 
-export async function fetchBibliographyEntries(baseName) {
-  return requestJson(`/api/ingest/latest?baseName=${encodeURIComponent(baseName)}&limit=5000`, {
-    errorMessage: 'Failed to load ingest entries',
-  })
-}
-
 export async function fetchIngestStats({ global = false } = {}) {
   return requestJson(`/api/ingest/stats${global ? '?global=1' : ''}`, { errorMessage: 'Failed to load ingest stats' })
 }
@@ -516,18 +510,22 @@ export async function fetchOpenAlexQuota() {
   return requestJson('/api/openalex/quota', { errorMessage: 'Failed to load OpenAlex quota' })
 }
 
-export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '' } = {}) {
+export async function fetchCorpus({ limit = 200, offset = 0, q = '', sort = '', stage = 'all' } = {}) {
   const params = new URLSearchParams()
   params.set('limit', String(limit))
   params.set('offset', String(offset))
   if (q) params.set('q', q)
   if (sort) params.set('sort', sort)
+  if (stage && stage !== 'all') params.set('stage', stage)
   const payload = await requestJson(`/api/corpus?${params.toString()}`, { errorMessage: 'Failed to load corpus' })
   const data = Array.isArray(payload) ? payload : payload.items || []
   const total = Number.isFinite(Number(payload?.total)) ? Number(payload.total) : data.length
   const stageTotals = payload?.stage_totals || null
   const statusCounts = payload?.status_counts || null
-  return { data, total, source: payload.source || 'api', stageTotals, statusCounts }
+  // The count of rows matching the stage filter too (the paging total);
+  // equals total when no stage is set.
+  const stageTotal = Number(payload?.stage_total ?? total)
+  return { data, total, source: payload.source || 'api', stageTotals, statusCounts, stageTotal }
 }
 
 // Fetched as a blob rather than linked directly: this route is behind the
@@ -658,13 +656,17 @@ export async function fetchLogsTail({
   includeRotated = true,
   cursor = 0,
   corpusId = null,
+  scope = 'corpus',
 } = {}) {
   const params = new URLSearchParams()
   params.set('type', String(type || 'pipeline'))
   params.set('lines', String(lines || 200))
   params.set('cursor', String(cursor || 0))
   params.set('include_rotated', includeRotated ? '1' : '0')
-  if (type === 'pipeline' && corpusId !== undefined && corpusId !== null) {
+  // `readable`: every pipeline line the live view may show (filter off).
+  if (type === 'pipeline' && scope === 'readable') {
+    params.set('scope', 'readable')
+  } else if (type === 'pipeline' && corpusId !== undefined && corpusId !== null) {
     params.set('corpus_id', String(corpusId))
   }
   return requestJson(`/api/logs/tail?${params.toString()}`, { errorMessage: 'Failed to fetch log tail' })
@@ -813,11 +815,4 @@ export async function fetchGraph3DNodeDetail(nodeId) {
     timeout: PIPELINE_TIMEOUT,
     errorMessage: 'Failed to load graph node',
   })
-}
-
-export async function fetchGraph3DClusterDetail(snapshotKey, clusterId) {
-  return requestJson(
-    `/api/graph/3d/cluster/${encodeURIComponent(String(snapshotKey || ''))}/${encodeURIComponent(String(clusterId || ''))}`,
-    { timeout: PIPELINE_TIMEOUT, errorMessage: 'Failed to load graph cluster' }
-  )
 }

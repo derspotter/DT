@@ -75,3 +75,9 @@ def test_busy_timeout_matches_the_connect_timeout(tmp_path):
         assert db.conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
     finally:
         db.conn.close()
+
+
+def test_pipeline_jobs_status_index_is_created(tmp_path):
+    db = DatabaseManager(str(tmp_path / "lit.db"))
+    names = {r[0] for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "idx_pipeline_jobs_status_finished" in names

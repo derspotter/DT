@@ -39,6 +39,6 @@ def test_log_appends_to_pipeline_log_file(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path / "logs"))
     mod, _ = _daemon(monkeypatch, tmp_path, lambda self, *a: object())
     mod.log("x-marker")
-    text = (tmp_path / "logs" / "backend-pipeline.log").read_text()
+    text = (tmp_path / "logs" / "backend-pipeline-v2.log").read_text()
     assert "[DAEMON] x-marker" in text
     assert "Failed to write to log file" not in capsys.readouterr().err

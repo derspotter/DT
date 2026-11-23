@@ -181,14 +181,46 @@ docker logs -f rag_feeder_frontend
 Persistent log files:
 
 - `logs/backend-app.log`
-- `logs/backend-pipeline.log`
+- `logs/backend-pipeline-v2.log`
+
+The pipeline log writers escape embedded line breaks, so every record is one
+line. They write `backend-pipeline-v2.log` (rotated as `.1` … `.5`). The old
+`logs/backend-pipeline.log` generation is no longer written: the Logs view shows
+it only to the admin, in the unfiltered view, and it ages out by hand.
 
 Tail them directly:
 
 ```bash
 tail -f logs/backend-app.log
-tail -f logs/backend-pipeline.log
+tail -f logs/backend-pipeline-v2.log
 ```
+
+Deploy step for the switch to `backend-pipeline-v2.log` (run once, from the repo
+root): the enrich and download workers are long-running processes and keep
+writing the old file until they restart on the new code.
+
+```bash
+BEFORE=$(docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log)
+# The worker's own clock and format (datetime.now().isoformat()), taken before the restart.
+SINCE=$(docker compose exec -T rag_enrich_worker \
+  python -c "from datetime import datetime; print(datetime.now().isoformat())")
+docker compose restart rag_backend rag_enrich_worker rag_download_worker
+# Give both workers time to start, then count fresh startup records per role.
+# A record counts only in the worker's exact format (worker.py log() and the
+# daemon's start line): "[<isoformat>] [DAEMON] <role> daemon starting. Waiting for work..."
+LOG=/usr/src/app/logs/backend-pipeline-v2.log
+for ROLE in enrich download; do
+  docker compose exec -T rag_backend awk -v since="[$SINCE]" -v role="$ROLE" '
+    BEGIN { want = "^\\[[0-9T:.-]+\\] \\[DAEMON\\] " role " daemon starting\\. Waiting for work\\.\\.\\.$" }
+    $1 > since && $0 ~ want { n++ }
+    END { print role ": " n+0 }' "$LOG"
+done
+docker compose exec -T rag_backend stat -c %s /usr/src/app/logs/backend-pipeline.log
+```
+
+Expected: `enrich: 1` and `download: 1` (one startup record per worker role
+written after `$SINCE`; rerun the loop after a few seconds if a worker is still
+starting), and the legacy size equals `$BEFORE`.
 
 Log API examples:
 
@@ -265,7 +297,7 @@ Typical causes:
 
 Actions:
 
-1. check `logs/backend-pipeline.log`
+1. check `logs/backend-pipeline-v2.log`
 2. check backend container logs
 3. confirm whether extraction actually finished and the issue is only UI status
 

@@ -187,14 +187,14 @@ describe('graph routes are scoped to readable corpora', () => {
     }
   })
 
-  test('cluster and snapshot files: k1 member 200, k2 member 403 admin 200, k3 member 403 admin 200', async () => {
+  test('snapshot files: k1 member 200, k2 member 403 admin 200, k3 member 403 admin 200', async () => {
     const expectations = [
       [fx.k1, 200, 200],
       [fx.k2, 403, 200],
       [fx.k3, 403, 200],
     ]
     for (const [key, memberStatus, adminStatus] of expectations) {
-      for (const url of [`/api/graph/3d/cluster/${key}/1`, `/api/graph/3d/snapshot/${key}/clusters.json`]) {
+      for (const url of [`/api/graph/3d/snapshot/${key}/clusters.json`]) {
         const member = await get(url, fx.viewer3Token)
         expect([url, member.status]).toEqual([url, memberStatus])
         if (memberStatus === 403) expect(member.body).toEqual({ error: 'Admin access required' })
@@ -203,7 +203,7 @@ describe('graph routes are scoped to readable corpora', () => {
       }
     }
     // A user who is not a member of k1's corpus is refused as well.
-    const lonely = await get(`/api/graph/3d/cluster/${fx.k1}/1`, fx.lonelyToken)
+    const lonely = await get(`/api/graph/3d/snapshot/${fx.k1}/clusters.json`, fx.lonelyToken)
     expect(lonely.status).toBe(403)
     expect(lonely.body).toEqual({ error: 'No access to this corpus' })
     // A client-supplied corpus never widens access.

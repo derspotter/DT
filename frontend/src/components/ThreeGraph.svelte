@@ -4,7 +4,6 @@
     fetchGraph3DSnapshot,
     fetchGraph3DSnapshotResources,
     fetchGraph3DNodeDetail,
-    fetchGraph3DClusterDetail,
   } from '../lib/api'
   import { createNodeQuadMaterial, createEdgeMaterial } from '../lib/graphMaterials'
   import { chooseEdgeSegments } from '../lib/graphGeometry'
@@ -82,7 +81,6 @@
   let hoveredNode = null
   let selectedCluster = null
   let selectedNodeDetail = null
-  let selectedClusterDetail = null
   let nodeDetailLoading = false
   let edgeEndpoints = null
   let edgeVertexStride = 2
@@ -95,7 +93,6 @@
   let yearFilterTimer = 0
   let fadeStart = 0
   const nodeDetailCache = new Map()
-  const clusterDetailCache = new Map()
   // Worker that builds the curved-edge buffers off the main thread (the per-edge
   // Bézier sampling is the heaviest part of a render at the 400k–650k edge
   // scale). Lazily created; null means "build synchronously on this thread".
@@ -1037,7 +1034,6 @@
   function selectCluster(cluster) {
     if (!cluster) return
     selectedCluster = Number(cluster.id)
-    void loadClusterDetail(cluster)
   }
 
   // Select a territory AND fly the camera to frame it. Used by the floating
@@ -1136,29 +1132,6 @@
     }
   }
 
-  async function loadClusterDetail(cluster) {
-    const snapshotKey = graphData.manifest?.snapshot_key
-    if (!snapshotKey || cluster?.id === undefined || cluster?.id === null) {
-      selectedClusterDetail = cluster || null
-      return
-    }
-    const cacheKey = `${snapshotKey}:${cluster.id}`
-    if (clusterDetailCache.has(cacheKey)) {
-      selectedClusterDetail = clusterDetailCache.get(cacheKey)
-      return
-    }
-    selectedClusterDetail = cluster
-    try {
-      const detail = await fetchGraph3DClusterDetail(snapshotKey, cluster.id)
-      clusterDetailCache.set(cacheKey, detail)
-      // Guard against a slower earlier request overwriting a newer selection:
-      // only apply if this cluster is still the selected one (cf. loadNodeDetail).
-      if (Number(cluster.id) === selectedCluster) selectedClusterDetail = detail
-    } catch {
-      if (Number(cluster.id) === selectedCluster) selectedClusterDetail = cluster
-    }
-  }
-
   function runSearch() {
     const query = searchQuery.trim().toLowerCase()
     if (query.length < 2) {
@@ -1204,7 +1177,6 @@
     selectedIndex = null
     hoveredNode = null
     selectedCluster = null
-    selectedClusterDetail = null
     halo = { ...halo, visible: false }
     disposeSelectionEdges()
     recomputeAlphas()
@@ -1250,7 +1222,6 @@
     halo = { ...halo, visible: false }
     tooltip = { ...tooltip, visible: false }
     selectedCluster = null
-    selectedClusterDetail = null
     searchResults = []
     const groupBy = groupByForMode(groupMode) || loadedGroupBy || 'field'
     try {
@@ -1836,7 +1807,6 @@
   $: activeNodeDetail = selectedNode && selectedNodeDetail ? { ...selectedNode, ...selectedNodeDetail } : activeNode
   $: clusters = graphData.clusters || []
   $: selectedClusterData = clusters.find((cluster) => Number(cluster.id) === selectedCluster)
-  $: selectedClusterPanel = selectedClusterDetail || selectedClusterData
   $: legendItems = clusterLegend.slice(0, 12)
   // The "Show all nodes" reset is only for states that actually dim the graph
   // (territory isolation, a citation path) — a plain selection no longer does.
@@ -2060,17 +2030,17 @@
         Regions: {compactList(graphData.stats?.top_regions)} ({coverageLabel(graphData.stats?.region_coverage)})
       </p>
 
-      {#if selectedClusterPanel}
+      {#if selectedClusterData}
         <div class="graph-3d-cluster-detail">
           <span class="eyebrow">Cluster profile</span>
-          <strong>{selectedClusterPanel.label}</strong>
-          <span class="muted small">{formatNumber(selectedClusterPanel.size)} works / radius {Math.round(selectedClusterPanel.radius || 0)}</span>
-          <span class="muted small">Areas: {compactList(selectedClusterPanel.areas)}</span>
-          <span class="muted small">Regions: {compactList(selectedClusterPanel.regions)}</span>
-          <span class="muted small">Countries: {compactList(selectedClusterPanel.countries, 'unknown countries')}</span>
-          <span class="muted small">Types: {compactList(selectedClusterPanel.types)}</span>
-          {#if selectedClusterPanel.year_min || selectedClusterPanel.year_max}
-            <span class="muted small">Years: {selectedClusterPanel.year_min || '?'}-{selectedClusterPanel.year_max || '?'}</span>
+          <strong>{selectedClusterData.label}</strong>
+          <span class="muted small">{formatNumber(selectedClusterData.size)} works / radius {Math.round(selectedClusterData.radius || 0)}</span>
+          <span class="muted small">Areas: {compactList(selectedClusterData.areas)}</span>
+          <span class="muted small">Regions: {compactList(selectedClusterData.regions)}</span>
+          <span class="muted small">Countries: {compactList(selectedClusterData.countries, 'unknown countries')}</span>
+          <span class="muted small">Types: {compactList(selectedClusterData.types)}</span>
+          {#if selectedClusterData.year_min || selectedClusterData.year_max}
+            <span class="muted small">Years: {selectedClusterData.year_min || '?'}-{selectedClusterData.year_max || '?'}</span>
           {/if}
         </div>
       {/if}

@@ -266,7 +266,7 @@ def worker(monkeypatch):
 
 def test_log_writes_three_lines_with_one_open(worker, monkeypatch, tmp_path):
     monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path))
-    log_file = str(tmp_path / "backend-pipeline.log")
+    log_file = str(tmp_path / "backend-pipeline-v2.log")
     opens = []
     real_open = builtins.open
 
@@ -283,19 +283,40 @@ def test_log_writes_three_lines_with_one_open(worker, monkeypatch, tmp_path):
     assert [line.split("[DAEMON] ", 1)[1] for line in lines] == ["line 0", "line 1", "line 2"]
 
 
+def test_log_escapes_line_breaks(worker, monkeypatch, tmp_path):
+    monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path))
+    worker.log("Job 9 failed: Traceback\n[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=12] forged\r\nend\rlast")
+    raw = (tmp_path / "backend-pipeline-v2.log").read_bytes().decode("utf-8")
+    assert raw.endswith("\n") and raw.count("\n") == 1 and "\r" not in raw
+    line = raw[:-1]
+    assert line.split("[DAEMON] ", 1)[1] == (
+        "Job 9 failed: Traceback\\n[2026-01-01T00:00:00.000Z] [get_bib_pages][corpus=12] forged\\nend\\nlast"
+    )
+
+
+def test_log_prints_the_raw_text_and_escapes_only_the_log_file_line(worker, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(tmp_path))
+    worker.log("Traceback\n  File x\nValueError")
+    out = capsys.readouterr().out
+    assert out.endswith("[DAEMON] Traceback\n  File x\nValueError\n")
+    raw = (tmp_path / "backend-pipeline-v2.log").read_text()
+    assert raw.count("\n") == 1
+    assert raw.rstrip("\n").endswith("[DAEMON] Traceback\\n  File x\\nValueError")
+
+
 def test_log_follows_a_changed_log_dir_and_a_rotated_file(worker, monkeypatch, tmp_path):
     first, second = tmp_path / "a", tmp_path / "b"
     monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(first))
     worker.log("one")
     monkeypatch.setenv("RAG_FEEDER_LOG_DIR", str(second))
     worker.log("two")
-    assert "one" in (first / "backend-pipeline.log").read_text()
-    assert "two" in (second / "backend-pipeline.log").read_text()
+    assert "one" in (first / "backend-pipeline-v2.log").read_text()
+    assert "two" in (second / "backend-pipeline-v2.log").read_text()
     # backend/src/index.js rotates by renaming the file: the next line lands in a new file.
-    os.rename(second / "backend-pipeline.log", second / "backend-pipeline.log.1")
+    os.rename(second / "backend-pipeline-v2.log", second / "backend-pipeline-v2.log.1")
     worker.log("three")
-    assert "three" in (second / "backend-pipeline.log").read_text()
-    assert "three" not in (second / "backend-pipeline.log.1").read_text()
+    assert "three" in (second / "backend-pipeline-v2.log").read_text()
+    assert "three" not in (second / "backend-pipeline-v2.log.1").read_text()
 
 
 def test_log_reopens_after_a_write_error(worker, monkeypatch, tmp_path):
@@ -318,7 +339,7 @@ def test_log_reopens_after_a_write_error(worker, monkeypatch, tmp_path):
     worker._LOG_STATE["handle"] = Broken()
     worker.log("two")
     real.close()
-    assert [line.split("[DAEMON] ", 1)[1] for line in (tmp_path / "backend-pipeline.log").read_text().splitlines()] == [
+    assert [line.split("[DAEMON] ", 1)[1] for line in (tmp_path / "backend-pipeline-v2.log").read_text().splitlines()] == [
         "one",
         "two",
     ]

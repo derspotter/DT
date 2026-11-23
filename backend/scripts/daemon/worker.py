@@ -122,7 +122,8 @@ def _log_handle_is_current(log_file: str) -> bool:
 
 
 def _append_log_line(log_dir: str, line: str) -> None:
-    log_file = os.path.join(log_dir, "backend-pipeline.log")
+    # The escaped-format generation (D11); backend-pipeline.log is admin-only history.
+    log_file = os.path.join(log_dir, "backend-pipeline-v2.log")
     with _LOG_LOCK:
         for attempt in range(2):
             try:
@@ -143,11 +144,15 @@ def _append_log_line(log_dir: str, line: str) -> None:
 def log(msg: str):
     timestamp = datetime.now().isoformat()
     formatted_msg = f"[{timestamp}] [DAEMON] {msg}"
+    # stdout (docker logs) keeps the raw text, tracebacks stay readable.
     print(formatted_msg, flush=True)
-    # Also append to the same pipeline log file that Node.js uses, so the UI can read it
+    # Also append to the same pipeline log file that Node.js uses, so the UI can read it.
+    # One record per line there: a traceback's continuation lines must never stand
+    # apart from their header in the pipeline log (D11).
+    file_line = formatted_msg.replace("\r\n", "\\n").replace("\r", "\\n").replace("\n", "\\n")
     log_dir = os.environ.get("RAG_FEEDER_LOG_DIR", "/usr/src/app/logs")
     try:
-        _append_log_line(log_dir, formatted_msg)
+        _append_log_line(log_dir, file_line)
     except Exception as e:
         print(f"[DAEMON ERROR] Failed to write to log file: {e}", file=sys.stderr)
 

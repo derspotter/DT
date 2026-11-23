@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createPythonRunner } from '../src/pythonProcess.js'
+import { createPythonRunner, parseJsonFromOutput } from '../src/pythonProcess.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const VENV_PYTHON = '/home/jay/DT/venv/bin/python'
@@ -150,4 +150,96 @@ test('the import-seed route leaves --corpus-id to spawnPython', () => {
   expect(start).toBeGreaterThan(0)
   const body = src.slice(start, src.indexOf('app.post(', start + 10))
   expect(body).not.toMatch(/--corpus-id/)
+})
+
+// D12 (BE-42): the fallback is the original multiline search, capped by a
+// cumulative work budget (controller ruling): within the budget every result
+// equals 95d861e's, a pathological input throws instead of pinning a core.
+const NO_JSON = 'No valid JSON output from python.'
+
+// Runs the parser while measuring the work actually done: every string built by
+// Array#join and every character handed to JSON.parse, independent of the
+// parser's own counters.
+function measured(output) {
+  const stats = { visited: 0, parses: 0, parsedChars: 0 }
+  const realJoin = Array.prototype.join
+  const realParse = JSON.parse
+  const seen = { joined: 0, parsed: 0 }
+  Array.prototype.join = function join(...args) {
+    const out = realJoin.apply(this, args)
+    seen.joined += out.length
+    return out
+  }
+  JSON.parse = function parse(text, ...rest) {
+    seen.parsed += String(text).length
+    return realParse(text, ...rest)
+  }
+  let result
+  let error = null
+  try {
+    result = parseJsonFromOutput(output, { stats })
+  } catch (e) {
+    error = e
+  } finally {
+    Array.prototype.join = realJoin
+    JSON.parse = realParse
+  }
+  return { stats, seen, result, error }
+}
+
+const pathological = {
+  'tagged log lines with brackets': Array.from({ length: 300 }, (_, i) => `[DB Manager] step ${i} [${i}/300]`).join('\n'),
+  'repeated unclosed openers': Array.from({ length: 2000 }, (_, i) => `[warn ${i} {unclosed`).join('\n'),
+  'overlapping malformed multiline blocks': [
+    ...Array.from({ length: 1000 }, () => '{"a":'),
+    'oops',
+    ...Array.from({ length: 1000 }, () => '}'),
+  ].join('\n'),
+  'nested blocks closing on one long line': [...Array.from({ length: 8000 }, () => '{"a":'), 'oops', '}'.repeat(8000)].join('\n'),
+}
+
+for (const [name, output] of Object.entries(pathological)) {
+  test(`a pathological input throws within the work budget: ${name}`, () => {
+    const { stats, seen, error } = measured(output)
+    expect(error?.message).toBe(`No valid JSON output from python. Output was: ${output}`)
+    const cap = 4 * output.length + 64 * 1024
+    expect(stats.cap).toBe(cap)
+    expect(stats.parses).toBeGreaterThan(0)
+    expect(stats.visited + stats.parsedChars).toBeLessThanOrEqual(cap)
+    // The real work, measured outside the parser: the fast path reads each line
+    // once; everything else is the fallback, which must stay within the cap.
+    expect(seen.joined + seen.parsed).toBeLessThanOrEqual(cap + 2 * output.length)
+  })
+}
+
+test('the thrown error text is unchanged', () => {
+  expect(() => parseJsonFromOutput('[log] nothing')).toThrow('No valid JSON output from python. Output was: [log] nothing')
+})
+
+// Strict parity with 95d861e (each expected value is what that revision returns).
+const parity = [
+  ['a later single-line log label does not displace an earlier JSON result', '{\n "ok": true\n}\n[3] done', { ok: true }],
+  ['a pretty-printed object with a nested array returns the whole object', JSON.stringify({ items: [1], ok: true }, null, 2), { items: [1], ok: true }],
+  ['diagnostic text with a quote before the first opener does not hide the block', 'warning " opening {\n  "ok": true\n}', { ok: true }],
+  // Ruling: the unchanged fast path wins, so the brief's fixture with
+  // '"n": [1, 2]' on its own line returns [1, 2]; the reordered one exercises the fallback.
+  ['the fast path takes a nested array alone on its line', '[log] a\n{\n  "ok": true,\n  "n": [1, 2]\n}\n[log] done', [1, 2]],
+  ['a pretty-printed block before trailing log lines', '[log] a\n{\n  "n": [1, 2],\n  "ok": true\n}\n[log] done', { ok: true, n: [1, 2] }],
+  ['brackets inside strings', '{\n "s": "a } ] {"\n}', { s: 'a } ] {' }],
+  ['escaped quotes and backslashes', '{\n "q": "say \\"hi\\" \\\\"\n}', { q: 'say "hi" \\' }],
+  ['a quote outside a block', '[log] it said "unterminated\n{\n "a": 1\n}', { a: 1 }],
+  ['a dangling [ before a quoted diagnostic', '[warn] items: [\nmsg: "oops {\n  "ok": true\n}', { ok: true }],
+  ['a dangling [ before an unquoted diagnostic', '[warn] unmatched [ here\nnote "quoted" then {\n  "ok": true\n}', { ok: true }],
+  ['a dangling [ before a line starting with a quote', '[warn] items: [\n"oops {\n  "ok": true\n}', { ok: true }],
+  ['a dangling [ and a bracket inside a string', '[warn] items: [\nresult: {"text": "[",\n "ok": true\n}', { text: '[', ok: true }],
+]
+for (const [name, output, expected] of parity) {
+  test(`parity: ${name}`, () => {
+    expect(parseJsonFromOutput(output)).toEqual(expected)
+  })
+}
+
+test('parity: an outer block with trailing text on its closing line stays unparsed', () => {
+  // 95d861e throws here too; the budgeted fallback keeps its results.
+  expect(() => parseJsonFromOutput('{\n "a": 1\n} done')).toThrow(NO_JSON)
 })

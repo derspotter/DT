@@ -53,7 +53,6 @@ def db():
 # former copy -> (shared function or None when kept private, getter for the name call sites use)
 DOI_MAP = {
     "dl_lit.db_manager.DatabaseManager._normalize_doi": (normalize_doi, lambda db: db._normalize_doi),
-    "backend.scripts.ingest_latest.normalize_doi": (normalize_doi, lambda db: _script("ingest_latest").normalize_doi),
     # graph_3d_export / migrate_to_works trimmed the input first: normalize_doi(str(v).strip()).
     "backend.scripts.graph_3d_export.normalize_doi": (None, lambda db: _script("graph_3d_export").normalize_doi),
     "backend.scripts.migrate_to_works.normalize_doi": (None, lambda db: _script("migrate_to_works").normalize_doi),
@@ -124,7 +123,8 @@ def _assert_reproduces(fn, raw_input, expected):
 
 
 def test_fixture_covers_every_former_copy():
-    assert set(FIXTURE["doi"]) == set(DOI_MAP)
+    assert set(FIXTURE["doi"]) - set(DOI_MAP) == {"backend.scripts.ingest_latest.normalize_doi"}
+    assert set(DOI_MAP) <= set(FIXTURE["doi"])
     assert set(FIXTURE["openalex_id"]) == set(OPENALEX_MAP)
     # The shadowed first db_manager definition was dead code and is deleted.
     assert set(FIXTURE["inverted_index"]) - set(INVERTED_MAP) == {
@@ -196,7 +196,6 @@ def test_call_sites_alias_the_shared_functions():
     assert ks.normalize_doi is extract_doi_lower
     assert ks.normalize_openalex_id is normalize_openalex_id_strict
     assert ks.openalex_result_to_record is openalex_work_to_record
-    assert _script("ingest_latest").normalize_doi is normalize_doi
     for name in ("backfill_openalex_topics", "backfill_citation_edges", "migrate_to_works", "graph_3d_export"):
         assert _script(name).normalize_openalex_id is normalize_openalex_id
 

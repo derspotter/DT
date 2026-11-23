@@ -40,6 +40,7 @@ WORKS_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_works_state ON works(download_status, metadata_status, metadata_lease_expires_at, download_lease_expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_works_year_id ON works(year, id)",
     "CREATE INDEX IF NOT EXISTS idx_corpus_works_added ON corpus_works(corpus_id, added_at, work_id)",
+    "CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_status_finished ON pipeline_jobs(status, finished_at)",
 ]
 
 # Redundant: covered by a primary key or by the prefix of another index (or legacy, created by nothing).

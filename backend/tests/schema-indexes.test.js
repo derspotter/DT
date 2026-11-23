@@ -3,7 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Database from 'better-sqlite3'
-import { ensureAuthSchema } from '../src/app.js'
+import request from 'supertest'
+import { ensureAuthSchema, createApp } from '../src/app.js'
 import { ensureSeedSchema } from '../src/seed.js'
 
 const NEW = ['idx_works_state', 'idx_works_year_id', 'idx_corpus_works_added']
@@ -110,4 +111,44 @@ test('the retained-index DDL is textually identical in app.js and db_manager.py'
     expect(ddl).not.toBeNull()
     expect(py).toContain(`"${ddl[0]}"`)
   }
+})
+
+test('ensureAuthSchema indexes pipeline_jobs by status and finished_at, idempotently', () => {
+  withDb((db) => {
+    db.exec(`CREATE TABLE pipeline_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, corpus_id INTEGER, job_type TEXT NOT NULL,
+      status TEXT DEFAULT 'pending', parameters_json TEXT, result_json TEXT, created_at TIMESTAMP, started_at TIMESTAMP, finished_at TIMESTAMP)`)
+    ensureAuthSchema(db)
+    ensureAuthSchema(db)
+    expect(indexNames(db).has('idx_pipeline_jobs_status_finished')).toBe(true)
+    expect(db.prepare("PRAGMA index_info('idx_pipeline_jobs_status_finished')").all().map((r) => r.name)).toEqual(['status', 'finished_at'])
+    const plan = (sql, ...args) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args).map((r) => r.detail).join(' ')
+    expect(plan(
+      `SELECT id, status FROM pipeline_jobs WHERE job_type = ? AND corpus_id IS ? AND status IN (?, ?) ORDER BY created_at ASC, id ASC LIMIT 1`,
+      'enrich', 1, 'pending', 'running'
+    )).toContain('idx_pipeline_jobs_status_finished')
+    expect(plan(
+      `DELETE FROM pipeline_jobs WHERE status IN ('completed','failed','cancelled') AND finished_at < ?`, '2026-01-01'
+    )).toContain('idx_pipeline_jobs_status_finished')
+  })
+})
+
+test('the pipeline_jobs index DDL is textually identical in app.js and db_manager.py', () => {
+  const app = fs.readFileSync(path.join(HERE, '..', 'src', 'app.js'), 'utf8')
+  const py = fs.readFileSync(path.join(HERE, '..', '..', 'dl_lit_project', 'dl_lit', 'db_manager.py'), 'utf8')
+  const ddl = app.match(/CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_status_finished ON [^;`'"]+/)
+  expect(ddl).not.toBeNull()
+  expect(py).toContain(`"${ddl[0]}"`)
+})
+
+test('the ingest/latest route is gone', async () => {
+  process.env.RAG_FEEDER_STUB = '1'
+  try {
+    const res = await request(createApp({ broadcast: () => {} })).get('/api/ingest/latest')
+    expect(res.status).toBe(404)
+  } finally {
+    delete process.env.RAG_FEEDER_STUB
+  }
+  const app = fs.readFileSync(path.join(HERE, '..', 'src', 'app.js'), 'utf8')
+  expect(app).not.toContain('INGEST_LATEST_SCRIPT')
+  expect(app).not.toContain('/api/ingest/latest')
 })
