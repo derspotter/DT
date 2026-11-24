@@ -389,5 +389,32 @@ process.stdout.write('{}')
       expect(range.body.length).toBe(2)
       expect([...range.body]).toEqual([1, 2])
     })
+
+    // Only a missing manifest means "rebuilt" (409); an unreadable one is a
+    // server error, logged, not a reason to reload the graph forever.
+    test('an unreadable manifest answers 500 and is logged; a missing one still answers 409', async () => {
+      const broken = 'a7a7a7a7a7a7a7a7a7a7'
+      const brokenDir = path.join(snapshotDir, broken)
+      fs.mkdirSync(brokenDir, { recursive: true })
+      fs.writeFileSync(path.join(brokenDir, 'manifest.json'), '{"generated_at": "A", trunc')
+      fs.writeFileSync(path.join(brokenDir, 'nodes.bin'), bytes)
+      const errors = jest.spyOn(console, 'error').mockImplementation(() => {})
+      try {
+        const res = await get(`/api/graph/3d/snapshot/${broken}/nodes.bin?v=A`, fx.adminToken)
+        expect(res.status).toBe(500)
+        expect(res.body.code).not.toBe('snapshot_rebuilt')
+        expect(res.headers['cache-control']).toBe('no-store')
+        expect(errors.mock.calls.some((args) => String(args[0]).startsWith('[graph3d] could not read the manifest version'))).toBe(true)
+      } finally {
+        errors.mockRestore()
+      }
+
+      const missing = 'b8b8b8b8b8b8b8b8b8b8'
+      fs.mkdirSync(path.join(snapshotDir, missing), { recursive: true })
+      fs.writeFileSync(path.join(snapshotDir, missing, 'nodes.bin'), bytes)
+      const gone = await get(`/api/graph/3d/snapshot/${missing}/nodes.bin?v=A`, fx.adminToken)
+      expect(gone.status).toBe(409)
+      expect(gone.body.code).toBe('snapshot_rebuilt')
+    })
   })
 })

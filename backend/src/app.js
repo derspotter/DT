@@ -598,15 +598,19 @@ async function warmGraph3dSnapshot() {
 }
 
 // The build version a snapshot's resource URLs carry in ?v=: the manifest's
-// generated_at, else its mtime floored; null when the manifest cannot be read.
+// generated_at, else its mtime floored; null when there is no manifest
+// (ENOENT). Any other read or parse error is logged and thrown: it is not a
+// rebuild, and the file route answers 500 for it.
 function graph3dManifestVersion(key) {
   const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
   try {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
     if (manifest?.generated_at) return String(manifest.generated_at);
     return String(Math.floor(fs.statSync(manifestPath).mtimeMs));
-  } catch {
-    return null;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    console.error(`[graph3d] could not read the manifest version of ${key}:`, error?.message || error);
+    throw error;
   }
 }
 
@@ -5896,9 +5900,18 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     // instead of pairing files of two builds. The backend is the only writer
     // and swaps with sync renames, so nothing swaps between this check and the
     // next statement; sendFile's async open after it is an accepted residual.
-    if (typeof req.query?.v === 'string' && graph3dManifestVersion(key) !== req.query.v) {
-      res.set('Cache-Control', 'no-store');
-      return res.status(409).json({ error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' });
+    if (typeof req.query?.v === 'string') {
+      let liveVersion;
+      try {
+        liveVersion = graph3dManifestVersion(key);
+      } catch {
+        res.set('Cache-Control', 'no-store');
+        return res.status(500).json({ error: 'Could not read the graph snapshot manifest' });
+      }
+      if (liveVersion !== req.query.v) {
+        res.set('Cache-Control', 'no-store');
+        return res.status(409).json({ error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' });
+      }
     }
     const filePath = graph3dSnapshotPath(key, fileName);
     if (!fs.existsSync(filePath)) {
