@@ -1820,6 +1820,7 @@
   })
 
   onDestroy(() => {
+    nodeDetailSeq += 1 // a detail request still pending belongs to no graph now
     componentMounted = false
     if (animationFrame) cancelAnimationFrame(animationFrame)
     if (settleFrame) cancelAnimationFrame(settleFrame)

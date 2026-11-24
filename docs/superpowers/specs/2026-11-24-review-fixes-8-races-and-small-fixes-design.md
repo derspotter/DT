@@ -403,8 +403,9 @@ call.**
   run between a synchronous check and the next statement.
 - A helper `graph3dManifestVersion(key) -> string | null` returns the version
   `decorateGraph3dManifest` puts in `?v=`: `String(manifest.generated_at)` when present, else the
-  manifest's `mtimeMs` floored, as today (`app.js:610-619`); `null` when the manifest cannot be
-  read. `decorateGraph3dManifest` uses the same rule (it keeps taking `generated_at` from the
+  manifest's `mtimeMs` floored, as today (`app.js:610-619`); `null` when the manifest does not
+  exist (ENOENT, answered 409 so the client reloads). Any other read or parse error is logged and
+  the file route answers 500 (final review fix). `decorateGraph3dManifest` uses the same rule (it keeps taking `generated_at` from the
   manifest it decorates).
 - The file route keeps its middleware order: `requireAuthMiddleware`, then
   `requireGraph3dScopeAccess`, then the handler. An outsider gets 403 before any version check,

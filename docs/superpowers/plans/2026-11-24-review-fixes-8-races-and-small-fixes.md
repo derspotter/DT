@@ -240,7 +240,7 @@ Runs after Task 1 (browser runs are serialized; it uses Task 1's checkpoint help
 - Test: `backend/tests/graph-read-path.test.js`, `backend/tests/graph-access.test.js`, `frontend/tests/graph-3d.spec.ts` (in the CI list).
 
 **Interfaces:**
-- Produces (module-local, not exported): `graph3dManifestVersion(key: string) -> string | null`. It reads `graph3dSnapshotPath(key, 'manifest.json')` once. When `generated_at` is present it returns `String(manifest.generated_at)`, else `String(Math.floor(mtimeMs))`, and `null` when the manifest is unreadable.
+- Produces (module-local, not exported): `graph3dManifestVersion(key: string) -> string | null`. It reads `graph3dSnapshotPath(key, 'manifest.json')` once. When `generated_at` is present it returns `String(manifest.generated_at)`, else `String(Math.floor(mtimeMs))`, and `null` when the manifest does not exist (ENOENT); other read or parse errors are logged and the route answers 500 (final review fix).
 - Consumes: `trackFetches`, `fetchStats`, `afterBodyRead` (Task 1).
 
 - [ ] **Step 1: Write the failing tests.**

@@ -310,3 +310,56 @@ test('a seed upload answered after a corpus switch does not import into the next
   expect((await fetchStats(page, '/api/process_pdf')).calls).toBe(upload.calls)
   expect(uploadRequests).toBe(1)
 })
+
+// An import that already started in corpus 1 reports its result on its row,
+// also after corpus 1 → 2 → 1 while it ran (the row is back on screen).
+test('an import that settles after switching away and back shows its result', async ({ page }) => {
+  importResult = IMPORTED
+  let release!: () => void
+  const importGate = new Promise<void>((r) => { release = r })
+  let corpusId = 1
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await trackFetches(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') {
+      return fulfil(route, mePayload({
+        corpusId,
+        corpora: [1, 2].map((id) => ({ id, name: `Research corpus ${id}`, role: 'owner', owner_username: 'admin' })),
+      }))
+    }
+    const select = path.match(/^\/api\/corpora\/(\d+)\/select$/)
+    if (select) {
+      corpusId = Number(select[1])
+      return fulfil(route, { selected: corpusId })
+    }
+    if (path === '/api/ingest/import-seed') await importGate
+    await mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('admin')
+
+  await page.locator('input[type="file"]').first().setInputFiles([{
+    name: 'references.bib',
+    mimeType: 'application/x-bibtex',
+    buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+  }])
+  await expect.poll(async () => (await fetchStats(page, '/api/ingest/import-seed')).calls).toBe(1)
+
+  const picker = page.locator('.header-corpus-picker select')
+  for (const target of ['2', '1']) {
+    const me = (await fetchStats(page, '/api/auth/me')).reads
+    await picker.selectOption(target)
+    await afterBodyRead(page, '/api/auth/me', me)
+  }
+  await expect(page.getByText('references.bib')).toBeVisible()
+
+  const imports = (await fetchStats(page, '/api/ingest/import-seed')).reads
+  release()
+  await afterBodyRead(page, '/api/ingest/import-seed', imports)
+  await expect(page.getByText(/Imported 2 works \(1 skipped, 2 added to corpus\)/)).toBeVisible()
+  await expect(page.getByText('Importing seed…')).toBeHidden()
+})

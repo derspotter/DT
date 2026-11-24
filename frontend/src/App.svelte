@@ -2736,7 +2736,10 @@
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
         const result = await importSeed(payload.filename, seedKind)
-        if (stale()) return
+        // The import ran in the corpus it started in, so its row reports the
+        // result even after a corpus switch (the row may be back on screen after
+        // A → B → A); only an ended session drops it.
+        if (session !== sessionEpoch) return
         if (result?.stopped) {
           // The import stopped on an error; what it saved before that stays.
           const processed = Number(result.processed || 0)
