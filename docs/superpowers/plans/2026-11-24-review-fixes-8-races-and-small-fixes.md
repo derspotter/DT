@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Revised 2026-11-24 after the Codex pre-flight rounds 1 to 3 (`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md`, `preflight-2.md`, `preflight-3.md`; rulings in `progress.md`).
+Revised 2026-11-24 after the Codex pre-flight rounds 1 to 4 (`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md` to `preflight-4.md`; rulings in `progress.md`).
 
 **Goal:** Close the small open rows of the reconciliation:
 - session and corpus races in the frontend (FE-60b, FE-63, FE-61);
@@ -135,7 +135,7 @@ test('a candidate file failing after a sign-out shows nothing', async ({ page })
 })
 // session.spec.ts — admin users adminA ('alice', is_admin true) and adminB ('bob', is_admin true) for the export test;
 // '/api/exports/bundle' request n awaits exportGates[n]; request 0 -> 'alice-bundle.zip', request 1 -> 'bob-bundle.zip'
-test('an old export neither saves nor unlocks the next user's export', async ({ page }) => {
+test("an old export neither saves nor unlocks the next user's export", async ({ page }) => {
   // logIn alice; click getByTestId('tab-downloads'); click export-bundle-button (request 0, held)
   // 'Log out'; logIn bob; auth-user 'bob'; click tab-downloads
   // expect(export-bundle-button).toBeEnabled()            // fails on c574aba
@@ -154,31 +154,38 @@ test('a search launched before a sign-out does not reach the next session', asyn
   //   fetchStats('/api/seed/sources').calls === seedCalls                                         // c574aba: + 1
   // seedGateOn = false; release the held seed requests
 })
-test('a late 403 on the launch's seed follow-up does not reconcile the next session', async ({ page }) => {
-  // POST 0 answers 202 { runId: 7 } at once; the first '/api/seed/sources' with alice's token after POST 0 is held, later answers 403
-  // poll it; 'Log out'; logIn bob; bob's first '/api/seed/sources' (bob's token) is held too; poll it
-  // meCalls = fetchStats('/api/auth/me').calls
-  // checkpoint on '/api/seed/sources' (alice's 403, read by text()): fetchStats('/api/auth/me').calls === meCalls   // c574aba: + 1
-  // release bob's request; 'Seed One' visible
+test("a late 403 on the launch's seed follow-up does not reconcile the next session", async ({ page }) => {
+  // alice signed in; wait until her initial seed load was read (afterBodyRead on '/api/seed/sources' from 0) before launching
+  // seedGateOn = true; Search; POST 0 answers 202 { runId: 7 } at once; poll the launch's follow-up seed request (alice's token): held
+  // 'Log out'; logIn bob; auth-user 'bob' (bob's seed requests are held by seedGateOn too); meGateOn = true (gates later /me)
+  // note seedReads, seedCalls ('/api/seed/sources') and meCalls ('/api/auth/me')
+  // release only alice's held request, with 403; afterBodyRead('/api/seed/sources', seedReads)   // the only body that can be read
+  // fetchStats('/api/auth/me').calls === meCalls          // c574aba: + 1 (reconcile, bob's token)
+  // fetchStats('/api/seed/sources').calls === seedCalls   // c574aba: + 1 (focusSeedSource's second reload)
+  // then meGateOn = false, seedGateOn = false, release everything held; 'Seed One' visible
 })
-// tab-resources.spec.ts — boot state gains searchGate (POST request 0 held, 202 { runId: 55 }), meGate (the /me after a select),
-// seedGateOn (gates '/api/seed/sources' while set), exportGate; admin boot for the export test.
-// commit = the first '/api/seed/sources' after the select's /me response, answered
+// tab-resources.spec.ts — boot state gains searchGate (POST request 0 held, 202 { runId: 55 }), meGateOn (gates /api/auth/me
+// while set), seedGateOn (gates '/api/seed/sources' while set), exportGate; admin boot for the export test.
+// New option boot(page, { settle: 'events' }) for these four tests: it calls trackFetches before goto and, instead of the
+// 1.5 s sleep (:168), waits with afterBodyRead for one read of each boot load ('/api/auth/me', '/api/seed/sources',
+// '/api/corpus', '/api/ingest/stats', '/api/ingest/runs').
+// switchTo2(): meGateOn = true; select '2' in .header-corpus-picker; poll until the select-triggered /me is held at its gate
+// (the server save is answered by then). commit(): note meReads; release that /me; afterBodyRead('/api/auth/me', meReads)
+// (handleSelectCorpus resets the workspace synchronously after reading it).
 test('a search launched before a corpus switch does not mark the new corpus as searching', async ({ page }) => {
-  // previewCount 5; Search; poll POST 0 (held); select '2' in .header-corpus-picker; wait for the commit; seedGateOn = true
-  // checkpoint on '/api/keyword-search': reason is not 'active'; seed calls unchanged   // c574aba: 'active', + 1
+  // previewCount 5; Search; poll POST 0 (held); seedGateOn = true; switchTo2(); commit()
+  // note seedCalls; checkpoint on '/api/keyword-search': reason is not 'active'; seed calls === seedCalls   // c574aba: 'active', + 1
   // seedGateOn = false; release
 })
 test('a launch answered between the saved switch and its /me is reset by the commit', async ({ page }) => {
-  // preservation (passes on c574aba): POST 0 held; meGate held; seedGateOn = true; select '2'; poll the select request
+  // preservation (passes on c574aba): POST 0 held; seedGateOn = true; switchTo2() (the /me stays held)
   // checkpoint on '/api/keyword-search': reason === 'active'; seed calls + 1 (the held follow-up)
   // seedGateOn = false; release the held seed requests; expect('Fetching in the background') visible
-  // release meGate; wait for the commit
-  // 'Fetching in the background' count 0; reason is not 'active'; state.searchBodies[0].corpusId === 1
+  // commit(); 'Fetching in the background' count 0; reason is not 'active'; state.searchBodies[0].corpusId === 1
 })
-test('an export keeps the session's export lock across a corpus switch', async ({ page }) => {
+test("an export keeps the session's export lock across a corpus switch", async ({ page }) => {
   // preservation: admin boot; click tab-downloads; exportGate held; click export-bundle-button
-  // switch to corpus 2 and wait for the commit; click tab-downloads; expect(export-bundle-button).toBeDisabled()
+  // switchTo2(); commit(); click tab-downloads; expect(export-bundle-button).toBeDisabled()
   // release; wait for the download event; button enabled
 })
 // seed-upload.spec.ts — the first test's flow (:68-96) with an init script:
@@ -275,10 +282,12 @@ test('a 409 after the graph unmounts starts no request', async ({ page }) => {
   // click tab-graph again; loaded status visible; manifest calls === 2; the new resources carry v=R
 })
 test('a 409 after a header corpus switch neither retries nor publishes the old corpus', async ({ page }) => {
-  // versions by corpus_id: '1' -> 'A', '2' -> 'C'; open the graph under corpus 1; nodes.bin?v=A held
-  // select '2' in .header-corpus-picker; wait for a manifest call with corpus_id=2; its resources (v=C) held
-  // checkpoint on /nodes\.bin\?v=A/ (release with 409): fetchStats(/snapshot\?.*corpus_id=1/).calls === 1
-  // release the v=C resources; loaded status visible        // c574aba: no corpus_id=2 call, the wait fails
+  // versions by corpus_id: '1' -> 'A', '2' -> 'C'; the corpus-2 manifest has stats.edge_count 7 (unique to corpus 2)
+  // open the graph under corpus 1; nodes.bin?v=A held; all v=C resources held
+  // select '2' in .header-corpus-picker; wait for a manifest call with corpus_id=2
+  // checkpoint on /nodes\.bin\?v=A/ (release with 409): fetchStats('/api/graph/3d/snapshot').calls === 2
+  //   (one per corpus; a retry under either corpus makes 3)
+  // release the v=C resources; 'Loaded 2 nodes and 7 edges from snapshot.' visible   // c574aba: no corpus_id=2 call, the wait fails
 })
 for (const late of ['fails', 'succeeds']) {
   test(`an older detail answer that ${late} does not end the selected node's loading`, async ({ page }) => {
