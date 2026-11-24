@@ -90,6 +90,7 @@
   let selectedCluster = null
   let selectedNodeDetail = null
   let nodeDetailLoading = false
+  let nodeDetailError = ''
   // Only the newest detail request writes the panel and the cache; a
   // deselection or a new load bumps it too, ending the pending request.
   let nodeDetailSeq = 0
@@ -961,6 +962,7 @@
     selectedNodeDetail = null
     nodeDetailSeq += 1
     nodeDetailLoading = false
+    nodeDetailError = ''
     selectedIndex = null
     hoveredNode = null
     tooltip = { ...tooltip, visible: false }
@@ -1129,6 +1131,7 @@
     if (!id) return
     // Taken before the cache check, so a cache hit supersedes an older request.
     const seq = ++nodeDetailSeq
+    nodeDetailError = ''
     if (nodeDetailCache.has(id)) {
       selectedNodeDetail = nodeDetailCache.get(id)
       nodeDetailLoading = false
@@ -1144,8 +1147,13 @@
       if ((selectedNode?.work_id || selectedNode?.id) === id) {
         selectedNodeDetail = detail
       }
-    } catch {
-      if (seq === nodeDetailSeq) selectedNodeDetail = null
+    } catch (error) {
+      // A superseded request fails silently; the current one says so (not cached: a
+      // later selection fetches again).
+      if (seq !== nodeDetailSeq) return
+      console.error('[graph] node detail failed:', error?.message || error)
+      selectedNodeDetail = null
+      nodeDetailError = 'Could not load details'
     } finally {
       if (seq === nodeDetailSeq) nodeDetailLoading = false
     }
@@ -1195,6 +1203,7 @@
     selectedNodeDetail = null
     nodeDetailSeq += 1
     nodeDetailLoading = false
+    nodeDetailError = ''
     selectedIndex = null
     hoveredNode = null
     selectedCluster = null
@@ -1247,6 +1256,7 @@
     selectedNodeDetail = null
     nodeDetailSeq += 1
     nodeDetailLoading = false
+    nodeDetailError = ''
     selectedIndex = null
     isolatedCluster = null
     halo = { ...halo, visible: false }
@@ -2102,6 +2112,9 @@
           <span class="muted small">Source: {activeNodeDetail.source || 'unknown'}</span>
           {#if nodeDetailLoading}
             <span class="muted small">Loading metadata...</span>
+          {/if}
+          {#if nodeDetailError}
+            <span class="muted small" role="status">{nodeDetailError}</span>
           {/if}
           {#if selectedNodeDetail?.authors}
             <span class="muted small">Authors: {selectedNodeDetail.authors}</span>

@@ -833,3 +833,42 @@ test('a recolour shows the loaded status again once the controls match the graph
   await expect(panel.getByText('References-only layout failed', { exact: true })).toBeHidden()
   expect(await calls(page, MANIFEST)).toBe(2)
 })
+
+// A failed detail request for the selected node says so and logs the error;
+// a superseded one stays silent.
+test('a failed detail request for the selected node shows Could not load details', async ({ page }) => {
+  const detailErrors: string[] = []
+  page.on('console', (message) => {
+    if (message.type() === 'error' && message.text().startsWith('[graph] node detail failed:')) detailErrors.push(message.text())
+  })
+  const { holdNode } = await graphMock(page)
+  const node1 = holdNode(1, 0)
+  const node2 = holdNode(2, 0)
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+
+  await selectSeed(panel)
+  await expect.poll(() => calls(page, NODE_1)).toBe(1)
+  await selectReferenced(panel)
+  await expect.poll(() => calls(page, NODE_2)).toBe(1)
+
+  const before = await reads(page, NODE_1)
+  node1.release({ status: 500, body: { error: 'boom' } })
+  await afterBodyRead(page, NODE_1, before)
+  await expect(panel.getByText('Could not load details')).toHaveCount(0)
+  expect(detailErrors).toEqual([])
+
+  node2.release({ status: 500, body: { error: 'detail store down' } })
+  await expect(panel.getByText('Could not load details', { exact: true })).toBeVisible()
+  await expect(panel.getByText('Loading metadata...')).toBeHidden()
+  await expect.poll(() => detailErrors.length).toBe(1)
+  expect(detailErrors[0]).toContain('detail store down')
+
+  // Not cached: selecting the work again fetches it, and the notice goes.
+  await selectSeed(panel)
+  await expect(panel.getByText('Identifiers: 10.1000/seed', { exact: true })).toBeVisible()
+  await selectReferenced(panel)
+  await expect(panel.getByText('Identifiers: 10.1000/example', { exact: true })).toBeVisible()
+  await expect(panel.getByText('Could not load details')).toHaveCount(0)
+  expect(await calls(page, NODE_2)).toBe(2)
+})
