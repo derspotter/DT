@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-Revised 2026-11-24 after the Codex pre-flight rounds 1 and 2 (`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md`, `preflight-2.md`; rulings in `progress.md`).
+Revised 2026-11-24 after the Codex pre-flight rounds 1 to 3 (`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md`, `preflight-2.md`, `preflight-3.md`; rulings in `progress.md`).
 
 **Goal:** Close the small open rows of the reconciliation:
 - session and corpus races in the frontend (FE-60b, FE-63, FE-61);
@@ -46,7 +46,7 @@ The worktree has no `node_modules`.
 - **Browser runs are serialized.** Tasks 1, 2 and 3 run Playwright on port 5190 in the same worktree, and Playwright reuses a server it finds there (`playwright.config.ts:12-21`, `reuseExistingServer: true`). So they run one after another, and each runs only its own specs. The whole CI list runs once, in the final verification.
 - `backend/src/app.js`: Task 2 (graph file route, `decorateGraph3dManifest`, new `graph3dManifestVersion`) and Task 3 (`DELETE /api/corpus/works/:workId`).
 - `frontend/src/App.svelte`: Task 1 (handlers, `startSearch`, `loadSeedSources`, reset, upload list) and Task 2 (the `{#key}` around the graph, `:5984`).
-- `frontend/tests/helpers/mockApi.ts`: Task 1 adds `logIn`, `recordDom` and `domSnapshots`; Task 2 uses the last two.
+- `frontend/tests/helpers/mockApi.ts`: Task 1 adds `logIn`, `trackFetches`, `fetchStats` and `afterBodyRead`; Task 2 uses the last three.
 - `frontend/tests/tab-resources.spec.ts`: Task 1 only. `ThreeGraph.svelte`: Task 2 only. `.github/workflows/ci.yml`: Task 3 only.
 
 ## Global Constraints
@@ -56,12 +56,12 @@ The worktree has no `node_modules`.
 - Python: `cd dl_lit_project && /home/jay/DT/dl_lit_project/.venv/bin/python -m pytest tests/<file> -q`. Tasks 4 and 5 run only their targeted files; the whole suite (`tests -q`) runs once, in the final verification. CI runs the whole suite, so new test files need no CI edit.
 - Backend: `cd backend && npm test -- <file>`; full run `npm test -- --maxWorkers=2` (full parallel runs can time out suites that pass alone; compare with a `c574aba` baseline before blaming a change).
 - Frontend: `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/<spec> --workers=1`, mocked specs only (check `ss -ltn` first that 5190 is free). Never the default 5175 (the dev container serves master). Never `*.real*.spec.ts`, `pipeline-perf.real-pdf.spec.ts` or `upstream-metadata.spec.ts`. Every spec that fakes a token calls `mockLogSocket(page)`. `npx vite build` must pass. A new spec goes into the CI list (`ci.yml:54`) in the task that creates it.
-- **Race tests never wait a fixed time** (no `waitForTimeout`, no `response.finished()`-plus-frame checkpoint) and add no hook to the app. Each one:
-  - holds the late request on a `deferred()` gate;
-  - confirms the commit by a request the app sends only after it: after a sign-in, a seed-list request with the new token; after a corpus switch, the first `/api/seed/sources` after the switch's `/me` response;
-  - releases the late answer and awaits that response;
-  - then lets a probe answer reach the same code path and waits for the probe's visible result;
-  - records transient states with `recordDom`.
+- **Race tests never wait a fixed time** (no `waitForTimeout`; a response reaching the browser is not a checkpoint) and add no hook to the app. Each one uses the checkpoint helpers of Task 1:
+  - it calls `trackFetches(page)` before `page.goto`;
+  - it confirms the commit by a request the app sends only after it (seen in the route log): after a sign-in, a seed-list request with the new token; after a corpus switch, the first `/api/seed/sources` after the switch's `/me` response;
+  - it releases the late answer, then calls `afterBodyRead(page, <path>, <reads before>)` and asserts right there;
+  - every follow-up request the late answer could start is route-gated, and the test asserts it with `fetchStats(page, <path>).calls` before releasing it;
+  - no DOM observer is used (none of the transient states needs one).
 - Exact strings from the spec:
   - D4: `[uploads] could not save the upload list:` (followed by the error message)
   - D8: 409 body `{ error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' }`, header `Cache-Control: no-store`
@@ -100,92 +100,86 @@ The worktree has no `node_modules`.
   - `loadSeedSources`'s `catch` (`:3283-3286`): the request-token check moves ahead of `handleCorpusPollForbidden`;
   - `:3863-3900` `startSearch`;
   - `:4266-4296` `handleExportDownload`, `:4298-4314` `handleDownloadedCorpusFile`, `:4369-4388` `handleDownloadSeedDocument`, `:4390-4410` `handleSeedCandidateFile`.
-- Modify: `frontend/tests/helpers/mockApi.ts`: add `logIn` (moved from `session.spec.ts:48-54`), `recordDom` and `domSnapshots`; `session.spec.ts` imports `logIn`.
+- Modify: `frontend/tests/helpers/mockApi.ts`: add `logIn` (moved from `session.spec.ts:48-54`), `trackFetches`, `fetchStats` and `afterBodyRead`; `session.spec.ts` imports `logIn`.
 - Test: `frontend/tests/seed-selection.spec.ts`, `frontend/tests/session.spec.ts`, `frontend/tests/tab-resources.spec.ts`, `frontend/tests/seed-upload.spec.ts` (all in the CI list).
 
 **Interfaces:**
 - Produces, in `helpers/mockApi.ts` (test code only; nothing is added to the app):
   - `logIn(page: Page, username: string): Promise<void>`: today's `session.spec.ts` body.
-  - `recordDom(page: Page, texts: string[], extra?: string): Promise<void>`: `page.evaluate` installs one `MutationObserver` on `document.body` (`subtree`, `childList`, `characterData`, `attributes`). On every mutation it pushes a snapshot `{ [text]: document.body.innerText.includes(text) }` to `window.__dtDomSnapshots`, after a first snapshot at install.
-  - `domSnapshots(page: Page): Promise<Array<Record<string, boolean>>>`: returns `window.__dtDomSnapshots`.
+  - `trackFetches(page: Page): Promise<void>`: `page.addInitScript` that wraps `window.fetch`.
+    - Per call it adds 1 to `window.__dtFetch.calls[key]`, synchronously, where `key` is `pathname + search` of the request URL.
+    - It wraps the returned response's `json`, `blob`, `text` and `arrayBuffer`. When the promise the app awaits resolves or rejects, it adds 1 to `window.__dtFetch.reads[key]`, then hands the result on.
+  - `fetchStats(page: Page, match: string | RegExp): Promise<{ calls: number; reads: number }>`: sums over the keys whose pathname equals `match` (string) or whose full key matches `match` (RegExp).
+  - `afterBodyRead(page: Page, match: string | RegExp, previousReads: number): Promise<void>`: `page.waitForFunction` until the summed reads exceed `previousReads`, then `page.evaluate(() => new Promise((r) => setTimeout(() => setTimeout(r, 0), 0)))`.
 - Consumes: nothing from other tasks.
 
-- [ ] **Step 1: Write the failing tests.** Each race test follows the spec's checkpoint rule:
-  - commit: wait for the request the app sends only after the commit (named per test);
-  - late answer: `const late = page.waitForResponse(<predicate>)`, release its gate, `await late`;
-  - probe: release or trigger the probe answer through the same code path and wait for its visible result.
-
-  No `waitForTimeout`, no frame/timer checkpoint.
+- [ ] **Step 1: Write the failing tests.** Every race test calls `trackFetches(page)` before `goto` and follows the checkpoint rule of Global Constraints. "Checkpoint on X" below means: note `fetchStats(page, X).reads`, release the gate, `afterBodyRead(page, X, noted)`.
 
 ```ts
-// seed-selection.spec.ts — boot(): State gains per-request gates for the candidate file (fileGates: Deferred[]),
-// `lateFileStatus?: number`, and request logs (fileRequests, seedRequests: { auth: string }[]).
+// seed-selection.spec.ts — boot(): per-request gates for '/api/seed/sources/search/70/candidates/readable/file'
+// (fileGates[n]); request 0 answers lateFileStatus === 500 ? fulfil(route, { error: 'late-candidate-error-7f3' }, 500)
+// : a PDF with 'Content-Disposition: attachment; filename="readable.pdf"'; later requests a PDF named "probe.pdf".
 // '/api/auth/login' -> { token: 'second-token', user: { id: 2, username: 'second', last_corpus_id: 1, is_admin: false } }
-// '/api/auth/me' by bearer: 'second-token' -> mePayload({ id: 2, username: 'second', admin: false, ... }), else today's 'reader'
-// '/api/seed/sources/search/70/candidates/readable/file': request n awaits fileGates[n] when present, then
-//   (n === 0 && lateFileStatus === 500) ? fulfil(route, { error: 'late-candidate-error-7f3' }, 500)
-//   : route.fulfill({ status: 200, contentType: 'application/pdf',
-//       headers: { 'Content-Disposition': 'attachment; filename="readable.pdf"' }, body: '%PDF-1.4 x' })
+// '/api/auth/me' by bearer: 'second-token' -> user 'second', else today's 'reader'; a route log of { path, auth }
 // candidates as in the readable-candidate test (:217-225)
 test('a candidate file that arrives after a sign-out is not saved', async ({ page }) => {
-  // downloads = []; page.on('download', ...); expandSeed; click 'Readable copy' .seed-download-link; poll fileRequests === 1
-  // 'Log out'; logIn(page, 'second'); auth-user 'second'; poll a seed request with 'Bearer second-token' (commit)
-  // release request 0 (late) and await its response
-  // probe: expandSeed; click the same link (request 1, no gate); wait for the download event and 'Downloaded readable.pdf.'
-  // expect(downloads).toHaveLength(1)        // 2 on c574aba
+  // names = []; page.on('download', (d) => names.push(d.suggestedFilename()))
+  // expandSeed; click 'Readable copy' .seed-download-link (request 0, held)
+  // 'Log out'; logIn(page, 'second'); auth-user 'second'; route log has a seed request with 'Bearer second-token' (commit)
+  // checkpoint on the file path: getByText('Downloaded readable.pdf.') count 0
+  // expandSeed; click the link again (request 1, answered); wait for the download event
+  // expect(names).toEqual(['probe.pdf'])
 })
 test('a candidate file failing after a sign-out shows nothing', async ({ page }) => {
-  // lateFileStatus 500; after the commit: recordDom(page, ['late-candidate-error-7f3'])
-  // release the late request, await it; same probe
-  // domSnapshots(page) never has 'late-candidate-error-7f3' true
+  // lateFileStatus 500; same flow up to the checkpoint (the text() read): getByText('late-candidate-error-7f3') count 0
 })
-// session.spec.ts — '/api/exports/bundle': request n awaits exportGates[n];
-// answers application/zip with 'Content-Disposition: attachment; filename="bundle.zip"'
-test('an old export neither saves nor unlocks the next user\'s export', async ({ page }) => {
-  // logIn alice; goto '#/downloads'; click export-bundle-button; poll export request 0
-  // 'Log out'; logIn bob; auth-user 'bob'; goto '#/downloads'
-  // expect(export-bundle-button).toBeEnabled()          // fails on c574aba
-  // click it; poll export request 1; button disabled
-  // recordDom(page, [], "document.querySelector('[data-testid=export-bundle-button]')?.disabled === false")
-  // release request 0, await it; release request 1 (probe), wait for its download event
-  // downloads === 1; button enabled; no snapshot before bob's download has 'extra' true
+// session.spec.ts — admin users adminA ('alice', is_admin true) and adminB ('bob', is_admin true) for the export test;
+// '/api/exports/bundle' request n awaits exportGates[n]; request 0 -> 'alice-bundle.zip', request 1 -> 'bob-bundle.zip'
+test('an old export neither saves nor unlocks the next user's export', async ({ page }) => {
+  // logIn alice; click getByTestId('tab-downloads'); click export-bundle-button (request 0, held)
+  // 'Log out'; logIn bob; auth-user 'bob'; click tab-downloads
+  // expect(export-bundle-button).toBeEnabled()            // fails on c574aba
+  // click it (request 1, held)
+  // checkpoint on '/api/exports/bundle': button still disabled; getByText(/export downloaded/) count 0
+  // release request 1; wait for the download event; names toEqual(['bob-bundle.zip']); button enabled
 })
-// session.spec.ts — keyword search mocks: preview answers { count: 5, threshold: 100000 };
-// POST /api/keyword-search request n awaits searchGates[n] when present;
-// request 0 -> fulfil(route, { runId: 7, status: 'running' }, 202); later requests -> fulfil(route, { results: [] })
-// probe = a second search in the new state: Query 'probe'; Search; wait for 'Search complete. Added 0 item(s) to Seed.'
+// session.spec.ts — keyword search: preview -> { count: 5, threshold: 100000 }; POST request 0 held on searchGate,
+// answers fulfil(route, { runId: 7, status: 'running' }, 202); '/api/seed/sources' gated once `seedGateOn` is set
 test('a search launched before a sign-out does not reach the next session', async ({ page }) => {
-  // alice: Query 'economics'; Search; poll POST 0 seen (held)
-  // 'Log out'; logIn bob; auth-user 'bob'; poll a seed request with bob's token (commit); recordDom(page, ['Fetching in the background'])
-  // release POST 0, await it; probe
-  // expect(await page.evaluate(() => (window as any).__dtRefresh.reason())).not.toBe('active')
-  // no snapshot has 'Fetching in the background' true
+  // alice: Query 'economics'; Search; poll POST 0 seen
+  // 'Log out'; logIn bob; auth-user 'bob'; bob's first seed request answered (commit); seedGateOn = true
+  // seedCalls = (await fetchStats(page, '/api/seed/sources')).calls
+  // checkpoint on '/api/keyword-search':
+  //   expect(await page.evaluate(() => (window as any).__dtRefresh.reason())).not.toBe('active')   // c574aba: 'active'
+  //   fetchStats('/api/seed/sources').calls === seedCalls                                         // c574aba: + 1
+  // seedGateOn = false; release the held seed requests
 })
-test('a late 403 on the launch\'s seed follow-up does not reconcile the next session', async ({ page }) => {
-  // POST 0 answers 202 { runId: 7 } at once; '/api/seed/sources' with alice's token, after POST 0, is held and later answers 403
-  // poll that held request; 'Log out'; logIn bob; bob's first '/api/seed/sources' (bob's token) is held too; poll it
-  // meCount = /api/auth/me requests so far; release alice's request with 403 and await it;
-  // release bob's (probe) and wait for bob's seed list ('Seed One')
-  // /api/auth/me requests === meCount        // one more on c574aba, with bob's token
+test('a late 403 on the launch's seed follow-up does not reconcile the next session', async ({ page }) => {
+  // POST 0 answers 202 { runId: 7 } at once; the first '/api/seed/sources' with alice's token after POST 0 is held, later answers 403
+  // poll it; 'Log out'; logIn bob; bob's first '/api/seed/sources' (bob's token) is held too; poll it
+  // meCalls = fetchStats('/api/auth/me').calls
+  // checkpoint on '/api/seed/sources' (alice's 403, read by text()): fetchStats('/api/auth/me').calls === meCalls   // c574aba: + 1
+  // release bob's request; 'Seed One' visible
 })
-// tab-resources.spec.ts — boot state gains `searchGates: Deferred[]` for POST /api/keyword-search (request 0 -> 202 { runId: 55 },
-// later -> 200 { results: [] }), `meGate: Deferred | null` (awaited for the /me after a select), `exportGate`;
-// commit = the first '/api/seed/sources' request after the select's /me response, and its response
+// tab-resources.spec.ts — boot state gains searchGate (POST request 0 held, 202 { runId: 55 }), meGate (the /me after a select),
+// seedGateOn (gates '/api/seed/sources' while set), exportGate; admin boot for the export test.
+// commit = the first '/api/seed/sources' after the select's /me response, answered
 test('a search launched before a corpus switch does not mark the new corpus as searching', async ({ page }) => {
-  // previewCount 5; Search; poll POST 0 (held); select '2' in .header-corpus-picker; wait for the commit
-  // recordDom(page, ['Fetching in the background']); release POST 0, await it; probe in corpus 2
-  // reason is not 'active'; no snapshot has 'Fetching in the background' true
+  // previewCount 5; Search; poll POST 0 (held); select '2' in .header-corpus-picker; wait for the commit; seedGateOn = true
+  // checkpoint on '/api/keyword-search': reason is not 'active'; seed calls unchanged   // c574aba: 'active', + 1
+  // seedGateOn = false; release
 })
 test('a launch answered between the saved switch and its /me is reset by the commit', async ({ page }) => {
-  // preservation (passes on c574aba): POST 0 held; meGate held; select '2'; poll the select request
-  // release POST 0, await it; expect('Fetching in the background') visible and expect.poll(reason) === 'active'
+  // preservation (passes on c574aba): POST 0 held; meGate held; seedGateOn = true; select '2'; poll the select request
+  // checkpoint on '/api/keyword-search': reason === 'active'; seed calls + 1 (the held follow-up)
+  // seedGateOn = false; release the held seed requests; expect('Fetching in the background') visible
   // release meGate; wait for the commit
   // 'Fetching in the background' count 0; reason is not 'active'; state.searchBodies[0].corpusId === 1
 })
-test('an export keeps the session\'s export lock across a corpus switch', async ({ page }) => {
-  // preservation: goto '#/downloads'; exportGate held; click export-bundle-button; poll the export request
-  // switch to corpus 2 and wait for the commit; expect(export-bundle-button).toBeDisabled()
-  // release, wait for the download event; button enabled
+test('an export keeps the session's export lock across a corpus switch', async ({ page }) => {
+  // preservation: admin boot; click tab-downloads; exportGate held; click export-bundle-button
+  // switch to corpus 2 and wait for the commit; click tab-downloads; expect(export-bundle-button).toBeDisabled()
+  // release; wait for the download event; button enabled
 })
 // seed-upload.spec.ts — the first test's flow (:68-96) with an init script:
 //   const real = Storage.prototype.setItem
@@ -198,17 +192,16 @@ test('a full localStorage does not fail an upload', async ({ page }) => {
 })
 ```
 
-  `recordDom`'s optional `extra` is the source of a page-side predicate, evaluated per snapshot under the key `'extra'` (the export test uses it for the button's state). Snapshots carry a running index so a test can split them at a release (`domSnapshots` length read just before it).
-
-- [ ] **Step 2: Run them and verify they fail.** Run `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/seed-selection.spec.ts tests/session.spec.ts tests/tab-resources.spec.ts tests/seed-upload.spec.ts --workers=1`. Expected FAIL on the regression tests:
-  - two download events;
-  - a snapshot with `late-candidate-error-7f3`;
-  - bob's button disabled while alice's export is held;
-  - `Fetching in the background` recorded and the reason `active`, in both the sign-out and the after-commit cases;
-  - one extra `/api/auth/me` after the late 403;
-  - the upload row never reaches `Imported 2 works`.
-
-  Expected PASS already (preservation): the in-gap reset test and the corpus-switch export-lock test. All existing tests pass.
+- [ ] **Step 2: Run them and verify they fail.** Run `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/seed-selection.spec.ts tests/session.spec.ts tests/tab-resources.spec.ts tests/seed-upload.spec.ts --workers=1`.
+  - Expected FAIL on the regression tests:
+    - `Downloaded readable.pdf.` at the checkpoint, and `readable.pdf` among the download names;
+    - `late-candidate-error-7f3` at the checkpoint;
+    - bob's button disabled while alice's export is held;
+    - the reason `'active'` and one more seed call at the checkpoint, after a sign-out and after a corpus commit;
+    - one more `/me` call after the late 403;
+    - the upload row never reaching `Imported 2 works`.
+  - Expected PASS already (preservation): the in-gap reset test and the corpus-switch export-lock test.
+  - All existing tests pass.
 - [ ] **Step 3: Implement D1, D2 and D4.**
   - D1: each of the four handlers takes `const session = sessionEpoch` before its request. Right after the `await` it returns when `session !== sessionEpoch`. Its `catch` returns on `error?.status === 401 || session !== sessionEpoch`. In `handleExportDownload`, the `finally` sets `exportBusy = false` only when `session === sessionEpoch`. `resetFrontendState` sets `exportBusy = false` when `signOut` is true.
   - D2:
@@ -218,7 +211,7 @@ test('a full localStorage does not fail an upload', async ({ page }) => {
     - In `loadSeedSources`' `catch`: `if (error?.status === 401) return; if (token !== seedSourcesRequestToken) return; handleCorpusPollForbidden(error); …`.
     - `handleSelectCorpus` is unchanged.
   - D4: `try { window.localStorage.setItem(key, JSON.stringify(persisted)) } catch (error) { if (!uploadStorageWarned) { uploadStorageWarned = true; console.warn('[uploads] could not save the upload list:', error?.message) } }`.
-  - Add `logIn`, `recordDom` and `domSnapshots` to `helpers/mockApi.ts`.
+  - Add `logIn`, `trackFetches`, `fetchStats` and `afterBodyRead` to `helpers/mockApi.ts`.
 - [ ] **Step 4: Run the four specs again, then `npx vite build`.** Expected: all pass.
 - [ ] **Step 5: Commit**: `frontend: downloads, search launches and their seed follow-ups from an ended session are dropped; the export lock is session-wide; a full localStorage no longer fails an upload (FE-60b, FE-63, FE-64)`
 
@@ -226,7 +219,7 @@ test('a full localStorage does not fail an upload', async ({ page }) => {
 
 ### Task 2: Graph rebuild check, load ownership, per-corpus graph instance and node-detail ownership (BE-54, FE-61)
 
-Runs after Task 1 (browser runs are serialized; it uses `recordDom`/`domSnapshots` and edits `App.svelte` after Task 1).
+Runs after Task 1 (browser runs are serialized; it uses Task 1's checkpoint helpers and edits `App.svelte` after Task 1).
 
 **Files:**
 - Modify: `backend/src/app.js`:
@@ -241,7 +234,7 @@ Runs after Task 1 (browser runs are serialized; it uses `recordDom`/`domSnapshot
 
 **Interfaces:**
 - Produces (module-local, not exported): `graph3dManifestVersion(key: string) -> string | null`. It reads `graph3dSnapshotPath(key, 'manifest.json')` once. When `generated_at` is present it returns `String(manifest.generated_at)`, else `String(Math.floor(mtimeMs))`, and `null` when the manifest is unreadable.
-- Consumes: `recordDom`, `domSnapshots` (Task 1).
+- Consumes: `trackFetches`, `fetchStats`, `afterBodyRead` (Task 1).
 
 - [ ] **Step 1: Write the failing tests.**
 
@@ -268,56 +261,55 @@ test('an outsider gets 403 for a snapshot file whatever its version', async () =
 ```
 
 ```ts
-// graph-3d.spec.ts — the manifest mock gains a build counter and the request's corpus_id:
-// manifest n lists every resource URL with `?v=${['A', 'B', 'C'][n]}`; resource requests can be gated per URL;
-// '/api/graph/3d/node/<id>' requests are gated per request (nodeGates[id][n]) and logged
+// graph-3d.spec.ts — every test calls trackFetches(page) before goto. The mock gains per-test state:
+// manifestVersions (by request order, or by corpus_id), resource gates per URL, per-request gates and a call log for
+// '/api/graph/3d/node/<id>', and a mutable lastCorpusId that '/api/corpora/<id>/select' sets and '/api/auth/me' returns
+// (mePayload({ corpusId: lastCorpusId, corpora: [corpus 1, corpus 2] })). Each manifest lists every resource URL with `?v=<version>`.
 test('a 409 on a snapshot file reloads the manifest once and loads build B', async ({ page }) => {
-  // nodes.bin?v=A -> 409 { error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' }
-  // /Loaded 2 nodes and 1 edges? from snapshot\./ visible; manifest requests === 2
-  // every resource request after the 409 has searchParams v === 'B'
+  // versions ['A', 'B']; nodes.bin?v=A -> 409 { error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' }
+  // /Loaded 2 nodes and 1 edges? from snapshot\./ visible; manifest calls === 2; every resource call after the 409 has v=B
 })
 test('a 409 after the graph unmounts starts no request', async ({ page }) => {
-  // preservation: nodes.bin?v=A gated; open the graph; poll the nodes.bin request; click the workspace tab (unmount)
-  // release with 409, await it; probe: open the graph tab again (new instance, answered at once), wait for the loaded status
-  // exactly two manifest requests (the first and the new instance's); no request with v=B
+  // preservation: versions ['A', 'R']; nodes.bin?v=A held; open the graph; poll its call; click tab-workspace (unmount)
+  // checkpoint on /nodes\.bin\?v=A/ (release with 409): manifest calls === 1
+  // click tab-graph again; loaded status visible; manifest calls === 2; the new resources carry v=R
 })
 test('a 409 after a header corpus switch neither retries nor publishes the old corpus', async ({ page }) => {
-  // me: corpora 1 and 2 (the header picker), graph opened under corpus 1; nodes.bin?v=A gated
-  // select '2' in .header-corpus-picker; wait for a manifest request with corpus_id=2 (its resources gated)
-  // release the old nodes.bin with 409, await it; release the corpus-2 resources (probe); wait for the loaded status
-  // manifest requests with corpus_id=1 === 1          // c574aba: no corpus_id=2 request at all, the wait fails
+  // versions by corpus_id: '1' -> 'A', '2' -> 'C'; open the graph under corpus 1; nodes.bin?v=A held
+  // select '2' in .header-corpus-picker; wait for a manifest call with corpus_id=2; its resources (v=C) held
+  // checkpoint on /nodes\.bin\?v=A/ (release with 409): fetchStats(/snapshot\?.*corpus_id=1/).calls === 1
+  // release the v=C resources; loaded status visible        // c574aba: no corpus_id=2 call, the wait fails
 })
-test('a late detail failure for another node keeps the selected node loading', async ({ page }) => {
-  // nodes 1 and 2 gated; select 'Graph seed work', then 'Referenced work'; recordDom(page, ['Loading metadata...', 'Identifiers: 10.1000/example'])
-  // release node 1 with 500, await it; release node 2 (probe); wait for 'Identifiers: 10.1000/example'
-  // no snapshot has both keys false
-})
-test('an older detail success neither shows nor ends the newer node\'s loading', async ({ page }) => {
-  // the same with node 1 answering 200 { id: 1, title: 'Graph seed work', doi: '10.1000/seed' };
-  // recordDom also tracks 'Identifiers: 10.1000/seed': never true; no snapshot has both loading and node 2 identifiers false
-})
+for (const late of ['fails', 'succeeds']) {
+  test(`an older detail answer that ${late} does not end the selected node's loading`, async ({ page }) => {
+    // node 1 and node 2 held; select 'Graph seed work', then 'Referenced work'
+    // checkpoint on '/api/graph/3d/node/1' (release with 500, or 200 { id: 1, title: 'Graph seed work', doi: '10.1000/seed' }):
+    //   'Loading metadata...' visible                       // c574aba: hidden by node 1's finally
+    // release node 2; 'Identifiers: 10.1000/example' visible
+  })
+}
 test('an older answer for the same node neither shows nor caches', async ({ page }) => {
-  // node 1 requests 0 and 1 gated; node 2 answers at once; select 1, 2, 1; recordDom(page, ['10.1000/seed-v1'])
-  // release node-1 request 0 with doi '10.1000/seed-v1', await it; release request 1 with '10.1000/seed-v2' (probe);
-  // wait for 'Identifiers: 10.1000/seed-v2'; 'seed-v1' never recorded
-  // select 'Referenced work', then 'Graph seed work': node-1 requests === 2; 'Identifiers: 10.1000/seed-v2'
+  // node-1 requests 0 (A1) and 1 (A2) held; node 2 answers at once; select 1, 2, 1
+  // release A2 with doi '10.1000/seed-v2'; 'Identifiers: 10.1000/seed-v2' visible
+  // checkpoint on '/api/graph/3d/node/1' (release A1 with '10.1000/seed-v1'): 'Identifiers: 10.1000/seed-v2' still visible
+  // select 'Referenced work', then 'Graph seed work': node-1 calls === 2; 'Identifiers: 10.1000/seed-v2'   // c574aba: seed-v1
 })
 test('Escape ends the pending detail request', async ({ page }) => {
-  // node 1 request 0 gated; select node 1; press Escape; release it with 200 { id: 1, doi: '10.1000/seed' }, await it
-  // probe: select 'Referenced work' (answered), wait for 'Identifiers: 10.1000/example'
-  // select 'Graph seed work' again: a second node-1 request is sent (poll node-1 requests === 2)   // c574aba: cache hit, 1
+  // node-1 request 0 held; select 'Graph seed work'; press Escape
+  // checkpoint on '/api/graph/3d/node/1' (release with 200 { id: 1, doi: '10.1000/seed' }), before any new selection
+  // select 'Graph seed work' again: expect.poll(node-1 calls) === 2                // c574aba: cache hit, 1
 })
 ```
 
-- [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/graph-read-path.test.js tests/graph-access.test.js` and `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/graph-3d.spec.ts --workers=1`. Expected:
-  - FAIL:
+- [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/graph-read-path.test.js tests/graph-access.test.js` and `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/graph-3d.spec.ts --workers=1`.
+  - Expected FAIL:
     - `?v=B` answers 200;
     - the 409 shows as an error instead of loading build B;
     - the header switch loads no corpus-2 graph;
-    - node 1's settling hides node 2's loading line;
-    - `10.1000/seed` and `seed-v1` are recorded;
+    - node 1's settling hides node 2's loading line (both cases);
+    - A1 overwrites panel and cache with `seed-v1`;
     - Escape leaves the answer cached.
-  - PASS already (preservation): the outsider and sendFile tests, and the unmount test.
+  - Expected PASS already (preservation): the outsider and sendFile tests, and the unmount test.
 - [ ] **Step 3: Implement D8 and D3.**
   - File route: after the key and file-name checks, `if (typeof req.query?.v === 'string' && graph3dManifestVersion(key) !== req.query.v)` set `Cache-Control: no-store` and answer the 409. Nothing else in the route changes; `requireGraph3dScopeAccess` stays ahead of the handler.
   - `decorateGraph3dManifest` keeps `generated_at` from its manifest and uses the helper's mtime rule only as the fallback.

@@ -1,8 +1,8 @@
 # Review fixes, phase 8: races and small fixes — design
 
-Date: 2026-11-24, revised the same day after the Codex pre-flight rounds 1 and 2
-(`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md` and
-`preflight-2.md`, rulings in `progress.md` next to them). Branch `review-fixes-8` (worktree from
+Date: 2026-11-24, revised the same day after the Codex pre-flight rounds 1 to 3
+(`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md`,
+`preflight-2.md` and `preflight-3.md`, rulings in `progress.md` next to them). Branch `review-fixes-8` (worktree from
 master `c574aba`).
 Source: the reconciliation of the review inventory against `c574aba`
 (`.superpowers/sdd/review-fixes-8-reconcile/{fe,be,py}.md`, and the section "Reconciliation against
@@ -165,22 +165,34 @@ Everything else that is still open after the reconciliation belongs to later pha
 
 ### Frontend
 
-**Checkpoints for every browser race test (D1 to D3, D8).** No race test waits a fixed time,
-and none relies on the response reaching the browser (`response.finished()` plus a frame can
-pass before the app has handled the body). No hook is added to the app. Each test:
-- holds the late request on a gate (`deferred()`);
-- confirms that the new state is committed before it releases the gate, by a request the app
-  makes only after the commit: for a sign-in, the new user's name in `auth-user` and the seed
-  list request sent with the new token; for a corpus switch, the `/api/seed/sources` request the
-  app sends after the switch's `/api/auth/me` answer (`refreshAll`), not the picker's value,
-  which changes before `/me` commits;
-- synchronizes on the consumer: it releases the late answer, waits for that response, then lets a
-  **probe** answer reach the same code path (the same handler, or the same `await` it is parked
-  on) and waits for the probe's visible result. The late answer was delivered first, so its
-  continuation has run by then;
-- records transient effects with a test-side `MutationObserver` installed by `page.evaluate`
-  (`recordDom(page, texts)` / `domSnapshots(page)` in `tests/helpers/mockApi.ts`), so a probe that
-  overwrites a status cannot hide an earlier write.
+**Checkpoints for every browser race test (D1 to D3, D8), controller ruling.** No race test
+waits a fixed time, and no hook is added to the app. A response reaching the browser
+(`waitForResponse`, `response.finished()`) is not a checkpoint: the app reads the body
+afterwards (`json()`, `blob()`, `text()` for errors, `api.js:91-105`) and may then start
+follow-up requests. The mechanism:
+- **A test-installed fetch wrapper.** `trackFetches(page)` in `tests/helpers/mockApi.ts` runs
+  through `page.addInitScript` before the app loads. It wraps `window.fetch`, and per request
+  path records page-side, in `window.__dtFetch`:
+  - each call, synchronously when the app calls `fetch`;
+  - each resolved body read: the wrapper wraps the response's `json`, `blob`, `text` and
+    `arrayBuffer`, and counts when the promise the app awaits resolves.
+- **The checkpoint.** `afterBodyRead(page, match, previous)` waits until the read count for
+  `match` exceeds `previous`, then drains with two `setTimeout(0)` rounds inside
+  `page.evaluate`. The app's continuation after its body read, up to its next `await` on a
+  request, has run by then.
+- **Follow-up requests stay route-gated and are asserted by count.** A follow-up the app would
+  start after the late answer (a seed reload, a `/me`, a retried manifest) is held by the
+  test's route. The test asserts it through the wrapper's synchronous call count
+  (`fetchStats(page, match).calls`), which has no IPC lag. Its answer is released only after
+  that assertion.
+- **The commit** of a sign-in or corpus switch is confirmed by a request the app sends only
+  after it, seen in the route log:
+  - for a sign-in, the new user's name in `auth-user` and a seed-list request with the new
+    token;
+  - for a corpus switch, the first `/api/seed/sources` after the switch's `/api/auth/me`
+    response. The picker's value is not a marker: it changes before `/me` commits.
+- Every assertion is taken at a gate, so no transient state needs a DOM observer. The
+  document-wide `MutationObserver` of round 2 is dropped.
 
 Each regression test is checked to fail on `c574aba`; the preservation tests that pass there are
 listed in the plan.
@@ -197,25 +209,29 @@ listed in the plan.
   session can start while the first runs. `resetFrontendState` sets `exportBusy = false` in its
   `signOut` branch only. `handleExportDownload`'s `finally` clears it only when
   `session === sessionEpoch`, so an old session's export never clears a new session's.
-- Tests:
+- Tests (all with `trackFetches`):
   - `seed-selection.spec.ts` (it has the readable-candidate fixture, `:217-225`). Its `boot`
     answers `/api/auth/login` with token `second-token`, and `/api/auth/me` by the bearer token
-    (`second-token` → user `second`, else `reader`). Hold `…/candidates/readable/file`; click the
-    row's Download; log out; sign in as `second` (committed: `auth-user` reads `second` and the
-    seed list was requested with `second-token`). Release the late file (a PDF with a
-    `Content-Disposition`). Probe: `second` clicks the same Download, answered at once, and the
-    test waits for that download event and `Downloaded readable.pdf.` Then exactly one download
-    event happened (two on `c574aba`).
-  - Same file, the failure case: the late file answers `500 { error: 'late-candidate-error-7f3' }`
-    (a non-JSON body would be shown as the error text). Same probe; the recorded DOM never
-    contained `late-candidate-error-7f3`.
-  - `session.spec.ts`: alice starts the Bundle ZIP export (held); log out; bob signs in; bob's
-    export button is enabled; bob starts an export (held too). Release alice's export, then bob's
-    (the probe), and wait for bob's download event: exactly one download event, the button is
-    enabled, and the recorded DOM never showed the button enabled between the two releases.
-  - `tab-resources.spec.ts` (preservation): an export held across a corpus switch (committed as
-    above) keeps the button disabled in the new corpus until it settles; then the button is
-    enabled.
+    (`second-token` → user `second`, else `reader`). The candidate file answers request 0 with
+    `readable.pdf` and later requests with `probe.pdf` (distinct `Content-Disposition`
+    filenames). Hold request 0; click the row's Download; log out; sign in as `second`
+    (committed). Release it and pass `afterBodyRead` on the file path: `Downloaded readable.pdf.`
+    is absent. Then `second` downloads again (request 1, answered at once) and the test waits for
+    that download: the download events' suggested filenames are exactly `['probe.pdf']`.
+  - Same file, the failure case: request 0 answers `500 { error: 'late-candidate-error-7f3' }`
+    (a non-JSON body would be shown as the error text). At the checkpoint (the `text()` read) the
+    text `late-candidate-error-7f3` is absent.
+  - `session.spec.ts`, with **admin** users (the Downloads tab is an admin tab,
+    `App.svelte:94-108`), navigating by the `tab-downloads` button in the same document. Export
+    request 0 answers `alice-bundle.zip`, request 1 `bob-bundle.zip`, each held. Alice starts the
+    Bundle ZIP export; log out; bob signs in, opens Downloads; his export button is enabled; he
+    starts an export (request 1, held). Release request 0 and pass `afterBodyRead`: bob's button
+    is still disabled (his response is still held) and no `export downloaded` text shows. Release
+    request 1 and wait for its download: the suggested filenames are exactly
+    `['bob-bundle.zip']`, and the button is enabled.
+  - `tab-resources.spec.ts` (preservation), admin boot, Downloads opened by its tab button: an
+    export held across a corpus switch (committed as above) keeps the button disabled in the new
+    corpus until it settles; then the button is enabled.
 
 **D2. A search launch is dropped once the frontend commits a session or corpus change (FE-63),
 controller call.**
@@ -239,25 +255,32 @@ controller call.**
   body carries `corpusId`, and `startSearch` drops a body whose corpus is no longer current) is
   unchanged.
 - The run itself goes on server side, as it does today.
-- Tests (probe for the launch: a second launch in the new state through the same
-  `startSearch`, answered `200 { results: [] }` with no `runId`, whose
-  `Search complete. Added 0 item(s) to Seed.` the test waits for):
+- Tests (all with `trackFetches`). The baseline effect at the checkpoint is
+  `startedSearchRunIds` holding the run, so `window.__dtRefresh.reason()` reads `'active'`,
+  plus a seed follow-up call. With the empty seed fixture, two seed loads would clear the run
+  (`startSearch`'s `loadSeedSources`, then `focusSeedSource`'s second load when the run is
+  absent; miss limit 2, `App.svelte:181-215`). So every `/api/seed/sources` request after the
+  late answer is route-gated until the assertions are done.
   - `session.spec.ts`: the preview answers `{ count: 5, threshold: 100000 }`; hold
-    `POST /api/keyword-search`; once it is seen, log out and sign in as bob (committed); release
-    `202 { runId: 7, status: 'running' }`; probe. Then `window.__dtRefresh.reason()` is not
-    `'active'`, and the recorded DOM never contained `Fetching in the background`.
-  - `session.spec.ts`, the late 403: the launch answers `202 { runId: 7 }` at once, and the
-    follow-up `/api/seed/sources` sent with alice's token is held. Log out; bob signs in, with
-    his own seed-list request held too. Release alice's request with `403`, then bob's (the
-    probe), and wait for bob's seed list. No `/api/auth/me` request was sent between the two
-    releases (one on `c574aba`, with bob's token).
+    `POST /api/keyword-search`; once it is seen, log out and sign in as bob (committed: his first
+    seed request answered). Gate later seed requests; note the seed call count. Release
+    `202 { runId: 7, status: 'running' }` and pass `afterBodyRead` on `/api/keyword-search`.
+    Then the reason is not `'active'` and the seed call count is unchanged (`c574aba`:
+    `'active'` and one more call).
+  - `session.spec.ts`, the late 403: the launch answers `202 { runId: 7 }` at once; the
+    follow-up `/api/seed/sources` sent with alice's token is held. Log out; bob signs in, with his
+    first seed-list request held too. Note the `/api/auth/me` call count and the seed read count.
+    Release alice's request with `403`, then pass `afterBodyRead` on `/api/seed/sources`: the
+    `/me` call count is unchanged (`c574aba`: one more, sent with bob's token). Then release bob's
+    request.
   - `tab-resources.spec.ts`, after the commit: the same as the first test with a corpus switch to
-    2, committed by the seed-list request after its `/me`.
+    2, committed by the answered seed-list request after its `/me`; later seed requests gated.
   - `tab-resources.spec.ts`, in the gap (preservation, passes on `c574aba`): hold the launch and
-    the `/me` after the select. Release the launch, then observe its effect in the gap:
-    `Fetching in the background` visible and the reason `'active'`. Release `/me` and wait for
-    the commit (the seed-list request after it, answered). Then the status is gone, the reason
-    is not `'active'`, and the launch body carried `corpusId: 1`.
+    the `/me` after the select, and gate the seed follow-ups. Release the launch and pass
+    `afterBodyRead`: the reason is `'active'` and one seed follow-up call is held. Release the
+    seed follow-ups and wait for `Fetching in the background`. Release `/me` and wait for the
+    commit. Then the status is gone, the reason is not `'active'`, and the launch body carried
+    `corpusId: 1`.
 
 **D3. Only the newest detail request writes the panel and the cache (FE-61).**
 - `ThreeGraph.svelte` gets `let nodeDetailSeq = 0`. `loadNodeDetail` takes
@@ -271,24 +294,24 @@ controller call.**
   reset at the start of `load3DGraph` (`:1215-1222`) bump `nodeDetailSeq` and set
   `nodeDetailLoading = false`, so hovering another node never shows the old node's
   "Loading metadata...".
-- Tests, `graph-3d.spec.ts`, with gates on `/api/graph/3d/node/1` and `/node/2`. The probe is
-  always a later detail answer through `loadNodeDetail`, released after the late one:
-  - a late failure: select `Graph seed work` (node 1, held), then `Referenced work` (node 2,
-    held); release node 1 with 500, then node 2 (the probe), and wait for
-    `Identifiers: 10.1000/example`. No recorded snapshot after selecting node 2 lacks both
-    `Loading metadata...` and the identifiers (on `c574aba` node 1's `finally` hides the
-    loading line while node 2 is still loading);
-  - an older success: the same with node 1 answering `200 { id: 1, doi: '10.1000/seed' }`: the
-    recorded DOM never showed `10.1000/seed`, and the loading line stayed until node 2 answered;
-  - A → B → A: node 1's first request (gate 1) and second request (gate 2) are held, node 2
-    answers at once (select 1, 2, 1). Release gate 1 with `doi: '10.1000/seed-v1'`, then gate 2
-    with `10.1000/seed-v2` (the probe), and wait for `Identifiers: 10.1000/seed-v2`. The recorded
-    DOM never showed `seed-v1`; select node 2, then node 1 again: no third node-1 request, and
-    `seed-v2` shows (the cache hit);
-  - deselection: select node 1 (held); press Escape; release node 1 with
-    `200 { id: 1, doi: '10.1000/seed' }`; probe: select node 2 (answered) and wait for its
-    identifiers. Then select node 1 again: a second node-1 request is sent (Escape ended the first
-    one, so its answer was not cached; on `c574aba` the cache hit sends none).
+- Tests, `graph-3d.spec.ts`, with `trackFetches` and per-request gates on
+  `/api/graph/3d/node/1` and `/node/2`:
+  - an older answer for another node, failing or succeeding (one parametrized test): select
+    `Graph seed work` (node 1, held), then `Referenced work` (node 2, held). Release node 1 with
+    500, or with `200 { id: 1, doi: '10.1000/seed' }`, and pass `afterBodyRead` on `/node/1`:
+    `Loading metadata...` is still visible. On `c574aba` node 1's `finally` hid it; the existing
+    selected-id check already keeps node 1's identifiers from showing under node 2. Then release
+    node 2: its identifiers show;
+  - A → B → A cache: node 1's first request (A1) and second request (A2) are held, node 2
+    answers at once (select 1, 2, 1). Release A2 first with `doi: '10.1000/seed-v2'` and wait for
+    `Identifiers: 10.1000/seed-v2`. Then release A1 with `10.1000/seed-v1` and pass
+    `afterBodyRead` on `/node/1` (second read): `seed-v2` is still shown. Select node 2, then
+    node 1 again: the node-1 call count stays 2 and `seed-v2` shows (the cached A2). On
+    `c574aba` A1 overwrites both the panel and the cache;
+  - Escape: select node 1 (held); press Escape; release node 1 with
+    `200 { id: 1, doi: '10.1000/seed' }` and pass `afterBodyRead` before any new selection. Then
+    select node 1 again: a second node-1 call is made (Escape ended the first request, so its
+    answer was not cached; on `c574aba` the cache hit makes none).
 
 **D4. The upload list is saved best effort (FE-64).**
 - `persistStoredUploads` wraps the `window.localStorage.setItem` call (the `window.localStorage`
@@ -425,19 +448,23 @@ call.**
     `?v=gen-<k1>` (matching) and with `?v=stale`.
   - The build-streaming test (`:307-325`) still passes.
   - `graph-3d.spec.ts`:
-    - manifest 1 lists resource URLs with `?v=A`, manifest 2 with `?v=B`; `nodes.bin?v=A`
-      answers 409. The manifest is requested twice, every resource request after the 409 carries
-      `v=B`, and the graph status shows the loaded node count.
-    - A 409 after unmount (preservation, passes on `c574aba`): hold `nodes.bin?v=A`; switch to
-      the workspace tab (the graph unmounts); release with 409; probe: open the graph tab again
-      (a new instance, answered at once) and wait for its loaded status. Only the new instance's
-      manifest request followed the first, and no request carried `v=B`.
-    - A 409 after a header corpus switch: open the graph under corpus 1, hold its
-      `nodes.bin?v=A`; switch the header picker to corpus 2 and wait for the new instance's
-      manifest request with `corpus_id=2`, its resources held. Release the old `nodes.bin` with
-      409, then the corpus-2 resources (the probe), and wait for the loaded status. No manifest
-      request with `corpus_id=1` followed the first one. (On `c574aba` there is no corpus-2 load
-      at all, so the test fails at that wait.)
+    - The graph mock takes the manifest versions per test, in request order, and answers `/me`
+      with a mutable `lastCorpusId` that the select POST sets. Retry: versions `['A', 'B']`;
+      `nodes.bin?v=A` answers 409. The manifest is requested twice, every resource request after
+      the 409 carries `v=B`, and the graph status shows the loaded node count.
+    - A 409 after unmount (preservation, passes on `c574aba`): versions `['A', 'R']`. Hold
+      `nodes.bin?v=A`; switch to the workspace tab (the graph unmounts); release with 409 and pass
+      `afterBodyRead` on that path: the manifest call count is still 1. Open the graph tab again
+      (a new instance, answered at once) and wait for its loaded status: exactly one new
+      manifest call (2 in all), and its resources carry `v=R`.
+    - A 409 after a header corpus switch: corpora 1 and 2; versions by corpus (`A` for 1, `C` for
+      2). Open the graph under corpus 1 and hold its `nodes.bin?v=A`. Select corpus 2 in the
+      header picker: the select POST sets `lastCorpusId = 2`, and `/me` returns it, so the
+      commit remounts the graph. Wait for the new instance's manifest request with
+      `corpus_id=2`, its resources held. Release the old `nodes.bin` with 409 and pass
+      `afterBodyRead`: no further manifest call with `corpus_id=1`. Release the corpus-2
+      resources and wait for the loaded status. (On `c574aba` there is no corpus-2 load at all,
+      so the test fails at that wait.)
 
 **D9. BE-38 is closed: sync writes stay, controller call.**
 - Measured on this machine (Node 22, 20,000 lines of 150 bytes in a loop): today's `existsSync` +
@@ -579,7 +606,7 @@ Five tasks, each one reviewable commit or a small group of them.
 
 1. **Frontend session races:** D1, D2, D4 (`App.svelte`; `seed-selection.spec.ts`,
    `session.spec.ts`, `tab-resources.spec.ts`, `seed-upload.spec.ts`, `helpers/mockApi.ts` with
-   `logIn`, `recordDom` and `domSnapshots`).
+   `logIn`, `trackFetches`, `fetchStats` and `afterBodyRead`).
 2. **Graph consistency:** D8 (file route, `decorateGraph3dManifest`) and D3, plus D8's load
    ownership, retry and per-corpus instance (`ThreeGraph.svelte`, the `{#key}` in `App.svelte`;
    `graph-read-path.test.js`, `graph-access.test.js`, `graph-3d.spec.ts`).
@@ -626,8 +653,10 @@ reconciliation section with a pointer to this spec.
   until the commit resets them; the run goes on server side. `loadSeedSources` checks its
   request token before it reconciles on a 403, so a late 403 never sends `/me` for the next
   session.
-- **Race-test checkpoints:** no app hook. Tests synchronize on a probe answer through the same
-  code path and record transient DOM states with a test-side `MutationObserver`.
+- **Race-test checkpoints (controller ruling):** no app hook. A test-installed fetch wrapper
+  records each call and each resolved body read per path; the test drains two `setTimeout(0)`
+  rounds after the late body read, and follow-up requests stay route-gated and are asserted by
+  call count. No DOM observer is needed.
 - **D5 (FE-22):** closed, not a bug: once `/me` shows a role change, the next cycle at the latest
   re-arms with it; a tab change re-arms itself.
 - **D6 (FE-24):** the config sets `usePolling: false`; chokidar's own `CHOKIDAR_USEPOLLING`
