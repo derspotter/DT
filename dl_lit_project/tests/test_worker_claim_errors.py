@@ -125,3 +125,117 @@ def test_a_failed_claim_in_a_direct_cycle_reaches_the_loop(monkeypatch, tmp_path
     with pytest.raises(RuntimeError, match=r"^enrich cycle failed: "):
         daemon._run_direct_cycles()
     assert exits == []
+
+
+# --- final fix (D11): only a claim failure is replayed; every terminal write is retried -------
+
+def _locked(*a):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def _scraper_job(monkeypatch, tmp_path, daemon):
+    """A scraper run that commits one artifact row, and its running job."""
+    from dl_lit import scraper_lab
+
+    c = sqlite3.connect(tmp_path / "lit.db", timeout=5)
+    scraper_lab.ensure_scraper_schema(c)
+    c.execute("INSERT INTO scraper_runs (id, source_type, status, query_json) VALUES (7, 'eurlex', 'queued', '{}')")
+    c.commit()
+    c.close()
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", lambda query: [{"title": "No link"}])
+    params = {"run_id": 7, "artifacts_root": str(tmp_path / "artifacts")}
+    return _insert_running_job(tmp_path, daemon.worker_id, "scrape_eurlex", params)
+
+
+def _artifact_count(tmp_path):
+    c = sqlite3.connect(tmp_path / "lit.db", timeout=5)
+    try:
+        return c.execute("SELECT COUNT(*) FROM scraper_artifacts WHERE run_id = 7").fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_a_job_that_did_work_and_cannot_record_its_end_is_not_replayed(monkeypatch, tmp_path):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    daemon.TERMINAL_WRITE_BACKOFF_SECONDS = (0, 0)
+    lines = []
+    monkeypatch.setattr(mod, "log", lines.append)
+    job = _scraper_job(monkeypatch, tmp_path, daemon)
+    attempts = []
+    monkeypatch.setattr(daemon, "mark_job_completed", lambda *a: (attempts.append("completed"), _locked())[1])
+    monkeypatch.setattr(daemon, "mark_job_failed", lambda *a: (attempts.append("failed"), _locked())[1])
+
+    daemon._process_job(job, generation=daemon._begin_work())
+
+    assert attempts == ["completed"] * 3 + ["failed"] * 3
+    assert _artifact_count(tmp_path) == 1
+    assert exits == []  # no restart, so start-up recovery does not run the scraper again
+    assert (
+        f"Job {job['id']}: its end could not be recorded (database is locked); "
+        "it stays running until start-up recovery after the next restart."
+    ) in lines
+    assert not any("exiting with code 75" in line for line in lines)
+    status, _, worker_id = _job_row(tmp_path, job["id"])
+    assert (status, worker_id) == ("running", daemon.worker_id)
+
+
+def test_a_failed_claim_whose_failure_write_is_retried_still_restarts(monkeypatch, tmp_path):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    daemon.TERMINAL_WRITE_BACKOFF_SECONDS = (0, 0)
+    job = _insert_running_job(tmp_path, daemon.worker_id, "enrich", {"limit": 1})
+    _deny_claim(monkeypatch, daemon, "claim_enrich_batch")
+    attempts = []
+    monkeypatch.setattr(daemon, "mark_job_failed", lambda *a: (attempts.append(1), _locked())[1])
+
+    daemon._process_job(job, generation=daemon._begin_work())
+
+    assert len(attempts) == 3
+    assert exits == [75]
+
+
+def test_a_lock_that_clears_on_the_second_attempt_records_the_completion(monkeypatch, tmp_path):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    daemon.TERMINAL_WRITE_BACKOFF_SECONDS = (0, 0)
+    job = _scraper_job(monkeypatch, tmp_path, daemon)
+    real = daemon.mark_job_completed
+    calls = []
+
+    def flaky(*a):
+        calls.append(1)
+        if len(calls) == 1:
+            _locked()
+        return real(*a)
+
+    monkeypatch.setattr(daemon, "mark_job_completed", flaky)
+
+    daemon._process_job(job, generation=daemon._begin_work())
+
+    assert len(calls) == 2
+    status, result_json, _ = _job_row(tmp_path, job["id"])
+    assert status == "completed"
+    assert json.loads(result_json)["run_id"] == 7
+    assert exits == []
+    assert _artifact_count(tmp_path) == 1
+
+
+def test_a_lock_that_clears_on_the_second_attempt_records_the_failure(monkeypatch, tmp_path):
+    mod, daemon, exits = _daemon(monkeypatch, tmp_path)
+    daemon.TERMINAL_WRITE_BACKOFF_SECONDS = (0, 0)
+    job = _insert_running_job(tmp_path, daemon.worker_id, "enrich", {"limit": 1})
+    _deny_claim(monkeypatch, daemon, "claim_enrich_batch")
+    real = daemon.mark_job_failed
+    calls = []
+
+    def flaky(*a):
+        calls.append(1)
+        if len(calls) == 1:
+            _locked()
+        return real(*a)
+
+    monkeypatch.setattr(daemon, "mark_job_failed", flaky)
+
+    daemon._process_job(job, generation=daemon._begin_work())
+
+    assert len(calls) == 2
+    assert _job_row(tmp_path, job["id"])[0] == "failed"
+    assert exits == []

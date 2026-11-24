@@ -187,6 +187,10 @@ HUNG_ITEM_COLUMNS = {
 
 class ItemsLatched(Exception):
     """A watchdog won: no item starts any more (D3)."""
+
+
+class JobClaimFailed(Exception):
+    """A job's work-row claim failed (raise_errors=True): the job ended before any work (D11)."""
 # Job types whose runner keeps its own run record (scraper_runs): the watchdog never times them
 # out (no deadline, as before D29), and a recovered job's run record is marked failed.
 UNWATCHED_JOB_TYPES = frozenset({"scrape_eurlex", "scrape_expert_groups"})
@@ -1125,6 +1129,29 @@ class PipelineDaemon:
         self.db.conn.commit()
         return int(cur.rowcount or 0) > 0
 
+    # Pauses between the attempts of a terminal job write (3 attempts in all, D11).
+    TERMINAL_WRITE_BACKOFF_SECONDS = (0.25, 0.5)
+
+    def _write_job_end(self, write, job_id: int, payload):
+        """Run a terminal job write (`mark_job_completed`/`mark_job_failed`), retrying on sqlite3.Error.
+
+        Up to 3 attempts with a short pause between them; the last attempt's error is raised.
+        """
+        attempts = len(self.TERMINAL_WRITE_BACKOFF_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                return write(job_id, payload)
+            except sqlite3.Error as error:
+                try:
+                    if self.db.conn.in_transaction:
+                        self.db.conn.rollback()
+                except sqlite3.Error:
+                    pass
+                if attempt == attempts - 1:
+                    raise
+                log(f"Job {job_id}: terminal write attempt {attempt + 1} failed ({error}); retrying.")
+                time.sleep(self.TERMINAL_WRITE_BACKOFF_SECONDS[attempt])
+
     # --- MARKING LOGIC ---
     def do_mark(self, corpus_id: int, limit: int):
         # Canonical works no longer require a separate raw-marking step.
@@ -1246,14 +1273,17 @@ class PipelineDaemon:
 
     def do_enrich(self, corpus_id: int, limit: int, workers: int, expansion: dict, pending_work_ids: list[int] | None = None):
         target_ids = [int(value) for value in (pending_work_ids or []) if str(value).strip().isdigit() and int(value) > 0]
-        to_process = self.db.claim_enrich_batch(
-            limit=max(1, int(limit or 1)),
-            corpus_id=corpus_id,
-            claimed_by=self.worker_id,
-            lease_seconds=self._claim_lease_seconds(),
-            target_ids=target_ids,
-            raise_errors=True,
-        )
+        try:
+            to_process = self.db.claim_enrich_batch(
+                limit=max(1, int(limit or 1)),
+                corpus_id=corpus_id,
+                claimed_by=self.worker_id,
+                lease_seconds=self._claim_lease_seconds(),
+                target_ids=target_ids,
+                raise_errors=True,
+            )
+        except sqlite3.Error as e:
+            raise JobClaimFailed(f"enrich claim failed: {e}") from e
         for row in to_process:
             for key in ("authors", "keywords"):
                 if isinstance(row.get(key), str):
@@ -1594,13 +1624,16 @@ class PipelineDaemon:
         if effective_limit != limit:
             log(f"Clamped download job batch from {limit} to {effective_limit} (RAG_FEEDER_DOWNLOAD_JOB_MAX={per_job_max})")
 
-        rows = self.db.claim_download_batch(
-            limit=effective_limit,
-            corpus_id=corpus_id,
-            claimed_by=self.worker_id,
-            lease_seconds=self._claim_lease_seconds(),
-            raise_errors=True,
-        )
+        try:
+            rows = self.db.claim_download_batch(
+                limit=effective_limit,
+                corpus_id=corpus_id,
+                claimed_by=self.worker_id,
+                lease_seconds=self._claim_lease_seconds(),
+                raise_errors=True,
+            )
+        except sqlite3.Error as e:
+            raise JobClaimFailed(f"download claim failed: {e}") from e
         if not rows:
             return {"processed": 0, "downloaded": 0, "failed": 0, "skipped": 0, "results": []}
 
@@ -1711,7 +1744,8 @@ class PipelineDaemon:
         corpus_id = job.get("corpus_id")
         params = job.get("params", {})
         result = None
-        record_failed = False
+        record_failed = False  # a claim failure whose failure write failed: exit 75 (D11)
+        end_unrecorded = False
 
         try:
             if job["job_type"] == "enrich":
@@ -1772,7 +1806,7 @@ class PipelineDaemon:
             else:
                 raise ValueError(f"Unknown job type: {job['job_type']}")
 
-            updated = self.mark_job_completed(job["id"], result or {})
+            updated = self._write_job_end(self.mark_job_completed, job["id"], result or {})
             if updated:
                 log(f"Successfully completed job {job['id']}")
             elif self._terminal:
@@ -1795,17 +1829,27 @@ class PipelineDaemon:
             err_msg = traceback.format_exc()
             log(f"Job {job['id']} failed: {e}")
             try:
-                updated = self.mark_job_failed(job["id"], err_msg)
+                updated = self._write_job_end(self.mark_job_failed, job["id"], err_msg)
             except sqlite3.Error as write_error:
-                # The job would stay 'running' under this live worker, which periodic
-                # recovery never reclaims: exit below, and start-up recovery requeues it (D11).
-                log(
-                    f"Job {job['id']}: the failure could not be recorded ({write_error}); "
-                    f"exiting with code {JOB_TIMEOUT_EXIT_CODE} so start-up recovery requeues it."
-                )
                 updated = False
-                record_failed = True
-            if not updated and not record_failed:
+                end_unrecorded = True
+                if isinstance(e, JobClaimFailed):
+                    # Its claim failed, so no work was done: the job would stay 'running' under
+                    # this live worker, which periodic recovery never reclaims. Exit below, and
+                    # start-up recovery requeues it (D11).
+                    log(
+                        f"Job {job['id']}: the failure could not be recorded ({write_error}); "
+                        f"exiting with code {JOB_TIMEOUT_EXIT_CODE} so start-up recovery requeues it."
+                    )
+                    record_failed = True
+                else:
+                    # The job did work (a scraper's artifacts are committed): a replay could
+                    # repeat it, so it is not requeued now (as before D11).
+                    log(
+                        f"Job {job['id']}: its end could not be recorded ({write_error}); "
+                        "it stays running until start-up recovery after the next restart."
+                    )
+            if not updated and not end_unrecorded:
                 if self._terminal:
                     log(f"Job {job['id']} failure not recorded because it was already timed out by the watchdog.")
                 else:
