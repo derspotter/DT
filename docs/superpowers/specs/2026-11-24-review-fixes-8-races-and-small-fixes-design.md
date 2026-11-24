@@ -1,8 +1,8 @@
 # Review fixes, phase 8: races and small fixes — design
 
-Date: 2026-11-24, revised the same day after the Codex pre-flight round 1
-(`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md`, rulings in
-`progress.md` next to it, section "Pre-flight round 1"). Branch `review-fixes-8` (worktree from
+Date: 2026-11-24, revised the same day after the Codex pre-flight rounds 1 and 2
+(`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md` and
+`preflight-2.md`, rulings in `progress.md` next to them). Branch `review-fixes-8` (worktree from
 master `c574aba`).
 Source: the reconciliation of the review inventory against `c574aba`
 (`.superpowers/sdd/review-fixes-8-reconcile/{fe,be,py}.md`, and the section "Reconciliation against
@@ -165,16 +165,25 @@ Everything else that is still open after the reconciliation belongs to later pha
 
 ### Frontend
 
-**Late-answer gates for every browser race test (D1 to D4, D8).** No race test waits a fixed
-time. Each one:
+**Checkpoints for every browser race test (D1 to D3, D8).** No race test waits a fixed time,
+and none relies on the response reaching the browser (`response.finished()` plus a frame can
+pass before the app has handled the body). No hook is added to the app. Each test:
 - holds the late request on a gate (`deferred()`);
-- confirms that the new session or corpus has loaded before it releases the gate (the new
-  user's name in `auth-user` and the workspace rendered; or the switched corpus in the picker and
-  its `/api/auth/me` answered);
-- after the release, waits on a browser-side checkpoint before it asserts:
-  `const response = page.waitForResponse(<url>)`, release, `await (await response).finished()`,
-  then `await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0))))`.
-  The helper is `afterLateAnswer(page, responsePromise)` in `tests/helpers/mockApi.ts`.
+- confirms that the new state is committed before it releases the gate, by a request the app
+  makes only after the commit: for a sign-in, the new user's name in `auth-user` and the seed
+  list request sent with the new token; for a corpus switch, the `/api/seed/sources` request the
+  app sends after the switch's `/api/auth/me` answer (`refreshAll`), not the picker's value,
+  which changes before `/me` commits;
+- synchronizes on the consumer: it releases the late answer, waits for that response, then lets a
+  **probe** answer reach the same code path (the same handler, or the same `await` it is parked
+  on) and waits for the probe's visible result. The late answer was delivered first, so its
+  continuation has run by then;
+- records transient effects with a test-side `MutationObserver` installed by `page.evaluate`
+  (`recordDom(page, texts)` / `domSnapshots(page)` in `tests/helpers/mockApi.ts`), so a probe that
+  overwrites a status cannot hide an earlier write.
+
+Each regression test is checked to fail on `c574aba`; the preservation tests that pass there are
+listed in the plan.
 
 **D1. A download that settles after a sign-out is dropped (FE-60b), controller call.**
 - `handleSeedCandidateFile`, `handleDownloadSeedDocument`, `handleDownloadedCorpusFile` and
@@ -192,19 +201,21 @@ time. Each one:
   - `seed-selection.spec.ts` (it has the readable-candidate fixture, `:217-225`). Its `boot`
     answers `/api/auth/login` with token `second-token`, and `/api/auth/me` by the bearer token
     (`second-token` → user `second`, else `reader`). Hold `…/candidates/readable/file`; click the
-    row's Download; log out; sign in as `second` and wait for `auth-user` to read `second`;
-    release with a PDF and a `Content-Disposition`; `afterLateAnswer`. Then: no `download` event
-    and no `Downloaded` text.
-  - Same file, the failure case: the file answers `500 { error: 'late-candidate-error-7f3' }`;
-    after the checkpoint the text `late-candidate-error-7f3` is absent. (A non-JSON body would be
-    shown as the error text, so `/Failed to download/` alone would already be absent on
-    `c574aba`.)
+    row's Download; log out; sign in as `second` (committed: `auth-user` reads `second` and the
+    seed list was requested with `second-token`). Release the late file (a PDF with a
+    `Content-Disposition`). Probe: `second` clicks the same Download, answered at once, and the
+    test waits for that download event and `Downloaded readable.pdf.` Then exactly one download
+    event happened (two on `c574aba`).
+  - Same file, the failure case: the late file answers `500 { error: 'late-candidate-error-7f3' }`
+    (a non-JSON body would be shown as the error text). Same probe; the recorded DOM never
+    contained `late-candidate-error-7f3`.
   - `session.spec.ts`: alice starts the Bundle ZIP export (held); log out; bob signs in; bob's
-    export button is enabled; bob starts an export (held too); release alice's export and wait
-    for the checkpoint: no download event, no `export downloaded` text, and bob's button is still
-    disabled (his export owns the lock); release bob's: one download event, button enabled.
-  - `tab-resources.spec.ts`: an export held across a corpus switch keeps the button disabled in
-    the new corpus until it settles; then the button is enabled.
+    export button is enabled; bob starts an export (held too). Release alice's export, then bob's
+    (the probe), and wait for bob's download event: exactly one download event, the button is
+    enabled, and the recorded DOM never showed the button enabled between the two releases.
+  - `tab-resources.spec.ts` (preservation): an export held across a corpus switch (committed as
+    above) keeps the button disabled in the new corpus until it settles; then the button is
+    enabled.
 
 **D2. A search launch is dropped once the frontend commits a session or corpus change (FE-63),
 controller call.**
@@ -213,6 +224,12 @@ controller call.**
 - `if (stale()) return` right after `runKeywordSearch` (before `refreshQuota` and before
   `startedSearchRunIds`), after `loadSeedSources` and after `focusSeedSource`. The `catch`
   returns on `error?.status === 401 || stale()`.
+- **The seed follow-up checks its token first.** When the launch has already reached
+  `loadSeedSources` and that request answers 403 after a sign-out, today's `catch`
+  (`App.svelte:3283-3286`) runs `handleCorpusPollForbidden` before its request-token check, and
+  the corpus reconciliation then sends `/me` with the next session's token. The existing
+  `if (token !== seedSourcesRequestToken) return` moves ahead of `handleCorpusPollForbidden`.
+  A current request's 403 still reconciles as today.
 - **The boundary is the frontend's commit.** `handleSelectCorpus` (`App.svelte:2319-2349`)
   saves the selection on the server, then waits for `/me`, and only then bumps
   `corpusScopeEpoch` (through `resetFrontendState`). A launch answered in that gap still applies
@@ -222,17 +239,25 @@ controller call.**
   body carries `corpusId`, and `startSearch` drops a body whose corpus is no longer current) is
   unchanged.
 - The run itself goes on server side, as it does today.
-- Tests:
+- Tests (probe for the launch: a second launch in the new state through the same
+  `startSearch`, answered `200 { results: [] }` with no `runId`, whose
+  `Search complete. Added 0 item(s) to Seed.` the test waits for):
   - `session.spec.ts`: the preview answers `{ count: 5, threshold: 100000 }`; hold
-    `POST /api/keyword-search`; once it is seen, log out and sign in as bob (wait for
-    `auth-user` = `bob`); release `202 { runId: 7, status: 'running' }`; `afterLateAnswer`. Then
-    no `Fetching in the background` text, and `window.__dtRefresh.reason()` is not `'active'`.
-  - `tab-resources.spec.ts`, after the frontend commit: the same with a corpus switch (wait for
-    the picker to read `2` and for the `/api/auth/me` that follows the select).
-  - `tab-resources.spec.ts`, in the gap: hold the launch and hold the `/me` after the select
-    (`delays.me` gate); release the launch first and wait for its checkpoint; then release `/me`
-    and wait for the commit. Then no `Fetching in the background` text, the reason is not
-    `'active'`, and the launch body carried `corpusId: 1`.
+    `POST /api/keyword-search`; once it is seen, log out and sign in as bob (committed); release
+    `202 { runId: 7, status: 'running' }`; probe. Then `window.__dtRefresh.reason()` is not
+    `'active'`, and the recorded DOM never contained `Fetching in the background`.
+  - `session.spec.ts`, the late 403: the launch answers `202 { runId: 7 }` at once, and the
+    follow-up `/api/seed/sources` sent with alice's token is held. Log out; bob signs in, with
+    his own seed-list request held too. Release alice's request with `403`, then bob's (the
+    probe), and wait for bob's seed list. No `/api/auth/me` request was sent between the two
+    releases (one on `c574aba`, with bob's token).
+  - `tab-resources.spec.ts`, after the commit: the same as the first test with a corpus switch to
+    2, committed by the seed-list request after its `/me`.
+  - `tab-resources.spec.ts`, in the gap (preservation, passes on `c574aba`): hold the launch and
+    the `/me` after the select. Release the launch, then observe its effect in the gap:
+    `Fetching in the background` visible and the reason `'active'`. Release `/me` and wait for
+    the commit (the seed-list request after it, answered). Then the status is gone, the reason
+    is not `'active'`, and the launch body carried `corpusId: 1`.
 
 **D3. Only the newest detail request writes the panel and the cache (FE-61).**
 - `ThreeGraph.svelte` gets `let nodeDetailSeq = 0`. `loadNodeDetail` takes
@@ -246,20 +271,24 @@ controller call.**
   reset at the start of `load3DGraph` (`:1215-1222`) bump `nodeDetailSeq` and set
   `nodeDetailLoading = false`, so hovering another node never shows the old node's
   "Loading metadata...".
-- Tests, `graph-3d.spec.ts`, with gates on `/api/graph/3d/node/1` and `/node/2`:
-  - select `Graph seed work` (held), select `Referenced work` (answers), see
-    `Identifiers: 10.1000/example`; release node 1 with 500 and wait for the checkpoint: still
-    shown, no `Loading metadata...`;
-  - A → B → A: node 1's first request held (gate 1), node 2 answers, node 1's second request held
-    (gate 2); release gate 2 with `doi: '10.1000/seed-v2'` (shown), then gate 1 with
-    `10.1000/seed-v1` and wait for the checkpoint: `10.1000/seed-v2` still shown; select node 2,
-    then node 1 again: no third node-1 request, and `10.1000/seed-v2` shows (the cache hit);
-  - deselection: select node 2 (answers, cached), select node 1 (held), press Escape, select node
-    2 again (cache hit); release node 1 with 500 and wait for the checkpoint:
-    `Identifiers: 10.1000/example` still shown and no `Loading metadata...`;
-  - older answer: node 1 and node 2 both held, select 1 then 2; release node 1 with 200 and wait
-    for the checkpoint: `Loading metadata...` still shown, no `10.1000/seed`; release node 2:
-    its identifiers show.
+- Tests, `graph-3d.spec.ts`, with gates on `/api/graph/3d/node/1` and `/node/2`. The probe is
+  always a later detail answer through `loadNodeDetail`, released after the late one:
+  - a late failure: select `Graph seed work` (node 1, held), then `Referenced work` (node 2,
+    held); release node 1 with 500, then node 2 (the probe), and wait for
+    `Identifiers: 10.1000/example`. No recorded snapshot after selecting node 2 lacks both
+    `Loading metadata...` and the identifiers (on `c574aba` node 1's `finally` hides the
+    loading line while node 2 is still loading);
+  - an older success: the same with node 1 answering `200 { id: 1, doi: '10.1000/seed' }`: the
+    recorded DOM never showed `10.1000/seed`, and the loading line stayed until node 2 answered;
+  - A → B → A: node 1's first request (gate 1) and second request (gate 2) are held, node 2
+    answers at once (select 1, 2, 1). Release gate 1 with `doi: '10.1000/seed-v1'`, then gate 2
+    with `10.1000/seed-v2` (the probe), and wait for `Identifiers: 10.1000/seed-v2`. The recorded
+    DOM never showed `seed-v1`; select node 2, then node 1 again: no third node-1 request, and
+    `seed-v2` shows (the cache hit);
+  - deselection: select node 1 (held); press Escape; release node 1 with
+    `200 { id: 1, doi: '10.1000/seed' }`; probe: select node 2 (answered) and wait for its
+    identifiers. Then select node 1 again: a second node-1 request is sent (Escape ended the first
+    one, so its answer was not cached; on `c574aba` the cache hit sends none).
 
 **D4. The upload list is saved best effort (FE-64).**
 - `persistStoredUploads` wraps the `window.localStorage.setItem` call (the `window.localStorage`
@@ -376,6 +405,14 @@ call.**
 
   A sign-out unmounts the graph tab, so a late 409 never starts a request under the next
   session's token (`requestJson` reads the token at call time, `api.js:41`).
+- **One graph instance per committed workspace corpus.** The header picker changes the
+  `selectedGraphCorpusId` prop (`App.svelte:552`, `:5984`) without remounting the component or
+  starting a load, so a late 409 could retry corpus A's graph and publish it under B. App.svelte
+  wraps the `<svelte:component this={module.default} …>` in `{#key graphCorpusId}`.
+  `graphCorpusId` follows `currentCorpusId`, which changes only at the switch's commit. A switch
+  destroys the old instance (its load stops owning) and mounts a new one, which loads the new
+  corpus's graph. A change of the graph's own corpus select inside the component starts a new
+  `load3DGraph`, which supersedes the old load through `graphLoadSeq`.
 - Tests:
   - `graph-read-path.test.js`, a hand-written snapshot dir as in the cluster test (`:327-340`),
     manifest `generated_at: 'A'`, `nodes.bin` and its `.gz`:
@@ -391,9 +428,16 @@ call.**
     - manifest 1 lists resource URLs with `?v=A`, manifest 2 with `?v=B`; `nodes.bin?v=A`
       answers 409. The manifest is requested twice, every resource request after the 409 carries
       `v=B`, and the graph status shows the loaded node count.
-    - A 409 after unmount: hold `nodes.bin?v=A`; switch to the workspace tab (the graph
-      unmounts); release with 409 and wait for the checkpoint: the manifest was requested once
-      and no request carries `v=B`.
+    - A 409 after unmount (preservation, passes on `c574aba`): hold `nodes.bin?v=A`; switch to
+      the workspace tab (the graph unmounts); release with 409; probe: open the graph tab again
+      (a new instance, answered at once) and wait for its loaded status. Only the new instance's
+      manifest request followed the first, and no request carried `v=B`.
+    - A 409 after a header corpus switch: open the graph under corpus 1, hold its
+      `nodes.bin?v=A`; switch the header picker to corpus 2 and wait for the new instance's
+      manifest request with `corpus_id=2`, its resources held. Release the old `nodes.bin` with
+      409, then the corpus-2 resources (the probe), and wait for the loaded status. No manifest
+      request with `corpus_id=1` followed the first one. (On `c574aba` there is no corpus-2 load
+      at all, so the test fails at that wait.)
 
 **D9. BE-38 is closed: sync writes stay, controller call.**
 - Measured on this machine (Node 22, 20,000 lines of 150 bytes in a loop): today's `existsSync` +
@@ -419,11 +463,17 @@ call.**
   its annotation becomes `tuple[list[tuple[int, str, str]], int]`
   (`test_backfill_helpers_carry_the_specified_annotations`, `test_doi_rule_scripts.py:157-165`,
   changes with it).
-- `write_results` takes the pass's guard and runs one `UPDATE` per row inside the batch's
-  transaction (at most 50). Each `UPDATE` repeats in one statement what the pass selected the
-  row for:
-  - pass 1: `WHERE id = ? AND openalex_id = ? AND (topics_fetched IS NULL OR topics_fetched = 0)`;
-  - pass 2: `WHERE id = ? AND doi = ? AND (openalex_id IS NULL OR openalex_id = '') AND (topics_fetched IS NULL OR topics_fetched = 0)`.
+- `write_results` takes the pass's guard and the run's `scope_clause` and runs one `UPDATE` per
+  row inside the batch's transaction (at most 50). Each `UPDATE` repeats in one statement what
+  the pass selected the row for, the metadata scope included (`main` builds `scope_clause` from
+  the `--scope` choice, `:244-246`: `metadata_status = 'matched'` by default, `1 = 1` for
+  `all`; never from free input):
+  - pass 1: `WHERE id = ? AND <scope_clause> AND openalex_id = ? AND (topics_fetched IS NULL OR topics_fetched = 0)`;
+  - pass 2: `WHERE id = ? AND <scope_clause> AND doi = ? AND (openalex_id IS NULL OR openalex_id = '') AND (topics_fetched IS NULL OR topics_fetched = 0)`.
+
+  A row the enrich worker requeued while its request was held (`metadata_status` back to
+  `pending`, both identifiers kept, `db_manager.py:1705`) is therefore not written under the
+  default scope either.
 
   A DOI row that gained an OpenAlex id while its request was held is therefore not written, and
   the next pass 1 looks it up by that id. The guard is chosen by the pass (`"openalex"` or
@@ -441,6 +491,9 @@ call.**
     topics, and the log line says 1;
   - pass 2, only `openalex_id` set (to `W9`): row 1 keeps `topics_fetched` `None`;
   - pass 1, `openalex_id` changed: the same;
+  - default scope, only `metadata_status` changed to `pending`: row 1 keeps `topics_fetched`
+    `None`, and the log line says 1;
+  - an unchanged row is written and no log line appears (preservation);
   - the existing pass-2 tests pass unchanged.
 
 **D11. The worker raises on a failed claim, and a job whose failure cannot be recorded is
@@ -503,7 +556,10 @@ recovered by a restart (PY-54), controller call.**
   - with `OPENALEX_API_KEY="  sekret-key-123\n"` the searcher's `api_key` is `sekret-key-123`;
   - with `OPENALEX_API_KEY="   "` and `RAG_FEEDER_OPENALEX_API_KEY="fallback-key"` it is
     `fallback-key`;
-  - with both variables unset and both module flags reset, building a searcher and then calling
+  - with both variables unset and both module flags reset (`utils._missing_openalex_api_key_warned`
+    and, where it still exists, `OpenAlexScraper._missing_api_key_warned`, with
+    `monkeypatch.setattr(..., False, raising=False)`, so the result does not depend on test
+    order), building a searcher and then calling
     `openalex_request_json` prints the `[WARN] OPENALEX_API_KEY not set` line exactly once
     (twice on `c574aba`). The request uses a stub session whose response has `status_code` 200,
     `headers` `{}`, `json()` and `raise_for_status()`, and `RAG_FEEDER_OPENALEX_QUOTA_PATH`
@@ -523,10 +579,10 @@ Five tasks, each one reviewable commit or a small group of them.
 
 1. **Frontend session races:** D1, D2, D4 (`App.svelte`; `seed-selection.spec.ts`,
    `session.spec.ts`, `tab-resources.spec.ts`, `seed-upload.spec.ts`, `helpers/mockApi.ts` with
-   `logIn` and `afterLateAnswer`).
+   `logIn`, `recordDom` and `domSnapshots`).
 2. **Graph consistency:** D8 (file route, `decorateGraph3dManifest`) and D3, plus D8's load
-   ownership and retry (`ThreeGraph.svelte`; `graph-read-path.test.js`, `graph-access.test.js`,
-   `graph-3d.spec.ts`).
+   ownership, retry and per-corpus instance (`ThreeGraph.svelte`, the `{#key}` in `App.svelte`;
+   `graph-read-path.test.js`, `graph-access.test.js`, `graph-3d.spec.ts`).
 3. **Backend transaction and dev config:** D7 (`app.js`, `corpus-sharing.test.js`) and D6
    (`vite.config.js`, new `dev-server-config.spec.ts`, `ci.yml`).
 4. **Python claims:** D11 (`db_manager.py`, `worker.py`, worker and claim tests).
@@ -567,7 +623,11 @@ reconciliation section with a pointer to this spec.
   export at a time per session, kept across corpus switches) and is reset on sign-out only.
 - **D2 (FE-63):** a search launch is dropped once the frontend commits a sign-out or corpus
   switch; a launch answered between the server's save and the `/me` answer applies its effects
-  until the commit resets them; the run goes on server side.
+  until the commit resets them; the run goes on server side. `loadSeedSources` checks its
+  request token before it reconciles on a 403, so a late 403 never sends `/me` for the next
+  session.
+- **Race-test checkpoints:** no app hook. Tests synchronize on a probe answer through the same
+  code path and record transient DOM states with a test-side `MutationObserver`.
 - **D5 (FE-22):** closed, not a bug: once `/me` shows a role change, the next cycle at the latest
   re-arms with it; a tab change re-arms itself.
 - **D6 (FE-24):** the config sets `usePolling: false`; chokidar's own `CHOKIDAR_USEPOLLING`
@@ -578,12 +638,14 @@ reconciliation section with a pointer to this spec.
   (`sendFile` keeps range and conditional responses); requests without `v` are unchanged; the
   scope check stays first. Residual: a swap between the check and the file open can still serve
   one new file under the old version (rare, fixed by the next load). The frontend owns each load
-  once and retries once, never after unmount. One build per key stays on disk.
+  once and retries once, never after unmount. The graph component is keyed by the committed
+  workspace corpus, so a header switch remounts it and loads the new corpus. One build per key
+  stays on disk.
 - **D9 (BE-38):** closed, won't fix: per-line sync writes cost about 26 µs in steady state, the
   per-line stat is needed for the workers' bytes, and every faster variant adds a failure mode to
   the shared log.
-- **D10 (PY-34):** each write repeats the pass's selection (identifier, no OpenAlex id for pass
-  2, unfetched) in one `UPDATE`; a changed row is left for the next run; `mark_fetched` goes;
+- **D10 (PY-34):** each write repeats the pass's selection (metadata scope, identifier, no
+  OpenAlex id for pass 2, unfetched) in one `UPDATE`; a changed row is left for the next run; `mark_fetched` goes;
   `doi_rows` returns triples, so a phase 7 annotation test changes.
 - **D11 (PY-54):** the worker raises on a failed claim for both enrich and download; such a job
   now ends `failed` instead of `completed` with zero counts. When the failure cannot be recorded
