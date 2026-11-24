@@ -104,7 +104,8 @@ def _openalex_api_url(url) -> str | None:
     path = parts.path or "/"
     if not path.startswith("/"):
         return None
-    return f"{_OPENALEX_API_BASE}{path}" + (f"?{parts.query}" if parts.query else "")
+    # Always with "?": callers append their options with "&".
+    return f"{_OPENALEX_API_BASE}{path}?{parts.query}"
 
 
 def _not_openalex_message(url) -> str:

@@ -844,3 +844,12 @@ def test_an_openalex_citing_url_is_requested_on_the_fixed_base(keyed_env):
     )
     assert len(session.sent) == 1
     assert session.sent[0].startswith("https://api.openalex.org/works?filter=cites:W1&")
+
+
+def test_a_citing_url_with_an_empty_query_keeps_its_path(keyed_env):
+    from dl_lit import OpenAlexScraper
+
+    session = _RecordingSession([_citing_page("W5")])
+    OpenAlexScraper.fetch_citing_work_ids("https://api.openalex.org/works?", _FreeLimiter(), session=session, api_key="sekret-c")
+    assert len(session.sent) == 1
+    assert session.sent[0].startswith("https://api.openalex.org/works?&select=")
