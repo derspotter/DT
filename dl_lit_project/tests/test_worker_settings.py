@@ -58,6 +58,38 @@ def _daemon(monkeypatch, tmp_path, builder, provider=None):
     return mod, mod.PipelineDaemon(str(tmp_path / "lit.db"), role="enrich")
 
 
+LEAKED_NAMES = ("RAG_FEEDER_LLM_PROVIDER", "OPENALEX_API_KEY", "RAG_FEEDER_OPENALEX_RPS")
+
+
+def test_the_settings_refresh_leaves_no_env_behind(monkeypatch, tmp_path):
+    """The refresh writes os.environ itself; the test's monkeypatch undo must restore it.
+
+    Order-independent check of ``_restore_setting_env``: the names are removed behind
+    monkeypatch's back (as an absent name looks to ``delenv(raising=False)``), the refresh
+    sets them from stored settings, and ``monkeypatch.undo()`` (what teardown runs) must bring
+    back the values from before the test.
+    """
+    before = {name: os.environ.get(name) for name in LEAKED_NAMES}
+    try:
+        for name in LEAKED_NAMES:
+            os.environ.pop(name, None)
+        mod, daemon = _daemon(monkeypatch, tmp_path, lambda self, *a: object())
+        _set_setting(tmp_path / "lit.db", "llm_provider", "openai")
+        _set_setting(tmp_path / "lit.db", "openalex_api_key", "new-key")
+        _set_setting(tmp_path / "lit.db", "openalex_rps", "7")
+        assert daemon.refresh_app_settings() is True
+        assert [os.environ.get(name) for name in LEAKED_NAMES] == ["openai", "new-key", "7"]
+
+        monkeypatch.undo()
+        assert {name: os.environ.get(name) for name in LEAKED_NAMES} == before
+    finally:
+        for name, value in before.items():  # never leak from here, pass or fail
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def test_refresh_rebuilds_enhancer_only_when_settings_change(monkeypatch, tmp_path):
     builds = []
     mod, daemon = _daemon(monkeypatch, tmp_path, lambda self, *a: builds.append(1) or object())

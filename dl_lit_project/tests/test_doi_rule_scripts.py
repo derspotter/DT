@@ -164,6 +164,9 @@ def test_backfill_helpers_carry_the_specified_annotations(backfill):
         "limit_clause": str,
         "return": tuple[list[tuple[int, str, str]], int],
     }
+    assert typing.get_type_hints(backfill.write_results) == {"guard": str, "scope_clause": str, "return": list[int]}
+    assert typing.get_type_hints(backfill.run_pass) == {"return": tuple[int, int, int]}
+    assert typing.get_type_hints(backfill)["WRITE_GUARDS"] == dict[str, str]
 
 
 def _backfill_db(tmp_path, backfill):
@@ -389,6 +392,34 @@ def test_backfill_skips_a_row_requeued_out_of_the_default_scope(tmp_path, monkey
     assert _topic_row(db_path, 1) == (None, None, None)
     assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
     assert f"[doi] 1 {CHANGED_LINE}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("pass_label, identifier, value_one, value_two", [
+    ("id", "openalex_id", "W1", "W2"),
+    ("doi", "doi", "10.1000/ONE", "10.1000/TWO"),
+])
+def test_backfill_never_overwrites_a_row_another_run_finished_during_the_request(
+    tmp_path, monkeypatch, capsys, backfill, pass_label, identifier, value_one, value_two
+):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, **{identifier: value_one, "metadata_status": "matched"})
+    _insert(conn, **{identifier: value_two, "metadata_status": "matched"})
+    conn.close()
+
+    def answers(filter_):
+        return [_work("W1", "10.1000/one", "T1"), _work("W2", "10.1000/two", "T2")]
+
+    # Another backfill writes row 1's topics while this run's request is still out.
+    _fake_openalex_changing(
+        monkeypatch, backfill, db_path,
+        "UPDATE works SET primary_topic = 'FIRST', primary_field = 'FIRST-field', topics_fetched = 1 WHERE id = 1",
+        answers,
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == ("FIRST", "FIRST-field", 1)
+    assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
+    assert f"[{pass_label}] 1 {CHANGED_LINE}" in capsys.readouterr().err
 
 
 def test_backfill_unchanged_rows_log_no_changed_line(tmp_path, monkeypatch, capsys, backfill):

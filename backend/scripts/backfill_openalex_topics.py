@@ -156,7 +156,7 @@ def topic_fields(work):
 
 # What each pass selected a row for, repeated in every write (the scope comes on top), so a row
 # the enrich worker or a merge changed while its request was held is left for the next run.
-WRITE_GUARDS = {
+WRITE_GUARDS: dict[str, str] = {
     "openalex": "openalex_id = ? AND (topics_fetched IS NULL OR topics_fetched = 0)",
     "doi": "doi = ? AND (openalex_id IS NULL OR openalex_id = '') AND (topics_fetched IS NULL OR topics_fetched = 0)",
 }
@@ -185,7 +185,7 @@ def write_results(conn, updates, guard: str, scope_clause: str) -> list[int]:
     return written
 
 
-def run_pass(conn, rows, key, build_filter, mailto, batch_size, label, guard, scope_clause):
+def run_pass(conn, rows, key, build_filter, mailto, batch_size, label, guard, scope_clause) -> tuple[int, int, int]:
     """Generic batched backfill. `key` maps a result work to its lookup token.
 
     rows: (work_id, token, raw identifier); ``guard`` and ``scope_clause`` go to ``write_results``.
