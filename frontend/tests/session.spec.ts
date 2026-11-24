@@ -1869,3 +1869,60 @@ test("a late 403 on the launch's seed follow-up does not reconcile the next sess
   for (const held of gates.heldSeeds.splice(0)) if (held !== alicesSeed) held.release()
   await expect(page.getByText('Seed One')).toBeVisible()
 })
+
+// A corpus selection whose save settles after a sign-out and a new sign-in
+// sends no /me with the next user's token (review, out of scope round 1).
+test("a corpus selection answered after a sign-out sends no /me with the next user's token", async ({ page }) => {
+  const corpus2 = { id: 2, name: 'Second corpus', role: 'owner', owner_username: 'alice' }
+  const selectGate = deferred()
+  let selectSeen = false
+  let meGateOn = false
+  const meRelease = deferred()
+  const answeredSeeds: string[] = []
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await trackFetches(page)
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (path === '/api/auth/me') {
+      if (meGateOn) await meRelease.promise
+      return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus, corpus2] })
+    }
+    if (path === '/api/corpora/2/select') {
+      selectSeen = true
+      await selectGate.promise
+      return fulfil(route, { success: true })
+    }
+    await workspaceDefaults(path, route)
+    if (path === '/api/seed/sources') answeredSeeds.push(auth)
+  })
+
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  await page.locator('.header-corpus-picker select').selectOption('2')
+  await expect.poll(() => selectSeen).toBe(true)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await expect.poll(() => answeredSeeds.includes('Bearer token-b')).toBe(true)
+  meGateOn = true
+  const meCalls = (await fetchStats(page, '/api/auth/me')).calls
+
+  const reads = (await fetchStats(page, '/api/corpora/2/select')).reads
+  selectGate.resolve()
+  await afterBodyRead(page, '/api/corpora/2/select', reads)
+  expect((await fetchStats(page, '/api/auth/me')).calls).toBe(meCalls)
+
+  meGateOn = false
+  meRelease.resolve()
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+})

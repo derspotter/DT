@@ -1,5 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
-import { mockLogSocket } from './helpers/mockApi'
+import { afterBodyRead, fetchStats, fulfil, logIn, mockLogSocket, trackFetches } from './helpers/mockApi'
 
 // Exercises the BibTeX/JSON seed upload flow end-to-end in the real frontend
 // with the backend mocked (no auth/DB available in CI): file picker accepts a
@@ -172,4 +172,80 @@ test('an import that saved nothing shows Import failed', async ({ page }) => {
   await expect(page.getByText(message, { exact: true })).toBeVisible()
   await expect(page.getByText(/Imported \d+ works/)).toHaveCount(0)
   await expect(item.locator('.status')).toHaveText('failed')
+})
+
+// A seed upload whose file answer settles after a sign-out and a new
+// sign-in does not import the old account's file under the new token, and
+// the rest of that selection is not uploaded under it either (review, out
+// of scope round 1).
+test('a seed upload answered after an account change does not import into the next account', async ({ page }) => {
+  importResult = IMPORTED
+  let release!: () => void
+  const uploadGate = new Promise<void>((r) => { release = r })
+  let uploadRequests = 0
+  const uploadHeld: (() => void)[] = []
+  let importGateOn = true
+  const importHeld: (() => void)[] = []
+  const answeredSeeds: string[] = []
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+    }
+  })
+  await trackFetches(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      return fulfil(route, { token: 'second-token', user: { id: 2, username: 'second', last_corpus_id: 1, is_admin: false } })
+    }
+    if (path === '/api/auth/me') {
+      const second = auth === 'Bearer second-token'
+      return fulfil(route, {
+        user: second ? { id: 2, username: 'second', last_corpus_id: 1, is_admin: false } : { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
+        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
+      })
+    }
+    if (path === '/api/process_pdf') {
+      uploadRequests += 1
+      if (uploadRequests === 1) await uploadGate
+      else await new Promise<void>((resolve) => { uploadHeld.push(resolve) })
+    }
+    if (path === '/api/ingest/import-seed' && importGateOn) {
+      await new Promise<void>((resolve) => { importHeld.push(resolve) })
+    }
+    await mockApi(route)
+    if (path === '/api/seed/sources') answeredSeeds.push(auth)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('admin')
+
+  await page.locator('input[type="file"]').first().setInputFiles([
+    {
+      name: 'references.bib',
+      mimeType: 'application/x-bibtex',
+      buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+    },
+    { name: 'more.json', mimeType: 'application/json', buffer: Buffer.from('[]') },
+  ])
+  await expect.poll(() => uploadRequests).toBe(1)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'second')
+  await expect(page.getByTestId('auth-user')).toHaveText('second')
+  await expect.poll(() => answeredSeeds.includes('Bearer second-token')).toBe(true)
+  const importCalls = (await fetchStats(page, '/api/ingest/import-seed')).calls
+  const upload = await fetchStats(page, '/api/process_pdf')
+
+  release()
+  await afterBodyRead(page, '/api/process_pdf', upload.reads)
+  expect((await fetchStats(page, '/api/ingest/import-seed')).calls).toBe(importCalls)
+  expect((await fetchStats(page, '/api/process_pdf')).calls).toBe(upload.calls)
+
+  importGateOn = false
+  for (const resume of importHeld.splice(0)) resume()
+  for (const resume of uploadHeld.splice(0)) resume()
 })

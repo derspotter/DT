@@ -2344,6 +2344,8 @@
     const epoch = sessionEpoch
     try {
       await selectCorpus(nextId)
+      // Its /me would carry the next session's token.
+      if (epoch !== sessionEpoch) return
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -2695,7 +2697,10 @@
     }))
     uploads = [...uploads, ...newItems]
     event.target.value = ''
+    // The rest of a selection is not uploaded under the next session's token.
+    const session = sessionEpoch
     for (const item of newItems) {
+      if (session !== sessionEpoch) return
       await uploadItem(item)
     }
   }
@@ -2709,14 +2714,19 @@
 
   async function uploadItem(item) {
     updateUpload(item.id, { status: 'uploading', message: '' })
+    // An upload that settles after a sign-out belongs to the session that
+    // ended: its import would run under the next session's token.
+    const session = sessionEpoch
     try {
       const payload = await uploadPdf(item.file)
+      if (session !== sessionEpoch) return
       const seedKind = seedKindForName(item.name)
       if (seedKind) {
         // BibTeX/JSON seeds are imported straight into the corpus (no PDF
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
         const result = await importSeed(payload.filename, seedKind)
+        if (session !== sessionEpoch) return
         if (result?.stopped) {
           // The import stopped on an error; what it saved before that stays.
           const processed = Number(result.processed || 0)
@@ -2743,6 +2753,7 @@
       }
       apiStatus = 'online'
     } catch (error) {
+      if (session !== sessionEpoch) return
       if (error?.status === 401) {
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
