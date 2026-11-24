@@ -790,3 +790,23 @@ test('a grouping whose resources failed is fetched again when chosen later', asy
   await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
   expect(await calls(page, /nodes\.bin\?v=U$/)).toBe(1)
 })
+
+test('a recolour after a failed corpus load keeps the corpus error', async ({ page }) => {
+  const { hold } = await graphMock(page, { versionsByCorpus: { 1: 'A', 2: 'C' } })
+  hold('nodes.bin?v=C').release({ status: 500, body: { error: 'Corpus 2 layout failed' } })
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  const corpus = panel.getByText('Corpus', { exact: true }).locator('..').locator('select')
+  const groupBy = panel.getByText('Group by').locator('..').locator('select')
+
+  await corpus.selectOption('2')
+  await expect(panel.getByText('Corpus 2 layout failed', { exact: true })).toBeVisible()
+  expect(await calls(page, /^\/api\/graph\/3d\/snapshot\?corpus_id=2&/)).toBe(1)
+
+  // The graph on screen is still corpus 1's, so its loaded status must not
+  // replace the corpus-2 failure.
+  await groupBy.selectOption('degree')
+  expect(await calls(page, MANIFEST)).toBe(2)
+  await expect(panel.getByText('Corpus 2 layout failed', { exact: true })).toBeVisible()
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeHidden()
+})
