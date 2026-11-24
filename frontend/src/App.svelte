@@ -2701,10 +2701,12 @@
     }))
     uploads = [...uploads, ...newItems]
     event.target.value = ''
-    // The rest of a selection is not uploaded under the next session's token.
+    // The rest of a selection is not uploaded under the next session's token,
+    // nor into a corpus the user switched to meanwhile (FE-65).
     const session = sessionEpoch
+    const scope = corpusScopeEpoch
     for (const item of newItems) {
-      if (session !== sessionEpoch) return
+      if (session !== sessionEpoch || scope !== corpusScopeEpoch) return
       await uploadItem(item)
     }
   }
@@ -2719,18 +2721,22 @@
   async function uploadItem(item) {
     updateUpload(item.id, { status: 'uploading', message: '' })
     // An upload that settles after a sign-out belongs to the session that
-    // ended: its import would run under the next session's token.
+    // ended: its import would run under the next session's token. One that
+    // settles after a corpus switch belongs to the corpus left: the import
+    // would land in the one now selected (FE-65).
     const session = sessionEpoch
+    const scope = corpusScopeEpoch
+    const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     try {
       const payload = await uploadPdf(item.file)
-      if (session !== sessionEpoch) return
+      if (stale()) return
       const seedKind = seedKindForName(item.name)
       if (seedKind) {
         // BibTeX/JSON seeds are imported straight into the corpus (no PDF
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
         const result = await importSeed(payload.filename, seedKind)
-        if (session !== sessionEpoch) return
+        if (stale()) return
         if (result?.stopped) {
           // The import stopped on an error; what it saved before that stays.
           const processed = Number(result.processed || 0)
@@ -2757,7 +2763,7 @@
       }
       apiStatus = 'online'
     } catch (error) {
-      if (session !== sessionEpoch) return
+      if (stale()) return
       if (error?.status === 401) {
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
