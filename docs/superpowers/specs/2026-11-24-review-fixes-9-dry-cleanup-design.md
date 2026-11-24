@@ -1,6 +1,6 @@
 # Review fixes, phase 9: backend/frontend DRY cleanup plus the rows parked in phase 8 — design
 
-Date: 2026-11-24, revised the same day after pre-flight 1 and pre-flight 2 (Codex,
+Date: 2026-11-24, revised the same day after pre-flights 1 to 4 (Codex,
 `.superpowers/sdd/2026-11-24-review-fixes-9-dry-cleanup/preflight.md` and `preflight-2.md`) and
 the controller's rulings on them. Branch `review-fixes-9` (worktree from master `d4518a9`).
 Source: the reconciliation of the review inventory against `c574aba`
@@ -348,15 +348,19 @@ The evidence for each row is in its decision; this list names the defect.
   body `serverErrorText(req, error, 'Keyword search failed')`. Each route logs the full error once:
   the preview's `console.error` already does; the launch's `Search script failed:` line logs the
   error object instead of `error?.message`, also when the response was already sent.
-- **Dead search runs (pre-flight 3).** After launch has answered `202`, `finalizeDeadSearchRun`
-  (`app.js:1183`) stores up to 200 characters of the child's error in `search_runs.error`, and
-  the seed API returns it to every corpus member as `run.error` (`seed.js:1115`). It now stores
-  a reason with no child text: `search process exited (code <exitCode>)`, or
-  `(signal <signal>)`, or `(<error.code>)` for a spawn error such as `ENOENT`, or
-  `(no exit status)`. Everyone gets this reason, admins included, because the stored row has no
-  viewer. The full error is still in the launch's log line. `search-run-failure.test.js:212`
-  keeps its assertions; a new case checks the stored text for an exit-code error whose message
-  holds stderr.
+- **Failed search runs (pre-flight 3 and 4).** A failed run's `search_runs.error` holds child
+  text from two writers: `finalizeDeadSearchRun` (`app.js:1183`, up to 200 characters of the
+  child's error) and the script's own `finish_search_run(run_id, 'failed', error=...)`
+  (`backend/scripts/keyword_search.py:904`, the exception text). Old failed rows hold it too. The
+  seed API hands it to every corpus member as `run.error` (`seed.js:1115`), and the frontend shows
+  it as `stopped after N of M: <error>` (`lib/seedStatus.js:50`). The fix sits at the API
+  boundary, not in the writers: `listSeedSources` takes `runErrorDetail = false`; when it is false
+  and `run.status === 'failed'`, `run.error` is `'search failed'`. Both callers
+  (`app.js:5018`, `:5104`) pass `runErrorDetail: isAdminUser(req.user, authConfig)`. A `done`
+  row keeps its quota note for everyone; `running` and `cancelled` rows are unchanged. No writer
+  changes and no migration: old rows fall under the same rule. `finalizeDeadSearchRun` and its
+  test (`search-run-failure.test.js:212-223`, which expects `search process exited (boom)`) stay
+  as they are; the full error stays in the launch's log line.
 - User-visible: a non-admin hitting a 500 on the 35 routes, or an unmapped keyword-search failure,
   reads the route's fallback (`Failed to export corpus data`, `Keyword search failed`, …) instead of
   SQLite text, paths or Python output. Stub mode's user is not the admin and gets the fallback.
@@ -369,7 +373,7 @@ The evidence for each row is in its decision; this list names the defect.
   - new `backend/tests/server-errors.test.js`, a fake Python and an admin, an editor and a corpus
     member; `console.error` spied:
     - the fake writes `SECRET-DIAG /srv/private/path` to stderr and exits 3:
-      `GET /api/exports?format=json` answers the member `500 { error: 'Failed to export corpus data' }`
+      `GET /api/exports/json` answers the member `500 { error: 'Failed to export corpus data' }`
       with no `SECRET-DIAG` in the body and the admin an `error` containing it; the log got
       `'[/api/exports] Error:'` with that message both times. On `d4518a9` the member's body has it;
     - the same fake on `POST /api/keyword-search/preview` and `POST /api/keyword-search` (before
@@ -377,10 +381,14 @@ The evidence for each row is in its decision; this list names the defect.
       the admin the detail, and the log the full error for each;
     - mapped cases stay for the editor: stderr `OpenAlex rate limit exceeded. Retry after 5s.`
       answers 429 with that text, `ValueError: bad query` answers 400 `bad query`;
-    - after a `202` (pre-flight 3): the fake prints a `run_created` line, then writes
-      `SECRET-DIAG` to stderr and exits 3 without settling its row. The seed source's `run.error`
-      that the editor reads is `search process exited (code 3)`, with no `SECRET-DIAG`; the log has
-      the full error. On `d4518a9` `run.error` holds the stderr text;
+    - failed runs in the seed list (pre-flight 4), in `search-run-failure.test.js` with its
+      dead-child harness (`:117`): the fake prints `run_created` for a `running` row that has one
+      undismissed result, writes `SECRET-DIAG` to stderr and exits 3; after the row settles, the
+      editor's `GET /api/seed/sources` and the candidates route's `source` summary show
+      `run.error === 'search failed'`, the admin's show the stored text with `SECRET-DIAG`, and the
+      log has the full error. A pre-existing `failed` row with a diagnostic (one result) gives the
+      editor `'search failed'` too; a `done` row with a quota note keeps the note for the editor.
+      On `d4518a9` the editor sees the stored text;
   - phase 8's trigger test in `corpus-sharing.test.js` (`:400`, as the admin) also asserts
     `{ error: 'marker delete failed' }`; an editor on the same trigger gets
     `{ error: 'Failed to remove work from corpus' }`;
@@ -481,10 +489,11 @@ ruling.**
   and an unmatched reference (`None`). The HTTP layer is mocked (the searcher's
   `openalex_session.get` records each URL and answers one page with one citing work), so the real
   `fetch_citing_work_ids` and its Crossref guard run (pre-flight 3). The output holds all three
-  references; the OpenAlex match has `citing_works_ids` with that one id; the Crossref match has
-  an empty `citing_works_ids` (an empty `FetchResult` with `complete` False: the CLI calls the
-  fetch, and the guard returns before any request); the
-  unmatched one has no key. Exactly one HTTP request ran, to `api.openalex.org`. With
+  references, read back from the written JSON; the OpenAlex match has `citing_works_ids` equal to
+  one work object with the mocked `openalex_id`; the Crossref match has `citing_works_ids == []`
+  (the CLI calls the fetch, and the guard returns before any request; `FetchResult.complete` is
+  not serialized); the
+  unmatched one is the original reference, unchanged. Exactly one HTTP request ran, to `api.openalex.org`. With
   `fetch_citations=False` no request runs. On `d4518a9` no request runs.
 
 ## Order of work
