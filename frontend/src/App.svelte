@@ -6032,7 +6032,11 @@
         {#await import('./components/ThreeGraph.svelte')}
           <p class="muted">Loading…</p>
         {:then module}
-          <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+          <!-- One instance per committed workspace corpus: a switch ends the old
+               instance's load and the new one loads the new corpus's graph. -->
+          {#key graphCorpusId}
+            <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+          {/key}
         {:catch error}
           {logTabImportError('ThreeGraph', error)}<p class="muted">Could not load this tab. Reload the page to try again.</p>
         {/await}

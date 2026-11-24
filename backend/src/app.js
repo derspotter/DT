@@ -597,6 +597,19 @@ async function warmGraph3dSnapshot() {
   }
 }
 
+// The build version a snapshot's resource URLs carry in ?v=: the manifest's
+// generated_at, else its mtime floored; null when the manifest cannot be read.
+function graph3dManifestVersion(key) {
+  const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    if (manifest?.generated_at) return String(manifest.generated_at);
+    return String(Math.floor(fs.statSync(manifestPath).mtimeMs));
+  } catch {
+    return null;
+  }
+}
+
 function decorateGraph3dManifest(manifest, key) {
   const base = `/api/graph/3d/snapshot/${encodeURIComponent(key)}`;
   const files = manifest?.files || {};
@@ -607,16 +620,10 @@ function decorateGraph3dManifest(manifest, key) {
   // manifest's own generated_at — written atomically with the rest of the
   // manifest and bumped on every rebuild — so the version always matches the
   // manifest being decorated (no separate stat() that could race a swap).
-  let version = '';
-  if (manifest?.generated_at) {
-    version = String(manifest.generated_at);
-  } else {
-    try {
-      version = String(Math.floor(fs.statSync(graph3dSnapshotPath(key, 'manifest.json')).mtimeMs));
-    } catch {
-      version = '';
-    }
-  }
+  // The fallback is the same rule the file route checks ?v= against.
+  const version = manifest?.generated_at
+    ? String(manifest.generated_at)
+    : (graph3dManifestVersion(key) || '');
   const v = version ? `?v=${encodeURIComponent(version)}` : '';
   return {
     ...manifest,
@@ -5877,6 +5884,15 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     const allowedFiles = new Set(['manifest.json', 'nodes.bin', 'edges.bin', 'nodes_meta.json', 'clusters.json']);
     if (!/^[a-f0-9]{20}$/.test(key) || !allowedFiles.has(fileName)) {
       return res.status(400).json({ error: 'Invalid snapshot file request' });
+    }
+    // A versioned request names the build its manifest came from. After a
+    // rebuild swapped the files, refuse it so the client reloads the manifest
+    // instead of pairing files of two builds. The backend is the only writer
+    // and swaps with sync renames, so nothing swaps between this check and the
+    // next statement; sendFile's async open after it is an accepted residual.
+    if (typeof req.query?.v === 'string' && graph3dManifestVersion(key) !== req.query.v) {
+      res.set('Cache-Control', 'no-store');
+      return res.status(409).json({ error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' });
     }
     const filePath = graph3dSnapshotPath(key, fileName);
     if (!fs.existsSync(filePath)) {

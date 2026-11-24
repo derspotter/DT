@@ -82,6 +82,11 @@
   let selectedCluster = null
   let selectedNodeDetail = null
   let nodeDetailLoading = false
+  // Only the newest detail request writes the panel and the cache; a
+  // deselection or a new load bumps it too, ending the pending request.
+  let nodeDetailSeq = 0
+  // Only the newest graph load (while mounted) requests, retries and publishes.
+  let graphLoadSeq = 0
   let edgeEndpoints = null
   let edgeVertexStride = 2
   let yearFrom = null
@@ -946,6 +951,8 @@
   function showAllNodes() {
     selectedNode = null
     selectedNodeDetail = null
+    nodeDetailSeq += 1
+    nodeDetailLoading = false
     selectedIndex = null
     hoveredNode = null
     tooltip = { ...tooltip, visible: false }
@@ -1112,6 +1119,8 @@
   async function loadNodeDetail(node) {
     const id = node?.work_id || node?.id
     if (!id) return
+    // Taken before the cache check, so a cache hit supersedes an older request.
+    const seq = ++nodeDetailSeq
     if (nodeDetailCache.has(id)) {
       selectedNodeDetail = nodeDetailCache.get(id)
       nodeDetailLoading = false
@@ -1121,14 +1130,16 @@
     selectedNodeDetail = null
     try {
       const detail = await fetchGraph3DNodeDetail(id)
+      // A superseded answer is dropped, not cached: a later selection fetches again.
+      if (seq !== nodeDetailSeq) return
       nodeDetailCache.set(id, detail)
       if ((selectedNode?.work_id || selectedNode?.id) === id) {
         selectedNodeDetail = detail
       }
     } catch {
-      selectedNodeDetail = null
+      if (seq === nodeDetailSeq) selectedNodeDetail = null
     } finally {
-      nodeDetailLoading = false
+      if (seq === nodeDetailSeq) nodeDetailLoading = false
     }
   }
 
@@ -1174,6 +1185,8 @@
   function clearSelection() {
     selectedNode = null
     selectedNodeDetail = null
+    nodeDetailSeq += 1
+    nodeDetailLoading = false
     selectedIndex = null
     hoveredNode = null
     selectedCluster = null
@@ -1213,10 +1226,17 @@
   }
 
   async function load3DGraph() {
+    // One load, one owner: a newer load, or the unmount (a tab switch, a
+    // sign-out, a workspace corpus switch), ends this one. A load that no
+    // longer owns makes no request and writes nothing.
+    const load = ++graphLoadSeq
+    const owns = () => componentMounted && load === graphLoadSeq
     graphLoading = true
     graphStatus = 'Building 3D graph snapshot...'
     selectedNode = null
     selectedNodeDetail = null
+    nodeDetailSeq += 1
+    nodeDetailLoading = false
     selectedIndex = null
     isolatedCluster = null
     halo = { ...halo, visible: false }
@@ -1224,15 +1244,24 @@
     selectedCluster = null
     searchResults = []
     const groupBy = groupByForMode(groupMode) || loadedGroupBy || 'field'
+    // Captured once: the one retry asks for the same graph.
+    const options = { maxNodes, relationship, groupBy, corpusId: selectedGraphCorpusId }
     try {
-      const manifest = await fetchGraph3DSnapshot({
-        maxNodes,
-        relationship,
-        groupBy,
-        corpusId: selectedGraphCorpusId,
-      })
+      let manifest = await fetchGraph3DSnapshot(options)
+      if (!owns()) return
       loadedGroupBy = groupBy
-      const snapshot = await fetchGraph3DSnapshotResources(manifest)
+      let snapshot
+      try {
+        snapshot = await fetchGraph3DSnapshotResources(manifest)
+      } catch (error) {
+        // 409: the snapshot was rebuilt after its manifest was read. Reload the
+        // manifest once, so the files all come from one build.
+        if (error?.status !== 409 || !owns()) throw error
+        manifest = await fetchGraph3DSnapshot(options)
+        if (!owns()) return
+        snapshot = await fetchGraph3DSnapshotResources(manifest)
+      }
+      if (!owns()) return
       const edgeCount = Number(snapshot.manifest?.buffers?.edges?.count || Math.floor((snapshot.edgeTriplets?.length || 0) / 3) || 0)
       graphData = {
         manifest,
@@ -1256,9 +1285,9 @@
       await tick()
       await renderGraph()
     } catch (error) {
-      graphStatus = error?.message || 'Failed to load 3D graph.'
+      if (owns()) graphStatus = error?.message || 'Failed to load 3D graph.'
     } finally {
-      graphLoading = false
+      if (load === graphLoadSeq) graphLoading = false
     }
   }
 

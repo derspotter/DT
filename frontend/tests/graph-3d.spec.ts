@@ -1,5 +1,5 @@
-import { expect, test, type Route } from '@playwright/test'
-import { mePayload, mockLogSocket } from './helpers/mockApi'
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
+import { afterBodyRead, fetchStats, fulfil, mePayload, mockLogSocket, trackFetches } from './helpers/mockApi'
 
 const graph3dPayload = {
   nodes: [
@@ -168,6 +168,7 @@ test('graph tab is available to non-admin users', async ({ page }) => {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
   await mockLogSocket(page)
+  await trackFetches(page)
   await page.route('**/api/**', mockApi)
   // Override auth to a non-admin researcher (registered last, so it wins).
   await page.route('**/api/auth/me', (route) =>
@@ -193,6 +194,7 @@ test('loads the Three.js 3D graph panel from the graph API', async ({ page }) =>
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
   await mockLogSocket(page)
+  await trackFetches(page)
   await page.route('**/api/**', mockApi)
 
   const graphResponse = page.waitForResponse((res) => {
@@ -226,6 +228,7 @@ async function openLoadedGraphPanel(page) {
     window.localStorage.setItem('rag_feeder_token', 'playwright-token')
   })
   await mockLogSocket(page)
+  await trackFetches(page)
   const loaded = page.waitForResponse((res) =>
     new URL(res.url()).pathname === '/api/graph/3d/snapshot/playwrightsnapshot/nodes_meta.json'
   )
@@ -448,4 +451,291 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
   await expect(panel.getByText('Economic sociology / seed').first()).toBeVisible()
   await expect(panel.getByText('Countries: DE')).toBeVisible()
   expect(clusterRequests).toBe(0)
+})
+
+// ---------------------------------------------------------------------------
+// Load ownership (BE-54) and node-detail ownership (FE-61).
+//
+// `graphMock` answers like `mockApi`, plus per-test state:
+// - the manifest version: `versions` by manifest request order (the last one
+//   repeats), or `versionsByCorpus` by `corpus_id`; every resource URL of a
+//   manifest carries `?v=<version>`;
+// - resource gates by `<file>?v=<version>` (`hold`), released with an answer
+//   (`{ status, body }`) or `undefined` (the normal file);
+// - per-request gates for `/api/graph/3d/node/<id>` (`holdNode(id, index)`);
+// - a mutable `lastCorpusId` that `/api/corpora/<id>/select` sets and
+//   `/api/auth/me` returns.
+
+const SNAPSHOT_BASE = '/api/graph/3d/snapshot/playwrightsnapshot'
+const MANIFEST = '/api/graph/3d/snapshot'
+const NODE_1 = '/api/graph/3d/node/1'
+const NODE_2 = '/api/graph/3d/node/2'
+const REBUILT = { error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' }
+const SECOND_CORPUS = { id: 2, name: 'Second corpus', role: 'owner', owner_username: 'admin' }
+const FIRST_CORPUS = { id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }
+
+type Answer = { status: number; body?: unknown } | undefined
+type Gate = { promise: Promise<Answer>; release: (answer?: Answer) => void }
+
+function gate(): Gate {
+  let release: (answer?: Answer) => void = () => {}
+  const promise = new Promise<Answer>((resolve) => { release = resolve })
+  return { promise, release }
+}
+
+function versionedManifest(version: string, edgeCount = 1) {
+  const v = `?v=${encodeURIComponent(version)}`
+  return {
+    ...graph3dSnapshotManifest,
+    stats: { ...graph3dPayload.stats, edge_count: edgeCount },
+    files: {
+      nodes: `${SNAPSHOT_BASE}/nodes.bin${v}`,
+      edges: `${SNAPSHOT_BASE}/edges.bin${v}`,
+      nodes_meta: `${SNAPSHOT_BASE}/nodes_meta.json${v}`,
+      clusters: `${SNAPSHOT_BASE}/clusters.json${v}`,
+      manifest: `${SNAPSHOT_BASE}/manifest.json${v}`,
+    },
+  }
+}
+
+const RESOURCE_FILES = ['nodes.bin', 'edges.bin', 'nodes_meta.json', 'clusters.json']
+
+async function graphMock(page: Page, {
+  versions = ['A'],
+  versionsByCorpus = null as Record<string, string> | null,
+  edgeCountByCorpus = {} as Record<string, number>,
+} = {}) {
+  const state = {
+    lastCorpusId: 1,
+    manifestCount: 0,
+    resourceGates: new Map<string, Gate>(),
+    nodeGates: new Map<string, Gate>(),
+    nodeRequests: {} as Record<string, number>,
+  }
+  const hold = (key: string) => {
+    const held = gate()
+    state.resourceGates.set(key, held)
+    return held
+  }
+  const holdNode = (id: number, index: number) => {
+    const held = gate()
+    state.nodeGates.set(`${id}#${index}`, held)
+    return held
+  }
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await mockLogSocket(page)
+  await trackFetches(page)
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url())
+    const path = url.pathname
+    if (path === '/api/auth/me') {
+      return fulfil(route, mePayload({ corpusId: state.lastCorpusId, corpora: [FIRST_CORPUS, SECOND_CORPUS] }))
+    }
+    const select = path.match(/^\/api\/corpora\/(\d+)\/select$/)
+    if (select && route.request().method() === 'POST') {
+      state.lastCorpusId = Number(select[1])
+      return fulfil(route, { ok: true })
+    }
+    if (path === MANIFEST) {
+      const corpus = url.searchParams.get('corpus_id') || ''
+      const version = versionsByCorpus
+        ? versionsByCorpus[corpus]
+        : versions[Math.min(state.manifestCount, versions.length - 1)]
+      state.manifestCount += 1
+      return fulfil(route, versionedManifest(version, edgeCountByCorpus[corpus] ?? 1))
+    }
+    if (path.startsWith(`${SNAPSHOT_BASE}/`)) {
+      const file = path.slice(SNAPSHOT_BASE.length + 1)
+      const held = state.resourceGates.get(`${file}?v=${url.searchParams.get('v')}`)
+      const answer = held ? await held.promise : undefined
+      if (answer) return fulfil(route, answer.body ?? {}, answer.status)
+      return mockApi(route)
+    }
+    const node = path.match(/^\/api\/graph\/3d\/node\/(\d+)$/)
+    if (node) {
+      const index = state.nodeRequests[node[1]] ?? 0
+      state.nodeRequests[node[1]] = index + 1
+      const held = state.nodeGates.get(`${node[1]}#${index}`)
+      const answer = held ? await held.promise : undefined
+      if (answer) return fulfil(route, answer.body ?? {}, answer.status)
+      if (node[1] === '1') return fulfil(route, { id: 1, title: 'Graph seed work', doi: '10.1000/seed' })
+      return mockApi(route)
+    }
+    return mockApi(route)
+  })
+  return { state, hold, holdNode }
+}
+
+// The keys of every fetch the app called after its first body read of a
+// request matching `readMatch` (page-side order, so causal).
+async function callsAfterRead(page: Page, readMatch: RegExp): Promise<string[] | null> {
+  return page.evaluate(({ source, flags }) => {
+    const re = new RegExp(source, flags)
+    const events = (window as any).__dtFetch.events as { kind: string; key: string }[]
+    const index = events.findIndex((event) => event.kind === 'read' && re.test(event.key))
+    if (index < 0) return null
+    return events.slice(index + 1).filter((event) => event.kind === 'call').map((event) => event.key)
+  }, { source: readMatch.source, flags: readMatch.flags })
+}
+
+const calls = async (page: Page, match: string | RegExp) => (await fetchStats(page, match)).calls
+const reads = async (page: Page, match: string | RegExp) => (await fetchStats(page, match)).reads
+
+async function openGraph(page: Page) {
+  await page.goto('/#/graph')
+  await page.getByTestId('tab-graph').click()
+  const panel = page.getByTestId('graph-3d-panel')
+  await expect(panel).toBeVisible()
+  return panel
+}
+
+async function selectWork(panel: Locator, title: string, query: string) {
+  await panel.getByTestId('graph-3d-search').fill(query)
+  const results = panel.getByTestId('graph-3d-search-results')
+  await results.getByRole('button', { name: new RegExp(title) }).click()
+  await expect(panel.locator('.graph-3d-selected strong')).toHaveText(title)
+}
+
+const selectSeed = (panel: Locator) => selectWork(panel, 'Graph seed work', 'Graph seed')
+const selectReferenced = (panel: Locator) => selectWork(panel, 'Referenced work', 'Referenced')
+
+const NODES_A = /nodes\.bin\?v=A$/
+
+test('a 409 on a snapshot file reloads the manifest once and loads build B', async ({ page }) => {
+  const { hold } = await graphMock(page, { versions: ['A', 'B'] })
+  hold('nodes.bin?v=A').release({ status: 409, body: REBUILT })
+  const panel = await openGraph(page)
+
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  expect(await calls(page, MANIFEST)).toBe(2)
+  const after = await callsAfterRead(page, NODES_A)
+  expect(after).not.toBeNull()
+  const resources = after!.filter((key) => key.startsWith(`${SNAPSHOT_BASE}/`))
+  expect(resources.length).toBe(RESOURCE_FILES.length)
+  for (const key of resources) expect(key).toMatch(/\?v=B$/)
+})
+
+test('a 409 after the graph unmounts starts no request', async ({ page }) => {
+  const { hold } = await graphMock(page, { versions: ['A', 'R'] })
+  const nodesA = hold('nodes.bin?v=A')
+  await openGraph(page)
+  await expect.poll(() => calls(page, NODES_A)).toBe(1)
+
+  await page.getByTestId('tab-workspace').click()
+  await expect(page.getByTestId('graph-3d-panel')).toBeHidden()
+  const before = await reads(page, NODES_A)
+  nodesA.release({ status: 409, body: REBUILT })
+  await afterBodyRead(page, NODES_A, before)
+  expect(await calls(page, MANIFEST)).toBe(1)
+
+  await page.getByTestId('tab-graph').click()
+  const panel = page.getByTestId('graph-3d-panel')
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  expect(await calls(page, MANIFEST)).toBe(2)
+  for (const file of RESOURCE_FILES) {
+    expect([file, await calls(page, `${SNAPSHOT_BASE}/${file}`)]).toEqual([file, 2])
+    expect([file, await calls(page, new RegExp(`${file.replace('.', '\\.')}\\?v=R$`))]).toEqual([file, 1])
+  }
+})
+
+test('a 409 after a header corpus switch neither retries nor publishes the old corpus', async ({ page }) => {
+  const { hold } = await graphMock(page, {
+    versionsByCorpus: { 1: 'A', 2: 'C' },
+    edgeCountByCorpus: { 2: 7 },
+  })
+  const nodesA = hold('nodes.bin?v=A')
+  const corpus2 = RESOURCE_FILES.map((file) => hold(`${file}?v=C`))
+  await openGraph(page)
+  await expect.poll(() => calls(page, NODES_A)).toBe(1)
+
+  await page.locator('.header-corpus-picker select').selectOption('2')
+  await expect.poll(() => calls(page, /^\/api\/graph\/3d\/snapshot\?corpus_id=2&/)).toBe(1)
+
+  const before = await reads(page, NODES_A)
+  nodesA.release({ status: 409, body: REBUILT })
+  await afterBodyRead(page, NODES_A, before)
+  // One manifest per corpus; a retry under either corpus makes 3.
+  expect(await calls(page, MANIFEST)).toBe(2)
+
+  for (const held of corpus2) held.release()
+  await expect(page.getByTestId('graph-3d-panel').getByText('Loaded 2 nodes and 7 edges from snapshot.')).toBeVisible()
+  expect(await calls(page, MANIFEST)).toBe(2)
+})
+
+for (const late of ['fails', 'succeeds'] as const) {
+  test(`an older detail answer that ${late} does not end the selected node's loading`, async ({ page }) => {
+    const { holdNode } = await graphMock(page)
+    const node1 = holdNode(1, 0)
+    const node2 = holdNode(2, 0)
+    const panel = await openGraph(page)
+    await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+
+    await selectSeed(panel)
+    await expect.poll(() => calls(page, NODE_1)).toBe(1)
+    await selectReferenced(panel)
+    await expect.poll(() => calls(page, NODE_2)).toBe(1)
+    await expect(panel.getByText('Loading metadata...')).toBeVisible()
+
+    const before = await reads(page, NODE_1)
+    node1.release(late === 'fails'
+      ? { status: 500, body: { error: 'boom' } }
+      : { status: 200, body: { id: 1, title: 'Graph seed work', doi: '10.1000/seed' } })
+    await afterBodyRead(page, NODE_1, before)
+    await expect(panel.getByText('Loading metadata...')).toBeVisible()
+
+    node2.release()
+    await expect(panel.getByText('Identifiers: 10.1000/example', { exact: true })).toBeVisible()
+    await expect(panel.getByText('Loading metadata...')).toBeHidden()
+  })
+}
+
+test('an older answer for the same node neither shows nor caches', async ({ page }) => {
+  const { holdNode } = await graphMock(page)
+  const a1 = holdNode(1, 0)
+  const a2 = holdNode(1, 1)
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+
+  await selectSeed(panel)
+  await expect.poll(() => calls(page, NODE_1)).toBe(1)
+  await selectReferenced(panel)
+  await expect(panel.getByText('Identifiers: 10.1000/example', { exact: true })).toBeVisible()
+  await selectSeed(panel)
+  await expect.poll(() => calls(page, NODE_1)).toBe(2)
+
+  a2.release({ status: 200, body: { id: 1, title: 'Graph seed work', doi: '10.1000/seed-v2' } })
+  await expect(panel.getByText('Identifiers: 10.1000/seed-v2', { exact: true })).toBeVisible()
+
+  const before = await reads(page, NODE_1)
+  a1.release({ status: 200, body: { id: 1, title: 'Graph seed work', doi: '10.1000/seed-v1' } })
+  await afterBodyRead(page, NODE_1, before)
+  await expect(panel.getByText('Identifiers: 10.1000/seed-v2', { exact: true })).toBeVisible()
+
+  await selectReferenced(panel)
+  await expect(panel.getByText('Identifiers: 10.1000/example', { exact: true })).toBeVisible()
+  await selectSeed(panel)
+  await expect(panel.getByText('Identifiers: 10.1000/seed-v2', { exact: true })).toBeVisible()
+  expect(await calls(page, NODE_1)).toBe(2)
+})
+
+test('Escape ends the pending detail request', async ({ page }) => {
+  const { holdNode } = await graphMock(page)
+  const first = holdNode(1, 0)
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+
+  await selectSeed(panel)
+  await expect.poll(() => calls(page, NODE_1)).toBe(1)
+  await page.keyboard.press('Escape')
+  await expect(panel.getByText('No node selected')).toBeVisible()
+
+  const before = await reads(page, NODE_1)
+  first.release({ status: 200, body: { id: 1, doi: '10.1000/seed' } })
+  await afterBodyRead(page, NODE_1, before)
+
+  await selectSeed(panel)
+  await expect.poll(() => calls(page, NODE_1)).toBe(2)
+  await expect(panel.getByText('Identifiers: 10.1000/seed', { exact: true })).toBeVisible()
 })

@@ -337,4 +337,55 @@ process.stdout.write('{}')
     const res = await get(`/api/graph/3d/cluster/${key}/0`, fx.adminToken)
     expect(res.status).toBe(404)
   })
+  describe('versioned snapshot files', () => {
+    const key = 'f6f6f6f6f6f6f6f6f6f6'
+    const bytes = Buffer.from([1, 2, 3, 4])
+    const fileUrl = `/api/graph/3d/snapshot/${key}/nodes.bin`
+
+    beforeAll(() => {
+      const dir = path.join(snapshotDir, key)
+      fs.mkdirSync(dir, { recursive: true })
+      fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ schema_version: 2, generated_at: 'A', files: {} }))
+      fs.writeFileSync(path.join(dir, 'nodes.bin'), bytes)
+      fs.writeFileSync(path.join(dir, 'nodes.bin.gz'), zlib.gzipSync(bytes))
+    })
+
+    const binary = (req) =>
+      req.buffer(true).parse((res, done) => {
+        const chunks = []
+        res.on('data', (chunk) => chunks.push(chunk))
+        res.on('end', () => done(null, Buffer.concat(chunks)))
+      })
+
+    test('a versioned file request is checked against the live build', async () => {
+      const current = await binary(get(`${fileUrl}?v=A`, fx.adminToken))
+      expect(current.status).toBe(200)
+      expect([...current.body]).toEqual([1, 2, 3, 4])
+
+      const stale = await get(`${fileUrl}?v=B`, fx.adminToken)
+      expect(stale.status).toBe(409)
+      expect(stale.body).toEqual({ error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' })
+      expect(stale.headers['cache-control']).toBe('no-store')
+
+      const unversioned = await binary(get(fileUrl, fx.adminToken))
+      expect(unversioned.status).toBe(200)
+      expect([...unversioned.body]).toEqual([1, 2, 3, 4])
+    })
+
+    test('a matching version keeps sendFile for a client without gzip, ranges included', async () => {
+      const whole = await binary(get(`${fileUrl}?v=A`, fx.adminToken).set('Accept-Encoding', 'identity'))
+      expect(whole.status).toBe(200)
+      expect(whole.headers['content-type']).toMatch(/application\/octet-stream/)
+      expect(whole.headers['content-length']).toBe('4')
+      expect(whole.headers['content-encoding']).toBeUndefined()
+      expect([...whole.body]).toEqual([1, 2, 3, 4])
+
+      const range = await binary(
+        get(`${fileUrl}?v=A`, fx.adminToken).set('Accept-Encoding', 'identity').set('Range', 'bytes=0-1')
+      )
+      expect(range.status).toBe(206)
+      expect(range.body.length).toBe(2)
+      expect([...range.body]).toEqual([1, 2])
+    })
+  })
 })

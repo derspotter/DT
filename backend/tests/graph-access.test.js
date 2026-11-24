@@ -212,6 +212,16 @@ describe('graph routes are scoped to readable corpora', () => {
     expect(spoofed.body).toEqual({ error: 'Admin access required' })
   })
 
+  test('an outsider gets 403 for a snapshot file whatever its version', async () => {
+    // The scope check runs before the version check: a matching and a stale
+    // version are refused alike, so the 409 never tells an outsider a build exists.
+    for (const v of [`gen-${fx.k1}`, 'stale']) {
+      const res = await get(`/api/graph/3d/snapshot/${fx.k1}/clusters.json?v=${v}`, fx.lonelyToken)
+      expect([v, res.status]).toEqual([v, 403])
+      expect(res.body).toEqual({ error: 'No access to this corpus' })
+    }
+  })
+
   test('writeGraph3dScope / readGraph3dScope round-trip, and a missing sidecar reads as null', () => {
     const key = 'd4d4d4d4d4d4d4d4d4d4'
     expect(appModule.readGraph3dScope(key)).toBeNull()
