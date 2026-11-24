@@ -773,6 +773,13 @@ test('a grouping whose resources failed is fetched again when chosen later', asy
   await expect(panel.getByText('Work type layout failed', { exact: true })).toBeVisible()
   expect(await calls(page, typeManifests)).toBe(1)
 
+  // Academic field is the layout on screen: a recolour, which drops the error
+  // and shows the loaded status again.
+  await groupBy.selectOption('cluster')
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  await expect(panel.getByText('Work type layout failed', { exact: true })).toBeHidden()
+  expect(await calls(page, MANIFEST)).toBe(2)
+
   // Degree only recolours the layout on screen (still Academic field).
   await groupBy.selectOption('degree')
   expect(await calls(page, MANIFEST)).toBe(2)

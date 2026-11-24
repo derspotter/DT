@@ -74,6 +74,9 @@
   let maxNodes = 25000
   let groupMode = 'cluster'
   let loadedGroupBy = 'field'
+  // The status of the graph on screen, restored when a recolour replaces a
+  // failed load's error.
+  let loadedStatus = ''
   let depthScale = 1.6
   let autoRotate = false
   let cameraPreset = null
@@ -1221,6 +1224,7 @@
     if (target && target !== loadedGroupBy) {
       void load3DGraph()
     } else {
+      if (loadedStatus) graphStatus = loadedStatus
       renderGraph()
     }
   }
@@ -1284,6 +1288,7 @@
         ? ` Showing the ${formatNumber(loadedNodes)} most connected works out of ${formatNumber(totalWorks)}.`
         : ''
       graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
+      loadedStatus = graphStatus
       await tick()
       await renderGraph()
     } catch (error) {
