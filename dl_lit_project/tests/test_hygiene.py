@@ -138,6 +138,65 @@ def test_fallback_search_never_prints_the_api_key(monkeypatch, capsys):
     assert "sekret-key-123" not in out
 
 
+# --- the scraper uses the shared key reader (PY-27) ---------------------------------
+
+def test_the_scraper_strips_the_api_key(monkeypatch):
+    from dl_lit import OpenAlexScraper
+
+    monkeypatch.setenv("OPENALEX_API_KEY", "  sekret-key-123\n")
+    assert OpenAlexScraper.OpenAlexCrossrefSearcher(rate_limiter=_NoRateLimit()).api_key == "sekret-key-123"
+
+
+def test_a_blank_primary_key_falls_back_to_the_rag_feeder_key(monkeypatch):
+    from dl_lit import OpenAlexScraper
+
+    monkeypatch.setenv("OPENALEX_API_KEY", "   ")
+    monkeypatch.setenv("RAG_FEEDER_OPENALEX_API_KEY", "fallback-key")
+    assert OpenAlexScraper.OpenAlexCrossrefSearcher(rate_limiter=_NoRateLimit()).api_key == "fallback-key"
+
+
+class _OkResponse:
+    status_code = 200
+    headers = {}
+
+    def json(self):
+        return {"results": []}
+
+    def raise_for_status(self):
+        pass
+
+
+class _OkSession:
+    def get(self, url, headers=None, params=None, timeout=None):
+        return _OkResponse()
+
+
+def test_the_missing_key_warning_prints_once(monkeypatch, capsys, tmp_path):
+    from dl_lit import OpenAlexScraper, utils
+
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+    monkeypatch.delenv("RAG_FEEDER_OPENALEX_API_KEY", raising=False)
+    monkeypatch.setenv("RAG_FEEDER_OPENALEX_QUOTA_PATH", str(tmp_path / "quota.json"))
+    monkeypatch.setattr(utils, "_missing_openalex_api_key_warned", False)
+    monkeypatch.setattr(OpenAlexScraper, "_missing_api_key_warned", False, raising=False)
+    monkeypatch.setattr(utils.time, "sleep", lambda s: None)
+    capsys.readouterr()
+
+    searcher = OpenAlexScraper.OpenAlexCrossrefSearcher(rate_limiter=_NoRateLimit())
+    assert searcher.api_key is None
+    utils.openalex_request_json(
+        url="https://api.openalex.org/works", params={"filter": "doi:x"},
+        session=_OkSession(), rate_limiter=_FreeLimiter(), retries=1,
+    )
+    assert capsys.readouterr().out.count("[WARN] OPENALEX_API_KEY not set.") == 1
+
+
+def test_the_scraper_has_no_key_reader_of_its_own():
+    source = (Path(__file__).resolve().parents[1] / "dl_lit" / "OpenAlexScraper.py").read_text(encoding="utf-8")
+    assert "getenv('OPENALEX_API_KEY')" not in source
+    assert "_missing_api_key_warned" not in source
+
+
 def test_citing_works_error_prints_the_url_without_the_api_key(monkeypatch, capsys):
     import requests
 

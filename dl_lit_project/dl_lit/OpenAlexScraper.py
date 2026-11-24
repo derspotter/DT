@@ -17,9 +17,11 @@ from .identifiers import (
 from .utils import (
     FetchResult,
     OpenAlexRateLimitExceeded,
+    _warn_missing_openalex_api_key,
     env_bool,
     env_float,
     get_global_rate_limiter,
+    get_openalex_api_key,
     openalex_request_json,
     redact_openalex_key,
 )
@@ -53,9 +55,6 @@ def _build_retry_session(
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
-
-
-_missing_api_key_warned = False
 
 
 _redact_api_key = redact_openalex_key  # former name
@@ -573,14 +572,10 @@ class OpenAlexCrossrefSearcher:
         self.rate_limiter = rate_limiter or get_global_rate_limiter()
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
-        self.api_key = os.getenv('OPENALEX_API_KEY') or os.getenv('RAG_FEEDER_OPENALEX_API_KEY')
+        self.api_key = get_openalex_api_key()
         self.enable_openalex_fallback = env_bool('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK')
-        global _missing_api_key_warned
-        if not self.api_key and not _missing_api_key_warned:
-            print(
-                "[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key."
-            )
-            _missing_api_key_warned = True
+        if not self.api_key:
+            _warn_missing_openalex_api_key()
         self.openalex_timeout = env_float('RAG_FEEDER_OPENALEX_TIMEOUT', 20.0)
         self.crossref_timeout = env_float('RAG_FEEDER_CROSSREF_TIMEOUT', 20.0)
         self.semantic_scholar_timeout = env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', 20.0)
