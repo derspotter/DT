@@ -6375,6 +6375,18 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     console.log('[pipeline-worker] DB-driven enrich/download workers expected; no pipeline_jobs scheduler started.');
   }
 
+  // BE-59: the last error handler, after every route. Without it an error no
+  // route catches (multer, the body parser, an async throw) reaches Express's
+  // default handler, which answers HTML with the stack outside NODE_ENV=production.
+  app.use((error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    const status = Number.isInteger(error?.status) ? error.status : error?.statusCode;
+    if (Number.isInteger(status) && status >= 400 && status <= 499) {
+      return res.status(status).json({ error: error.expose && error.message ? error.message : 'Bad request' });
+    }
+    return sendServerError(req, res, 'express', error, 'Internal server error');
+  });
+
   app.warmGraph3dSnapshot = warmGraph3dSnapshot;
   // index.js hands these to attachLogSocket (logSocket.js) after listen().
   app.authDb = authDb;

@@ -13,6 +13,7 @@ describe('server errors: the detail goes to admins only', () => {
   let app
   let tmpDir = ''
   let dbPath = ''
+  let uploadsDir = ''
   let errorSpy
   const password = 'server-errors-password'
   const tokens = {}
@@ -64,6 +65,9 @@ process.exit(Number(process.env.FAKE_EXIT_CODE || 0))
     setEnv('RAG_FEEDER_DB_PATH', dbPath)
     setEnv('RAG_FEEDER_PYTHON', fakePython)
     setEnv('RAG_FEEDER_ARTIFACTS_DIR', path.join(tmpDir, 'artifacts'))
+    uploadsDir = path.join(tmpDir, 'uploads')
+    fs.mkdirSync(uploadsDir)
+    setEnv('RAG_FEEDER_UPLOADS_DIR', uploadsDir)
     setEnv('RAG_FEEDER_JWT_SECRET', 'server-errors-secret')
     setEnv('RAG_ADMIN_USER', 'server-errors-admin')
     setEnv('RAG_ADMIN_PASSWORD', 'server-errors-admin-password')
@@ -224,5 +228,44 @@ process.exit(Number(process.env.FAKE_EXIT_CODE || 0))
       '[/api/seed/sources/:sourceType/:sourceKey/promote] Expansion seeding failed:',
       'SECRET-DIAG'
     )).toHaveLength(2)
+  })
+
+  // BE-59: errors no route catches get JSON from the last handler, not
+  // Express's HTML page with the stack.
+  test('malformed JSON answers a JSON 400, not HTML', async () => {
+    const res = await request(app).post('/api/keyword-search/preview').set(as('editor'))
+      .set('Content-Type', 'application/json').send('{"query": ')
+    expect(res.status).toBe(400)
+    expect(res.headers['content-type']).toMatch(/application\/json/)
+    expect(typeof res.body.error).toBe('string')
+    expect(res.text).not.toContain('<')
+  })
+
+  test('a multer write failure hides the path from an editor and shows it to the admin', async () => {
+    // The uploads dir becomes a plain file, so multer's disk write fails.
+    fs.rmSync(uploadsDir, { recursive: true, force: true })
+    fs.writeFileSync(uploadsDir, 'not a directory')
+    try {
+      const upload = (who) => request(app).post('/api/process_pdf').set(as(who))
+        .attach('file', Buffer.from('%PDF-1.4\n%%EOF\n'), { filename: 'paper.pdf', contentType: 'application/pdf' })
+
+      const editor = await upload('editor')
+      expect(editor.status).toBe(500)
+      expect(editor.body).toEqual({ error: 'Internal server error' })
+      expect(editor.text).not.toContain('<')
+      expect(editor.text).not.toContain(tmpDir)
+
+      const admin = await upload('admin')
+      expect(admin.status).toBe(500)
+      expect(admin.body.error).toMatch(/ENOTDIR|ENOENT/)
+
+      // fs errors come from Node's realm, so no instanceof check against the test's Error.
+      expect(errorSpy.mock.calls.filter(
+        ([tag, err]) => tag === '[express] Error:' && /ENOTDIR|ENOENT/.test(String(err?.message))
+      )).toHaveLength(2)
+    } finally {
+      fs.rmSync(uploadsDir, { force: true })
+      fs.mkdirSync(uploadsDir)
+    }
   })
 })
