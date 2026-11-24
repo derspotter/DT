@@ -2222,9 +2222,12 @@
     kantroposTargetsError = ''
     finishExtractionProgress()
     if (signOut) {
-      // The export lock is the session's: a corpus switch keeps it, so one
-      // export at a time per session.
+      // The export and corpus action locks are the session's: a corpus switch
+      // keeps them, so one export (and one corpus creation or deletion) at a
+      // time per session.
       exportBusy = false
+      creatingCorpus = false
+      deletingCorpus = false
       // null makes the Admin tab fetch the settings again.
       appSettings = null
       appSettingsDraft = {}
@@ -2325,7 +2328,9 @@
       corpusActionStatus = error.message || 'Failed to create corpus.'
       corpusActionError = true
     } finally {
-      creatingCorpus = false
+      // The lock is the session's: a sign-out already cleared it, and the next
+      // user's own action may hold it now.
+      if (epoch === sessionEpoch) creatingCorpus = false
     }
   }
 
@@ -2377,7 +2382,9 @@
       corpusActionStatus = error.message || 'Failed to delete corpus.'
       corpusActionError = true
     } finally {
-      deletingCorpus = false
+      // The lock is the session's: a sign-out already cleared it, and the next
+      // user's own action may hold it now.
+      if (epoch === sessionEpoch) deletingCorpus = false
     }
   }
 

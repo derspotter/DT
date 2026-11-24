@@ -802,6 +802,8 @@ test('a recolour after a failed corpus load keeps the corpus error', async ({ pa
   await corpus.selectOption('2')
   await expect(panel.getByText('Corpus 2 layout failed', { exact: true })).toBeVisible()
   expect(await calls(page, /^\/api\/graph\/3d\/snapshot\?corpus_id=2&/)).toBe(1)
+  // The picker goes back to the corpus on screen.
+  await expect(corpus).toHaveValue('1')
 
   // The graph on screen is still corpus 1's, so its loaded status must not
   // replace the corpus-2 failure.
@@ -809,6 +811,43 @@ test('a recolour after a failed corpus load keeps the corpus error', async ({ pa
   expect(await calls(page, MANIFEST)).toBe(2)
   await expect(panel.getByText('Corpus 2 layout failed', { exact: true })).toBeVisible()
   await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeHidden()
+  await expect(corpus).toHaveValue('1')
+})
+
+test('a failed corpus manifest puts the picker back', async ({ page }) => {
+  const { holdManifest } = await graphMock(page, { versionsByCorpus: { 1: 'A', 2: 'C' } })
+  // Manifest request 1 is corpus 2's.
+  holdManifest(1).release({ status: 500, body: { error: 'Corpus 2 manifest failed' } })
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  const corpus = panel.getByText('Corpus', { exact: true }).locator('..').locator('select')
+  const groupBy = panel.getByText('Group by').locator('..').locator('select')
+
+  await corpus.selectOption('2')
+  await expect(panel.getByText('Corpus 2 manifest failed', { exact: true })).toBeVisible()
+  await expect(corpus).toHaveValue('1')
+
+  // A recolour keeps the error: the picker matches the graph on screen again,
+  // but the failed switch is the newest news.
+  await groupBy.selectOption('degree')
+  expect(await calls(page, MANIFEST)).toBe(2)
+  await expect(panel.getByText('Corpus 2 manifest failed', { exact: true })).toBeVisible()
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeHidden()
+  await expect(corpus).toHaveValue('1')
+})
+
+test('a render failure after publishing keeps the new corpus in the picker', async ({ page }) => {
+  const { hold } = await graphMock(page, { versionsByCorpus: { 1: 'A', 2: 'C' } })
+  // Valid JSON that is not an array: the load publishes corpus 2's data, then
+  // renderGraph throws at nodes.map.
+  hold('nodes_meta.json?v=C').release({ status: 200, body: {} })
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  const corpus = panel.getByText('Corpus', { exact: true }).locator('..').locator('select')
+
+  await corpus.selectOption('2')
+  await expect(panel.getByText(/nodes\.map is not a function/)).toBeVisible()
+  await expect(corpus).toHaveValue('2')
 })
 
 test('a recolour shows the loaded status again once the controls match the graph on screen', async ({ page }) => {

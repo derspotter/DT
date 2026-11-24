@@ -76,11 +76,15 @@
   let loadedGroupBy = 'field'
   // The status of the graph on screen, restored when a recolour replaces a
   // failed load's error. `loadedScope` is the graph on screen's options apart
-  // from the grouping. A recolour shows the loaded status only while the
-  // controls match it again; while they still name another corpus (or node
-  // limit, or relationship) that failed to load, the error stays.
+  // from the grouping, `loadedCorpusId` its corpus. A recolour shows the loaded
+  // status only while the controls match it again; while they still name a node
+  // limit or relationship that failed to load, the error stays. A failed corpus
+  // switch puts the picker back on `loadedCorpusId` and sets `keepLoadError`,
+  // so the error stays through recolours until the next load starts.
   let loadedStatus = ''
   let loadedScope = ''
+  let loadedCorpusId = null
+  let keepLoadError = false
   const graphScope = ({ corpusId, maxNodes, relationship }) => JSON.stringify([corpusId, maxNodes, relationship])
   let depthScale = 1.6
   let autoRotate = false
@@ -1239,7 +1243,7 @@
       void load3DGraph()
     } else {
       const controlsScope = graphScope({ maxNodes, relationship, corpusId: selectedGraphCorpusId })
-      if (loadedStatus && controlsScope === loadedScope) graphStatus = loadedStatus
+      if (loadedStatus && !keepLoadError && controlsScope === loadedScope) graphStatus = loadedStatus
       renderGraph()
     }
   }
@@ -1250,6 +1254,7 @@
     // longer owns makes no request and writes nothing.
     const load = ++graphLoadSeq
     const owns = () => componentMounted && load === graphLoadSeq
+    keepLoadError = false
     graphLoading = true
     graphStatus = 'Building 3D graph snapshot...'
     selectedNode = null
@@ -1307,11 +1312,19 @@
       graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
       loadedStatus = graphStatus
       loadedScope = scope
+      loadedCorpusId = options.corpusId
       await tick()
       await renderGraph()
     } catch (error) {
       if (owns()) {
         graphStatus = error?.message || 'Failed to load 3D graph.'
+        // A corpus that failed before its data was published is not on screen:
+        // the picker goes back to the one that is (a render failure comes after
+        // publishing, so its corpus stays).
+        if (loadedCorpusId !== null && options.corpusId !== loadedCorpusId) {
+          selectedGraphCorpusId = loadedCorpusId
+          keepLoadError = true
+        }
       }
     } finally {
       if (load === graphLoadSeq) graphLoading = false
