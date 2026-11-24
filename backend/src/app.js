@@ -5517,18 +5517,24 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       return res.status(400).json({ error: 'Invalid work id' });
     }
     try {
-      const result = authDb
-        .prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
-        .run(req.corpusId, workId);
-      if (result.changes === 0) {
-        return res.status(404).json({ error: 'Work is not a member of this corpus' });
-      }
-      // Drop the explicit seed marker too, so the seed table stops showing the
-      // item as promoted and offers it for promotion again.
-      if (tableExists(authDb, 'seed_candidates_in_corpus')) {
-        authDb
-          .prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+      // One transaction: a failed marker delete rolls the membership delete
+      // back, so the work never leaves the corpus with its marker left behind.
+      const removed = authDb.transaction(() => {
+        const result = authDb
+          .prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
           .run(req.corpusId, workId);
+        if (result.changes === 0) return 0;
+        // Drop the explicit seed marker too, so the seed table stops showing the
+        // item as promoted and offers it for promotion again.
+        if (tableExists(authDb, 'seed_candidates_in_corpus')) {
+          authDb
+            .prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+            .run(req.corpusId, workId);
+        }
+        return result.changes;
+      })();
+      if (removed === 0) {
+        return res.status(404).json({ error: 'Work is not a member of this corpus' });
       }
       return res.json({ removed: true, work_id: workId });
     } catch (error) {

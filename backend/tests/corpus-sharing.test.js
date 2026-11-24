@@ -374,6 +374,54 @@ describe('corpus sharing and multi-user isolation', () => {
     })
   })
 
+  test('a failed marker delete keeps the membership and the marker', async () => {
+    const admin = await login(adminUsername, adminPassword)
+    const corpusId = Number(admin.user.last_corpus_id)
+    const workId = seedCorpusWork(corpusId, 'Marked Work')
+
+    withDb((db) => {
+      // DDL of seed.js:629-637, in case the test schema has no marker table yet.
+      db.exec(`CREATE TABLE IF NOT EXISTS seed_candidates_in_corpus (
+        corpus_id INTEGER NOT NULL,
+        source_type TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        candidate_key TEXT NOT NULL,
+        work_id INTEGER,
+        marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (corpus_id, source_type, source_key, candidate_key)
+      )`)
+      db
+        .prepare(
+          `INSERT INTO seed_candidates_in_corpus (corpus_id, source_type, source_key, candidate_key, work_id)
+           VALUES (?, 'search', '1', 'k1', ?)`
+        )
+        .run(corpusId, workId)
+      db.exec(
+        "CREATE TRIGGER fail_marker_delete BEFORE DELETE ON seed_candidates_in_corpus BEGIN SELECT RAISE(ABORT, 'marker delete failed'); END"
+      )
+    })
+
+    try {
+      const res = await request(app)
+        .delete(`/api/corpus/works/${workId}`)
+        .set('Authorization', `Bearer ${admin.token}`)
+      expect(res.status).toBe(500)
+
+      withDb((db) => {
+        const membership = db
+          .prepare('SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
+          .get(corpusId, workId)
+        expect(membership).toBeTruthy()
+        const marker = db
+          .prepare('SELECT 1 FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+          .get(corpusId, workId)
+        expect(marker).toBeTruthy()
+      })
+    } finally {
+      withDb((db) => db.exec('DROP TRIGGER IF EXISTS fail_marker_delete'))
+    }
+  })
+
   test('removing a work that is not in the current corpus returns 404', async () => {
     const admin = await login(adminUsername, adminPassword)
     const orphanWorkId = withDb((db) => {

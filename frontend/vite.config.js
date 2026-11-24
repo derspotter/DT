@@ -51,8 +51,13 @@ export default defineConfig({
     fs: {
       deny: fsDeny,
     },
+    // No forced polling. The bundled chokidar 3 lets CHOKIDAR_USEPOLLING
+    // override this option (node_modules/vite/dist/node/chunks/config.js:13887-13893):
+    // the dev containers set it to 1 for their bind mount (docker-compose.yml:169,
+    // docker-compose.dev.yml:30), so they keep polling; Playwright and CI leave
+    // it unset, so the host uses native file events.
     watch: {
-      usePolling: true,
+      usePolling: false,
     },
     hmr,
     proxy: {
