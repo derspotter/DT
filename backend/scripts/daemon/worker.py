@@ -1252,6 +1252,7 @@ class PipelineDaemon:
             claimed_by=self.worker_id,
             lease_seconds=self._claim_lease_seconds(),
             target_ids=target_ids,
+            raise_errors=True,
         )
         for row in to_process:
             for key in ("authors", "keywords"):
@@ -1593,7 +1594,13 @@ class PipelineDaemon:
         if effective_limit != limit:
             log(f"Clamped download job batch from {limit} to {effective_limit} (RAG_FEEDER_DOWNLOAD_JOB_MAX={per_job_max})")
 
-        rows = self.db.claim_download_batch(limit=effective_limit, corpus_id=corpus_id, claimed_by=self.worker_id, lease_seconds=self._claim_lease_seconds())
+        rows = self.db.claim_download_batch(
+            limit=effective_limit,
+            corpus_id=corpus_id,
+            claimed_by=self.worker_id,
+            lease_seconds=self._claim_lease_seconds(),
+            raise_errors=True,
+        )
         if not rows:
             return {"processed": 0, "downloaded": 0, "failed": 0, "skipped": 0, "results": []}
 
@@ -1704,6 +1711,7 @@ class PipelineDaemon:
         corpus_id = job.get("corpus_id")
         params = job.get("params", {})
         result = None
+        record_failed = False
 
         try:
             if job["job_type"] == "enrich":
@@ -1786,11 +1794,22 @@ class PipelineDaemon:
             import traceback
             err_msg = traceback.format_exc()
             log(f"Job {job['id']} failed: {e}")
-            updated = self.mark_job_failed(job["id"], err_msg)
-            if not updated and self._terminal:
-                log(f"Job {job['id']} failure not recorded because it was already timed out by the watchdog.")
-            elif not updated:
-                log(f"Job {job['id']} failure not recorded because it was already cancelled.")
+            try:
+                updated = self.mark_job_failed(job["id"], err_msg)
+            except sqlite3.Error as write_error:
+                # The job would stay 'running' under this live worker, which periodic
+                # recovery never reclaims: exit below, and start-up recovery requeues it (D11).
+                log(
+                    f"Job {job['id']}: the failure could not be recorded ({write_error}); "
+                    f"exiting with code {JOB_TIMEOUT_EXIT_CODE} so start-up recovery requeues it."
+                )
+                updated = False
+                record_failed = True
+            if not updated and not record_failed:
+                if self._terminal:
+                    log(f"Job {job['id']} failure not recorded because it was already timed out by the watchdog.")
+                else:
+                    log(f"Job {job['id']} failure not recorded because it was already cancelled.")
             self._heartbeat(
                 "error",
                 {
@@ -1806,6 +1825,8 @@ class PipelineDaemon:
             self._end_work(generation)
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1)
+        if record_failed:
+            self._exit(JOB_TIMEOUT_EXIT_CODE)
 
     # Direct (job-less) batch cycles per role, run in turn when no job is pending.
     DIRECT_CYCLES = {
