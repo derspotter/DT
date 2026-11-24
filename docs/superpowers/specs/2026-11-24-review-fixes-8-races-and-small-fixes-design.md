@@ -1,6 +1,9 @@
 # Review fixes, phase 8: races and small fixes — design
 
-Date: 2026-11-24. Branch `review-fixes-8` (worktree from master `c574aba`).
+Date: 2026-11-24, revised the same day after the Codex pre-flight round 1
+(`.superpowers/sdd/2026-11-24-review-fixes-8-races-and-small-fixes/preflight.md`, rulings in
+`progress.md` next to it, section "Pre-flight round 1"). Branch `review-fixes-8` (worktree from
+master `c574aba`).
 Source: the reconciliation of the review inventory against `c574aba`
 (`.superpowers/sdd/review-fixes-8-reconcile/{fe,be,py}.md`, and the section "Reconciliation against
 master `c574aba` (2026-11-24)" at the end of
@@ -126,13 +129,16 @@ their decisions.
   saved file, no status line, no polling cadence.
 - A node's detail panel shows only that node's outcome.
 - An upload never fails because the browser cannot store the upload list.
-- Mocked Playwright runs and CI do not poll the file system; the dev containers still do.
+- Mocked Playwright runs and CI do not poll the file system; the dev containers still do, at
+  their current cost.
 - Removing one work from a corpus is all or nothing.
-- A graph load uses files of one build only, or reloads.
-- The topic backfill writes only rows whose identifier is still the one it looked up.
-- A failed claim in the worker is a failed job or cycle, never an empty one.
+- A graph load notices a rebuild and reloads once, in the same session and only while the graph
+  is open (with D8's accepted residual).
+- The topic backfill writes only rows still in the state it selected them in.
+- A failed claim in the worker is a failed job or cycle, never an empty one, and a job whose
+  failure cannot be recorded is requeued by a restart.
 - One place reads the OpenAlex key, and the missing-key warning prints once per process.
-- Each change has a test that fails on `c574aba`, except D6's, which pins a config value.
+- Each change has a test that fails on `c574aba`.
 
 ## Non-goals
 
@@ -149,12 +155,26 @@ Everything else that is still open after the reconciliation belongs to later pha
   is FE-64, here), PY-31 (phase 6).
 - **D1 does not merge the four download handlers;** each gets the same three-line guard. FE-16
   replaces their link code with one helper in phase 9.
-- **D8 keeps one build per key on disk.** No per-build directories, no grace period for old
-  builds.
+- **D8 keeps one build per key on disk and assumes one writer.** No per-build directories, no
+  grace period for old builds, no fd streaming; the small gap between the version check and the
+  file open is an accepted residual (D8).
+- **D11 does not change the watchdog or the direct-cycle error path;** it adds only the restart
+  when a job's failure cannot be recorded.
 
 ## Decisions
 
 ### Frontend
+
+**Late-answer gates for every browser race test (D1 to D4, D8).** No race test waits a fixed
+time. Each one:
+- holds the late request on a gate (`deferred()`);
+- confirms that the new session or corpus has loaded before it releases the gate (the new
+  user's name in `auth-user` and the workspace rendered; or the switched corpus in the picker and
+  its `/api/auth/me` answered);
+- after the release, waits on a browser-side checkpoint before it asserts:
+  `const response = page.waitForResponse(<url>)`, release, `await (await response).finished()`,
+  then `await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0))))`.
+  The helper is `afterLateAnswer(page, responsePromise)` in `tests/helpers/mockApi.ts`.
 
 **D1. A download that settles after a sign-out is dropped (FE-60b), controller call.**
 - `handleSeedCandidateFile`, `handleDownloadSeedDocument`, `handleDownloadedCorpusFile` and
@@ -163,90 +183,144 @@ Everything else that is still open after the reconciliation belongs to later pha
   navigation, no status. Their `catch` returns on `error?.status === 401 || session !== sessionEpoch`.
 - Only the session counts, not the corpus: a file the user asked for under corpus A is still
   theirs after a switch to B.
-- `exportBusy` joins `initialWorkspaceState()` (`false`) and the `resetFrontendState`
-  destructuring, so a new session's export button is not held by the old export.
-  `handleExportDownload`'s `finally` clears it only when `session === sessionEpoch`.
+- **The export lock is session-wide.** `exportBusy` stays out of `initialWorkspaceState()`, so a
+  corpus switch keeps it: one export at a time per session, and no second export of the same
+  session can start while the first runs. `resetFrontendState` sets `exportBusy = false` in its
+  `signOut` branch only. `handleExportDownload`'s `finally` clears it only when
+  `session === sessionEpoch`, so an old session's export never clears a new session's.
 - Tests:
-  - `seed-selection.spec.ts` (it has the readable-candidate fixture, `:217-225`): hold the
-    `…/candidates/readable/file` route, click the row's Download, log out, sign in as another
-    user (the `logIn` pattern of `session.spec.ts`; move `logIn` to `helpers/mockApi.ts` if both
-    specs need it), then answer with a PDF and a `Content-Disposition`. After 300 ms: no
-    `download` event on the page and no `Downloaded` text.
-  - `session.spec.ts`: the same for the corpus export, plus: the export button is enabled for
-    the new user while the old export is still held.
+  - `seed-selection.spec.ts` (it has the readable-candidate fixture, `:217-225`). Its `boot`
+    answers `/api/auth/login` with token `second-token`, and `/api/auth/me` by the bearer token
+    (`second-token` → user `second`, else `reader`). Hold `…/candidates/readable/file`; click the
+    row's Download; log out; sign in as `second` and wait for `auth-user` to read `second`;
+    release with a PDF and a `Content-Disposition`; `afterLateAnswer`. Then: no `download` event
+    and no `Downloaded` text.
+  - Same file, the failure case: the file answers `500 { error: 'late-candidate-error-7f3' }`;
+    after the checkpoint the text `late-candidate-error-7f3` is absent. (A non-JSON body would be
+    shown as the error text, so `/Failed to download/` alone would already be absent on
+    `c574aba`.)
+  - `session.spec.ts`: alice starts the Bundle ZIP export (held); log out; bob signs in; bob's
+    export button is enabled; bob starts an export (held too); release alice's export and wait
+    for the checkpoint: no download event, no `export downloaded` text, and bob's button is still
+    disabled (his export owns the lock); release bob's: one download event, button enabled.
+  - `tab-resources.spec.ts`: an export held across a corpus switch keeps the button disabled in
+    the new corpus until it settles; then the button is enabled.
 
-**D2. A search launch is dropped when the session or corpus changed (FE-63), controller call.**
+**D2. A search launch is dropped once the frontend commits a session or corpus change (FE-63),
+controller call.**
 - `startSearch`, after its corpus check, takes `const session = sessionEpoch` and
   `const scope = corpusScopeEpoch`, with `const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch`.
 - `if (stale()) return` right after `runKeywordSearch` (before `refreshQuota` and before
   `startedSearchRunIds`), after `loadSeedSources` and after `focusSeedSource`. The `catch`
   returns on `error?.status === 401 || stale()`.
-- The corpus switch counts here (unlike D1): the run belongs to corpus A, and marking it running
-  in B only polls B for nothing. The run itself goes on server side, as it does today.
+- **The boundary is the frontend's commit.** `handleSelectCorpus` (`App.svelte:2319-2349`)
+  saves the selection on the server, then waits for `/me`, and only then bumps
+  `corpusScopeEpoch` (through `resetFrontendState`). A launch answered in that gap still applies
+  its effects, as today; the commit that follows resets all of them (`startedSearchRunIds`,
+  `searchStatus`, the seed list), and a `loadSeedSources` or `focusSeedSource` still running then
+  ends on its own epoch check and on `stale()`. Phase 7's submitted-corpus binding (FE-62: the
+  body carries `corpusId`, and `startSearch` drops a body whose corpus is no longer current) is
+  unchanged.
+- The run itself goes on server side, as it does today.
 - Tests:
   - `session.spec.ts`: the preview answers `{ count: 5, threshold: 100000 }`; hold
-    `POST /api/keyword-search`; once it is seen, log out and sign in as bob; answer `202`
-    `{ runId: 7, status: 'running' }` (the shape the FE-55 test there uses). After 300 ms: no
-    `Fetching in the background` text, and `window.__dtRefresh.reason()` is not `'active'`.
-  - `tab-resources.spec.ts` (next to the FE-62 test, `:625`): the same with a corpus switch
-    instead of the sign-out.
+    `POST /api/keyword-search`; once it is seen, log out and sign in as bob (wait for
+    `auth-user` = `bob`); release `202 { runId: 7, status: 'running' }`; `afterLateAnswer`. Then
+    no `Fetching in the background` text, and `window.__dtRefresh.reason()` is not `'active'`.
+  - `tab-resources.spec.ts`, after the frontend commit: the same with a corpus switch (wait for
+    the picker to read `2` and for the `/api/auth/me` that follows the select).
+  - `tab-resources.spec.ts`, in the gap: hold the launch and hold the `/me` after the select
+    (`delays.me` gate); release the launch first and wait for its checkpoint; then release `/me`
+    and wait for the commit. Then no `Fetching in the background` text, the reason is not
+    `'active'`, and the launch body carried `corpusId: 1`.
 
-**D3. Only the newest detail request writes the panel (FE-61).**
+**D3. Only the newest detail request writes the panel and the cache (FE-61).**
 - `ThreeGraph.svelte` gets `let nodeDetailSeq = 0`. `loadNodeDetail` takes
   `const seq = ++nodeDetailSeq` first, before the cache check, so a cache hit also supersedes an
   older request.
-- The fetched detail is always cached. It is shown only when `seq === nodeDetailSeq` and the node
-  is still selected (today's check). The `catch` clears `selectedNodeDetail` and the `finally`
-  clears `nodeDetailLoading` only when `seq === nodeDetailSeq`.
-- Test, `graph-3d.spec.ts`: hold the detail of `Graph seed work` (node 1); select it through the
-  search; select `Referenced work` (node 2, answers at once) and wait for
-  `Identifiers: 10.1000/example`; answer node 1 with 500. After 300 ms the identifiers are still
-  visible. A second case holds node 2 instead and answers node 1 first: `Loading metadata...`
-  stays visible until node 2 answers.
+- After the fetch, nothing happens unless `seq === nodeDetailSeq`: the cache write, the panel
+  write (still only while the node is selected), the `catch`'s clear and the `finally`'s
+  `nodeDetailLoading = false` all check it. A superseded answer is dropped, not cached; a later
+  selection fetches again.
+- **Deselection ends the request.** `clearSelection` (`:1174`), `showAllNodes` (`:946`) and the
+  reset at the start of `load3DGraph` (`:1215-1222`) bump `nodeDetailSeq` and set
+  `nodeDetailLoading = false`, so hovering another node never shows the old node's
+  "Loading metadata...".
+- Tests, `graph-3d.spec.ts`, with gates on `/api/graph/3d/node/1` and `/node/2`:
+  - select `Graph seed work` (held), select `Referenced work` (answers), see
+    `Identifiers: 10.1000/example`; release node 1 with 500 and wait for the checkpoint: still
+    shown, no `Loading metadata...`;
+  - A → B → A: node 1's first request held (gate 1), node 2 answers, node 1's second request held
+    (gate 2); release gate 2 with `doi: '10.1000/seed-v2'` (shown), then gate 1 with
+    `10.1000/seed-v1` and wait for the checkpoint: `10.1000/seed-v2` still shown; select node 2,
+    then node 1 again: no third node-1 request, and `10.1000/seed-v2` shows (the cache hit);
+  - deselection: select node 2 (answers, cached), select node 1 (held), press Escape, select node
+    2 again (cache hit); release node 1 with 500 and wait for the checkpoint:
+    `Identifiers: 10.1000/example` still shown and no `Loading metadata...`;
+  - older answer: node 1 and node 2 both held, select 1 then 2; release node 1 with 200 and wait
+    for the checkpoint: `Loading metadata...` still shown, no `10.1000/seed`; release node 2:
+    its identifiers show.
 
 **D4. The upload list is saved best effort (FE-64).**
 - `persistStoredUploads` wraps the `window.localStorage.setItem` call (the `window.localStorage`
   access included) in `try`/`catch`. On a failure it logs
   `console.warn('[uploads] could not save the upload list:', error?.message)` once per page load
-  (a module flag) and returns. The upload and extraction go on; the list only does not come back
-  after a reload. No other caller changes.
+  (a module flag) and returns. The upload and extraction go on. No other caller changes.
+- **What a reload shows:** the last list that was saved. If every save failed, that is nothing.
+  If earlier saves worked and later ones fail (the quota filled up mid-session), a reload restores
+  that older list, with the older statuses (`normalizeStoredUploadStatus` maps running states to
+  `uploaded`). The seed list from the server stays the source of truth for extracted PDFs.
 - Test, `seed-upload.spec.ts`: an init script replaces `Storage.prototype.setItem` with one that
   throws a `DOMException` named `QuotaExceededError` for keys starting with `rag-feeder:uploads:`
-  and calls the original otherwise (the token key keeps working). The BibTeX import of the first
-  test (`:68`) then still ends with its success text, not `failed`.
+  and calls the original otherwise (the token key keeps working). The BibTeX upload of the first
+  test (`:68`) runs; the test asserts the upload row's final text directly
+  (`Imported 2 works (1 skipped, 2 added to corpus).`) and that it is not failed. It does not
+  wait on the import request, which never starts on `c574aba`, so the baseline fails at that UI
+  assertion. It also expects exactly one `[uploads] could not save the upload list:` warning.
 
 **D5. FE-22 is closed: not a bug, controller call.** Every way the two values change already
-re-arms the timer, or the stale cadence ends at the next tick:
+re-arms the timer, or the stale cadence ends at the next cycle:
 - `activeTab` is only assigned in `setActiveTab` (`App.svelte:4729`), which calls
   `scheduleRefresh()` itself (`:4734`), and in `onMount` before sign-in (`:4743`), when
   `authStatus` is not `authenticated`. The sign-in that follows changes `authStatus`, which is on
   the list.
 - `isAdmin`/`diagnosticsEnabled` derive from `authUser` (`:120-121`, declared before `:220`, so
-  they update first in the same flush). A sign-in changes `authStatus` too. A role change during
-  a session arrives through the `/me` poll inside a refresh cycle (`:1476`), and
-  `runLiveRefreshCycle`'s `finally` re-arms (`:1587-1593`) with the new value. The corpus
-  actions that also set `authUser` (`:2332`, `:2363`, `:2412`) reset `ingestStats`, which is on
-  the list. `diagnosticsEnabled` only matters next to a busy worker, and loading the worker
-  status changes `pipelineWorker`/`downloadWorker`, which are on the list.
-- So the cadence is never stale for longer than one cycle (2 s active, 20 s idle), which a
-  dependency would not shorten. No code change; the row is closed in the inventory.
+  they update first in the same flush). The frontend learns of a role change only when a `/me`
+  answer shows it:
+  - at sign-in, which changes `authStatus` too;
+  - in the `/me` poll inside a refresh cycle (`:1476`), whose `finally` re-arms
+    (`runLiveRefreshCycle`, `:1587-1593`) with the new value;
+  - in the corpus actions (`:2332`, `:2363`, `:2412`), which reset `ingestStats`, which is on the
+    list.
+  `diagnosticsEnabled` only matters next to a busy worker, and loading the worker status changes
+  `pipelineWorker`/`downloadWorker`, which are on the list.
+- So once `/me` has shown a change, the cadence is stale for at most one cycle (2 s active, 20 s
+  idle), which a dependency would not shorten. No code change; the row is closed in the inventory.
 
-**D6. Polling is an env flag (FE-24), controller call.**
-- `vite.config.js`:
-  `const usePolling = ['1', 'true', 'yes'].includes(String(process.env.CHOKIDAR_USEPOLLING || '').trim().toLowerCase())`,
-  and `watch: { usePolling }`, with a comment that the dev containers set the variable
-  (`docker-compose.yml`, `docker-compose.dev.yml`) for the bind mount, and that Playwright and CI
-  leave it unset.
-- The variable is the one compose already sets, so the containers keep polling with no compose
-  change; the genkia.de dev container (`rag_feeder_frontend`, `./frontend:/app` bind mount) sees
-  the same watcher after Vite restarts on the config change. Deleting the line alone would work
-  today, because chokidar 3 reads the variable itself; the explicit read keeps that true if
-  Vite's watcher stops doing so.
-- Test, new `frontend/tests/dev-server-config.spec.ts` (no page): it runs
-  `node --input-type=module -e "const m = await import('./vite.config.js'); console.log(JSON.stringify(m.default.server.watch))"`
-  with `cwd` the frontend dir, once with `CHOKIDAR_USEPOLLING` removed from the env and once each
-  with `1`, `true` and `0`, and expects `usePolling` `false`, `true`, `true`, `false`. The spec
-  is added to the CI Playwright list (`.github/workflows/ci.yml:54`).
+**D6. The config no longer forces polling (FE-24), controller call.**
+- `vite.config.js` sets `watch: { usePolling: false }`, with a comment: the bundled chokidar 3
+  (`node_modules/vite/dist/node/chunks/config.js:13887-13893`) lets `CHOKIDAR_USEPOLLING`
+  override the option; the dev containers set it to `1` (`docker-compose.yml:169`,
+  `docker-compose.dev.yml:30`) for the bind mount; Playwright and CI leave it unset.
+- Effect: the host (Playwright, CI, a local `npm run dev`) stops polling. The containers keep
+  polling and keep its CPU cost, unchanged; the genkia.de dev container (`rag_feeder_frontend`,
+  `./frontend:/app` bind mount) sees the same watcher after Vite restarts on the config change.
+  No compose change.
+- Chokidar's own parsing of the variable stays: `0` and `false` turn polling off; any other
+  non-empty value, `bogus` and ` 0 ` included, turns it on. The config does not parse the
+  variable itself, because chokidar would override the result anyway.
+- Test, new `frontend/tests/dev-server-config.spec.ts` (no page). It checks the watcher Vite
+  actually builds, not the config object. A node child with `cwd` the frontend dir runs
+  `createServer({ configFile: 'vite.config.js', logLevel: 'silent', optimizeDeps: { noDiscovery: true } })`
+  from `vite`, prints `JSON.stringify({ usePolling: server.watcher.options.usePolling })` and
+  closes the server without `listen()`. The expected values:
+  - `false` with the variable removed from the env;
+  - `true` with `1` (compose's value);
+  - `true` with ` TRUE `.
+
+  The spec is added to the CI Playwright list (`.github/workflows/ci.yml:54`). The same probe in
+  a scratch dir against Vite 7.3.1 gave `false` unset, `true` for `1`, `false` for `0`, and
+  `true` for ` 0 ` and `bogus`.
 
 ### Backend
 
@@ -262,47 +336,71 @@ re-arms the timer, or the stale cadence ends at the next tick:
   send the DELETE: 500, and both the membership and the marker are still there. Drop the trigger
   afterwards.
 
-**D8. A versioned file request is served from that build or not at all (BE-54), controller call.**
-- A helper `graph3dManifestVersion(key)` returns the version `decorateGraph3dManifest` puts in
-  `?v=`: `String(manifest.generated_at)` when present, else the manifest's `mtimeMs` floored, as
-  today (`app.js:610-619`); `null` when the manifest cannot be read. `decorateGraph3dManifest`
-  uses the same rule (it keeps taking `generated_at` from the manifest it decorates).
-- The file route, when the request has a `v` query value:
-  1. reads the version (V1);
-  2. opens the file it will serve with `fs.openSync` (the `.gz` when the client accepts gzip and
-     it exists, else the plain file; a missing file is 404 as today);
-  3. reads the version again (V2).
-
-  If `V1 !== v` or `V2 !== v`, it closes the fd and answers
-  `409 { error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' }`
-  with `Cache-Control: no-store`. A swap renames the whole dir, so with `V1 === V2` the fd
-  belongs to that build. Otherwise it streams from the fd
-  (`fs.createReadStream(filePath, { fd })`), with `Content-Length` from `fs.fstatSync(fd)` and
-  the same headers as today (`Content-Type` by extension on the plain path too, which today goes
-  through `res.sendFile`). The client-abort and stream-error handling stays.
-- Without `v` (old manifests, other callers) the route answers as today, through the same fd
-  path.
-- **Frontend:** `load3DGraph` (`ThreeGraph.svelte:1215-1260`) retries once: when
-  `fetchGraph3DSnapshotResources` rejects with `error.status === 409`, it fetches the manifest
-  again with the same options and loads its resources; a second 409 is shown like any other
-  error.
+**D8. A versioned file request is checked against the live build once (BE-54), controller
+call.**
+- **Deployment assumption: one writer.** Only the backend process publishes snapshots, and it
+  swaps them with synchronous renames (`app.js:538-548`, `renameSync` at `:540-546`). No other request in that process can
+  run between a synchronous check and the next statement.
+- A helper `graph3dManifestVersion(key) -> string | null` returns the version
+  `decorateGraph3dManifest` puts in `?v=`: `String(manifest.generated_at)` when present, else the
+  manifest's `mtimeMs` floored, as today (`app.js:610-619`); `null` when the manifest cannot be
+  read. `decorateGraph3dManifest` uses the same rule (it keeps taking `generated_at` from the
+  manifest it decorates).
+- The file route keeps its middleware order: `requireAuthMiddleware`, then
+  `requireGraph3dScopeAccess`, then the handler. An outsider gets 403 before any version check,
+  for a matching and for a stale `v` alike.
+- In the handler, after the key and file-name checks and before the existence check: when the
+  request has a string `v` and `graph3dManifestVersion(key) !== v`, it sets
+  `Cache-Control: no-store` and answers
+  `409 { error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' }`.
+  Otherwise the route goes on exactly as today: the gzip stream, or `res.sendFile` with its range
+  and conditional handling. A request without `v` is unchanged.
+- **Accepted residual:** the gzip path's `statSync` and stream open, and `sendFile`'s
+  asynchronous open, run after the check. A rebuild that swaps in that gap can still serve one
+  file of the new build under the old version. Rebuilds are rare (1 h TTL, or an admin refresh),
+  the worst case is one mixed graph until the next load, and closing the gap would need fd
+  streaming that drops `sendFile`'s range and conditional responses.
 - `generated_at` is an ISO timestamp with microseconds (`graph_3d_export.py:817`), and a build
   takes tens of seconds, so two builds never share a version.
+- **Frontend: one load, one owner.** `load3DGraph` (`ThreeGraph.svelte:1215-1260`):
+  - takes `const load = ++graphLoadSeq` and captures its options once
+    (`{ maxNodes, relationship, groupBy, corpusId: selectedGraphCorpusId }`);
+  - `owns() = componentMounted && load === graphLoadSeq`, checked after the manifest, before the
+    resources, before a retry, after the retry's manifest, and before it publishes `graphData`
+    or `graphStatus`; a load that no longer owns returns without a request or a write;
+  - retries once: when the resources reject with `error.status === 409` and it still owns, it
+    fetches the manifest again with the captured options and loads that manifest's resources; a
+    second failure is shown like any other error;
+  - its `catch` writes the status only while it owns, and its `finally` clears `graphLoading`
+    only when `load === graphLoadSeq`.
+
+  A sign-out unmounts the graph tab, so a late 409 never starts a request under the next
+  session's token (`requestJson` reads the token at call time, `api.js:41`).
 - Tests:
-  - `graph-read-path.test.js`, a hand-written snapshot dir as in the cluster test (`:327-340`):
-    `nodes.bin?v=A` answers 200 with the bytes; `?v=B` answers 409 with `no-store`; no `v`
-    answers 200.
-  - Same file: `jest.spyOn(fs, 'openSync')` calls through and then rewrites `manifest.json` with
-    `generated_at: 'B'` when the opened path is that `nodes.bin`; `?v=A` answers 409.
-  - The build-streaming test (`:307-325`) still passes: the manifest is the only file read with
-    `readFileSync`.
-  - `graph-3d.spec.ts`: the first `nodes.bin` request answers 409; the manifest is requested
-    twice and the graph status shows the loaded node count.
+  - `graph-read-path.test.js`, a hand-written snapshot dir as in the cluster test (`:327-340`),
+    manifest `generated_at: 'A'`, `nodes.bin` and its `.gz`:
+    - `nodes.bin?v=A` answers 200 with the bytes (gzip path);
+    - with `Accept-Encoding: identity`, `?v=A` answers 200 through `sendFile`: octet-stream
+      type, length 4, and a `Range: bytes=0-1` request answers 206;
+    - `?v=B` answers 409 with the body above and `Cache-Control: no-store`;
+    - no `v` answers 200.
+  - `graph-access.test.js`: the lonely user gets 403 for `clusters.json` of `k1` with
+    `?v=gen-<k1>` (matching) and with `?v=stale`.
+  - The build-streaming test (`:307-325`) still passes.
+  - `graph-3d.spec.ts`:
+    - manifest 1 lists resource URLs with `?v=A`, manifest 2 with `?v=B`; `nodes.bin?v=A`
+      answers 409. The manifest is requested twice, every resource request after the 409 carries
+      `v=B`, and the graph status shows the loaded node count.
+    - A 409 after unmount: hold `nodes.bin?v=A`; switch to the workspace tab (the graph
+      unmounts); release with 409 and wait for the checkpoint: the manifest was requested once
+      and no request carries `v=B`.
 
 **D9. BE-38 is closed: sync writes stay, controller call.**
-- Measured on this machine (Node 22, 20,000 lines of 150 bytes): today's `existsSync` +
+- Measured on this machine (Node 22, 20,000 lines of 150 bytes in a loop): today's `existsSync` +
   `statSync` + `appendFileSync` costs about 26 µs a line; a held fd with `fstatSync` +
   `writeSync` about 8 µs. At a busy 100 lines/s the difference is under 0.2 % of the event loop.
+  This is the steady-state cost only: the loop does not measure stalls during a rotation (five
+  renames) or under bursts.
 - Tracking the size in memory is wrong for `backend-pipeline-v2.log`: the two workers append to
   it, so the backend would rotate long past the limit. A per-line `stat` is what counts their
   bytes.
@@ -315,39 +413,64 @@ re-arms the timer, or the stale cadence ends at the next tick:
 
 ### Python
 
-**D10. The backfill writes only rows whose identifier is unchanged (PY-34), controller call.**
+**D10. The backfill writes only rows still in the state it read (PY-34), controller call.**
 - Rows carry the raw identifier they were read with: pass 1 rows become
   `(work_id, token, raw_openalex_id)`, and `doi_rows` returns `(work_id, key, raw_doi)` triples;
   its annotation becomes `tuple[list[tuple[int, str, str]], int]`
   (`test_backfill_helpers_carry_the_specified_annotations`, `test_doi_rule_scripts.py:157-165`,
   changes with it).
-- `run_pass` takes `guard_column` (`"openalex_id"` for pass 1, `"doi"` for pass 2; fixed
-  strings, never user input). `write_results` and `mark_fetched` add `AND <guard_column> = ?`
-  with the raw value. `write_results` runs one `UPDATE` per row inside the batch's transaction
-  (at most 50) and returns the ids it changed; `matched` and `fielded` count only those.
-- Rows whose write changed nothing keep `topics_fetched` as it was, so the next run looks them up
-  under their new identifier. The pass logs
+- `write_results` takes the pass's guard and runs one `UPDATE` per row inside the batch's
+  transaction (at most 50). Each `UPDATE` repeats in one statement what the pass selected the
+  row for:
+  - pass 1: `WHERE id = ? AND openalex_id = ? AND (topics_fetched IS NULL OR topics_fetched = 0)`;
+  - pass 2: `WHERE id = ? AND doi = ? AND (openalex_id IS NULL OR openalex_id = '') AND (topics_fetched IS NULL OR topics_fetched = 0)`.
+
+  A DOI row that gained an OpenAlex id while its request was held is therefore not written, and
+  the next pass 1 looks it up by that id. The guard is chosen by the pass (`"openalex"` or
+  `"doi"`), never by input. `write_results` returns the ids it changed; `matched` and `fielded`
+  count only those.
+- **`mark_fetched` goes.** Every result `run_pass` resolves to a row is appended to `updates` as
+  well as to `seen_work_ids` (`backfill_openalex_topics.py:204-215`), and `write_results` already
+  sets `topics_fetched = 1`. The second write only repeated it, and unguarded it would mark a row
+  that the guard skipped as fetched without topics.
+- Rows the guard skipped keep `topics_fetched` as it was. The pass logs
   `[<label>] <n> work(s) changed while the batch was fetched; left for the next run` when `n > 0`.
-- Tests, `test_doi_rule_scripts.py`, with `_fake_openalex`:
-  - pass 2: the fake request changes row 1's `doi` through a second connection before it
-    answers; row 1 keeps `(None, None, None)`, row 2 of the same batch gets its topics, and the
-    log line says 1;
-  - pass 1: the same with `openalex_id`;
+- Tests, `test_doi_rule_scripts.py`, with `_fake_openalex`; the fake request changes the row
+  through a second connection before it answers:
+  - pass 2, `doi` changed: row 1 keeps `(None, None, None)`, row 2 of the same batch gets its
+    topics, and the log line says 1;
+  - pass 2, only `openalex_id` set (to `W9`): row 1 keeps `topics_fetched` `None`;
+  - pass 1, `openalex_id` changed: the same;
   - the existing pass-2 tests pass unchanged.
 
-**D11. The worker raises on a failed claim (PY-54), controller call.**
+**D11. The worker raises on a failed claim, and a job whose failure cannot be recorded is
+recovered by a restart (PY-54), controller call.**
 - `claim_enrich_batch` gets `raise_errors: bool = False`, as `claim_download_batch` has: on a
   `sqlite3.Error` it rolls back and re-raises when set, else answers `[]`. The docstring says so.
 - The worker passes `raise_errors=True` to both claims: `do_enrich` (`worker.py:1249`) and
   `do_download` (`:1596`). The download claim joins because it is the same defect in the same
   loop.
-- Effects, all through existing paths:
+- Effects through existing paths:
   - a job (`enrich`, `download`, `pipeline_tick`) is marked `failed` with the traceback and an
     error heartbeat (`_process_job`'s `except`, `:1785-1803`), instead of `completed` with zero
     counts; the user can run it again;
   - a direct cycle's error goes to `_run_direct_cycles` (`:1817-1857`): the other role's cycle
     still runs, and with nothing processed the main loop logs it, sends its error heartbeat and
     waits 10 s (`:1907-1913`).
+- **When the terminal write fails too.** A lock long enough to fail the claim (30 s
+  `busy_timeout`) can also fail `mark_job_failed`. Today that exception leaves the `except`, the
+  `finally` stops the job's heartbeat and watchdog, and the job stays `running` under this live
+  worker, which periodic recovery never reclaims (`_recover_stale_running_jobs(periodic=True)` → `_recover_dead_owners_only`, `:743-763`, `:887`). The
+  fix uses the existing restart path:
+  - `_process_job` wraps `mark_job_failed` in `try`/`except sqlite3.Error`. On that error it logs
+    `Job <id>: the failure could not be recorded (<error>); exiting with code 75 so start-up recovery requeues it.`,
+    still sends the error heartbeat (which handles its own errors), and after the `finally` calls
+    `self._exit(JOB_TIMEOUT_EXIT_CODE)`.
+  - Docker's restart policy brings the worker back, and start-up recovery
+    (`_recover_stale_running_jobs()` in `__init__`, `:298`; the predecessor rule, `:778-781`)
+    sets the job back to `pending` and releases the dead worker's work claims. The job runs again
+    rather than ending `failed`: the same outcome as any other worker restart.
+  - The watchdog's own failure path is unchanged.
 - Other callers keep `[]`: the default is unchanged, and the "daemon's contract" assertion of
   `test_a_failed_claim_is_not_an_empty_queue` (`test_cli_download_leases.py:1248-1258`) still
   holds for the default.
@@ -355,56 +478,78 @@ re-arms the timer, or the stale cadence ends at the next tick:
   - `db_manager`: with `_deny_next_begin` (`test_cli_download_leases.py:1236-1245`),
     `claim_enrich_batch` answers `[]` by default and raises `sqlite3.Error` with
     `raise_errors=True`, leaving no open transaction;
-  - worker, using the `_daemon` fixture of `test_worker_settings.py`: an `enrich` job whose
-    claim is denied ends `failed`, with the SQLite message in its error, not `completed`; the
-    same for a `download` job; `_run_direct_cycles` for role `enrich` raises
-    `RuntimeError("enrich cycle failed: …")`.
+  - worker (`daemon._exit = exits.append`): an `enrich`, a `download` and a `pipeline_tick` job
+    whose claim is denied end `failed`, with the SQLite message in the error, and `exits == []`;
+  - both failures injected: the claim is denied and `mark_job_failed` raises
+    `sqlite3.OperationalError('database is locked')`. The job is still `running`, the log line
+    above was written, and `exits == [75]`. A new daemon of the same role on the same DB (the
+    restart) finds the job `pending`;
+  - `_run_direct_cycles` for role `enrich` raises `RuntimeError("enrich cycle failed: …")`.
 
 **D12. The scraper uses the shared key reader (PY-27, DRY half), controller call.**
 - `OpenAlexCrossrefSearcher.__init__` sets `self.api_key = get_openalex_api_key()` and, when it
   is `None`, calls `utils._warn_missing_openalex_api_key()`. `_missing_api_key_warned` and the
   scraper's own warning text are removed. Both are imported from `.utils`; the helper keeps its
   name (it is package-internal).
-- Behaviour changes: a key with surrounding whitespace is stripped; a whitespace-only key counts
-  as unset; the missing-key warning prints once per process instead of up to twice. The worker's
-  settings refresh (`test_worker_settings.py:98-103`) still sees the new key, because the reader
-  runs at construction as before.
+- Behaviour changes:
+  - a key with surrounding whitespace is stripped;
+  - a blank or whitespace-only `OPENALEX_API_KEY` counts as unset, so the reader falls back to
+    `RAG_FEEDER_OPENALEX_API_KEY` (`utils.py:260-262`); today the scraper sends the blank value;
+  - the missing-key warning prints once per process instead of twice.
+
+  The worker's settings refresh (`test_worker_settings.py:98-103`) still sees the new key,
+  because the reader runs at construction as before.
 - Tests, `test_hygiene.py` next to `:118`:
   - with `OPENALEX_API_KEY="  sekret-key-123\n"` the searcher's `api_key` is `sekret-key-123`;
-  - with both key variables unset and the two module flags reset, building a searcher and then
-    calling `openalex_request_json` (request faked) prints the `[WARN] OPENALEX_API_KEY not set`
-    line exactly once;
+  - with `OPENALEX_API_KEY="   "` and `RAG_FEEDER_OPENALEX_API_KEY="fallback-key"` it is
+    `fallback-key`;
+  - with both variables unset and both module flags reset, building a searcher and then calling
+    `openalex_request_json` prints the `[WARN] OPENALEX_API_KEY not set` line exactly once
+    (twice on `c574aba`). The request uses a stub session whose response has `status_code` 200,
+    `headers` `{}`, `json()` and `raise_for_status()`, and `RAG_FEEDER_OPENALEX_QUOTA_PATH`
+    points into `tmp_path`;
   - `git grep -n "getenv('OPENALEX_API_KEY')" -- dl_lit_project/dl_lit` finds nothing.
 
 ## Order of work
 
-Five tasks, each one reviewable commit or a small group of them. Tasks 1, 4 and 5 touch disjoint
-files and can run in parallel with the others; task 3 runs after task 2, because both edit
-`backend/src/app.js` (different routes).
+Five tasks, each one reviewable commit or a small group of them.
+- **Browser runs are serialized.** Tasks 1, 2 and 3 each run Playwright on the same port in the
+  same worktree, and Playwright reuses a server it finds there, so these three tasks run one
+  after another (1, 2, 3). Task 3 must follow Task 2 anyway: both edit `backend/src/app.js`
+  (different routes).
+- Tasks 4 and 5 (Python) touch disjoint files and can run beside them.
+- Each task runs only its own specs; the whole CI Playwright list runs once, at the final
+  verification.
+
 1. **Frontend session races:** D1, D2, D4 (`App.svelte`; `seed-selection.spec.ts`,
-   `session.spec.ts`, `tab-resources.spec.ts`, `seed-upload.spec.ts`, and `helpers/mockApi.ts`
-   if `logIn` moves).
-2. **Graph consistency:** D8 (file route, `decorateGraph3dManifest`) and D3, plus D8's retry
-   (`ThreeGraph.svelte`; `graph-read-path.test.js`, `graph-3d.spec.ts`).
+   `session.spec.ts`, `tab-resources.spec.ts`, `seed-upload.spec.ts`, `helpers/mockApi.ts` with
+   `logIn` and `afterLateAnswer`).
+2. **Graph consistency:** D8 (file route, `decorateGraph3dManifest`) and D3, plus D8's load
+   ownership and retry (`ThreeGraph.svelte`; `graph-read-path.test.js`, `graph-access.test.js`,
+   `graph-3d.spec.ts`).
 3. **Backend transaction and dev config:** D7 (`app.js`, `corpus-sharing.test.js`) and D6
    (`vite.config.js`, new `dev-server-config.spec.ts`, `ci.yml`).
-4. **Python claims:** D11 (`db_manager.py`, `worker.py`, new or existing worker and claim tests).
+4. **Python claims:** D11 (`db_manager.py`, `worker.py`, worker and claim tests).
 5. **Python backfill and key:** D10 and D12 (`backfill_openalex_topics.py`, `OpenAlexScraper.py`,
    `test_doi_rule_scripts.py`, `test_hygiene.py`).
+
+**Setup, once, before Task 1.** The worktree has no `node_modules`: `cd backend && npm ci`,
+`cd frontend && npm ci`, then `cd frontend && npx playwright install chromium`.
 
 D5 and D9 have no task: the controller marks FE-22 and BE-38 closed in the inventory's
 reconciliation section with a pointer to this spec.
 
 ## Acceptance
 
-- Every change has a test that fails on `c574aba` and passes after its task, except D6's config
-  spec. Each commit names the rows it closes.
-- Python: `cd dl_lit_project && /home/jay/DT/venv/bin/python -m pytest tests -q` is green.
+- Every change has a test that fails on `c574aba` and passes after its task. Each commit names
+  the rows it closes.
+- Python: `cd dl_lit_project && /home/jay/DT/dl_lit_project/.venv/bin/python -m pytest tests -q`
+  is green.
 - Backend: `cd backend && npm test` is green. Suites can time out under the full parallel load
   on this machine; compare with a `c574aba` baseline or use `npm test -- --maxWorkers=2` before
   blaming a task.
-- Frontend: `cd frontend && npx vite build` succeeds. The specs this phase touches and the whole
-  CI Playwright list (`ci.yml:54`, now with `dev-server-config.spec.ts`) pass with
+- Frontend: `cd frontend && npx vite build` succeeds. The whole CI Playwright list (`ci.yml:54`,
+  now with `dev-server-config.spec.ts`) passes once at the end with
   `E2E_FRONTEND_PORT=5190 npx playwright test <specs> --workers=1` (check first that 5190 is
   free, e.g. `ss -ltn`; any free port works). Never the default 5175: that is the dev container,
   which serves master's code, not this branch. No live spec is run.
@@ -418,22 +563,31 @@ reconciliation section with a pointer to this spec.
 ## Controller calls (for the owner)
 
 - **D1 (FE-60b):** the session guard goes into all four download handlers, not only the seed
-  candidate one; a corpus switch does not cancel a download; `exportBusy` is reset with the
-  workspace, so a new session can export while the old export is still running.
-- **D2 (FE-63):** a search launch is also dropped from view on a corpus switch, not only on a
-  sign-out; the run goes on server side.
-- **D5 (FE-22):** closed, not a bug: every change of the two values already re-arms the timer or
-  is corrected at the next cycle.
-- **D6 (FE-24):** the flag is the existing `CHOKIDAR_USEPOLLING`, read explicitly, default off;
-  compose already sets it for the containers, so nothing changes there.
-- **D8 (BE-54):** a file request whose `v` no longer matches the build answers 409 (no-store),
-  and the frontend reloads the graph once; requests without `v` behave as before. One build per
-  key stays on disk.
-- **D9 (BE-38):** closed, won't fix: per-line sync writes cost about 26 µs, the per-line stat is
-  needed for the workers' bytes, and every faster variant adds a failure mode to the shared log.
-- **D10 (PY-34):** a write is guarded on the identifier the lookup used; a changed row is left
-  unfetched for the next run; `doi_rows` returns triples, so a phase 7 annotation test changes.
+  candidate one; a corpus switch does not cancel a download; the export lock is session-wide (one
+  export at a time per session, kept across corpus switches) and is reset on sign-out only.
+- **D2 (FE-63):** a search launch is dropped once the frontend commits a sign-out or corpus
+  switch; a launch answered between the server's save and the `/me` answer applies its effects
+  until the commit resets them; the run goes on server side.
+- **D5 (FE-22):** closed, not a bug: once `/me` shows a role change, the next cycle at the latest
+  re-arms with it; a tab change re-arms itself.
+- **D6 (FE-24):** the config sets `usePolling: false`; chokidar's own `CHOKIDAR_USEPOLLING`
+  override keeps the containers polling (compose sets `1`), so the host stops polling and the
+  containers keep their cost.
+- **D8 (BE-54):** single-writer assumption; a versioned file request is compared once with the
+  live build's version and answers 409 (no-store) on a mismatch; otherwise the route is unchanged
+  (`sendFile` keeps range and conditional responses); requests without `v` are unchanged; the
+  scope check stays first. Residual: a swap between the check and the file open can still serve
+  one new file under the old version (rare, fixed by the next load). The frontend owns each load
+  once and retries once, never after unmount. One build per key stays on disk.
+- **D9 (BE-38):** closed, won't fix: per-line sync writes cost about 26 µs in steady state, the
+  per-line stat is needed for the workers' bytes, and every faster variant adds a failure mode to
+  the shared log.
+- **D10 (PY-34):** each write repeats the pass's selection (identifier, no OpenAlex id for pass
+  2, unfetched) in one `UPDATE`; a changed row is left for the next run; `mark_fetched` goes;
+  `doi_rows` returns triples, so a phase 7 annotation test changes.
 - **D11 (PY-54):** the worker raises on a failed claim for both enrich and download; such a job
-  now ends `failed` instead of `completed` with zero counts. Other callers keep `[]`.
-- **D12 (PY-27):** the scraper strips the key and treats a blank one as unset; the warning
-  prints once per process.
+  now ends `failed` instead of `completed` with zero counts. When the failure cannot be recorded
+  either, the worker exits with 75, and start-up recovery requeues the job (it runs again). Other
+  callers keep `[]`.
+- **D12 (PY-27):** the scraper strips the key, treats a blank one as unset (falling back to
+  `RAG_FEEDER_OPENALEX_API_KEY`), and the warning prints once per process.
