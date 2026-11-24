@@ -1,6 +1,6 @@
 import json
 import re
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -78,6 +78,23 @@ def convert_inverted_index_to_text(inverted_index):
     """Like :func:`dl_lit.identifiers.inverted_index_to_text`, but ``""`` for empty input."""
     return inverted_index_to_text(inverted_index) or ""
 
+def _is_openalex_api_url(url) -> bool:
+    """True for an https URL on api.openalex.org, the only host the key and mailto go to.
+
+    A stored ``cited_by_api_url`` or a ``next_page`` is upstream data: the Crossref mapping, for
+    one, stores an api.crossref.org URL there.
+    """
+    try:
+        parts = urlsplit(str(url))
+        return parts.scheme == "https" and parts.hostname == "api.openalex.org" and parts.port in (None, 443)
+    except ValueError:  # a malformed port or netloc
+        return False
+
+
+def _not_openalex_message(url) -> str:
+    return f"Citing-works URL is not an OpenAlex API URL, not fetched: {_redact_api_key(url)}"
+
+
 def fetch_citing_work_ids(
     cited_by_url,
     rate_limiter,
@@ -102,6 +119,12 @@ def fetch_citing_work_ids(
         return FetchResult()
 
     citing_work_ids = FetchResult()
+    if not _is_openalex_api_url(cited_by_url):
+        # Never send the OpenAlex key (or the OpenAlex client's quota accounting) elsewhere;
+        # such a URL holds no OpenAlex citing list to read anyway.
+        _mark_incomplete(citing_work_ids, _not_openalex_message(cited_by_url))
+        _warn_if_incomplete(citing_work_ids, "citing works")
+        return citing_work_ids
     quota_error = None
     select_fields = "id,title,display_name,authorships,publication_year,doi,type"
     if include_links:
@@ -149,8 +172,12 @@ def fetch_citing_work_ids(
             meta = data.get("meta", {})
             if meta.get("next_page") and len(citing_work_ids) < max_citations:
                 url = meta["next_page"]
-                page += 1
-                print(f"Fetching next page of citing works: Page {page}")
+                if not _is_openalex_api_url(url):
+                    _mark_incomplete(citing_work_ids, _not_openalex_message(url))
+                    url = None
+                else:
+                    page += 1
+                    print(f"Fetching next page of citing works: Page {page}")
             else:
                 url = None # No more pages or reached limit
 

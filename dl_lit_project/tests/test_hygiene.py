@@ -217,6 +217,58 @@ def test_citing_works_error_prints_the_url_without_the_api_key(monkeypatch, caps
     assert "sekret-key-123" not in out
 
 
+# --- OpenAlex credentials go only to api.openalex.org --------------------------------
+
+class _RecordingSession:
+    """Answers each GET with the next page and records the URL it was sent to."""
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.sent = []
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        import requests
+
+        self.sent.append(requests.Request("GET", url, params=params).prepare().url)
+        page = self.pages.pop(0)
+        return SimpleNamespace(status_code=200, headers={}, json=lambda: page, raise_for_status=lambda: None)
+
+
+def _citing_page(work_id, next_page=None):
+    return {"results": [{"id": f"https://openalex.org/{work_id}", "authorships": []}], "meta": {"next_page": next_page}}
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.crossref.org/works/10.1000/xyz/references",  # what the Crossref mapping stores
+    "http://api.openalex.org/works?filter=cites:W1",  # not https
+    "https://api.openalex.org.evil.example/works?filter=cites:W1",
+    "https://evil.example/api.openalex.org/works?filter=cites:W1",
+])
+def test_a_non_openalex_citing_url_is_never_sent_the_key(keyed_env, capsys, url):
+    from dl_lit import OpenAlexScraper
+
+    session = _RecordingSession([_citing_page("W5")])
+    result = OpenAlexScraper.fetch_citing_work_ids(url, _FreeLimiter(), session=session, api_key="sekret-c")
+    assert session.sent == []  # not requested at all, so neither key can reach that host
+    assert list(result) == [] and result.complete is False
+    assert "not an OpenAlex API URL" in result.errors[0]
+    out = capsys.readouterr().out
+    assert "sekret" not in out
+
+
+def test_an_openalex_citing_url_still_carries_the_key_and_a_foreign_next_page_is_not_followed(keyed_env):
+    from dl_lit import OpenAlexScraper
+
+    session = _RecordingSession([_citing_page("W5", next_page="https://evil.example/works?page=2"), _citing_page("W6")])
+    result = OpenAlexScraper.fetch_citing_work_ids(
+        "https://api.openalex.org/works?filter=cites:W1", _FreeLimiter(), session=session, api_key="sekret-c"
+    )
+    assert len(session.sent) == 1
+    assert session.sent[0].startswith("https://api.openalex.org/works?") and "api_key=sekret-c" in session.sent[0]
+    assert [w["openalex_id"] for w in result] == ["https://openalex.org/W5"]
+    assert result.complete is False and "not an OpenAlex API URL" in result.errors[0]
+
+
 REDACTION_CASES = [
     ("https://x/works?api_key=abc&page=2", "https://x/works?page=2"),  # first
     ("https://x/works?page=2&api_key=abc", "https://x/works?page=2"),  # last
