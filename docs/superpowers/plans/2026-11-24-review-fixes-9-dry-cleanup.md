@@ -2,12 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+Revised after the plan pre-flight (`.superpowers/sdd/2026-11-24-review-fixes-9-dry-cleanup/plan-preflight.md`;
+binding rulings in `plan-preflight-rulings.md`). BE-56 and BE-57 are parked (spec Non-goals).
+
 **Goal:** One copy of each duplicated helper (FE-11, FE-16, FE-23, BE-24, BE-27 to BE-31, BE-33,
 BE-34), and fixes for the rows parked in phase 8 plus FE-68:
 - import and extraction bound to the submitted corpus and to the uploader (FE-65b, FE-68);
 - late extraction replies dropped; corpus button locks per session (FE-66); the graph picker
   rolled back (FE-67);
-- 500 details for admins only (BE-29);
+- 500 details, failed-run errors and promotion expansion errors for admins only (BE-29; BE-56
+  and BE-57 parked);
 - a membership-checked seed marker (PY-55), shared-token backfill rows (PY-57), no replay of a
   completed scrape (PY-58), and the CLI's citing fetch (PY-59).
 
@@ -21,8 +25,9 @@ PY-32 is closed without code (spec D13).
 5. Import/extraction binding (`app.js`, `staged_uploads` table, `api.js`, `App.svelte`).
 6. Python (`seed_promote.py`, `backfill_openalex_topics.py`, `scraper_lab.py`, `OpenAlexScraper.py`).
 
-One new table (`staged_uploads`, `CREATE TABLE IF NOT EXISTS` in `ensureAuthSchema`). No new
-dependency. No new Playwright spec, so `.github/workflows/ci.yml` is not edited.
+One new table (`staged_uploads`, `CREATE TABLE IF NOT EXISTS` in `ensureAuthSchema`). Staged names
+use `crypto.randomUUID()`. No new dependency. No new Playwright spec, so
+`.github/workflows/ci.yml` is not edited.
 
 **Tech Stack:** Node 20, Express 5, better-sqlite3, Jest + supertest; Svelte 5 (legacy syntax) +
 Vite 7, Playwright (mocked); Python 3.11 (`/home/jay/DT/dl_lit_project/.venv/bin/python`), pytest,
@@ -65,9 +70,14 @@ sqlite3.
   `tmp_path` / `fs.mkdtempSync` DBs. Set `RAG_FEEDER_OPENALEX_QUOTA_PATH` into `tmp_path` in any
   test that reaches `openalex_request_json`.
 - Never use bounded-repeat quantifiers (`{m,n}`) in `grep` patterns.
+- Every grep check runs from the worktree root (`/home/jay/DT/.worktrees/review-fixes-9`) after
+  `git add -A` of the task's files, so new files are searched; a negative grep from the wrong
+  directory proves nothing.
+- Every Playwright command carries `E2E_FRONTEND_PORT=5190`.
 - No secret in a fixture: fake keys only (`sekret-…`, `fake-…`), never a value from `.env`.
 - Commands:
-  - Jest: `cd backend && npx jest tests/<file> --runInBand`;
+  - Jest: `cd backend && npm test -- tests/<file> --runInBand` (the repo's ESM runner; never bare
+    `npx jest`);
   - Python: `cd dl_lit_project && /home/jay/DT/dl_lit_project/.venv/bin/python -m pytest tests/<file> -q`;
   - Playwright: `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/<file> --workers=1`
     (check `ss -ltn` that 5190 is free; never 5175, the dev container serving master; never a
@@ -82,11 +92,13 @@ sqlite3.
   - D1: `Invite token is missing.`, `Reset token is missing.`, `Failed to accept invite`,
     `Failed to reset password` (and today's `Password must be at least 8 characters.`,
     `Passwords do not match.`);
-  - D4: `Uploaded file not found. Please re-upload.` (import),
+  - D4: `Failed to start bibliography extraction` (extraction lookup error; the import keeps
+    `Failed to import seed file`), `Uploaded file not found. Please re-upload.` (import),
     `Uploaded PDF not found (and no extracted pages exist). Please re-upload the PDF.` (extraction),
     `Invalid corpusId`;
   - D10: `Keyword search failed`, `search failed` (a failed run's `run.error` for non-admins),
-    and the 35 routes' own fallback texts, unchanged.
+    `Failed to build expansion seeds` (promotion expansion), and the 35 routes' own fallback texts,
+    unchanged.
 - Exact values: D11 TTL `60_000` ms, token `crypto.randomBytes(24).toString('base64url')`; D17 one
   page `per-page=100`, `max_citations` 100.
 - No compose, Caddy or CI change. Schema: only `staged_uploads`.
@@ -150,7 +162,8 @@ Spec D1, D2, D3.
 for (const { flow, endpoint, button } of signInLinks) {
   test(`${flow} shows its own validation and failure texts`, async ({ page }) => {
     // goto `#/${flow}` without token: submit -> text `${flow === 'accept-invite' ? 'Invite' : 'Reset'} token is missing.`
-    // with ?token=t: 'short' / 'short' -> 'Password must be at least 8 characters.'
+    // with ?token=t: 'short' / 'short' -> 'Password must be at least 8 characters.' (native minlength would block the
+    //   submit: set form.noValidate = true via page.locator('form.login-form').evaluate before clicking)
     // 'secret-password' / 'other-password' -> 'Passwords do not match.'
     // endpoint answers fulfil(route, { error: 'Link expired' }, 400): 'Link expired' visible; button still visible
   })
@@ -160,14 +173,16 @@ test('a stored corpus file downloads through its ticket', async ({ page }) => {
   // corpus list with one downloaded item id 5; POST '/api/corpus/downloaded/5/download-ticket'
   //   -> { url: '/api/corpus/downloaded/5/file?ticket=t', expires_in_seconds: 60 }
   // GET that path -> body '%PDF-1.4', headers { 'Content-Disposition': 'attachment; filename="paper.pdf"' }
-  // expand the row; click getByTitle('Download the stored file')
-  // (await page.waitForEvent('download')).suggestedFilename() === 'paper.pdf'; 'Download started.' visible
+  // expand the row; const download = page.waitForEvent('download') BEFORE the click; click getByTitle('Download the stored file')
+  // (await download).suggestedFilename() === 'paper.pdf'; 'Download started.' visible
 })
 // tab-resources.spec.ts — next to the FE-23 test (:855), admin boot, hash '#/downloads'
 test('both worker views carry exactly their heartbeat fields', async ({ page }) => {
   // state.workers = { enrich: { online: true, status: 'running', last_seen_at: 'T1', details: { state: 'enriching' } },
   //                   download: { online: false, status: 'error', last_seen_at: 'T2', details: { error: 'boom' } } }
-  // backlog { queued_download: 4, downloading: 1 }
+  // corpus-scoped backlog in the daemon-status answer: { queued_download: 4, downloading: 1 }
+  // wait until the heartbeat is applied: expect.poll(() => page.evaluate(() => (window as any).__dtRefresh.workers()
+  //   .downloadWorker.last_error)).toBe('boom'); then
   // const w = await page.evaluate(() => (window as any).__dtRefresh.workers())
   // expect(w.pipelineWorker).toMatchObject({ running: true, in_flight: true, started_at: 'T1', last_tick_at: 'T1',
   //   last_result: { state: 'enriching' }, last_error: null })
@@ -190,7 +205,8 @@ test('both worker views carry exactly their heartbeat fields', async ({ page }) 
   - D3: `pipelineWorker = workerView(pipelineWorker, enrich)`;
     `downloadWorker = { ...workerView(downloadWorker, download), queued_download_items, running_jobs }`.
 - [ ] **Step 4: Verify.** The Step 2 command passes; `cd frontend && npx vite build` succeeds;
-  `git grep -n "createElement('a')" -- frontend/src` prints only `src/lib/download.js`.
+  From the worktree root, after `git add -A frontend`, `git grep -n "createElement('a')" -- frontend/src` prints
+  only `frontend/src/lib/download.js`.
 - [ ] **Step 5: Commit**: `frontend: one sign-in tail, one set-password handler, one download helper and one worker-view builder (FE-11, FE-16, FE-23)`
 
 ---
@@ -234,9 +250,9 @@ test('a failed corpus manifest puts the picker back', async ({ page }) => {
   // openGraph; loaded; select '2': 'Corpus 2 manifest failed' visible; picker '1'; recolour 'degree': error stays, picker '1'
 })
 test('a render failure after publishing keeps the new corpus in the picker', async ({ page }) => {
-  // Review Focus 5. Corpus 2's manifest and files load, but its data makes renderGraph throw after graphData,
-  // loadedScope and loadedCorpusId name corpus 2 (e.g. nodes.bin shorter than the manifest's node count). Before relying
-  // on it, confirm the throw comes from renderGraph and not from fetchGraph3DSnapshotResources; name the shape in a comment
+  // Review Focus 5. Corpus 2's manifest and binary files are valid, but its nodes_meta.json answers valid JSON that is
+  // not an array ({}): the load publishes graphData (loadedScope and loadedCorpusId name corpus 2), then renderGraph
+  // throws at nodes.map (ThreeGraph.svelte:274). (A short aligned nodes.bin would not throw: positionValue falls back.)
   // select '2': an error status shows; expect(corpus).toHaveValue('2')
 })
 ```
@@ -268,7 +284,7 @@ Spec D7.
   `safeJsonParse` `:1327`, `normalizeGraphOpenAlexId` `:1528`, `normalizeGraphDoi` `:1535`; the
   five `['pdf', 'search']` sites).
 - Modify: `backend/src/seed.js` (drop `tableExists` `:4`, `tableHasColumn` `:9`, `parseJson`
-  `:14`, `normalizeDoi` `:46`, `normalizeOpenAlexId` `:53`; the redundant check `:137`; three
+  `:14`, `normalizeDoi` `:46`, `normalizeOpenAlexId` `:53`; the redundant probe `:137`; three
   source-type sites).
 - Modify: `backend/src/pipelineReads.js` (drop `tableExists` `:1`, `hasColumn` `:10`),
   `backend/src/corpusList.js` (import `tableExists` from `dbHelpers.js`).
@@ -277,7 +293,7 @@ Spec D7.
 
 **Interfaces:**
 - Produces (`dbHelpers.js`):
-  - `tableExists(db, name: string): boolean` (positive answers in a `WeakMap<db, Set<string>>`);
+  - `tableExists(db, name: string): boolean` (today's query; no cache, per the plan pre-flight ruling);
   - `tableHasColumn(db, table: string, column: string): boolean`;
   - `listTableColumns(db, table: string): string[]` (`[]` for a missing table);
   - `parseJson(value, fallback = null)` (`seed.js`'s rule: `''`/`null`/`undefined` → fallback;
@@ -293,9 +309,8 @@ Spec D7.
 
 ```js
 // db-helpers.test.js (in-memory better-sqlite3)
-test('tableExists asks again until a table exists, then remembers it', () => {
-  // tableExists(db, 't') === false; db.exec('CREATE TABLE t (a)'); tableExists(db, 't') === true
-  // counting wrapper { prepare: (sql) => { n += 1; return db.prepare(sql) } }: two positive calls -> n === 1
+test('tableExists follows the schema', () => {
+  // false; db.exec('CREATE TABLE t (a)') -> true; db.exec('DROP TABLE t') -> false
 })
 test('listTableColumns of a missing table is empty', () => { /* [] ; ['a'] after CREATE TABLE t (a) */ })
 test('tableHasColumn sees a column added later', () => { /* false; ALTER TABLE t ADD COLUMN b; true */ })
@@ -323,16 +338,17 @@ test('a URL-form match in another corpus follows the read rule', () => {
 ```
 
 - [ ] **Step 2: Run them and verify they fail.** Run
-  `cd backend && npx jest tests/db-helpers.test.js tests/identifiers.test.js tests/seed-state.test.js --runInBand`.
+  `cd backend && npm test -- tests/db-helpers.test.js tests/identifiers.test.js tests/seed-state.test.js --runInBand`.
   Expected FAIL: the two new modules do not exist; the URL-form candidate is `pending`.
 - [ ] **Step 3: Implement D7.** Create both modules; switch every importer; replace the eight
   `['pdf', 'search'].includes(x)` with `isSeedSourceType(x)`, keeping each site's trimming and
   lowercasing; in `pipeline-reads.test.js` import `tableExists` from `../src/dbHelpers.js`.
 - [ ] **Step 4: Verify.** The Step 2 command plus
-  `npx jest tests/pipeline-reads.test.js tests/seed-read-path.test.js tests/seed-candidates-route.test.js tests/graph.test.js tests/graph-access.test.js tests/corpus-list.test.js tests/search-run-failure.test.js --runInBand`
-  pass. `git grep -n "function tableExists" -- backend/src` prints only `dbHelpers.js`;
+  `npm test -- tests/pipeline-reads.test.js tests/seed-read-path.test.js tests/seed-candidates-route.test.js tests/graph.test.js tests/graph-access.test.js tests/corpus-list.test.js tests/search-run-failure.test.js --runInBand`
+  pass. From the worktree root after `git add -A backend`, `git grep -n "function tableExists" -- backend/src`
+  prints only `backend/src/dbHelpers.js`;
   `git grep -n "\['pdf', 'search'\]" -- backend/src` prints only `SEED_SOURCE_TYPES`.
-- [ ] **Step 5: Commit**: `backend: shared DB helpers and identifier rules; seed matching takes the works.openalex_id rule; positive table checks are remembered (BE-33, BE-34, BE-24)`
+- [ ] **Step 5: Commit**: `backend: shared DB helpers and identifier rules; seed matching takes the works.openalex_id rule; redundant table probes go (BE-33, BE-34 in part, BE-24)`
 
 ---
 
@@ -347,8 +363,9 @@ Spec D8 to D12. Runs after Task 3.
   - D9: the seven stub checks, plus new `sendStubExport`, `stubCorpusPage`, `stubGraphNode` next to
     `STUB_RESULTS` (`:270-660`);
   - D10: `serverErrorText`/`sendServerError` in `createApp`, the 35 regular sites, the upload
-    `details` (`:4455`), keyword preview (`:4915-4918`) and launch (`:4973-4979`), and the two
-    `listSeedSources` callers (`:5018`, `:5104`);
+    `details` (`:4455`), keyword preview (`:4915-4918`) and launch (`:4973-4979`), the two
+    `listSeedSources` callers (`:5018`, `:5104`), and the promotion's `expansion_error` and
+    `message` (`:5410-5446`);
   - D11: the ticket maps `:2824-2825`, prunes `:2864-2871`, `:2903-2910`, mints `:3828-3835`,
     `:5607-5614`;
   - D12: `:2219-2243`, `:2357-2366`, `:2388-2443`.
@@ -398,7 +415,17 @@ test('an unmapped keyword-search failure hides the diagnostic', async () => {
 })
 test('mapped keyword-search failures keep their text', async () => {
   // FAKE_STDERR 'OpenAlex rate limit exceeded. Retry after 5s.' -> editor 429 { error: 'OpenAlex rate limit exceeded. Retry after 5s.' }
-  // FAKE_STDERR 'ValueError: bad query' -> 400 { error: 'bad query' }
+  // FAKE_STDERR 'ValueError: bad query' -> 400 { error: 'bad query' } (today's mapping, kept; BE-56 parked)
+})
+test('a failed promotion expansion hides the diagnostic from an editor', async () => {
+  // fake Python branches on the script in argv: seed_promote.py answers a normal promotion summary, seed_expand.py
+  //   writes 'SECRET-DIAG' to stderr and exits 3; POST .../promote { candidateKeys: [...], promotionMode: 'new_seed',
+  //   includeDownstream: true, relatedDepthDownstream: 1 }
+  // editor: 200; body.expansion_error === 'Failed to build expansion seeds';
+  //   body.message contains 'Expansion seeds could not be built: Failed to build expansion seeds';
+  //   JSON.stringify(body) has no 'SECRET-DIAG'                                       // d4518a9: has it
+  // admin: expansion_error and message contain 'SECRET-DIAG'; body.promotion and body.jobs equal the editor's shape
+  // console.error got the full error
 })
 // search-run-failure.test.js — the dead-child harness (:117); its temp DB gains the search_results and ingest_entries
 // DDL of seed-candidates-route.test.js:55; every run is registered to the shared corpus; each read asserts 200 first
@@ -423,7 +450,7 @@ test('the upload expansion payload keeps its eight fields', async () => {
 ```
 
 - [ ] **Step 2: Run them and verify they fail.** Run
-  `cd backend && npx jest tests/download-tickets.test.js tests/server-errors.test.js tests/search-run-failure.test.js tests/corpus-sharing.test.js tests/recursion-args.test.js --runInBand`.
+  `cd backend && npm test -- tests/download-tickets.test.js tests/server-errors.test.js tests/search-run-failure.test.js tests/corpus-sharing.test.js tests/recursion-args.test.js --runInBand`.
   Expected FAIL: `downloadTickets.js` missing; the member and editor bodies carry `SECRET-DIAG`,
   the SQLite text, or the stored run text. Expected PASS already: the payload test, the mapped
   cases, the admin cases.
@@ -437,19 +464,22 @@ test('the upload expansion payload keeps its eight fields', async () => {
     when the mapped status is 500, else the mapped answer. The launch does the same with 500 and
     logs `console.error('[/api/keyword-search] Search script failed:', error)` (the object) before
     the `responded` check. Both `listSeedSources` callers pass
-    `runErrorDetail: isAdminUser(req.user, authConfig)`.
+    `runErrorDetail: isAdminUser(req.user, authConfig)`. The promotion sets
+    `expansionError = serverErrorText(req, error, 'Failed to build expansion seeds')` after logging
+    the full error, so `expansion_error` and `message` carry the same text; counts and jobs are
+    unchanged. Nothing else (stopped-import `result.error`, scraper errors) changes (BE-57).
   - D11: both stores from `createTicketStore()`; the middlewares use `store.get`/`store.revoke`;
     the mints answer `expires_in_seconds: store.ttlSeconds`.
   - D12: `buildExpansion`; the keyword path calls `buildExpansion(req.body, RECURSION_DEFAULTS.keyword)`;
     `buildUploadedDocsExpansion` per D12; delete `applyUploadedDocsExpansionArgs`.
 - [ ] **Step 4: Verify.** The Step 2 command plus
-  `npx jest tests/corpus.test.js tests/downloads.test.js tests/exports.test.js tests/graph.test.js tests/keyword-search.test.js tests/keyword-search-corpus.test.js tests/topic-search.test.js tests/scraper-draft.test.js tests/seed-read-path.test.js tests/access-revalidation.test.js tests/access-routes.test.js tests/auth.test.js tests/graph-access.test.js --runInBand`
-  pass. Then `npm test -- --maxWorkers=2`. These greps print nothing:
+  `npm test -- tests/corpus.test.js tests/downloads.test.js tests/exports.test.js tests/graph.test.js tests/keyword-search.test.js tests/keyword-search-corpus.test.js tests/topic-search.test.js tests/scraper-draft.test.js tests/seed-read-path.test.js tests/access-revalidation.test.js tests/access-routes.test.js tests/auth.test.js tests/graph-access.test.js --runInBand`
+  pass. Then `npm test -- --maxWorkers=2`. From the worktree root, these greps print nothing:
   - `git grep -n "new Database(DB_PATH, { readonly" -- backend/src`;
   - `git grep -n "applyUploadedDocsExpansionArgs\|normalizeGraphOpenAlexId\|safeJsonParse" -- backend/src`.
 
   And `git grep -n "RAG_FEEDER_STUB === '1'" -- backend/src/app.js` prints only `isStubMode`.
-- [ ] **Step 5: Commit**: `backend: file routes read through authDb; one stub check per handler; 500 details and failed-run errors for admins only; one ticket store; one expansion builder (BE-27, BE-28, BE-29, BE-30, BE-31)`
+- [ ] **Step 5: Commit**: `backend: file routes read through authDb; one stub check per handler; 500 details, failed-run and expansion errors for admins only; one ticket store; one expansion builder (BE-27, BE-28, BE-29, BE-30, BE-31)`
 
 ---
 
@@ -463,9 +493,11 @@ Spec D4. Runs after Tasks 2 and 4.
   - `/api/process_pdf` (`:4426-4466`);
   - `/api/extract-bibliography/:filename` (`:4470-4502`);
   - `/api/ingest/import-seed` (`:5955-5967`);
+  - multer's filename (`:4413-4419`): `crypto.randomUUID()` as the suffix;
   - the `bindSubmittedCorpus` comment (`:2961`).
 - Modify: `frontend/src/lib/api.js` (`importSeed` `:282`, `extractBibliography` `:291`),
-  `frontend/src/App.svelte` (`uploadItem` `:2721`, `extractForItem` `:2779-2800`).
+  `frontend/src/App.svelte` (`uploadStorageKey` `:758-762`, `persistStoredUploads` `:773-801`,
+  `uploadItem` `:2721`, `extractForItem` `:2779-2800`).
 - Test: new `backend/tests/staged-uploads.test.js`, `frontend/tests/seed-upload.spec.ts`.
 
 **Interfaces:**
@@ -473,7 +505,10 @@ Spec D4. Runs after Tasks 2 and 4.
   (existing).
 - Produces (in `createApp`): `ownsStagedUpload(req, filename: string): boolean`: `true` in stub
   mode and for the admin; else `true` only when
-  `SELECT 1 FROM staged_uploads WHERE filename = ? AND user_id = ?` finds a row.
+  `SELECT 1 FROM staged_uploads WHERE filename = ? AND user_id = ?` finds a row. It may throw; each
+  caller runs it inside its `try`.
+- Produces (`App.svelte`): `uploadStorageKey(): string` =
+  `` `rag-feeder:uploads:${authUser.id}:${corpusId}` `` (`''` without a signed-in user or corpus).
 - Produces (`api.js`): `importSeed(filename, kind, { corpusId } = {})`,
   `extractBibliography(filename, { corpusId } = {})`. Each sends `corpusId` in the JSON body only
   when `Number.isFinite(corpusId)`.
@@ -504,9 +539,20 @@ test('the import runs in the submitted corpus, with its write check', async () =
   // alice (saved corpus b) import F with corpusId a -> argv --corpus-id a; without corpusId -> b
   // corpusId viewed -> 403; foreign -> 403; 'x' -> 400 { error: 'Invalid corpusId' }; no extra argv lines
 })
-test('the extraction starts under the submitted corpus', async () => {
+test('the extraction starts under the submitted corpus, with its write check', async () => {
   // alice uploads P.pdf; POST /api/extract-bibliography/P.pdf { corpusId: a } -> 202
   // lines.some((l) => l.includes(`[extract-status][corpus=${ids.a}]`) && l.includes('started'))
+  // await a terminal line for that file (`[extract-status]…done`) before the argv log is reset or tmpDir removed
+  // corpusId viewed -> 403; foreign -> 403 (no extraction starts)
+})
+test('a failing ownership lookup answers the JSON fallback', async () => {
+  // as an editor: db.exec('ALTER TABLE staged_uploads RENAME TO staged_uploads_x') on a second handle; import and
+  // extraction -> 500 with content-type JSON and { error: 'Failed to import seed file' } /
+  //   { error: 'Failed to start bibliography extraction' }; no HTML; rename back in finally
+})
+test('staged names carry a UUID', async () => {
+  // alice uploads 'seed.json' -> filename matches /^[0-9a-f-]+-seed\.json$/ and its first 36 characters are a UUID
+  //   (check with a JS regex in the test, not grep)
 })
 ```
 
@@ -517,10 +563,14 @@ test('an import started before a saved switch keeps its corpus', async ({ page }
   // hold '/api/process_pdf'; set the BibTeX file; select '2' in .header-corpus-picker (its /me held)
   // release the upload; poll the import request: its JSON body has corpusId === 1           // d4518a9: no corpusId
 })
-test('an extraction clicked before the commit keeps its corpus and its late reply is dropped', async ({ page }) => {
-  // PDF row uploaded; '/api/extract-bibliography/…' held; select '2' (/me held); click Extract on the old row
-  // body corpusId === 1                                                                      // d4518a9: none
-  // reads = fetchStats('/api/auth/me').reads; release /me; afterBodyRead('/api/auth/me', reads) (commit)
+test('an extraction clicked before the commit keeps its corpus', async ({ page }) => {
+  // PDF row uploaded; select '2' (/me held); click Extract on the old row: body corpusId === 1    // d4518a9: none
+})
+test('a late extraction reply is dropped after the commit', async ({ page }) => {
+  // no body assertion here, so the late check runs on d4518a9 too
+  // PDF row uploaded; '/api/extract-bibliography/…' held; select '2'; the switch's own /me is identified as in
+  //   tab-resources.spec.ts:888-900: seq = __dtFetch.firstCallAfterRead('/api/corpora/2/select', '/api/auth/me');
+  //   click Extract on the old row; release that /me; afterBodyRead('/api/auth/me', reads) (commit)
   // eReads = fetchStats(<extract path>).reads; release the extraction with 202 { state: 'started' }; afterBodyRead(…, eReads)
   // expect(page.locator('.extract-progress')).toHaveCount(0)                                 // d4518a9: 1
 })
@@ -528,30 +578,43 @@ test('a late extraction failure does not clear the new corpus progress', async (
   // as above up to the commit; corpus 2 uploads its own PDF and clicks Extract (answered 202 at once): .extract-progress visible
   // release the old extraction with 500; afterBodyRead: .extract-progress still visible      // d4518a9: cleared
 })
+test("saved upload rows belong to their user and lose transient messages", async ({ page }) => {
+  // alice uploads a PDF in corpus 1 (row saved); log out; logIn bob (same corpus 1): alice's row is not shown  // d4518a9: shown
+  // localStorage 'rag-feeder:uploads:1' (legacy key) holding a row: not shown after reload
+  // alice: Extract held (row message 'Submitting extraction request...'); switch to 2 and back (commits confirmed):
+  //   the restored row does not contain 'Submitting extraction request...'                                    // d4518a9: it does
+})
 ```
 
 - [ ] **Step 2: Run them and verify they fail.** Run
-  `cd backend && npx jest tests/staged-uploads.test.js --runInBand` and
+  `cd backend && npm test -- tests/staged-uploads.test.js --runInBand` and
   `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/seed-upload.spec.ts --workers=1`.
-  Expected FAIL: bob's 200/202; alice's corpus argument is `b`; the extraction under `b`; the request
-  bodies carry no `corpusId`; the late progress shows, and the late failure clears it. Expected
-  PASS: the input-error test.
+  Expected FAIL: bob's 200/202; alice's corpus argument is `b`; the extraction under `b` and not
+  refused for `viewed`/`foreign`; the lookup test (no table check exists); the non-UUID name; the
+  request bodies carry no `corpusId`; the late progress shows, and the late failure clears it;
+  bob sees alice's row and the transient message is restored. Expected PASS: the input-error test.
 - [ ] **Step 3: Implement D4.**
   - Schema line in `ensureAuthSchema`.
-  - `/api/process_pdf`: after multer, `INSERT INTO staged_uploads (filename, user_id) VALUES (?, ?)`
-    with `req.file.filename` and `req.user.id`; on error, unlink the file and answer the route's
-    500.
+  - Multer's `filename` callback uses `` `${crypto.randomUUID()}-${safeOriginalName}` ``.
+  - `/api/process_pdf`: after multer, a plain `INSERT INTO staged_uploads (filename, user_id) VALUES (?, ?)`
+    (never `OR REPLACE` or an upsert) with `req.file.filename` and `req.user.id`; on error, answer
+    through `sendServerError` and leave the file in place.
   - Both routes: `requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess`. In each
     handler, after today's validation and before the existence checks:
     `if (!ownsStagedUpload(req, filename)) return res.status(404).json({ error: <route text> })`.
     The import uses the trimmed `filename`; the extraction uses `req.params.filename` after its
-    separator and `ensureInsideDirectory` checks.
+    separator and `ensureInsideDirectory` checks. Both calls sit inside a `try` whose `catch` is
+    `sendServerError(req, res, <route tag>, error, <route fallback>)`; the extraction's is in the
+    synchronous part, before `enqueueExtractionTask`.
+  - `uploadStorageKey()` per Interfaces; the old corpus-only key is neither read nor deleted.
+    `persistStoredUploads` saves `message: ''` when the row's status is `uploading`, `importing`,
+    `extracting` or `queued`.
   - Frontend: `uploadItem` passes `{ corpusId: currentCorpusId }` captured next to `session`/`scope`.
     `extractForItem` captures `corpusId`, `session`, `scope` and `stale()` at the click, returns on
     `stale()` right after the reply and first thing in its `catch`.
 - [ ] **Step 4: Verify.** The Step 2 commands pass. Also run
-  `npx jest tests/import-seed-route.test.js tests/keyword-search-corpus.test.js tests/extraction-models-route.test.js tests/logs-tail-reader.test.js --runInBand`
-  and `npx playwright test tests/seed-upload.spec.ts tests/dead-code.spec.ts --workers=1`, then
+  `npm test -- tests/import-seed-route.test.js tests/keyword-search-corpus.test.js tests/extraction-models-route.test.js tests/logs-tail-reader.test.js --runInBand`
+  and `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/seed-upload.spec.ts tests/dead-code.spec.ts --workers=1`, then
   `npx vite build`.
 - [ ] **Step 5: Commit**: `ingest: import and extraction take the submitted corpus and only the uploader's staged file; late extraction replies are dropped (FE-65b, FE-68)`
 
@@ -598,7 +661,8 @@ def test_the_membership_check_is_part_of_the_insert(...):
 def test_backfill_pass1_writes_every_row_of_a_shared_token(tmp_path, monkeypatch, capsys, backfill):
     # rows 1 openalex_id 'W1', 2 'https://openalex.org/W1' (matched); fake answers W1
     # both _topic_row -> topics set, topics_fetched 1; the recorded filter is 'openalex_id:W1' (W1 once)
-    # '1/1 processed, 2 resolved' style line: matched counts 2                       (d4518a9: one row unfetched)
+    # the log has '2/2 processed, 2 resolved' (progress counts rows; the token is requested once per batch;
+    # duplicate upstream results for one token keep last-wins)                         (d4518a9: one row unfetched)
 def test_backfill_pass2_writes_every_row_of_a_shared_doi_key(tmp_path, monkeypatch, capsys, backfill):
     # rows 1 doi '10.1000/abc', 2 '10.1000/ABC'; both written; filter lists the DOI once
 # test_scraper_lab.py
@@ -611,16 +675,18 @@ def test_a_pending_run_still_scrapes(tmp_path, monkeypatch):   # scrape_eurlex p
 def test_every_connection_is_closed(tmp_path, monkeypatch):
     # wrap sqlite3.connect in scraper_lab to record connections; after the completed-run return and after an unknown run id
     # (ValueError) every recorded connection is closed (a closed connection raises ProgrammingError on execute)
-# test_hygiene.py — a searcher with rate_limiter=_NoRateLimit(); its openalex_session.get replaced by a recorder that
-# answers one page: {"results": [{"id": "https://openalex.org/W99", ...}], "meta": {"next_cursor": None}}, status 200
+# test_hygiene.py — a searcher whose rate_limiter is _FreeLimiter() (it has remaining_block_seconds, which the request
+# wrapper calls; _NoRateLimit does not) and whose openalex_session is _RecordingSession([_citing_page("W99")]);
+# RAG_FEEDER_OPENALEX_QUOTA_PATH into tmp_path; (tmp_path / "out").mkdir() before the call
 def test_the_cli_fetches_citing_works_only_for_openalex_matches(tmp_path, monkeypatch):
     # input file: [ref_openalex, ref_crossref, ref_unmatched]; process_single_reference patched to return, in order:
     #   {"title": "A", "openalex_id": "https://openalex.org/W7", "cited_by_api_url": "https://api.openalex.org/works?filter=cites:W7"},
     #   {"title": "B", "openalex_id": None, "cited_by_api_url": "https://api.crossref.org/works/10.1/x"}, None
     # process_single_file(str(input), str(tmp_path / "out"), searcher)
     # out = json.loads(<written file>); len(out) == 3
-    # out[0]["citing_works_ids"] == [one work object with openalex_id "W99"]; out[1]["citing_works_ids"] == []
-    # out[2] == ref_unmatched; recorded URLs: exactly one, host api.openalex.org      (d4518a9: no request)
+    # out[0]["citing_works_ids"] == [one work object with openalex_id "https://openalex.org/W99"] (the fetcher keeps the
+    #   full id); out[1]["citing_works_ids"] == []
+    # out[2] == ref_unmatched; session.sent: exactly one URL, host api.openalex.org       (d4518a9: none sent)
 def test_the_cli_fetches_nothing_without_fetch_citations(tmp_path, monkeypatch):  # fetch_citations=False -> no request
 ```
 
@@ -633,8 +699,8 @@ def test_the_cli_fetches_nothing_without_fetch_citations(tmp_path, monkeypatch):
 - [ ] **Step 3: Implement D14–D17.**
   - D14: the `INSERT … SELECT … WHERE EXISTS … ON CONFLICT … DO UPDATE SET work_id = excluded.work_id, marked_at = CURRENT_TIMESTAMP`
     of the spec; the `NULL` branch and `COALESCE` go.
-  - D15: group by token; build the filter from `list(token_to_rows)`; one update per row with its
-    own raw value.
+  - D15: per batch, group by token; build the filter from `list(token_to_rows)` (once per batch);
+    one update per row with its own raw value; last upstream result per token wins, as today.
   - D16: an outer `try`/`finally: conn.close()` from right after `connect`; the completed-run
     return after the source check; the inner `try`/`except` (mark failed, raise) around the scrape
     only.
@@ -643,7 +709,8 @@ def test_the_cli_fetches_nothing_without_fetch_citations(tmp_path, monkeypatch):
     and call `fetch_citing_work_ids` as today.
 - [ ] **Step 4: Verify.** The Step 2 command passes; then
   `tests/test_schema_indexes.py tests/test_worker_watchdog.py tests/test_identifiers.py tests/test_openalex_partial.py`
-  (same runner) pass. `git grep -n "best_match_result" -- dl_lit_project/dl_lit` prints nothing.
+  (same runner) pass. From the worktree root, `git grep -n "best_match_result" -- dl_lit_project/dl_lit`
+  prints nothing.
 - [ ] **Step 5: Commit**: `python: seed marker checks membership in its insert; shared backfill tokens write every row; a completed scrape is not replayed; the CLI fetches citing works again (PY-55, PY-57, PY-58, PY-59)`
 
 ---

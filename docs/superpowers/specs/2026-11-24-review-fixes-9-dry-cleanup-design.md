@@ -1,8 +1,9 @@
 # Review fixes, phase 9: backend/frontend DRY cleanup plus the rows parked in phase 8 — design
 
 Date: 2026-11-24, revised the same day after pre-flights 1 to 5 (Codex,
-`.superpowers/sdd/2026-11-24-review-fixes-9-dry-cleanup/preflight.md` to `preflight-5.md`) and
-the controller's rulings on them. Branch `review-fixes-9` (worktree from master `d4518a9`).
+`.superpowers/sdd/2026-11-24-review-fixes-9-dry-cleanup/preflight.md` to `preflight-5.md`), and
+revised after the plan pre-flight (`plan-preflight.md`, rulings in `plan-preflight-rulings.md`),
+with the controller's rulings on all of them. Branch `review-fixes-9` (worktree from master `d4518a9`).
 Source: the reconciliation of the review inventory against `c574aba`
 (`/home/jay/DT/.worktrees/review-fixes-8/.superpowers/sdd/review-fixes-8-reconcile/{fe,be,py}.md`)
 and the section "Reconciliation against master `c574aba` (2026-11-24)" at the end of
@@ -75,7 +76,8 @@ The evidence for each row is in its decision; this list names the defect.
     column probes, two equivalent JSON parsers, two equivalent DOI normalizers, and two OpenAlex-id
     normalizers that disagree (`app.js:1528-1533` vs `seed.js:53-59`).
 16. **BE-34:** about 50 `tableExists` calls on request paths, mostly for tables `createApp` creates
-    at boot (`app.js:735-945`, `seed.js:607-645`).
+    at boot (`app.js:735-945`, `seed.js:607-645`), some of them redundant (`seed.js:137`). Phase 6
+    measured the probes in microseconds and deferred caching them.
 
 ### Python
 
@@ -97,7 +99,9 @@ The evidence for each row is in its decision; this list names the defect.
 - Import and extraction run in the corpus the user submitted from, with its write check, only on
   a file that user staged (the admin may use any), and a late reply never touches the next
   workspace.
-- A 500 answers a non-admin with the route's own text; the detail goes to the log and to admins.
+- A 500, an unmapped keyword-search failure, a failed run's `run.error` and a promotion's
+  expansion error answer a non-admin with a fixed text; the detail goes to the log and to admins.
+  Other diagnostic surfaces are out of scope (BE-57).
 - A sign-out never leaves the next user's corpus buttons disabled.
 - The graph's Corpus picker names the graph on screen.
 - A seed marker exists only while its work is in the corpus.
@@ -119,6 +123,14 @@ The evidence for each row is in its decision; this list names the defect.
     clock step remains;
   - FE-17 remainder (lazy-load `UpstreamBrowser`): needs a `bind:`-props refactor, worth it only
     for a smaller main chunk.
+- New rows, parked (plan pre-flight, controller ruling):
+  - BE-56: `keywordSearchErrorResponse` maps any `ValueError:` line of the child's output to a
+    public 400 with the rest of the line; pre-existing, and tightening it needs an audit of every
+    intended validation message;
+  - BE-57: other places that hand child or stored diagnostics to members, such as stopped import
+    summaries (`result.error`) and stored scraper errors, stay as they are.
+- BE-34's positive `tableExists` cache is deferred, as phase 6 decided; D7 keeps the shared helper
+  and drops the redundant probes.
 - No stub router (D9); the 21 `isStubMode()` checks in the middleware stay.
 - No renaming of staged files (D4).
 - `corpusList.js`'s `parseJson` (`{ ok, value }`, which tells a JSON `null` from a parse failure)
@@ -195,12 +207,25 @@ The evidence for each row is in its decision; this list names the defect.
 - **Storage.** Nothing records an upload today (`ingest_entries` and `ingest_source_metadata` are
   written later, keyed by corpus). `ensureAuthSchema` gets
   `CREATE TABLE IF NOT EXISTS staged_uploads (filename TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP)`.
-  `/api/process_pdf` inserts `(req.file.filename, req.user.id)` after multer stored the file; if
-  the insert fails it removes the file and answers its 500. Rejected: an in-memory map (a restart
-  or deploy would refuse every staged file, while the upload rows come back from `localStorage`);
-  crypto-random names (they bind nothing, since members see the names anyway). Accepted: files
-  staged before the deploy answer 404 once and are uploaded again; rows are never pruned, like
-  the staged files.
+  Rejected: an in-memory map (a restart or deploy would refuse every staged file, while the
+  upload rows come back from `localStorage`). Accepted: files staged before the deploy answer 404
+  once and are uploaded again; rows are never pruned, like the staged files.
+- **Unique names (plan pre-flight, controller ruling).** Multer's suffix
+  `Date.now() + '-' + Math.round(Math.random() * 1E9)` (`app.js:4414`) becomes
+  `crypto.randomUUID()`, so the name is `<uuid>-<original name>`: unique by construction, and the
+  extracted-page directories keyed by the name's stem (`app.js:4485`) inherit that. The UUID does
+  not bind the file to its uploader (members see the names); the table does. `/api/process_pdf`
+  runs a plain `INSERT INTO staged_uploads (filename, user_id) VALUES (?, ?)` after multer stored
+  the file, never `OR REPLACE` or an upsert, so a collision fails instead of moving ownership. On
+  that failure the route answers through `sendServerError` and does not delete the file. No
+  forced-collision test: a UUID collision is not a realistic input (accepted cost: a theoretical
+  overwrite).
+- **Lookup errors (plan pre-flight).** `ownsStagedUpload` runs inside each route's `try`, before
+  any Python call, so a throwing lookup answers through `sendServerError` (the member gets the
+  route's JSON fallback, never Express's HTML page). For the extraction that is the synchronous
+  part of the handler, before `enqueueExtractionTask`. The fallbacks are the import's existing
+  `Failed to import seed file` and, for the extraction (which has no 500 handler today),
+  `Failed to start bibliography extraction`.
 - **Frontend.** `importSeed(filename, kind, { corpusId } = {})` and
   `extractBibliography(filename, { corpusId } = {})` send `{ corpusId }` when it is a number.
   `uploadItem` takes `const corpusId = currentCorpusId` beside its `session`/`scope` capture.
@@ -208,6 +233,14 @@ The evidence for each row is in its decision; this list names the defect.
   and `stale()` at the click (pre-flight 2). After the reply, `if (stale()) return` before any
   `updateUpload`, `ensureExtractionRunActive` or `apiStatus`; its `catch` returns on `stale()`
   before `finishExtractionProgress`. Phase 8's drop of an import after a committed switch stays.
+- **Saved upload rows (plan pre-flight, controller ruling).** `uploadStorageKey()`
+  (`App.svelte:758-762`) becomes `rag-feeder:uploads:<user id>:<corpus id>` (empty without a
+  signed-in user), so a second user of the browser never sees the first user's rows and their
+  Extract action. The old corpus-only key is ignored, neither read nor deleted: rows saved before
+  the deploy disappear from the list; their files can be uploaded again. `persistStoredUploads`
+  saves `message: ''` for a row in a transient state (`uploading`, `importing`, `extracting`,
+  `queued`), so a restored row never shows `Submitting extraction request...`; final messages
+  (`failed`, `uploaded`) are kept.
 - Tests:
   - new `backend/tests/staged-uploads.test.js`, with the roles, corpora and argv-logging fake Python
     of `keyword-search-corpus.test.js` and a temp `RAG_FEEDER_UPLOADS_DIR`. Alice is an editor of
@@ -225,18 +258,30 @@ The evidence for each row is in its decision; this list names the defect.
       `'x'` answers 400, with no Python call;
     - alice's extraction with `corpusId: a` while her saved corpus is `b` starts under `a` (the
       `[extract-status][corpus=a]` line through the `broadcast` the test passes to `createApp`);
+      `viewed` and `foreign` answer 403 on the extraction too. A test that starts an extraction
+      waits for its terminal `[extract-status]… done` line before the argv log is reset or the
+      temp directory removed;
+    - a throwing ownership lookup (the `staged_uploads` table renamed under the app) answers the
+      member `500` with the route's JSON fallback on both routes, not an HTML page;
+    - a staged name has the form `<uuid>-<original name>`;
   - `seed-upload.spec.ts`, corpora 1 and 2:
     - import gap: hold `/api/process_pdf`; select corpus 2 with its `/me` held; release the upload:
       the import body carries `corpusId: 1` (on `d4518a9`: none);
-    - extraction gap: select corpus 2 with `/me` held; click Extract on the old row: the body
-      carries `corpusId: 1` (on `d4518a9`: none). The extraction reply is held too;
-    - late success: release `/me` (the switch commits), then the held extraction `202 started`, and
-      pass `afterBodyRead`: no `.extract-progress` in the new workspace (on `d4518a9` the progress
-      card shows; no `extracting` tag appears there, because `updateUpload` only patches an
-      existing row with the old id and the two corpora's uploads differ);
+    - extraction body (its own test): select corpus 2 with `/me` held; click Extract on the old
+      row: the body carries `corpusId: 1` (on `d4518a9`: none);
+    - late success (its own test, no body assertion, so it reaches its check on `d4518a9`): the
+      switch's own `/me` is identified with the fetch-sequence pattern
+      (`__dtFetch.firstCallAfterRead`, as in `tab-resources.spec.ts:888-900`) and its release is
+      confirmed by `afterBodyRead`; then the held extraction answers `202 started`, and after
+      `afterBodyRead` there is no `.extract-progress` in the new workspace (on `d4518a9` the
+      progress card shows; no `extracting` tag appears, because `updateUpload` only patches an
+      existing row with the old id);
     - late failure: as above, but corpus 2 starts its own extraction (answered at once, its
       `.extract-progress` visible) before the old reply is released with `500`: the progress is
-      still visible (on `d4518a9` it is cleared).
+      still visible (on `d4518a9` it is cleared);
+    - saved rows: alice's staged row is not shown to bob on the same browser and corpus; a row
+      saved under the legacy key `rag-feeder:uploads:1` is not shown; a row saved mid-extraction
+      comes back after a switch away and back without `Submitting extraction request...`.
 
 **D5. The corpus button locks are the session's (FE-66).**
 - As phase 8 did for `exportBusy`: `handleCreateCorpus` and `handleDeleteCorpus` clear their flag
@@ -267,12 +312,11 @@ The evidence for each row is in its decision; this list names the defect.
 
 ### Backend
 
-**D7. Shared DB helpers and one identifier rule (BE-33, BE-34, BE-24), controller call.**
+**D7. Shared DB helpers and one identifier rule (BE-33, BE-34 in part, BE-24), controller call.**
 - New `backend/src/dbHelpers.js`:
-  - `tableExists(db, name)`: a positive answer is remembered per handle
-    (`WeakMap<Database, Set<string>>`); a negative one is asked again, because the Python side
-    creates `search_runs`, `search_results`, `ingest_entries`, `work_aliases` and `citation_edges`
-    after boot;
+  - `tableExists(db, name)`: today's query, not cached (plan pre-flight, controller ruling: the
+    probes cost microseconds, phase 6 deferred a cache, and a cache would answer stale for a table
+    dropped at run time);
   - `tableHasColumn(db, table, column)` and `listTableColumns(db, table)` (`[]` for a missing
     table), not remembered, because scripts add columns at run time;
   - `parseJson(value, fallback = null)` with `seed.js`'s rule; for the strings and `NULL`s
@@ -280,9 +324,6 @@ The evidence for each row is in its decision; this list names the defect.
 - `app.js`, `seed.js`, `pipelineReads.js` and `corpusList.js` import these; their copies go
   (`hasColumn` becomes `tableHasColumn`; the redundant second check in `loadMatchRows`,
   `seed.js:137`, goes). `pipeline-reads.test.js` imports `tableExists` from the new module.
-- Accepted residual (BE-34): a table dropped under a running backend counts as present until
-  restart, so a query answers 500 instead of an empty result. Nothing in `backend/src`,
-  `backend/scripts` or `dl_lit` drops a table; `search-run-failure.test.js:240` expects the failure.
 - New `backend/src/identifiers.js`: `normalizeDoi` is `seed.js`'s (the graph copy agrees for every
   input); `normalizeOpenAlexId` takes the graph rule (the first `W\d+`, uppercased, else `null`),
   which is the Python `works.openalex_id` rule (`identifiers.py:84-92`).
@@ -301,8 +342,8 @@ The evidence for each row is in its decision; this list names the defect.
 - `seed.js` exports `isSeedSourceType(value)` (`SEED_SOURCE_TYPES = new Set(['pdf', 'search'])`);
   the eight sites use it and keep their own trimming and lowercasing.
 - Tests:
-  - new `db-helpers.test.js`: `tableExists` is `false`, then `true` after `CREATE TABLE`; a second
-    positive call does not `prepare` (a counting wrapper); `listTableColumns` of a missing table is
+  - new `db-helpers.test.js`: `tableExists` is `false`, then `true` after `CREATE TABLE`, then
+    `false` after `DROP TABLE`; `listTableColumns` of a missing table is
     `[]`; `parseJson` of `null`, `''`, `'{"a":1}'`, `'null'`, `'{bad'`;
   - new `identifiers.test.js`: `normalizeOpenAlexId` of `'W12'`, `'w12'`,
     `'https://openalex.org/W12'`, `'https://api.openalex.org/works/W12'`, `'A123'`, `''`, `null`
@@ -342,9 +383,13 @@ The evidence for each row is in its decision; this list names the defect.
 - The rule is the log tail's (`app.js:6377-6379`). For the admin, `error?.message` wins: the 16
   `error.message` copies differ only when a non-object is thrown, where today the `catch` itself
   throws and Express 5 answers its default HTML 500.
+- **Scope (plan pre-flight, controller ruling).** D10 covers the 500 bodies, the unmapped
+  keyword-search failures, a failed run's `run.error` and the promotion's expansion fields, and
+  nothing else: the stopped-import summary and stored scraper errors are BE-57, and the
+  `ValueError:` mapping is BE-56 (both parked).
 - **Keyword search (pre-flight 2).** The mapped answers of `keywordSearchErrorResponse`
-  (`app.js:2278-2286`) stay for everyone: 429 with the rate-limit text, 400 with the query-syntax
-  text. Only the unmapped case changes: the preview keeps its `502` and the launch its `500`, with
+  (`app.js:2278-2286`) stay for everyone, as today: 429 with the rate-limit text, 400 with the
+  `QuerySyntaxError:`/`ValueError:` text (BE-56). Only the unmapped case changes: the preview keeps its `502` and the launch its `500`, with
   body `serverErrorText(req, error, 'Keyword search failed')`. Each route logs the full error once:
   the preview's `console.error` already does; the launch's `Search script failed:` line logs the
   error object instead of `error?.message`, also when the response was already sent.
@@ -361,8 +406,14 @@ The evidence for each row is in its decision; this list names the defect.
   changes and no migration: old rows fall under the same rule. `finalizeDeadSearchRun` and its
   test (`search-run-failure.test.js:212-223`, which expects `search process exited (boom)`) stay
   as they are; the full error stays in the launch's log line.
-- User-visible: a non-admin hitting a 500 on the 35 routes, or an unmapped keyword-search failure,
-  reads the route's fallback (`Failed to export corpus data`, `Keyword search failed`, …) instead of
+- **Promotion expansion (plan pre-flight, controller ruling).** When a promotion builds expansion
+  seeds and that fails (`app.js:5410-5446`), the successful response carries the child text in
+  `expansion_error` and inside `message` (` Expansion seeds could not be built: <error>`). Both use
+  `serverErrorText(req, error, 'Failed to build expansion seeds')` (the existing fallback text);
+  the full error stays in the route's log. `success`, `jobs`, `promotion`, `expansion_seeds` and the
+  counts are unchanged.
+- User-visible: a non-admin hitting a 500 on the 35 routes, an unmapped keyword-search failure or a
+  failed expansion reads the route's fallback (`Failed to export corpus data`, `Keyword search failed`, …) instead of
   SQLite text, paths or Python output. Stub mode's user is not the admin and gets the fallback.
   Admins see no change. Tags, fallbacks and status codes stay.
 - The other irregular sites keep their shape: sign-in (`:3389`, `:3420`, fixed text), invitations
@@ -380,7 +431,13 @@ The evidence for each row is in its decision; this list names the defect.
       any `run_created` line): the editor gets `502` and `500` with `{ error: 'Keyword search failed' }`,
       the admin the detail, and the log the full error for each;
     - mapped cases stay for the editor: stderr `OpenAlex rate limit exceeded. Retry after 5s.`
-      answers 429 with that text, `ValueError: bad query` answers 400 `bad query`;
+      answers 429 with that text, `ValueError: bad query` answers 400 `bad query` (BE-56);
+    - promotion with expansion (`promotionMode: 'new_seed'`, downstream depth 1) whose expansion
+      child fails with `SECRET-DIAG`: the editor's `200` body has
+      `expansion_error === 'Failed to build expansion seeds'` and a `message` containing
+      `Expansion seeds could not be built: Failed to build expansion seeds`, with no `SECRET-DIAG`
+      anywhere; the admin's has the detail in both; `promotion` counts and `jobs` are the same for
+      both;
     - failed runs in the seed list (pre-flight 4), in `search-run-failure.test.js` with its
       dead-child harness (`:117`), whose temporary DB gains the minimal `search_results` and
       `ingest_entries` schemas from `seed-candidates-route.test.js:55` (pre-flight 5; every run is
@@ -446,13 +503,14 @@ both and for the test loader (`test_doi_rule_scripts.py:14-25`).
   separate `SELECT` on `corpus_works` precedes it.
 
 **D15. Every row of a shared token is written (PY-57).**
-- `run_pass` builds `token_to_rows: dict[str, list[tuple[int, str]]]` and requests each token once
-  (the filter is built from `list(token_to_rows)`, whose keys are already unique and in
-  insertion order). Every row of a returned token gets an update with its own raw
+- `run_pass` builds `token_to_rows: dict[str, list[tuple[int, str]]]` per batch and requests each
+  token once per batch (the filter is built from `list(token_to_rows)`, whose keys are unique and
+  in insertion order). Duplicate upstream results for one token keep today's rule: the last one
+  wins. Progress still counts rows. Every row of a returned token gets an update with its own raw
   value, so phase 8's write guard still checks each row against what it was read with.
 - Tests, `test_doi_rule_scripts.py` with `_fake_openalex`: pass 1 rows `W1` and
   `https://openalex.org/W1` both get topics and `topics_fetched = 1`, the filter lists `W1` once,
-  `matched` counts 2; pass 2 rows `10.1000/abc` and `10.1000/ABC` the same. On `d4518a9` one row of
+  and the log says `2/2 processed, 2 resolved`; pass 2 rows `10.1000/abc` and `10.1000/ABC` the same. On `d4518a9` one row of
   each pair stays unfetched.
 
 **D16. A completed scraper run is not scraped again (PY-58), controller call.**
@@ -486,13 +544,15 @@ ruling.**
   `OpenAlexScraper.py:171`; `max_citations` 100, one page). Under the measured rule
   (`dl_lit/keyword_search.py:191-194`: 1 credit a filter page, 10 a text search) that is about
   1 credit per eligible lookup, at most about 60 for a 60-entry bibliography.
-- Tests, `test_hygiene.py`: one file with an OpenAlex match (`openalex_id: 'https://openalex.org/W7'`
+- Tests, `test_hygiene.py` (plan pre-flight: `_FreeLimiter`, `_RecordingSession` and
+  `_citing_page("W99")`, the output directory created first): one file with an OpenAlex match (`openalex_id: 'https://openalex.org/W7'`
   and an OpenAlex `cited_by_api_url`), a Crossref match (an `api.crossref.org` URL, no OpenAlex id)
   and an unmatched reference (`None`). The HTTP layer is mocked (the searcher's
   `openalex_session.get` records each URL and answers one page with one citing work), so the real
   `fetch_citing_work_ids` and its Crossref guard run (pre-flight 3). The output holds all three
   references, read back from the written JSON; the OpenAlex match has `citing_works_ids` equal to
-  one work object with the mocked `openalex_id`; the Crossref match has `citing_works_ids == []`
+  one work object whose `openalex_id` is `https://openalex.org/W99` (the fetcher keeps the full
+  id); the Crossref match has `citing_works_ids == []`
   (the CLI calls the fetch, and the guard returns before any request; `FetchResult.complete` is
   not serialized); the
   unmatched one is the original reference, unchanged. Exactly one HTTP request ran, to `api.openalex.org`. With
@@ -540,7 +600,8 @@ FE-68 there, and records the phase 9 outcome for the other rows.
   unchanged) passes once at the end with
   `E2E_FRONTEND_PORT=5190 npx playwright test <specs> --workers=1` (check that 5190 is free, e.g.
   `ss -ltn`). Never 5175, the dev container serving master. No live spec.
-- Greps, each finding only what is named:
+- Greps, run from the worktree root after `git add -A` (so new files count), each finding only
+  what is named:
   - `git grep -n "createElement('a')" -- frontend/src`: `lib/download.js`;
   - `git grep -n "RAG_FEEDER_STUB === '1'" -- backend/src/app.js`: `isStubMode`;
   - `git grep -n "new Database(DB_PATH, { readonly" -- backend/src`: nothing;
@@ -555,14 +616,16 @@ FE-68 there, and records the phase 9 outcome for the other rows.
 
 - **D2 (FE-16), call:** both helpers set `noopener` and always revoke; no visible change.
 - **D4 (FE-65b, FE-68), call:** corpus check, then input validation, then a DB-recorded uploader
-  check (404; admin exempt); late extraction replies dropped; pre-deploy staged files need one
-  re-upload.
+  check (404; admin exempt; lookup errors through `sendServerError`); UUID staged names with a
+  plain insert (ruling); saved rows keyed by user and corpus, legacy rows dropped (ruling); late
+  extraction replies dropped; pre-deploy staged files need one re-upload.
 - **D6 (FE-67), call:** the picker rolls back before publish and keeps the error through recolours.
 - **D7 (BE-33/34), call:** seed matching takes the workers' OpenAlex rule (URL ids now match, which
-  can show `downloaded_elsewhere` for readable works); positive `tableExists` answers remembered.
+  can show `downloaded_elsewhere` for readable works); no `tableExists` cache (ruling, deferred).
 - **D9 (BE-28), call:** no stub router; one `isStubMode()` line per handler.
-- **D10 (BE-29), ruling:** non-admins get the route's fallback on 500s and unmapped keyword-search
-  failures; admins keep the detail; the log always has it; mapped 400/429 unchanged.
+- **D10 (BE-29), ruling:** non-admins get the route's fallback on 500s, unmapped keyword-search
+  failures, failed runs and promotion expansion errors; admins keep the detail; the log always has
+  it; mapped 400/429 unchanged. BE-56 and BE-57 parked (ruling).
 - **D13 (PY-32), ruling:** closed, won't fix.
 - **D14 (PY-55), call:** the marker insert checks membership in the same statement; races before the
   fix leave their markers.
