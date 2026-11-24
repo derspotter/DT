@@ -6,7 +6,8 @@
 // the script prints. Filtering, counting, sorting and paging happen in SQL;
 // labels are computed in JS for the returned page only, except for the `seed`
 // sort, whose key is the label itself.
-import { tableExists, readWorkStateCounts, bucketCounts, corpusIsSmall, memoised, noteCommittedState, SMALL_CORPUS_LIMIT } from './pipelineReads.js'
+import { tableExists } from './dbHelpers.js'
+import { readWorkStateCounts, bucketCounts, corpusIsSmall, memoised, noteCommittedState, SMALL_CORPUS_LIMIT } from './pipelineReads.js'
 
 export const CORPUS_SORT_KEYS = ['title', 'authors', 'year', 'added', 'source', 'seed', 'metadata', 'download']
 

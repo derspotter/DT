@@ -3,7 +3,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { readIngestStats, readWorkStateCounts, workStatus, bucketCounts, resetWorkStateMemo, listDownloads, listIngestRuns, tableExists, corpusIsSmall, SMALL_CORPUS_LIMIT } from '../src/pipelineReads.js'
+import { readIngestStats, readWorkStateCounts, workStatus, bucketCounts, resetWorkStateMemo, listDownloads, listIngestRuns, corpusIsSmall, SMALL_CORPUS_LIMIT } from '../src/pipelineReads.js'
+import { tableExists } from '../src/dbHelpers.js'
 
 let db
 beforeEach(() => {

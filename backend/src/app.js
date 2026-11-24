@@ -15,6 +15,8 @@ import jwt from 'jsonwebtoken';
 import nodemailer from 'nodemailer';
 import { bucketCounts, listDownloads, listIngestRuns, readIngestStats, readWorkStateCounts, workStatus } from './pipelineReads.js';
 import { listCorpus, corpusStageStatuses } from './corpusList.js';
+import { tableExists, listTableColumns, parseJson } from './dbHelpers.js';
+import { normalizeDoi, normalizeOpenAlexId } from './identifiers.js';
 import { createPythonRunner } from './pythonProcess.js';
 import { tokenMailContent } from './authMail.js';
 import { getPasswordHasher } from './passwordHasher.js';
@@ -32,6 +34,7 @@ import {
   resolveSeedDocumentPath,
   createStateResolver,
   findSeedCandidateDownloads,
+  isSeedSourceType,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -336,11 +339,6 @@ const STUB_RESULTS = {
   },
 };
 
-function tableExists(db, tableName) {
-  const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName);
-  return Boolean(row);
-}
-
 function ensureColumn(db, tableName, columnName, columnType) {
   const columns = db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name);
   if (!columns.includes(columnName)) {
@@ -356,11 +354,6 @@ function tableRowCount(db, tableName) {
   } catch {
     return 0;
   }
-}
-
-function listTableColumns(db, tableName) {
-  if (!tableExists(db, tableName)) return [];
-  return db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => String(row.name || ''));
 }
 
 export function buildGraph3dRequest(req) {
@@ -1324,14 +1317,6 @@ async function countBibEntriesInFile(filePath, stats) {
   return read;
 }
 
-function safeJsonParse(value, fallback = null) {
-  try {
-    return JSON.parse(String(value || ''));
-  } catch {
-    return fallback;
-  }
-}
-
 function parseBibtexKeys(content) {
   const keys = new Set();
   const regex = /@[A-Za-z]+\s*\{\s*([^,\s]+)\s*,/g;
@@ -1418,7 +1403,7 @@ function mapScraperRunRow(row) {
   return {
     id: Number(row.id),
     source_type: row.source_type,
-    query: safeJsonParse(row.query_json, {}),
+    query: parseJson(row.query_json, {}),
     status: row.status,
     requested_by_user_id: row.requested_by_user_id == null ? null : Number(row.requested_by_user_id),
     total_count: Number(row.total_count || 0),
@@ -1444,7 +1429,7 @@ function mapScraperArtifactRow(row) {
     download_url: row.download_url || '',
     local_artifact_path: row.local_artifact_path || '',
     file_name: row.file_name || '',
-    raw_metadata: safeJsonParse(row.raw_metadata_json, {}),
+    raw_metadata: parseJson(row.raw_metadata_json, {}),
     bibtex_key: row.bibtex_key || '',
     bibtex_entry: row.bibtex_entry || '',
     metadata_completeness: row.metadata_completeness || '',
@@ -1525,22 +1510,8 @@ async function listKantroposCorporaOverview(db, { targetId } = {}) {
   }));
 }
 
-function normalizeGraphOpenAlexId(value) {
-  const text = String(value || '').trim();
-  if (!text) return null;
-  const match = text.match(/(W\d+)/i);
-  return match ? match[1].toUpperCase() : null;
-}
-
-function normalizeGraphDoi(value) {
-  const text = String(value || '').trim();
-  if (!text) return null;
-  const match = text.match(/(10\.\d{4,9}\/[-._;()/:A-Z0-9]+)/i);
-  return (match ? match[1] : text).toUpperCase();
-}
-
 function graphNodeIdFromWorkRow(data) {
-  return normalizeGraphOpenAlexId(data?.openalex_id) || normalizeGraphDoi(data?.doi) || `work:${Number(data?.id)}`;
+  return normalizeOpenAlexId(data?.openalex_id) || normalizeDoi(data?.doi) || `work:${Number(data?.id)}`;
 }
 
 function mapWorkRowToBrowserItem(data, extra = {}) {
@@ -1648,7 +1619,7 @@ function buildKantroposGraphPayload(db, currentItems = [], pendingItems = []) {
     let sourceId = null;
     if (sourceWorkId !== null && sourceWorkId !== undefined && sourceWorkId !== '') {
       sourceId = workIdToNodeId.get(Number(sourceWorkId)) || workIdToNodeId.get(String(sourceWorkId));
-      sourceId = sourceId || normalizeGraphOpenAlexId(sourceWorkId) || normalizeGraphDoi(sourceWorkId);
+      sourceId = sourceId || normalizeOpenAlexId(sourceWorkId) || normalizeDoi(sourceWorkId);
     }
     addEdge(sourceId, targetId, node.relationship_type || 'references');
   }
@@ -5058,7 +5029,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     try {
       const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.params?.sourceKey || '').trim();
-      if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+      if (!isSeedSourceType(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
       // One resolver for both calls: building it is the expensive part. It
@@ -5132,7 +5103,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.params?.sourceKey || '').trim();
       const candidateKey = String(req.params?.candidateKey || '').trim();
-      if (!['pdf', 'search'].includes(sourceType) || !sourceKey || !candidateKey) {
+      if (!isSeedSourceType(sourceType) || !sourceKey || !candidateKey) {
         return res.status(400).json({ error: 'Invalid seed candidate' });
       }
 
@@ -5195,7 +5166,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
   app.post('/api/seed/sources/:sourceType/:sourceKey/promote', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
     const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
     const sourceKey = String(req.params?.sourceKey || '').trim();
-    if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+    if (!isSeedSourceType(sourceType) || !sourceKey) {
       return res.status(400).json({ error: 'Invalid seed source' });
     }
 
@@ -5457,7 +5428,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     try {
       const sourceType = String(req.body?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.body?.sourceKey || '').trim();
-      if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+      if (!isSeedSourceType(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
       if (req.body?.all === true) {
@@ -5481,7 +5452,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     try {
       const sourceType = String(req.params?.sourceType || '').trim().toLowerCase();
       const sourceKey = String(req.params?.sourceKey || '').trim();
-      if (!['pdf', 'search'].includes(sourceType) || !sourceKey) {
+      if (!isSeedSourceType(sourceType) || !sourceKey) {
         return res.status(400).json({ error: 'Invalid seed source' });
       }
       const removed = hideSeedSource(authDb, req.corpusId, sourceType, sourceKey);
