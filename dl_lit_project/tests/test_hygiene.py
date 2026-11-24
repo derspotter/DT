@@ -243,6 +243,12 @@ def _citing_page(work_id, next_page=None):
     "http://api.openalex.org/works?filter=cites:W1",  # not https
     "https://api.openalex.org.evil.example/works?filter=cites:W1",
     "https://evil.example/api.openalex.org/works?filter=cites:W1",
+    # parser differentials: urllib3 ends the authority at a backslash, urlsplit does not
+    "https://evil.example\\@api.openalex.org/works?filter=cites:W1",
+    "https://api.openalex.org\\@evil.example/works?filter=cites:W1",
+    "https://user@api.openalex.org/works?filter=cites:W1",  # userinfo
+    "https://api.openalex.org:8443/works?filter=cites:W1",  # another port
+    "https://api.openalex.org/works?filter=cites:W1 https://evil.example/",  # whitespace
 ])
 def test_a_non_openalex_citing_url_is_never_sent_the_key(keyed_env, capsys, url):
     from dl_lit import OpenAlexScraper
@@ -827,3 +833,14 @@ def test_a_resolved_identifier_owned_by_another_row_links_to_that_row(tmp_path, 
     corpora = db.conn.execute("SELECT corpus_id, work_id FROM corpus_works ORDER BY corpus_id, work_id").fetchall()
     assert corpora == [(1, a_id), (1, c_id), (2, a_id)]
     assert db.get_entry_by_id("works", c_id)["normalized_doi"] == db._normalize_doi("10.1/c")
+
+
+def test_an_openalex_citing_url_is_requested_on_the_fixed_base(keyed_env):
+    from dl_lit import OpenAlexScraper
+
+    session = _RecordingSession([_citing_page("W5")])
+    OpenAlexScraper.fetch_citing_work_ids(
+        "HTTPS://API.OPENALEX.ORG:443/works?filter=cites:W1#frag", _FreeLimiter(), session=session, api_key="sekret-c"
+    )
+    assert len(session.sent) == 1
+    assert session.sent[0].startswith("https://api.openalex.org/works?filter=cites:W1&")

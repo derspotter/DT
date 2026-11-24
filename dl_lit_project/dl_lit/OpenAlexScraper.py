@@ -78,17 +78,33 @@ def convert_inverted_index_to_text(inverted_index):
     """Like :func:`dl_lit.identifiers.inverted_index_to_text`, but ``""`` for empty input."""
     return inverted_index_to_text(inverted_index) or ""
 
-def _is_openalex_api_url(url) -> bool:
-    """True for an https URL on api.openalex.org, the only host the key and mailto go to.
+_OPENALEX_API_BASE = "https://api.openalex.org"
+_OPENALEX_API_NETLOCS = {"api.openalex.org", "api.openalex.org:443"}
 
-    A stored ``cited_by_api_url`` or a ``next_page`` is upstream data: the Crossref mapping, for
-    one, stores an api.crossref.org URL there.
+
+def _openalex_api_url(url) -> str | None:
+    """The URL rebuilt on ``https://api.openalex.org``, or None when it is not an OpenAlex API URL.
+
+    The key and mailto go to that host only. A stored ``cited_by_api_url`` or a ``next_page``
+    is upstream data (the Crossref mapping, for one, stores an api.crossref.org URL there), so
+    the authority must be exactly ``api.openalex.org`` (no userinfo, no other port) and no
+    backslash, whitespace or control character may appear, which different URL parsers split
+    differently. The request then uses the fixed base with only the parsed path and query, never
+    the supplied authority.
     """
+    text = str(url)
+    if any(ch == "\\" or ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
     try:
-        parts = urlsplit(str(url))
-        return parts.scheme == "https" and parts.hostname == "api.openalex.org" and parts.port in (None, 443)
-    except ValueError:  # a malformed port or netloc
-        return False
+        parts = urlsplit(text)
+    except ValueError:  # a malformed netloc
+        return None
+    if parts.scheme.lower() != "https" or parts.netloc.lower() not in _OPENALEX_API_NETLOCS:
+        return None
+    path = parts.path or "/"
+    if not path.startswith("/"):
+        return None
+    return f"{_OPENALEX_API_BASE}{path}" + (f"?{parts.query}" if parts.query else "")
 
 
 def _not_openalex_message(url) -> str:
@@ -119,7 +135,8 @@ def fetch_citing_work_ids(
         return FetchResult()
 
     citing_work_ids = FetchResult()
-    if not _is_openalex_api_url(cited_by_url):
+    openalex_url = _openalex_api_url(cited_by_url)
+    if openalex_url is None:
         # Never send the OpenAlex key (or the OpenAlex client's quota accounting) elsewhere;
         # such a URL holds no OpenAlex citing list to read anyway.
         _mark_incomplete(citing_work_ids, _not_openalex_message(cited_by_url))
@@ -129,7 +146,7 @@ def fetch_citing_work_ids(
     select_fields = "id,title,display_name,authorships,publication_year,doi,type"
     if include_links:
         select_fields += ",referenced_works,cited_by_api_url"
-    url = f"{cited_by_url}&select={select_fields}&per-page=100&mailto={mailto}"
+    url = f"{openalex_url}&select={select_fields}&per-page=100&mailto={mailto}"
     if api_key:
         url = f"{url}&api_key={quote_plus(api_key)}"
     page = 1
@@ -171,10 +188,10 @@ def fetch_citing_work_ids(
             # Check for next page
             meta = data.get("meta", {})
             if meta.get("next_page") and len(citing_work_ids) < max_citations:
-                url = meta["next_page"]
-                if not _is_openalex_api_url(url):
-                    _mark_incomplete(citing_work_ids, _not_openalex_message(url))
-                    url = None
+                next_page = meta["next_page"]
+                url = _openalex_api_url(next_page)
+                if url is None:
+                    _mark_incomplete(citing_work_ids, _not_openalex_message(next_page))
                 else:
                     page += 1
                     print(f"Fetching next page of citing works: Page {page}")
