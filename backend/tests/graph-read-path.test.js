@@ -360,6 +360,8 @@ process.stdout.write('{}')
     test('a versioned file request is checked against the live build', async () => {
       const current = await binary(get(`${fileUrl}?v=A`, fx.adminToken))
       expect(current.status).toBe(200)
+      // The gzip branch served it (supertest decodes the body).
+      expect(current.headers['content-encoding']).toBe('gzip')
       expect([...current.body]).toEqual([1, 2, 3, 4])
 
       const stale = await get(`${fileUrl}?v=B`, fx.adminToken)

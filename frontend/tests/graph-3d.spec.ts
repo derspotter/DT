@@ -462,7 +462,8 @@ test('selecting a cluster shows its detail without a request', async ({ page }) 
 //   manifest carries `?v=<version>`;
 // - resource gates by `<file>?v=<version>` (`hold`), released with an answer
 //   (`{ status, body }`) or `undefined` (the normal file);
-// - per-request gates for `/api/graph/3d/node/<id>` (`holdNode(id, index)`);
+// - per-request gates for `/api/graph/3d/node/<id>` (`holdNode(id, index)`)
+//   and for the manifest (`holdManifest(index)`, by manifest request order);
 // - a mutable `lastCorpusId` that `/api/corpora/<id>/select` sets and
 //   `/api/auth/me` returns.
 
@@ -510,6 +511,7 @@ async function graphMock(page: Page, {
     manifestCount: 0,
     resourceGates: new Map<string, Gate>(),
     nodeGates: new Map<string, Gate>(),
+    manifestGates: new Map<number, Gate>(),
     nodeRequests: {} as Record<string, number>,
   }
   const hold = (key: string) => {
@@ -520,6 +522,11 @@ async function graphMock(page: Page, {
   const holdNode = (id: number, index: number) => {
     const held = gate()
     state.nodeGates.set(`${id}#${index}`, held)
+    return held
+  }
+  const holdManifest = (index: number) => {
+    const held = gate()
+    state.manifestGates.set(index, held)
     return held
   }
   await page.addInitScript(() => {
@@ -543,7 +550,10 @@ async function graphMock(page: Page, {
       const version = versionsByCorpus
         ? versionsByCorpus[corpus]
         : versions[Math.min(state.manifestCount, versions.length - 1)]
+      const held = state.manifestGates.get(state.manifestCount)
       state.manifestCount += 1
+      const answer = held ? await held.promise : undefined
+      if (answer) return fulfil(route, answer.body ?? {}, answer.status)
       return fulfil(route, versionedManifest(version, edgeCountByCorpus[corpus] ?? 1))
     }
     if (path.startsWith(`${SNAPSHOT_BASE}/`)) {
@@ -565,7 +575,7 @@ async function graphMock(page: Page, {
     }
     return mockApi(route)
   })
-  return { state, hold, holdNode }
+  return { state, hold, holdNode, holdManifest }
 }
 
 // The keys of every fetch the app called after its first body read of a
@@ -618,8 +628,10 @@ test('a 409 on a snapshot file reloads the manifest once and loads build B', asy
 })
 
 test('a 409 after the graph unmounts starts no request', async ({ page }) => {
-  const { hold } = await graphMock(page, { versions: ['A', 'R'] })
+  const { hold, holdManifest } = await graphMock(page, { versions: ['A', 'R'] })
   const nodesA = hold('nodes.bin?v=A')
+  // A retry would be manifest request 1: held, so it can start nothing more.
+  const secondManifest = holdManifest(1)
   await openGraph(page)
   await expect.poll(() => calls(page, NODES_A)).toBe(1)
 
@@ -630,7 +642,10 @@ test('a 409 after the graph unmounts starts no request', async ({ page }) => {
   await afterBodyRead(page, NODES_A, before)
   expect(await calls(page, MANIFEST)).toBe(1)
 
+  // The reopened graph is a new instance; its manifest is request 1.
   await page.getByTestId('tab-graph').click()
+  await expect.poll(() => calls(page, MANIFEST)).toBe(2)
+  secondManifest.release()
   const panel = page.getByTestId('graph-3d-panel')
   await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
   expect(await calls(page, MANIFEST)).toBe(2)
@@ -641,16 +656,21 @@ test('a 409 after the graph unmounts starts no request', async ({ page }) => {
 })
 
 test('a 409 after a header corpus switch neither retries nor publishes the old corpus', async ({ page }) => {
-  const { hold } = await graphMock(page, {
+  const { hold, holdManifest } = await graphMock(page, {
     versionsByCorpus: { 1: 'A', 2: 'C' },
     edgeCountByCorpus: { 2: 7 },
   })
   const nodesA = hold('nodes.bin?v=A')
   const corpus2 = RESOURCE_FILES.map((file) => hold(`${file}?v=C`))
+  // Manifest 0 is corpus 1's, 1 is corpus 2's; a retry would be request 2: held.
+  const retriedManifest = holdManifest(2)
   await openGraph(page)
   await expect.poll(() => calls(page, NODES_A)).toBe(1)
 
   await page.locator('.header-corpus-picker select').selectOption('2')
+  // Commit marker: the new instance's corpus-2 manifest. The Graph tab skips the
+  // seed reads, so the global "first /api/seed/sources after the switch's /me"
+  // marker never comes here; this is the graph-specific checkpoint (owner ruling).
   await expect.poll(() => calls(page, /^\/api\/graph\/3d\/snapshot\?corpus_id=2&/)).toBe(1)
 
   const before = await reads(page, NODES_A)
@@ -662,6 +682,7 @@ test('a 409 after a header corpus switch neither retries nor publishes the old c
   for (const held of corpus2) held.release()
   await expect(page.getByTestId('graph-3d-panel').getByText('Loaded 2 nodes and 7 edges from snapshot.')).toBeVisible()
   expect(await calls(page, MANIFEST)).toBe(2)
+  retriedManifest.release()
 })
 
 for (const late of ['fails', 'succeeds'] as const) {
