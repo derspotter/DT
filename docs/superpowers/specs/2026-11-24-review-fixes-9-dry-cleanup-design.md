@@ -1,7 +1,7 @@
 # Review fixes, phase 9: backend/frontend DRY cleanup plus the rows parked in phase 8 — design
 
-Date: 2026-11-24, revised the same day after pre-flights 1 to 4 (Codex,
-`.superpowers/sdd/2026-11-24-review-fixes-9-dry-cleanup/preflight.md` and `preflight-2.md`) and
+Date: 2026-11-24, revised the same day after pre-flights 1 to 5 (Codex,
+`.superpowers/sdd/2026-11-24-review-fixes-9-dry-cleanup/preflight.md` to `preflight-5.md`) and
 the controller's rulings on them. Branch `review-fixes-9` (worktree from master `d4518a9`).
 Source: the reconciliation of the review inventory against `c574aba`
 (`/home/jay/DT/.worktrees/review-fixes-8/.superpowers/sdd/review-fixes-8-reconcile/{fe,be,py}.md`)
@@ -382,10 +382,12 @@ The evidence for each row is in its decision; this list names the defect.
     - mapped cases stay for the editor: stderr `OpenAlex rate limit exceeded. Retry after 5s.`
       answers 429 with that text, `ValueError: bad query` answers 400 `bad query`;
     - failed runs in the seed list (pre-flight 4), in `search-run-failure.test.js` with its
-      dead-child harness (`:117`): the fake prints `run_created` for a `running` row that has one
+      dead-child harness (`:117`), whose temporary DB gains the minimal `search_results` and
+      `ingest_entries` schemas from `seed-candidates-route.test.js:55` (pre-flight 5; every run is
+      registered to the shared corpus and each read asserts HTTP 200 first): the fake prints `run_created` for a `running` row that has one
       undismissed result, writes `SECRET-DIAG` to stderr and exits 3; after the row settles, the
-      editor's `GET /api/seed/sources` and the candidates route's `source` summary show
-      `run.error === 'search failed'`, the admin's show the stored text with `SECRET-DIAG`, and the
+      editor's `GET /api/seed/sources` and the candidates route's `body.source_summary.run.error`
+      show `'search failed'`, the admin's show the stored text with `SECRET-DIAG`, and the
       log has the full error. A pre-existing `failed` row with a diagnostic (one result) gives the
       editor `'search failed'` too; a `done` row with a quota note keeps the note for the editor.
       On `d4518a9` the editor sees the stored text;
@@ -511,8 +513,9 @@ Six tasks, each one reviewable commit or a small group of them.
 3. **Backend helpers:** D7 (new `dbHelpers.js`, `identifiers.js`; `seed.js`, `pipelineReads.js`,
    `corpusList.js`, `app.js`; `db-helpers.test.js`, `identifiers.test.js`, `seed-state.test.js`,
    `pipeline-reads.test.js`).
-4. **Backend routes:** D8–D12 (`app.js`, new `downloadTickets.js`; `download-tickets.test.js`,
-   `recursion-args.test.js`, new `server-errors.test.js`, `corpus-sharing.test.js`).
+4. **Backend routes:** D8–D12 (`app.js`, `seed.js` (`runErrorDetail`), new `downloadTickets.js`;
+   `download-tickets.test.js`, `recursion-args.test.js`, new `server-errors.test.js`,
+   `corpus-sharing.test.js`, `search-run-failure.test.js`).
 5. **Import and extraction binding:** D4 (`app.js` with `staged_uploads`, `lib/api.js`,
    `App.svelte`; new `staged-uploads.test.js`, `seed-upload.spec.ts`).
 6. **Python:** D14–D17 (`seed_promote.py`, `backfill_openalex_topics.py`, `scraper_lab.py`,
