@@ -70,6 +70,14 @@ export async function logIn(page: Page, username: string) {
 // `afterBodyRead` waits for one more read than `previousReads` and then
 // drains two `setTimeout(0)` rounds, so the app's continuation after that
 // read, up to its next await on a request, has run.
+//
+// For causal checkpoints each call also gets a page-wide sequence number,
+// sent to the route as the `x-dt-fetch-seq` request header (string or URL
+// inputs only), and `events` keeps calls and reads in order.
+// `firstCallAfterRead(readPath, callPath)` returns the sequence number of
+// the first `callPath` call made after the latest `readPath` read: the
+// request the app sent in its continuation after reading that body.
+export const FETCH_SEQ_HEADER = 'x-dt-fetch-seq'
 type FetchMatch = { path: string } | { source: string; flags: string }
 
 function fetchMatch(match: string | RegExp): FetchMatch {
@@ -83,10 +91,21 @@ export async function trackFetches(page: Page) {
     if (w.__dtFetch) return
     const calls: Record<string, number> = {}
     const reads: Record<string, number> = {}
+    const events: { kind: 'call' | 'read'; key: string; seq: number }[] = []
+    let lastSeq = 0
     const bump = (bag: Record<string, number>, key: string) => { bag[key] = (bag[key] || 0) + 1 }
+    const pathOf = (key: string) => key.split('?')[0]
     w.__dtFetch = {
       calls,
       reads,
+      events,
+      firstCallAfterRead(readPath: string, callPath: string) {
+        let last = -1
+        events.forEach((event, i) => { if (event.kind === 'read' && pathOf(event.key) === readPath) last = i })
+        if (last < 0) return null
+        const hit = events.slice(last + 1).find((event) => event.kind === 'call' && pathOf(event.key) === callPath)
+        return hit ? hit.seq : null
+      },
       stats(spec: { path?: string; source?: string; flags?: string }) {
         const re = spec.source !== undefined ? new RegExp(spec.source, spec.flags) : null
         // lastIndex is reset per key, so `g` and `y` keep their meaning for
@@ -111,13 +130,22 @@ export async function trackFetches(page: Page) {
       } catch {
         key = String(input)
       }
+      const seq = ++lastSeq
       bump(calls, key)
-      return realFetch(input, init).then((response) => {
+      events.push({ kind: 'call', key, seq })
+      let request: [RequestInfo | URL, RequestInit | undefined] = [input, init]
+      if (typeof input === 'string' || input instanceof URL) {
+        const headers = new Headers(init?.headers)
+        headers.set('x-dt-fetch-seq', String(seq))
+        request = [input, { ...init, headers }]
+      }
+      return realFetch(...request).then((response) => {
+        const read = () => { bump(reads, key); events.push({ kind: 'read', key, seq }) }
         for (const method of ['json', 'blob', 'text', 'arrayBuffer'] as const) {
           const original = (response[method] as () => Promise<unknown>).bind(response)
           ;(response as any)[method] = () => original().then(
-            (value) => { bump(reads, key); return value },
-            (error) => { bump(reads, key); throw error },
+            (value) => { read(); return value },
+            (error) => { read(); throw error },
           )
         }
         return response
@@ -136,4 +164,15 @@ export async function afterBodyRead(page: Page, match: string | RegExp, previous
     { spec: fetchMatch(match), previous: previousReads },
   )
   await page.evaluate(() => new Promise((r) => setTimeout(() => setTimeout(r, 0), 0)))
+}
+
+// Waits until every request matching `match` made so far has had its body
+// read (at least one), then drains as `afterBodyRead` does: none is in
+// flight, so an app-side in-flight join cannot absorb the next request.
+export async function settleReads(page: Page, match: string | RegExp) {
+  await expect.poll(async () => {
+    const stats = await fetchStats(page, match)
+    return stats.calls > 0 && stats.reads === stats.calls
+  }).toBe(true)
+  await afterBodyRead(page, match, (await fetchStats(page, match)).reads - 1)
 }

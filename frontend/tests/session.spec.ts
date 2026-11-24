@@ -1,7 +1,7 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
-import { afterBodyRead, fetchStats, fulfil, logIn, mockLogSocket, trackFetches } from './helpers/mockApi'
+import { afterBodyRead, fetchStats, fulfil, logIn, mockLogSocket, settleReads, trackFetches } from './helpers/mockApi'
 
 // One sign-out path: a 401 from any request runs the full logout (socket
 // closed, token cleared, workspace state reset), and a /me answer requested
@@ -1812,6 +1812,8 @@ async function launchSearch(page: Page) {
 
 test('a search launched before a sign-out does not reach the next session', async ({ page }) => {
   const gates = await bootSearchRace(page, { holdLaunch: true })
+  // Alice's boot budget load is read before the launch.
+  await settleReads(page, '/api/openalex/quota')
   await launchSearch(page)
   await expect.poll(() => gates.searchPosts).toBe(1)
 
@@ -1820,8 +1822,10 @@ test('a search launched before a sign-out does not reach the next session', asyn
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
   // The commit: bob's first seed-list request, sent with his token, answered.
   await expect.poll(() => gates.log.some((e) => e.path === '/api/seed/sources' && e.auth.endsWith('token-b') && e.answered)).toBe(true)
-  // Bob's own budget load is answered before the quota gate goes up.
+  // Bob's own budget load is read (none in flight, so the app's in-flight
+  // join cannot absorb a late launch's refresh) before the quota gate goes up.
   await expect.poll(() => gates.log.some((e) => e.path === '/api/openalex/quota' && e.auth.endsWith('token-b') && e.answered)).toBe(true)
+  await settleReads(page, '/api/openalex/quota')
   gates.seedGateOn = true
   gates.quotaGateOn = true
   const seedCalls = (await fetchStats(page, '/api/seed/sources')).calls

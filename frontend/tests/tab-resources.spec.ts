@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page, type Route } from '@playwright/test'
-import { afterBodyRead, fetchStats, fulfil, mockLogSocket, trackFetches } from './helpers/mockApi'
+import { afterBodyRead, FETCH_SEQ_HEADER, fetchStats, fulfil, mockLogSocket, settleReads, trackFetches } from './helpers/mockApi'
 
 // One tab→resources table with per-resource in-flight dedupe: every tab loads
 // exactly what it renders, a resource in flight is joined rather than
@@ -75,17 +75,17 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     // `heldQuota` until released; `exportGate` holds the exports.
     searchGate: null as Promise<void> | null,
     meGateOn: false,
-    // `switchMe` marks the first /me after the corpus select was answered:
-    // the one handleSelectCorpus sends, not a poll's reconcile.
-    heldMe: [] as { release: () => void; switchMe: boolean }[],
+    // Each held /me carries its page-side fetch sequence number.
+    heldMe: [] as { release: () => void; seq: number }[],
     seedGateOn: false,
     heldSeeds: [] as (() => void)[],
     quotaGateOn: false,
     heldQuota: [] as (() => void)[],
     exportGate: null as Promise<void> | null,
-    selectAnswered: false,
-    switchMeSeen: false,
-    // The log length when the switch's /me was answered (-1 before).
+    // The switch's own /me: the first /me the app sent after it read the
+    // select's answer (set by switchTo2), and the log length when it was
+    // answered (-1 before).
+    switchMeSeq: null as number | null,
     switchMeAnsweredAt: -1,
   }
   const held = (queue: (() => void)[]) => new Promise<void>((resolve) => { queue.push(resolve) })
@@ -106,10 +106,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     const entry = { path, search: url.searchParams, answered: false }
     log.push(entry)
     if (path === '/api/auth/me') {
-      const switchMe = state.selectAnswered && !state.switchMeSeen
-      if (switchMe) state.switchMeSeen = true
+      const seq = Number(route.request().headers()[FETCH_SEQ_HEADER] || 0)
       if (state.meGateOn) {
-        await new Promise<void>((release) => { state.heldMe.push({ release, switchMe }) })
+        await new Promise<void>((release) => { state.heldMe.push({ release, seq }) })
       }
       if (delays.me) await new Promise((resolve) => setTimeout(resolve, delays.me))
       await fulfil(route, {
@@ -119,7 +118,7 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
           { id: 2, name: 'Second corpus', role: 'owner', owner_username: 'admin' },
         ],
       })
-      if (switchMe) state.switchMeAnsweredAt = log.length
+      if (seq && seq === state.switchMeSeq) state.switchMeAnsweredAt = log.length
       return
     }
     if (path === '/api/corpus') {
@@ -164,9 +163,7 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     if (select) {
       if (state.selectError) return fulfil(route, { error: state.selectError }, 403)
       state.lastCorpusId = Number(select[1])
-      await fulfil(route, {})
-      state.selectAnswered = true
-      return
+      return fulfil(route, {})
     }
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
     if (path === '/api/openalex/quota') {
@@ -886,12 +883,21 @@ function deferred() {
 
 type Booted = Awaited<ReturnType<typeof boot>>
 
-// Selects corpus 2 with /me gated: returns once the select's own /me (the
-// first after the server answered the save) is held.
+const SELECT_2 = '/api/corpora/2/select'
+
+// Selects corpus 2 with /me gated. The switch's /me is identified causally:
+// once the app has read the select's answer, it is the first /me the app
+// called after that read (by fetch sequence number). Returns when that
+// request is held at the gate.
 async function switchTo2(page: Page, { state }: Booted) {
   state.meGateOn = true
+  const selectReads = (await fetchStats(page, SELECT_2)).reads
   await page.locator('.header-corpus-picker select').selectOption('2')
-  await expect.poll(() => state.heldMe.some((held) => held.switchMe)).toBe(true)
+  await afterBodyRead(page, SELECT_2, selectReads)
+  const seq = await page.evaluate((path) => (window as any).__dtFetch.firstCallAfterRead(path, '/api/auth/me'), SELECT_2)
+  expect(seq).not.toBeNull()
+  state.switchMeSeq = seq
+  await expect.poll(() => state.heldMe.some((held: { seq: number }) => held.seq === seq)).toBe(true)
 }
 
 // Releases only the switch's /me and checkpoints on its read: the workspace
@@ -901,7 +907,7 @@ async function switchTo2(page: Page, { state }: Booted) {
 // must be off for it).
 async function commit(page: Page, { state, log }: Booted) {
   const meReads = (await fetchStats(page, '/api/auth/me')).reads
-  const switchMe = state.heldMe.find((held) => held.switchMe)!
+  const switchMe = state.heldMe.find((held) => held.seq === state.switchMeSeq)!
   state.heldMe.splice(state.heldMe.indexOf(switchMe), 1)
   switchMe.release()
   await afterBodyRead(page, '/api/auth/me', meReads)
@@ -933,13 +939,16 @@ test('a search launched before a corpus switch does not mark the new corpus as s
   const launch = deferred()
   state.previewCount = 5
   state.searchGate = launch.promise
+  // The boot budget load is read first, so the app's in-flight coalescing
+  // cannot hide a late launch's quota refresh.
+  await settleReads(page, '/api/openalex/quota')
   await launchSearch(page)
   await expect.poll(() => state.searchBodies.length).toBe(1)
   await switchTo2(page, booted)
   await commit(page, booted)
-  // The commit's own budget load is answered too; then every follow-up the
-  // late launch could start is gated.
-  await expect.poll(() => answeredAfterSwitch(booted, '/api/openalex/quota')).toBe(true)
+  // No budget load is in flight (the commit's own, if any, was read); then
+  // every follow-up the late launch could start is gated.
+  await settleReads(page, '/api/openalex/quota')
   state.seedGateOn = true
   state.quotaGateOn = true
   const seedCalls = (await fetchStats(page, '/api/seed/sources')).calls
