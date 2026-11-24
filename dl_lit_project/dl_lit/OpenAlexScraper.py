@@ -13,6 +13,7 @@ from .identifiers import (
     inverted_index_to_text,
     inverted_index_to_text_last_wins,
     normalize_doi_lower,
+    normalize_openalex_id_strict,
 )
 from .utils import (
     FetchResult,
@@ -107,6 +108,25 @@ def _openalex_api_url(url) -> str | None:
         return None
     # Always with "?": callers append their options with "&".
     return f"{_OPENALEX_API_BASE}{path}?{parts.query}"
+
+
+def citing_works_url(stored_url, openalex_id) -> str | None:
+    """The citing-works URL to request for a work: its stored URL, or OpenAlex's ``cites:`` filter.
+
+    A stored URL that is not an OpenAlex API URL (the Crossref mapping stores an
+    api.crossref.org one) is never fetched; when the work's OpenAlex id is known, the
+    equivalent ``filter=cites:<id>`` URL stands in for it. Without that id the stored URL is
+    returned, and the fetch marks the result incomplete. No stored URL answers None (each
+    caller keeps its own rule for that case).
+    """
+    if not stored_url:
+        return None
+    if _openalex_api_url(stored_url) is not None:
+        return stored_url
+    work_id = normalize_openalex_id_strict(openalex_id)
+    if work_id:
+        return f"{_OPENALEX_API_BASE}/works?filter=cites:{work_id}"
+    return stored_url
 
 
 def _not_openalex_message(url) -> str:
@@ -966,10 +986,12 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
 
     for ref in references:
         enriched_ref = process_single_reference(ref, searcher, searcher.rate_limiter)
-        if enriched_ref and fetch_citations and enriched_ref.get('best_match_result', {}).get('cited_by_api_url'):
-            print(f"Fetching citations for: {enriched_ref.get('best_match_result', {}).get('display_name')}")
+        best_match = (enriched_ref or {}).get('best_match_result') or {}
+        cited_by_url = citing_works_url(best_match.get('cited_by_api_url'), best_match.get('id'))
+        if enriched_ref and fetch_citations and cited_by_url:
+            print(f"Fetching citations for: {best_match.get('display_name')}")
             enriched_ref['citing_works_ids'] = fetch_citing_work_ids(
-                enriched_ref['best_match_result']['cited_by_api_url'], 
+                cited_by_url,
                 searcher.rate_limiter, 
                 searcher.headers['User-Agent'].split('/')[-1], # Extract mailto from User-Agent
                 session=searcher.openalex_session,
@@ -1404,10 +1426,11 @@ def _fetch_related_works(
                     ]
     
     # Fetch citing works if requested
-    if fetch_citations and openalex_result.get('cited_by_api_url'):
+    cited_by_url = citing_works_url(openalex_result.get('cited_by_api_url'), openalex_result.get('id'))
+    if fetch_citations and cited_by_url:
         print(f"Fetching citing works (max: {max_citations})...")
         enrichment_data['citing_works'] = fetch_citing_work_ids(
-            openalex_result['cited_by_api_url'],
+            cited_by_url,
             rate_limiter,
             searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
             max_citations,
@@ -1419,7 +1442,7 @@ def _fetch_related_works(
         if related_depth_upstream > 1 and enrichment_data['citing_works']:
             print(f"Fetching second-level citing works (depth: {related_depth_upstream})...")
             for citing_work in enrichment_data['citing_works']:
-                cited_by_url = citing_work.get('cited_by_api_url')
+                cited_by_url = citing_works_url(citing_work.get('cited_by_api_url'), citing_work.get('openalex_id'))
                 if not cited_by_url:
                     continue
                 citing_work['citing_works_expanded'] = fetch_citing_work_ids(

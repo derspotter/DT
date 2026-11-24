@@ -920,3 +920,64 @@ def test_other_openalex_requests_keep_following_redirects(keyed_env):
 
     utils.openalex_request_json(url="https://api.openalex.org/works", session=_Session(), rate_limiter=_FreeLimiter(), retries=1)
     assert "allow_redirects" not in seen
+
+
+# --- final fix: a rejected citing URL falls back to OpenAlex's cites: filter -----------------
+
+CROSSREF_CITED_BY = "https://api.crossref.org/works/10.1000/xyz/references"  # identifiers.py's mapping
+
+
+@pytest.mark.parametrize("stored, work_id, expected", [
+    (CROSSREF_CITED_BY, "https://openalex.org/W5", "https://api.openalex.org/works?filter=cites:W5"),
+    (CROSSREF_CITED_BY, "W5", "https://api.openalex.org/works?filter=cites:W5"),
+    (CROSSREF_CITED_BY, "crossref:10.1000/xyz", CROSSREF_CITED_BY),  # no OpenAlex id: stays rejected
+    (CROSSREF_CITED_BY, None, CROSSREF_CITED_BY),
+    ("https://api.openalex.org/works?filter=cites:W1", "W5", "https://api.openalex.org/works?filter=cites:W1"),
+    (None, "W5", None),  # no URL: the caller's own rule
+])
+def test_citing_works_url_falls_back_only_for_a_rejected_url(stored, work_id, expected):
+    from dl_lit.OpenAlexScraper import citing_works_url
+
+    assert citing_works_url(stored, work_id) == expected
+
+
+def test_a_crossref_matched_work_with_an_openalex_id_gets_its_citing_works(keyed_env, monkeypatch):
+    from dl_lit import OpenAlexScraper
+
+    session = _RecordingSession([_citing_page("W7"), _citing_page("W8")])
+    searcher = SimpleNamespace(
+        headers={"User-Agent": "x/spott@wzb.eu"}, openalex_session=session, openalex_timeout=5, api_key="sekret-c"
+    )
+    enrichment = {}
+    result = {
+        "id": "https://openalex.org/W5",
+        "cited_by_api_url": CROSSREF_CITED_BY,
+        "referenced_works": [],
+    }
+    OpenAlexScraper._fetch_related_works(
+        enrichment, result, searcher, _FreeLimiter(), fetch_references=False, fetch_citations=True,
+    )
+    assert len(session.sent) == 1
+    assert session.sent[0].startswith("https://api.openalex.org/works?filter=cites:W5&")
+    assert [w["openalex_id"] for w in enrichment["citing_works"]] == ["https://openalex.org/W7"]
+    assert enrichment["citing_works"].complete is True
+
+
+def test_a_second_level_citing_url_that_is_rejected_falls_back_too(keyed_env):
+    from dl_lit import OpenAlexScraper
+
+    first = {"results": [{"id": "https://openalex.org/W7", "authorships": [], "cited_by_api_url": CROSSREF_CITED_BY}],
+             "meta": {}}
+    session = _RecordingSession([first, _citing_page("W8")])
+    searcher = SimpleNamespace(
+        headers={"User-Agent": "x/spott@wzb.eu"}, openalex_session=session, openalex_timeout=5, api_key="sekret-c"
+    )
+    enrichment = {}
+    OpenAlexScraper._fetch_related_works(
+        enrichment, {"id": "https://openalex.org/W5", "cited_by_api_url": "https://api.openalex.org/works?filter=cites:W5"},
+        searcher, _FreeLimiter(), fetch_references=False, fetch_citations=True, related_depth_upstream=2,
+    )
+    assert len(session.sent) == 2
+    assert session.sent[1].startswith("https://api.openalex.org/works?filter=cites:W7&")
+    expanded = enrichment["citing_works"][0]["citing_works_expanded"]
+    assert [w["openalex_id"] for w in expanded] == ["https://openalex.org/W8"]
