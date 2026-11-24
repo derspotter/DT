@@ -201,21 +201,31 @@ def test_cli_downloaded_count_ignores_the_duplicate_merge_result(mocker, tmp_pat
     enhancer = mocker.patch("dl_lit.cli.BibliographyEnhancer", autospec=True).return_value
     pdf = tmp_path / "paper.pdf"
     pdf.write_bytes(b"%PDF")
-    db.fetch_download_queue.return_value = [
-        {"id": 1, "title": "Already downloaded"},
-        {"id": 2, "title": "Fresh paper"},
+    db.claim_download_batch.side_effect = [
+        [{"id": 1, "title": "Already downloaded"}],
+        [{"id": 2, "title": "Fresh paper"}],
+        [],
     ]
-    db.check_if_exists.side_effect = [("works", 9, "normalized_title"), (None, None, None)]
+    db.find_downloaded_duplicate.side_effect = [("works", 9, "normalized_title"), (None, None, None)]
     db.merge_duplicate_queued_work.return_value = (True, "merged into 9")
-    enhancer.enhance_bibliography.return_value = {
-        "downloaded_file": str(pdf), "download_source": "mock", "checksum": "abc",
-    }
+    db.move_entry_to_downloaded.return_value = (2, None)
+    db.mark_download_failed.return_value = (2, None)
+    staged = {}
+
+    def stage(ref, download_dir):
+        staged["result"] = {"downloaded_file": str(pdf) + ref["part_suffix"], "download_source": "mock", "checksum": "abc"}
+        return staged["result"]
+
+    enhancer.enhance_bibliography.side_effect = stage
 
     result = CliRunner().invoke(cli, ["download-pdfs", "--db-path", str(tmp_path / "t.db"), "--download-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert "Worker finished: 1 downloaded, 0 failed." in result.output
-    db.move_entry_to_downloaded.assert_called_once_with(2, enhancer.enhance_bibliography.return_value, str(pdf), "abc", "mock")
+    assert "Worker finished: 1 downloaded, 0 failed, 1 duplicate(s) merged, 0 claim(s) lost (result discarded)." in result.output
+    cli_id = db.claim_download_batch.call_args.kwargs["claimed_by"]
+    fp = staged["result"]["downloaded_file"]
+    db.move_entry_to_downloaded.assert_called_once_with(2, staged["result"], fp, "abc", "mock", claimed_by=cli_id, part_path=fp)
+    db.release_download_claims.assert_called_once_with(cli_id)
 
 
 def test_cli_keeps_two_queued_rows_with_the_same_title_and_different_dois(mocker, tmp_path):
@@ -250,6 +260,8 @@ def _worker_daemon(monkeypatch, tmp_path, enhancer):
     mod = load_worker("dt_worker_download_path", monkeypatch)
     assert mod.download_ref is download_ref
     daemon = object.__new__(mod.PipelineDaemon)
+    daemon.worker_id = "daemon:test:1:abc"
+    daemon._init_work_state()
     daemon.db = DatabaseManager(str(tmp_path / "worker.db"))
     daemon.db_lock = threading.RLock()
     daemon.enhancer = enhancer
@@ -257,26 +269,50 @@ def _worker_daemon(monkeypatch, tmp_path, enhancer):
     return daemon
 
 
+class _StagingEnhancer(_Enhancer):
+    """A successful fake that writes its bytes where the real builders do: ``<final><part_suffix>``."""
+
+    def __init__(self, result, data=b"%PDF"):
+        super().__init__(result)
+        self.data = data
+
+    def enhance_bibliography(self, ref, download_dir):
+        self.calls.append((ref, download_dir))
+        path = str(self.result["downloaded_file"]) + ref.get("part_suffix", "")
+        with open(path, "wb") as fh:
+            fh.write(self.data)
+        return {**self.result, "downloaded_file": path}
+
+
+def _claimed(daemon, work_id, phase="download"):
+    """The row as the daemon gets it: claimed through the real claim with its worker_id."""
+    claim = daemon.db.claim_download_batch if phase == "download" else daemon.db.claim_enrich_batch
+    rows = [r for r in claim(limit=50, corpus_id=None, claimed_by=daemon.worker_id, lease_seconds=900)
+            if int(r["id"]) == int(work_id)]
+    assert rows, f"work {work_id} was not claimed"
+    return rows[0]
+
+
 def test_worker_download_single_marks_downloaded_with_the_downloader_checksum(tmp_path, monkeypatch):
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
-    enhancer = _Enhancer({"downloaded_file": str(pdf), "checksum": "abc", "download_source": "mock",
-                          "download_trace": [{"source": "mock"}]})
+    enhancer = _StagingEnhancer({"downloaded_file": str(pdf), "checksum": "abc", "download_source": "mock",
+                                 "download_trace": [{"source": "mock"}]})
     daemon = _worker_daemon(monkeypatch, tmp_path, enhancer)
     qid = _insert_work(daemon.db, "Queued", year=2020, authors="not json", download_status="queued")
 
-    status, info = daemon._download_single(daemon.db.get_entry_by_id("works", qid))
+    status, info = daemon._download_single(_claimed(daemon, qid))
 
     assert status == "downloaded" and info["downloaded_id"] == qid and info["_trace"] == [{"source": "mock"}]
     assert enhancer.calls[0][0]["authors"] == ["not json"]
     row = daemon.db.get_entry_by_id("works", qid)
     assert (row["download_status"], row["file_checksum"]) == ("downloaded", "abc")
+    assert row["file_path"] == str(pdf) and pdf.read_bytes() == b"%PDF"
 
 
 def test_worker_download_single_reads_the_duplicate_row_under_db_lock(tmp_path, monkeypatch):
     daemon = _worker_daemon(monkeypatch, tmp_path, _Enhancer({"downloaded_file": ""}))
     qid = _insert_work(daemon.db, "Queued", year=2020, doi="10.1/queued", download_status="queued")
-    row = daemon.db.get_entry_by_id("works", qid)
+    row = _claimed(daemon, qid)
     other = _insert_work(daemon.db, "Queued", year=2020, doi="10.1/other", download_status="queued")
     monkeypatch.setattr(daemon.db, "check_if_exists", lambda **kwargs: ("works", other, "title_year"))
     held = []
@@ -295,13 +331,12 @@ def test_worker_download_single_reads_the_duplicate_row_under_db_lock(tmp_path, 
 
 def test_worker_keeps_a_row_whose_doi_differs_from_a_downloaded_title_match(tmp_path, monkeypatch):
     pdf = tmp_path / "paper.pdf"
-    pdf.write_bytes(b"%PDF")
-    enhancer = _Enhancer({"downloaded_file": str(pdf), "checksum": "abc", "download_source": "mock"})
+    enhancer = _StagingEnhancer({"downloaded_file": str(pdf), "checksum": "abc", "download_source": "mock"})
     daemon = _worker_daemon(monkeypatch, tmp_path, enhancer)
     qid = _insert_work(daemon.db, "Same Title", year=2020, doi="10.1/one", download_status="queued")
     other = _insert_work(daemon.db, "Same Title", year=2020, doi="10.1/two", download_status="downloaded")
 
-    status, info = daemon._download_single(daemon.db.get_entry_by_id("works", qid))
+    status, info = daemon._download_single(_claimed(daemon, qid))
 
     assert status == "downloaded" and info["downloaded_id"] == qid
     norm = daemon.db._normalize_doi
@@ -315,7 +350,7 @@ def test_worker_still_drops_a_row_without_a_conflicting_identifier(tmp_path, mon
     qid = _insert_work(daemon.db, "Same Title", year=2020, download_status="queued")
     other = _insert_work(daemon.db, "Same Title", year=2020, doi="10.1/two", download_status="downloaded")
 
-    status, info = daemon._download_single(daemon.db.get_entry_by_id("works", qid))
+    status, info = daemon._download_single(_claimed(daemon, qid))
 
     assert (status, info["action"]) == ("skipped", "dropped_duplicate")
     assert [r[0] for r in daemon.db.conn.execute("SELECT id FROM works")] == [other]
@@ -331,7 +366,7 @@ def test_worker_raw_download_failure_reports_the_refs_failure_fields(tmp_path, m
     daemon = _worker_daemon(monkeypatch, tmp_path, _Failing())
     wid = _insert_work(daemon.db, "Raw", year=2020)
 
-    ok, info = daemon._attempt_raw_download(daemon.db.get_entry_by_id("works", wid))
+    ok, info = daemon._attempt_raw_download(_claimed(daemon, wid, phase="enrich"))
 
     assert not ok
     assert (info["failure_category"], info["failure_detail"]) == ("source_exhausted", "nothing found")

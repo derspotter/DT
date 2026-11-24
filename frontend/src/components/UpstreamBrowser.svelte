@@ -251,7 +251,7 @@
               bind:value={selectedKantroposTargetId}
               on:change={onKantroposTargetChange}
               disabled={kantroposAssignmentLoading || kantroposAssignmentSaving || !currentCorpusId || !canConfigureCurrentCorpusKantropos}
-              title={canConfigureCurrentCorpusKantropos ? 'Assign this local corpus to a predefined Kantropos corpus' : 'Only owners or editors can change the Kantropos assignment'}
+              title={canConfigureCurrentCorpusKantropos ? 'Assign this local corpus to a predefined Kantropos corpus' : 'Only admins can change the Kantropos assignment'}
             >
               <option value="">No assignment</option>
               {#each targets as target}

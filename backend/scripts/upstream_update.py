@@ -20,6 +20,16 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+from _bootstrap import ensure_import_paths
+
+ensure_import_paths(__file__)
+ROOT = Path(__file__).resolve().parents[2]
+DL_LIT_PROJECT = ROOT / "dl_lit_project"
+if str(DL_LIT_PROJECT) not in sys.path:
+    sys.path.insert(0, str(DL_LIT_PROJECT))
+
+from dl_lit.identifiers import normalize_doi  # noqa: E402
+
 
 DEFAULT_TARGET_NAME = "Anthropozän & Nachhaltiges Management"
 DEFAULT_CONTAINER_DB_PATH = "/usr/src/app/dl_lit_project/data/literature.db"
@@ -231,17 +241,9 @@ def parse_existing_bib_keys(text: str) -> set[str]:
     return set(re.findall(r"@\w+\s*\{\s*([^,\s]+)", text or ""))
 
 
-def _normalize_doi(value: object) -> str:
-    """Lowercase, drop an http(s) doi.org URL or ``doi:`` prefix, ``""`` for empty; no trim of ``.;,``.
-
-    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
-    """
-    if not value:
-        return ""
-    text = str(value).strip().lower()
-    text = re.sub(r"^(https?://(dx\.)?doi\.org/)", "", text)
-    text = re.sub(r"^doi:\s*", "", text)
-    return text
+def display_doi(value: object) -> str:
+    """The DB's DOI rule in lowercase (``normalize_doi(value, case="lower")``), ``""`` for none."""
+    return normalize_doi(value, case="lower") or ""
 
 
 def parse_authors(value: object) -> list[str]:
@@ -304,7 +306,7 @@ def make_bibtex_key(row: sqlite3.Row, metadata: dict, used_keys: set[str]) -> st
     candidates = []
     if explicit:
         candidates.append(simple_key_part(explicit, "ref"))
-    doi = _normalize_doi(row["doi"] or metadata.get("doi"))
+    doi = normalize_doi(row["doi"] or metadata.get("doi"))
     if doi:
         candidates.append(f"doi_{simple_key_part(doi, 'doi')}")
     authors = parse_authors(row["authors"] or metadata.get("authors") or metadata.get("author"))
@@ -376,7 +378,7 @@ def render_bibtex_entry(row: sqlite3.Row, pdf_name: str, used_keys: set[str]) ->
     abstract = row["abstract"] or metadata.get("abstract")
     if abstract:
         fields["abstract"] = abstract
-    doi = _normalize_doi(row["doi"] or metadata.get("doi"))
+    doi = display_doi(row["doi"] or metadata.get("doi"))
     if doi:
         fields["doi"] = doi
     source = row["source"] or metadata.get("source") or metadata.get("journal") or metadata.get("container")
@@ -828,7 +830,7 @@ def command_draft(args: argparse.Namespace) -> None:
             "work_id": row["id"],
             "title": row["title"],
             "year": row["year"],
-            "doi": _normalize_doi(row["doi"]),
+            "doi": display_doi(row["doi"]),
             "source_file_path": str(source_path),
             "staged_file": str(staged_path.relative_to(draft_dir)),
             "target_file": pdf_name,

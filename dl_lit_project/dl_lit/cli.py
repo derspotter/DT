@@ -1,5 +1,8 @@
 import click
 import json
+import os
+import secrets
+import socket
 import traceback
 import sqlite3
 from pathlib import Path
@@ -9,7 +12,7 @@ from threading import Lock
 import bibtexparser
 
 # Local application imports
-from .db_manager import DatabaseManager
+from .db_manager import CLAIM_LOST, DatabaseManager
 # For tests: patched in test_get_bib_pages. Lazy import in handler for runtime.
 extract_reference_sections = None
 from .OpenAlexScraper import (
@@ -19,7 +22,7 @@ from .OpenAlexScraper import (
     process_single_reference,
 )
 from .new_dl import BibliographyEnhancer
-from .download_path import download_ref
+from .download_path import discard_download, download_ref, is_staged_path
 from .utils import get_global_rate_limiter
 from .bibtex_formatter import BibTeXFormatter
 from .APIscraper_v2 import process_directory_v2, process_single_pdf
@@ -646,6 +649,10 @@ def process_downloads_command(db_path, batch_size):
 # ----------------------------------------------------------------------
 # ----------------------------------------------------------------------
 
+# One claim covers one download (spec D2).
+CLI_DOWNLOAD_LEASE_SECONDS = 900
+
+
 @cli.command("download-pdfs")
 @click.option('--db-path', default=str(DEFAULT_DB_PATH), type=click.Path(dir_okay=False, resolve_path=True), help='SQLite database path.')
 @click.option('--limit', default=10, show_default=True, help='Number of queue entries to process per run.')
@@ -661,98 +668,178 @@ def download_pdfs_command(db_path, limit, download_dir):
     db = DatabaseManager(db_path)
     enhancer = BibliographyEnhancer(db_manager=db, rate_limiter=rl, email='spott@wzb.eu', output_folder=download_dir)
 
-    queue = db.fetch_download_queue(limit=limit)
-    if not queue:
-        click.echo("Queue is empty.")
-        db.close_connection()
-        return
-
+    cli_id = f"cli:{socket.gethostname()}:{os.getpid()}:{secrets.token_hex(3)}"
     ok = 0
     failed = 0
-    for row in queue:
-        # Correctly parse author data from the database row, prioritizing rich JSON
-        author_structs = []
-        author_names_for_display = []
-
-        # 1. Try to get authors from the full OpenAlex JSON first
-        openalex_json_str = row.get('openalex_json')
-        if openalex_json_str:
+    duplicates = 0
+    lost = 0
+    claimed = 0
+    try:
+        # One row per claim, one lease per download: a long run holds no lease on rows it has
+        # not reached. A negative --limit means no limit, 0 claims nothing.
+        while limit < 0 or claimed < limit:
             try:
-                openalex_data = json.loads(openalex_json_str)
-                if openalex_data and 'authorships' in openalex_data:
-                    for authorship in openalex_data['authorships']:
-                        author_name = authorship.get('author', {}).get('display_name')
-                        if author_name:
-                            author_names_for_display.append(author_name)
-                            # Also populate author_structs for the downloader, which needs 'family' for LibGen
-                            name_parts = author_name.split()
-                            author_structs.append({
-                                'raw': author_name,
-                                'family': name_parts[-1] if name_parts else ''
-                            })
-            except (json.JSONDecodeError, TypeError):
-                pass # Fallback to simple authors field if JSON is malformed
-
-        # 2. Fallback to the basic 'authors' column if OpenAlex data was not available or failed
-        if not author_structs:
-            try:
-                authors_json = row.get('authors')
-                if authors_json:
-                    loaded_json = json.loads(authors_json)
-                    if isinstance(loaded_json, list):
-                        author_structs = loaded_json  # Assume it's a list of dicts with 'family', 'given'
-                        for author in author_structs:
-                            if isinstance(author, dict):
-                                given = author.get('given', '')
-                                family = author.get('family', '')
-                                if family:
-                                    author_names_for_display.append(f"{given} {family}".strip())
-            except (json.JSONDecodeError, TypeError):
-                pass # Keep lists empty if data is malformed
-
-        # Drop queue entry if it already resolves to an existing downloaded work
-        dup_table, dup_id, dup_field = db.check_if_exists(
-            doi=row.get('doi'),
-            openalex_id=row.get('openalex_id'),
-            title=row.get('title'),
-            authors=author_structs or row.get('authors'),
-            year=row.get('year'),
-            exclude_id=row['id'],
-            exclude_table='works'
+                rows = db.claim_download_batch(
+                    limit=1, corpus_id=None, claimed_by=cli_id,
+                    lease_seconds=CLI_DOWNLOAD_LEASE_SECONDS, raise_errors=True,
+                )
+            except sqlite3.Error as e:
+                # Not an empty queue: say so and exit 1 (PY-35); the finally releases our claims.
+                raise click.ClickException(f"claiming a download row failed: {e}")
+            if not rows:
+                break
+            claimed += 1
+            outcome = _cli_download_row(db, enhancer, rows[0], download_dir, cli_id)
+            if outcome == "downloaded":
+                ok += 1
+            elif outcome == "failed":
+                failed += 1
+            elif outcome == "duplicate":
+                duplicates += 1
+            elif outcome == "claim_lost":
+                lost += 1
+        if not claimed:
+            click.echo("Queue is empty.")
+            return
+        click.echo(
+            f"\nWorker finished: {ok} downloaded, {failed} failed, {duplicates} duplicate(s) merged, "
+            f"{lost} claim(s) lost (result discarded)."
         )
-        if dup_table == 'works' and dup_id is not None:
-            merged, msg = db.merge_duplicate_queued_work(row['id'], dup_table, dup_id, dup_field)
+    finally:
+        try:
+            db.release_download_claims(cli_id)
+        finally:
+            db.close_connection()
+
+
+def _cli_claim_lost(work_id) -> None:
+    click.echo(f"Work {work_id}: download claim lost before its result was written; result discarded.")
+
+
+def _cli_mark_failed(db, work_id, reason, cli_id) -> str:
+    """Mark the claimed row failed. If that write fails the run stops: the row stays claimed
+    until the ``finally`` releases it, and no further row is claimed meanwhile."""
+    marked_id, err = db.mark_download_failed(work_id, reason, claimed_by=cli_id)
+    if err == CLAIM_LOST:
+        _cli_claim_lost(work_id)
+        return "claim_lost"
+    if marked_id is None:
+        # Success is the returned row id: an error text can be empty (RAISE(ABORT, '')).
+        detail = err or "mark_download_failed returned no row"
+        raise click.ClickException(f"Work {work_id}: could not mark the download failed ({detail}); stopping.")
+    return "failed"
+
+
+def _cli_download_row(db, enhancer, row, download_dir, cli_id) -> str:
+    """Download one claimed row; returns 'downloaded', 'failed', 'duplicate' or 'claim_lost'."""
+    # Correctly parse author data from the database row, prioritizing rich JSON
+    author_structs = []
+    author_names_for_display = []
+
+    # 1. Try to get authors from the full OpenAlex JSON first
+    openalex_json_str = row.get('openalex_json')
+    if openalex_json_str:
+        try:
+            openalex_data = json.loads(openalex_json_str)
+            if openalex_data and 'authorships' in openalex_data:
+                for authorship in openalex_data['authorships']:
+                    author_name = authorship.get('author', {}).get('display_name')
+                    if author_name:
+                        author_names_for_display.append(author_name)
+                        # Also populate author_structs for the downloader, which needs 'family' for LibGen
+                        name_parts = author_name.split()
+                        author_structs.append({
+                            'raw': author_name,
+                            'family': name_parts[-1] if name_parts else ''
+                        })
+        except (json.JSONDecodeError, TypeError):
+            pass # Fallback to simple authors field if JSON is malformed
+
+    # 2. Fallback to the basic 'authors' column if OpenAlex data was not available or failed
+    if not author_structs:
+        try:
+            authors_json = row.get('authors')
+            if authors_json:
+                loaded_json = json.loads(authors_json)
+                if isinstance(loaded_json, list):
+                    author_structs = loaded_json  # Assume it's a list of dicts with 'family', 'given'
+                    for author in author_structs:
+                        if isinstance(author, dict):
+                            given = author.get('given', '')
+                            family = author.get('family', '')
+                            if family:
+                                author_names_for_display.append(f"{given} {family}".strip())
+        except (json.JSONDecodeError, TypeError):
+            pass # Keep lists empty if data is malformed
+
+    # Drop the row only into a matching work that is already downloaded (the daemon's rule).
+    dup_table, dup_id, dup_field = db.find_downloaded_duplicate(row, author_structs or row.get('authors'))
+    if dup_table == 'works' and dup_id is not None:
+        merged, msg = db.merge_duplicate_queued_work(row['id'], dup_table, dup_id, dup_field, claimed_by=cli_id)
+        if msg == CLAIM_LOST:
+            _cli_claim_lost(row['id'])
+            return "claim_lost"
+        if merged:
             click.echo(f"  ↺ duplicate detected: {msg}")
-            continue
+            return "duplicate"
+        if msg != "duplicate_target_gone":
+            click.echo(f"  ✗ duplicate merge failed: {msg}")
+            return _cli_mark_failed(db, row['id'], 'duplicate_merge_failed', cli_id)
 
-        # Update the user on progress
-        click.echo(f"\n[QID {row['id']}] {row['title'][:80]}")
-        click.echo(f"Authors: {', '.join(author_names_for_display) if author_names_for_display else 'N/A'}")
-        click.echo(f"Year: {row.get('year', 'N/A')}")
+    # Update the user on progress
+    click.echo(f"\n[QID {row['id']}] {(row.get('title') or '')[:80]}")
+    click.echo(f"Authors: {', '.join(author_names_for_display) if author_names_for_display else 'N/A'}")
+    click.echo(f"Year: {row.get('year', 'N/A')}")
 
-        ref = {
-            'title': row.get('title'),
-            'authors': author_structs,  # Pass the structured data for searching
-            'doi': row.get('doi'),
-            'type': row.get('type') or row.get('entry_type') or '',
-            'year': row.get('year'),
-            'open_access_url': row.get('url_source') or row.get('url'),
-            'openalex_json': row.get('openalex_json'),
-        }
+    ref = {
+        'title': row.get('title'),
+        'authors': author_structs,  # Pass the structured data for searching
+        'doi': row.get('doi'),
+        'type': row.get('type') or row.get('entry_type') or '',
+        'year': row.get('year'),
+        'open_access_url': row.get('url_source') or row.get('url'),
+        'openalex_json': row.get('openalex_json'),
+    }
 
-        result, checksum, _trace = download_ref(enhancer, copy.deepcopy(ref), download_dir)
-        if result is not None:
-            fp = result['downloaded_file']
-            db.move_entry_to_downloaded(row['id'], result, fp, checksum, result.get('download_source', 'unknown'))
-            click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
-            ok += 1
-        else:
-            db.mark_download_failed(row['id'], 'download_failed')
+    attempt_ref = copy.deepcopy(ref)
+    part_path = None
+    try:
+        result, checksum, _trace = download_ref(
+            enhancer, attempt_ref, download_dir, part_suffix=f".part-{secrets.token_hex(4)}"
+        )
+        if result is None:
+            if _cli_mark_failed(db, row['id'], 'download_failed', cli_id) == "claim_lost":
+                return "claim_lost"
             click.echo("  ✗ download failed")
-            failed += 1
-
-    click.echo(f"\nWorker finished: {ok} downloaded, {failed} failed.")
-    db.close_connection()
+            return "failed"
+        fp = str(result['downloaded_file'])
+        if not is_staged_path(fp):
+            # A staged request must come back staged: anything else bypasses the exclusive publish.
+            click.echo(f"  ✗ the downloader returned an unstaged file ({fp}); not recorded")
+            return _cli_mark_failed(db, row['id'], 'unstaged_download', cli_id)
+        part_path = fp
+        downloaded_id, err = db.move_entry_to_downloaded(
+            row['id'], result, fp, checksum, result.get('download_source', 'unknown'),
+            claimed_by=cli_id, part_path=part_path,
+        )
+        if err == CLAIM_LOST:
+            _cli_claim_lost(row['id'])
+            return "claim_lost"
+        if err or not downloaded_id:
+            reason = "checksum_unavailable" if err == "checksum_unavailable" else "move_to_downloaded_failed"
+            if err and err != reason:
+                reason = f"{reason}: {err}"  # store the real error (F3)
+            outcome = _cli_mark_failed(db, row['id'], reason, cli_id)
+            if outcome == "failed":
+                click.echo(f"  ✗ download not recorded: {reason}")
+            return outcome
+        click.echo(f"  ✓ downloaded via {result.get('download_source', '?')}")
+        return "downloaded"
+    finally:
+        # The staged file goes on every outcome; a published PDF is a separate hard link.
+        staged = part_path or attempt_ref.get('downloaded_file')
+        if is_staged_path(staged):
+            discard_download(staged)
 
 
 

@@ -219,8 +219,8 @@ describe('corpus sharing and multi-user isolation', () => {
       .put(`/api/corpora/${corpusId}/kantropos-assignment`)
       .set('Authorization', `Bearer ${userLogin.token}`)
       .send({ targetId: 'target-a' })
-    expect(editorWrite.status).toBe(200)
-    expect(editorWrite.body.assignment).toEqual(expect.objectContaining({ target_id: 'target-a' }))
+    expect(editorWrite.status).toBe(403)
+    expect(editorWrite.body.error).toBe('Only the global admin can assign a Kantropos corpus')
   })
 
   test('downloaded corpus files can be served from relative pdf_library paths', async () => {

@@ -14,6 +14,9 @@ import unittest
 from unittest.mock import patch
 
 
+SCRIPTS_DIR = Path(__file__).resolve().parents[2] / 'backend' / 'scripts'
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))  # upstream_update imports _bootstrap from its own folder
 SPEC = importlib.util.spec_from_file_location(
     "upstream_update", Path(__file__).resolve().parents[2] / "backend/scripts/upstream_update.py"
 )
@@ -297,6 +300,7 @@ class TextScanTests(unittest.TestCase):
         # Do not drain stderr until exit: the child really has a blocked consumer.
         code = '''
 import os, runpy, sys, threading
+sys.path.insert(0, os.path.dirname(sys.argv[1]))  # the script imports _bootstrap from its folder
 m = runpy.run_path(sys.argv[1])
 os.set_blocking(2, False)
 try:

@@ -18,6 +18,7 @@ import { listCorpus, corpusStageStatuses } from './corpusList.js';
 import { createPythonRunner } from './pythonProcess.js';
 import { tokenMailContent } from './authMail.js';
 import { getPasswordHasher } from './passwordHasher.js';
+import { createLoginLimiter } from './loginLimiter.js';
 import {
   ensureSeedSchema,
   upsertSearchRunCorpus,
@@ -1226,6 +1227,7 @@ function getCorpusRoleForUser(db, userId, corpusId) {
 // Positive integer corpus id (numeric strings accepted, as route params arrive
 // as strings), else null.
 function normalizeCorpusId(corpusId) {
+  if (typeof corpusId !== 'number' && typeof corpusId !== 'string') return null;
   if (typeof corpusId === 'string' && !/^\d+$/.test(corpusId.trim())) return null;
   const n = Number(corpusId);
   return Number.isInteger(n) && n > 0 ? n : null;
@@ -1255,10 +1257,6 @@ export function ensureLastCorpus(db, user, authConfig = resolveAuthConfig()) {
     db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(next, user.id);
   }
   return next;
-}
-
-function canConfigureCorpus(role) {
-  return role === 'owner' || role === 'editor';
 }
 
 function getKantroposTargetById(targetId) {
@@ -2807,8 +2805,9 @@ function spentTokenError() {
   return error;
 }
 
-export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
+export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimiter } = {}) {
   const app = express();
+  const signInLimiter = loginLimiter || createLoginLimiter();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
   const corpusDownloadTickets = new Map(); // token -> { userId, corpusId, itemId, expiresAt }
@@ -2946,6 +2945,19 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     if (!hasWorkerAccess(req)) {
       return res.status(403).json({ error: 'Only corpus owners or editors can change corpus data' });
     }
+    return next();
+  };
+  // The search preview and launch carry the corpus the user submitted from
+  // (FE-62): a corpus switch saved meanwhile must not move the search. The
+  // caller's access to that corpus is then checked by requireCorpusWriteAccess.
+  const bindSubmittedCorpus = (req, res, next) => {
+    if (isStubMode()) return next();
+    const submitted = req.body?.corpusId;
+    if (submitted === undefined || submitted === null) return next();
+    const corpusId = normalizeCorpusId(submitted);
+    if (!corpusId) return res.status(400).json({ error: 'Invalid corpusId' });
+    req.corpusId = corpusId;
+    req.corpusRole = resolveCorpusRole(authDb, req.user, corpusId, authConfig);
     return next();
   };
   // Corpus-scoped readers treat a null corpusId as "all corpora", so every
@@ -3348,29 +3360,59 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
   // --- Auth endpoints ---
   app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};
-    if (!username || !password) {
+    const name = typeof username === 'string' ? username.trim() : '';
+    if (!name || typeof password !== 'string') {
       return res.status(400).json({ error: 'Missing username or password' });
     }
-    const user = authDb
-      .prepare('SELECT id, username, email, password_hash, account_status, last_corpus_id FROM users WHERE username = ?')
-      .get(username);
+    // The exact name first, so a legacy account stored with surrounding
+    // whitespace still signs in; the trimmed name only when that finds no row.
+    let user;
+    try {
+      const lookup = authDb.prepare(
+        'SELECT id, username, email, password_hash, account_status, last_corpus_id FROM users WHERE username = ?'
+      );
+      user = lookup.get(username);
+      if (!user && name !== username) user = lookup.get(name);
+    } catch (error) {
+      console.error('[auth login] User lookup failed:', error);
+      return res.status(500).json({ error: 'Login failed' });
+    }
+    // Every name gets the same 429 after the same failures. A resolved account
+    // is keyed by its id in the uncapped map (flooding junk names cannot evict
+    // it, and two rows such as 'dup' and ' dup ' never share a counter); a name
+    // with no row is keyed by the trimmed name in the capped map.
+    const gate = user
+      ? signInLimiter.reserve(`id:${user.id}`, { known: true })
+      : signInLimiter.reserve(name);
+    if (!gate.allowed) {
+      const minutes = Math.ceil(gate.retryAfterSeconds / 60);
+      res.set('Retry-After', String(gate.retryAfterSeconds));
+      return res.status(429).json({
+        error: `Too many failed sign-ins for this account. Try again in ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}.`,
+      });
+    }
     if (user?.account_status === 'invited') {
+      signInLimiter.fail(gate.ticket);
       return res.status(403).json({ error: 'Invitation pending. Use the link from your email to set your password.' });
     }
     if (!user) {
+      signInLimiter.fail(gate.ticket);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     let valid = false;
     try {
       valid = await getPasswordHasher().compare(password, user.password_hash);
     } catch (error) {
+      signInLimiter.refund(gate.ticket);
       if (answerHasherBusy(res, error)) return undefined;
       console.error('[auth login] Password check failed:', error);
       return res.status(500).json({ error: 'Login failed' });
     }
     if (!valid) {
+      signInLimiter.fail(gate.ticket);
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    signInLimiter.succeed(gate.ticket);
     const lastCorpusId = ensureLastCorpus(authDb, user, authConfig);
     return res.json({
       token: issueAuthToken(user, authConfig),
@@ -4160,19 +4202,22 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
 
   app.get('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusMember(corpusIdFromParams), (req, res) => {
     const corpusId = Number(req.params.id);
-    const role = req.corpusRole;
     return res.json({
       assignment: getCorpusKantroposAssignment(authDb, corpusId),
       corpora: KANTROPOS_TARGETS,
       root_path: KANTROPOS_CORPORA_ROOT,
-      can_edit: canConfigureCorpus(role) || role === 'admin',
+      can_edit: isAdminUser(req.user, authConfig),
     });
   });
 
-  const requireCorpusConfigurer = requireCorpusRole(['owner', 'editor'], corpusIdFromParams, {
-    forbiddenError: 'Only corpus owners, editors, or the global admin can assign a Kantropos corpus',
+  // Only the admin assigns a Kantropos corpus (BE-19): an assignment grants the
+  // corpus's owners and editors rights on the target (canUseKantroposTarget).
+  // With no roles listed, only the corpus role 'admin' passes; a non-member
+  // still gets 'No access to this corpus' first.
+  const requireKantroposAssigner = requireCorpusRole([], corpusIdFromParams, {
+    forbiddenError: 'Only the global admin can assign a Kantropos corpus',
   });
-  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireCorpusConfigurer, (req, res) => {
+  app.put('/api/corpora/:id/kantropos-assignment', requireAuthMiddleware, requireKantroposAssigner, (req, res) => {
     const corpusId = Number(req.params.id);
     const nextTargetIdRaw = req.body?.targetId;
     const nextTargetId = nextTargetIdRaw === null || nextTargetIdRaw === undefined || nextTargetIdRaw === ''
@@ -4840,7 +4885,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
 
   // Legacy `/api/bibliographies/consolidate` endpoint removed (DB-first pipeline).
 
-  app.post('/api/keyword-search/preview', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+  app.post('/api/keyword-search/preview', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, async (req, res) => {
     const built = buildKeywordSearchArgs(req);
     if (built.error) return res.status(400).json({ error: built.error });
     const threshold = searchWarnThreshold();
@@ -4851,7 +4896,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     try {
       const payload = await runPythonJson(KEYWORD_SEARCH_SCRIPT, [...built.args, '--count-only'], { dbPath: DB_PATH, corpusId: req.corpusId });
       return res.json({
-        count: Number(payload?.count || 0),
+        // An unknown count stays null, never 0: the frontend then asks first (FE-55).
+        count: Number.isInteger(payload?.count) && payload.count >= 0 ? payload.count : null,
         threshold,
         creditsPerPage: Number(payload?.credits_per_page) > 0 ? Number(payload.credits_per_page) : creditsPerPage,
       });
@@ -4862,7 +4908,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport } = {}) {
     }
   });
 
-  app.post('/api/keyword-search', requireAuthMiddleware, requireCorpusWriteAccess, (req, res) => {
+  app.post('/api/keyword-search', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, (req, res) => {
     const built = buildKeywordSearchArgs(req);
     if (built.error) return res.status(400).json({ error: built.error });
     if (process.env.RAG_FEEDER_STUB === '1') {

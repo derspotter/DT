@@ -350,8 +350,12 @@ def count_openalex(query: str,
                    mailto: str | None = None,
                    field: str | None = "default",
                    author: str | None = None,
-                   topics=None) -> int:
-    """How many works the same search would return. One request, per-page=1."""
+                   topics=None) -> int | None:
+    """How many works the same search would return. One request, per-page=1.
+
+    None when the answer has no valid ``meta.count`` (a non-negative integer): an unknown
+    count must not read as 0, which would skip the large-search confirmation (FE-55).
+    """
     try:
         params, _ = _build_search_params(query, year_from, year_to, mailto, field, author, sort=None, topics=topics)
     except _NoAuthorMatch:
@@ -359,7 +363,11 @@ def count_openalex(query: str,
     params["per-page"] = 1
     params["select"] = "id"  # only meta.count is read; skip the full-record payload
     data = _openalex_request('works', params, get_global_rate_limiter())
-    return int((data.get("meta") or {}).get("count") or 0)
+    meta = data.get("meta") if isinstance(data, dict) else None
+    count = meta.get("count") if isinstance(meta, dict) else None
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        return count
+    return None
 
 
 openalex_result_to_record = openalex_work_to_record  # former name, kept for callers and tests

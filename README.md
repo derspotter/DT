@@ -27,7 +27,7 @@ Supported daemon job types in current code:
 
 ### Access model
 
-- Read access to a corpus needs any `user_corpora` row for it or the global admin (`RAG_ADMIN_USER`). Configuring a corpus (share, delete) needs the owner or admin; Kantropos assignment needs owner/editor or admin. Admin passes every check.
+- Read access to a corpus needs any `user_corpora` row for it or the global admin (`RAG_ADMIN_USER`). Configuring a corpus (share, delete) needs the owner or admin; Kantropos assignment needs the admin. Admin passes every check.
 - Each request re-validates the user's current corpus (`last_corpus_id`) against current membership. A revoked member falls back to their newest remaining corpus, or to none; corpus-scoped reads then answer 403 `Select a corpus first`.
 - Non-member access to an explicit corpus answers 403 `No access to this corpus`; admin-only routes answer 403 `Admin access required`. The app log (`/api/logs/tail?type=app`) and the merged all-corpora graph are admin-only; graph nodes outside the user's corpora answer 404.
 - Scraper apply into a Kantropos target needs admin or owner/editor of a corpus assigned to it. Kantropos browsing is open to all logged-in users.

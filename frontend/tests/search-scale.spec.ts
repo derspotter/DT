@@ -261,6 +261,233 @@ test('Reset clears the warning instead of leaving stale "Cap at" / "Fetch all" a
   expect(searchRequests).toBe(0)
 })
 
+// FE-55 (spec D8): a preview that fails asks before starting; every
+// confirmation starts the body that was submitted; Reset, an edit, a sign-out
+// or a corpus switch drop a preview still on its way.
+function heldAnswer() {
+  let release: (value: { status: number, body: any }) => void = () => {}
+  const promise = new Promise<{ status: number, body: any }>((resolve) => { release = resolve })
+  return { promise, release }
+}
+
+type PreviewAnswer = { status: number, body: any } | Promise<{ status: number, body: any }>
+
+async function routeSearch(page: import('@playwright/test').Page, answers: PreviewAnswer[]) {
+  const seen = { previews: 0, previewBodies: [] as any[], searchBodies: [] as any[] }
+  await page.addInitScript(() => window.localStorage.setItem('rag_feeder_token', 'playwright-token'))
+  await page.route('**/api/**', async (route) => {
+    const pathname = new URL(route.request().url()).pathname
+    if (pathname === '/api/keyword-search/preview') {
+      seen.previewBodies.push(route.request().postDataJSON())
+      const answer = await (answers[seen.previews++] ?? answers[answers.length - 1])
+      return route.fulfill({ status: answer.status, contentType: 'application/json', body: JSON.stringify(answer.body) })
+    }
+    if (pathname === '/api/keyword-search' && route.request().method() === 'POST') {
+      seen.searchBodies.push(route.request().postDataJSON())
+      return route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify({ runId: 55, status: 'running' }) })
+    }
+    return mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  const card = page.locator('.seed-intake-card--search')
+  return {
+    seen,
+    card,
+    query: card.getByRole('textbox', { name: 'Query' }),
+    maxResults: card.getByRole('spinbutton', { name: 'Max results' }),
+    searchButton: card.getByRole('button', { name: 'Search', exact: true }),
+    status: card.locator('.seed-search-footer > p.muted'),
+    warning: page.getByTestId('search-warning'),
+  }
+}
+
+const previewTimeout = { status: 502, body: { error: 'OpenAlex timed out' } }
+const previewLarge = { status: 200, body: { count: 342118, threshold: 100000 } }
+
+test('a failed preview asks before starting, and "Search anyway" starts the submitted search', async ({ page }) => {
+  const ui = await routeSearch(page, [previewTimeout])
+  await ui.query.fill('climate')
+  await ui.maxResults.fill('0')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('Could not check how many works match (OpenAlex timed out).')
+  await expect(ui.warning).toContainText('This search has no cap, so it may fetch a very large number of works.')
+  await expect(ui.warning).toContainText('Narrow the query, or:')
+  expect(ui.seen.searchBodies).toHaveLength(0)
+  await ui.warning.getByRole('button', { name: 'Search anyway' }).click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  expect(ui.seen.searchBodies[0].maxResults).toBe(0)
+  expect(ui.seen.searchBodies[0].query).toBe('climate')
+  await expect(ui.status).toContainText('Fetching in the background')
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+})
+
+test('the unknown-count warning names the cap', async ({ page }) => {
+  const ui = await routeSearch(page, [previewTimeout])
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('This search stops at 50 works.')
+  await ui.maxResults.fill('2500')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('This search stops at 2,500 works.')
+  expect(ui.seen.searchBodies).toHaveLength(0)
+})
+
+test('Enter while the unknown-count warning shows runs the preview again, not the search', async ({ page }) => {
+  const ui = await routeSearch(page, [previewTimeout, previewTimeout])
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('Could not check how many works match')
+  await ui.query.press('Enter')
+  await expect.poll(() => ui.seen.previews).toBe(2)
+  await expect(ui.warning).toContainText('Could not check how many works match (OpenAlex timed out).')
+  expect(ui.seen.searchBodies).toHaveLength(0)
+})
+
+test('Reset clears the unknown-count warning', async ({ page }) => {
+  const ui = await routeSearch(page, [previewTimeout])
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('Could not check how many works match')
+  await ui.card.getByRole('button', { name: 'Reset' }).click()
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+  await expect(ui.status).toHaveText('')
+  expect(ui.seen.searchBodies).toHaveLength(0)
+})
+
+for (const late of [previewTimeout, previewLarge]) {
+  test(`a preview answering after Reset shows nothing and starts nothing (${late.status})`, async ({ page }) => {
+    const held = heldAnswer()
+    const ui = await routeSearch(page, [held.promise])
+    await ui.query.fill('climate')
+    await ui.searchButton.click()
+    await expect.poll(() => ui.seen.previews).toBe(1)
+    await ui.card.getByRole('button', { name: 'Reset' }).click()
+    await expect(ui.searchButton).toBeEnabled()
+    held.release(late)
+    // Let the late answer arrive and settle.
+    await page.waitForTimeout(300)
+    await expect(page.getByTestId('search-warning')).toHaveCount(0)
+    await expect(page.getByTestId('search-preview')).toHaveCount(0)
+    await expect(ui.status).toHaveText('')
+    expect(ui.seen.searchBodies).toHaveLength(0)
+  })
+}
+
+test('an edit withdraws the warning, and a late preview for the edited form is dropped', async ({ page }) => {
+  const held = heldAnswer()
+  const ui = await routeSearch(page, [previewTimeout, held.promise])
+  // (a) A shown warning goes on the first edit.
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('Could not check how many works match')
+  await ui.query.fill('climate change')
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+  // (b) A preview still on its way when the form changes is dropped.
+  await ui.searchButton.click()
+  await expect.poll(() => ui.seen.previews).toBe(2)
+  await ui.query.fill('climate policy')
+  held.release(previewTimeout)
+  await page.waitForTimeout(300)
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+  expect(ui.seen.searchBodies).toHaveLength(0)
+})
+
+test('an edited search submitted before the previous preview returns owns the button and the result', async ({ page }) => {
+  const held = heldAnswer()
+  const ui = await routeSearch(page, [held.promise, previewTimeout])
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect.poll(() => ui.seen.previews).toBe(1)
+  await expect(ui.searchButton).toBeDisabled()
+  await expect(ui.status).toHaveText('Checking how many works match...')
+  await ui.query.fill('climate policy')
+  await expect(ui.searchButton).toBeEnabled()
+  await expect(ui.status).not.toHaveText('Checking how many works match...')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('Could not check how many works match (OpenAlex timed out).')
+  held.release(previewLarge)
+  await page.waitForTimeout(300)
+  await expect(ui.warning).toContainText('Could not check how many works match (OpenAlex timed out).')
+  await expect(ui.warning).not.toContainText('This search matches')
+  expect(ui.seen.searchBodies).toHaveLength(0)
+  await ui.warning.getByRole('button', { name: 'Search anyway' }).click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  expect(ui.seen.searchBodies[0].query).toBe('climate policy')
+})
+
+test('"Cap at" starts the submitted body with only the cap replaced', async ({ page }) => {
+  const ui = await routeSearch(page, [previewLarge])
+  await ui.query.fill('economics')
+  await ui.maxResults.fill('0')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('This search matches 342,118 works')
+  // Move the live form away from the submitted search without an `input`
+  // event (the Sort select binds on `change`), so the confirmation stays open:
+  // a button that rebuilt the body from the fields would send 'newest'.
+  await ui.card.getByRole('combobox', { name: 'Sort' }).evaluate((select: HTMLSelectElement) => {
+    select.value = 'newest'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await expect(ui.warning).toContainText('This search matches 342,118 works')
+  await ui.warning.getByRole('button', { name: 'Cap at 10,000' }).click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  const submitted = ui.seen.previewBodies[0]
+  expect(submitted).toMatchObject({ query: 'economics', maxResults: 0, sort: 'relevance' })
+  // The launch wrapper adds `enqueue: false`; every other field is the submitted one.
+  expect(ui.seen.searchBodies[0]).toEqual({ ...submitted, maxResults: 10000, enqueue: false })
+})
+
+// FE-55: a preview without a valid count is unknown, never 0.
+for (const body of [{ count: null, threshold: 100000 }, { threshold: 100000 }]) {
+  test(`a preview without a count (${JSON.stringify(body)}) asks before starting`, async ({ page }) => {
+    const ui = await routeSearch(page, [{ status: 200, body }])
+    await ui.query.fill('climate')
+    await ui.maxResults.fill('0')
+    await ui.searchButton.click()
+    await expect(ui.warning).toContainText('Could not check how many works match (the server reported no count).')
+    await expect(ui.warning).toContainText('This search has no cap, so it may fetch a very large number of works.')
+    await page.waitForTimeout(200)
+    expect(ui.seen.searchBodies).toHaveLength(0)
+    await ui.warning.getByRole('button', { name: 'Search anyway' }).click()
+    await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  })
+}
+
+test('a genuine zero count starts the search without asking', async ({ page }) => {
+  const ui = await routeSearch(page, [{ status: 200, body: { count: 0, threshold: 100000 } }])
+  await ui.query.fill('climate')
+  await ui.searchButton.click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  await expect(page.getByTestId('search-warning')).toHaveCount(0)
+})
+
+// FE-55 minor: a threshold below 10 never offers "Cap at 0", which the
+// backend would read as no cap.
+test('"Cap at" never goes below 1', async ({ page }) => {
+  const ui = await routeSearch(page, [{ status: 200, body: { count: 50, threshold: 5 } }])
+  await ui.query.fill('climate')
+  await ui.maxResults.fill('0')
+  await ui.searchButton.click()
+  await expect(ui.warning).toContainText('This search matches 50 works')
+  await expect(ui.warning.getByRole('button', { name: 'Cap at 0' })).toHaveCount(0)
+  await ui.warning.getByRole('button', { name: 'Cap at 1', exact: true }).click()
+  await expect.poll(() => ui.seen.searchBodies.length).toBe(1)
+  expect(ui.seen.searchBodies[0].maxResults).toBe(1)
+})
+
+for (const status of [400, 403]) {
+  test(`a ${status} preview shows its message and starts nothing`, async ({ page }) => {
+    const ui = await routeSearch(page, [{ status, body: { error: 'denied or invalid' } }])
+    await ui.query.fill('climate')
+    await ui.searchButton.click()
+    await expect(ui.status).toHaveText('denied or invalid')
+    await expect(page.getByTestId('search-warning')).toHaveCount(0)
+    await page.waitForTimeout(200)
+    expect(ui.seen.searchBodies).toHaveLength(0)
+    await expect(ui.searchButton).toBeEnabled()
+  })
+}
+
 function makeSeedCandidates(count: number, startIndex = 0) {
   return Array.from({ length: count }, (_, i) => {
     const n = startIndex + i

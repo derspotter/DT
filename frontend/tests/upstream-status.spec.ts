@@ -24,6 +24,7 @@ async function boot(page: Page, {
   targets = [{ id: 'k1', name: 'Kantropos One' }],
   targetsAnswer = null as Answer | null,
   browseAnswers = [] as Answer[],
+  admin = false,
 } = {}) {
   const counts = { browse: 0, targets: 0 }
   await mockLogSocket(page)
@@ -32,14 +33,14 @@ async function boot(page: Page, {
   })
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
-    if (path === '/api/auth/me') return fulfil(route, mePayload({ admin: false, username: 'reader' }))
+    if (path === '/api/auth/me') return fulfil(route, mePayload({ admin, username: admin ? 'admin' : 'reader' }))
     if (path === '/api/kantropos/corpora') {
       counts.targets += 1
       if (targetsAnswer) return fulfil(route, { error: targetsAnswer.error }, targetsAnswer.status)
       return fulfil(route, { corpora: targets })
     }
     if (path === '/api/corpora/1/kantropos-assignment') {
-      return fulfil(route, { assignment: null, corpora: targetsAnswer ? null : targets, can_edit: true })
+      return fulfil(route, { assignment: null, corpora: targetsAnswer ? null : targets, can_edit: admin })
     }
     if (path === '/api/kantropos/corpora/k1/browse') {
       counts.browse += 1
@@ -103,4 +104,22 @@ test('a failed quiet refresh keeps the data and says it is stale', async ({ page
   await expect(statusLine(page)).toHaveText('Could not load the upstream corpus: busy. Showing the last loaded data.')
   await expect(page.getByText('Pending Work Alpha')).toBeVisible()
   await expect(page.getByTestId('upstream-retry')).toBeVisible()
+})
+
+// BE-19 (spec D9): the assignment PUT is admin-only, so the control is too;
+// a corpus owner who is not the admin sees it disabled, with the reason.
+test('a non-admin owner cannot change the Kantropos assignment', async ({ page }) => {
+  await boot(page, { admin: false })
+  await expect(page.getByText('Pending Work Alpha')).toBeVisible()
+  const select = page.getByRole('combobox', { name: 'Upstream target' })
+  await expect(select).toBeDisabled()
+  await expect(select).toHaveAttribute('title', 'Only admins can change the Kantropos assignment')
+})
+
+test('the admin can change the Kantropos assignment', async ({ page }) => {
+  await boot(page, { admin: true })
+  await expect(page.getByText('Pending Work Alpha')).toBeVisible()
+  const select = page.getByRole('combobox', { name: 'Upstream target' })
+  await expect(select).toBeEnabled()
+  await expect(select).toHaveAttribute('title', 'Assign this local corpus to a predefined Kantropos corpus')
 })

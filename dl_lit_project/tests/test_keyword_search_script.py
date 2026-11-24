@@ -88,6 +88,14 @@ def test_count_only(monkeypatch, tmp_path, capsys):
     assert _events(capsys)[-1] == {"count": 342118, "credits_per_page": 10}
 
 
+def test_count_only_passes_an_unknown_count_as_null(monkeypatch, tmp_path, capsys):
+    mod = _load(monkeypatch)
+    monkeypatch.setattr(mod, "count_openalex", lambda **kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["x", "--db-path", str(tmp_path / "t.db"), "--query", "q", "--count-only"])
+    mod.main()
+    assert _events(capsys)[-1] == {"count": None, "credits_per_page": 10}
+
+
 def test_sigterm_marks_cancelled_and_exits_zero(monkeypatch, tmp_path, capsys):
     mod = _load(monkeypatch)
 

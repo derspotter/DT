@@ -2,10 +2,23 @@ import argparse
 import json
 import os
 import re
+import secrets
 import sqlite3
+import sys
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+
+from _bootstrap import ensure_import_paths
+
+ensure_import_paths(__file__)
+ROOT = Path(__file__).resolve().parents[2]
+DL_LIT_PROJECT = ROOT / "dl_lit_project"
+if str(DL_LIT_PROJECT) not in sys.path:
+    sys.path.insert(0, str(DL_LIT_PROJECT))
+
+from dl_lit.identifiers import normalize_doi  # noqa: E402
 
 
 VALID_STATUSES = {
@@ -17,19 +30,6 @@ VALID_STATUSES = {
     "failed_download",
     "enriching",
 }
-
-
-def _normalize_doi(value):
-    """Lowercase, drop an http(s) doi.org URL or ``doi:`` prefix; no trim of ``.;,``.
-
-    Deliberately not a dl_lit.identifiers rule: it matches none of them (see test_identifiers).
-    """
-    if not value:
-        return None
-    text = str(value).strip().lower()
-    text = re.sub(r"^(https?://(dx\.)?doi\.org/)", "", text)
-    text = re.sub(r"^doi:\s*", "", text)
-    return text or None
 
 
 def normalize_text(value):
@@ -125,7 +125,7 @@ def load_items(conn: sqlite3.Connection, corpus_id: int | None):
             "authors": parse_authors(data.get("authors")),
             "year": data.get("year"),
             "doi": data.get("doi"),
-            "normalized_doi": _normalize_doi(data.get("doi") or data.get("normalized_doi")),
+            "normalized_doi": data.get("normalized_doi") or normalize_doi(data.get("doi")),
             "openalex_id": data.get("openalex_id"),
             "source": build_source(data),
             "entry_type": data.get("type") or "misc",
@@ -212,9 +212,23 @@ def render_json_payload(items):
     }
 
 
+@contextmanager
+def _created(out_path: Path, opener):
+    """Open a new export file with ``opener`` (exclusive: an existing file is another export
+    and raises before anything is created). A write that fails removes the partial file."""
+    handle = opener()
+    try:
+        with handle:
+            yield handle
+    except BaseException:
+        out_path.unlink(missing_ok=True)
+        raise
+
+
 def write_json_export(items, out_path: Path):
-    payload = render_json_payload(items)
-    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    text = json.dumps(render_json_payload(items), ensure_ascii=False, indent=2)  # render before creating the file
+    with _created(out_path, lambda: out_path.open("x", encoding="utf-8")) as fh:  # never overwrite another export
+        fh.write(text)
     return {"exported_count": len(items)}
 
 
@@ -224,7 +238,9 @@ def render_bibtex_text(items):
 
 
 def write_bibtex_export(items, out_path: Path):
-    out_path.write_text(render_bibtex_text(items), encoding="utf-8")
+    text = render_bibtex_text(items)  # render before creating the file
+    with _created(out_path, lambda: out_path.open("x", encoding="utf-8")) as fh:  # never overwrite another export
+        fh.write(text)
     return {"exported_count": len([item for item in items if item.get("title")])}
 
 
@@ -245,7 +261,7 @@ def collect_pdf_files(items):
 
 def write_pdf_zip(items, out_path: Path):
     files, missing = collect_pdf_files(items)
-    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with _created(out_path, lambda: zipfile.ZipFile(out_path, "x", compression=zipfile.ZIP_DEFLATED)) as zf:
         for item, pdf_path in files:
             zf.write(pdf_path, arcname=pdf_path.name)
     return {"exported_count": len(files), "missing_files": missing}
@@ -255,7 +271,7 @@ def write_bundle_zip(items, out_path: Path):
     files, missing = collect_pdf_files(items)
     json_payload = json.dumps(render_json_payload(items), ensure_ascii=False, indent=2)
     bibtex_text = render_bibtex_text(items)
-    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with _created(out_path, lambda: zipfile.ZipFile(out_path, "x", compression=zipfile.ZIP_DEFLATED)) as zf:
         zf.writestr("metadata.json", json_payload)
         zf.writestr("references.bib", bibtex_text)
         for item, pdf_path in files:
@@ -315,8 +331,11 @@ def main():
         "pdfs_zip": ".zip",
         "bundle_zip": ".zip",
     }
-    filename = f"export_{timestamp}{suffix_map[args.format]}"
-    out_path = out_dir / filename
+    ext = suffix_map[args.format]
+    # The download name stays export_<timestamp><ext>; the file on disk gets a
+    # random suffix so two exports in the same second never share a path (BE-53).
+    filename = f"export_{timestamp}{ext}"
+    out_path = out_dir / f"export_{timestamp}_{secrets.token_hex(4)}{ext}"
 
     if args.format == "json":
         stats = write_json_export(items, out_path)

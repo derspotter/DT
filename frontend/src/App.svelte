@@ -322,7 +322,11 @@
   let searchStatus = ''
   let searchPreview = null
   let searchWarning = false
-  let searchPreviewBusy = false
+  // The preview's error message when it could not count the matches (D8).
+  let searchPreviewError = ''
+  // The submitted search: `{ body, previewing }`. Its identity is the
+  // request's identity; an edit, Reset, a sign-out or a corpus switch drop it.
+  let searchRequest = null
   // Topic field (OpenAlex topics, ~4,500 of them). A topic-only run is a pure
   // filter listing and costs 1 credit a page instead of 10 for text search.
   let searchTopics = []
@@ -549,7 +553,7 @@
   // Load settings the first time an admin opens the Admin tab.
   $: if (activeTab === 'admin' && isAdmin && appSettings === null) loadAppSettings()
   $: canDeleteCurrentCorpus = Boolean(currentCorpusId && currentCorpus?.role === 'owner')
-  $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && (isAdmin || currentCorpus?.role === 'owner' || currentCorpus?.role === 'editor'))
+  $: canConfigureCurrentCorpusKantropos = Boolean(currentCorpusId && isAdmin)
   let shareUsername = ''
   let shareRole = 'viewer'
   let shareStatus = ''
@@ -2166,6 +2170,8 @@
       searchMaxResults: DEFAULT_SEARCH_MAX_RESULTS,
       searchStatus: '',
       searchPreview: null,
+      searchPreviewError: '',
+      searchRequest: null,
       searchWarning: false,
       startedSearchRunIds: new Set(),
       uploads: [],
@@ -2235,6 +2241,8 @@
       searchMaxResults,
       searchStatus,
       searchPreview,
+      searchPreviewError,
+      searchRequest,
       searchWarning,
       startedSearchRunIds,
       uploads,
@@ -2629,7 +2637,7 @@
       return
     }
     if (!canConfigureCurrentCorpusKantropos) {
-      kantroposAssignmentStatus = 'Only corpus owners, editors, or the global admin can change the Kantropos assignment.'
+      kantroposAssignmentStatus = 'Only admins can change the Kantropos assignment.'
       kantroposAssignmentError = true
       return
     }
@@ -3639,6 +3647,9 @@
       maxResults: searchResultCap(maxResults), sort: searchSort,
       includeDownstream: false, includeUpstream: false, relatedDepthDownstream: 0, relatedDepthUpstream: 0,
       maxRelated: 30,
+      // The preview and the launch run in the corpus the search was submitted
+      // from, even if a switch is saved meanwhile (FE-62).
+      corpusId: currentCorpusId,
     }
   }
 
@@ -3728,14 +3739,12 @@
     searchTopics = [...searchTopics, { id: topic.id, label: topic.label, hint: topic.hint || '', works_count: topic.works_count ?? null }]
     topicQuery = ''
     closeTopicSuggestions()
-    searchPreview = null
-    searchWarning = false
+    invalidateSearchConfirmation()
   }
 
   function removeTopic(id) {
     searchTopics = searchTopics.filter((t) => t.id !== id)
-    searchPreview = null
-    searchWarning = false
+    invalidateSearchConfirmation()
   }
 
   function closeTopicSuggestions() {
@@ -3750,8 +3759,7 @@
     closeTopicSuggestions()
     searchTopics = []
     topicQuery = ''
-    searchPreview = null
-    searchWarning = false
+    invalidateSearchConfirmation()
   }
 
   function handleTopicKeydown(event) {
@@ -3782,43 +3790,91 @@
     return `${value.toLocaleString('en-US')} works`
   }
 
-  // Submit: ask for the count first; warn above the threshold, else start.
+  const SEARCH_CHECKING_STATUS = 'Checking how many works match...'
+
+  // Drops the submitted search (D8): its preview, if still on its way, is
+  // ignored, and no warning offers to start what the form no longer says.
+  function invalidateSearchConfirmation() {
+    searchRequest = null
+    searchPreview = null
+    searchPreviewError = ''
+    searchWarning = false
+    if (searchStatus === SEARCH_CHECKING_STATUS) searchStatus = ''
+  }
+
+  // Submit: ask for the count first; warn above the threshold or when the
+  // count is unknown, else start.
   async function runSearch() {
-    // The preview takes up to a minute: a sign-out or a corpus switch meanwhile
-    // ends this search, whose form has been reset under it.
+    // The preview takes up to a minute: a sign-out, a corpus switch, Reset or
+    // an edit meanwhile ends this request.
     const session = sessionEpoch
     const scope = corpusScopeEpoch
+    const request = { body: buildSearchBody(searchMaxResults), previewing: true }
+    searchRequest = request
+    searchPreview = null
+    searchPreviewError = ''
     searchWarning = false
-    searchStatus = 'Checking how many works match...'
-    searchPreviewBusy = true
+    searchStatus = SEARCH_CHECKING_STATUS
     let preview = null
+    let previewError = ''
     try {
-      preview = await previewKeywordSearch(buildSearchBody(searchMaxResults))
+      preview = await previewKeywordSearch(request.body)
     } catch (error) {
       if (error?.status === 401) return
-      // Any other failed preview must not block the search.
-    } finally {
-      searchPreviewBusy = false
+      if (request !== searchRequest || session !== sessionEpoch || scope !== corpusScopeEpoch) return
+      if (error?.status === 400 || error?.status === 403) {
+        // The launch runs the same validation and permission check.
+        request.previewing = false
+        searchRequest = searchRequest
+        searchStatus = error.message || 'Search failed.'
+        return
+      }
+      previewError = error?.message || 'the server did not answer'
     }
-    if (session !== sessionEpoch || scope !== corpusScopeEpoch) return
-    searchPreview = preview
+    if (request !== searchRequest || session !== sessionEpoch || scope !== corpusScopeEpoch) return
+    request.previewing = false
+    searchRequest = searchRequest
     // The preview costs OpenAlex credits too.
     void refreshQuota()
+    // A missing or invalid count is unknown, never 0: ask first (FE-55).
+    if (!previewError && !(Number.isInteger(preview?.count) && preview.count >= 0)) {
+      previewError = 'the server reported no count'
+    }
+    if (previewError) {
+      searchPreview = null
+      searchPreviewError = previewError
+      searchWarning = true
+      searchStatus = ''
+      return
+    }
+    searchPreview = preview
+    searchPreviewError = ''
     const cap = searchResultCap(searchMaxResults)
     if (searchPreview && searchPreview.count >= searchPreview.threshold && (cap === 0 || cap >= searchPreview.threshold)) {
       searchWarning = true
       searchStatus = ''
       return
     }
-    await startSearch()
+    await startSearch({ body: request.body })
   }
 
-  async function startSearch({ maxResultsOverride = null } = {}) {
+  // `body` is the submitted search a confirmation starts; without one the
+  // current fields are used.
+  async function startSearch({ maxResultsOverride = null, body = null } = {}) {
     searchWarning = false
     if (maxResultsOverride !== null) searchMaxResults = maxResultsOverride
+    const requestBody = body
+      ? (maxResultsOverride !== null ? { ...body, maxResults: maxResultsOverride } : body)
+      : buildSearchBody(searchMaxResults)
+    // A search submitted under another corpus than the one now shown is
+    // dropped (FE-62): its confirmation belonged to that corpus.
+    if ((requestBody.corpusId ?? null) !== (currentCorpusId ?? null)) {
+      searchStatus = ''
+      return
+    }
     searchStatus = 'Starting search...'
     try {
-      const { data, expansion, runId, running } = await runKeywordSearch(buildSearchBody(searchMaxResults))
+      const { data, expansion, runId, running } = await runKeywordSearch(requestBody)
       void refreshQuota()
       if (runId && running) {
         // Start polling on the 202 itself; the seed list may not report this
@@ -3850,9 +3906,8 @@
     searchMaxResults = DEFAULT_SEARCH_MAX_RESULTS
     searchSort = 'relevance'
     resetTopicSearch()
+    invalidateSearchConfirmation()
     searchStatus = ''
-    searchPreview = null
-    searchWarning = false
   }
 
   function corpusPageSignature(data, total, stageTotals) {
@@ -4091,6 +4146,14 @@
     }
   }
 
+  // A worker's error heartbeat as the text the admin reads, not as JSON (D10).
+  function workerErrorText(details) {
+    for (const value of [details?.error, details?.message, details?.state]) {
+      if (typeof value === 'string' && value.trim()) return value
+    }
+    return JSON.stringify(details || {})
+  }
+
   async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
     if (global) return loadGlobalWorkerBacklog()
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
@@ -4111,7 +4174,7 @@
         started_at: enrich.last_seen_at || null,
         last_tick_at: enrich.last_seen_at || null,
         last_result: enrich.details || null,
-        last_error: enrich.status === 'error' ? JSON.stringify(enrich.details || {}) : null,
+        last_error: enrich.status === 'error' ? workerErrorText(enrich.details) : null,
       }
       downloadWorker = {
         ...downloadWorker,
@@ -4120,7 +4183,7 @@
         started_at: download.last_seen_at || null,
         last_tick_at: download.last_seen_at || null,
         last_result: download.details || null,
-        last_error: download.status === 'error' ? JSON.stringify(download.details || {}) : null,
+        last_error: download.status === 'error' ? workerErrorText(download.details) : null,
         queued_download_items: Number(workerBacklog?.queued_download || 0),
         running_jobs: Number(workerBacklog?.downloading || 0),
       }
@@ -5069,7 +5132,7 @@
                   title="Daily OpenAlex API budget as reported by the last request"
                 >{openalexQuotaView.text}</span>
               </div>
-              <form class="seed-search-form" on:submit|preventDefault={runSearch}>
+              <form class="seed-search-form" on:submit|preventDefault={runSearch} on:input={invalidateSearchConfirmation}>
                 <div class="seed-search-row">
                   <label class="seed-search-main">
                     <span>Query</span>
@@ -5162,20 +5225,30 @@
                     {/if}
                     {#if searchWarning && searchPreview}
                       {@const est = searchEstimate(searchPreview.count, openalexQuota, creditsPerPageFor(searchPreview))}
+                      {@const warnCap = Math.max(1, Math.floor(searchPreview.threshold / 10))}
                       <div class="search-warning" role="alert" data-testid="search-warning">
                         <p>This search matches {searchPreview.count.toLocaleString('en-US')} works. Fetching all of them takes about {est.requests.toLocaleString('en-US')} OpenAlex requests ({est.credits.toLocaleString('en-US')} credits) and {est.duration}.{#if est.budgetSentence} {est.budgetSentence}{/if} Narrow the query, or:</p>
                         <div class="search-warning__actions">
-                          <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: Math.floor(searchPreview.threshold / 10) })}>Cap at {Math.floor(searchPreview.threshold / 10).toLocaleString('en-US')}</button>
+                          <button class="secondary" type="button" on:click={() => startSearch({ maxResultsOverride: warnCap, body: searchRequest?.body })}>Cap at {warnCap.toLocaleString('en-US')}</button>
                           {#if est.canCapAtBudget}
-                            <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.capAtBudget })}>Cap at budget</button>
+                            <button class="secondary" type="button" data-testid="search-cap-at-budget" on:click={() => startSearch({ maxResultsOverride: est.capAtBudget, body: searchRequest?.body })}>Cap at budget</button>
                           {/if}
-                          <button class="primary" type="button" on:click={() => startSearch()}>Fetch all {searchPreview.count.toLocaleString('en-US')}</button>
+                          <button class="primary" type="button" on:click={() => startSearch({ body: searchRequest?.body })}>Fetch all {searchPreview.count.toLocaleString('en-US')}</button>
+                        </div>
+                      </div>
+                    {/if}
+                    {#if searchWarning && !searchPreview && searchPreviewError}
+                      {@const unknownCap = searchResultCap(searchMaxResults)}
+                      <div class="search-warning" role="alert" data-testid="search-warning">
+                        <p>Could not check how many works match ({searchPreviewError}). {#if unknownCap === 0}This search has no cap, so it may fetch a very large number of works.{:else}This search stops at {unknownCap.toLocaleString('en-US')} works.{/if} Narrow the query, or:</p>
+                        <div class="search-warning__actions">
+                          <button class="primary" type="button" on:click={() => startSearch({ body: searchRequest?.body })}>Search anyway</button>
                         </div>
                       </div>
                     {/if}
                     <div class="seed-search-actions">
                       <button class="secondary" type="button" on:click={resetSearchForm}>Reset</button>
-                      <button class="primary" type="submit" disabled={searchPreviewBusy}>Search</button>
+                      <button class="primary" type="submit" disabled={searchRequest?.previewing}>Search</button>
                     </div>
                   </div>
                 </div>

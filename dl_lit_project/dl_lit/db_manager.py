@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dl_lit.identifiers import inverted_index_to_text, normalize_doi, normalize_openalex_id
 from dl_lit.utils import parse_bibtex_file_field
+from dl_lit.download_path import publish_download, remove_published
 
 # ANSI escape codes for colors
 GREEN = "\033[92m"
@@ -15,6 +16,21 @@ YELLOW = "\033[93m"
 BLUE = "\033[94m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
+
+# A writer given claimed_by= returns (None | False, CLAIM_LOST) when the row is no longer
+# in_progress with that owner; it then writes nothing.
+CLAIM_LOST = "claim_lost"
+# The claim columns of each phase: (status column, claimed_by column).
+_CLAIM_COLUMNS = {
+    "download": ("download_status", "download_claimed_by"),
+    "enrich": ("metadata_status", "metadata_claimed_by"),
+}
+
+# Claim bookkeeping of a row: never merged from a duplicate into its canonical.
+_CLAIM_STATE_COLUMNS = (
+    "download_claimed_by", "download_claimed_at", "download_lease_expires_at",
+    "metadata_claimed_by", "metadata_claimed_at", "metadata_lease_expires_at",
+)
 
 # Bulk imports commit every this many entries, so no write lock is held for a whole file
 # (the workers' heartbeats and claims wait at most one chunk).
@@ -745,10 +761,16 @@ class DatabaseManager:
             "status_notes": ref.get("status_notes"),
         }
 
-    def mark_metadata_failed(self, work_id: int, reason: str) -> tuple[int | None, str | None]:
-        """Mark a canonical work as failed during metadata enrichment."""
+    def mark_metadata_failed(self, work_id: int, reason: str, *, claimed_by: str | None = None) -> tuple[int | None, str | None]:
+        """Mark a canonical work as failed during metadata enrichment.
+
+        With ``claimed_by`` it writes only while that owner holds the metadata claim.
+        """
         cur = self.conn.cursor()
+        self._refuse_open_transaction(claimed_by)
         try:
+            if claimed_by is not None and not self._begin_owned("enrich", work_id, claimed_by):
+                return None, CLAIM_LOST
             cur.execute(
                 """UPDATE works
                    SET metadata_status = 'failed',
@@ -764,6 +786,8 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.conn.rollback()
             return None, str(e)
+        finally:
+            self._end_owned(claimed_by)
 
     def _clean_string_value(self, value: str | None) -> str | None:
         """Strips leading/trailing curly braces from a string value."""
@@ -1575,12 +1599,23 @@ class DatabaseManager:
         self,
         work_id: int,
         enrichment: dict,
+        *,
+        claimed_by: str | None = None,
     ) -> tuple[int | None, str | None]:
-        """Update a pending work with enriched metadata."""
+        """Update a pending work with enriched metadata.
+
+        With ``claimed_by`` the claim check is the first statement of the transaction, which
+        this call must own: joining a caller's open transaction could let the caller commit a
+        partial absorption after this call returned its error.
+        """
+        if claimed_by is not None and self.conn.in_transaction:
+            raise RuntimeError("apply_enriched_metadata(claimed_by=...) must not run inside an open transaction")
         try:
             # BEGIN IMMEDIATE; any exception rolls back and re-raises, so the shared
             # connection is never left mid-transaction. Only sqlite3.Error becomes a return value.
             with self.transaction():
+                if claimed_by is not None and not self._claim_held("enrich", work_id, claimed_by):
+                    return None, CLAIM_LOST  # commits an empty transaction
                 base = self.get_entry_by_id("works", work_id)
                 if not base:
                     return None, "Row not found in works"  # commits an empty transaction
@@ -1823,9 +1858,12 @@ class DatabaseManager:
                 pass
             return []
 
-    def reset_enrich_claim(self, no_meta_id: int, *, state: str = "pending", error: str | None = None, selected: int = 0) -> tuple[bool, str | None]:
+    def reset_enrich_claim(self, no_meta_id: int, *, state: str = "pending", error: str | None = None, selected: int = 0, claimed_by: str | None = None) -> tuple[bool | None, str | None]:
         cur = self.conn.cursor()
+        self._refuse_open_transaction(claimed_by)
         try:
+            if claimed_by is not None and not self._begin_owned("enrich", no_meta_id, claimed_by):
+                return None, CLAIM_LOST
             cur.execute(
                 """UPDATE works
                       SET metadata_status = ?,
@@ -1841,6 +1879,8 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.conn.rollback()
             return False, str(e)
+        finally:
+            self._end_owned(claimed_by)
 
     def delete_work(self, work_id: int) -> tuple[bool, str | None]:
         cur = self.conn.cursor()
@@ -1853,49 +1893,50 @@ class DatabaseManager:
             self.conn.rollback()
             return False, str(e)
 
-    def fetch_download_queue(self, limit: int = None) -> list[dict]:
-        """Fetch queued works."""
-        cursor = self.conn.cursor()
-        cursor.row_factory = sqlite3.Row
-        query = """
-            SELECT id, bibtex_key, entry_type, title, authors, year, doi, pmid,
-                   arxiv_id, openalex_id, semantic_scholar_id, mag_id, url_source,
-                   file_path, abstract, keywords, journal_conference, volume, issue,
-                   pages, publisher, metadata_source_type, bibtex_entry_json,
-                   crossref_json, openalex_json, status_notes, date_added,
-                   date_processed, checksum_pdf
-            FROM (
-                SELECT id, NULL AS bibtex_key, type AS entry_type, title, authors, year, doi, NULL AS pmid,
-                       NULL AS arxiv_id, openalex_id, semantic_scholar_id, NULL AS mag_id, url AS url_source,
-                       file_path, abstract, keywords, source AS journal_conference, volume, issue,
-                       pages, publisher, metadata_source AS metadata_source_type, bibtex_entry_json,
-                       crossref_json, openalex_json, status_notes, created_at AS date_added,
-                       downloaded_at AS date_processed, file_checksum AS checksum_pdf
-                FROM works
-                WHERE download_status = 'queued'
-            )
-            ORDER BY date_added ASC
-        """
-
-        if limit is not None:
-            query += " LIMIT ?"
-            cursor.execute(query, (limit,))
-        else:
-            cursor.execute(query)
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
-
     def _convert_inverted_index_to_text(self, inverted_index: dict | None) -> str | None:
         """See :func:`dl_lit.identifiers.inverted_index_to_text`."""
         return inverted_index_to_text(inverted_index)
 
-    def move_entry_to_downloaded(self, source_id: int, enriched_metadata: dict, file_path: str, checksum: str, source_of_download: str):
-        """Mark a matched work as downloaded."""
-        cursor = self.conn.cursor()
+    def move_entry_to_downloaded(
+        self,
+        source_id: int,
+        enriched_metadata: dict,
+        file_path: str,
+        checksum: str,
+        source_of_download: str,
+        *,
+        claimed_by: str | None = None,
+        part_path: str | None = None,
+    ):
+        """Mark a matched work as downloaded.
+
+        ``claimed_by``: write only while that owner holds the download claim (else CLAIM_LOST).
+        ``part_path``: a staged download; it is published (``publish_download``) inside the
+        same transaction and the published path is stored. The caller removes the part.
+        """
+        if part_path is not None and claimed_by is None:
+            raise ValueError("part_path needs claimed_by: publishing runs inside the owned transaction")
+        published = None
+        committed = False
+        self._refuse_open_transaction(claimed_by)
         try:
+            if claimed_by is not None and not self._begin_owned("download", source_id, claimed_by):
+                return None, CLAIM_LOST
+            if part_path is not None and not checksum:
+                return None, "checksum_unavailable"
             original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
                 raise sqlite3.Error(f"No entry found in works with ID {source_id}")
+
+            if part_path is not None:
+                try:
+                    published = publish_download(part_path, int(source_id))
+                except OSError as e:
+                    self.conn.rollback()
+                    print(f"{RED}[DB Manager] Error publishing the download of work {source_id}: {e}{RESET}")
+                    return None, f"publish failed: {e}"
+                file_path = published
+                enriched_metadata = self._retained_download_result(enriched_metadata, published)
 
             authorships = enriched_metadata.get('authorships', [])
             authors = json.dumps([author['author']['display_name'] for author in authorships]) if authorships else original_entry.get('authors')
@@ -1948,11 +1989,31 @@ class DatabaseManager:
             }
             self._update_work_record(int(source_id), merged)
             self.conn.commit()
+            committed = True
             return int(source_id), None
         except sqlite3.Error as e:
             self.conn.rollback()
             print(f"{RED}[DB Manager] Error moving entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
+        finally:
+            self._end_owned(claimed_by)
+            if published and not committed:
+                remove_published(published)
+
+    _KEEP_CHECKSUM = object()
+
+    @classmethod
+    def _retained_download_result(cls, download_result: dict, retained_path: str | None, retained_checksum=_KEEP_CHECKSUM) -> dict:
+        """The download result as stored: names the PDF the row keeps, without the stage suffix.
+
+        With ``retained_checksum`` (the kept PDF's own checksum, possibly None) a serialised
+        ``checksum`` is replaced by it, so the checksum of a removed file is never stored.
+        """
+        cleaned = {k: v for k, v in (download_result or {}).items() if k != "part_suffix"}
+        cleaned["downloaded_file"] = retained_path
+        if retained_checksum is not cls._KEEP_CHECKSUM and "checksum" in cleaned:
+            cleaned["checksum"] = retained_checksum
+        return cleaned
 
     def _raw_download_fields(self, original: dict, download_result: dict) -> dict:
         """Identity fields of a raw-download result over its source row (title, authors, ids, url)."""
@@ -2018,12 +2079,40 @@ class DatabaseManager:
         file_path: str,
         checksum: str,
         source_of_download: str,
+        *,
+        claimed_by: str | None = None,
+        part_path: str | None = None,
     ) -> tuple[int | None, str | None]:
-        """Mark a raw work row as downloaded after raw-download fallback."""
+        """Mark a raw work row as downloaded after raw-download fallback.
+
+        ``claimed_by`` guards on the metadata claim (the raw fallback holds that one);
+        ``part_path`` as in move_entry_to_downloaded. When the row merges into a canonical
+        that keeps its own PDF, the newly published file is removed after the commit.
+        """
+        if part_path is not None and claimed_by is None:
+            raise ValueError("part_path needs claimed_by: publishing runs inside the owned transaction")
+        published = None
+        committed = False
+        drop_after_commit = None
+        self._refuse_open_transaction(claimed_by)
         try:
+            if claimed_by is not None and not self._begin_owned("enrich", source_id, claimed_by):
+                return None, CLAIM_LOST
+            if part_path is not None and not checksum:
+                return None, "checksum_unavailable"
             original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
                 raise sqlite3.Error(f"No entry found in works with ID {source_id}")
+
+            if part_path is not None:
+                try:
+                    published = publish_download(part_path, int(source_id))
+                except OSError as e:
+                    self.conn.rollback()
+                    print(f"{RED}[DB Manager] Error publishing the download of work {source_id}: {e}{RESET}")
+                    return None, f"publish failed: {e}"
+                file_path = published
+                download_result = self._retained_download_result(download_result, published)
 
             fields = self._raw_download_fields(original_entry, download_result)
             payload = self._raw_download_payload(original_entry, download_result, file_path, checksum, source_of_download)
@@ -2041,24 +2130,41 @@ class DatabaseManager:
             if duplicate_table == "works" and duplicate_id is not None:
                 existing = self.get_entry_by_id("works", int(duplicate_id)) or {}
                 # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
+                merged = self._apply_work_merge_priority(existing, payload)
+                if published and merged.get("file_path") != published:
+                    # The canonical keeps its own PDF: store that one, drop the new file.
+                    retained = self._retained_download_result(download_result, merged.get("file_path"), merged.get("file_checksum"))
+                    payload = self._raw_download_payload(original_entry, retained, file_path, checksum, source_of_download)
+                    merged = self._apply_work_merge_priority(existing, payload)
+                    drop_after_commit = published
                 self._absorb_duplicate(int(duplicate_id), int(source_id), match_field=duplicate_field, notes="mark_raw_work_downloaded")
-                self._update_work_record(int(duplicate_id), self._apply_work_merge_priority(existing, payload))
+                self._update_work_record(int(duplicate_id), merged)
                 self.conn.commit()
+                committed = True
+                if drop_after_commit:
+                    remove_published(drop_after_commit)
                 return int(duplicate_id), None
 
             payload['type'] = download_result.get('type') or original_entry.get('type')
             self._update_work_record(int(source_id), payload)
             self.conn.commit()
+            committed = True
             return int(source_id), None
         except sqlite3.Error as e:
             self.conn.rollback()
             print(f"{RED}[DB Manager] Error moving raw entry {source_id} to downloaded: {e}{RESET}")
             return None, str(e)
+        finally:
+            self._end_owned(claimed_by)
+            if published and not committed:
+                remove_published(published)
 
-    def move_entry_to_failed(self, source_id: int, reason: str) -> tuple[int | None, str | None]:
-        """Mark a canonical work as failed during download."""
-        cursor = self.conn.cursor()
+    def move_entry_to_failed(self, source_id: int, reason: str, *, claimed_by: str | None = None) -> tuple[int | None, str | None]:
+        """Mark a canonical work as failed during download (guarded by ``claimed_by`` when given)."""
+        self._refuse_open_transaction(claimed_by)
         try:
+            if claimed_by is not None and not self._begin_owned("download", source_id, claimed_by):
+                return None, CLAIM_LOST
             original_entry = self.get_entry_by_id('works', source_id)
             if not original_entry:
                 return None, f"No entry found in works with ID {source_id}"
@@ -2076,6 +2182,8 @@ class DatabaseManager:
             self.conn.rollback()
             print(f"{RED}[DB Manager] Error moving entry {source_id} to failed: {e}{RESET}")
             return None, str(e)
+        finally:
+            self._end_owned(claimed_by)
 
     def get_entry_by_id(self, table_name: str, entry_id: int) -> dict | None:
         """Fetches a single entry from a table by its primary key ID."""
@@ -2636,6 +2744,116 @@ class DatabaseManager:
             print(f"{RED}[DB Manager] General error during save_to_disk: {e}{RESET}")
             return False
 
+    def _claim_held(self, phase: str, work_id: int, claimed_by: str) -> bool:
+        """True while ``claimed_by`` holds the phase's claim on the row (caller's transaction)."""
+        status_col, by_col = _CLAIM_COLUMNS[phase]
+        row = self.conn.execute(
+            f"SELECT 1 FROM works WHERE id = ? AND {status_col} = 'in_progress' AND {by_col} = ?",
+            (int(work_id), claimed_by),
+        ).fetchone()
+        return row is not None
+
+    def _refuse_open_transaction(self, claimed_by: str | None) -> None:
+        """An owned writer never joins a caller's open transaction (as ``apply_enriched_metadata``):
+        its claim check must be the first statement of its own transaction, and its commit or
+        rollback must not take the caller's pending writes with it. Called before the writer's
+        ``try``, so its ``finally`` leaves the caller's transaction alone."""
+        if claimed_by is not None and self.conn.in_transaction:
+            raise RuntimeError("an owned writer (claimed_by=...) must not run inside an open transaction")
+
+    def _begin_owned(self, phase: str, work_id: int, claimed_by: str) -> bool:
+        """BEGIN IMMEDIATE, then the claim check (an open transaction was refused before).
+
+        For writers that commit themselves: the write lock is held from the check through
+        their own commit or rollback. Rolls back and returns False when the claim is lost.
+        """
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN IMMEDIATE")
+        if self._claim_held(phase, work_id, claimed_by):
+            return True
+        self.conn.rollback()
+        return False
+
+    def _end_owned(self, owner: str | None) -> None:
+        """The ``finally`` of an owned (or publishing) writer: never leave its transaction open.
+
+        ``owner`` is the writer's ``claimed_by``; None means a writer called the old way, whose
+        behaviour is unchanged (a writer given ``part_path`` always has an owner).
+        """
+        if owner is not None and self.conn is not None and self.conn.in_transaction:
+            self.conn.rollback()
+
+    def find_downloaded_duplicate(self, row: dict, authors) -> tuple[str | None, int | None, str | None]:
+        """The duplicate a queued row may be merged into: a matching works row that is downloaded."""
+        dup_table, dup_id, dup_field = self.check_if_exists(
+            doi=row.get("doi"),
+            openalex_id=row.get("openalex_id"),
+            title=row.get("title"),
+            authors=authors,
+            editors=row.get("editors"),
+            year=row.get("year"),
+            exclude_id=row["id"],
+            exclude_table="works",
+        )
+        if dup_table == "works" and dup_id is not None:
+            existing = self.get_entry_by_id("works", int(dup_id)) or {}
+            if str(existing.get("download_status") or "").strip().lower() == "downloaded":
+                return dup_table, int(dup_id), dup_field
+        return None, None, None
+
+    def release_download_claims(self, claimed_by: str) -> int:
+        """Return every in_progress row this owner claimed for download to the queue.
+
+        A failure rolls back (never leaves the write open on the shared connection) and raises.
+        """
+        try:
+            cur = self.conn.execute(
+                """UPDATE works
+                      SET download_status = 'queued',
+                          download_claimed_by = NULL,
+                          download_claimed_at = NULL,
+                          download_lease_expires_at = NULL
+                    WHERE download_status = 'in_progress' AND download_claimed_by = ?""",
+                (claimed_by,),
+            )
+            self.conn.commit()
+        except sqlite3.Error:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+        return int(cur.rowcount or 0)
+
+    def release_enrich_claims(self, work_ids: list[int], claimed_by: str) -> int:
+        """Return unstarted enrich rows to pending and take back the attempt they never used.
+
+        A failure rolls back and raises; the caller logs it (the rows then wait for their lease).
+        """
+        ids = [int(value) for value in (work_ids or [])]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            return self._release_enrich_claims(ids, placeholders, claimed_by)
+        except sqlite3.Error:
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            raise
+
+    def _release_enrich_claims(self, ids, placeholders, claimed_by) -> int:
+        cur = self.conn.execute(
+            f"""UPDATE works
+                   SET metadata_status = 'pending',
+                       metadata_claimed_by = NULL,
+                       metadata_claimed_at = NULL,
+                       metadata_lease_expires_at = NULL,
+                       metadata_attempt_count = MAX(COALESCE(metadata_attempt_count, 0) - 1, 0)
+                 WHERE id IN ({placeholders})
+                   AND metadata_status = 'in_progress' AND metadata_claimed_by = ?""",
+            ids + [claimed_by],
+        )
+        self.conn.commit()
+        return int(cur.rowcount or 0)
+
     def claim_download_batch(
         self,
         *,
@@ -2644,8 +2862,13 @@ class DatabaseManager:
         claimed_by: str,
         lease_seconds: int = 15 * 60,
         max_attempts: int | None = None,
+        raise_errors: bool = False,
     ) -> list[dict]:
-        """Atomically claim queued works for download processing."""
+        """Atomically claim queued works for download processing.
+
+        A SQLite error rolls back and answers ``[]`` (the daemon retries on its next poll),
+        or, with ``raise_errors``, re-raises so a caller can tell it from an empty queue.
+        """
         if limit <= 0:
             return []
 
@@ -2758,20 +2981,41 @@ class DatabaseManager:
                 self.conn.rollback()
             except Exception:
                 pass
+            if raise_errors:
+                raise
             return []
 
-    def mark_download_failed(self, queue_id: int, reason: str) -> tuple[int | None, str | None]:
+    def mark_download_failed(self, queue_id: int, reason: str, *, claimed_by: str | None = None) -> tuple[int | None, str | None]:
         """Mark a queued work as failed."""
-        return self.move_entry_to_failed(queue_id, reason)
+        return self.move_entry_to_failed(queue_id, reason, claimed_by=claimed_by)
 
     def merge_duplicate_queued_work(
         self,
         queue_id: int,
         existing_table: str,
         existing_id: int,
-        matched_field: str | None = None
+        matched_field: str | None = None,
+        *,
+        claimed_by: str | None = None,
     ) -> tuple[bool, str | None]:
-        """Merge a queued work row into an existing canonical work."""
+        """Merge a queued work row into an existing canonical work.
+
+        With ``claimed_by``: only while that owner holds the download claim (else CLAIM_LOST),
+        and only into a target that is still ``downloaded`` when re-read inside the same
+        transaction (else ``duplicate_target_gone``, and the caller downloads the row).
+        """
+        self._refuse_open_transaction(claimed_by)
+        try:
+            if claimed_by is not None and not self._begin_owned("download", queue_id, claimed_by):
+                return False, CLAIM_LOST
+            return self._merge_duplicate_queued_work(queue_id, existing_table, existing_id, matched_field, guarded=claimed_by is not None)
+        except sqlite3.Error as err:
+            self.conn.rollback()
+            return False, f"SQLite error dropping duplicate queue entry {queue_id}: {err}"
+        finally:
+            self._end_owned(claimed_by)
+
+    def _merge_duplicate_queued_work(self, queue_id, existing_table, existing_id, matched_field, *, guarded: bool) -> tuple[bool, str | None]:
         if not self._fetch_record_dict("works", queue_id):
             return False, f"Queue entry {queue_id} not found."
         if existing_table != "works":
@@ -2781,7 +3025,12 @@ class DatabaseManager:
         if not existing_work_id:
             return False, f"Canonical work not found for duplicate queue entry {queue_id}."
         duplicate = self.get_entry_by_id("works", int(queue_id)) or {}
+        # The duplicate's own claim never moves onto the canonical.
+        for column in _CLAIM_STATE_COLUMNS:
+            duplicate.pop(column, None)
         canonical = self.get_entry_by_id("works", int(existing_work_id)) or {}
+        if guarded and str(canonical.get("download_status") or "").strip().lower() != "downloaded":
+            return False, "duplicate_target_gone"
         try:
             # Absorb before updating the canonical (unique DOI/openalex id, see apply_enriched_metadata).
             self._absorb_duplicate(int(existing_work_id), int(queue_id), match_field=matched_field, notes="merge_duplicate_queued_work")

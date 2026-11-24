@@ -58,10 +58,6 @@ DOI_MAP = {
     "backend.scripts.migrate_to_works.normalize_doi": (None, lambda db: _script("migrate_to_works").normalize_doi),
     "dl_lit.OpenAlexScraper.normalize_doi": (normalize_doi_lower, lambda db: __import__("dl_lit.OpenAlexScraper", fromlist=["x"]).normalize_doi),
     "backend.scripts.keyword_search.normalize_doi": (extract_doi_lower, lambda db: _script("keyword_search").normalize_doi),
-    # Kept private: they match none of the shared rules (see test_private_doi_copies_differ).
-    "backend.scripts.backfill_openalex_topics.normalize_doi": (None, lambda db: _script("backfill_openalex_topics")._normalize_doi),
-    "backend.scripts.export_bundle.normalize_doi": (None, lambda db: _script("export_bundle")._normalize_doi),
-    "backend.scripts.upstream_update.normalize_doi": (None, lambda db: _script("upstream_update")._normalize_doi),
 }
 
 OPENALEX_MAP = {
@@ -205,21 +201,6 @@ def test_normalize_doi_case_lower():
     assert normalize_doi("Not-A-Doi", case="lower") == "not-a-doi"
     with pytest.raises(ValueError):
         normalize_doi("10.1000/abc", case="title")
-
-
-def test_private_doi_copies_differ_from_every_shared_rule():
-    shared = (normalize_doi, normalize_doi_lower, extract_doi_lower, lambda v: normalize_doi(v, case="lower"))
-    for name in (
-        "backend.scripts.backfill_openalex_topics.normalize_doi",
-        "backend.scripts.export_bundle.normalize_doi",
-        "backend.scripts.upstream_update.normalize_doi",
-    ):
-        recorded = FIXTURE["doi"][name]
-        for fn in shared:
-            assert any(
-                not (isinstance(out, dict) and RAISES in out) and fn(ast.literal_eval(raw)) != out
-                for raw, out in recorded.items()
-            ), name
 
 
 def test_inverted_index_collision_semantics():

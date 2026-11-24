@@ -132,7 +132,7 @@ describe('explicit-corpus routes enforce corpus roles', () => {
 
     const assign = await request(app)
       .put(`/api/corpora/${ids.A}/kantropos-assignment`)
-      .set(as('owner1'))
+      .set(as('admin'))
       .send({ targetId: 'target-a' })
     expect(assign.status).toBe(200)
   })
@@ -229,7 +229,13 @@ describe('explicit-corpus routes enforce corpus roles', () => {
     expect(withDb((db) => db.prepare('SELECT id FROM corpora WHERE id = ?').get(ids.D))).toBeUndefined()
   })
 
-  test('kantropos-assignment: GET member, PUT owner/editor', async () => {
+  test('kantropos-assignment: GET member, PUT admin only', async () => {
+    const adminOnly = 'Only the global admin can assign a Kantropos corpus'
+    const put = (who, targetId) =>
+      request(app).put(`/api/corpora/${ids.A}/kantropos-assignment`).set(as(who)).send({ targetId })
+    const assignmentRow = () =>
+      withDb((db) => db.prepare('SELECT target_id FROM corpus_kantropos_assignments WHERE corpus_id = ?').get(ids.A))
+
     const viewerGet = await request(app).get(`/api/corpora/${ids.A}/kantropos-assignment`).set(as('viewer3'))
     expect(viewerGet.status).toBe(200)
     expect(viewerGet.body.assignment.target_id).toBe('target-a')
@@ -238,25 +244,30 @@ describe('explicit-corpus routes enforce corpus roles', () => {
     const outsiderGet = await request(app).get(`/api/corpora/${ids.A}/kantropos-assignment`).set(as('outsider5'))
     expect(outsiderGet.status).toBe(403)
 
-    const viewerPut = await request(app)
-      .put(`/api/corpora/${ids.A}/kantropos-assignment`)
-      .set(as('viewer3'))
-      .send({ targetId: 'target-b' })
-    expect(viewerPut.status).toBe(403)
-    expect(viewerPut.body.error).toBe(
-      'Only corpus owners, editors, or the global admin can assign a Kantropos corpus'
-    )
+    for (const who of ['viewer3', 'editor4', 'owner1']) {
+      const res = await put(who, 'target-b')
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe(adminOnly)
+    }
+    const ownerClear = await put('owner1', null)
+    expect(ownerClear.status).toBe(403)
+    expect(ownerClear.body.error).toBe(adminOnly)
+    expect(assignmentRow()).toEqual({ target_id: 'target-a' })
 
-    const editorPut = await request(app)
-      .put(`/api/corpora/${ids.A}/kantropos-assignment`)
-      .set(as('editor4'))
-      .send({ targetId: 'target-a' })
-    expect(editorPut.status).toBe(200)
-    expect(editorPut.body.assignment.target_id).toBe('target-a')
+    const outsiderPut = await put('outsider5', 'target-b')
+    expect(outsiderPut.status).toBe(403)
+    expect(outsiderPut.body.error).toBe('No access to this corpus')
+    expect(assignmentRow()).toEqual({ target_id: 'target-a' })
 
-    const adminGet = await request(app).get(`/api/corpora/${ids.A}/kantropos-assignment`).set(as('admin'))
-    expect(adminGet.status).toBe(200)
-    expect(adminGet.body.can_edit).toBe(true)
+    const adminPut = await put('admin', 'target-a')
+    expect(adminPut.status).toBe(200)
+    expect(adminPut.body.assignment.target_id).toBe('target-a')
+
+    for (const [who, canEdit] of [['owner1', false], ['editor4', false], ['admin', true]]) {
+      const res = await request(app).get(`/api/corpora/${ids.A}/kantropos-assignment`).set(as(who))
+      expect(res.status).toBe(200)
+      expect(res.body.can_edit).toBe(canEdit)
+    }
   })
 
   test('scraper apply: viewer 403, owner of an assigned corpus 200 path reached, admin reached', async () => {

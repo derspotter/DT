@@ -30,6 +30,8 @@ type KantroposTarget = {
   metadata_bib_path?: string
 }
 
+// The credentials must be the global admin's: the Kantropos assignment PUT this
+// spec makes is admin-only (BE-19), so a corpus owner's sign-in gets a 403.
 async function ensureSignedIn(page: Page): Promise<string> {
   await page.goto('/')
   const heading = page.getByRole('heading', { name: 'Corpus orchestration workspace' })
@@ -40,8 +42,8 @@ async function ensureSignedIn(page: Page): Promise<string> {
 
   const username = process.env.E2E_USERNAME || process.env.RAG_ADMIN_USER || ''
   const password = process.env.E2E_PASSWORD || process.env.RAG_ADMIN_PASSWORD || ''
-  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER for Playwright login').toBeTruthy()
-  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD for Playwright login').toBeTruthy()
+  expect(username, 'Missing E2E_USERNAME or RAG_ADMIN_USER (the global admin; the Kantropos assignment is admin-only) for Playwright login').toBeTruthy()
+  expect(password, 'Missing E2E_PASSWORD or RAG_ADMIN_PASSWORD (the global admin\'s; the Kantropos assignment is admin-only) for Playwright login').toBeTruthy()
 
   await page.getByRole('textbox', { name: 'Username' }).fill(username)
   await page.getByRole('textbox', { name: 'Password' }).fill(password)

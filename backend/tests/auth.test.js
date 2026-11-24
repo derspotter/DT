@@ -136,6 +136,17 @@ describe('auth routes: hashing, one-time tokens, mails and transactions', () => 
     expect(withDb((db) => db.prepare('SELECT id FROM users WHERE username = ?').get('busy-user'))).toBeUndefined()
   })
 
+  test('a busy hasher does not count against the username', async () => {
+    hasherState.busy = true
+    for (let i = 0; i < 11; i += 1) {
+      const res = await login(ADMIN, 'wrong-password')
+      expect(res.status).toBe(503)
+    }
+    hasherState.busy = false
+    expect((await login(ADMIN, 'wrong-password')).status).toBe(401)
+    expect((await login(ADMIN, ADMIN_PASSWORD)).status).toBe(200)
+  })
+
   test('two concurrent accept-invite submissions: exactly one succeeds', async () => {
     const inv = await invite('race-invitee', 'race-invitee@example.test')
     expect(inv.status).toBe(201)
