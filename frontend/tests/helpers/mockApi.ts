@@ -74,7 +74,7 @@ type FetchMatch = { path: string } | { source: string; flags: string }
 
 function fetchMatch(match: string | RegExp): FetchMatch {
   if (typeof match === 'string') return { path: match }
-  return { source: match.source, flags: match.flags.replace(/[gy]/g, '') }
+  return { source: match.source, flags: match.flags }
 }
 
 export async function trackFetches(page: Page) {
@@ -89,7 +89,13 @@ export async function trackFetches(page: Page) {
       reads,
       stats(spec: { path?: string; source?: string; flags?: string }) {
         const re = spec.source !== undefined ? new RegExp(spec.source, spec.flags) : null
-        const hit = (key: string) => (re ? re.test(key) : key.split('?')[0] === spec.path)
+        // lastIndex is reset per key, so `g` and `y` keep their meaning for
+        // one key (`y`: anchored at offset 0) without carrying over.
+        const hit = (key: string) => {
+          if (!re) return key.split('?')[0] === spec.path
+          re.lastIndex = 0
+          return re.test(key)
+        }
         const sum = (bag: Record<string, number>) =>
           Object.entries(bag).reduce((total, [key, n]) => (hit(key) ? total + n : total), 0)
         return { calls: sum(calls), reads: sum(reads) }

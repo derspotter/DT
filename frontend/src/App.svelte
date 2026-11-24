@@ -1,3 +1,8 @@
+<script module>
+  // Once per page load, not per mount (FE-64): the upload list's storage warning.
+  let uploadStorageWarned = false
+</script>
+
 <script>
   import { onMount } from 'svelte'
   import {
@@ -764,9 +769,7 @@
   }
 
   // The upload list is saved best effort (FE-64): a full or blocked
-  // localStorage must not fail the upload, and is reported once per page load.
-  let uploadStorageWarned = false
-
+  // localStorage must not fail the upload. The warning flag is module-level.
   function persistStoredUploads(nextUploads = uploads) {
     if (typeof window === 'undefined') return
     const key = uploadStorageKey()

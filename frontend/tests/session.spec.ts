@@ -1679,6 +1679,7 @@ test("an old export neither saves nor unlocks the next user's export", async ({ 
   const adminB = { ...userB, is_admin: true }
   const exportGates = [deferred(), deferred()]
   let exportRequests = 0
+  const answeredSeeds: string[] = []
   const names: string[] = []
   page.on('download', (download) => names.push(download.suggestedFilename()))
   await trackFetches(page)
@@ -1705,7 +1706,8 @@ test("an old export neither saves nor unlocks the next user's export", async ({ 
         body: Buffer.from('PK'),
       })
     }
-    return workspaceDefaults(path, route)
+    await workspaceDefaults(path, route)
+    if (path === '/api/seed/sources') answeredSeeds.push(auth)
   })
 
   await page.goto('/#/login')
@@ -1719,6 +1721,8 @@ test("an old export neither saves nor unlocks the next user's export", async ({ 
   await page.getByRole('button', { name: 'Log out' }).click()
   await logIn(page, 'bob')
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  // The commit: a seed-list request sent with bob's token, answered.
+  await expect.poll(() => answeredSeeds.includes('Bearer token-b')).toBe(true)
   await page.getByTestId('tab-downloads').click()
   await expect(button).toBeEnabled()
   await button.click()
@@ -1749,6 +1753,8 @@ async function bootSearchRace(page: Page, { holdLaunch }: { holdLaunch: boolean 
     meRelease: deferred(),
     heldSeeds: [] as HeldSeed[],
     heldMe: 0,
+    quotaGateOn: false,
+    heldQuota: [] as (() => void)[],
     searchPosts: 0,
     log: [] as { path: string; auth: string; answered: boolean }[],
   }
@@ -1777,8 +1783,12 @@ async function bootSearchRace(page: Page, { holdLaunch }: { holdLaunch: boolean 
     if (path === '/api/keyword-search/preview') return fulfil(route, { count: 5, threshold: 100000 })
     if (path === '/api/keyword-search' && request.method() === 'POST') {
       gates.searchPosts += 1
-      if (holdLaunch) await gates.search.promise
+      if (!holdLaunch) return fulfil(route, { runId: 7 }, 202)
+      await gates.search.promise
       return fulfil(route, { runId: 7, status: 'running' }, 202)
+    }
+    if (path === '/api/openalex/quota' && gates.quotaGateOn) {
+      await new Promise<void>((resolve) => { gates.heldQuota.push(resolve) })
     }
     if (path === '/api/seed/sources' && gates.seedGateOn) {
       const status = await new Promise<number>((resolve) => {
@@ -1810,17 +1820,24 @@ test('a search launched before a sign-out does not reach the next session', asyn
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
   // The commit: bob's first seed-list request, sent with his token, answered.
   await expect.poll(() => gates.log.some((e) => e.path === '/api/seed/sources' && e.auth.endsWith('token-b') && e.answered)).toBe(true)
+  // Bob's own budget load is answered before the quota gate goes up.
+  await expect.poll(() => gates.log.some((e) => e.path === '/api/openalex/quota' && e.auth.endsWith('token-b') && e.answered)).toBe(true)
   gates.seedGateOn = true
+  gates.quotaGateOn = true
   const seedCalls = (await fetchStats(page, '/api/seed/sources')).calls
+  const quotaCalls = (await fetchStats(page, '/api/openalex/quota')).calls
 
   const reads = (await fetchStats(page, '/api/keyword-search')).reads
   gates.search.resolve()
   await afterBodyRead(page, '/api/keyword-search', reads)
   expect(await page.evaluate(() => (window as any).__dtRefresh.reason())).not.toBe('active')
   expect((await fetchStats(page, '/api/seed/sources')).calls).toBe(seedCalls)
+  expect((await fetchStats(page, '/api/openalex/quota')).calls).toBe(quotaCalls)
 
   gates.seedGateOn = false
+  gates.quotaGateOn = false
   for (const held of gates.heldSeeds.splice(0)) held.release()
+  for (const release of gates.heldQuota.splice(0)) release()
 })
 
 test("a late 403 on the launch's seed follow-up does not reconcile the next session", async ({ page }) => {

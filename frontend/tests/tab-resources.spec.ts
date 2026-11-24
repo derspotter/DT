@@ -30,7 +30,7 @@ type Options = {
 const BOOT_LOADS = ['/api/auth/me', '/api/seed/sources', '/api/corpus', '/api/ingest/stats', '/api/ingest/runs']
 
 async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspace', admin = false, running = false, corpusDelayMs = 0, seedsDelayMs = 0, corpusTotal = 1, settle = 'sleep' }: Options = {}) {
-  const log: { path: string; search: URLSearchParams }[] = []
+  const log: { path: string; search: URLSearchParams; answered: boolean }[] = []
   const delays = { corpus: corpusDelayMs, seeds: seedsDelayMs, me: 0 }
   // Mutable server state: the corpus rows (ids, in order) and the corpus /me reports.
   const state = {
@@ -69,15 +69,24 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     failTargets: false,
     // Answer the global ingest stats with a 500.
     failGlobalStats: false,
-    // Race gates. `searchGate` holds launch request 0; while `meGateOn` or
-    // `seedGateOn` is set, /api/auth/me or /api/seed/sources requests wait in
-    // `heldMe` / `heldSeeds` until released; `exportGate` holds the exports.
+    // Race gates. `searchGate` holds launch request 0; while `meGateOn`,
+    // `seedGateOn` or `quotaGateOn` is set, /api/auth/me, /api/seed/sources
+    // or /api/openalex/quota requests wait in `heldMe` / `heldSeeds` /
+    // `heldQuota` until released; `exportGate` holds the exports.
     searchGate: null as Promise<void> | null,
     meGateOn: false,
-    heldMe: [] as (() => void)[],
+    // `switchMe` marks the first /me after the corpus select was answered:
+    // the one handleSelectCorpus sends, not a poll's reconcile.
+    heldMe: [] as { release: () => void; switchMe: boolean }[],
     seedGateOn: false,
     heldSeeds: [] as (() => void)[],
+    quotaGateOn: false,
+    heldQuota: [] as (() => void)[],
     exportGate: null as Promise<void> | null,
+    selectAnswered: false,
+    switchMeSeen: false,
+    // The log length when the switch's /me was answered (-1 before).
+    switchMeAnsweredAt: -1,
   }
   const held = (queue: (() => void)[]) => new Promise<void>((resolve) => { queue.push(resolve) })
   const scripted = async (route: Route, steps: Step[]) => {
@@ -94,17 +103,24 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url())
     const path = url.pathname
-    log.push({ path, search: url.searchParams })
+    const entry = { path, search: url.searchParams, answered: false }
+    log.push(entry)
     if (path === '/api/auth/me') {
-      if (state.meGateOn) await held(state.heldMe)
+      const switchMe = state.selectAnswered && !state.switchMeSeen
+      if (switchMe) state.switchMeSeen = true
+      if (state.meGateOn) {
+        await new Promise<void>((release) => { state.heldMe.push({ release, switchMe }) })
+      }
       if (delays.me) await new Promise((resolve) => setTimeout(resolve, delays.me))
-      return fulfil(route, {
+      await fulfil(route, {
         user: { id: 1, username: admin ? 'admin' : 'reader', last_corpus_id: state.lastCorpusId, is_admin: admin },
         corpora: [
           { id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' },
           { id: 2, name: 'Second corpus', role: 'owner', owner_username: 'admin' },
         ],
       })
+      if (switchMe) state.switchMeAnsweredAt = log.length
+      return
     }
     if (path === '/api/corpus') {
       if (await scripted(route, state.corpusSteps)) return
@@ -133,7 +149,10 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     }
     if (path === '/api/keyword-search' && route.request().method() === 'POST') {
       state.searchBodies.push(route.request().postDataJSON())
-      if (state.searchBodies.length === 1 && state.searchGate) await state.searchGate
+      if (state.searchBodies.length === 1 && state.searchGate) {
+        await state.searchGate
+        return fulfil(route, { runId: 55 }, 202)
+      }
       return fulfil(route, { runId: 55, status: 'running' }, 202)
     }
     if (path === '/api/keyword-search/preview') {
@@ -145,10 +164,17 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     if (select) {
       if (state.selectError) return fulfil(route, { error: state.selectError }, 403)
       state.lastCorpusId = Number(select[1])
-      return fulfil(route, {})
+      await fulfil(route, {})
+      state.selectAnswered = true
+      return
     }
     if (path === '/api/recursion-config') return fulfil(route, { keyword: {} })
-    if (path === '/api/openalex/quota') return fulfil(route, { available: false })
+    if (path === '/api/openalex/quota') {
+      if (state.quotaGateOn) await held(state.heldQuota)
+      await fulfil(route, { available: false })
+      entry.answered = true
+      return
+    }
     if (path === '/api/seed/sources') {
       if (state.seedGateOn) await held(state.heldSeeds)
       if (delays.seeds) await new Promise((resolve) => setTimeout(resolve, delays.seeds))
@@ -157,7 +183,9 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
         : state.seedCandidates
           ? [{ id: 1, source_type: 'search', source_key: '1', title: 'Seed', name: 'Seed', candidate_count: state.seedCandidates }]
           : []
-      return fulfil(route, { sources, total: sources.length, source: 'api' })
+      await fulfil(route, { sources, total: sources.length, source: 'api' })
+      entry.answered = true
+      return
     }
     if (path === '/api/ingest/runs') return fulfil(route, { runs: state.ingestRuns, total: state.ingestRuns.length, source: 'api' })
     if (path === '/api/ingest/stats') {
@@ -856,20 +884,34 @@ function deferred() {
   return { promise, resolve }
 }
 
-// Selects corpus 2 with /me gated: returns once the select's /me is held
-// (the server save is answered by then).
-async function switchTo2(page: Page, state: any) {
+type Booted = Awaited<ReturnType<typeof boot>>
+
+// Selects corpus 2 with /me gated: returns once the select's own /me (the
+// first after the server answered the save) is held.
+async function switchTo2(page: Page, { state }: Booted) {
   state.meGateOn = true
   await page.locator('.header-corpus-picker select').selectOption('2')
-  await expect.poll(() => state.heldMe.length).toBeGreaterThanOrEqual(1)
+  await expect.poll(() => state.heldMe.some((held) => held.switchMe)).toBe(true)
 }
 
-async function commit(page: Page, state: any) {
+// Releases only the switch's /me and checkpoints on its read: the workspace
+// reset runs synchronously after it. Then lifts the /me gate (a poll's /me,
+// if one was held, answers after the commit) and waits for the commit
+// marker: the first seed-list request after that /me, answered (`seedGateOn`
+// must be off for it).
+async function commit(page: Page, { state, log }: Booted) {
   const meReads = (await fetchStats(page, '/api/auth/me')).reads
-  const waiting = state.heldMe.splice(0)
+  const switchMe = state.heldMe.find((held) => held.switchMe)!
+  state.heldMe.splice(state.heldMe.indexOf(switchMe), 1)
+  switchMe.release()
+  await afterBodyRead(page, '/api/auth/me', meReads)
   state.meGateOn = false
-  for (const release of waiting) release()
-  await afterBodyRead(page, '/api/auth/me', meReads + waiting.length - 1)
+  for (const held of state.heldMe.splice(0)) held.release()
+  await expect.poll(() => answeredAfterSwitch({ state, log } as Booted, '/api/seed/sources')).toBe(true)
+}
+
+function answeredAfterSwitch({ state, log }: Booted, path: string) {
+  return state.switchMeAnsweredAt >= 0 && log.slice(state.switchMeAnsweredAt).some((e) => e.path === path && e.answered)
 }
 
 function releaseSeeds(state: any) {
@@ -886,36 +928,44 @@ async function launchSearch(page: Page) {
 const refreshReason = (page: Page) => page.evaluate(() => (window as any).__dtRefresh.reason())
 
 test('a search launched before a corpus switch does not mark the new corpus as searching', async ({ page }) => {
-  const { state } = await boot(page, { settle: 'events' })
+  const booted = await boot(page, { settle: 'events' })
+  const { state } = booted
   const launch = deferred()
   state.previewCount = 5
   state.searchGate = launch.promise
   await launchSearch(page)
   await expect.poll(() => state.searchBodies.length).toBe(1)
+  await switchTo2(page, booted)
+  await commit(page, booted)
+  // The commit's own budget load is answered too; then every follow-up the
+  // late launch could start is gated.
+  await expect.poll(() => answeredAfterSwitch(booted, '/api/openalex/quota')).toBe(true)
   state.seedGateOn = true
-  await switchTo2(page, state)
-  await commit(page, state)
-  // The commit's own seed reload, sent after its /me, is held.
-  await expect.poll(() => state.heldSeeds.length).toBe(1)
+  state.quotaGateOn = true
   const seedCalls = (await fetchStats(page, '/api/seed/sources')).calls
+  const quotaCalls = (await fetchStats(page, '/api/openalex/quota')).calls
 
   const reads = (await fetchStats(page, '/api/keyword-search')).reads
   launch.resolve()
   await afterBodyRead(page, '/api/keyword-search', reads)
   expect(await refreshReason(page)).not.toBe('active')
   expect((await fetchStats(page, '/api/seed/sources')).calls).toBe(seedCalls)
+  expect((await fetchStats(page, '/api/openalex/quota')).calls).toBe(quotaCalls)
   releaseSeeds(state)
+  state.quotaGateOn = false
+  for (const release of state.heldQuota.splice(0)) release()
 })
 
 test('a launch answered between the saved switch and its /me is reset by the commit', async ({ page }) => {
-  const { state } = await boot(page, { settle: 'events' })
+  const booted = await boot(page, { settle: 'events' })
+  const { state } = booted
   const launch = deferred()
   state.previewCount = 5
   state.searchGate = launch.promise
   await launchSearch(page)
   await expect.poll(() => state.searchBodies.length).toBe(1)
   state.seedGateOn = true
-  await switchTo2(page, state)
+  await switchTo2(page, booted)
   const seedCalls = (await fetchStats(page, '/api/seed/sources')).calls
 
   const reads = (await fetchStats(page, '/api/keyword-search')).reads
@@ -927,14 +977,15 @@ test('a launch answered between the saved switch and its /me is reset by the com
   releaseSeeds(state)
   const status = page.getByText('Fetching in the background', { exact: false })
   await expect(status).toBeVisible()
-  await commit(page, state)
+  await commit(page, booted)
   await expect(status).toHaveCount(0)
   expect(await refreshReason(page)).not.toBe('active')
   expect(state.searchBodies[0].corpusId).toBe(1)
 })
 
 test("an export keeps the session's export lock across a corpus switch", async ({ page }) => {
-  const { state } = await boot(page, { admin: true, settle: 'events' })
+  const booted = await boot(page, { admin: true, settle: 'events' })
+  const { state } = booted
   const names: string[] = []
   page.on('download', (download) => names.push(download.suggestedFilename()))
   const exported = deferred()
@@ -944,8 +995,8 @@ test("an export keeps the session's export lock across a corpus switch", async (
   await button.click()
   await expect(button).toBeDisabled()
 
-  await switchTo2(page, state)
-  await commit(page, state)
+  await switchTo2(page, booted)
+  await commit(page, booted)
   await page.getByTestId('tab-downloads').click()
   await expect(button).toBeDisabled()
 
