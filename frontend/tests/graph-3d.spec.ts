@@ -810,3 +810,26 @@ test('a recolour after a failed corpus load keeps the corpus error', async ({ pa
   await expect(panel.getByText('Corpus 2 layout failed', { exact: true })).toBeVisible()
   await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeHidden()
 })
+
+test('a recolour shows the loaded status again once the controls match the graph on screen', async ({ page }) => {
+  const { hold } = await graphMock(page, { versions: ['A', 'T'] })
+  hold('nodes.bin?v=T').release({ status: 500, body: { error: 'References-only layout failed' } })
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  const relationship = panel.getByText('Relationship', { exact: true }).locator('..').locator('select')
+  const groupBy = panel.getByText('Group by').locator('..').locator('select')
+
+  // References only + Work type is a new load, and it fails.
+  await relationship.selectOption('references')
+  await groupBy.selectOption('type')
+  await expect(panel.getByText('References-only layout failed', { exact: true })).toBeVisible()
+  expect(await calls(page, MANIFEST)).toBe(2)
+
+  // Back to the settings of the graph on screen: Academic field only recolours,
+  // and the abandoned load's error gives way to the loaded status.
+  await relationship.selectOption('both')
+  await groupBy.selectOption('cluster')
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  await expect(panel.getByText('References-only layout failed', { exact: true })).toBeHidden()
+  expect(await calls(page, MANIFEST)).toBe(2)
+})

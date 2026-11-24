@@ -75,13 +75,12 @@
   let groupMode = 'cluster'
   let loadedGroupBy = 'field'
   // The status of the graph on screen, restored when a recolour replaces a
-  // failed load's error. Only a grouping-only failure is superseded that way:
-  // `loadedScope` is the graph on screen's options apart from the grouping,
-  // `statusScope` those of the load whose result `graphStatus` shows. A failed
-  // load of another corpus (or node limit, or relationship) keeps its error.
+  // failed load's error. `loadedScope` is the graph on screen's options apart
+  // from the grouping. A recolour shows the loaded status only while the
+  // controls match it again; while they still name another corpus (or node
+  // limit, or relationship) that failed to load, the error stays.
   let loadedStatus = ''
   let loadedScope = ''
-  let statusScope = ''
   const graphScope = ({ corpusId, maxNodes, relationship }) => JSON.stringify([corpusId, maxNodes, relationship])
   let depthScale = 1.6
   let autoRotate = false
@@ -1230,7 +1229,8 @@
     if (target && target !== loadedGroupBy) {
       void load3DGraph()
     } else {
-      if (loadedStatus && statusScope === loadedScope) graphStatus = loadedStatus
+      const controlsScope = graphScope({ maxNodes, relationship, corpusId: selectedGraphCorpusId })
+      if (loadedStatus && controlsScope === loadedScope) graphStatus = loadedStatus
       renderGraph()
     }
   }
@@ -1297,13 +1297,11 @@
       graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
       loadedStatus = graphStatus
       loadedScope = scope
-      statusScope = scope
       await tick()
       await renderGraph()
     } catch (error) {
       if (owns()) {
         graphStatus = error?.message || 'Failed to load 3D graph.'
-        statusScope = scope
       }
     } finally {
       if (load === graphLoadSeq) graphLoading = false
