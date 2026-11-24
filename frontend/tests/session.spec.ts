@@ -1977,14 +1977,17 @@ test("a corpus selection answered after a sign-out sends no /me with the next us
 })
 
 // A corpus creation or deletion that settles after a sign-out and a new
-// sign-in sends no /me with the next user's token (review round 2).
+// sign-in sends no /me with the next user's token (review round 2). Its lock
+// is the session's: it neither locks the next user's buttons nor unlocks
+// them while the next user's own action is pending (FE-66).
 for (const action of [
   { name: 'creation', button: 'New corpus', method: 'POST', path: '/api/corpora', answer: { corpus: { id: 3, name: 'Fresh corpus' } } },
   { name: 'deletion', button: 'Delete corpus', method: 'DELETE', path: '/api/corpora/1', answer: { deleted_name: 'Shared corpus', selected_corpus_id: null } },
 ]) {
-  test(`a corpus ${action.name} answered after a sign-out sends no /me with the next user's token`, async ({ page }) => {
-    const actionGate = deferred()
-    let actionSeen = false
+  test(`a corpus ${action.name} answered after a sign-out sends no /me and leaves the next user's buttons alone`, async ({ page }) => {
+    // One gate per session, told apart by the bearer token.
+    const actionGates: Record<string, ReturnType<typeof deferred>> = { 'token-a': deferred(), 'token-b': deferred() }
+    const actionSeen: string[] = []
     let meGateOn = false
     const meRelease = deferred()
     const answeredSeeds: string[] = []
@@ -2007,68 +2010,15 @@ for (const action of [
         return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
       }
       if (path === action.path && request.method() === action.method) {
-        actionSeen = true
-        await actionGate.promise
-        return fulfil(route, action.answer)
-      }
-      await workspaceDefaults(path, route)
-      if (path === '/api/seed/sources') answeredSeeds.push(auth)
-    })
-
-    await page.goto('/#/upstream')
-    await expect(page.getByTestId('auth-user')).toHaveText('alice')
-    await page.getByRole('button', { name: action.button }).click()
-    await expect.poll(() => actionSeen).toBe(true)
-
-    await page.getByRole('button', { name: 'Log out' }).click()
-    await logIn(page, 'bob')
-    await expect(page.getByTestId('auth-user')).toHaveText('bob')
-    await expect.poll(() => answeredSeeds.includes('Bearer token-b')).toBe(true)
-    meGateOn = true
-    const meCalls = (await fetchStats(page, '/api/auth/me')).calls
-
-    const reads = (await fetchStats(page, action.path)).reads
-    actionGate.resolve()
-    await afterBodyRead(page, action.path, reads)
-    expect((await fetchStats(page, '/api/auth/me')).calls).toBe(meCalls)
-
-    meGateOn = false
-    meRelease.resolve()
-    await expect(page.getByTestId('auth-user')).toHaveText('bob')
-  })
-
-  // The corpus button locks are the session's: alice's pending action does not
-  // lock bob's buttons, and its late answer does not unlock bob's own (FE-66).
-  test(`a corpus ${action.name} pending at sign-out does not lock the next user's buttons`, async ({ page }) => {
-    const gates: Record<string, ReturnType<typeof deferred>> = { 'token-a': deferred(), 'token-b': deferred() }
-    const actionSeen: string[] = []
-    const answeredSeeds: string[] = []
-    page.on('dialog', (dialog) => dialog.accept(dialog.type() === 'prompt' ? 'Fresh corpus' : undefined))
-    await page.addInitScript(() => {
-      if (!window.sessionStorage.getItem('booted')) {
-        window.sessionStorage.setItem('booted', '1')
-        window.localStorage.setItem('rag_feeder_token', 'token-a')
-      }
-    })
-    await trackFetches(page)
-    await mockLogSocket(page)
-    await page.route('**/api/**', async (route) => {
-      const request = route.request()
-      const path = new URL(request.url()).pathname
-      const auth = request.headers().authorization || ''
-      if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
-      if (path === '/api/auth/me') {
-        return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
-      }
-      if (path === action.path && request.method() === action.method) {
         const token = auth.replace('Bearer ', '')
         actionSeen.push(token)
-        await gates[token].promise
+        await actionGates[token].promise
         return fulfil(route, action.answer)
       }
       await workspaceDefaults(path, route)
       if (path === '/api/seed/sources') answeredSeeds.push(auth)
     })
+    // While pending, the buttons read "Creating..." / "Deleting...".
     const createButton = page.locator('.upstream-management-form__actions button.secondary')
     const deleteButton = page.locator('.upstream-management-form__actions button.danger')
 
@@ -2082,23 +2032,30 @@ for (const action of [
     await expect(page.getByTestId('auth-user')).toHaveText('bob')
     await expect.poll(() => answeredSeeds.includes('Bearer token-b')).toBe(true)
     await page.getByRole('button', { name: 'Korpus Management' }).click()
+    // Alice's pending action does not lock bob's buttons (bob owns corpus 1).
     await expect(page.getByRole('button', { name: 'New corpus' })).toBeEnabled()
-    if (action.name === 'deletion') await expect(page.getByRole('button', { name: 'Delete corpus' })).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Delete corpus' })).toBeEnabled()
 
     await page.getByRole('button', { name: action.button }).click()
     await expect.poll(() => actionSeen).toEqual(['token-a', 'token-b'])
     await expect(createButton).toBeDisabled()
     await expect(deleteButton).toBeDisabled()
+    meGateOn = true
+    const meCalls = (await fetchStats(page, '/api/auth/me')).calls
 
     const reads = (await fetchStats(page, action.path)).reads
-    gates['token-a'].resolve()
+    actionGates['token-a'].resolve()
     await afterBodyRead(page, action.path, reads)
-    // Alice's late answer does not unlock bob's pending action.
+    // Alice's late answer sends no /me and does not unlock bob's pending action.
+    expect((await fetchStats(page, '/api/auth/me')).calls).toBe(meCalls)
     await expect(createButton).toBeDisabled()
     await expect(deleteButton).toBeDisabled()
 
-    gates['token-b'].resolve()
+    meGateOn = false
+    meRelease.resolve()
+    actionGates['token-b'].resolve()
     await expect(page.getByRole('button', { name: 'New corpus' })).toBeEnabled()
     await expect(page.getByRole('button', { name: 'Delete corpus' })).toBeEnabled()
+    await expect(page.getByTestId('auth-user')).toHaveText('bob')
   })
 }
