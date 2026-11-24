@@ -87,7 +87,9 @@ function sortSeedCandidates(candidates) {
 }
 
 function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false, onlyDownloaded = false } = {}) {
-  if (!tableExists(db, table)) return []
+  // An empty column list means the table is missing: one existence probe per load.
+  const cols = listTableColumns(db, table)
+  if (cols.length === 0) return []
 
   const joins = []
   const where = []
@@ -108,7 +110,6 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
   }
 
   const columns = ['t.id', 't.title', 't.authors', 't.year', 't.doi']
-  const cols = listTableColumns(db, table)
   if (cols.includes('openalex_id')) columns.push('t.openalex_id')
   if (cols.includes('download_state')) columns.push('t.download_state')
   if (cols.includes('download_last_error')) columns.push('t.download_last_error')
