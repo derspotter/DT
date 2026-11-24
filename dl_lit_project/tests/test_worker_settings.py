@@ -1,9 +1,27 @@
+import os
 import sqlite3
 
 import pytest
 
 from dl_lit import app_settings
 from tests._worker_import import load_worker
+
+
+@pytest.fixture(autouse=True)
+def _restore_setting_env(monkeypatch):
+    """Undo the settings refresh's own writes to os.environ when the test ends.
+
+    ``apply_app_settings_env`` sets the managed names in os.environ directly, and
+    ``monkeypatch.delenv(..., raising=False)`` records nothing for a name that is absent, so a
+    stored setting (``llm_provider = openai``, ``openalex_api_key``) would outlive the test.
+    Registering every managed name here makes monkeypatch restore it, or remove it again.
+    """
+    for name in app_settings.APP_SETTING_ENV.values():
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+        else:
+            monkeypatch.setenv(name, "")  # recorded as absent: teardown removes it
+            monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)
