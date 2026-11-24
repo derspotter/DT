@@ -136,8 +136,10 @@ their decisions.
   is open (with D8's accepted residual).
 - The topic backfill writes only rows still in the state it selected them in.
 - A failed claim in the worker is a failed job or cycle, never an empty one, and a job whose
-  failure cannot be recorded is requeued by a restart.
-- One place reads the OpenAlex key, and the missing-key warning prints once per process.
+  claim failed and whose failure cannot be recorded is requeued by a restart (a job that did
+  work is not; see D11).
+- One place reads the OpenAlex key, and the missing-key warning prints once per process (two
+  concurrent first callers can each print it once; D12).
 - Each change has a test that fails on `c574aba`.
 
 ## Non-goals
@@ -158,8 +160,9 @@ Everything else that is still open after the reconciliation belongs to later pha
 - **D8 keeps one build per key on disk and assumes one writer.** No per-build directories, no
   grace period for old builds, no fd streaming; the small gap between the version check and the
   file open is an accepted residual (D8).
-- **D11 does not change the watchdog or the direct-cycle error path;** it adds only the restart
-  when a job's failure cannot be recorded.
+- **D11 does not change the watchdog or the direct-cycle error path;** it adds the bounded retry
+  of a terminal job write and the restart when a job whose claim failed cannot record its
+  failure.
 
 ## Decisions
 
@@ -350,7 +353,9 @@ re-arms the timer, or the stale cadence ends at the next cycle:
   idle), which a dependency would not shorten. No code change; the row is closed in the inventory.
 
 **D6. The config no longer forces polling (FE-24), controller call.**
-- `vite.config.js` sets `watch: { usePolling: false }`, with a comment: the bundled chokidar 3
+- `vite.config.js` sets `watch: { usePolling: pollingFromEnv(process.env.CHOKIDAR_USEPOLLING) }`
+  (corrected after `59841c8`; the first wording, a literal `false`, is wrong on macOS), with a
+  comment: the bundled chokidar 3
   (`node_modules/vite/dist/node/chunks/config.js:13887-13893`) lets `CHOKIDAR_USEPOLLING`
   override the option; the dev containers set it to `1` (`docker-compose.yml:169`,
   `docker-compose.dev.yml:30`) for the bind mount; Playwright and CI leave it unset.
@@ -359,8 +364,11 @@ re-arms the timer, or the stale cadence ends at the next cycle:
   `./frontend:/app` bind mount) sees the same watcher after Vite restarts on the config change.
   No compose change.
 - Chokidar's own parsing of the variable stays: `0` and `false` turn polling off; any other
-  non-empty value, `bogus` and ` 0 ` included, turns it on. The config does not parse the
-  variable itself, because chokidar would override the result anyway.
+  non-empty value, `bogus` and ` 0 ` included, turns it on. The config's `pollingFromEnv`
+  repeats exactly that rule (case-insensitive, untrimmed; unset or empty is off), so the option
+  carries the value chokidar would pick. A literal `false` is not enough: on macOS chokidar
+  chooses FSEvents from the option before its environment override applies, which brought back
+  the FSEvents ordering bug that `59841c8` fixed.
 - Test, new `frontend/tests/dev-server-config.spec.ts` (no page). It checks the watcher Vite
   actually builds, not the config object. A node child with `cwd` the frontend dir runs
   `createServer({ configFile: 'vite.config.js', logLevel: 'silent', optimizeDeps: { noDiscovery: true } })`
@@ -409,7 +417,9 @@ call.**
   and conditional handling. A request without `v` is unchanged.
 - **Accepted residual:** the gzip path's `statSync` and stream open, and `sendFile`'s
   asynchronous open, run after the check. A rebuild that swaps in that gap can still serve one
-  file of the new build under the old version. Rebuilds are rare (1 h TTL, or an admin refresh),
+  file of the new build under the old version. Rebuilds are rare (1 h TTL, or an explicit
+  `refresh=1` manifest request, which any viewer of the corpus can send, so a rebuild is not
+  admin-only),
   the worst case is one mixed graph until the next load, and closing the gap would need fd
   streaming that drops `sendFile`'s range and conditional responses.
 - `generated_at` is an ISO timestamp with microseconds (`graph_3d_export.py:817`), and a build
@@ -551,6 +561,20 @@ recovered by a restart (PY-54), controller call.**
     sets the job back to `pending` and releases the dead worker's work claims. The job runs again
     rather than ending `failed`: the same outcome as any other worker restart.
   - The watchdog's own failure path is unchanged.
+  - **Final review correction (replay only without work).** The restart above replayed every job
+    type, so a scraper job whose run had committed its artifacts ran again and duplicated them.
+    Now:
+    - every terminal job write (`mark_job_completed`, `mark_job_failed`) goes through
+      `_write_job_end`: 3 attempts, pauses `TERMINAL_WRITE_BACKOFF_SECONDS = (0.25, 0.5)`, a
+      rollback of any open transaction between them; the last error is raised. A completion
+      that still fails falls into the `except` and the failure write is tried (as before D11);
+    - the claim in `do_enrich` and `do_download` raises `JobClaimFailed` (chained to the
+      `sqlite3.Error`). Only for that exception does an unrecordable failure log the line above
+      and exit 75; the claim is the first thing these jobs do, so no work was done;
+    - any other job that cannot record its end logs
+      `Job <id>: its end could not be recorded (<error>); it stays running until start-up recovery after the next restart.`
+      and does not exit (pre-phase-8 behaviour: the job shows `running` until a restart's
+      recovery rules apply).
 - Other callers keep `[]`: the default is unchanged, and the "daemon's contract" assertion of
   `test_a_failed_claim_is_not_an_empty_queue` (`test_cli_download_leases.py:1248-1258`) still
   holds for the default.
@@ -575,7 +599,9 @@ recovered by a restart (PY-54), controller call.**
   - a key with surrounding whitespace is stripped;
   - a blank or whitespace-only `OPENALEX_API_KEY` counts as unset, so the reader falls back to
     `RAG_FEEDER_OPENALEX_API_KEY` (`utils.py:260-262`); today the scraper sends the blank value;
-  - the missing-key warning prints once per process instead of twice.
+  - the missing-key warning prints once per process instead of twice. Accepted exception
+    (cosmetic): the flag is checked and set without a lock, so two concurrent first callers can
+    both pass the check while the first print runs and each print the warning once.
 
   The worker's settings refresh (`test_worker_settings.py:98-103`) still sees the new key,
   because the reader runs at construction as before.
@@ -659,14 +685,16 @@ reconciliation section with a pointer to this spec.
   call count. No DOM observer is needed.
 - **D5 (FE-22):** closed, not a bug: once `/me` shows a role change, the next cycle at the latest
   re-arms with it; a tab change re-arms itself.
-- **D6 (FE-24):** the config sets `usePolling: false`; chokidar's own `CHOKIDAR_USEPOLLING`
-  override keeps the containers polling (compose sets `1`), so the host stops polling and the
-  containers keep their cost.
+- **D6 (FE-24):** the config sets `usePolling` to the environment value parsed with chokidar's
+  rule (`pollingFromEnv(process.env.CHOKIDAR_USEPOLLING)`), not a literal `false`, because macOS
+  picks FSEvents from the option; the containers keep polling (compose sets `1`), the host stops
+  polling, and the containers keep their cost.
 - **D8 (BE-54):** single-writer assumption; a versioned file request is compared once with the
   live build's version and answers 409 (no-store) on a mismatch; otherwise the route is unchanged
   (`sendFile` keeps range and conditional responses); requests without `v` are unchanged; the
   scope check stays first. Residual: a swap between the check and the file open can still serve
-  one new file under the old version (rare, fixed by the next load). The frontend owns each load
+  one new file under the old version (rare, fixed by the next load; a rebuild comes from the TTL
+  or from any corpus viewer's `refresh=1`, not only from an administrator). The frontend owns each load
   once and retries once, never after unmount. The graph component is keyed by the committed
   workspace corpus, so a header switch remounts it and loads the new corpus. One build per key
   stays on disk.
@@ -677,8 +705,35 @@ reconciliation section with a pointer to this spec.
   OpenAlex id for pass 2, unfetched) in one `UPDATE`; a changed row is left for the next run; `mark_fetched` goes;
   `doi_rows` returns triples, so a phase 7 annotation test changes.
 - **D11 (PY-54):** the worker raises on a failed claim for both enrich and download; such a job
-  now ends `failed` instead of `completed` with zero counts. When the failure cannot be recorded
-  either, the worker exits with 75, and start-up recovery requeues the job (it runs again). Other
-  callers keep `[]`.
+  now ends `failed` instead of `completed` with zero counts. Every terminal job write gets 3
+  attempts. When a job whose claim failed cannot record its failure either, the worker exits
+  with 75, and start-up recovery requeues the job (it runs again, having done no work). A job
+  that did work and cannot record its end logs one line and stays `running` until a restart
+  (no replay, so a scraper's artifacts are not duplicated). Other callers keep `[]`.
 - **D12 (PY-27):** the scraper strips the key, treats a blank one as unset (falling back to
-  `RAG_FEEDER_OPENALEX_API_KEY`), and the warning prints once per process.
+  `RAG_FEEDER_OPENALEX_API_KEY`), and the warning prints once per process; two concurrent first
+  callers can each print it once (accepted, cosmetic).
+
+### Final review fixes (Codex final review and the Claude second pass)
+
+1. **D11 replay scope:** terminal job writes retried (3 attempts, short backoff); automatic
+   replay (exit 75, start-up requeue) only after a failed claim; a job that did work keeps the
+   pre-phase-8 behaviour. Tests in `test_worker_claim_errors.py`.
+2. **Citing requests do not follow redirects (PY-27 follow-up):** `openalex_request_json` takes
+   `allow_redirects` (default unchanged; the option reaches the session only when `False`); the
+   citing fetch passes `False`, and a 3xx answer marks the result incomplete with
+   `OpenAlex answered a redirect (<status>) to <origin>; not followed`. Tests in `test_hygiene.py`.
+3. **Rejected citing URL fallback:** `citing_works_url(stored, openalex_id)` keeps an OpenAlex
+   citing URL, replaces a rejected one (the Crossref mapping's api.crossref.org URL) with
+   `https://api.openalex.org/works?filter=cites:<id>` when the OpenAlex id is known, and keeps it
+   rejected otherwise; the enrichment, second-level, `process_single_file` and keyword-search
+   upstream callers use it.
+4. **FE-65 fixed here (un-parked):** `handleFiles` and `uploadItem` capture `corpusScopeEpoch`
+   next to `sessionEpoch`; after a corpus switch the in-flight upload does not call
+   `importSeed` and the rest of the selection is not uploaded. Test in `seed-upload.spec.ts`.
+5. **Node detail failure:** a failed detail request that is still current logs
+   `[graph] node detail failed:` and shows "Could not load details"; a superseded one stays
+   silent; nothing is cached. Test in `graph-3d.spec.ts`.
+6. **Manifest version errors:** `graph3dManifestVersion` answers `null` only on `ENOENT`; any
+   other read or parse error is logged and thrown, and the file route answers 500 (no-store)
+   instead of 409. Test in `graph-read-path.test.js`.

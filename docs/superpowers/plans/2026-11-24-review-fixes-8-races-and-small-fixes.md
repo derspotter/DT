@@ -69,7 +69,7 @@ The worktree has no `node_modules`.
   - D11: `Job <id>: the failure could not be recorded (<error>); exiting with code 75 so start-up recovery requeues it.`; the direct-cycle prefix `enrich cycle failed: ` (built by the existing `_run_direct_cycles`)
   - D12: `[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key.` (the existing utils text)
 - Exact values from the spec:
-  - D6: `watch: { usePolling: false }`; chokidar's env override decides inside the containers.
+  - D6: `watch: { usePolling: pollingFromEnv(process.env.CHOKIDAR_USEPOLLING) }`, chokidar's own rule applied to the env value (corrected after `59841c8`: a literal `false` lets macOS pick FSEvents from the option).
   - D8: one version check, no fd streaming; `sendFile` and the gzip stream stay; the middleware order stays.
   - D10: the guard is chosen by the pass, never by input.
   - D11: default `raise_errors=False`; exit code `JOB_TIMEOUT_EXIT_CODE` (75).
@@ -86,7 +86,7 @@ The worktree has no `node_modules`.
 2. **A client that refuses gzip, or asks for a range.** With a matching `v` it must still get `sendFile`'s plain file and a 206. Test in Task 2.
 3. **A late 403 on a seed follow-up after a sign-out.** It must not reconcile, so no `/me` is sent with the next user's token. Test in Task 1.
 4. **An outsider with a matching or a stale `v`.** Both get 403 from the scope check, never a 409 that reveals the build. Test in Task 2.
-5. **A job whose failure cannot be recorded.** It must not stay `running` under a live worker; the restart requeues it. Test in Task 4.
+5. **A job whose failure cannot be recorded.** After a failed claim it must not stay `running` under a live worker; the restart requeues it. A job that did work is not replayed (final review correction, spec D11). Test in Task 4 and the final fix.
 6. **`CHOKIDAR_USEPOLLING` set to compose's `1`, or to ` TRUE `.** The watcher Vite builds polls. Test in Task 3.
 
 ---
@@ -380,7 +380,7 @@ test('the watcher Vite builds polls only when CHOKIDAR_USEPOLLING turns it on', 
 - [ ] **Step 2: Run them and verify they fail.** Run `cd backend && npm test -- tests/corpus-sharing.test.js` and `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/dev-server-config.spec.ts --workers=1`. Expected: FAIL. The marker test sees the membership gone; the probe sees `usePolling: true` with the variable unset. The `1` and ` TRUE ` cases already pass.
 - [ ] **Step 3: Implement D7 and D6.**
   - D7: `const removed = authDb.transaction(() => { … })()`. Inside, the `corpus_works` delete runs; on `changes === 0` it returns `0`; otherwise the marker delete runs (same `tableExists` check) and it returns `changes`. The route answers 404 on `0`, else `{ removed: true, work_id }`; the `catch` is unchanged.
-  - D6: `watch: { usePolling: false }`. The comment names chokidar's `CHOKIDAR_USEPOLLING` override (`node_modules/vite/dist/node/chunks/config.js:13887-13893`) and the compose files that set it to `1` for the bind mount, and says that Playwright and CI leave it unset.
+  - D6: `watch: { usePolling: pollingFromEnv(process.env.CHOKIDAR_USEPOLLING) }` (corrected after `59841c8`; not a literal `false`, because chokidar picks FSEvents on macOS from the option). The comment names chokidar's `CHOKIDAR_USEPOLLING` override (`node_modules/vite/dist/node/chunks/config.js:13887-13893`) and the compose files that set it to `1` for the bind mount, and says that Playwright and CI leave it unset.
   - Append the new spec to the `ci.yml:54` list.
 - [ ] **Step 4: Run both again, then `npx vite build`.** Expected: all pass. `git grep -n "usePolling: true" -- frontend/vite.config.js` prints nothing.
 - [ ] **Step 5: Commit**: `backend: removing one work from a corpus is one transaction; vite no longer forces polling outside the containers (BE-55, FE-24)`
