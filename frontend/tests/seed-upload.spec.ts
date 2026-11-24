@@ -1,5 +1,5 @@
 import { expect, test, type Route } from '@playwright/test'
-import { mockLogSocket } from './helpers/mockApi'
+import { afterBodyRead, fetchStats, fulfil, logIn, mePayload, mockLogSocket, trackFetches } from './helpers/mockApi'
 
 // Exercises the BibTeX/JSON seed upload flow end-to-end in the real frontend
 // with the backend mocked (no auth/DB available in CI): file picker accepts a
@@ -97,6 +97,41 @@ test('BibTeX seed upload imports into the corpus and reports counts', async ({ p
   expect(processPdfCalls).toBe(1)
 })
 
+// FE-64 (spec D4): the upload list is saved best effort; a full
+// localStorage neither fails the upload nor stops the import.
+test('a full localStorage does not fail an upload', async ({ page }) => {
+  processPdfCalls = 0
+  importResult = IMPORTED
+  const warnings: string[] = []
+  page.on('console', (message) => {
+    if (message.type() === 'warning') warnings.push(message.text())
+  })
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+    const real = Storage.prototype.setItem
+    Storage.prototype.setItem = function (k: string, v: string) {
+      if (String(k).startsWith('rag-feeder:uploads:')) throw new DOMException('full', 'QuotaExceededError')
+      return real.call(this, k, v)
+    }
+  })
+  await page.route('**/api/**', mockApi)
+  await page.goto('/#/workspace')
+
+  const fileInput = page.locator('input[type="file"]').first()
+  await expect(fileInput).toBeAttached()
+  await fileInput.setInputFiles({
+    name: 'references.bib',
+    mimeType: 'application/x-bibtex',
+    buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+  })
+
+  const item = page.locator('.upload-item', { hasText: 'references.bib' })
+  await expect(item).toContainText('Imported 2 works (1 skipped, 2 added to corpus).')
+  await expect(item.locator('.status')).not.toHaveText('failed')
+  expect(warnings.filter((text) => text.startsWith('[uploads] could not save the upload list:'))).toHaveLength(1)
+})
+
 async function uploadSeed(page: import('@playwright/test').Page) {
   await mockLogSocket(page)
   await page.addInitScript(() => {
@@ -137,4 +172,194 @@ test('an import that saved nothing shows Import failed', async ({ page }) => {
   await expect(page.getByText(message, { exact: true })).toBeVisible()
   await expect(page.getByText(/Imported \d+ works/)).toHaveCount(0)
   await expect(item.locator('.status')).toHaveText('failed')
+})
+
+// A seed upload whose file answer settles after a sign-out and a new
+// sign-in does not import the old account's file under the new token, and
+// the rest of that selection is not uploaded under it either (review, out
+// of scope round 1).
+test('a seed upload answered after an account change does not import into the next account', async ({ page }) => {
+  importResult = IMPORTED
+  let release!: () => void
+  const uploadGate = new Promise<void>((r) => { release = r })
+  let uploadRequests = 0
+  const uploadHeld: (() => void)[] = []
+  let importGateOn = true
+  const importHeld: (() => void)[] = []
+  const answeredSeeds: string[] = []
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+    }
+  })
+  await trackFetches(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      return fulfil(route, { token: 'second-token', user: { id: 2, username: 'second', last_corpus_id: 1, is_admin: false } })
+    }
+    if (path === '/api/auth/me') {
+      const second = auth === 'Bearer second-token'
+      return fulfil(route, {
+        user: second ? { id: 2, username: 'second', last_corpus_id: 1, is_admin: false } : { id: 1, username: 'admin', last_corpus_id: 1, is_admin: true },
+        corpora: [{ id: 1, name: 'Local research corpus', role: 'owner', owner_username: 'admin' }],
+      })
+    }
+    if (path === '/api/process_pdf') {
+      uploadRequests += 1
+      if (uploadRequests === 1) await uploadGate
+      else await new Promise<void>((resolve) => { uploadHeld.push(resolve) })
+    }
+    if (path === '/api/ingest/import-seed' && importGateOn) {
+      await new Promise<void>((resolve) => { importHeld.push(resolve) })
+    }
+    await mockApi(route)
+    if (path === '/api/seed/sources') answeredSeeds.push(auth)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('admin')
+
+  await page.locator('input[type="file"]').first().setInputFiles([
+    {
+      name: 'references.bib',
+      mimeType: 'application/x-bibtex',
+      buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+    },
+    { name: 'more.json', mimeType: 'application/json', buffer: Buffer.from('[]') },
+  ])
+  await expect.poll(() => uploadRequests).toBe(1)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'second')
+  await expect(page.getByTestId('auth-user')).toHaveText('second')
+  await expect.poll(() => answeredSeeds.includes('Bearer second-token')).toBe(true)
+  const importCalls = (await fetchStats(page, '/api/ingest/import-seed')).calls
+  const upload = await fetchStats(page, '/api/process_pdf')
+
+  release()
+  await afterBodyRead(page, '/api/process_pdf', upload.reads)
+  expect((await fetchStats(page, '/api/ingest/import-seed')).calls).toBe(importCalls)
+  expect((await fetchStats(page, '/api/process_pdf')).calls).toBe(upload.calls)
+
+  importGateOn = false
+  for (const resume of importHeld.splice(0)) resume()
+  for (const resume of uploadHeld.splice(0)) resume()
+})
+
+// FE-65: a corpus switch while a seed upload is in flight stops the
+// selection. The upload that settles after the switch does not import into
+// the corpus now selected, and the rest of the selection is not uploaded.
+test('a seed upload answered after a corpus switch does not import into the next corpus', async ({ page }) => {
+  importResult = IMPORTED
+  let release!: () => void
+  const uploadGate = new Promise<void>((r) => { release = r })
+  let uploadRequests = 0
+  let corpusId = 1
+  let seedsAfterSwitch = 0
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await trackFetches(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') {
+      return fulfil(route, mePayload({
+        corpusId,
+        corpora: [1, 2].map((id) => ({ id, name: `Research corpus ${id}`, role: 'owner', owner_username: 'admin' })),
+      }))
+    }
+    if (path === '/api/corpora/2/select') {
+      corpusId = 2
+      return fulfil(route, { selected: 2 })
+    }
+    if (path === '/api/process_pdf') {
+      uploadRequests += 1
+      if (uploadRequests === 1) await uploadGate
+    }
+    await mockApi(route)
+    if (path === '/api/seed/sources' && corpusId === 2) seedsAfterSwitch += 1
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('admin')
+
+  await page.locator('input[type="file"]').first().setInputFiles([
+    {
+      name: 'references.bib',
+      mimeType: 'application/x-bibtex',
+      buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+    },
+    { name: 'more.json', mimeType: 'application/json', buffer: Buffer.from('[]') },
+  ])
+  await expect.poll(() => uploadRequests).toBe(1)
+
+  await page.locator('.header-corpus-picker select').selectOption('2')
+  await expect.poll(() => seedsAfterSwitch).toBeGreaterThan(0)
+  const importCalls = (await fetchStats(page, '/api/ingest/import-seed')).calls
+  const upload = await fetchStats(page, '/api/process_pdf')
+  expect(importCalls).toBe(0)
+  expect(upload.calls).toBe(1)
+
+  release()
+  await afterBodyRead(page, '/api/process_pdf', upload.reads)
+  expect((await fetchStats(page, '/api/ingest/import-seed')).calls).toBe(importCalls)
+  expect((await fetchStats(page, '/api/process_pdf')).calls).toBe(upload.calls)
+  expect(uploadRequests).toBe(1)
+})
+
+// An import that already started in corpus 1 reports its result on its row,
+// also after corpus 1 → 2 → 1 while it ran (the row is back on screen).
+test('an import that settles after switching away and back shows its result', async ({ page }) => {
+  importResult = IMPORTED
+  let release!: () => void
+  const importGate = new Promise<void>((r) => { release = r })
+  let corpusId = 1
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+  })
+  await trackFetches(page)
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === '/api/auth/me') {
+      return fulfil(route, mePayload({
+        corpusId,
+        corpora: [1, 2].map((id) => ({ id, name: `Research corpus ${id}`, role: 'owner', owner_username: 'admin' })),
+      }))
+    }
+    const select = path.match(/^\/api\/corpora\/(\d+)\/select$/)
+    if (select) {
+      corpusId = Number(select[1])
+      return fulfil(route, { selected: corpusId })
+    }
+    if (path === '/api/ingest/import-seed') await importGate
+    await mockApi(route)
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('admin')
+
+  await page.locator('input[type="file"]').first().setInputFiles([{
+    name: 'references.bib',
+    mimeType: 'application/x-bibtex',
+    buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+  }])
+  await expect.poll(async () => (await fetchStats(page, '/api/ingest/import-seed')).calls).toBe(1)
+
+  const picker = page.locator('.header-corpus-picker select')
+  for (const target of ['2', '1']) {
+    const me = (await fetchStats(page, '/api/auth/me')).reads
+    await picker.selectOption(target)
+    await afterBodyRead(page, '/api/auth/me', me)
+  }
+  await expect(page.getByText('references.bib')).toBeVisible()
+
+  const imports = (await fetchStats(page, '/api/ingest/import-seed')).reads
+  release()
+  await afterBodyRead(page, '/api/ingest/import-seed', imports)
+  await expect(page.getByText(/Imported 2 works \(1 skipped, 2 added to corpus\)/)).toBeVisible()
+  await expect(page.getByText('Importing seed…')).toBeHidden()
 })

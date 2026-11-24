@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { fulfil, mePayload, mockLogSocket } from './helpers/mockApi'
+import { afterBodyRead, fetchStats, fulfil, logIn, mePayload, mockLogSocket, trackFetches } from './helpers/mockApi'
 
 // Seed selection behaviour with the backend mocked: one search seed holding
 // 70,000 items of which only the first page (3 rows) is loaded.
@@ -38,7 +38,16 @@ type State = {
   source?: typeof seedSource
   keywordConfig?: Record<string, unknown>
   candidates?: typeof candidates
+  // Per-request gates for the 'readable' candidate's file (request n waits
+  // for fileGates[n]); request 0 answers with this status (default 200).
+  fileGates?: Promise<void>[]
+  lateFileStatus?: number
+  fileRequests?: number
+  // Every request's path and Authorization header, in order.
+  routeLog?: { path: string; auth: string }[]
 }
+
+const READABLE_FILE = '/api/seed/sources/search/70/candidates/readable/file'
 
 async function boot(page: Page, state: State) {
   const source = state.source || seedSource
@@ -46,8 +55,26 @@ async function boot(page: Page, state: State) {
   await mockLogSocket(page)
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname
+    const auth = route.request().headers().authorization || ''
+    state.routeLog?.push({ path, auth })
+    if (path === '/api/auth/login') {
+      return fulfil(route, { token: 'second-token', user: { id: 2, username: 'second', last_corpus_id: 1, is_admin: false } })
+    }
     if (path === '/api/auth/me') {
-      return fulfil(route, mePayload({ username: 'reader', admin: false, corpusId: state.corpusId, corpora: [corpusA, corpusB] }))
+      const second = auth === 'Bearer second-token'
+      return fulfil(route, mePayload({ id: second ? 2 : 1, username: second ? 'second' : 'reader', admin: false, corpusId: state.corpusId, corpora: [corpusA, corpusB] }))
+    }
+    if (path === READABLE_FILE) {
+      const n = state.fileRequests = (state.fileRequests || 0) + 1
+      const gate = state.fileGates?.[n - 1]
+      if (gate) await gate
+      if (n === 1 && state.lateFileStatus === 500) return fulfil(route, { error: 'late-candidate-error-7f3' }, 500)
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/pdf',
+        headers: { 'Content-Disposition': `attachment; filename="${n === 1 ? 'readable' : 'probe'}.pdf"` },
+        body: Buffer.from('%PDF-1.4\n'),
+      })
     }
     if (path === '/api/corpora/2/select') {
       state.corpusId = 2
@@ -230,4 +257,60 @@ test('a candidate shows a Download button only when the server marks its file re
   await expect(row('Readable copy').locator('.seed-download-link')).toHaveCount(1)
   await expect(row('Unreadable copy').locator('.seed-download-link')).toHaveCount(0)
   await expect(row('Missing copy').locator('.seed-download-link')).toHaveCount(0)
+})
+
+// FE-60b (spec D1): a candidate file that settles after a sign-out belongs to
+// the session that ended: no file is saved and no status or error shows.
+// The file route is built from the row's own source fields.
+const readableCandidates = [
+  { ...candidates[0], candidate_key: 'readable', source_type: 'search', source_key: '70', title: 'Readable copy', state: 'downloaded_elsewhere', downloaded_work_id: 9, file_available: true } as any,
+  { ...candidates[1], candidate_key: 'unreadable', title: 'Unreadable copy', state: 'pending', downloaded_work_id: null, file_available: false } as any,
+  { ...candidates[2], candidate_key: 'missing', title: 'Missing copy', state: 'downloaded', downloaded_work_id: 8, file_available: false } as any,
+]
+
+async function lateCandidateFile(page: Page, lateFileStatus: number) {
+  let release!: () => void
+  const state: State = {
+    corpusId: 1,
+    promoteBody: null,
+    holdPromote: null,
+    candidates: readableCandidates,
+    fileGates: [new Promise<void>((r) => { release = r })],
+    lateFileStatus,
+    routeLog: [],
+  }
+  const names: string[] = []
+  page.on('download', (download) => names.push(download.suggestedFilename()))
+  await trackFetches(page)
+  await boot(page, state)
+  await expandSeed(page)
+  const readableLink = page.getByTestId('seed-candidate-row').filter({ hasText: 'Readable copy' }).locator('.seed-download-link')
+  await readableLink.click()
+  await expect.poll(() => state.fileRequests).toBe(1)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'second')
+  await expect(page.getByTestId('auth-user')).toHaveText('second')
+  await expect.poll(() => state.routeLog!.some((e) => e.path === '/api/seed/sources' && e.auth === 'Bearer second-token')).toBe(true)
+
+  const reads = (await fetchStats(page, READABLE_FILE)).reads
+  release()
+  await afterBodyRead(page, READABLE_FILE, reads)
+  return { names, readableLink, state }
+}
+
+test('a candidate file that arrives after a sign-out is not saved', async ({ page }) => {
+  const { names, readableLink } = await lateCandidateFile(page, 200)
+  await expect(page.getByText('Downloaded readable.pdf.')).toHaveCount(0)
+
+  await expandSeed(page)
+  const download = page.waitForEvent('download')
+  await readableLink.click()
+  await download
+  expect(names).toEqual(['probe.pdf'])
+})
+
+test('a candidate file failing after a sign-out shows nothing', async ({ page }) => {
+  await lateCandidateFile(page, 500)
+  await expect(page.getByText('late-candidate-error-7f3')).toHaveCount(0)
 })

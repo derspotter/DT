@@ -1736,8 +1736,13 @@ class DatabaseManager:
         lease_seconds: int = 15 * 60,
         max_attempts: int | None = None,
         target_ids: list[int] | None = None,
+        raise_errors: bool = False,
     ) -> list[dict]:
-        """Atomically claim pending work rows for enrichment processing."""
+        """Atomically claim pending work rows for enrichment processing.
+
+        A SQLite error rolls back and answers ``[]`` (the daemon retries on its next poll),
+        or, with ``raise_errors``, re-raises so a caller can tell it from an empty queue.
+        """
         if limit <= 0:
             return []
 
@@ -1856,6 +1861,8 @@ class DatabaseManager:
                 self.conn.rollback()
             except Exception:
                 pass
+            if raise_errors:
+                raise
             return []
 
     def reset_enrich_claim(self, no_meta_id: int, *, state: str = "pending", error: str | None = None, selected: int = 0, claimed_by: str | None = None) -> tuple[bool | None, str | None]:

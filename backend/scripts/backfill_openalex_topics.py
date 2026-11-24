@@ -83,8 +83,11 @@ def doi_filter(tokens: list[str]) -> str:
     return "doi:" + "|".join(token.lower() for token in tokens)
 
 
-def doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[int, str]], int]:
-    """Pass 2's candidates as ``(work_id, DB key)`` pairs, plus how many were not a whole DOI."""
+def doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[int, str, str]], int]:
+    """Pass 2's candidates as ``(work_id, DB key, raw doi)``, plus how many were not a whole DOI.
+
+    The raw ``doi`` is the column's value exactly as read; the write guard compares against it.
+    """
     rows = []
     skipped = 0
     for row in conn.execute(
@@ -99,7 +102,7 @@ def doi_rows(conn, *, scope_clause: str, limit_clause: str) -> tuple[list[tuple[
     ):
         bare = bare_doi(row[1])
         if bare:
-            rows.append((row[0], bare.upper()))  # == normalize_doi(bare), the DB key
+            rows.append((row[0], bare.upper(), row[1]))  # bare.upper() == normalize_doi(bare), the DB key
         else:
             skipped += 1
     return rows, skipped
@@ -151,43 +154,53 @@ def topic_fields(work):
     )
 
 
-def write_results(conn, updates):
-    """updates: list of (work_id, topic, subfield, field, domain, topics_json)."""
-    conn.executemany(
-        """
+# What each pass selected a row for, repeated in every write (the scope comes on top), so a row
+# the enrich worker or a merge changed while its request was held is left for the next run.
+WRITE_GUARDS: dict[str, str] = {
+    "openalex": "openalex_id = ? AND (topics_fetched IS NULL OR topics_fetched = 0)",
+    "doi": "doi = ? AND (openalex_id IS NULL OR openalex_id = '') AND (topics_fetched IS NULL OR topics_fetched = 0)",
+}
+
+
+def write_results(conn, updates, guard: str, scope_clause: str) -> list[int]:
+    """Write topics for rows still in the state the pass read; return the ids written.
+
+    updates: list of (work_id, raw, topic, subfield, field, domain, topics_json), where ``raw``
+    is the identifier the row was read with. ``guard`` names a ``WRITE_GUARDS`` entry and
+    ``scope_clause`` is ``main``'s fixed scope; neither comes from free input. Every resolved
+    row gets ``topics_fetched = 1`` here, with or without a usable topic.
+    """
+    sql = f"""
         UPDATE works
         SET primary_topic = ?, primary_subfield = ?, primary_field = ?,
             primary_domain = ?, topics_json = ?, topics_fetched = 1
-        WHERE id = ?
-        """,
-        [(topic, subfield, field, domain, topics_json, work_id)
-         for (work_id, topic, subfield, field, domain, topics_json) in updates],
-    )
+        WHERE id = ? AND ({scope_clause}) AND {WRITE_GUARDS[guard]}
+        """
+    written = []
+    for work_id, raw, topic, subfield, field, domain, topics_json in updates:
+        cur = conn.execute(sql, (topic, subfield, field, domain, topics_json, work_id, raw))
+        if cur.rowcount == 1:
+            written.append(work_id)
     conn.commit()
+    return written
 
 
-def mark_fetched(conn, work_ids):
-    """Mark resolved-but-topicless works so re-runs skip them."""
-    conn.executemany(
-        "UPDATE works SET topics_fetched = 1 WHERE id = ? AND topics_fetched IS NULL",
-        [(work_id,) for work_id in work_ids],
-    )
-    conn.commit()
+def run_pass(conn, rows, key, build_filter, mailto, batch_size, label, guard, scope_clause) -> tuple[int, int, int]:
+    """Generic batched backfill. `key` maps a result work to its lookup token.
 
-
-def run_pass(conn, rows, key, build_filter, mailto, batch_size, label):
-    """Generic batched backfill. `key` maps a result work to its lookup token."""
+    rows: (work_id, token, raw identifier); ``guard`` and ``scope_clause`` go to ``write_results``.
+    """
     processed = 0
     matched = 0
     fielded = 0
     total = len(rows)
     for batch in chunk(rows, batch_size):
-        token_to_work_id = {token: work_id for work_id, token in batch}
+        token_to_row = {token: (work_id, raw) for work_id, token, raw in batch}
         try:
             data = openalex_request_json(
                 endpoint="works",
                 params={
-                    "filter": build_filter([token for _wid, token in batch]),
+                    "filter": build_filter([token for _wid, token, _raw in batch]),
                     "per-page": batch_size,
                     "select": SELECT_FIELDS,
                 },
@@ -201,24 +214,25 @@ def run_pass(conn, rows, key, build_filter, mailto, batch_size, label):
             processed += len(batch)
             continue
 
-        updates = []
-        seen_work_ids = []
+        # One update per work: a second result for the same token would otherwise fail the
+        # guard (the first already set topics_fetched) and be counted as changed. The last
+        # result wins, as it did when every result was written in turn.
+        by_work_id = {}
         for work in data.get("results", []):
             token = key(work)
-            work_id = token_to_work_id.get(token)
-            if work_id is None:
+            row = token_to_row.get(token)
+            if row is None:
                 continue
-            seen_work_ids.append(work_id)
-            topic, subfield, field, domain, topics_json = topic_fields(work)
-            if field:
-                fielded += 1
-            updates.append((work_id, topic, subfield, field, domain, topics_json))
+            work_id, raw = row
+            by_work_id[work_id] = (work_id, raw, *topic_fields(work))
+        updates = list(by_work_id.values())
         if updates:
-            write_results(conn, updates)
-            matched += len(updates)
-        # Resolved IDs with no usable topic still get flagged so we don't refetch.
-        if seen_work_ids:
-            mark_fetched(conn, seen_work_ids)
+            written = set(write_results(conn, updates, guard, scope_clause))
+            matched += len(written)
+            fielded += sum(1 for update in updates if update[0] in written and update[4])
+            changed = len(updates) - len(written)
+            if changed > 0:
+                log(f"[{label}] {changed} work(s) changed while the batch was fetched; left for the next run")
         processed += len(batch)
         log(f"[{label}] {processed}/{total} processed, {matched} resolved, {fielded} with a field")
     return processed, matched, fielded
@@ -259,7 +273,7 @@ def main():
     ):
         token = normalize_openalex_id(row["openalex_id"])
         if token:
-            id_rows.append((row["id"], token))
+            id_rows.append((row["id"], token, row["openalex_id"]))
     log(f"Pass 1 (by openalex_id): {len(id_rows)} works")
     run_pass(
         conn,
@@ -269,6 +283,8 @@ def main():
         mailto=mailto,
         batch_size=batch_size,
         label="id",
+        guard="openalex",
+        scope_clause=scope_clause,
     )
 
     # Pass 2: matched works without an OpenAlex ID but with a DOI.
@@ -283,6 +299,8 @@ def main():
             mailto=mailto,
             batch_size=batch_size,
             label="doi",
+            guard="doi",
+            scope_clause=scope_clause,
         )
 
     # Final coverage report.

@@ -41,6 +41,15 @@ const hmr = disableHmr
         clientPort: 5175,
       }
 
+// chokidar 3's reading of CHOKIDAR_USEPOLLING: '0'/'false' off, '1'/'true' on,
+// any other non-empty value on, unset or empty off (case-insensitive, untrimmed).
+function pollingFromEnv(value) {
+  if (value === undefined) return false
+  const lower = value.toLowerCase()
+  if (lower === 'false' || lower === '0') return false
+  return lower.length > 0
+}
+
 export default defineConfig({
   plugins: [svelte()],
   server: {
@@ -51,8 +60,14 @@ export default defineConfig({
     fs: {
       deny: fsDeny,
     },
+    // No forced polling. CHOKIDAR_USEPOLLING turns it on: the dev containers set
+    // it to 1 for their bind mount (docker compose), so they keep polling;
+    // Playwright and CI leave it unset, so the host uses native file events.
+    // The option itself carries the value (read with chokidar's own rule)
+    // because chokidar chooses FSEvents on macOS from the option, before its
+    // environment override applies.
     watch: {
-      usePolling: true,
+      usePolling: pollingFromEnv(process.env.CHOKIDAR_USEPOLLING),
     },
     hmr,
     proxy: {

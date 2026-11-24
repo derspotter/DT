@@ -408,3 +408,23 @@ def test_topic_only_run_is_labelled_and_records_topics(monkeypatch, tmp_path, ca
     assert filters["topics"] == ["T10208", "T11421"]
     assert filters["topic_labels"] == ["Labor market dynamics", "Labor Movements and Unions"]
     db.close_connection()
+
+
+# --- final fix: a rejected stored citing URL falls back to OpenAlex's cites: filter ---------
+
+def test_upstream_expansion_of_a_work_with_a_crossref_citing_url_uses_the_cites_filter(monkeypatch):
+    mod = _load(monkeypatch)
+    sent = []
+
+    def fake_fetch(url, rate_limiter, **kwargs):
+        sent.append(url)
+        return []
+
+    monkeypatch.setattr(mod, 'fetch_citing_work_ids', fake_fetch)
+    work = {
+        'id': 'https://openalex.org/W5',
+        'cited_by_api_url': 'https://api.crossref.org/works/10.1000/xyz/references',
+    }
+    mod._fetch_upstream_candidates(work, rate_limiter=None, mailto='m@example.org', max_related=5)
+    assert len(sent) == 1
+    assert sent[0].startswith('https://api.openalex.org/works?filter=cites:W5&sort=')

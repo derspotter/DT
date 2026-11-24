@@ -19,6 +19,7 @@ if str(DL_LIT_PROJECT) not in sys.path:
     sys.path.insert(0, str(DL_LIT_PROJECT))
 
 from dl_lit.OpenAlexScraper import (
+    citing_works_url,
     fetch_citing_work_ids,
     fetch_referenced_work_details,
 )
@@ -315,7 +316,8 @@ def _details_after_quota(exc, candidate_ids, known=None):
 
 
 def _fetch_upstream_candidates(work, rate_limiter, mailto, max_related, related_sort=DEFAULT_RELATED_SORT):
-    cited_by_url = work.get('cited_by_api_url')
+    # A stored URL that is not an OpenAlex one (the Crossref mapping's) gives way to `cites:`.
+    cited_by_url = citing_works_url(work.get('cited_by_api_url'), work.get('id'))
     if not cited_by_url:
         # OpenAlex has removed cited_by_api_url from the works payload — it is
         # absent even when no `select` is given, so refetching the work cannot

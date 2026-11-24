@@ -597,6 +597,23 @@ async function warmGraph3dSnapshot() {
   }
 }
 
+// The build version a snapshot's resource URLs carry in ?v=: the manifest's
+// generated_at, else its mtime floored; null when there is no manifest
+// (ENOENT). Any other read or parse error is logged and thrown: it is not a
+// rebuild, and the file route answers 500 for it.
+function graph3dManifestVersion(key) {
+  const manifestPath = graph3dSnapshotPath(key, 'manifest.json');
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+    if (manifest?.generated_at) return String(manifest.generated_at);
+    return String(Math.floor(fs.statSync(manifestPath).mtimeMs));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    console.error(`[graph3d] could not read the manifest version of ${key}:`, error?.message || error);
+    throw error;
+  }
+}
+
 function decorateGraph3dManifest(manifest, key) {
   const base = `/api/graph/3d/snapshot/${encodeURIComponent(key)}`;
   const files = manifest?.files || {};
@@ -607,16 +624,10 @@ function decorateGraph3dManifest(manifest, key) {
   // manifest's own generated_at — written atomically with the rest of the
   // manifest and bumped on every rebuild — so the version always matches the
   // manifest being decorated (no separate stat() that could race a swap).
-  let version = '';
-  if (manifest?.generated_at) {
-    version = String(manifest.generated_at);
-  } else {
-    try {
-      version = String(Math.floor(fs.statSync(graph3dSnapshotPath(key, 'manifest.json')).mtimeMs));
-    } catch {
-      version = '';
-    }
-  }
+  // The fallback is the same rule the file route checks ?v= against.
+  const version = manifest?.generated_at
+    ? String(manifest.generated_at)
+    : (graph3dManifestVersion(key) || '');
   const v = version ? `?v=${encodeURIComponent(version)}` : '';
   return {
     ...manifest,
@@ -5510,18 +5521,24 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       return res.status(400).json({ error: 'Invalid work id' });
     }
     try {
-      const result = authDb
-        .prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
-        .run(req.corpusId, workId);
-      if (result.changes === 0) {
-        return res.status(404).json({ error: 'Work is not a member of this corpus' });
-      }
-      // Drop the explicit seed marker too, so the seed table stops showing the
-      // item as promoted and offers it for promotion again.
-      if (tableExists(authDb, 'seed_candidates_in_corpus')) {
-        authDb
-          .prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+      // One transaction: a failed marker delete rolls the membership delete
+      // back, so the work never leaves the corpus with its marker left behind.
+      const removed = authDb.transaction(() => {
+        const result = authDb
+          .prepare('DELETE FROM corpus_works WHERE corpus_id = ? AND work_id = ?')
           .run(req.corpusId, workId);
+        if (result.changes === 0) return 0;
+        // Drop the explicit seed marker too, so the seed table stops showing the
+        // item as promoted and offers it for promotion again.
+        if (tableExists(authDb, 'seed_candidates_in_corpus')) {
+          authDb
+            .prepare('DELETE FROM seed_candidates_in_corpus WHERE corpus_id = ? AND work_id = ?')
+            .run(req.corpusId, workId);
+        }
+        return result.changes;
+      })();
+      if (removed === 0) {
+        return res.status(404).json({ error: 'Work is not a member of this corpus' });
       }
       return res.json({ removed: true, work_id: workId });
     } catch (error) {
@@ -5877,6 +5894,24 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     const allowedFiles = new Set(['manifest.json', 'nodes.bin', 'edges.bin', 'nodes_meta.json', 'clusters.json']);
     if (!/^[a-f0-9]{20}$/.test(key) || !allowedFiles.has(fileName)) {
       return res.status(400).json({ error: 'Invalid snapshot file request' });
+    }
+    // A versioned request names the build its manifest came from. After a
+    // rebuild swapped the files, refuse it so the client reloads the manifest
+    // instead of pairing files of two builds. The backend is the only writer
+    // and swaps with sync renames, so nothing swaps between this check and the
+    // next statement; sendFile's async open after it is an accepted residual.
+    if (typeof req.query?.v === 'string') {
+      let liveVersion;
+      try {
+        liveVersion = graph3dManifestVersion(key);
+      } catch {
+        res.set('Cache-Control', 'no-store');
+        return res.status(500).json({ error: 'Could not read the graph snapshot manifest' });
+      }
+      if (liveVersion !== req.query.v) {
+        res.set('Cache-Control', 'no-store');
+        return res.status(409).json({ error: 'The graph snapshot was rebuilt; reload the graph.', code: 'snapshot_rebuilt' });
+      }
     }
     const filePath = graph3dSnapshotPath(key, fileName);
     if (!fs.existsSync(filePath)) {

@@ -1,3 +1,8 @@
+<script module>
+  // Once per page load, not per mount (FE-64): the upload list's storage warning.
+  let uploadStorageWarned = false
+</script>
+
 <script>
   import { onMount } from 'svelte'
   import {
@@ -763,6 +768,8 @@
     return 'uploaded'
   }
 
+  // The upload list is saved best effort (FE-64): a full or blocked
+  // localStorage must not fail the upload. The warning flag is module-level.
   function persistStoredUploads(nextUploads = uploads) {
     if (typeof window === 'undefined') return
     const key = uploadStorageKey()
@@ -784,7 +791,14 @@
         backendFilename: String(item.backendFilename || ''),
         message: String(item.message || ''),
       }))
-    window.localStorage.setItem(key, JSON.stringify(persisted))
+    try {
+      window.localStorage.setItem(key, JSON.stringify(persisted))
+    } catch (error) {
+      if (!uploadStorageWarned) {
+        uploadStorageWarned = true
+        console.warn('[uploads] could not save the upload list:', error?.message)
+      }
+    }
   }
 
   function restoreStoredUploads() {
@@ -2280,6 +2294,9 @@
     kantroposTargetsError = ''
     finishExtractionProgress()
     if (signOut) {
+      // The export lock is the session's: a corpus switch keeps it, so one
+      // export at a time per session.
+      exportBusy = false
       // null makes the Admin tab fetch the settings again.
       appSettings = null
       appSettingsDraft = {}
@@ -2327,6 +2344,8 @@
     const epoch = sessionEpoch
     try {
       await selectCorpus(nextId)
+      // Its /me would carry the next session's token.
+      if (epoch !== sessionEpoch) return
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -2358,6 +2377,8 @@
     const epoch = sessionEpoch
     try {
       await createCorpus(name.trim())
+      // Its /me would carry the next session's token.
+      if (epoch !== sessionEpoch) return
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -2407,6 +2428,8 @@
     const epoch = sessionEpoch
     try {
       const payload = await deleteCorpusApi(currentCorpusId)
+      // Its /me would carry the next session's token.
+      if (epoch !== sessionEpoch) return
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -2678,7 +2701,12 @@
     }))
     uploads = [...uploads, ...newItems]
     event.target.value = ''
+    // The rest of a selection is not uploaded under the next session's token,
+    // nor into a corpus the user switched to meanwhile (FE-65).
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
     for (const item of newItems) {
+      if (session !== sessionEpoch || scope !== corpusScopeEpoch) return
       await uploadItem(item)
     }
   }
@@ -2692,14 +2720,26 @@
 
   async function uploadItem(item) {
     updateUpload(item.id, { status: 'uploading', message: '' })
+    // An upload that settles after a sign-out belongs to the session that
+    // ended: its import would run under the next session's token. One that
+    // settles after a corpus switch belongs to the corpus left: the import
+    // would land in the one now selected (FE-65).
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
+    const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     try {
       const payload = await uploadPdf(item.file)
+      if (stale()) return
       const seedKind = seedKindForName(item.name)
       if (seedKind) {
         // BibTeX/JSON seeds are imported straight into the corpus (no PDF
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
         const result = await importSeed(payload.filename, seedKind)
+        // The import ran in the corpus it started in, so its row reports the
+        // result even after a corpus switch (the row may be back on screen after
+        // A → B → A); only an ended session drops it.
+        if (session !== sessionEpoch) return
         if (result?.stopped) {
           // The import stopped on an error; what it saved before that stays.
           const processed = Number(result.processed || 0)
@@ -2726,6 +2766,7 @@
       }
       apiStatus = 'online'
     } catch (error) {
+      if (stale()) return
       if (error?.status === 401) {
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
         return
@@ -3281,8 +3322,11 @@
       }
     } catch (error) {
       if (error?.status === 401) return
-      handleCorpusPollForbidden(error)
+      // A superseded request (a newer load, a corpus switch or a sign-out)
+      // does not reconcile: after a sign-out that /me would carry the next
+      // session's token.
       if (token !== seedSourcesRequestToken) return
+      handleCorpusPollForbidden(error)
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
   }
@@ -3872,9 +3916,15 @@
       searchStatus = ''
       return
     }
+    // A launch answered after the frontend committed a sign-out or a corpus
+    // switch belongs to what ended (FE-63); the run itself goes on server side.
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
+    const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     searchStatus = 'Starting search...'
     try {
       const { data, expansion, runId, running } = await runKeywordSearch(requestBody)
+      if (stale()) return
       void refreshQuota()
       if (runId && running) {
         // Start polling on the 202 itself; the seed list may not report this
@@ -3883,7 +3933,9 @@
       }
       if (runId) {
         await loadSeedSources({ quiet: true })
+        if (stale()) return
         await focusSeedSource('search', runId)
+        if (stale()) return
       }
       if (running) {
         searchStatus = 'Fetching in the background. The seed below fills in as pages arrive.'
@@ -3892,7 +3944,7 @@
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
       searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || stale()) return
       searchStatus = error?.message || 'Search failed.'
     }
   }
@@ -4266,6 +4318,9 @@
   async function handleExportDownload(format, label) {
     if (exportBusy) return
     exportBusy = true
+    // A file that settles after a sign-out belongs to the session that ended
+    // (FE-60b); a corpus switch does not end it.
+    const session = sessionEpoch
     exportStatus = `${label} export is being generated...`
     const exportFilters = {
       status: exportFilterStatus === 'all' ? '' : exportFilterStatus,
@@ -4275,6 +4330,7 @@
     }
     try {
       const { blob, filename } = await downloadCorpusExport(format, exportFilters)
+      if (session !== sessionEpoch) return
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -4285,22 +4341,22 @@
       URL.revokeObjectURL(url)
       exportStatus = `${label} export downloaded.`
     } catch (error) {
-      if (error?.status === 401) {
-        exportStatus = 'Session expired. Please sign in again.'
-        return
-      }
+      if (error?.status === 401 || session !== sessionEpoch) return
       exportStatus = error?.message || 'Failed to export corpus data.'
     } finally {
-      exportBusy = false
+      // An old session's export never unlocks the next session's.
+      if (session === sessionEpoch) exportBusy = false
     }
   }
 
   async function handleDownloadedCorpusFile(item) {
     const itemId = Number(item?.id);
     if (!Number.isFinite(itemId) || itemId <= 0) return;
+    const session = sessionEpoch
     try {
       corpusLoadStatus = 'Preparing download...'
       const url = await createCorpusItemDownloadUrl(itemId)
+      if (session !== sessionEpoch) return
       const link = document.createElement('a')
       link.href = url
       document.body.appendChild(link)
@@ -4308,7 +4364,7 @@
       link.remove()
       corpusLoadStatus = 'Download started.'
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       corpusLoadStatus = error?.message || 'Failed to download file.'
     }
   }
@@ -4370,8 +4426,10 @@
     const sourceKey = String(ingestSource || '').trim()
     if (!sourceKey) return
     let objectUrl = ''
+    const session = sessionEpoch
     try {
       const { blob, filename } = await fetchSeedSourceDocument(sourceKey)
+      if (session !== sessionEpoch) return
       objectUrl = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = objectUrl
@@ -4380,7 +4438,7 @@
       link.click()
       link.remove()
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       ingestRunsStatus = error?.message || 'Failed to download the seed document.'
     } finally {
       if (objectUrl) URL.revokeObjectURL(objectUrl)
@@ -4393,8 +4451,10 @@
     const sourceKey = String(candidate?.source_key || '').trim()
     const candidateKey = String(candidate?.candidate_key || '').trim()
     if (!Number.isFinite(workId) || workId <= 0 || !sourceType || !sourceKey || !candidateKey) return
+    const session = sessionEpoch
     try {
       const { blob, filename } = await downloadSeedCandidateFile(sourceType, sourceKey, candidateKey)
+      if (session !== sessionEpoch) return
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -4405,7 +4465,7 @@
       URL.revokeObjectURL(url)
       seedActionStatus = `Downloaded ${filename}.`
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       seedActionStatus = error?.message || 'Failed to download seed candidate file.'
     }
   }
@@ -5981,7 +6041,11 @@
         {#await import('./components/ThreeGraph.svelte')}
           <p class="muted">Loading…</p>
         {:then module}
-          <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+          <!-- One instance per committed workspace corpus: a switch ends the old
+               instance's load and the new one loads the new corpus's graph. -->
+          {#key graphCorpusId}
+            <svelte:component this={module.default} {corpora} selectedGraphCorpusId={graphCorpusId} allowAllCorpora={isAdmin} />
+          {/key}
         {:catch error}
           {logTabImportError('ThreeGraph', error)}<p class="muted">Could not load this tab. Reload the page to try again.</p>
         {/await}

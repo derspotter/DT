@@ -162,8 +162,11 @@ def test_backfill_helpers_carry_the_specified_annotations(backfill):
     assert typing.get_type_hints(backfill.doi_rows) == {
         "scope_clause": str,
         "limit_clause": str,
-        "return": tuple[list[tuple[int, str]], int],
+        "return": tuple[list[tuple[int, str, str]], int],
     }
+    assert typing.get_type_hints(backfill.write_results) == {"guard": str, "scope_clause": str, "return": list[int]}
+    assert typing.get_type_hints(backfill.run_pass) == {"return": tuple[int, int, int]}
+    assert typing.get_type_hints(backfill)["WRITE_GUARDS"] == dict[str, str]
 
 
 def _backfill_db(tmp_path, backfill):
@@ -294,6 +297,140 @@ def test_backfill_pass2_keeps_scope_and_limit(tmp_path, monkeypatch, backfill):
     filters.clear()
     _run(monkeypatch, backfill, db_path, "--scope", "all")
     assert len(filters) == 1 and "10.1000/three" in filters[0].split(":", 1)[1].split("|")
+
+
+
+# --- the backfill writes only rows still in the state it read (PY-34) ---------
+
+
+def _work(openalex, doi, topic):
+    return {"id": f"https://openalex.org/{openalex}", "doi": f"https://doi.org/{doi}", "primary_topic": _topic(topic), "topics": []}
+
+
+def _fake_openalex_changing(monkeypatch, backfill, db_path, change, results_for):
+    """Like ``_fake_openalex``, but the first request first runs ``change`` through a second connection."""
+    pending = [change]
+
+    def results(filter_):
+        if pending:
+            other = sqlite3.connect(db_path)
+            other.execute(pending.pop())
+            other.commit()
+            other.close()
+        return results_for(filter_)
+
+    return _fake_openalex(monkeypatch, backfill, results)
+
+
+CHANGED_LINE = "work(s) changed while the batch was fetched; left for the next run"
+
+
+def _two_doi_rows(tmp_path, backfill):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, doi="10.1000/ONE", metadata_status="matched")
+    _insert(conn, doi="10.1000/TWO", metadata_status="matched")
+    conn.close()
+    return db_path
+
+
+def _doi_answers(filter_):
+    if not filter_.startswith("doi:"):
+        return []  # pass 1 (an id the change gave a row) finds nothing
+    return [_work("W1", "10.1000/one", "T1"), _work("W2", "10.1000/two", "T2")]
+
+
+def test_backfill_pass2_skips_a_row_whose_doi_changed_during_the_request(tmp_path, monkeypatch, capsys, backfill):
+    db_path = _two_doi_rows(tmp_path, backfill)
+    _fake_openalex_changing(
+        monkeypatch, backfill, db_path, "UPDATE works SET doi = '10.1000/OTHER' WHERE id = 1", _doi_answers
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == (None, None, None)
+    assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
+    assert f"[doi] 1 {CHANGED_LINE}" in capsys.readouterr().err
+
+
+def test_backfill_pass2_skips_a_row_that_gained_an_openalex_id(tmp_path, monkeypatch, capsys, backfill):
+    db_path = _two_doi_rows(tmp_path, backfill)
+    _fake_openalex_changing(
+        monkeypatch, backfill, db_path, "UPDATE works SET openalex_id = 'W9' WHERE id = 1", _doi_answers
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == (None, None, None)
+    assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
+    assert f"[doi] 1 {CHANGED_LINE}" in capsys.readouterr().err
+
+
+def test_backfill_pass1_skips_a_row_whose_openalex_id_changed(tmp_path, monkeypatch, capsys, backfill):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, openalex_id="W1", metadata_status="matched")
+    _insert(conn, openalex_id="W2", metadata_status="matched")
+    conn.close()
+
+    def answers(filter_):
+        return [_work("W1", "10.1000/one", "T1"), _work("W2", "10.1000/two", "T2")] if filter_ == "openalex_id:W1|W2" else []
+
+    _fake_openalex_changing(
+        monkeypatch, backfill, db_path, "UPDATE works SET openalex_id = 'W9' WHERE id = 1", answers
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == (None, None, None)
+    assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
+    assert f"[id] 1 {CHANGED_LINE}" in capsys.readouterr().err
+
+
+def test_backfill_skips_a_row_requeued_out_of_the_default_scope(tmp_path, monkeypatch, capsys, backfill):
+    db_path = _two_doi_rows(tmp_path, backfill)
+    _fake_openalex_changing(
+        monkeypatch, backfill, db_path, "UPDATE works SET metadata_status = 'pending' WHERE id = 1", _doi_answers
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == (None, None, None)
+    assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
+    assert f"[doi] 1 {CHANGED_LINE}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("pass_label, identifier, value_one, value_two", [
+    ("id", "openalex_id", "W1", "W2"),
+    ("doi", "doi", "10.1000/ONE", "10.1000/TWO"),
+])
+def test_backfill_never_overwrites_a_row_another_run_finished_during_the_request(
+    tmp_path, monkeypatch, capsys, backfill, pass_label, identifier, value_one, value_two
+):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, **{identifier: value_one, "metadata_status": "matched"})
+    _insert(conn, **{identifier: value_two, "metadata_status": "matched"})
+    conn.close()
+
+    def answers(filter_):
+        return [_work("W1", "10.1000/one", "T1"), _work("W2", "10.1000/two", "T2")]
+
+    # Another backfill writes row 1's topics while this run's request is still out.
+    _fake_openalex_changing(
+        monkeypatch, backfill, db_path,
+        "UPDATE works SET primary_topic = 'FIRST', primary_field = 'FIRST-field', topics_fetched = 1 WHERE id = 1",
+        answers,
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == ("FIRST", "FIRST-field", 1)
+    assert _topic_row(db_path, 2) == ("T2", "T2-field", 1)
+    assert f"[{pass_label}] 1 {CHANGED_LINE}" in capsys.readouterr().err
+
+
+def test_backfill_unchanged_rows_log_no_changed_line(tmp_path, monkeypatch, capsys, backfill):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, doi="10.1000/ONE", metadata_status="matched")
+    conn.close()
+    _fake_openalex(monkeypatch, backfill, lambda _f: [_work("W1", "10.1000/one", "T1")])
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == ("T1", "T1-field", 1)
+    assert "changed while the batch was fetched" not in capsys.readouterr().err
 
 
 # --- export_bundle output names (BE-53) --------------------------------------

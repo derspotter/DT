@@ -74,6 +74,14 @@
   let maxNodes = 25000
   let groupMode = 'cluster'
   let loadedGroupBy = 'field'
+  // The status of the graph on screen, restored when a recolour replaces a
+  // failed load's error. `loadedScope` is the graph on screen's options apart
+  // from the grouping. A recolour shows the loaded status only while the
+  // controls match it again; while they still name another corpus (or node
+  // limit, or relationship) that failed to load, the error stays.
+  let loadedStatus = ''
+  let loadedScope = ''
+  const graphScope = ({ corpusId, maxNodes, relationship }) => JSON.stringify([corpusId, maxNodes, relationship])
   let depthScale = 1.6
   let autoRotate = false
   let cameraPreset = null
@@ -82,6 +90,12 @@
   let selectedCluster = null
   let selectedNodeDetail = null
   let nodeDetailLoading = false
+  let nodeDetailError = ''
+  // Only the newest detail request writes the panel and the cache; a
+  // deselection or a new load bumps it too, ending the pending request.
+  let nodeDetailSeq = 0
+  // Only the newest graph load (while mounted) requests, retries and publishes.
+  let graphLoadSeq = 0
   let edgeEndpoints = null
   let edgeVertexStride = 2
   let yearFrom = null
@@ -946,6 +960,9 @@
   function showAllNodes() {
     selectedNode = null
     selectedNodeDetail = null
+    nodeDetailSeq += 1
+    nodeDetailLoading = false
+    nodeDetailError = ''
     selectedIndex = null
     hoveredNode = null
     tooltip = { ...tooltip, visible: false }
@@ -1112,6 +1129,9 @@
   async function loadNodeDetail(node) {
     const id = node?.work_id || node?.id
     if (!id) return
+    // Taken before the cache check, so a cache hit supersedes an older request.
+    const seq = ++nodeDetailSeq
+    nodeDetailError = ''
     if (nodeDetailCache.has(id)) {
       selectedNodeDetail = nodeDetailCache.get(id)
       nodeDetailLoading = false
@@ -1121,14 +1141,21 @@
     selectedNodeDetail = null
     try {
       const detail = await fetchGraph3DNodeDetail(id)
+      // A superseded answer is dropped, not cached: a later selection fetches again.
+      if (seq !== nodeDetailSeq) return
       nodeDetailCache.set(id, detail)
       if ((selectedNode?.work_id || selectedNode?.id) === id) {
         selectedNodeDetail = detail
       }
-    } catch {
+    } catch (error) {
+      // A superseded request fails silently; the current one says so (not cached: a
+      // later selection fetches again).
+      if (seq !== nodeDetailSeq) return
+      console.error('[graph] node detail failed:', error?.message || error)
       selectedNodeDetail = null
+      nodeDetailError = 'Could not load details'
     } finally {
-      nodeDetailLoading = false
+      if (seq === nodeDetailSeq) nodeDetailLoading = false
     }
   }
 
@@ -1174,6 +1201,9 @@
   function clearSelection() {
     selectedNode = null
     selectedNodeDetail = null
+    nodeDetailSeq += 1
+    nodeDetailLoading = false
+    nodeDetailError = ''
     selectedIndex = null
     hoveredNode = null
     selectedCluster = null
@@ -1208,15 +1238,25 @@
     if (target && target !== loadedGroupBy) {
       void load3DGraph()
     } else {
+      const controlsScope = graphScope({ maxNodes, relationship, corpusId: selectedGraphCorpusId })
+      if (loadedStatus && controlsScope === loadedScope) graphStatus = loadedStatus
       renderGraph()
     }
   }
 
   async function load3DGraph() {
+    // One load, one owner: a newer load, or the unmount (a tab switch, a
+    // sign-out, a workspace corpus switch), ends this one. A load that no
+    // longer owns makes no request and writes nothing.
+    const load = ++graphLoadSeq
+    const owns = () => componentMounted && load === graphLoadSeq
     graphLoading = true
     graphStatus = 'Building 3D graph snapshot...'
     selectedNode = null
     selectedNodeDetail = null
+    nodeDetailSeq += 1
+    nodeDetailLoading = false
+    nodeDetailError = ''
     selectedIndex = null
     isolatedCluster = null
     halo = { ...halo, visible: false }
@@ -1224,15 +1264,27 @@
     selectedCluster = null
     searchResults = []
     const groupBy = groupByForMode(groupMode) || loadedGroupBy || 'field'
+    // Captured once: the one retry asks for the same graph.
+    const options = { maxNodes, relationship, groupBy, corpusId: selectedGraphCorpusId }
+    const scope = graphScope(options)
     try {
-      const manifest = await fetchGraph3DSnapshot({
-        maxNodes,
-        relationship,
-        groupBy,
-        corpusId: selectedGraphCorpusId,
-      })
+      let manifest = await fetchGraph3DSnapshot(options)
+      if (!owns()) return
+      let snapshot
+      try {
+        snapshot = await fetchGraph3DSnapshotResources(manifest)
+      } catch (error) {
+        // 409: the snapshot was rebuilt after its manifest was read. Reload the
+        // manifest once, so the files all come from one build.
+        if (error?.status !== 409 || !owns()) throw error
+        manifest = await fetchGraph3DSnapshot(options)
+        if (!owns()) return
+        snapshot = await fetchGraph3DSnapshotResources(manifest)
+      }
+      if (!owns()) return
+      // Only a layout whose files all loaded is the one on screen; a failed
+      // grouping stays unloaded, so choosing it again fetches it.
       loadedGroupBy = groupBy
-      const snapshot = await fetchGraph3DSnapshotResources(manifest)
       const edgeCount = Number(snapshot.manifest?.buffers?.edges?.count || Math.floor((snapshot.edgeTriplets?.length || 0) / 3) || 0)
       graphData = {
         manifest,
@@ -1253,12 +1305,16 @@
         ? ` Showing the ${formatNumber(loadedNodes)} most connected works out of ${formatNumber(totalWorks)}.`
         : ''
       graphStatus = `Loaded ${formatNumber(loadedNodes)} nodes and ${formatNumber(graphData.stats?.edge_count || 0)} edges from snapshot.${limitedNote}`
+      loadedStatus = graphStatus
+      loadedScope = scope
       await tick()
       await renderGraph()
     } catch (error) {
-      graphStatus = error?.message || 'Failed to load 3D graph.'
+      if (owns()) {
+        graphStatus = error?.message || 'Failed to load 3D graph.'
+      }
     } finally {
-      graphLoading = false
+      if (load === graphLoadSeq) graphLoading = false
     }
   }
 
@@ -1764,6 +1820,7 @@
   })
 
   onDestroy(() => {
+    nodeDetailSeq += 1 // a detail request still pending belongs to no graph now
     componentMounted = false
     if (animationFrame) cancelAnimationFrame(animationFrame)
     if (settleFrame) cancelAnimationFrame(settleFrame)
@@ -2056,6 +2113,9 @@
           <span class="muted small">Source: {activeNodeDetail.source || 'unknown'}</span>
           {#if nodeDetailLoading}
             <span class="muted small">Loading metadata...</span>
+          {/if}
+          {#if nodeDetailError}
+            <span class="muted small" role="status">{nodeDetailError}</span>
           {/if}
           {#if selectedNodeDetail?.authors}
             <span class="muted small">Authors: {selectedNodeDetail.authors}</span>

@@ -1,6 +1,6 @@
 import json
 import re
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -13,13 +13,17 @@ from .identifiers import (
     inverted_index_to_text,
     inverted_index_to_text_last_wins,
     normalize_doi_lower,
+    normalize_openalex_id_strict,
 )
 from .utils import (
     FetchResult,
     OpenAlexRateLimitExceeded,
+    OpenAlexRedirectNotFollowed,
+    _warn_missing_openalex_api_key,
     env_bool,
     env_float,
     get_global_rate_limiter,
+    get_openalex_api_key,
     openalex_request_json,
     redact_openalex_key,
 )
@@ -55,9 +59,6 @@ def _build_retry_session(
     return session
 
 
-_missing_api_key_warned = False
-
-
 _redact_api_key = redact_openalex_key  # former name
 
 
@@ -78,6 +79,59 @@ def clean_search_term(term):
 def convert_inverted_index_to_text(inverted_index):
     """Like :func:`dl_lit.identifiers.inverted_index_to_text`, but ``""`` for empty input."""
     return inverted_index_to_text(inverted_index) or ""
+
+_OPENALEX_API_BASE = "https://api.openalex.org"
+_OPENALEX_API_NETLOCS = {"api.openalex.org", "api.openalex.org:443"}
+
+
+def _openalex_api_url(url) -> str | None:
+    """The URL rebuilt on ``https://api.openalex.org``, or None when it is not an OpenAlex API URL.
+
+    The key and mailto go to that host only. A stored ``cited_by_api_url`` or a ``next_page``
+    is upstream data (the Crossref mapping, for one, stores an api.crossref.org URL there), so
+    the authority must be exactly ``api.openalex.org`` (no userinfo, no other port) and no
+    backslash, whitespace or control character may appear, which different URL parsers split
+    differently. The request then uses the fixed base with only the parsed path and query, never
+    the supplied authority.
+    """
+    text = str(url)
+    if any(ch == "\\" or ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    try:
+        parts = urlsplit(text)
+    except ValueError:  # a malformed netloc
+        return None
+    if parts.scheme.lower() != "https" or parts.netloc.lower() not in _OPENALEX_API_NETLOCS:
+        return None
+    path = parts.path or "/"
+    if not path.startswith("/"):
+        return None
+    # Always with "?": callers append their options with "&".
+    return f"{_OPENALEX_API_BASE}{path}?{parts.query}"
+
+
+def citing_works_url(stored_url, openalex_id) -> str | None:
+    """The citing-works URL to request for a work: its stored URL, or OpenAlex's ``cites:`` filter.
+
+    A stored URL that is not an OpenAlex API URL (the Crossref mapping stores an
+    api.crossref.org one) is never fetched; when the work's OpenAlex id is known, the
+    equivalent ``filter=cites:<id>`` URL stands in for it. Without that id the stored URL is
+    returned, and the fetch marks the result incomplete. No stored URL answers None (each
+    caller keeps its own rule for that case).
+    """
+    if not stored_url:
+        return None
+    if _openalex_api_url(stored_url) is not None:
+        return stored_url
+    work_id = normalize_openalex_id_strict(openalex_id)
+    if work_id:
+        return f"{_OPENALEX_API_BASE}/works?filter=cites:{work_id}"
+    return stored_url
+
+
+def _not_openalex_message(url) -> str:
+    return f"Citing-works URL is not an OpenAlex API URL, not fetched: {_redact_api_key(url)}"
+
 
 def fetch_citing_work_ids(
     cited_by_url,
@@ -103,11 +157,18 @@ def fetch_citing_work_ids(
         return FetchResult()
 
     citing_work_ids = FetchResult()
+    openalex_url = _openalex_api_url(cited_by_url)
+    if openalex_url is None:
+        # Never send the OpenAlex key (or the OpenAlex client's quota accounting) elsewhere;
+        # such a URL holds no OpenAlex citing list to read anyway.
+        _mark_incomplete(citing_work_ids, _not_openalex_message(cited_by_url))
+        _warn_if_incomplete(citing_work_ids, "citing works")
+        return citing_work_ids
     quota_error = None
     select_fields = "id,title,display_name,authorships,publication_year,doi,type"
     if include_links:
         select_fields += ",referenced_works,cited_by_api_url"
-    url = f"{cited_by_url}&select={select_fields}&per-page=100&mailto={mailto}"
+    url = f"{openalex_url}&select={select_fields}&per-page=100&mailto={mailto}"
     if api_key:
         url = f"{url}&api_key={quote_plus(api_key)}"
     page = 1
@@ -125,6 +186,7 @@ def fetch_citing_work_ids(
                 session=http,
                 rate_limiter=rate_limiter,
                 retries=3,
+                allow_redirects=False,  # a redirect's next hop would get the key and mailto too
             )
 
             results = data.get("results", [])
@@ -149,9 +211,13 @@ def fetch_citing_work_ids(
             # Check for next page
             meta = data.get("meta", {})
             if meta.get("next_page") and len(citing_work_ids) < max_citations:
-                url = meta["next_page"]
-                page += 1
-                print(f"Fetching next page of citing works: Page {page}")
+                next_page = meta["next_page"]
+                url = _openalex_api_url(next_page)
+                if url is None:
+                    _mark_incomplete(citing_work_ids, _not_openalex_message(next_page))
+                else:
+                    page += 1
+                    print(f"Fetching next page of citing works: Page {page}")
             else:
                 url = None # No more pages or reached limit
 
@@ -160,6 +226,11 @@ def fetch_citing_work_ids(
             print(message)
             _mark_incomplete(citing_work_ids, message, quota=True)
             quota_error = e
+            url = None
+        except OpenAlexRedirectNotFollowed as e:
+            message = f"Error fetching citing works from {_redact_api_key(url)}: {e}"
+            print(message)
+            _mark_incomplete(citing_work_ids, message)
             url = None
         except requests.exceptions.RequestException as e:
             message = f"Error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}"
@@ -573,14 +644,10 @@ class OpenAlexCrossrefSearcher:
         self.rate_limiter = rate_limiter or get_global_rate_limiter()
         self.fields = 'id,doi,display_name,authorships,open_access,title,publication_year,type,referenced_works,abstract_inverted_index,keywords,cited_by_api_url'
         self.crossref_fields = 'DOI,title,author,container-title,published-print,published-online,published'
-        self.api_key = os.getenv('OPENALEX_API_KEY') or os.getenv('RAG_FEEDER_OPENALEX_API_KEY')
+        self.api_key = get_openalex_api_key()
         self.enable_openalex_fallback = env_bool('RAG_FEEDER_ENABLE_OPENALEX_FALLBACK')
-        global _missing_api_key_warned
-        if not self.api_key and not _missing_api_key_warned:
-            print(
-                "[WARN] OPENALEX_API_KEY not set. OpenAlex daily credits may be severely limited without an API key."
-            )
-            _missing_api_key_warned = True
+        if not self.api_key:
+            _warn_missing_openalex_api_key()
         self.openalex_timeout = env_float('RAG_FEEDER_OPENALEX_TIMEOUT', 20.0)
         self.crossref_timeout = env_float('RAG_FEEDER_CROSSREF_TIMEOUT', 20.0)
         self.semantic_scholar_timeout = env_float('RAG_FEEDER_SEMANTIC_SCHOLAR_TIMEOUT', 20.0)
@@ -919,10 +986,12 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
 
     for ref in references:
         enriched_ref = process_single_reference(ref, searcher, searcher.rate_limiter)
-        if enriched_ref and fetch_citations and enriched_ref.get('best_match_result', {}).get('cited_by_api_url'):
-            print(f"Fetching citations for: {enriched_ref.get('best_match_result', {}).get('display_name')}")
+        best_match = (enriched_ref or {}).get('best_match_result') or {}
+        cited_by_url = citing_works_url(best_match.get('cited_by_api_url'), best_match.get('id'))
+        if enriched_ref and fetch_citations and cited_by_url:
+            print(f"Fetching citations for: {best_match.get('display_name')}")
             enriched_ref['citing_works_ids'] = fetch_citing_work_ids(
-                enriched_ref['best_match_result']['cited_by_api_url'], 
+                cited_by_url,
                 searcher.rate_limiter, 
                 searcher.headers['User-Agent'].split('/')[-1], # Extract mailto from User-Agent
                 session=searcher.openalex_session,
@@ -1357,10 +1426,11 @@ def _fetch_related_works(
                     ]
     
     # Fetch citing works if requested
-    if fetch_citations and openalex_result.get('cited_by_api_url'):
+    cited_by_url = citing_works_url(openalex_result.get('cited_by_api_url'), openalex_result.get('id'))
+    if fetch_citations and cited_by_url:
         print(f"Fetching citing works (max: {max_citations})...")
         enrichment_data['citing_works'] = fetch_citing_work_ids(
-            openalex_result['cited_by_api_url'],
+            cited_by_url,
             rate_limiter,
             searcher.headers.get('User-Agent', 'spott@wzb.eu').split('/')[-1],
             max_citations,
@@ -1372,7 +1442,7 @@ def _fetch_related_works(
         if related_depth_upstream > 1 and enrichment_data['citing_works']:
             print(f"Fetching second-level citing works (depth: {related_depth_upstream})...")
             for citing_work in enrichment_data['citing_works']:
-                cited_by_url = citing_work.get('cited_by_api_url')
+                cited_by_url = citing_works_url(citing_work.get('cited_by_api_url'), citing_work.get('openalex_id'))
                 if not cited_by_url:
                     continue
                 citing_work['citing_works_expanded'] = fetch_citing_work_ids(
