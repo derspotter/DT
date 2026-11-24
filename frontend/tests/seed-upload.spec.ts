@@ -97,6 +97,41 @@ test('BibTeX seed upload imports into the corpus and reports counts', async ({ p
   expect(processPdfCalls).toBe(1)
 })
 
+// FE-64 (spec D4): the upload list is saved best effort; a full
+// localStorage neither fails the upload nor stops the import.
+test('a full localStorage does not fail an upload', async ({ page }) => {
+  processPdfCalls = 0
+  importResult = IMPORTED
+  const warnings: string[] = []
+  page.on('console', (message) => {
+    if (message.type() === 'warning') warnings.push(message.text())
+  })
+  await mockLogSocket(page)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('rag_feeder_token', 'playwright-token')
+    const real = Storage.prototype.setItem
+    Storage.prototype.setItem = function (k: string, v: string) {
+      if (String(k).startsWith('rag-feeder:uploads:')) throw new DOMException('full', 'QuotaExceededError')
+      return real.call(this, k, v)
+    }
+  })
+  await page.route('**/api/**', mockApi)
+  await page.goto('/#/workspace')
+
+  const fileInput = page.locator('input[type="file"]').first()
+  await expect(fileInput).toBeAttached()
+  await fileInput.setInputFiles({
+    name: 'references.bib',
+    mimeType: 'application/x-bibtex',
+    buffer: Buffer.from('@article{a, title={A Work}, author={Doe, Jane}, year={2020}}\n'),
+  })
+
+  const item = page.locator('.upload-item', { hasText: 'references.bib' })
+  await expect(item).toContainText('Imported 2 works (1 skipped, 2 added to corpus).')
+  await expect(item.locator('.status')).not.toHaveText('failed')
+  expect(warnings.filter((text) => text.startsWith('[uploads] could not save the upload list:'))).toHaveLength(1)
+})
+
 async function uploadSeed(page: import('@playwright/test').Page) {
   await mockLogSocket(page)
   await page.addInitScript(() => {

@@ -763,6 +763,10 @@
     return 'uploaded'
   }
 
+  // The upload list is saved best effort (FE-64): a full or blocked
+  // localStorage must not fail the upload, and is reported once per page load.
+  let uploadStorageWarned = false
+
   function persistStoredUploads(nextUploads = uploads) {
     if (typeof window === 'undefined') return
     const key = uploadStorageKey()
@@ -784,7 +788,14 @@
         backendFilename: String(item.backendFilename || ''),
         message: String(item.message || ''),
       }))
-    window.localStorage.setItem(key, JSON.stringify(persisted))
+    try {
+      window.localStorage.setItem(key, JSON.stringify(persisted))
+    } catch (error) {
+      if (!uploadStorageWarned) {
+        uploadStorageWarned = true
+        console.warn('[uploads] could not save the upload list:', error?.message)
+      }
+    }
   }
 
   function restoreStoredUploads() {
@@ -2280,6 +2291,9 @@
     kantroposTargetsError = ''
     finishExtractionProgress()
     if (signOut) {
+      // The export lock is the session's: a corpus switch keeps it, so one
+      // export at a time per session.
+      exportBusy = false
       // null makes the Admin tab fetch the settings again.
       appSettings = null
       appSettingsDraft = {}
@@ -3281,8 +3295,11 @@
       }
     } catch (error) {
       if (error?.status === 401) return
-      handleCorpusPollForbidden(error)
+      // A superseded request (a newer load, a corpus switch or a sign-out)
+      // does not reconcile: after a sign-out that /me would carry the next
+      // session's token.
       if (token !== seedSourcesRequestToken) return
+      handleCorpusPollForbidden(error)
       if (!quiet) seedSourcesStatus = error?.message || 'Failed to load seeds.'
     }
   }
@@ -3872,9 +3889,15 @@
       searchStatus = ''
       return
     }
+    // A launch answered after the frontend committed a sign-out or a corpus
+    // switch belongs to what ended (FE-63); the run itself goes on server side.
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
+    const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     searchStatus = 'Starting search...'
     try {
       const { data, expansion, runId, running } = await runKeywordSearch(requestBody)
+      if (stale()) return
       void refreshQuota()
       if (runId && running) {
         // Start polling on the 202 itself; the seed list may not report this
@@ -3883,7 +3906,9 @@
       }
       if (runId) {
         await loadSeedSources({ quiet: true })
+        if (stale()) return
         await focusSeedSource('search', runId)
+        if (stale()) return
       }
       if (running) {
         searchStatus = 'Fetching in the background. The seed below fills in as pages arrive.'
@@ -3892,7 +3917,7 @@
       const suffix = expansion?.added ? ` (+${expansion.added} related works)` : ''
       searchStatus = `Search complete. Added ${data.length} item(s) to Seed.${suffix}`
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || stale()) return
       searchStatus = error?.message || 'Search failed.'
     }
   }
@@ -4266,6 +4291,9 @@
   async function handleExportDownload(format, label) {
     if (exportBusy) return
     exportBusy = true
+    // A file that settles after a sign-out belongs to the session that ended
+    // (FE-60b); a corpus switch does not end it.
+    const session = sessionEpoch
     exportStatus = `${label} export is being generated...`
     const exportFilters = {
       status: exportFilterStatus === 'all' ? '' : exportFilterStatus,
@@ -4275,6 +4303,7 @@
     }
     try {
       const { blob, filename } = await downloadCorpusExport(format, exportFilters)
+      if (session !== sessionEpoch) return
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -4285,22 +4314,22 @@
       URL.revokeObjectURL(url)
       exportStatus = `${label} export downloaded.`
     } catch (error) {
-      if (error?.status === 401) {
-        exportStatus = 'Session expired. Please sign in again.'
-        return
-      }
+      if (error?.status === 401 || session !== sessionEpoch) return
       exportStatus = error?.message || 'Failed to export corpus data.'
     } finally {
-      exportBusy = false
+      // An old session's export never unlocks the next session's.
+      if (session === sessionEpoch) exportBusy = false
     }
   }
 
   async function handleDownloadedCorpusFile(item) {
     const itemId = Number(item?.id);
     if (!Number.isFinite(itemId) || itemId <= 0) return;
+    const session = sessionEpoch
     try {
       corpusLoadStatus = 'Preparing download...'
       const url = await createCorpusItemDownloadUrl(itemId)
+      if (session !== sessionEpoch) return
       const link = document.createElement('a')
       link.href = url
       document.body.appendChild(link)
@@ -4308,7 +4337,7 @@
       link.remove()
       corpusLoadStatus = 'Download started.'
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       corpusLoadStatus = error?.message || 'Failed to download file.'
     }
   }
@@ -4370,8 +4399,10 @@
     const sourceKey = String(ingestSource || '').trim()
     if (!sourceKey) return
     let objectUrl = ''
+    const session = sessionEpoch
     try {
       const { blob, filename } = await fetchSeedSourceDocument(sourceKey)
+      if (session !== sessionEpoch) return
       objectUrl = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = objectUrl
@@ -4380,7 +4411,7 @@
       link.click()
       link.remove()
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       ingestRunsStatus = error?.message || 'Failed to download the seed document.'
     } finally {
       if (objectUrl) URL.revokeObjectURL(objectUrl)
@@ -4393,8 +4424,10 @@
     const sourceKey = String(candidate?.source_key || '').trim()
     const candidateKey = String(candidate?.candidate_key || '').trim()
     if (!Number.isFinite(workId) || workId <= 0 || !sourceType || !sourceKey || !candidateKey) return
+    const session = sessionEpoch
     try {
       const { blob, filename } = await downloadSeedCandidateFile(sourceType, sourceKey, candidateKey)
+      if (session !== sessionEpoch) return
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -4405,7 +4438,7 @@
       URL.revokeObjectURL(url)
       seedActionStatus = `Downloaded ${filename}.`
     } catch (error) {
-      if (error?.status === 401) return
+      if (error?.status === 401 || session !== sessionEpoch) return
       seedActionStatus = error?.message || 'Failed to download seed candidate file.'
     }
   }

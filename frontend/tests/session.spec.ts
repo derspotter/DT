@@ -1,7 +1,7 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { expect, test, type Page, type Route, type WebSocketRoute } from '@playwright/test'
-import { fulfil, mockLogSocket } from './helpers/mockApi'
+import { afterBodyRead, fetchStats, fulfil, logIn, mockLogSocket, trackFetches } from './helpers/mockApi'
 
 // One sign-out path: a 401 from any request runs the full logout (socket
 // closed, token cleared, workspace state reset), and a /me answer requested
@@ -43,14 +43,6 @@ async function mockSocket(page: Page, sockets: { opened: number; closed: number 
     sockets.opened += 1
     ws.onClose(() => { sockets.closed += 1 })
   })
-}
-
-async function logIn(page: Page, username: string) {
-  const form = page.getByTestId('login-form')
-  await expect(form).toBeVisible()
-  await form.getByLabel('Username').fill(username)
-  await form.getByLabel('Password').fill('secret-password')
-  await form.getByRole('button', { name: 'Sign in' }).click()
 }
 
 test('a 401 on a scoped request signs out completely', async ({ page }) => {
@@ -1677,4 +1669,186 @@ test('a late sign-in failure does not overwrite a newer forgot-password outcome 
   await expect.poll(() => loginAnswered).toBe(true)
   await page.waitForTimeout(300)
   await expect(card.locator('.error')).toHaveText('Mail server down')
+})
+
+// FE-60b (spec D1): the export lock is the session's, and an export that
+// settles after a sign-out neither saves its file nor unlocks the next
+// user's export.
+test("an old export neither saves nor unlocks the next user's export", async ({ page }) => {
+  const adminA = { ...userA, is_admin: true }
+  const adminB = { ...userB, is_admin: true }
+  const exportGates = [deferred(), deferred()]
+  let exportRequests = 0
+  const names: string[] = []
+  page.on('download', (download) => names.push(download.suggestedFilename()))
+  await trackFetches(page)
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    if (path === '/api/auth/login') {
+      const username = request.postDataJSON()?.username
+      return fulfil(route, username === 'bob' ? { token: 'token-b', user: adminB } : { token: 'token-a', user: adminA })
+    }
+    if (!auth) return fulfil(route, { error: 'Unauthorized' }, 401)
+    if (path === '/api/auth/me') {
+      return fulfil(route, { user: auth.endsWith('token-b') ? adminB : adminA, corpora: [corpus] })
+    }
+    if (path === '/api/exports/bundle') {
+      const n = exportRequests++
+      await exportGates[n].promise
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/zip',
+        headers: { 'Content-Disposition': `attachment; filename="${n === 0 ? 'alice' : 'bob'}-bundle.zip"` },
+        body: Buffer.from('PK'),
+      })
+    }
+    return workspaceDefaults(path, route)
+  })
+
+  await page.goto('/#/login')
+  await logIn(page, 'alice')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  await page.getByTestId('tab-downloads').click()
+  const button = page.getByTestId('export-bundle-button')
+  await button.click()
+  await expect.poll(() => exportRequests).toBe(1)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await page.getByTestId('tab-downloads').click()
+  await expect(button).toBeEnabled()
+  await button.click()
+  await expect.poll(() => exportRequests).toBe(2)
+
+  const reads = (await fetchStats(page, '/api/exports/bundle')).reads
+  exportGates[0].resolve()
+  await afterBodyRead(page, '/api/exports/bundle', reads)
+  await expect(button).toBeDisabled()
+  await expect(page.getByText(/export downloaded/)).toHaveCount(0)
+
+  const download = page.waitForEvent('download')
+  exportGates[1].resolve()
+  await download
+  expect(names).toEqual(['bob-bundle.zip'])
+  await expect(button).toBeEnabled()
+})
+
+// FE-63 (spec D2): a search launch answered after a sign-out, or its seed
+// follow-up, changes nothing in the next session.
+type HeldSeed = { auth: string; release: (status?: number) => void }
+
+async function bootSearchRace(page: Page, { holdLaunch }: { holdLaunch: boolean }) {
+  const gates = {
+    search: deferred(),
+    seedGateOn: false,
+    meGateOn: false,
+    meRelease: deferred(),
+    heldSeeds: [] as HeldSeed[],
+    heldMe: 0,
+    searchPosts: 0,
+    log: [] as { path: string; auth: string; answered: boolean }[],
+  }
+  await page.addInitScript(() => {
+    if (!window.sessionStorage.getItem('booted')) {
+      window.sessionStorage.setItem('booted', '1')
+      window.localStorage.setItem('rag_feeder_token', 'token-a')
+    }
+  })
+  await trackFetches(page)
+  await mockLogSocket(page)
+  await page.route('**/api/**', async (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    const auth = request.headers().authorization || ''
+    const entry = { path, auth, answered: false }
+    gates.log.push(entry)
+    if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+    if (path === '/api/auth/me') {
+      if (gates.meGateOn) {
+        gates.heldMe += 1
+        await gates.meRelease.promise
+      }
+      return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+    }
+    if (path === '/api/keyword-search/preview') return fulfil(route, { count: 5, threshold: 100000 })
+    if (path === '/api/keyword-search' && request.method() === 'POST') {
+      gates.searchPosts += 1
+      if (holdLaunch) await gates.search.promise
+      return fulfil(route, { runId: 7, status: 'running' }, 202)
+    }
+    if (path === '/api/seed/sources' && gates.seedGateOn) {
+      const status = await new Promise<number>((resolve) => {
+        gates.heldSeeds.push({ auth, release: (code = 200) => resolve(code) })
+      })
+      if (status !== 200) return fulfil(route, { error: 'Forbidden' }, status)
+    }
+    await workspaceDefaults(path, route)
+    entry.answered = true
+  })
+  await page.goto('/#/workspace')
+  await expect(page.getByTestId('auth-user')).toHaveText('alice')
+  return gates
+}
+
+async function launchSearch(page: Page) {
+  const card = page.locator('.seed-intake-card--search')
+  await card.getByRole('textbox', { name: 'Query' }).fill('economics')
+  await card.getByRole('button', { name: 'Search', exact: true }).click()
+}
+
+test('a search launched before a sign-out does not reach the next session', async ({ page }) => {
+  const gates = await bootSearchRace(page, { holdLaunch: true })
+  await launchSearch(page)
+  await expect.poll(() => gates.searchPosts).toBe(1)
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  // The commit: bob's first seed-list request, sent with his token, answered.
+  await expect.poll(() => gates.log.some((e) => e.path === '/api/seed/sources' && e.auth.endsWith('token-b') && e.answered)).toBe(true)
+  gates.seedGateOn = true
+  const seedCalls = (await fetchStats(page, '/api/seed/sources')).calls
+
+  const reads = (await fetchStats(page, '/api/keyword-search')).reads
+  gates.search.resolve()
+  await afterBodyRead(page, '/api/keyword-search', reads)
+  expect(await page.evaluate(() => (window as any).__dtRefresh.reason())).not.toBe('active')
+  expect((await fetchStats(page, '/api/seed/sources')).calls).toBe(seedCalls)
+
+  gates.seedGateOn = false
+  for (const held of gates.heldSeeds.splice(0)) held.release()
+})
+
+test("a late 403 on the launch's seed follow-up does not reconcile the next session", async ({ page }) => {
+  const gates = await bootSearchRace(page, { holdLaunch: false })
+  // Alice's own boot seed load is read before the launch.
+  await afterBodyRead(page, '/api/seed/sources', 0)
+  gates.seedGateOn = true
+  await launchSearch(page)
+  await expect.poll(() => gates.heldSeeds.some((held) => held.auth.endsWith('token-a'))).toBe(true)
+  const alicesSeed = gates.heldSeeds.find((held) => held.auth.endsWith('token-a'))!
+
+  await page.getByRole('button', { name: 'Log out' }).click()
+  await logIn(page, 'bob')
+  await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  await expect.poll(() => gates.heldSeeds.some((held) => held.auth.endsWith('token-b'))).toBe(true)
+  gates.meGateOn = true
+  const seed = await fetchStats(page, '/api/seed/sources')
+  const meCalls = (await fetchStats(page, '/api/auth/me')).calls
+
+  alicesSeed.release(403)
+  // The only seed body that can be read: every other seed request is held.
+  await afterBodyRead(page, '/api/seed/sources', seed.reads)
+  expect((await fetchStats(page, '/api/auth/me')).calls).toBe(meCalls)
+  expect((await fetchStats(page, '/api/seed/sources')).calls).toBe(seed.calls)
+
+  gates.meGateOn = false
+  gates.seedGateOn = false
+  gates.meRelease.resolve()
+  for (const held of gates.heldSeeds.splice(0)) if (held !== alicesSeed) held.release()
+  await expect(page.getByText('Seed One')).toBeVisible()
 })
