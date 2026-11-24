@@ -70,9 +70,10 @@ sqlite3.
   `tmp_path` / `fs.mkdtempSync` DBs. Set `RAG_FEEDER_OPENALEX_QUOTA_PATH` into `tmp_path` in any
   test that reaches `openalex_request_json`.
 - Never use bounded-repeat quantifiers (`{m,n}`) in `grep` patterns.
-- Every grep check runs from the worktree root (`/home/jay/DT/.worktrees/review-fixes-9`) after
-  `git add -A` of the task's files, so new files are searched; a negative grep from the wrong
-  directory proves nothing.
+- Every grep check runs from the worktree root (`/home/jay/DT/.worktrees/review-fixes-9`) as
+  `git grep --untracked -n …`, so new files are searched without touching the index; a negative
+  grep from the wrong directory proves nothing. Commits stage explicit file lists, never
+  `git add -A`. Tasks run one after another (one implementer at a time).
 - Every Playwright command carries `E2E_FRONTEND_PORT=5190`.
 - No secret in a fixture: fake keys only (`sekret-…`, `fake-…`), never a value from `.env`.
 - Commands:
@@ -205,7 +206,7 @@ test('both worker views carry exactly their heartbeat fields', async ({ page }) 
   - D3: `pipelineWorker = workerView(pipelineWorker, enrich)`;
     `downloadWorker = { ...workerView(downloadWorker, download), queued_download_items, running_jobs }`.
 - [ ] **Step 4: Verify.** The Step 2 command passes; `cd frontend && npx vite build` succeeds;
-  From the worktree root, after `git add -A frontend`, `git grep -n "createElement('a')" -- frontend/src` prints
+  From the worktree root, `git grep --untracked -n "createElement('a')" -- frontend/src` prints
   only `frontend/src/lib/download.js`.
 - [ ] **Step 5: Commit**: `frontend: one sign-in tail, one set-password handler, one download helper and one worker-view builder (FE-11, FE-16, FE-23)`
 
@@ -345,9 +346,9 @@ test('a URL-form match in another corpus follows the read rule', () => {
   lowercasing; in `pipeline-reads.test.js` import `tableExists` from `../src/dbHelpers.js`.
 - [ ] **Step 4: Verify.** The Step 2 command plus
   `npm test -- tests/pipeline-reads.test.js tests/seed-read-path.test.js tests/seed-candidates-route.test.js tests/graph.test.js tests/graph-access.test.js tests/corpus-list.test.js tests/search-run-failure.test.js --runInBand`
-  pass. From the worktree root after `git add -A backend`, `git grep -n "function tableExists" -- backend/src`
+  pass. From the worktree root `git grep --untracked -n "function tableExists" -- backend/src`
   prints only `backend/src/dbHelpers.js`;
-  `git grep -n "\['pdf', 'search'\]" -- backend/src` prints only `SEED_SOURCE_TYPES`.
+  `git grep --untracked -n "\['pdf', 'search'\]" -- backend/src` prints only `SEED_SOURCE_TYPES`.
 - [ ] **Step 5: Commit**: `backend: shared DB helpers and identifier rules; seed matching takes the works.openalex_id rule; redundant table probes go (BE-33, BE-34 in part, BE-24)`
 
 ---
@@ -616,6 +617,20 @@ test("saved upload rows belong to their user and lose transient messages", async
   `npm test -- tests/import-seed-route.test.js tests/keyword-search-corpus.test.js tests/extraction-models-route.test.js tests/logs-tail-reader.test.js --runInBand`
   and `cd frontend && E2E_FRONTEND_PORT=5190 npx playwright test tests/seed-upload.spec.ts tests/dead-code.spec.ts --workers=1`, then
   `npx vite build`.
+- [ ] **Pre-flight notes (plan re-review, binding for this task's tests):**
+  - Every backend extraction case (accepted, viewer-denied, foreign-file-denied, and any
+    unexpected `202` on the baseline) drains by filename until the route's terminal event and its
+    `finally` cleanup ran, before asserting and before resetting the argv log or removing the
+    temp dir. The fake page counter reports no usable count, so the shared Gemini upload path is
+    not used; upload and artifact directories sit under the temp root.
+  - Lookup-failure test: rename `staged_uploads` on the second handle only if it exists, submit
+    a valid staged filename in each route case, restore only if the rename happened. On
+    `d4518a9` the failure must come from the HTTP assertion, not setup.
+  - Multer filename: `<uuid>-<name>` where the sanitized original is cut to at most 200 UTF-8
+    bytes, keeping its extension and never splitting a character; the UUID stays whole.
+  - Saved-row Playwright test: three separate cases (Bob does not see Alice's row; a legacy
+    corpus-only key is ignored; a transient submission message is not restored), with Alice and
+    Bob given distinct mocked user ids.
 - [ ] **Step 5: Commit**: `ingest: import and extraction take the submitted corpus and only the uploader's staged file; late extraction replies are dropped (FE-65b, FE-68)`
 
 ---
