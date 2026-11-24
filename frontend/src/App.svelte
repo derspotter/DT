@@ -2377,6 +2377,8 @@
     const epoch = sessionEpoch
     try {
       await createCorpus(name.trim())
+      // Its /me would carry the next session's token.
+      if (epoch !== sessionEpoch) return
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user
@@ -2426,6 +2428,8 @@
     const epoch = sessionEpoch
     try {
       const payload = await deleteCorpusApi(currentCorpusId)
+      // Its /me would carry the next session's token.
+      if (epoch !== sessionEpoch) return
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
       authUser = me.user

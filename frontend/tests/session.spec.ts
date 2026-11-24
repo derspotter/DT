@@ -1930,3 +1930,65 @@ test("a corpus selection answered after a sign-out sends no /me with the next us
   meRelease.resolve()
   await expect(page.getByTestId('auth-user')).toHaveText('bob')
 })
+
+// A corpus creation or deletion that settles after a sign-out and a new
+// sign-in sends no /me with the next user's token (review round 2).
+for (const action of [
+  { name: 'creation', button: 'New corpus', method: 'POST', path: '/api/corpora', answer: { corpus: { id: 3, name: 'Fresh corpus' } } },
+  { name: 'deletion', button: 'Delete corpus', method: 'DELETE', path: '/api/corpora/1', answer: { deleted_name: 'Shared corpus', selected_corpus_id: null } },
+]) {
+  test(`a corpus ${action.name} answered after a sign-out sends no /me with the next user's token`, async ({ page }) => {
+    const actionGate = deferred()
+    let actionSeen = false
+    let meGateOn = false
+    const meRelease = deferred()
+    const answeredSeeds: string[] = []
+    page.on('dialog', (dialog) => dialog.accept(dialog.type() === 'prompt' ? 'Fresh corpus' : undefined))
+    await page.addInitScript(() => {
+      if (!window.sessionStorage.getItem('booted')) {
+        window.sessionStorage.setItem('booted', '1')
+        window.localStorage.setItem('rag_feeder_token', 'token-a')
+      }
+    })
+    await trackFetches(page)
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const request = route.request()
+      const path = new URL(request.url()).pathname
+      const auth = request.headers().authorization || ''
+      if (path === '/api/auth/login') return fulfil(route, { token: 'token-b', user: userB })
+      if (path === '/api/auth/me') {
+        if (meGateOn) await meRelease.promise
+        return fulfil(route, { user: auth.endsWith('token-b') ? userB : userA, corpora: [corpus] })
+      }
+      if (path === action.path && request.method() === action.method) {
+        actionSeen = true
+        await actionGate.promise
+        return fulfil(route, action.answer)
+      }
+      await workspaceDefaults(path, route)
+      if (path === '/api/seed/sources') answeredSeeds.push(auth)
+    })
+
+    await page.goto('/#/upstream')
+    await expect(page.getByTestId('auth-user')).toHaveText('alice')
+    await page.getByRole('button', { name: action.button }).click()
+    await expect.poll(() => actionSeen).toBe(true)
+
+    await page.getByRole('button', { name: 'Log out' }).click()
+    await logIn(page, 'bob')
+    await expect(page.getByTestId('auth-user')).toHaveText('bob')
+    await expect.poll(() => answeredSeeds.includes('Bearer token-b')).toBe(true)
+    meGateOn = true
+    const meCalls = (await fetchStats(page, '/api/auth/me')).calls
+
+    const reads = (await fetchStats(page, action.path)).reads
+    actionGate.resolve()
+    await afterBodyRead(page, action.path, reads)
+    expect((await fetchStats(page, '/api/auth/me')).calls).toBe(meCalls)
+
+    meGateOn = false
+    meRelease.resolve()
+    await expect(page.getByTestId('auth-user')).toHaveText('bob')
+  })
+}
