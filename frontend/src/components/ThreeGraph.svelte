@@ -1249,7 +1249,6 @@
     try {
       let manifest = await fetchGraph3DSnapshot(options)
       if (!owns()) return
-      loadedGroupBy = groupBy
       let snapshot
       try {
         snapshot = await fetchGraph3DSnapshotResources(manifest)
@@ -1262,6 +1261,9 @@
         snapshot = await fetchGraph3DSnapshotResources(manifest)
       }
       if (!owns()) return
+      // Only a layout whose files all loaded is the one on screen; a failed
+      // grouping stays unloaded, so choosing it again fetches it.
+      loadedGroupBy = groupBy
       const edgeCount = Number(snapshot.manifest?.buffers?.edges?.count || Math.floor((snapshot.edgeTriplets?.length || 0) / 3) || 0)
       graphData = {
         manifest,

@@ -760,3 +760,26 @@ test('Escape ends the pending detail request', async ({ page }) => {
   await expect.poll(() => calls(page, NODE_1)).toBe(2)
   await expect(panel.getByText('Identifiers: 10.1000/seed', { exact: true })).toBeVisible()
 })
+
+test('a grouping whose resources failed is fetched again when chosen later', async ({ page }) => {
+  const { hold } = await graphMock(page, { versions: ['A', 'T', 'U'] })
+  hold('nodes.bin?v=T').release({ status: 500, body: { error: 'Work type layout failed' } })
+  const panel = await openGraph(page)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  const groupBy = panel.getByText('Group by').locator('..').locator('select')
+  const typeManifests = /^\/api\/graph\/3d\/snapshot\?.*group_by=type/
+
+  await groupBy.selectOption('type')
+  await expect(panel.getByText('Work type layout failed', { exact: true })).toBeVisible()
+  expect(await calls(page, typeManifests)).toBe(1)
+
+  // Degree only recolours the layout on screen (still Academic field).
+  await groupBy.selectOption('degree')
+  expect(await calls(page, MANIFEST)).toBe(2)
+
+  // Work type was never loaded, so choosing it again fetches its layout.
+  await groupBy.selectOption('type')
+  await expect.poll(() => calls(page, typeManifests)).toBe(2)
+  await expect(panel.getByText(/Loaded 2 nodes and 1 edges? from snapshot\./)).toBeVisible()
+  expect(await calls(page, /nodes\.bin\?v=U$/)).toBe(1)
+})
