@@ -231,8 +231,9 @@ The evidence for each row is in its decision; this list names the defect.
     - extraction gap: select corpus 2 with `/me` held; click Extract on the old row: the body
       carries `corpusId: 1` (on `d4518a9`: none). The extraction reply is held too;
     - late success: release `/me` (the switch commits), then the held extraction `202 started`, and
-      pass `afterBodyRead`: no `.extract-progress` and no `extracting` tag in the new workspace
-      (on `d4518a9` both show);
+      pass `afterBodyRead`: no `.extract-progress` in the new workspace (on `d4518a9` the progress
+      card shows; no `extracting` tag appears there, because `updateUpload` only patches an
+      existing row with the old id and the two corpora's uploads differ);
     - late failure: as above, but corpus 2 starts its own extraction (answered at once, its
       `.extract-progress` visible) before the old reply is released with `500`: the progress is
       still visible (on `d4518a9` it is cleared).
@@ -347,6 +348,15 @@ The evidence for each row is in its decision; this list names the defect.
   body `serverErrorText(req, error, 'Keyword search failed')`. Each route logs the full error once:
   the preview's `console.error` already does; the launch's `Search script failed:` line logs the
   error object instead of `error?.message`, also when the response was already sent.
+- **Dead search runs (pre-flight 3).** After launch has answered `202`, `finalizeDeadSearchRun`
+  (`app.js:1183`) stores up to 200 characters of the child's error in `search_runs.error`, and
+  the seed API returns it to every corpus member as `run.error` (`seed.js:1115`). It now stores
+  a reason with no child text: `search process exited (code <exitCode>)`, or
+  `(signal <signal>)`, or `(<error.code>)` for a spawn error such as `ENOENT`, or
+  `(no exit status)`. Everyone gets this reason, admins included, because the stored row has no
+  viewer. The full error is still in the launch's log line. `search-run-failure.test.js:212`
+  keeps its assertions; a new case checks the stored text for an exit-code error whose message
+  holds stderr.
 - User-visible: a non-admin hitting a 500 on the 35 routes, or an unmapped keyword-search failure,
   reads the route's fallback (`Failed to export corpus data`, `Keyword search failed`, …) instead of
   SQLite text, paths or Python output. Stub mode's user is not the admin and gets the fallback.
@@ -367,6 +377,10 @@ The evidence for each row is in its decision; this list names the defect.
       the admin the detail, and the log the full error for each;
     - mapped cases stay for the editor: stderr `OpenAlex rate limit exceeded. Retry after 5s.`
       answers 429 with that text, `ValueError: bad query` answers 400 `bad query`;
+    - after a `202` (pre-flight 3): the fake prints a `run_created` line, then writes
+      `SECRET-DIAG` to stderr and exits 3 without settling its row. The seed source's `run.error`
+      that the editor reads is `search process exited (code 3)`, with no `SECRET-DIAG`; the log has
+      the full error. On `d4518a9` `run.error` holds the stderr text;
   - phase 8's trigger test in `corpus-sharing.test.js` (`:400`, as the admin) also asserts
     `{ error: 'marker delete failed' }`; an editor on the same trigger gets
     `{ error: 'Failed to remove work from corpus' }`;
@@ -423,7 +437,8 @@ both and for the test loader (`test_doi_rule_scripts.py:14-25`).
 
 **D15. Every row of a shared token is written (PY-57).**
 - `run_pass` builds `token_to_rows: dict[str, list[tuple[int, str]]]` and requests each token once
-  (`dict.fromkeys` keeps the order). Every row of a returned token gets an update with its own raw
+  (the filter is built from `list(token_to_rows)`, whose keys are already unique and in
+  insertion order). Every row of a returned token gets an update with its own raw
   value, so phase 8's write guard still checks each row against what it was read with.
 - Tests, `test_doi_rule_scripts.py` with `_fake_openalex`: pass 1 rows `W1` and
   `https://openalex.org/W1` both get topics and `topics_fetched = 1`, the filter lists `W1` once,
@@ -463,9 +478,14 @@ ruling.**
   1 credit per eligible lookup, at most about 60 for a 60-entry bibliography.
 - Tests, `test_hygiene.py`: one file with an OpenAlex match (`openalex_id: 'https://openalex.org/W7'`
   and an OpenAlex `cited_by_api_url`), a Crossref match (an `api.crossref.org` URL, no OpenAlex id)
-  and an unmatched reference (`None`); `fetch_citing_work_ids` patched to record its URL. The output
-  holds all three; only the first has `citing_works_ids`; one fetch ran, with the stored URL. With
-  `fetch_citations=False` nothing is fetched. On `d4518a9` no fetch runs.
+  and an unmatched reference (`None`). The HTTP layer is mocked (the searcher's
+  `openalex_session.get` records each URL and answers one page with one citing work), so the real
+  `fetch_citing_work_ids` and its Crossref guard run (pre-flight 3). The output holds all three
+  references; the OpenAlex match has `citing_works_ids` with that one id; the Crossref match has
+  an empty `citing_works_ids` (an empty `FetchResult` with `complete` False: the CLI calls the
+  fetch, and the guard returns before any request); the
+  unmatched one has no key. Exactly one HTTP request ran, to `api.openalex.org`. With
+  `fetch_citations=False` no request runs. On `d4518a9` no request runs.
 
 ## Order of work
 
