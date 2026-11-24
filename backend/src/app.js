@@ -18,6 +18,7 @@ import { listCorpus, corpusStageStatuses } from './corpusList.js';
 import { tableExists, listTableColumns, parseJson } from './dbHelpers.js';
 import { normalizeDoi, normalizeOpenAlexId } from './identifiers.js';
 import { createPythonRunner } from './pythonProcess.js';
+import { createTicketStore } from './downloadTickets.js';
 import { tokenMailContent } from './authMail.js';
 import { getPasswordHasher } from './passwordHasher.js';
 import { createLoginLimiter } from './loginLimiter.js';
@@ -653,6 +654,43 @@ function stubGraph3dManifest() {
     edges: STUB_RESULTS.graph.edges,
     clusters: [],
   };
+}
+
+// Stub mode's export answer: a small file per format, no Python child.
+function sendStubExport(res, format) {
+  if (format === 'json') {
+    const payload = JSON.stringify({
+      generated_at: new Date().toISOString(),
+      total: STUB_RESULTS.corpus.length,
+      items: STUB_RESULTS.corpus,
+    }, null, 2);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="export_stub.json"');
+    return res.status(200).send(payload);
+  }
+  if (format === 'bibtex') {
+    const payload = '@article{stub_export,\n  title = {Stub Export}\n}\n';
+    res.setHeader('Content-Type', 'application/x-bibtex; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="export_stub.bib"');
+    return res.status(200).send(payload);
+  }
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${format === 'bundle_zip' ? 'export_stub_bundle.zip' : 'export_stub_pdfs.zip'}"`
+  );
+  return res.status(200).send(EMPTY_ZIP_BUFFER);
+}
+
+function stubCorpusPage(stage) {
+  const statuses = corpusStageStatuses(String(stage || ''));
+  const items = statuses ? STUB_RESULTS.corpus.filter((item) => statuses.includes(item.status)) : STUB_RESULTS.corpus;
+  return { items, total: STUB_RESULTS.corpus.length, stage_total: items.length, source: 'stub' };
+}
+
+function stubGraphNode(nodeId) {
+  const node = STUB_RESULTS.graph.nodes.find((item) => String(item.id) === nodeId || String(item.work_id) === nodeId);
+  return node ? { ...node, source: 'stub' } : null;
 }
 
 function emptyGraph3dPayload(source = 'api') {
@@ -2187,30 +2225,32 @@ function coercePositiveInt(value, fallback, minValue = 1) {
   return normalized >= minValue ? normalized : minValue;
 }
 
-function buildKeywordSearchExpansion(body = {}) {
+// The seven expansion fields the keyword search and the uploaded-docs paths
+// share; `defaults` is the path's RECURSION_DEFAULTS entry. relatedDepth sets
+// both directions unless a direction names its own depth.
+function buildExpansion(body, defaults) {
   const explicitDepth = coerceInt(body?.relatedDepth, null);
-  const parsed = {
+  return {
     relatedDepthDownstream: coercePositiveInt(
       coerceInt(body?.relatedDepthDownstream, explicitDepth ?? null),
-      RECURSION_DEFAULTS.keyword.relatedDepthDownstream,
+      defaults.relatedDepthDownstream,
       0
     ),
     relatedDepthUpstream: coercePositiveInt(
       coerceInt(body?.relatedDepthUpstream, explicitDepth ?? null),
-      RECURSION_DEFAULTS.keyword.relatedDepthUpstream,
+      defaults.relatedDepthUpstream,
       0
     ),
-    maxRelated: coercePositiveInt(body?.maxRelated, RECURSION_DEFAULTS.keyword.maxRelated, 1),
+    maxRelated: coercePositiveInt(body?.maxRelated, defaults.maxRelated, 1),
     relatedSort: coerceRelatedSort(body?.relatedSort),
     promotionMode: coercePromotionMode(body?.promotionMode),
     includeDownstream: body?.includeDownstream === undefined
-      ? RECURSION_DEFAULTS.keyword.includeDownstream
+      ? defaults.includeDownstream
       : Boolean(body.includeDownstream),
     includeUpstream: body?.includeUpstream === undefined
-      ? RECURSION_DEFAULTS.keyword.includeUpstream
+      ? defaults.includeUpstream
       : Boolean(body.includeUpstream),
   };
-  return parsed;
 }
 
 function applyKeywordSearchExpansionArgs(args, expansion) {
@@ -2325,16 +2365,7 @@ export function buildKeywordSearchArgs(req) {
 
   const args = ['--db-path', dbPath, '--max-results', String(maxResults), '--field', String(field)];
   if (sort) args.push('--sort', sort);
-  const expansion = buildKeywordSearchExpansion({
-    relatedDepth: coerceInt(req.body?.relatedDepth, null),
-    relatedDepthDownstream: coerceInt(req.body?.relatedDepthDownstream, null),
-    relatedDepthUpstream: coerceInt(req.body?.relatedDepthUpstream, null),
-    maxRelated: coerceInt(req.body?.maxRelated, null),
-    includeDownstream: req.body?.includeDownstream,
-    includeUpstream: req.body?.includeUpstream,
-    relatedSort: req.body?.relatedSort,
-    promotionMode: req.body?.promotionMode,
-  });
+  const expansion = buildExpansion(req.body, RECURSION_DEFAULTS.keyword);
 
   if (seedJson) {
     const seedPayload = typeof seedJson === 'string' ? seedJson : JSON.stringify(seedJson);
@@ -2357,59 +2388,10 @@ export function buildKeywordSearchArgs(req) {
 }
 
 function buildUploadedDocsExpansion(body = {}) {
-  const explicitDepth = coerceInt(body?.relatedDepth, null)
   return {
-    relatedDepth: coercePositiveInt(
-      explicitDepth,
-      RECURSION_DEFAULTS.uploadedDocs.relatedDepth,
-      0
-    ),
-    relatedDepthDownstream: coercePositiveInt(
-      coerceInt(body?.relatedDepthDownstream, explicitDepth ?? null),
-      RECURSION_DEFAULTS.uploadedDocs.relatedDepthDownstream,
-      0
-    ),
-    relatedDepthUpstream: coercePositiveInt(
-      coerceInt(body?.relatedDepthUpstream, explicitDepth ?? null),
-      RECURSION_DEFAULTS.uploadedDocs.relatedDepthUpstream,
-      0
-    ),
-    relatedSort: coerceRelatedSort(body?.relatedSort),
-    promotionMode: coercePromotionMode(body?.promotionMode),
-    maxRelated: coercePositiveInt(
-      body?.maxRelated,
-      RECURSION_DEFAULTS.uploadedDocs.maxRelated,
-      1
-    ),
-    includeDownstream: body?.includeDownstream === undefined
-      ? RECURSION_DEFAULTS.uploadedDocs.includeDownstream
-      : Boolean(body.includeDownstream),
-    includeUpstream: body?.includeUpstream === undefined
-      ? RECURSION_DEFAULTS.uploadedDocs.includeUpstream
-      : Boolean(body.includeUpstream),
+    relatedDepth: coercePositiveInt(coerceInt(body?.relatedDepth, null), RECURSION_DEFAULTS.uploadedDocs.relatedDepth, 0),
+    ...buildExpansion(body, RECURSION_DEFAULTS.uploadedDocs),
   };
-}
-
-function applyUploadedDocsExpansionArgs(args, expansion) {
-  if (expansion.includeDownstream || expansion.includeUpstream) {
-    args.push('--related-depth-downstream', String(expansion.relatedDepthDownstream));
-    if (!expansion.includeDownstream) {
-      args.push('--no-include-downstream');
-    }
-    if (expansion.includeUpstream) {
-      args.push('--include-upstream');
-      args.push('--related-depth-upstream', String(expansion.relatedDepthUpstream));
-    } else {
-      args.push('--no-include-upstream');
-    }
-  } else {
-    args.push('--related-depth-downstream', String(0));
-    args.push('--no-include-downstream');
-    args.push('--no-include-upstream');
-  }
-  args.push('--max-related', String(expansion.maxRelated));
-  // Rank-then-cap: decides WHICH related works survive the cap (spec 12).
-  if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
 // Each setting maps 1:1 onto the environment variable the Python scripts
@@ -2792,8 +2774,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
   const signInLimiter = loginLimiter || createLoginLimiter();
   const send = typeof broadcast === 'function' ? broadcast : () => {};
   const sendEvent = typeof broadcastEvent === 'function' ? broadcastEvent : () => {};
-  const corpusDownloadTickets = new Map(); // token -> { userId, corpusId, itemId, expiresAt }
-  const upstreamDownloadTickets = new Map(); // token -> { userId, targetId, itemId, expiresAt }
+  const corpusDownloadTickets = createTicketStore(); // { userId, corpusId, itemId }
+  const upstreamDownloadTickets = createTicketStore(); // { userId, targetId, itemId }
   const authConfig = resolveAuthConfig();
 
   // Ensure temporary and output directories exist
@@ -2832,20 +2814,18 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
   const orphanedRuns = markOrphanedSearchRuns(authDb, new Date().toISOString());
   if (orphanedRuns > 0) console.log(`[startup] Marked ${orphanedRuns} interrupted search run(s) as failed`);
   const requireAuthMiddleware = requireAuth(authDb, authConfig);
-  const pruneCorpusDownloadTickets = () => {
-    const now = Date.now();
-    for (const [token, ticket] of corpusDownloadTickets.entries()) {
-      if (!ticket || Number(ticket.expiresAt || 0) <= now) {
-        corpusDownloadTickets.delete(token);
-      }
-    }
+  // One 500 rule (D10): the admin reads the error's message, everyone else
+  // the route's fallback; the server log always gets the whole error.
+  const serverErrorText = (req, error, fallback) => (isAdminUser(req.user, authConfig) && error?.message) || fallback;
+  const sendServerError = (req, res, route, error, fallback) => {
+    console.error(`[${route}] Error:`, error);
+    return res.status(500).json({ error: serverErrorText(req, error, fallback) });
   };
   const requireCorpusDownloadAccess = (req, res, next) => {
     const token = String(req.query?.ticket || '').trim();
     if (!token) {
       return requireAuthMiddleware(req, res, next);
     }
-    pruneCorpusDownloadTickets();
     const ticket = corpusDownloadTickets.get(token);
     const itemId = coerceInt(req.params?.id, null);
     if (!ticket || !Number.isFinite(itemId) || Number(ticket.itemId) !== Number(itemId)) {
@@ -2858,7 +2838,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     }
     const user = getUserById(authDb, ticket.userId);
     if (!user) {
-      corpusDownloadTickets.delete(token);
+      corpusDownloadTickets.revoke(token);
       return res.status(401).json({ error: 'Unknown user' });
     }
     const corpusId = ticket.corpusId ?? ensureLastCorpus(authDb, user, authConfig);
@@ -2871,20 +2851,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     req.corpusRole = corpusRole;
     return next();
   };
-  const pruneUpstreamDownloadTickets = () => {
-    const now = Date.now();
-    for (const [token, ticket] of upstreamDownloadTickets.entries()) {
-      if (!ticket || Number(ticket.expiresAt || 0) <= now) {
-        upstreamDownloadTickets.delete(token);
-      }
-    }
-  };
   const requireUpstreamDownloadAccess = (req, res, next) => {
     const token = String(req.query?.ticket || '').trim();
     if (!token) {
       return res.status(401).json({ error: 'Missing download ticket' });
     }
-    pruneUpstreamDownloadTickets();
     const ticket = upstreamDownloadTickets.get(token);
     const itemId = coerceInt(req.params?.workId, null);
     const targetId = String(req.params?.id || '').trim();
@@ -2903,7 +2874,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     }
     const user = getUserById(authDb, ticket.userId);
     if (!user) {
-      upstreamDownloadTickets.delete(token);
+      upstreamDownloadTickets.revoke(token);
       return res.status(401).json({ error: 'Unknown user' });
     }
     req.user = user;
@@ -3424,8 +3395,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       }
       return res.json({ settings });
     } catch (error) {
-      console.error('[/api/admin/settings GET] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to load settings' });
+      return sendServerError(req, res, '/api/admin/settings GET', error, 'Failed to load settings');
     }
   });
 
@@ -3479,8 +3449,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       apply(Object.entries(updates));
       return res.json({ saved: true });
     } catch (error) {
-      console.error('[/api/admin/settings PUT] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to save settings' });
+      return sendServerError(req, res, '/api/admin/settings PUT', error, 'Failed to save settings');
     }
   });
 
@@ -3764,8 +3733,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       }
       return res.json(payload);
     } catch (error) {
-      console.error('[/api/kantropos/corpora/:id/browse] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to load Kantropos corpus browser data' });
+      return sendServerError(req, res, '/api/kantropos/corpora/:id/browse', error, 'Failed to load Kantropos corpus browser data');
     }
   });
 
@@ -3796,21 +3764,13 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       if (!row) {
         return res.status(404).json({ error: 'Downloaded upstream file not found' });
       }
-      pruneUpstreamDownloadTickets();
-      const token = crypto.randomBytes(24).toString('base64url');
-      upstreamDownloadTickets.set(token, {
-        userId: req.user.id,
-        targetId,
-        itemId,
-        expiresAt: Date.now() + 60_000,
-      });
+      const token = upstreamDownloadTickets.mint({ userId: req.user.id, targetId, itemId });
       return res.json({
         url: `/api/kantropos/corpora/${encodeURIComponent(targetId)}/works/${encodeURIComponent(String(itemId))}/file?ticket=${encodeURIComponent(token)}`,
-        expires_in_seconds: 60,
+        expires_in_seconds: upstreamDownloadTickets.ttlSeconds,
       });
     } catch (error) {
-      console.error('[/api/kantropos/corpora/:id/works/:workId/download-ticket] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to create upstream download ticket' });
+      return sendServerError(req, res, '/api/kantropos/corpora/:id/works/:workId/download-ticket', error, 'Failed to create upstream download ticket');
     }
   });
 
@@ -3823,8 +3783,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         return res.status(400).json({ error: 'Invalid upstream work download request' });
       }
       const metadataBibPath = String(path.join(String(target.path || ''), 'metadata.bib'));
-      const db = new Database(DB_PATH, { readonly: true });
-      const row = db
+      const row = authDb
         .prepare(
           `SELECT id, title, file_path, origin_key
              FROM works
@@ -3835,7 +3794,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
             LIMIT 1`
         )
         .get(itemId, metadataBibPath);
-      db.close();
       if (!row) {
         return res.status(404).json({ error: 'Downloaded upstream file not found' });
       }
@@ -3845,8 +3803,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       }
       return res.download(filePath, path.basename(filePath));
     } catch (error) {
-      console.error('[/api/kantropos/corpora/:id/works/:workId/file] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to download upstream file' });
+      return sendServerError(req, res, '/api/kantropos/corpora/:id/works/:workId/file', error, 'Failed to download upstream file');
     }
   });
 
@@ -3884,8 +3841,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       });
       return res.status(201).json({ run: mapScraperRunRow(authDb.prepare('SELECT * FROM scraper_runs WHERE id = ?').get(runId)), job_id: jobId });
     } catch (error) {
-      console.error('[/api/scraper/runs] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to create scraper run' });
+      return sendServerError(req, res, '/api/scraper/runs', error, 'Failed to create scraper run');
     }
   });
 
@@ -3902,8 +3858,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         .all(limit);
       return res.json({ runs: rows.map(mapScraperRunRow) });
     } catch (error) {
-      console.error('[/api/scraper/runs GET] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to load scraper runs' });
+      return sendServerError(req, res, '/api/scraper/runs GET', error, 'Failed to load scraper runs');
     }
   });
 
@@ -3925,8 +3880,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         .all(runId);
       return res.json({ run: mapScraperRunRow(run), artifacts: artifactRows.map(mapScraperArtifactRow) });
     } catch (error) {
-      console.error('[/api/scraper/runs/:id] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to load scraper run' });
+      return sendServerError(req, res, '/api/scraper/runs/:id', error, 'Failed to load scraper run');
     }
   });
 
@@ -4090,8 +4044,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         generated_bib_url: appendedEntries.length > 0 ? `/api/scraper/apply-events/${encodeURIComponent(String(eventId))}/metadata-bib` : '',
       });
     } catch (error) {
-      console.error('[/api/scraper/apply] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to apply scraper artifacts' });
+      return sendServerError(req, res, '/api/scraper/apply', error, 'Failed to apply scraper artifacts');
     }
   });
 
@@ -4121,8 +4074,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       res.setHeader('Content-Type', 'application/x-bibtex; charset=utf-8');
       return res.download(generatedBibPath, 'metadata.bib');
     } catch (error) {
-      console.error('[/api/scraper/apply-events/:id/metadata-bib] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to download generated metadata.bib' });
+      return sendServerError(req, res, '/api/scraper/apply-events/:id/metadata-bib', error, 'Failed to download generated metadata.bib');
     }
   });
 
@@ -4145,8 +4097,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       })();
       return res.status(201).json({ id: corpusId, name });
     } catch (error) {
-      console.error('[/api/corpora POST] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to create corpus' });
+      return sendServerError(req, res, '/api/corpora POST', error, 'Failed to create corpus');
     }
   });
 
@@ -4368,8 +4319,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
 
       return res.json(result);
     } catch (error) {
-      console.error('[/api/corpora/:id DELETE] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to delete corpus' });
+      return sendServerError(req, res, '/api/corpora/:id DELETE', error, 'Failed to delete corpus');
     }
   });
 
@@ -4423,7 +4373,9 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       console.error('[/api/upload] CAUGHT ERROR in /api/process_pdf:', error);
       // Check if response has already been sent
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Server error during upload', details: error.message });
+        const body = { error: 'Server error during upload' };
+        if (isAdminUser(req.user, authConfig)) body.details = error?.message;
+        res.status(500).json(body);
       } else {
         console.error('[/api/upload] Error occurred after headers sent.');
       }
@@ -4872,7 +4824,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     if (built.error) return res.status(400).json({ error: built.error });
     const threshold = searchWarnThreshold();
     const creditsPerPage = searchCreditsPerPage(req.body?.query);
-    if (process.env.RAG_FEEDER_STUB === '1') {
+    if (isStubMode()) {
       return res.json({ count: STUB_RESULTS.keywordResults.length, threshold, creditsPerPage });
     }
     try {
@@ -4886,14 +4838,17 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     } catch (error) {
       console.error('[/api/keyword-search/preview] Error:', error);
       const failure = keywordSearchErrorResponse(error);
-      return res.status(failure.status === 500 ? 502 : failure.status).json({ error: failure.message });
+      if (failure.status === 500) {
+        return res.status(502).json({ error: serverErrorText(req, error, 'Keyword search failed') });
+      }
+      return res.status(failure.status).json({ error: failure.message });
     }
   });
 
   app.post('/api/keyword-search', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, (req, res) => {
     const built = buildKeywordSearchArgs(req);
     if (built.error) return res.status(400).json({ error: built.error });
-    if (process.env.RAG_FEEDER_STUB === '1') {
+    if (isStubMode()) {
       return res.json({
         runId: 0,
         results: STUB_RESULTS.keywordResults,
@@ -4942,11 +4897,12 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         // The run row carries a quota stop to the UI (status 'done', error = the note).
         (payload) => { openAlexQuotaStop('/api/keyword-search', payload); return null; },
         (error) => {
-          console.error('[/api/keyword-search] Search script failed:', error?.message || error);
+          console.error('[/api/keyword-search] Search script failed:', error);
           if (!responded) {
             responded = true;
             const failure = keywordSearchErrorResponse(error);
-            res.status(failure.status).json({ error: failure.message });
+            const message = failure.status === 500 ? serverErrorText(req, error, 'Keyword search failed') : failure.message;
+            res.status(failure.status).json({ error: message });
           }
           return error;
         },
@@ -4991,11 +4947,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         resolveDownloadedFilePath: findDownloadedFilePath,
         q,
         withStateCounts: false,
+        runErrorDetail: isAdminUser(req.user, authConfig),
       });
       return res.json({ source: 'db', sources, total: sources.length });
     } catch (error) {
-      console.error('[/api/seed/sources] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to load seed sources' });
+      return sendServerError(req, res, '/api/seed/sources', error, 'Failed to load seed sources');
     }
   });
 
@@ -5020,8 +4976,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       }
       return res.download(resolved, path.basename(resolved));
     } catch (error) {
-      console.error('[/api/seed/sources/pdf/:sourceKey/file] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to serve seed document' });
+      return sendServerError(req, res, '/api/seed/sources/pdf/:sourceKey/file', error, 'Failed to serve seed document');
     }
   });
 
@@ -5078,6 +5033,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         stateResolver,
         only: { sourceType, sourceKey },
         withStateCounts: !lightSummary,
+        runErrorDetail: isAdminUser(req.user, authConfig),
         // Same filter as the candidate list, so candidate_count / state_counts
         // describe what is actually returned.
         q,
@@ -5093,8 +5049,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         limit,
       });
     } catch (error) {
-      console.error('[/api/seed/sources/:sourceType/:sourceKey/candidates] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to load seed candidates' });
+      return sendServerError(req, res, '/api/seed/sources/:sourceType/:sourceKey/candidates', error, 'Failed to load seed candidates');
     }
   });
 
@@ -5123,30 +5078,24 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const isAdmin = isAdminUser(req.user, authConfig);
       let filePath = null;
       let sawRow = false;
-      let db = null;
-      try {
-        db = new Database(DB_PATH, { readonly: true });
-        const fileRow = db.prepare(
-          `SELECT w.id, w.title, w.file_path, w.origin_key
-             FROM works w
-            WHERE w.id = ?
-              AND w.download_status = 'downloaded'
-              ${isAdmin ? '' : `AND EXISTS (
-                SELECT 1 FROM corpus_works cw
-                JOIN user_corpora uc ON uc.corpus_id = cw.corpus_id
-                WHERE cw.work_id = w.id AND uc.user_id = ?
-              )`}
-            LIMIT 1`
-        );
-        for (const workId of workIds) {
-          const row = fileRow.get(...(isAdmin ? [workId] : [workId, req.user.id]));
-          if (!row) continue;
-          sawRow = true;
-          filePath = findDownloadedFilePath(row.file_path, { originKey: row.origin_key });
-          if (filePath) break;
-        }
-      } finally {
-        db?.close();
+      const fileRow = authDb.prepare(
+        `SELECT w.id, w.title, w.file_path, w.origin_key
+           FROM works w
+          WHERE w.id = ?
+            AND w.download_status = 'downloaded'
+            ${isAdmin ? '' : `AND EXISTS (
+              SELECT 1 FROM corpus_works cw
+              JOIN user_corpora uc ON uc.corpus_id = cw.corpus_id
+              WHERE cw.work_id = w.id AND uc.user_id = ?
+            )`}
+          LIMIT 1`
+      );
+      for (const workId of workIds) {
+        const row = fileRow.get(...(isAdmin ? [workId] : [workId, req.user.id]));
+        if (!row) continue;
+        sawRow = true;
+        filePath = findDownloadedFilePath(row.file_path, { originKey: row.origin_key });
+        if (filePath) break;
       }
 
       if (!sawRow) {
@@ -5158,8 +5107,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
 
       return res.download(filePath, path.basename(filePath));
     } catch (error) {
-      console.error('[/api/seed/sources/:sourceType/:sourceKey/candidates/:candidateKey/file] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to download seed candidate file' });
+      return sendServerError(req, res, '/api/seed/sources/:sourceType/:sourceKey/candidates/:candidateKey/file', error, 'Failed to download seed candidate file');
     }
   });
 
@@ -5380,7 +5328,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
           }
         } catch (error) {
           console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Expansion seeding failed:', error);
-          expansionError = error?.message || 'Failed to build expansion seeds';
+          expansionError = serverErrorText(req, error, 'Failed to build expansion seeds');
         } finally {
           if (tempExpandSeedPath) {
             try {
@@ -5419,8 +5367,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
           : 'Selected candidates were already reflected in the corpus state.') + expansionMessage + expansionNotice,
       });
     } catch (error) {
-      console.error('[/api/seed/sources/:sourceType/:sourceKey/promote] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to promote seed candidates' });
+      return sendServerError(req, res, '/api/seed/sources/:sourceType/:sourceKey/promote', error, 'Failed to promote seed candidates');
     }
   });
 
@@ -5443,8 +5390,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const dismissed = dismissSeedCandidates(authDb, req.corpusId, sourceType, sourceKey, candidateKeys);
       return res.json({ success: true, dismissed });
     } catch (error) {
-      console.error('[/api/seed/candidates/dismiss] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to dismiss seed candidates' });
+      return sendServerError(req, res, '/api/seed/candidates/dismiss', error, 'Failed to dismiss seed candidates');
     }
   });
 
@@ -5458,17 +5404,12 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const removed = hideSeedSource(authDb, req.corpusId, sourceType, sourceKey);
       return res.json({ success: true, removed });
     } catch (error) {
-      console.error('[/api/seed/sources/:sourceType/:sourceKey] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to remove seed source' });
+      return sendServerError(req, res, '/api/seed/sources/:sourceType/:sourceKey', error, 'Failed to remove seed source');
     }
   });
 
   app.get('/api/corpus', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      const statuses = corpusStageStatuses(String(req.query?.stage || ''));
-      const items = statuses ? STUB_RESULTS.corpus.filter((item) => statuses.includes(item.status)) : STUB_RESULTS.corpus;
-      return res.json({ items, total: STUB_RESULTS.corpus.length, stage_total: items.length, source: 'stub' });
-    }
+    if (isStubMode()) return res.json(stubCorpusPage(req.query?.stage));
     const limit = Math.min(CORPUS_MAX_LIMIT, Math.max(0, coerceInt(req.query?.limit, 200)));
     const offset = coerceInt(req.query?.offset, 0);
     const query = String(req.query?.q || '').trim();
@@ -5478,8 +5419,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       // SQL port of scripts/corpus_list.py (kept as the golden-test oracle).
       return res.json(listCorpus(authDb, { corpusId: req.corpusId ?? null, limit, offset, q: query, sort, stage }));
     } catch (error) {
-      console.error('[/api/corpus] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch corpus' });
+      return sendServerError(req, res, '/api/corpus', error, 'Failed to fetch corpus');
     }
   });
 
@@ -5513,8 +5453,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       }
       return res.json({ removed: true, work_id: workId });
     } catch (error) {
-      console.error('[/api/corpus/works/:workId] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to remove work from corpus' });
+      return sendServerError(req, res, '/api/corpus/works/:workId', error, 'Failed to remove work from corpus');
     }
   });
 
@@ -5552,8 +5491,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         skipped_work_ids: workIds.filter((id) => !removedIds.includes(id)),
       });
     } catch (error) {
-      console.error('[/api/corpus/works/remove] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to remove works from corpus' });
+      return sendServerError(req, res, '/api/corpus/works/remove', error, 'Failed to remove works from corpus');
     }
   });
 
@@ -5575,21 +5513,13 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       if (!row) {
         return res.status(404).json({ error: 'Downloaded file not found in this corpus' });
       }
-      pruneCorpusDownloadTickets();
-      const token = crypto.randomBytes(24).toString('base64url');
-      corpusDownloadTickets.set(token, {
-        userId: req.user.id,
-        corpusId: req.corpusId,
-        itemId,
-        expiresAt: Date.now() + 60_000,
-      });
+      const token = corpusDownloadTickets.mint({ userId: req.user.id, corpusId: req.corpusId, itemId });
       return res.json({
         url: `/api/corpus/downloaded/${encodeURIComponent(String(itemId))}/file?ticket=${encodeURIComponent(token)}`,
-        expires_in_seconds: 60,
+        expires_in_seconds: corpusDownloadTickets.ttlSeconds,
       });
     } catch (error) {
-      console.error('[/api/corpus/downloaded/:id/download-ticket] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to create download ticket' });
+      return sendServerError(req, res, '/api/corpus/downloaded/:id/download-ticket', error, 'Failed to create download ticket');
     }
   });
 
@@ -5599,8 +5529,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       return res.status(400).json({ error: 'Invalid downloaded item id' });
     }
     try {
-      const db = new Database(DB_PATH, { readonly: true });
-      const row = db.prepare(
+      const row = authDb.prepare(
         `SELECT w.id, w.title, w.file_path, w.origin_key
            FROM works w
            JOIN corpus_works cw ON cw.work_id = w.id
@@ -5609,7 +5538,6 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
             AND w.download_status = 'downloaded'
           LIMIT 1`
       ).get(req.corpusId, itemId);
-      db.close();
 
       if (!row) {
         return res.status(404).json({ error: 'Downloaded file not found in this corpus' });
@@ -5623,8 +5551,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const downloadName = path.basename(filePath);
       return res.download(filePath, downloadName);
     } catch (error) {
-      console.error('[/api/corpus/downloaded/:id/file] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to download corpus file' });
+      return sendServerError(req, res, '/api/corpus/downloaded/:id/file', error, 'Failed to download corpus file');
     }
   });
 
@@ -5671,7 +5598,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
   });
 
   app.get('/api/downloads', requireAuthMiddleware, requireCurrentCorpusMember, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
+    if (isStubMode()) {
       return res.json({ items: STUB_RESULTS.downloads, total: STUB_RESULTS.downloads.length, source: 'stub' });
     }
     const limit = coerceInt(req.query?.limit, 200);
@@ -5679,8 +5606,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     try {
       return res.json(listDownloads(authDb, { corpusId: req.corpusId, limit, offset }));
     } catch (error) {
-      console.error('[/api/downloads] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch download queue' });
+      return sendServerError(req, res, '/api/downloads', error, 'Failed to fetch download queue');
     }
   });
 
@@ -5701,30 +5627,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       return res.status(400).json({ error: 'year_from must be <= year_to' });
     }
 
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      if (selectedFormat === 'json') {
-        const payload = JSON.stringify({
-          generated_at: new Date().toISOString(),
-          total: STUB_RESULTS.corpus.length,
-          items: STUB_RESULTS.corpus,
-        }, null, 2);
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.setHeader('Content-Disposition', 'attachment; filename="export_stub.json"');
-        return res.status(200).send(payload);
-      }
-      if (selectedFormat === 'bibtex') {
-        const payload = '@article{stub_export,\n  title = {Stub Export}\n}\n';
-        res.setHeader('Content-Type', 'application/x-bibtex; charset=utf-8');
-        res.setHeader('Content-Disposition', 'attachment; filename="export_stub.bib"');
-        return res.status(200).send(payload);
-      }
-      res.setHeader('Content-Type', 'application/zip');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${selectedFormat === 'bundle_zip' ? 'export_stub_bundle.zip' : 'export_stub_pdfs.zip'}"`
-      );
-      return res.status(200).send(EMPTY_ZIP_BUFFER);
-    }
+    if (isStubMode()) return sendStubExport(res, selectedFormat);
 
     const dbPath = DB_PATH;
     let exportDir = path.join(ARTIFACTS_DIR, 'exports');
@@ -5761,12 +5664,11 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const downloadName = payload?.filename || path.basename(outputPath);
       return res.download(outputPath, downloadName);
     } catch (error) {
-      console.error('[/api/exports] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to export corpus data' });
+      return sendServerError(req, res, '/api/exports', error, 'Failed to export corpus data');
     }
   });
   app.get('/api/graph/3d/snapshot', requireAuthMiddleware, async (req, res) => {
-    if (process.env.RAG_FEEDER_STUB === '1') {
+    if (isStubMode()) {
       return res.json(stubGraph3dManifest());
     }
 
@@ -5795,8 +5697,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const manifest = await buildGraph3dSnapshot(options, key);
       return res.json(decorateGraph3dManifest(manifest, key));
     } catch (error) {
-      console.error('[/api/graph/3d/snapshot] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to build 3D graph snapshot' });
+      return sendServerError(req, res, '/api/graph/3d/snapshot', error, 'Failed to build 3D graph snapshot');
     }
   });
 
@@ -5805,57 +5706,51 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     if (!nodeId) {
       return res.status(400).json({ error: 'Missing node id' });
     }
-    if (process.env.RAG_FEEDER_STUB === '1') {
-      const node = STUB_RESULTS.graph.nodes.find((item) => String(item.id) === nodeId || String(item.work_id) === nodeId);
-      return node ? res.json({ ...node, source: 'stub' }) : res.status(404).json({ error: 'Node not found' });
+    if (isStubMode()) {
+      const node = stubGraphNode(nodeId);
+      return node ? res.json(node) : res.status(404).json({ error: 'Node not found' });
     }
 
     try {
-      const db = new Database(DB_PATH, { readonly: true });
-      try {
-        const columns = new Set(listTableColumns(db, 'works'));
-        const wanted = [
-          'id',
-          'title',
-          'authors',
-          'year',
-          'doi',
-          'openalex_id',
-          'source',
-          'publisher',
-          'type',
-          'abstract',
-          'keywords',
-          'metadata_status',
-          'download_status',
-          'origin_key',
-          'source_pdf',
-          'source_work_id',
-          'relationship_type',
-          'file_path',
-        ].filter((column) => columns.has(column));
-        if (!wanted.length) {
-          return res.status(404).json({ error: 'Works table not found' });
-        }
-        const selectList = wanted.map((column) => `w.${column}`).join(', ');
-        const row = findGraphNodeWork(db, nodeId, selectList, columns);
-        // 404 rather than 403 so node ids do not reveal works in foreign corpora.
-        if (!row || !workReadableByUser(authDb, req.user, row.id, authConfig)) {
-          return res.status(404).json({ error: 'Node not found' });
-        }
-        return res.json({
-          ...mapWorkRowToBrowserItem(row),
-          publisher: row.publisher || '',
-          abstract: row.abstract || '',
-          keywords: row.keywords || '',
-          source_pdf: row.source_pdf || '',
-        });
-      } finally {
-        db.close();
+      const columns = new Set(listTableColumns(authDb, 'works'));
+      const wanted = [
+        'id',
+        'title',
+        'authors',
+        'year',
+        'doi',
+        'openalex_id',
+        'source',
+        'publisher',
+        'type',
+        'abstract',
+        'keywords',
+        'metadata_status',
+        'download_status',
+        'origin_key',
+        'source_pdf',
+        'source_work_id',
+        'relationship_type',
+        'file_path',
+      ].filter((column) => columns.has(column));
+      if (!wanted.length) {
+        return res.status(404).json({ error: 'Works table not found' });
       }
+      const selectList = wanted.map((column) => `w.${column}`).join(', ');
+      const row = findGraphNodeWork(authDb, nodeId, selectList, columns);
+      // 404 rather than 403 so node ids do not reveal works in foreign corpora.
+      if (!row || !workReadableByUser(authDb, req.user, row.id, authConfig)) {
+        return res.status(404).json({ error: 'Node not found' });
+      }
+      return res.json({
+        ...mapWorkRowToBrowserItem(row),
+        publisher: row.publisher || '',
+        abstract: row.abstract || '',
+        keywords: row.keywords || '',
+        source_pdf: row.source_pdf || '',
+      });
     } catch (error) {
-      console.error('[/api/graph/3d/node/:nodeId] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to load node detail' });
+      return sendServerError(req, res, '/api/graph/3d/node/:nodeId', error, 'Failed to load node detail');
     }
   });
 
@@ -5949,8 +5844,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       }
       return res.json(result);
     } catch (error) {
-      console.error('[/api/ingest/import-seed] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to import seed file' });
+      return sendServerError(req, res, '/api/ingest/import-seed', error, 'Failed to import seed file');
     }
   });
 
@@ -5970,8 +5864,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const payload = await runPythonJson(INGEST_ENQUEUE_SCRIPT, args, { dbPath, corpusId: req.corpusId });
       return res.json(payload);
     } catch (error) {
-      console.error('[/api/ingest/enqueue] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to enqueue ingest entries' });
+      return sendServerError(req, res, '/api/ingest/enqueue', error, 'Failed to enqueue ingest entries');
     }
   });
 
@@ -6046,8 +5939,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
           : 'Marked entries remain queued in the database. Background workers will enrich them automatically.'
       });
     } catch (error) {
-      console.error('[/api/ingest/process-marked] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to queue marked ingest entries for processing' });
+      return sendServerError(req, res, '/api/ingest/process-marked', error, 'Failed to queue marked ingest entries for processing');
     }
   });
 
@@ -6057,8 +5949,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const { runs, total } = listIngestRuns(authDb, { corpusId: req.corpusId, limit });
       return res.json({ runs, total, source: 'db' });
     } catch (error) {
-      console.error('[/api/ingest/runs] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch ingest runs' });
+      return sendServerError(req, res, '/api/ingest/runs', error, 'Failed to fetch ingest runs');
     }
   });
 
@@ -6071,8 +5962,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     try {
       return res.json({ stats: readIngestStats(authDb, corpusId ?? null), source: 'db' });
     } catch (error) {
-      console.error('[/api/ingest/stats] Error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to fetch ingest stats' });
+      return sendServerError(req, res, '/api/ingest/stats', error, 'Failed to fetch ingest stats');
     }
   });
 
@@ -6088,8 +5978,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         backlog: readWorkerBacklogSummary(globalScope ? null : req.corpusId),
       });
     } catch (error) {
-      console.error('[/api/pipeline/daemon/status] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to fetch daemon status' });
+      return sendServerError(req, res, '/api/pipeline/daemon/status', error, 'Failed to fetch daemon status');
     }
   });
 
@@ -6210,8 +6099,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
         daemon: daemonStatusForRequest(req),
       });
     } catch (error) {
-      console.error('[/api/pipeline/jobs/summary] Error:', error);
-      return res.status(500).json({ error: error?.message || 'Failed to fetch job summary' });
+      return sendServerError(req, res, '/api/pipeline/jobs/summary', error, 'Failed to fetch job summary');
     }
   });
 

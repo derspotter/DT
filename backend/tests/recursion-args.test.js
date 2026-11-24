@@ -346,6 +346,49 @@ console.log(JSON.stringify({ results: [], source: 'fake-python' }))
     expect(params?.expansion?.promotionMode).toBe('download_all')
   })
 
+  test('the upload expansion payload keeps its eight fields', async () => {
+    seedPendingWork()
+    const res = await doIngestProcess({
+      limit: 2,
+      workers: 2,
+      relatedDepth: '3',
+      relatedDepthDownstream: '4',
+      relatedDepthUpstream: 2,
+      maxRelated: '0',
+      relatedSort: 'NEWEST',
+      promotionMode: 'download_all',
+      includeDownstream: 1,
+      includeUpstream: '',
+    })
+    expect(res.status).toBe(200)
+    expect(readLatestJob('enrich').expansion).toEqual({
+      relatedDepth: 3,
+      relatedDepthDownstream: 4,
+      relatedDepthUpstream: 2,
+      maxRelated: 1,
+      relatedSort: 'newest',
+      promotionMode: 'download_all',
+      includeDownstream: true,
+      includeUpstream: false,
+    })
+
+    const config = await request(app).get('/api/recursion-config').set('Authorization', `Bearer ${authToken}`)
+    expect(config.status).toBe(200)
+    const defaults = config.body.uploadedDocs
+    const empty = await doIngestProcess({})
+    expect(empty.status).toBe(200)
+    expect(readLatestJob('enrich').expansion).toEqual({
+      relatedDepth: defaults.relatedDepth,
+      relatedDepthDownstream: defaults.relatedDepthDownstream,
+      relatedDepthUpstream: defaults.relatedDepthUpstream,
+      maxRelated: defaults.maxRelated,
+      relatedSort: defaults.relatedSort,
+      promotionMode: defaults.promotionMode,
+      includeDownstream: defaults.includeDownstream,
+      includeUpstream: defaults.includeUpstream,
+    })
+  })
+
   test('defaults upload process to DB-driven background mode', async () => {
     const res = await doIngestProcess({
       limit: 2,

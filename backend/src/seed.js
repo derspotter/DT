@@ -986,6 +986,9 @@ export function listSeedSources(db, corpusId, {
   // gets `state_counts: null`; the candidates route asks for one seed via
   // `only` and keeps the counts.
   withStateCounts = true,
+  // A failed run's stored error is child output (D10): only the admin reads
+  // it; everyone else gets 'search failed'. A done run's quota note stays.
+  runErrorDetail = false,
 } = {}) {
   // Built on first use only: the light list (withStateCounts: false) never
   // needs it.
@@ -1086,7 +1089,12 @@ export function listSeedSources(db, corpusId, {
     if (!sourceKey || !wanted('search', sourceKey)) return
     const total = countSeedCandidates(db, corpusId, 'search', sourceKey, { q })
     const run = row.status !== undefined
-      ? { status: row.status || null, fetched_count: row.fetched_count ?? null, expected_count: row.expected_count ?? null, error: row.error || null }
+      ? {
+        status: row.status || null,
+        fetched_count: row.fetched_count ?? null,
+        expected_count: row.expected_count ?? null,
+        error: row.status === 'failed' && !runErrorDetail ? 'search failed' : (row.error || null),
+      }
       : null
     if (total === 0 && run?.status !== 'running') return
     const withinLimit = withStateCounts && total <= seedStateCountLimit()
