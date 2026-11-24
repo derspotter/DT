@@ -71,6 +71,7 @@
   import UpstreamBrowser from './components/UpstreamBrowser.svelte'
   import AdminPanel from './components/AdminPanel.svelte'
   import { searchRunSubtitle, seedActivity, seedPromotionStatus } from './lib/seedStatus'
+  import { openDownloadUrl, saveBlob } from './lib/download'
   import {
     workState,
     metadataLabel,
@@ -1756,24 +1757,7 @@
       submit.session = epoch
       const me = await fetchMe()
       if (epoch !== sessionEpoch) return
-      authUser = me.user
-      corpora = me.corpora || []
-      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
-      authStatus = 'authenticated'
-      authFlow = 'login'
-      authFlowToken = ''
-      const authNavigationRevision = navigationRevision
-      await loadRecursionConfig()
-      // Signed out or expired meanwhile: the loads belong to no session.
-      if (lostSession()) return
-      const refreshedTab = activeTab
-      await refreshAll(refreshedTab)
-      // A 401 during the loads signed the session out already.
-      if (lostSession()) return
-      connectLogs()
-      if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
-      }
+      await openSignedInSession(me, lostSession)
     } catch (error) {
       // Only the attempt still in charge may report or clear. That includes a
       // 401 from its own /me, which already ran expireSession.
@@ -1815,14 +1799,16 @@
     }
   }
 
-  async function handleAcceptInvite(event) {
+  // The accept-invite and reset-password submits: the same steps around
+  // their own API call and texts (FE-11).
+  async function submitNewPassword(event, { form, request, missingTokenText, failureText }) {
     event?.preventDefault?.()
     // Single-flight: a second submit (Enter, a double click) is ignored.
-    if (authFormSubmit.acceptInvite) return
+    if (authFormSubmit[form]) return
     authError = ''
     authInfo = ''
     if (!authFlowToken) {
-      authError = 'Invite token is missing.'
+      authError = missingTokenText
       return
     }
     if (authPassword.length < 8) {
@@ -1840,9 +1826,9 @@
     // Set once the password call succeeded: a later failure is a failed
     // sign-in, not a failed link.
     let savedUsername = null
-    const submit = beginAuthSubmit('acceptInvite')
+    const submit = beginAuthSubmit(form)
     try {
-      const payload = await acceptInvite({ token: authFlowToken, password: authPassword })
+      const payload = await request({ token: authFlowToken, password: authPassword })
       if (!authSubmitOwns(submit)) return
       savedUsername = String(payload?.user?.username || '')
       enterSession(payload)
@@ -1859,22 +1845,7 @@
       }
       const me = await fetchMe()
       if (lostSession()) return
-      authUser = me.user
-      corpora = me.corpora || []
-      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
-      authStatus = 'authenticated'
-      authFlow = 'login'
-      authFlowToken = ''
-      const authNavigationRevision = navigationRevision
-      await loadRecursionConfig()
-      if (lostSession()) return
-      const refreshedTab = activeTab
-      await refreshAll(refreshedTab)
-      if (lostSession()) return
-      connectLogs()
-      if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
-      }
+      await openSignedInSession(me, lostSession)
     } catch (error) {
       if (attempt !== signInEpoch) return
       if (savedUsername !== null) {
@@ -1884,85 +1855,18 @@
       }
       // A newer submit owns the form: its outcome stays on screen.
       if (!authSubmitOwns(submit)) return
-      authError = error.message || 'Failed to accept invite'
+      authError = error.message || failureText
     } finally {
       endAuthSubmit(submit)
     }
   }
 
-  async function handleResetPassword(event) {
-    event?.preventDefault?.()
-    // Single-flight: a second submit (Enter, a double click) is ignored.
-    if (authFormSubmit.resetPassword) return
-    authError = ''
-    authInfo = ''
-    if (!authFlowToken) {
-      authError = 'Reset token is missing.'
-      return
-    }
-    if (authPassword.length < 8) {
-      authError = 'Password must be at least 8 characters.'
-      return
-    }
-    if (authPassword !== authPasswordConfirm) {
-      authError = 'Passwords do not match.'
-      return
-    }
-    // A newer sign-in or a sign-out takes this attempt over; an expired token
-    // does not (signInEpoch). Its success starts the session `epoch` watches.
-    let attempt = signInEpoch
-    let epoch = sessionEpoch
-    // Set once the password call succeeded: a later failure is a failed
-    // sign-in, not a failed link.
-    let savedUsername = null
-    const submit = beginAuthSubmit('resetPassword')
-    try {
-      const payload = await resetPassword({ token: authFlowToken, password: authPassword })
-      if (!authSubmitOwns(submit)) return
-      savedUsername = String(payload?.user?.username || '')
-      enterSession(payload)
-      attempt = signInEpoch
-      submit.attempt = attempt
-      epoch = sessionEpoch
-      submit.session = epoch
-      // A 401 from any load of the new session (they swallow it) expired
-      // the session: the password is saved all the same.
-      const lostSession = () => {
-        if (epoch === sessionEpoch) return false
-        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, { message: lastExpiryMessage })
-        return true
-      }
-      const me = await fetchMe()
-      if (lostSession()) return
-      authUser = me.user
-      corpora = me.corpora || []
-      currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
-      authStatus = 'authenticated'
-      authFlow = 'login'
-      authFlowToken = ''
-      const authNavigationRevision = navigationRevision
-      await loadRecursionConfig()
-      if (lostSession()) return
-      const refreshedTab = activeTab
-      await refreshAll(refreshedTab)
-      if (lostSession()) return
-      connectLogs()
-      if (navigationRevision === authNavigationRevision) {
-        setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
-      }
-    } catch (error) {
-      if (attempt !== signInEpoch) return
-      if (savedUsername !== null) {
-        if (authSubmitOwns(submit)) recoverSavedPassword(savedUsername, error)
-        else releaseOwnSession(submit)
-        return
-      }
-      // A newer submit owns the form: its outcome stays on screen.
-      if (!authSubmitOwns(submit)) return
-      authError = error.message || 'Failed to reset password'
-    } finally {
-      endAuthSubmit(submit)
-    }
+  function handleAcceptInvite(event) {
+    return submitNewPassword(event, { form: 'acceptInvite', request: acceptInvite, missingTokenText: 'Invite token is missing.', failureText: 'Failed to accept invite' })
+  }
+
+  function handleResetPassword(event) {
+    return submitNewPassword(event, { form: 'resetPassword', request: resetPassword, missingTokenText: 'Reset token is missing.', failureText: 'Failed to reset password' })
   }
 
   async function handleCreateInvitation(event) {
@@ -2103,6 +2007,30 @@
     if (payload?.user) {
       authUser = payload.user
       currentCorpusId = payload.user.last_corpus_id || null
+    }
+  }
+
+  // A sign-in's steps once its own /me answered: the session opens and loads.
+  // Returns as soon as `lostSession()` says a sign-out or expiry took it
+  // over; errors reach the caller's catch.
+  async function openSignedInSession(me, lostSession) {
+    authUser = me.user
+    corpora = me.corpora || []
+    currentCorpusId = authUser?.last_corpus_id || currentCorpusId || corpora[0]?.id || null
+    authStatus = 'authenticated'
+    authFlow = 'login'
+    authFlowToken = ''
+    const authNavigationRevision = navigationRevision
+    await loadRecursionConfig()
+    // Signed out or expired meanwhile: the loads belong to no session.
+    if (lostSession()) return
+    const refreshedTab = activeTab
+    await refreshAll(refreshedTab)
+    // A 401 during the loads signed the session out already.
+    if (lostSession()) return
+    connectLogs()
+    if (navigationRevision === authNavigationRevision) {
+      setActiveTab('workspace', { replace: true, loadedTab: refreshedTab })
     }
   }
 
@@ -4206,6 +4134,19 @@
     return JSON.stringify(details || {})
   }
 
+  // A worker card's view of its daemon heartbeat entry (FE-23).
+  function workerView(previous, entry) {
+    return {
+      ...previous,
+      running: Boolean(entry.online),
+      in_flight: String(entry.status || '').toLowerCase() === 'running',
+      started_at: entry.last_seen_at || null,
+      last_tick_at: entry.last_seen_at || null,
+      last_result: entry.details || null,
+      last_error: entry.status === 'error' ? workerErrorText(entry.details) : null,
+    }
+  }
+
   async function loadPipelineWorkerStatus({ quiet = false, global = false } = {}) {
     if (global) return loadGlobalWorkerBacklog()
     if (!quiet) pipelineWorkerStatus = 'Loading worker status...'
@@ -4219,23 +4160,9 @@
       workerBacklog = payload?.backlog || workerBacklog
       const enrich = daemonStatus?.workers?.enrich || {}
       const download = daemonStatus?.workers?.download || {}
-      pipelineWorker = {
-        ...pipelineWorker,
-        running: Boolean(enrich.online),
-        in_flight: String(enrich.status || '').toLowerCase() === 'running',
-        started_at: enrich.last_seen_at || null,
-        last_tick_at: enrich.last_seen_at || null,
-        last_result: enrich.details || null,
-        last_error: enrich.status === 'error' ? workerErrorText(enrich.details) : null,
-      }
+      pipelineWorker = workerView(pipelineWorker, enrich)
       downloadWorker = {
-        ...downloadWorker,
-        running: Boolean(download.online),
-        in_flight: String(download.status || '').toLowerCase() === 'running',
-        started_at: download.last_seen_at || null,
-        last_tick_at: download.last_seen_at || null,
-        last_result: download.details || null,
-        last_error: download.status === 'error' ? workerErrorText(download.details) : null,
+        ...workerView(downloadWorker, download),
         queued_download_items: Number(workerBacklog?.queued_download || 0),
         running_jobs: Number(workerBacklog?.downloading || 0),
       }
@@ -4331,14 +4258,7 @@
     try {
       const { blob, filename } = await downloadCorpusExport(format, exportFilters)
       if (session !== sessionEpoch) return
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = filename
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
-      URL.revokeObjectURL(url)
+      saveBlob(blob, filename)
       exportStatus = `${label} export downloaded.`
     } catch (error) {
       if (error?.status === 401 || session !== sessionEpoch) return
@@ -4357,11 +4277,7 @@
       corpusLoadStatus = 'Preparing download...'
       const url = await createCorpusItemDownloadUrl(itemId)
       if (session !== sessionEpoch) return
-      const link = document.createElement('a')
-      link.href = url
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
+      openDownloadUrl(url)
       corpusLoadStatus = 'Download started.'
     } catch (error) {
       if (error?.status === 401 || session !== sessionEpoch) return
@@ -4425,23 +4341,14 @@
   async function handleDownloadSeedDocument(ingestSource) {
     const sourceKey = String(ingestSource || '').trim()
     if (!sourceKey) return
-    let objectUrl = ''
     const session = sessionEpoch
     try {
       const { blob, filename } = await fetchSeedSourceDocument(sourceKey)
       if (session !== sessionEpoch) return
-      objectUrl = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = objectUrl
-      link.download = filename
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
+      saveBlob(blob, filename)
     } catch (error) {
       if (error?.status === 401 || session !== sessionEpoch) return
       ingestRunsStatus = error?.message || 'Failed to download the seed document.'
-    } finally {
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }
 
@@ -4455,14 +4362,7 @@
     try {
       const { blob, filename } = await downloadSeedCandidateFile(sourceType, sourceKey, candidateKey)
       if (session !== sessionEpoch) return
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = filename
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
-      URL.revokeObjectURL(url)
+      saveBlob(blob, filename)
       seedActionStatus = `Downloaded ${filename}.`
     } catch (error) {
       if (error?.status === 401 || session !== sessionEpoch) return

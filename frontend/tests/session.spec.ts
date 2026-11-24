@@ -654,6 +654,51 @@ for (const { flow, endpoint, button } of signInLinks) {
   })
 }
 
+// FE-11 (phase 9 D1): both links share one handler and keep their own texts.
+for (const { flow, endpoint, button } of signInLinks) {
+  test(`${flow} shows its own validation and failure texts`, async ({ page }) => {
+    let linkCalls = 0
+    await mockLogSocket(page)
+    await page.route('**/api/**', async (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === endpoint) {
+        linkCalls += 1
+        return fulfil(route, { error: 'Link expired' }, 400)
+      }
+      return fulfil(route, { error: 'Not signed in' }, 401)
+    })
+    const form = page.locator('form.login-form')
+    const error = form.locator('.error')
+    const fill = async (password: string, confirm: string) => {
+      await page.getByLabel('New password').fill(password)
+      await page.getByLabel('Confirm password').fill(confirm)
+    }
+
+    await page.goto(`/#/${flow}`)
+    await fill('secret-password', 'secret-password')
+    await page.getByRole('button', { name: button }).click()
+    await expect(error).toHaveText(`${flow === 'accept-invite' ? 'Invite' : 'Reset'} token is missing.`)
+
+    await page.goto(`/#/${flow}?token=t`)
+    // The native minlength would block this submit before the handler runs.
+    await form.evaluate((element: HTMLFormElement) => { element.noValidate = true })
+    await fill('short', 'short')
+    await page.getByRole('button', { name: button }).click()
+    await expect(error).toHaveText('Password must be at least 8 characters.')
+
+    await fill('secret-password', 'other-password')
+    await page.getByRole('button', { name: button }).click()
+    await expect(error).toHaveText('Passwords do not match.')
+    expect(linkCalls).toBe(0)
+
+    await fill('secret-password', 'secret-password')
+    await page.getByRole('button', { name: button }).click()
+    await expect(error).toHaveText('Link expired')
+    expect(linkCalls).toBe(1)
+    await expect(page.getByRole('button', { name: button })).toBeVisible()
+  })
+}
+
 test('a sign-in whose own /me answers 401 shows the error on the login form', async ({ page }) => {
   await mockLogSocket(page)
   await page.route('**/api/**', async (route) => {

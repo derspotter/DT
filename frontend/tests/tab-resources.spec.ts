@@ -63,6 +63,8 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     searchBodies: [] as any[],
     // Daemon workers; a running batch puts an admin on the 2 s cadence.
     workers: {} as Record<string, unknown>,
+    // The daemon status's corpus-scoped backlog.
+    backlog: {} as Record<string, number>,
     ingestRuns: [] as Record<string, unknown>[],
     // The Kantropos target list, and whether its route answers 503.
     targets: [{ id: 'k1', name: 'Kantropos One' }],
@@ -191,7 +193,7 @@ async function boot(page: Page, { setup = (_state: any) => {}, hash = '#/workspa
     }
     if (path === '/api/pipeline/daemon/status') {
       if (url.searchParams.get('global') !== '1' && await scripted(route, state.daemonSteps)) return
-      return fulfil(route, { daemon: { workers: state.workers }, backlog: url.searchParams.get('global') === '1' ? { downloading: 3 } : {} })
+      return fulfil(route, { daemon: { workers: state.workers }, backlog: url.searchParams.get('global') === '1' ? { downloading: 3 } : state.backlog })
     }
     if (path === '/api/exports/bundle') {
       if (state.exportGate) await state.exportGate
@@ -870,6 +872,36 @@ test('an error heartbeat shows its error text on the download worker card', asyn
   const card = page.locator('.worker-card', { has: page.getByText('Download worker', { exact: true }) })
   await expect(card.locator('.error')).toHaveText('timed out after 1800s; worker restarted')
   await expect(card).not.toContainText('{"phase"')
+})
+
+// FE-23 remainder (phase 9 D3): one builder makes both worker views.
+test('both worker views carry exactly their heartbeat fields', async ({ page }) => {
+  await boot(page, {
+    admin: true,
+    hash: '#/downloads',
+    setup: (state) => {
+      state.workers = {
+        enrich: { online: true, status: 'running', last_seen_at: 'T1', details: { state: 'enriching' } },
+        download: { online: false, status: 'error', last_seen_at: 'T2', details: { error: 'boom' } },
+      }
+      state.backlog = { queued_download: 4, downloading: 1 }
+    },
+  })
+  await expect.poll(() => page.evaluate(() => (window as any).__dtRefresh.workers().downloadWorker.last_error)).toBe('boom')
+  const w = await page.evaluate(() => (window as any).__dtRefresh.workers())
+  expect(w.pipelineWorker).toMatchObject({
+    running: true, in_flight: true, started_at: 'T1', last_tick_at: 'T1', last_result: { state: 'enriching' }, last_error: null,
+  })
+  expect(w.downloadWorker).toMatchObject({
+    running: false,
+    in_flight: false,
+    started_at: 'T2',
+    last_tick_at: 'T2',
+    last_result: { error: 'boom' },
+    last_error: 'boom',
+    queued_download_items: 4,
+    running_jobs: 1,
+  })
 })
 
 // FE-63 / FE-60b (spec D1, D2) across a corpus switch. The switch commits when

@@ -148,6 +148,28 @@ async function holdNextPoll(page: Page, state: State) {
   return poll
 }
 
+// FE-16 (phase 9 D2): the stored-file chip downloads through its ticket URL.
+test('a stored corpus file downloads through its ticket', async ({ page }) => {
+  const state = newState({ rows: () => ({ ids: [5], total: 1 }) })
+  await boot(page, state)
+  await page.route('**/api/corpus/downloaded/5/download-ticket', (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    return fulfil(route, { url: '/api/corpus/downloaded/5/file?ticket=t', expires_in_seconds: 60 })
+  })
+  await page.route('**/api/corpus/downloaded/5/file?ticket=t', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/pdf',
+    headers: { 'Content-Disposition': 'attachment; filename="paper.pdf"' },
+    body: '%PDF-1.4',
+  }))
+  await expect(rows(page)).toHaveCount(1)
+  await rows(page).first().click()
+  const download = page.waitForEvent('download')
+  await page.getByTitle('Download the stored file').click()
+  expect((await download).suggestedFilename()).toBe('paper.pdf')
+  await expect(page.getByTestId('corpus-panel').getByText('Download started.')).toBeVisible()
+})
+
 test('a filter typed during a slow poll reloads with the filter', async ({ page }) => {
   const state = newState()
   await boot(page, state)
