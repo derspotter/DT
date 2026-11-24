@@ -17,6 +17,7 @@ from .identifiers import (
 from .utils import (
     FetchResult,
     OpenAlexRateLimitExceeded,
+    OpenAlexRedirectNotFollowed,
     _warn_missing_openalex_api_key,
     env_bool,
     env_float,
@@ -165,6 +166,7 @@ def fetch_citing_work_ids(
                 session=http,
                 rate_limiter=rate_limiter,
                 retries=3,
+                allow_redirects=False,  # a redirect's next hop would get the key and mailto too
             )
 
             results = data.get("results", [])
@@ -204,6 +206,11 @@ def fetch_citing_work_ids(
             print(message)
             _mark_incomplete(citing_work_ids, message, quota=True)
             quota_error = e
+            url = None
+        except OpenAlexRedirectNotFollowed as e:
+            message = f"Error fetching citing works from {_redact_api_key(url)}: {e}"
+            print(message)
+            _mark_incomplete(citing_work_ids, message)
             url = None
         except requests.exceptions.RequestException as e:
             message = f"Error fetching citing works from {_redact_api_key(url)}: {_redact_api_key(e)}"

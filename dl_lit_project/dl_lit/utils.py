@@ -22,6 +22,14 @@ class OpenAlexRateLimitExceeded(RuntimeError):
     """Raised when OpenAlex is unavailable due to throttling or daily quota exhaustion."""
 
 
+class OpenAlexRedirectNotFollowed(RuntimeError):
+    """A request sent with ``allow_redirects=False`` was answered with a 3xx redirect.
+
+    The message names the status and the target's origin only: the Location may repeat the
+    query, api_key included.
+    """
+
+
 class FetchResult(list):
     """A list of fetched items that also says whether the fetch was complete.
 
@@ -513,7 +521,14 @@ def openalex_request_json(
     rate_limiter: ServiceRateLimiter | None = None,
     retries: int = 3,
     mailto: str | None = None,
+    allow_redirects: bool = True,
 ):
+    """GET an OpenAlex endpoint or URL with the key, retries and quota handling; returns the JSON.
+
+    With ``allow_redirects=False`` a redirect is never followed (the next hop would get the key
+    and mailto too): a 3xx answer raises OpenAlexRedirectNotFollowed. The default leaves the
+    session's redirect handling as it is.
+    """
     if endpoint and url:
         raise ValueError('Provide either endpoint or url, not both')
     if not endpoint and not url:
@@ -553,11 +568,13 @@ def openalex_request_json(
                     raise OpenAlexRateLimitExceeded(_openalex_quota_message(remaining_block))
                 rate_limiter.wait_if_needed('openalex')
 
+            get_options = {} if allow_redirects else {'allow_redirects': False}
             response = http.get(
                 request_url,
                 headers=request_headers,
                 params=request_params,
                 timeout=timeout,
+                **get_options,
             )
             record_openalex_quota(response)
             wait_seconds = _apply_openalex_response_limits(
@@ -576,6 +593,12 @@ def openalex_request_json(
                 time.sleep(wait_seconds)
                 continue
 
+            if not allow_redirects and 300 <= int(response.status_code) < 400:
+                raise OpenAlexRedirectNotFollowed(
+                    f"OpenAlex answered a redirect ({response.status_code}) to "
+                    f"{_redirect_origin(response)}; not followed"
+                )
+
             if response.status_code in (500, 502, 503, 504):
                 if attempt == retries - 1:
                     response.raise_for_status()
@@ -584,7 +607,7 @@ def openalex_request_json(
 
             response.raise_for_status()
             return response.json()
-        except OpenAlexRateLimitExceeded:
+        except (OpenAlexRateLimitExceeded, OpenAlexRedirectNotFollowed):
             raise
         except requests.RequestException as exc:
             last_error = exc
@@ -596,6 +619,19 @@ def openalex_request_json(
     if last_error is not None:
         raise redact_openalex_request_error(last_error) from None
     raise RuntimeError('OpenAlex request failed after retries')
+
+
+def _redirect_origin(response) -> str:
+    """The scheme and host of a redirect's Location (never its path or query)."""
+    location = str((getattr(response, 'headers', None) or {}).get('Location') or '')
+    try:
+        parts = urlsplit(location)
+    except ValueError:
+        return 'an unparseable location'
+    host = parts.hostname or ''
+    if not host:
+        return 'a relative location' if location else 'no location'
+    return f"{parts.scheme}://{host}" if parts.scheme else host
 
 
 _thread_sessions_local = threading.local()

@@ -226,9 +226,10 @@ class _RecordingSession:
         self.pages = list(pages)
         self.sent = []
 
-    def get(self, url, headers=None, params=None, timeout=None):
+    def get(self, url, headers=None, params=None, timeout=None, allow_redirects=True):
         import requests
 
+        assert allow_redirects is False  # a citing request never follows a redirect
         self.sent.append(requests.Request("GET", url, params=params).prepare().url)
         page = self.pages.pop(0)
         return SimpleNamespace(status_code=200, headers={}, json=lambda: page, raise_for_status=lambda: None)
@@ -853,3 +854,69 @@ def test_a_citing_url_with_an_empty_query_keeps_its_path(keyed_env):
     OpenAlexScraper.fetch_citing_work_ids("https://api.openalex.org/works?", _FreeLimiter(), session=session, api_key="sekret-c")
     assert len(session.sent) == 1
     assert session.sent[0].startswith("https://api.openalex.org/works?&select=")
+
+
+# --- final fix (PY-27 follow-up): a citing request never follows a redirect ------------------
+
+class _RedirectingAdapter:
+    """A requests transport: api.openalex.org answers 302 to another origin, which answers a page."""
+
+    def __init__(self, status=302):
+        self.status = status
+        self.sent = []
+
+    def send(self, request, **kwargs):
+        import requests
+        from requests.structures import CaseInsensitiveDict
+
+        self.sent.append(request.url)
+        response = requests.Response()
+        response.request = request
+        response.url = request.url
+        response.encoding = "utf-8"
+        if request.url.startswith("https://api.openalex.org/"):
+            response.status_code = self.status
+            response.headers = CaseInsensitiveDict({"Location": "https://evil.example/works?" + request.url.split("?", 1)[1]})
+            response._content = b""
+        else:
+            response.status_code = 200
+            response.headers = CaseInsensitiveDict({"Content-Type": "application/json"})
+            response._content = json.dumps(_citing_page("W9")).encode()
+        return response
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_a_citing_request_does_not_follow_a_redirect(keyed_env, status):
+    import requests
+
+    from dl_lit import OpenAlexScraper
+
+    adapter = _RedirectingAdapter(status)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    result = OpenAlexScraper.fetch_citing_work_ids(
+        "https://api.openalex.org/works?filter=cites:W1", _FreeLimiter(), session=session, api_key="sekret-c"
+    )
+    assert len(adapter.sent) == 1 and adapter.sent[0].startswith("https://api.openalex.org/")
+    assert not any("evil.example" in url for url in adapter.sent)  # neither key reaches that origin
+    assert list(result) == [] and result.complete is False
+    assert f"redirect ({status})" in result.errors[0] and "not followed" in result.errors[0]
+    assert "sekret" not in result.errors[0]
+
+
+def test_other_openalex_requests_keep_following_redirects(keyed_env):
+    """Only the citing request turns redirects off; the shared helper's default is unchanged."""
+    from dl_lit import utils
+
+    seen = {}
+
+    class _Session:
+        def get(self, url, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: {"results": []}, raise_for_status=lambda: None)
+
+    utils.openalex_request_json(url="https://api.openalex.org/works", session=_Session(), rate_limiter=_FreeLimiter(), retries=1)
+    assert "allow_redirects" not in seen
