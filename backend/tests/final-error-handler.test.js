@@ -34,7 +34,7 @@ describe('final error handler', () => {
     expect(res.status).toBe(404)
     expect(res.body).toEqual({ error: 'Not Found' })
     expect(res.text).not.toContain('/abs/secret')
-    expect(warnSpy).toHaveBeenCalledWith('[express] GET /fail 404:', error)
+    expect(warnSpy).toHaveBeenCalledWith('[express] GET /fail 404:', { name: 'Error', type: undefined, code: 'ENOENT', syscall: 'stat' })
   })
 
   test('a non-exposed 413 answers its status text', async () => {
@@ -52,7 +52,18 @@ describe('final error handler', () => {
     const res = await request(appFailingWith(error)).get('/fail')
     expect(res.status).toBe(400)
     expect(res.body).toEqual({ error: 'Unexpected end of JSON input' })
-    expect(warnSpy).toHaveBeenCalledWith('[express] GET /fail 400:', error)
+    expect(warnSpy).toHaveBeenCalledWith('[express] GET /fail 400:', { name: 'Error', type: 'entity.parse.failed', code: undefined, syscall: undefined })
+  })
+
+  // Final re-review: a malformed login body must not reach the log, neither
+  // through the parser error's `body` nor through a message quoting it.
+  test('a 4xx log line carries no message, body or query', async () => {
+    const error = Object.assign(new Error('Unexpected token \'p\', "{"password":"hunter2"" is not valid JSON'), {
+      status: 400, statusCode: 400, expose: true, type: 'entity.parse.failed', body: '{"password":"hunter2"',
+    })
+    await request(appFailingWith(error)).get('/fail?ticket=t0ps3cret')
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(warnSpy.mock.calls[0])).not.toMatch(/hunter2|t0ps3cret/)
   })
 
   test('a 5xx goes to sendServerError labelled with method and url', async () => {
@@ -61,7 +72,7 @@ describe('final error handler', () => {
     expect(res.status).toBe(500)
     expect(sendServerError).toHaveBeenCalledTimes(1)
     const [, , route, passed, fallback] = sendServerError.mock.calls[0]
-    expect(route).toBe('express GET /fail?x=1')
+    expect(route).toBe('express GET /fail')
     expect(passed).toBe(error)
     expect(fallback).toBe('Internal server error')
     expect(warnSpy).not.toHaveBeenCalled()

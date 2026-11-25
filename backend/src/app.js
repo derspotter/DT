@@ -2309,25 +2309,31 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
 // JSON answer drops them and keeps only a 416's Content-Range. A 4xx echoes
 // its message only when exposed and not a filesystem error (send turns an
 // ENOENT between its stat and open into an exposed 404 naming the absolute
-// path); otherwise it answers the status text. Every 4xx is logged; a 5xx
-// goes through the one 500 rule.
+// path); otherwise it answers the status text. Every 4xx is logged without
+// its message, body or query; a 5xx goes through the one 500 rule.
 const FINAL_ERROR_ENTITY_HEADERS = ['Content-Type', 'Content-Disposition', 'Content-Encoding', 'Content-Length', 'ETag', 'Last-Modified'];
 const clientErrorStatus = (error) => [error?.status, error?.statusCode]
   .find((value) => Number.isInteger(value) && value >= 400 && value <= 499);
 const isFilesystemError = (error) => Boolean(
   error?.syscall || error?.path || (typeof error?.code === 'string' && error.code.startsWith('E'))
 );
+// The URL's query is left out too: download tickets travel in it.
+const clientErrorLogFields = (error) => ({
+  name: error?.name, type: error?.type, code: error?.code, syscall: error?.syscall,
+});
 export function createFinalErrorHandler({ sendServerError }) {
   return (error, req, res, next) => {
     if (res.headersSent) return next(error);
     for (const header of FINAL_ERROR_ENTITY_HEADERS) res.removeHeader(header);
     const status = clientErrorStatus(error);
     if (status !== undefined) {
-      console.warn(`[express] ${req.method} ${req.originalUrl} ${status}:`, error);
+      // Only these fields: a body-parser error carries the raw body (a login's
+      // password) in `body` and, on Node 20+, a quote of it in `message`.
+      console.warn(`[express] ${req.method} ${req.path} ${status}:`, clientErrorLogFields(error));
       const echo = error.expose && error.message && !isFilesystemError(error);
       return res.status(status).json({ error: echo ? error.message : (http.STATUS_CODES[status] || 'Bad request') });
     }
-    return sendServerError(req, res, `express ${req.method} ${req.originalUrl}`, error, 'Internal server error');
+    return sendServerError(req, res, `express ${req.method} ${req.path}`, error, 'Internal server error');
   };
 }
 
