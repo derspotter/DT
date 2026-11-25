@@ -250,21 +250,31 @@ process.exit(1)
     expect(seed[36]).toBe('-')
   })
 
-  test('a long original name is cut to 200 UTF-8 bytes, keeping its extension and whole characters', async () => {
+  test('a long original name is cut to 150 UTF-8 bytes, keeping its extension and whole characters', async () => {
     const ascii = await upload('alice', `${'x'.repeat(300)}.pdf`, '%PDF-1.4\n%%EOF\n')
     expect(ascii.slice(0, 36)).toMatch(UUID)
     const asciiRest = ascii.slice(37)
-    expect(Buffer.byteLength(asciiRest)).toBe(200)
-    expect(asciiRest).toBe(`${'x'.repeat(196)}.pdf`)
+    expect(Buffer.byteLength(asciiRest)).toBe(150)
+    expect(asciiRest).toBe(`${'x'.repeat(146)}.pdf`)
+    // The page extractor's derived names still fit a 255-byte path component.
+    const derived = `${path.basename(ascii, '.pdf')}_refs_physical_p10000.pdf`
+    expect(Buffer.byteLength(derived)).toBeLessThanOrEqual(255)
 
     const wide = await upload('alice', `${'ä'.repeat(150)}.pdf`, '%PDF-1.4\n%%EOF\n')
     expect(wide.slice(0, 36)).toMatch(UUID)
     const wideRest = wide.slice(37)
-    expect(Buffer.byteLength(wideRest)).toBeLessThanOrEqual(200)
-    expect(Buffer.byteLength(wideRest)).toBeGreaterThan(190)
+    expect(Buffer.byteLength(wideRest)).toBeLessThanOrEqual(150)
+    expect(Buffer.byteLength(wideRest)).toBeGreaterThan(140)
     expect(wideRest.endsWith('.pdf')).toBe(true)
-    expect(wideRest).not.toContain('�')
+    expect(wideRest).not.toContain('\uFFFD')
     expect(Buffer.from(wideRest, 'utf8').toString('utf8')).toBe(wideRest)
     expect(fs.existsSync(path.join(tmpDir, 'uploads', wide))).toBe(true)
+
+    // An extension that exactly fits the cap is kept whole; one longer is cut.
+    const fitting = `.${'e'.repeat(149)}`
+    const exact = await upload('alice', `a${fitting}`, '%PDF-1.4\n%%EOF\n')
+    expect(exact.slice(37)).toBe(fitting)
+    const longer = await upload('alice', `a.${'e'.repeat(200)}`, '%PDF-1.4\n%%EOF\n')
+    expect(longer.slice(37)).toBe(`a.${'e'.repeat(148)}`)
   })
 })

@@ -115,15 +115,16 @@ const UPLOADS_DIR = resolveUploadsDir(REPO_ROOT);
 const ARTIFACTS_DIR = process.env.RAG_FEEDER_ARTIFACTS_DIR || path.join(DL_LIT_PROJECT_DIR, 'artifacts');
 const BIB_OUTPUT_DIR = path.join(ARTIFACTS_DIR, 'bibliographies');
 const EXTRACTION_UPLOAD_MISSING = 'Uploaded PDF not found (and no extracted pages exist). Please re-upload the PDF.';
-// The original name's share of a staged name `<uuid>-<name>`, in UTF-8 bytes.
-const STAGED_NAME_MAX_BYTES = 200;
+// The original name's share of a staged name `<uuid>-<name>`, in UTF-8 bytes:
+// 37 (UUID + '-') + 150 leaves 255 - 187 = 68 bytes for derived suffixes such as `_refs_physical_p100.pdf`.
+const STAGED_NAME_MAX_BYTES = 150;
 
 // Cuts a file name to at most maxBytes UTF-8 bytes, keeping its extension
-// (unless the extension alone does not fit) and never splitting a code point.
+// whenever it fits (only a longer one is cut) and never splitting a code point.
 function clampUtf8Name(name, maxBytes) {
   if (Buffer.byteLength(name) <= maxBytes) return name;
   let ext = path.extname(name);
-  if (Buffer.byteLength(ext) >= maxBytes) ext = '';
+  if (Buffer.byteLength(ext) > maxBytes) ext = '';
   let budget = maxBytes - Buffer.byteLength(ext);
   let stem = '';
   for (const char of name.slice(0, name.length - ext.length)) {
