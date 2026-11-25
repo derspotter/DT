@@ -543,7 +543,9 @@ ruling.**
 - Cost: one pure-filter list request per eligible lookup (`filter=cites:<id>`, `per-page=100`,
   `OpenAlexScraper.py:171`; `max_citations` 100, one page). Under the measured rule
   (`dl_lit/keyword_search.py:191-194`: 1 credit a filter page, 10 a text search) that is about
-  1 credit per eligible lookup, at most about 60 for a 60-entry bibliography.
+  1 credit per eligible lookup, at most about 60 for a 60-entry bibliography. The fetcher follows a
+  continuation only when OpenAlex returns one and stops at `max_citations` (100), so a lookup costs
+  one page in practice and never more than the pages needed for 100 citations (task 6 review).
 - Tests, `test_hygiene.py` (plan pre-flight: `_FreeLimiter`, `_RecordingSession` and
   `_citing_page("W99")`, the output directory created first): one file with an OpenAlex match (`openalex_id: 'https://openalex.org/W7'`
   and an OpenAlex `cited_by_api_url`), a Crossref match (an `api.crossref.org` URL, no OpenAlex id)
