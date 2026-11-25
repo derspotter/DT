@@ -114,6 +114,26 @@ const REPO_ROOT = path.dirname(DL_LIT_PROJECT_DIR);
 const UPLOADS_DIR = resolveUploadsDir(REPO_ROOT);
 const ARTIFACTS_DIR = process.env.RAG_FEEDER_ARTIFACTS_DIR || path.join(DL_LIT_PROJECT_DIR, 'artifacts');
 const BIB_OUTPUT_DIR = path.join(ARTIFACTS_DIR, 'bibliographies');
+const EXTRACTION_UPLOAD_MISSING = 'Uploaded PDF not found (and no extracted pages exist). Please re-upload the PDF.';
+// The original name's share of a staged name `<uuid>-<name>`, in UTF-8 bytes.
+const STAGED_NAME_MAX_BYTES = 200;
+
+// Cuts a file name to at most maxBytes UTF-8 bytes, keeping its extension
+// (unless the extension alone does not fit) and never splitting a code point.
+function clampUtf8Name(name, maxBytes) {
+  if (Buffer.byteLength(name) <= maxBytes) return name;
+  let ext = path.extname(name);
+  if (Buffer.byteLength(ext) >= maxBytes) ext = '';
+  let budget = maxBytes - Buffer.byteLength(ext);
+  let stem = '';
+  for (const char of name.slice(0, name.length - ext.length)) {
+    const bytes = Buffer.byteLength(char);
+    if (bytes > budget) break;
+    stem += char;
+    budget -= bytes;
+  }
+  return stem + ext;
+}
 const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
 const DEFAULT_DB_PATH = path.join(DL_LIT_PROJECT_DIR, 'data', 'literature.db');
@@ -973,6 +993,9 @@ export function ensureAuthSchema(db) {
       details_json TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+    -- Who staged each uploaded file: only that user (or the admin) may import
+    -- or extract it (FE-68). Rows are never pruned, like the staged files.
+    CREATE TABLE IF NOT EXISTS staged_uploads (filename TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
   `);
   if (tableExists(db, 'ingest_entries')) {
     ensureColumn(db, 'ingest_entries', 'corpus_id', 'INTEGER');
@@ -2900,9 +2923,10 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     }
     return next();
   };
-  // The search preview and launch carry the corpus the user submitted from
-  // (FE-62): a corpus switch saved meanwhile must not move the search. The
-  // caller's access to that corpus is then checked by requireCorpusWriteAccess.
+  // The search preview and launch (FE-62), the seed import and the
+  // bibliography extraction (FE-65b) carry the corpus the user submitted
+  // from: a corpus switch saved meanwhile must not move them. The caller's
+  // access to that corpus is then checked by requireCorpusWriteAccess.
   const bindSubmittedCorpus = (req, res, next) => {
     if (isStubMode()) return next();
     const submitted = req.body?.corpusId;
@@ -4332,16 +4356,26 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       cb(null, uploadDir);
     },
     filename: function (req, file, cb) {
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
       // Strip any directory components from the client-supplied name so a crafted
       // multipart filename (e.g. "../../etc/x") cannot escape uploadDir. Normalize
       // backslashes first so Windows-style separators are handled on POSIX too.
       const safeOriginalName = path.basename(String(file.originalname || '').replace(/\\/g, '/')) || 'upload';
-      cb(null, uniqueSuffix + '-' + safeOriginalName);
+      // A UUID makes the name unique by construction; staged_uploads, not the
+      // name, binds the file to its uploader.
+      cb(null, `${crypto.randomUUID()}-${clampUtf8Name(safeOriginalName, STAGED_NAME_MAX_BYTES)}`);
     }
   });
 
   const upload = multer({ storage: storage });
+
+  // true when the caller may use this staged file: stub mode, the admin, or
+  // the user who uploaded it. May throw; each caller runs it inside its try.
+  const ownsStagedUpload = (req, filename) => {
+    if (isStubMode() || isAdminUser(req.user, authConfig)) return true;
+    return Boolean(
+      authDb.prepare('SELECT 1 FROM staged_uploads WHERE filename = ? AND user_id = ?').get(filename, req.user?.id)
+    );
+  };
 
   // --- MODIFIED ENDPOINT: Upload PDF ---
   // Renamed conceptually, but keeping path for minimal frontend changes initially
@@ -4360,6 +4394,14 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       const filePath = req.file.path;
       console.log(`[/api/upload] File uploaded successfully: ${filePath}`);
       console.log(`[/api/upload] Stored filename: ${storedFilename}`);
+
+      // A plain insert: a name collision fails rather than move ownership. On
+      // failure the file stays where multer stored it.
+      try {
+        authDb.prepare('INSERT INTO staged_uploads (filename, user_id) VALUES (?, ?)').run(storedFilename, req.user.id);
+      } catch (error) {
+        return sendServerError(req, res, '/api/process_pdf', error, 'Server error during upload');
+      }
 
       // Return the generated filename to the client
       console.log('[/api/upload] Attempting to send success response...');
@@ -4390,7 +4432,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
   // --- END MODIFIED UPLOAD ENDPOINT ---
 
   // --- NEW ENDPOINT: Extract Bibliography ---
-  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+  app.post('/api/extract-bibliography/:filename', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, async (req, res) => {
     const { filename } = req.params;
     // Reject path separators (Express decodes %2F into the param) and confirm the
     // resolved path stays inside UPLOADS_DIR. ensureInsideDirectory is the real
@@ -4404,6 +4446,14 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     const inputPdfPath = path.join(UPLOADS_DIR, filename);
     if (!ensureInsideDirectory(UPLOADS_DIR, inputPdfPath)) {
       return res.status(400).json({ error: 'Invalid filename' });
+    }
+    // 404, not 403: the answer does not confirm another user's file.
+    try {
+      if (!ownsStagedUpload(req, filename)) {
+        return res.status(404).json({ error: EXTRACTION_UPLOAD_MISSING });
+      }
+    } catch (error) {
+      return sendServerError(req, res, '/api/extract-bibliography', error, 'Failed to start bibliography extraction');
     }
     const baseName = path.basename(filename, path.extname(filename)); // stable ingest_source
     const existingPagesDir = path.join(BIB_OUTPUT_DIR, baseName);
@@ -4421,9 +4471,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     if (!inputExists && !pagesExist) {
       console.error(`[/api/extract-bibliography] Input PDF not found: ${inputPdfPath}`);
       console.error(`[/api/extract-bibliography] No existing extracted pages found in: ${existingPagesDir}`);
-      return res.status(404).json({
-        error: 'Uploaded PDF not found (and no extracted pages exist). Please re-upload the PDF.',
-      });
+      return res.status(404).json({ error: EXTRACTION_UPLOAD_MISSING });
     }
 
     const queueState = enqueueExtractionTask(corpusId, async () => {
@@ -5818,7 +5866,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     return res.sendFile(filePath);
   });
 
-  app.post('/api/ingest/import-seed', requireAuthMiddleware, requireCorpusWriteAccess, async (req, res) => {
+  app.post('/api/ingest/import-seed', requireAuthMiddleware, bindSubmittedCorpus, requireCorpusWriteAccess, async (req, res) => {
     const filename = String(req.body?.filename || '').trim();
     const kind = String(req.body?.kind || '').trim();
     if (!filename || !['bib', 'json'].includes(kind)) {
@@ -5828,12 +5876,13 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
       return res.status(400).json({ error: 'Invalid filename' });
     }
     const filePath = path.join(UPLOADS_DIR, filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'Uploaded file not found. Please re-upload.' });
-    }
-    // spawnPython appends the corpus flag from its corpusId option.
-    const args = ['--db-path', DB_PATH, '--file', filePath, '--kind', kind, '--source-label', filename];
     try {
+      // 404, not 403: the answer does not confirm another user's file.
+      if (!ownsStagedUpload(req, filename) || !fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Uploaded file not found. Please re-upload.' });
+      }
+      // spawnPython appends the corpus flag from its corpusId option.
+      const args = ['--db-path', DB_PATH, '--file', filePath, '--kind', kind, '--source-label', filename];
       const result = await runPythonJson(INGEST_IMPORT_SEED_SCRIPT, args, { dbPath: DB_PATH, corpusId: req.corpusId });
       if (result?.stopped) {
         // The summary goes to a session-local upload row; this is the lasting trace.
