@@ -974,6 +974,21 @@ function summarizeStates(candidates) {
   return stateCounts
 }
 
+// The OpenAlex rate-limit message inside a failure text, or null. The
+// keyword-search launch answers it as a 429; the seed list shows it to
+// everyone. Shared on purpose; the ValueError->400 mapping is not.
+export function openAlexRateLimitText(message) {
+  const match = String(message || '').match(/OpenAlex rate limit exceeded\.?(?: Retry after \d+s\.)?/)
+  return match ? match[0] : null
+}
+
+// What a non-admin reads for a failed search run: the rate-limit message or
+// the Node-written restart text, else 'search failed'.
+function sharedRunFailureText(storedError) {
+  if (storedError === 'backend restarted') return storedError
+  return openAlexRateLimitText(storedError) || 'search failed'
+}
+
 export function listSeedSources(db, corpusId, {
   limit = 200,
   resolveDownloadedFilePath = null,
@@ -987,7 +1002,8 @@ export function listSeedSources(db, corpusId, {
   // `only` and keeps the counts.
   withStateCounts = true,
   // A failed run's stored error is child output (D10): only the admin reads
-  // it; everyone else gets 'search failed'. A done run's quota note stays.
+  // it; everyone else gets 'search failed', except the rate-limit message and
+  // the restart sweep's text (sharedRunFailureText). A done run's quota note stays.
   runErrorDetail = false,
 } = {}) {
   // Built on first use only: the light list (withStateCounts: false) never
@@ -1093,7 +1109,7 @@ export function listSeedSources(db, corpusId, {
         status: row.status || null,
         fetched_count: row.fetched_count ?? null,
         expected_count: row.expected_count ?? null,
-        error: row.status === 'failed' && !runErrorDetail ? 'search failed' : (row.error || null),
+        error: row.status === 'failed' && !runErrorDetail ? sharedRunFailureText(row.error) : (row.error || null),
       }
       : null
     if (total === 0 && run?.status !== 'running') return

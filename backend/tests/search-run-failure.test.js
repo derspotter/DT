@@ -252,6 +252,27 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
     addResult(6103)
     register(6103)
     expect(await runErrors(editorToken, 6103)).toEqual([note, note])
+
+    // Two failure texts are ours, not child output, and everyone reads them:
+    // the OpenAlex rate-limit message (the one the launch maps to 429) and
+    // the restart sweep's 'backend restarted'. Only the rate-limit part of a
+    // longer text is shown.
+    const rateLimit = 'OpenAlex rate limit exceeded. Retry after 5s.'
+    const shared = [
+      [6104, rateLimit, rateLimit],
+      [6105, 'backend restarted', 'backend restarted'],
+      [6106, `Traceback: SECRET-DIAG /srv/private/path\nRuntimeError: ${rateLimit}`, rateLimit],
+    ]
+    for (const [runId, stored] of shared) {
+      withDb((db) => db.prepare(
+        `INSERT INTO search_runs (id, query, status, fetched_count, error) VALUES (?, 'shared failure', 'failed', 1, ?)`
+      ).run(runId, stored))
+      addResult(runId)
+      register(runId)
+    }
+    for (const [runId, , shown] of shared) {
+      expect(await runErrors(editorToken, runId)).toEqual([shown, shown])
+    }
   })
 
   test('a run the child already settled is left alone', async () => {

@@ -3,6 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import http from 'node:http';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
@@ -36,6 +37,7 @@ import {
   createStateResolver,
   findSeedCandidateDownloads,
   isSeedSourceType,
+  openAlexRateLimitText,
 } from './seed.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -2299,6 +2301,36 @@ function applyKeywordSearchExpansionArgs(args, expansion) {
   if (expansion.relatedSort) args.push('--related-sort', String(expansion.relatedSort));
 }
 
+// BE-59: the last error handler. Without it an error no route catches
+// (multer, the body parser, an async throw) reaches Express's default
+// handler, which answers HTML with the stack outside NODE_ENV=production.
+// A file route may have set its own headers before failing (send's 416 after
+// Content-Type: application/pdf, a snapshot's Content-Encoding: gzip); the
+// JSON answer drops them and keeps only a 416's Content-Range. A 4xx echoes
+// its message only when exposed and not a filesystem error (send turns an
+// ENOENT between its stat and open into an exposed 404 naming the absolute
+// path); otherwise it answers the status text. Every 4xx is logged; a 5xx
+// goes through the one 500 rule.
+const FINAL_ERROR_ENTITY_HEADERS = ['Content-Type', 'Content-Disposition', 'Content-Encoding', 'Content-Length', 'ETag', 'Last-Modified'];
+const clientErrorStatus = (error) => [error?.status, error?.statusCode]
+  .find((value) => Number.isInteger(value) && value >= 400 && value <= 499);
+const isFilesystemError = (error) => Boolean(
+  error?.syscall || error?.path || (typeof error?.code === 'string' && error.code.startsWith('E'))
+);
+export function createFinalErrorHandler({ sendServerError }) {
+  return (error, req, res, next) => {
+    if (res.headersSent) return next(error);
+    for (const header of FINAL_ERROR_ENTITY_HEADERS) res.removeHeader(header);
+    const status = clientErrorStatus(error);
+    if (status !== undefined) {
+      console.warn(`[express] ${req.method} ${req.originalUrl} ${status}:`, error);
+      const echo = error.expose && error.message && !isFilesystemError(error);
+      return res.status(status).json({ error: echo ? error.message : (http.STATUS_CODES[status] || 'Bad request') });
+    }
+    return sendServerError(req, res, `express ${req.method} ${req.originalUrl}`, error, 'Internal server error');
+  };
+}
+
 // keyword_search.py and seed_expand.py report an expansion that OpenAlex quota
 // stopped early as `quota_exhausted: true` plus `message` in their JSON (the
 // results fetched before the stop are kept). Logs it and returns the message,
@@ -2315,8 +2347,8 @@ export function openAlexQuotaStop(route, payload) {
 // (and `args` unusable) when a required filter is missing.
 export function keywordSearchErrorResponse(error) {
   const rawMessage = String(error?.message || 'Keyword search failed');
-  const rateLimitMatch = rawMessage.match(/OpenAlex rate limit exceeded\.?(?: Retry after \d+s\.)?/);
-  if (rateLimitMatch) return { status: 429, message: rateLimitMatch[0] };
+  const rateLimit = openAlexRateLimitText(rawMessage);
+  if (rateLimit) return { status: 429, message: rateLimit };
   const queryMatch = rawMessage.match(/(?:QuerySyntaxError|ValueError):\s*([^\n]+)/);
   if (queryMatch) return { status: 400, message: queryMatch[1].trim() };
   return { status: 500, message: rawMessage };
@@ -4454,6 +4486,7 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     // 404, not 403: the answer does not confirm another user's file.
     try {
       if (!ownsStagedUpload(req, filename)) {
+        console.warn('[/api/extract-bibliography] staged upload not owned:', req.user?.id, filename);
         return res.status(404).json({ error: EXTRACTION_UPLOAD_MISSING });
       }
     } catch (error) {
@@ -5882,7 +5915,9 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     const filePath = path.join(UPLOADS_DIR, filename);
     try {
       // 404, not 403: the answer does not confirm another user's file.
-      if (!ownsStagedUpload(req, filename) || !fs.existsSync(filePath)) {
+      const owned = ownsStagedUpload(req, filename);
+      if (!owned) console.warn('[/api/ingest/import-seed] staged upload not owned:', req.user?.id, filename);
+      if (!owned || !fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'Uploaded file not found. Please re-upload.' });
       }
       // spawnPython appends the corpus flag from its corpusId option.
@@ -6428,24 +6463,8 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
     console.log('[pipeline-worker] DB-driven enrich/download workers expected; no pipeline_jobs scheduler started.');
   }
 
-  // BE-59: the last error handler, after every route. Without it an error no
-  // route catches (multer, the body parser, an async throw) reaches Express's
-  // default handler, which answers HTML with the stack outside NODE_ENV=production.
-  // A file route may have set its own headers before failing (send's 416 after
-  // Content-Type: application/pdf, a snapshot's Content-Encoding: gzip); the
-  // JSON answer drops them and keeps only a 416's Content-Range.
-  const ENTITY_HEADERS = ['Content-Type', 'Content-Disposition', 'Content-Encoding', 'Content-Length', 'ETag', 'Last-Modified'];
-  const clientErrorStatus = (error) => [error?.status, error?.statusCode]
-    .find((value) => Number.isInteger(value) && value >= 400 && value <= 499);
-  app.use((error, req, res, next) => {
-    if (res.headersSent) return next(error);
-    for (const header of ENTITY_HEADERS) res.removeHeader(header);
-    const status = clientErrorStatus(error);
-    if (status !== undefined) {
-      return res.status(status).json({ error: error.expose && error.message ? error.message : 'Bad request' });
-    }
-    return sendServerError(req, res, 'express', error, 'Internal server error');
-  });
+  // BE-59: the last error handler, after every route (createFinalErrorHandler).
+  app.use(createFinalErrorHandler({ sendServerError }));
 
   app.warmGraph3dSnapshot = warmGraph3dSnapshot;
   // index.js hands these to attachLogSocket (logSocket.js) after listen().

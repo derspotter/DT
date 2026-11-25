@@ -261,7 +261,7 @@ process.exit(Number(process.env.FAKE_EXIT_CODE || 0))
 
       // fs errors come from Node's realm, so no instanceof check against the test's Error.
       expect(errorSpy.mock.calls.filter(
-        ([tag, err]) => tag === '[express] Error:' && /ENOTDIR|ENOENT/.test(String(err?.message))
+        ([tag, err]) => tag === '[express POST /api/process_pdf] Error:' && /ENOTDIR|ENOENT/.test(String(err?.message))
       )).toHaveLength(2)
     } finally {
       fs.rmSync(uploadsDir, { force: true })

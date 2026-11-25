@@ -165,11 +165,19 @@ process.exit(1)
   test("another user's staged file is refused even into a writable corpus", async () => {
     const seed = await upload('alice', 'seed.json', '[]')
     const pdf = await upload('alice', 'paper.pdf', '%PDF-1.4\n%%EOF\n')
+    const warnSpy = console.warn
+    warnSpy.mockClear()
     const bobImport = await importSeed('bob', { filename: seed, kind: 'json', corpusId: ids.b })
     expect([bobImport.status, bobImport.body]).toEqual([404, { error: IMPORT_MISSING }])
     const bobExtract = await extract('bob', pdf, { corpusId: ids.b })
     expect([bobExtract.status, bobExtract.body]).toEqual([404, { error: EXTRACT_MISSING }])
     expect(corpusArgs()).toEqual([])
+    // The 404 does not tell bob; the log tells the operator, once per refusal.
+    const refusals = warnSpy.mock.calls.filter(([tag]) => String(tag).endsWith('staged upload not owned:'))
+    expect(refusals).toEqual([
+      ['[/api/ingest/import-seed] staged upload not owned:', ids.bob, seed],
+      ['[/api/extract-bibliography] staged upload not owned:', ids.bob, pdf],
+    ])
 
     const own = await importSeed('alice', { filename: seed, kind: 'json' })
     expect(own.status).toBe(200)
