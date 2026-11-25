@@ -391,17 +391,19 @@ def execute_scraper_job(db_path: str, run_id: int, artifacts_root: str) -> dict:
                 "failed": row["failed_count"],
                 "replayed": True,
             }
-        query = json.loads(row["query_json"] or "{}")
-        run_dir = Path(artifacts_root) / "scraper_lab" / f"run_{run_id}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-
-        conn.execute(
-            "UPDATE scraper_runs SET status = 'running', started_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?",
-            (run_id,),
-        )
-        conn.commit()
-
+        # From here on every failure marks the run 'failed' with its error: a corrupt
+        # query_json or an unwritable run directory must not leave it 'queued'.
         try:
+            query = json.loads(row["query_json"] or "{}")
+            run_dir = Path(artifacts_root) / "scraper_lab" / f"run_{run_id}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            conn.execute(
+                "UPDATE scraper_runs SET status = 'running', started_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?",
+                (run_id,),
+            )
+            conn.commit()
+
             raw_results = scrape_eurlex(query) if source_type == "eurlex" else scrape_expert_groups(query)
             downloaded = 0
             failed = 0

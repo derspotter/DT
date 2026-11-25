@@ -68,9 +68,35 @@ def test_a_member_work_gets_its_marker(db, promote):
     assert markers[0][:5] == (1, "search", "run-1", "cand-1", 10)
 
 
-def test_a_removed_work_gets_no_marker(db, promote):
+def test_a_removed_work_gets_no_marker(db, promote, capsys):
     promote._mark_candidate_in_corpus(db, 1, CANDIDATE, 10)
     assert _markers(db) == []
+    err = capsys.readouterr().err
+    assert "[seed_promote]" in err
+    assert "cand-1" in err and "10" in err
+
+
+def test_a_member_marker_writes_no_note(db, promote, capsys):
+    _add_member(db)
+    promote._mark_candidate_in_corpus(db, 1, CANDIDATE, 10)
+    assert capsys.readouterr().err == ""
+
+
+def test_a_failed_marker_write_is_reported(db, promote, capsys):
+    db.conn.execute("DROP TABLE seed_candidates_in_corpus")
+    db.conn.commit()
+    promote._mark_candidate_in_corpus(db, 1, CANDIDATE, 10)
+    assert "[seed_promote] marker write failed:" in capsys.readouterr().err
+
+
+def test_a_failed_corpus_link_is_reported(db, promote, capsys, monkeypatch):
+    def refuse(*_args):
+        raise RuntimeError("link refused")
+
+    monkeypatch.setattr(db, "add_corpus_item", refuse)
+    promote._add_existing_to_corpus(db, 1, "works", 10)
+    err = capsys.readouterr().err
+    assert "[seed_promote]" in err and "link refused" in err
 
 
 def test_a_member_marker_is_refreshed(db, promote):

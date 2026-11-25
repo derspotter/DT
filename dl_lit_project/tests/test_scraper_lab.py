@@ -201,3 +201,47 @@ def test_every_connection_is_closed(tmp_path, monkeypatch):
     for conn in opened:
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
+
+
+# --- a run that fails before scraping is marked failed, not left queued ------------
+
+
+def _set_query_json(db_path, run_id, text):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE scraper_runs SET query_json = ? WHERE id = ?", (text, run_id))
+    conn.commit()
+    conn.close()
+
+
+def _status_error(db_path, run_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, error FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def test_a_corrupt_query_marks_the_run_failed(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "queued")
+    _set_query_json(db_path, run_id, "{not json")
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", _scraped_again)
+
+    with pytest.raises(json.JSONDecodeError):
+        scraper_lab.execute_scraper_job(db_path, run_id, str(tmp_path / "artifacts"))
+
+    status, error = _status_error(db_path, run_id)
+    assert status == "failed"
+    assert error
+
+
+def test_an_unwritable_run_dir_marks_the_run_failed(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "queued")
+    blocker = tmp_path / "artifacts"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", _scraped_again)
+
+    with pytest.raises(OSError):
+        scraper_lab.execute_scraper_job(db_path, run_id, str(blocker))
+
+    status, error = _status_error(db_path, run_id)
+    assert status == "failed"
+    assert error

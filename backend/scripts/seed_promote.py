@@ -1,6 +1,7 @@
 import argparse
 import json
 import sqlite3
+import sys
 from pathlib import Path
 
 from _bootstrap import ensure_import_paths
@@ -151,16 +152,23 @@ def _mark_candidate_in_corpus(
             (corpus_id, source_type, source_key, candidate_key, work_id, corpus_id, work_id),
         )
         db.conn.commit()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        print(f"[seed_promote] marker write failed: {exc}", file=sys.stderr)
         db.conn.rollback()
+        return
+    if cur.rowcount == 0:
+        print(
+            f"[seed_promote] no marker for candidate {candidate_key}: work {work_id} is not in corpus {corpus_id}",
+            file=sys.stderr,
+        )
 
 
 def _add_existing_to_corpus(db: DatabaseManager, corpus_id: int, table_name: str, row_id: int) -> None:
     if corpus_id and table_name and row_id:
         try:
             db.add_corpus_item(corpus_id, table_name, row_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[seed_promote] corpus link failed for {table_name} {row_id} (corpus {corpus_id}): {exc}", file=sys.stderr)
 
 
 def _merge_candidate_into_existing(db: DatabaseManager, table_name: str, row_id: int, ref: dict, matched_on: str | None) -> None:
