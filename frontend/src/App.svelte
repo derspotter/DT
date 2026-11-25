@@ -756,11 +756,18 @@
     persistStoredUploads()
   }
 
+  // Saved rows belong to one user and one corpus, so a second user of the
+  // browser never sees the first one's rows (FE-68). The older corpus-only
+  // key is neither read nor deleted.
   function uploadStorageKey() {
     const corpusId = Number(currentCorpusId)
+    if (authUser?.id === undefined || authUser?.id === null) return ''
     if (!Number.isFinite(corpusId) || corpusId <= 0) return ''
-    return `rag-feeder:uploads:${corpusId}`
+    return `rag-feeder:uploads:${authUser.id}:${corpusId}`
   }
+
+  // A restored row never shows the message of a request that ended with the page.
+  const TRANSIENT_UPLOAD_STATUSES = new Set(['uploading', 'importing', 'extracting', 'queued'])
 
   function normalizeStoredUploadStatus(status) {
     const value = String(status || '').trim().toLowerCase()
@@ -790,7 +797,7 @@
         size: Number(item.size || 0),
         status: normalizeStoredUploadStatus(item.status),
         backendFilename: String(item.backendFilename || ''),
-        message: String(item.message || ''),
+        message: TRANSIENT_UPLOAD_STATUSES.has(item.status) ? '' : String(item.message || ''),
       }))
     try {
       window.localStorage.setItem(key, JSON.stringify(persisted))
@@ -2661,6 +2668,7 @@
     // would land in the one now selected (FE-65).
     const session = sessionEpoch
     const scope = corpusScopeEpoch
+    const corpusId = currentCorpusId
     const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     try {
       const payload = await uploadPdf(item.file)
@@ -2670,7 +2678,7 @@
         // BibTeX/JSON seeds are imported straight into the corpus (no PDF
         // bibliography extraction step applies).
         updateUpload(item.id, { status: 'importing', backendFilename: payload.filename, message: 'Importing seed…' })
-        const result = await importSeed(payload.filename, seedKind)
+        const result = await importSeed(payload.filename, seedKind, { corpusId })
         // The import ran in the corpus it started in, so its row reports the
         // result even after a corpus switch (the row may be back on screen after
         // A → B → A); only an ended session drops it.
@@ -2714,9 +2722,16 @@
   async function extractForItem(item) {
     if (!item.backendFilename) return
     const baseName = item.backendFilename.replace(/\.pdf$/i, '')
+    // The extraction runs in the corpus of the click; a reply that settles
+    // after a sign-out or a committed corpus switch changes nothing here.
+    const corpusId = currentCorpusId
+    const session = sessionEpoch
+    const scope = corpusScopeEpoch
+    const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     updateUpload(item.id, { status: 'extracting', message: 'Submitting extraction request...' })
     try {
-      const payload = await extractBibliography(item.backendFilename)
+      const payload = await extractBibliography(item.backendFilename, { corpusId })
+      if (stale()) return
       const state = String(payload?.state || 'started').trim().toLowerCase()
       if (state === 'queued') {
         updateUpload(item.id, { status: 'queued', message: 'Queued for extraction' })
@@ -2726,6 +2741,7 @@
       }
       apiStatus = 'online'
     } catch (error) {
+      if (stale()) return
       finishExtractionProgress()
       if (error?.status === 401) {
         updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
