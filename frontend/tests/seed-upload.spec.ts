@@ -534,6 +534,12 @@ test('a late extraction reply is dropped after the commit', async ({ page }) => 
   reply.resolve()
   await afterBodyRead(page, EXTRACT, eReads)
   await expect(page.locator('.extract-progress')).toHaveCount(0)
+
+  // The outcome went into corpus 1's saved rows: back there the row says the
+  // extraction started instead of sitting idle as 'Uploaded'.
+  await switchAndCommit(page, state, '1')
+  await expect(uploadRow(page, 'paper.pdf')).toContainText('Extraction started')
+  await expect(uploadRow(page, 'paper.pdf')).not.toContainText('Uploaded')
 })
 
 test('a late extraction failure does not clear the new corpus progress', async ({ page }) => {
@@ -555,6 +561,12 @@ test('a late extraction failure does not clear the new corpus progress', async (
   reply.resolve()
   await afterBodyRead(page, EXTRACT, eReads)
   await expect(page.locator('.extract-progress')).toBeVisible()
+  await expect(uploadRow(page, 'paper.pdf')).toHaveCount(0)
+
+  // Back in corpus 1 the row shows the failure, not an idle 'Uploaded'.
+  await switchAndCommit(page, state, '1')
+  await expect(uploadRow(page, 'paper.pdf')).toContainText('Failed to start bibliography extraction')
+  await expect(uploadRow(page, 'paper.pdf').locator('.status')).toHaveText('failed')
 })
 
 test("a saved upload row is not shown to the next user of the browser", async ({ page }) => {
