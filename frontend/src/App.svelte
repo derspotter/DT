@@ -778,8 +778,9 @@
 
   // The upload list is saved best effort (FE-64): a full or blocked
   // localStorage must not fail the upload. The warning flag is module-level.
-  function persistStoredUploads(nextUploads = uploads, key = uploadStorageKey()) {
+  function persistStoredUploads(nextUploads = uploads) {
     if (typeof window === 'undefined') return
+    const key = uploadStorageKey()
     if (!key) return
     const extractedBaseNames = new Set(
       (ingestRuns || [])
@@ -808,10 +809,13 @@
     }
   }
 
-  function readStoredUploads(key) {
+  function restoreStoredUploads() {
+    if (typeof window === 'undefined') return
+    const key = uploadStorageKey()
+    if (!key) return
     try {
       const parsed = JSON.parse(window.localStorage.getItem(key) || '[]')
-      return Array.isArray(parsed)
+      uploads = Array.isArray(parsed)
         ? parsed
           .filter((item) => String(item?.backendFilename || '').trim())
           .map((item) => ({
@@ -825,32 +829,8 @@
           }))
         : []
     } catch {
-      return []
+      uploads = []
     }
-  }
-
-  function restoreStoredUploads() {
-    if (typeof window === 'undefined') return
-    const key = uploadStorageKey()
-    if (!key) return
-    uploads = readStoredUploads(key)
-  }
-
-  // An outcome for a row of the corpus saved under `key` (FE-65b): the
-  // visible row when that corpus is on screen, else its saved row, so the
-  // row shows it after switching back.
-  function recordUploadOutcome(key, backendFilename, patch) {
-    if (!key) return
-    if (key === uploadStorageKey()) {
-      updateUploadByBackendFilename(backendFilename, patch)
-      return
-    }
-    if (typeof window === 'undefined') return
-    const normalized = String(backendFilename || '').trim()
-    persistStoredUploads(
-      readStoredUploads(key).map((item) => (item.backendFilename === normalized ? { ...item, ...patch } : item)),
-      key
-    )
   }
 
   function pruneExtractedUploads() {
@@ -2742,29 +2722,17 @@
   async function extractForItem(item) {
     if (!item.backendFilename) return
     const baseName = item.backendFilename.replace(/\.pdf$/i, '')
-    // The extraction runs in the corpus of the click. A reply that settles
-    // after a sign-out changes nothing; one after a committed corpus switch
-    // leaves the visible list and progress alone and goes to the saved rows
-    // of the corpus clicked in (recordUploadOutcome). Saved rows keep no
-    // transient status, so a started extraction is saved as its message.
+    // The extraction runs in the corpus of the click; a reply that settles
+    // after a sign-out or a committed corpus switch changes nothing here.
     const corpusId = currentCorpusId
-    const storageKey = uploadStorageKey()
     const session = sessionEpoch
     const scope = corpusScopeEpoch
-    const lateInOtherScope = () => session === sessionEpoch && scope !== corpusScopeEpoch
     const stale = () => session !== sessionEpoch || scope !== corpusScopeEpoch
     updateUpload(item.id, { status: 'extracting', message: 'Submitting extraction request...' })
     try {
       const payload = await extractBibliography(item.backendFilename, { corpusId })
-      const state = String(payload?.state || 'started').trim().toLowerCase()
-      if (lateInOtherScope()) {
-        recordUploadOutcome(storageKey, item.backendFilename, {
-          status: 'uploaded',
-          message: state === 'queued' ? 'Queued for extraction' : 'Extraction started',
-        })
-        return
-      }
       if (stale()) return
+      const state = String(payload?.state || 'started').trim().toLowerCase()
       if (state === 'queued') {
         updateUpload(item.id, { status: 'queued', message: 'Queued for extraction' })
       } else {
@@ -2773,16 +2741,13 @@
       }
       apiStatus = 'online'
     } catch (error) {
-      const failure = error?.status === 401
-        ? { status: 'failed', message: 'Session expired. Please sign in again.' }
-        : { status: 'failed', message: error?.message || 'Extraction failed' }
-      if (lateInOtherScope()) {
-        recordUploadOutcome(storageKey, item.backendFilename, failure)
-        return
-      }
       if (stale()) return
       finishExtractionProgress()
-      updateUpload(item.id, failure)
+      if (error?.status === 401) {
+        updateUpload(item.id, { status: 'failed', message: 'Session expired. Please sign in again.' })
+        return
+      }
+      updateUpload(item.id, { status: 'failed', message: error.message || 'Extraction failed' })
     }
   }
 
