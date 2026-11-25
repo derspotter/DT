@@ -433,6 +433,45 @@ def test_backfill_unchanged_rows_log_no_changed_line(tmp_path, monkeypatch, caps
     assert "changed while the batch was fetched" not in capsys.readouterr().err
 
 
+# --- every row of a shared token is written (PY-57) ---------------------------
+
+
+def test_backfill_pass1_writes_every_row_of_a_shared_token(tmp_path, monkeypatch, capsys, backfill):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, openalex_id="W1", metadata_status="matched")
+    _insert(conn, openalex_id="https://openalex.org/W1", metadata_status="matched")
+    conn.close()
+
+    filters = _fake_openalex(
+        monkeypatch, backfill, lambda f: [_work("W1", "10.1000/one", "T1")] if f.startswith("openalex_id:") else []
+    )
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == ("T1", "T1-field", 1)
+    assert _topic_row(db_path, 2) == ("T1", "T1-field", 1)
+    assert filters == ["openalex_id:W1"]
+    err = capsys.readouterr().err
+    assert "[id] 2/2 processed, 2 resolved" in err
+    assert "changed while the batch was fetched" not in err
+
+
+def test_backfill_pass2_writes_every_row_of_a_shared_doi_key(tmp_path, monkeypatch, capsys, backfill):
+    db_path, conn = _backfill_db(tmp_path, backfill)
+    _insert(conn, doi="10.1000/abc", metadata_status="matched")
+    _insert(conn, doi="10.1000/ABC", metadata_status="matched")
+    conn.close()
+
+    filters = _fake_openalex(monkeypatch, backfill, lambda _f: [_work("W1", "10.1000/abc", "T1")])
+    _run(monkeypatch, backfill, db_path)
+
+    assert _topic_row(db_path, 1) == ("T1", "T1-field", 1)
+    assert _topic_row(db_path, 2) == ("T1", "T1-field", 1)
+    assert filters == ["doi:10.1000/abc"]
+    err = capsys.readouterr().err
+    assert "[doi] 2/2 processed, 2 resolved" in err
+    assert "changed while the batch was fetched" not in err
+
+
 # --- export_bundle output names (BE-53) --------------------------------------
 
 

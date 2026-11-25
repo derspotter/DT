@@ -119,14 +119,21 @@ def _mark_candidate_in_corpus(
     db: DatabaseManager,
     corpus_id: int,
     candidate: dict,
-    work_id: int | None = None,
+    work_id: int,
 ) -> None:
+    """Mark the candidate as in the corpus, only while ``work_id`` is a member of it.
+
+    The membership check is part of the one INSERT, so it runs under SQLite's write lock: a
+    removal committed before it leaves no marker, one committed after it deletes the marker.
+    An old marker of a work that left the corpus is not refreshed.
+    """
     source_type = str(candidate.get("source_type") or "").strip().lower()
     source_key = str(candidate.get("source_key") or "").strip()
     candidate_key = str(candidate.get("candidate_key") or "").strip()
     if source_type not in {"pdf", "search"} or not source_key or not candidate_key:
         return
-    normalized_work_id = int(work_id) if work_id is not None else None
+    corpus_id = int(corpus_id)
+    work_id = int(work_id)
     cur = db.conn.cursor()
     try:
         cur.execute(
@@ -134,13 +141,14 @@ def _mark_candidate_in_corpus(
             INSERT INTO seed_candidates_in_corpus (
               corpus_id, source_type, source_key, candidate_key, work_id, marked_at
             )
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            SELECT ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+            WHERE EXISTS (SELECT 1 FROM corpus_works WHERE corpus_id = ? AND work_id = ?)
             ON CONFLICT(corpus_id, source_type, source_key, candidate_key)
             DO UPDATE SET
-              work_id = COALESCE(excluded.work_id, seed_candidates_in_corpus.work_id),
+              work_id = excluded.work_id,
               marked_at = CURRENT_TIMESTAMP
             """,
-            (int(corpus_id), source_type, source_key, candidate_key, normalized_work_id),
+            (corpus_id, source_type, source_key, candidate_key, work_id, corpus_id, work_id),
         )
         db.conn.commit()
     except sqlite3.Error:

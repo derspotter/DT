@@ -189,18 +189,22 @@ def run_pass(conn, rows, key, build_filter, mailto, batch_size, label, guard, sc
     """Generic batched backfill. `key` maps a result work to its lookup token.
 
     rows: (work_id, token, raw identifier); ``guard`` and ``scope_clause`` go to ``write_results``.
+    Rows that share a token (``W1`` and ``https://openalex.org/W1``) are all written; the token
+    is requested once per batch. Progress counts rows.
     """
     processed = 0
     matched = 0
     fielded = 0
     total = len(rows)
     for batch in chunk(rows, batch_size):
-        token_to_row = {token: (work_id, raw) for work_id, token, raw in batch}
+        token_to_rows: dict[str, list[tuple[int, str]]] = {}
+        for work_id, token, raw in batch:
+            token_to_rows.setdefault(token, []).append((work_id, raw))
         try:
             data = openalex_request_json(
                 endpoint="works",
                 params={
-                    "filter": build_filter([token for _wid, token, _raw in batch]),
+                    "filter": build_filter(list(token_to_rows)),
                     "per-page": batch_size,
                     "select": SELECT_FIELDS,
                 },
@@ -214,17 +218,14 @@ def run_pass(conn, rows, key, build_filter, mailto, batch_size, label, guard, sc
             processed += len(batch)
             continue
 
-        # One update per work: a second result for the same token would otherwise fail the
-        # guard (the first already set topics_fetched) and be counted as changed. The last
-        # result wins, as it did when every result was written in turn.
+        # One update per work, each with the raw value its row was read with: a second result
+        # for the same token would otherwise fail the guard (the first already set
+        # topics_fetched) and be counted as changed. The last result wins, as it did when every
+        # result was written in turn.
         by_work_id = {}
         for work in data.get("results", []):
-            token = key(work)
-            row = token_to_row.get(token)
-            if row is None:
-                continue
-            work_id, raw = row
-            by_work_id[work_id] = (work_id, raw, *topic_fields(work))
+            for work_id, raw in token_to_rows.get(key(work), ()):
+                by_work_id[work_id] = (work_id, raw, *topic_fields(work))
         updates = list(by_work_id.values())
         if updates:
             written = set(write_results(conn, updates, guard, scope_clause))

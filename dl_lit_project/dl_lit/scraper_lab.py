@@ -370,106 +370,118 @@ def build_artifact_record(source_type: str, metadata: dict, index: int, run_dir:
 
 def execute_scraper_job(db_path: str, run_id: int, artifacts_root: str) -> dict:
     conn = sqlite3.connect(db_path, timeout=30)
-    conn.row_factory = sqlite3.Row
-    ensure_scraper_schema(conn)
-    row = conn.execute("SELECT * FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()
-    if not row:
-        raise ValueError(f"Unknown scraper run id: {run_id}")
-
-    source_type = str(row["source_type"] or "").strip()
-    if source_type not in SCRAPER_SOURCES:
-        raise ValueError(f"Unsupported scraper source: {source_type}")
-    query = json.loads(row["query_json"] or "{}")
-    run_dir = Path(artifacts_root) / "scraper_lab" / f"run_{run_id}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    conn.execute(
-        "UPDATE scraper_runs SET status = 'running', started_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?",
-        (run_id,),
-    )
-    conn.commit()
-
     try:
-        raw_results = scrape_eurlex(query) if source_type == "eurlex" else scrape_expert_groups(query)
-        downloaded = 0
-        failed = 0
-        for index, metadata in enumerate(raw_results, start=1):
-            record = build_artifact_record(source_type, metadata, index, run_dir)
-            status = "downloaded"
-            error = None
-            if record["download_url"]:
-                try:
-                    download_file(record["download_url"], Path(record["local_artifact_path"]))
-                    Path(record["local_artifact_path"]).with_suffix(".json").write_text(
-                        record["raw_metadata_json"],
-                        encoding="utf-8",
-                    )
-                    downloaded += 1
-                except Exception as exc:
+        conn.row_factory = sqlite3.Row
+        ensure_scraper_schema(conn)
+        row = conn.execute("SELECT * FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown scraper run id: {run_id}")
+
+        source_type = str(row["source_type"] or "").strip()
+        if source_type not in SCRAPER_SOURCES:
+            raise ValueError(f"Unsupported scraper source: {source_type}")
+        if row["status"] == "completed":
+            # A replayed job (start-up or periodic recovery) never scrapes a finished run again;
+            # every new scrape gets a run of its own.
+            return {
+                "run_id": run_id,
+                "source_type": source_type,
+                "total": row["total_count"],
+                "downloaded": row["downloaded_count"],
+                "failed": row["failed_count"],
+                "replayed": True,
+            }
+        query = json.loads(row["query_json"] or "{}")
+        run_dir = Path(artifacts_root) / "scraper_lab" / f"run_{run_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        conn.execute(
+            "UPDATE scraper_runs SET status = 'running', started_at = CURRENT_TIMESTAMP, error = NULL WHERE id = ?",
+            (run_id,),
+        )
+        conn.commit()
+
+        try:
+            raw_results = scrape_eurlex(query) if source_type == "eurlex" else scrape_expert_groups(query)
+            downloaded = 0
+            failed = 0
+            for index, metadata in enumerate(raw_results, start=1):
+                record = build_artifact_record(source_type, metadata, index, run_dir)
+                status = "downloaded"
+                error = None
+                if record["download_url"]:
+                    try:
+                        download_file(record["download_url"], Path(record["local_artifact_path"]))
+                        Path(record["local_artifact_path"]).with_suffix(".json").write_text(
+                            record["raw_metadata_json"],
+                            encoding="utf-8",
+                        )
+                        downloaded += 1
+                    except Exception as exc:
+                        status = "failed"
+                        error = str(exc)
+                        failed += 1
+                else:
                     status = "failed"
-                    error = str(exc)
+                    error = "No download URL found"
                     failed += 1
-            else:
-                status = "failed"
-                error = "No download URL found"
-                failed += 1
+
+                conn.execute(
+                    """
+                    INSERT INTO scraper_artifacts (
+                      run_id, source_type, source_id, title, date, year, source_url,
+                      download_url, local_artifact_path, file_name, raw_metadata_json,
+                      bibtex_key, bibtex_entry, metadata_completeness, status, error,
+                      created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        run_id,
+                        source_type,
+                        record["source_id"],
+                        record["title"],
+                        record["date"],
+                        record["year"],
+                        record["source_url"],
+                        record["download_url"],
+                        record["local_artifact_path"],
+                        record["file_name"],
+                        record["raw_metadata_json"],
+                        record["bibtex_key"],
+                        record["bibtex_entry"],
+                        record["metadata_completeness"],
+                        status,
+                        error,
+                    ),
+                )
+                conn.commit()
 
             conn.execute(
                 """
-                INSERT INTO scraper_artifacts (
-                  run_id, source_type, source_id, title, date, year, source_url,
-                  download_url, local_artifact_path, file_name, raw_metadata_json,
-                  bibtex_key, bibtex_entry, metadata_completeness, status, error,
-                  created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                UPDATE scraper_runs
+                   SET status = 'completed',
+                       total_count = ?,
+                       downloaded_count = ?,
+                       failed_count = ?,
+                       finished_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
                 """,
-                (
-                    run_id,
-                    source_type,
-                    record["source_id"],
-                    record["title"],
-                    record["date"],
-                    record["year"],
-                    record["source_url"],
-                    record["download_url"],
-                    record["local_artifact_path"],
-                    record["file_name"],
-                    record["raw_metadata_json"],
-                    record["bibtex_key"],
-                    record["bibtex_entry"],
-                    record["metadata_completeness"],
-                    status,
-                    error,
-                ),
+                (len(raw_results), downloaded, failed, run_id),
             )
             conn.commit()
-
-        conn.execute(
-            """
-            UPDATE scraper_runs
-               SET status = 'completed',
-                   total_count = ?,
-                   downloaded_count = ?,
-                   failed_count = ?,
-                   finished_at = CURRENT_TIMESTAMP
-             WHERE id = ?
-            """,
-            (len(raw_results), downloaded, failed, run_id),
-        )
-        conn.commit()
-        return {"run_id": run_id, "source_type": source_type, "total": len(raw_results), "downloaded": downloaded, "failed": failed}
-    except Exception as exc:
-        conn.execute(
-            """
-            UPDATE scraper_runs
-               SET status = 'failed',
-                   error = ?,
-                   finished_at = CURRENT_TIMESTAMP
-             WHERE id = ?
-            """,
-            (str(exc), run_id),
-        )
-        conn.commit()
-        raise
+            return {"run_id": run_id, "source_type": source_type, "total": len(raw_results), "downloaded": downloaded, "failed": failed}
+        except Exception as exc:
+            conn.execute(
+                """
+                UPDATE scraper_runs
+                   SET status = 'failed',
+                       error = ?,
+                       finished_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (str(exc), run_id),
+            )
+            conn.commit()
+            raise
     finally:
         conn.close()
