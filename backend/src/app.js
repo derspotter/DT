@@ -6378,10 +6378,17 @@ export function createApp({ broadcast, broadcastEvent, mailTransport, loginLimit
   // BE-59: the last error handler, after every route. Without it an error no
   // route catches (multer, the body parser, an async throw) reaches Express's
   // default handler, which answers HTML with the stack outside NODE_ENV=production.
+  // A file route may have set its own headers before failing (send's 416 after
+  // Content-Type: application/pdf, a snapshot's Content-Encoding: gzip); the
+  // JSON answer drops them and keeps only a 416's Content-Range.
+  const ENTITY_HEADERS = ['Content-Type', 'Content-Disposition', 'Content-Encoding', 'Content-Length', 'ETag', 'Last-Modified'];
+  const clientErrorStatus = (error) => [error?.status, error?.statusCode]
+    .find((value) => Number.isInteger(value) && value >= 400 && value <= 499);
   app.use((error, req, res, next) => {
     if (res.headersSent) return next(error);
-    const status = Number.isInteger(error?.status) ? error.status : error?.statusCode;
-    if (Number.isInteger(status) && status >= 400 && status <= 499) {
+    for (const header of ENTITY_HEADERS) res.removeHeader(header);
+    const status = clientErrorStatus(error);
+    if (status !== undefined) {
       return res.status(status).json({ error: error.expose && error.message ? error.message : 'Bad request' });
     }
     return sendServerError(req, res, 'express', error, 'Internal server error');
