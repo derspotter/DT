@@ -276,5 +276,11 @@ process.exit(1)
     expect(exact.slice(37)).toBe(fitting)
     const longer = await upload('alice', `a.${'e'.repeat(200)}`, '%PDF-1.4\n%%EOF\n')
     expect(longer.slice(37)).toBe(`a.${'e'.repeat(148)}`)
+
+    // A cut that ends the stem on a dot drops the dot, so the import's path
+    // check (no '..') still accepts the staged name.
+    const dotted = await upload('alice', `${'x'.repeat(144)}.v.json`, '[]')
+    expect(dotted.slice(37)).toBe(`${'x'.repeat(144)}.json`)
+    expect((await importSeed('alice', { filename: dotted, kind: 'json', corpusId: ids.a })).status).toBe(200)
   })
 })

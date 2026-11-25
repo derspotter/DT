@@ -133,7 +133,10 @@ function clampUtf8Name(name, maxBytes) {
     stem += char;
     budget -= bytes;
   }
-  return stem + ext;
+  // A cut can end the stem on a dot ('x.v.json' -> 'x.' + '.json'); the import's
+  // path check refuses '..', so trailing dots and spaces go.
+  stem = stem.replace(/[.\s]+$/u, '');
+  return (stem + ext) || 'upload';
 }
 const GET_BIB_PAGES_SCRIPT = path.join(DL_LIT_CODE_DIR, 'get_bib_pages.py');
 const API_SCRAPER_SCRIPT = path.join(DL_LIT_CODE_DIR, 'APIscraper_v2.py');
