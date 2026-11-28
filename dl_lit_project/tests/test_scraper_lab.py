@@ -112,3 +112,136 @@ def test_eurlex_response_validation_surfaces_soap_fault():
 def test_eurlex_response_validation_rejects_http_errors_without_fault():
     with pytest.raises(RuntimeError, match="HTTP 503"):
         raise_for_eurlex_response(b"service unavailable", 503)
+
+
+# --- a completed run is not scraped again (PY-58, spec D16) ---------------------------
+
+import json
+import sqlite3
+
+from dl_lit import scraper_lab
+
+
+def _lab_db(tmp_path, status, total=0, downloaded=0, failed=0, artifacts=0):
+    db_path = tmp_path / "lab.db"
+    conn = sqlite3.connect(db_path)
+    scraper_lab.ensure_scraper_schema(conn)
+    run_id = conn.execute(
+        """
+        INSERT INTO scraper_runs (source_type, query_json, status, total_count, downloaded_count, failed_count,
+                                  started_at, finished_at)
+        VALUES ('eurlex', ?, ?, ?, ?, ?, '2000-01-01 00:00:00', '2000-01-01 00:01:00')
+        """,
+        (json.dumps({"fm_coded": "REG"}), status, total, downloaded, failed),
+    ).lastrowid
+    for index in range(artifacts):
+        conn.execute(
+            "INSERT INTO scraper_artifacts (run_id, source_type, title, status) VALUES (?, 'eurlex', ?, 'downloaded')",
+            (run_id, f"A{index}"),
+        )
+    conn.commit()
+    conn.close()
+    return str(db_path), run_id
+
+
+def _run_row(db_path, run_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT * FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()
+    artifacts = conn.execute("SELECT COUNT(*) FROM scraper_artifacts WHERE run_id = ?", (run_id,)).fetchone()[0]
+    conn.close()
+    return row, artifacts
+
+
+def _scraped_again(_query):
+    raise AssertionError("scraped again")
+
+
+def test_a_completed_run_is_not_scraped_again(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "completed", total=3, downloaded=2, failed=1, artifacts=1)
+    before = _run_row(db_path, run_id)
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", _scraped_again)
+
+    result = scraper_lab.execute_scraper_job(db_path, run_id, str(tmp_path / "artifacts"))
+
+    assert result == {"run_id": run_id, "source_type": "eurlex", "total": 3, "downloaded": 2, "failed": 1, "replayed": True}
+    assert _run_row(db_path, run_id) == before
+    assert before[1] == 1
+
+
+def test_a_pending_run_still_scrapes(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "pending")
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", lambda _query: [])
+
+    result = scraper_lab.execute_scraper_job(db_path, run_id, str(tmp_path / "artifacts"))
+
+    assert result == {"run_id": run_id, "source_type": "eurlex", "total": 0, "downloaded": 0, "failed": 0}
+    conn = sqlite3.connect(db_path)
+    assert conn.execute("SELECT status FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()[0] == "completed"
+    conn.close()
+
+
+def test_every_connection_is_closed(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "completed", total=3, downloaded=2, failed=1)
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", _scraped_again)
+    opened = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(scraper_lab.sqlite3, "connect", recording_connect)
+
+    scraper_lab.execute_scraper_job(db_path, run_id, str(tmp_path / "artifacts"))
+    with pytest.raises(ValueError, match="Unknown scraper run id"):
+        scraper_lab.execute_scraper_job(db_path, run_id + 100, str(tmp_path / "artifacts"))
+
+    assert len(opened) == 2
+    for conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+# --- a run that fails before scraping is marked failed, not left queued ------------
+
+
+def _set_query_json(db_path, run_id, text):
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE scraper_runs SET query_json = ? WHERE id = ?", (text, run_id))
+    conn.commit()
+    conn.close()
+
+
+def _status_error(db_path, run_id):
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, error FROM scraper_runs WHERE id = ?", (run_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def test_a_corrupt_query_marks_the_run_failed(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "queued")
+    _set_query_json(db_path, run_id, "{not json")
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", _scraped_again)
+
+    with pytest.raises(json.JSONDecodeError):
+        scraper_lab.execute_scraper_job(db_path, run_id, str(tmp_path / "artifacts"))
+
+    status, error = _status_error(db_path, run_id)
+    assert status == "failed"
+    assert error
+
+
+def test_an_unwritable_run_dir_marks_the_run_failed(tmp_path, monkeypatch):
+    db_path, run_id = _lab_db(tmp_path, "queued")
+    blocker = tmp_path / "artifacts"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(scraper_lab, "scrape_eurlex", _scraped_again)
+
+    with pytest.raises(OSError):
+        scraper_lab.execute_scraper_job(db_path, run_id, str(blocker))
+
+    status, error = _status_error(db_path, run_id)
+    assert status == "failed"
+    assert error

@@ -406,6 +406,23 @@ describe('corpus sharing and multi-user isolation', () => {
         .delete(`/api/corpus/works/${workId}`)
         .set('Authorization', `Bearer ${admin.token}`)
       expect(res.status).toBe(500)
+      // The admin reads the SQLite text (D10).
+      expect(res.body).toEqual({ error: 'marker delete failed' })
+
+      // An editor of the corpus gets the route's fallback, not the SQLite text (D10).
+      const editorName = 'marker-trigger-editor'
+      const editorPassword = 'marker-trigger-editor-password'
+      const editor = createActiveUser(editorName, editorPassword)
+      withDb((db) => {
+        db.prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'editor')").run(editor.userId, corpusId)
+        db.prepare('UPDATE users SET last_corpus_id = ? WHERE id = ?').run(corpusId, editor.userId)
+      })
+      const editorLogin = await login(editorName, editorPassword)
+      const editorRes = await request(app)
+        .delete(`/api/corpus/works/${workId}`)
+        .set('Authorization', `Bearer ${editorLogin.token}`)
+      expect(editorRes.status).toBe(500)
+      expect(editorRes.body).toEqual({ error: 'Failed to remove work from corpus' })
 
       withDb((db) => {
         const membership = db

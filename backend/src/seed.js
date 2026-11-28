@@ -1,24 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { bucketCounts, readWorkStateCounts } from './pipelineReads.js'
-function tableExists(db, tableName) {
-  const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName)
-  return Boolean(row)
-}
+import { tableExists, tableHasColumn, listTableColumns, parseJson } from './dbHelpers.js'
+import { normalizeDoi, normalizeOpenAlexId } from './identifiers.js'
 
-function tableHasColumn(db, tableName, columnName) {
-  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all()
-  return rows.some((row) => row.name === columnName)
-}
+export const SEED_SOURCE_TYPES = new Set(['pdf', 'search'])
 
-function parseJson(value, fallback = null) {
-  if (value === undefined || value === null || value === '') return fallback
-  if (typeof value === 'object') return value
-  try {
-    return JSON.parse(value)
-  } catch {
-    return fallback
-  }
+export function isSeedSourceType(value) {
+  return SEED_SOURCE_TYPES.has(value)
 }
 
 function parseNameList(value) {
@@ -41,21 +30,6 @@ function parseNameList(value) {
 function normalizeText(text) {
   if (!text) return null
   return String(text).toLowerCase().replace(/[^a-z0-9\s]/g, '').trim() || null
-}
-
-function normalizeDoi(doi) {
-  if (!doi) return null
-  const match = String(doi).match(/(10\.\d{4,9}\/[\-._;()/:A-Z0-9]+)/i)
-  if (match) return match[1].toUpperCase()
-  return String(doi).trim().toUpperCase() || null
-}
-
-function normalizeOpenAlexId(value) {
-  if (!value) return null
-  const raw = String(value).trim()
-  if (!raw) return null
-  const match = raw.match(/(https?:\/\/openalex\.org\/W\d+|W\d+)/i)
-  return match ? match[1].toUpperCase() : raw.toUpperCase()
 }
 
 function normalizeYear(value) {
@@ -113,7 +87,9 @@ function sortSeedCandidates(candidates) {
 }
 
 function loadMatchRows(db, table, { corpusId = null, requireSelected = false, onlyQueued = false, onlyDownloaded = false } = {}) {
-  if (!tableExists(db, table)) return []
+  // An empty column list means the table is missing: one existence probe per load.
+  const cols = listTableColumns(db, table)
+  if (cols.length === 0) return []
 
   const joins = []
   const where = []
@@ -134,14 +110,11 @@ function loadMatchRows(db, table, { corpusId = null, requireSelected = false, on
   }
 
   const columns = ['t.id', 't.title', 't.authors', 't.year', 't.doi']
-  if (tableExists(db, table)) {
-    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name)
-    if (cols.includes('openalex_id')) columns.push('t.openalex_id')
-    if (cols.includes('download_state')) columns.push('t.download_state')
-    if (cols.includes('download_last_error')) columns.push('t.download_last_error')
-    if (cols.includes('metadata_status')) columns.push('t.metadata_status')
-    if (cols.includes('download_status')) columns.push('t.download_status')
-  }
+  if (cols.includes('openalex_id')) columns.push('t.openalex_id')
+  if (cols.includes('download_state')) columns.push('t.download_state')
+  if (cols.includes('download_last_error')) columns.push('t.download_last_error')
+  if (cols.includes('metadata_status')) columns.push('t.metadata_status')
+  if (cols.includes('download_status')) columns.push('t.download_status')
 
   const query = `
     SELECT ${columns.join(', ')}
@@ -821,7 +794,7 @@ export function listSeedCandidates(db, corpusId, sourceType, sourceKey, { stateR
   const needle = String(q || '').trim().toLowerCase()
   const sourceKind = String(sourceType || '').trim().toLowerCase()
   const sourceRef = String(sourceKey || '').trim()
-  if (!sourceRef || !['pdf', 'search'].includes(sourceKind)) return []
+  if (!sourceRef || !isSeedSourceType(sourceKind)) return []
 
   const resolverBundle = stateResolver || createStateResolver(db, corpusId, { resolveDownloadedFilePath })
   const inCorpusMarked = loadInCorpusCandidateKeySet(db, corpusId, sourceKind, sourceRef)
@@ -1001,6 +974,21 @@ function summarizeStates(candidates) {
   return stateCounts
 }
 
+// The OpenAlex rate-limit message inside a failure text, or null. The
+// keyword-search launch answers it as a 429; the seed list shows it to
+// everyone. Shared on purpose; the ValueError->400 mapping is not.
+export function openAlexRateLimitText(message) {
+  const match = String(message || '').match(/OpenAlex rate limit exceeded\.?(?: Retry after \d+s\.)?/)
+  return match ? match[0] : null
+}
+
+// What a non-admin reads for a failed search run: the rate-limit message or
+// the Node-written restart text, else 'search failed'.
+function sharedRunFailureText(storedError) {
+  if (storedError === 'backend restarted') return storedError
+  return openAlexRateLimitText(storedError) || 'search failed'
+}
+
 export function listSeedSources(db, corpusId, {
   limit = 200,
   resolveDownloadedFilePath = null,
@@ -1013,6 +1001,10 @@ export function listSeedSources(db, corpusId, {
   // gets `state_counts: null`; the candidates route asks for one seed via
   // `only` and keeps the counts.
   withStateCounts = true,
+  // A failed run's stored error is child output (D10): only the admin reads
+  // it; everyone else gets 'search failed', except the rate-limit message and
+  // the restart sweep's text (sharedRunFailureText). A done run's quota note stays.
+  runErrorDetail = false,
 } = {}) {
   // Built on first use only: the light list (withStateCounts: false) never
   // needs it.
@@ -1113,7 +1105,12 @@ export function listSeedSources(db, corpusId, {
     if (!sourceKey || !wanted('search', sourceKey)) return
     const total = countSeedCandidates(db, corpusId, 'search', sourceKey, { q })
     const run = row.status !== undefined
-      ? { status: row.status || null, fetched_count: row.fetched_count ?? null, expected_count: row.expected_count ?? null, error: row.error || null }
+      ? {
+        status: row.status || null,
+        fetched_count: row.fetched_count ?? null,
+        expected_count: row.expected_count ?? null,
+        error: row.status === 'failed' && !runErrorDetail ? sharedRunFailureText(row.error) : (row.error || null),
+      }
       : null
     if (total === 0 && run?.status !== 'running') return
     const withinLimit = withStateCounts && total <= seedStateCountLimit()
@@ -1154,7 +1151,7 @@ export function listSeedSources(db, corpusId, {
 export function hideSeedSource(db, corpusId, sourceType, sourceKey) {
   const type = String(sourceType || '').trim().toLowerCase()
   const key = String(sourceKey || '').trim()
-  if (!key || !['pdf', 'search'].includes(type)) return false
+  if (!key || !isSeedSourceType(type)) return false
   const result = db.prepare(
     `INSERT OR REPLACE INTO seed_sources_hidden (corpus_id, source_type, source_key, hidden_at)
      VALUES (?, ?, ?, CURRENT_TIMESTAMP)`
@@ -1166,7 +1163,7 @@ export function dismissSeedCandidates(db, corpusId, sourceType, sourceKey, candi
   const type = String(sourceType || '').trim().toLowerCase()
   const key = String(sourceKey || '').trim()
   const normalized = [...new Set((candidateKeys || []).map((value) => String(value || '').trim()).filter(Boolean))]
-  if (!key || !['pdf', 'search'].includes(type) || normalized.length === 0) return 0
+  if (!key || !isSeedSourceType(type) || normalized.length === 0) return 0
   const insert = db.prepare(
     `INSERT OR REPLACE INTO seed_candidates_dismissed (corpus_id, source_type, source_key, candidate_key, dismissed_at)
      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`

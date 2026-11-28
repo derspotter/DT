@@ -981,3 +981,53 @@ def test_a_second_level_citing_url_that_is_rejected_falls_back_too(keyed_env):
     assert session.sent[1].startswith("https://api.openalex.org/works?filter=cites:W7&")
     expanded = enrichment["citing_works"][0]["citing_works_expanded"]
     assert [w["openalex_id"] for w in expanded] == ["https://openalex.org/W8"]
+
+
+# --- PY-59: the bibliography CLI reads the producer's top-level citation fields (spec D17) ----
+
+_REF_OPENALEX = {"title": "A", "authors": ["Ann"]}
+_REF_CROSSREF = {"title": "B", "authors": ["Bob"]}
+_REF_UNMATCHED = {"title": "C", "authors": ["Cid"]}
+
+
+def _cli_run(tmp_path, monkeypatch, **kwargs):
+    from urllib.parse import urlsplit
+
+    from dl_lit import OpenAlexScraper
+
+    answers = iter([
+        {"title": "A", "openalex_id": "https://openalex.org/W7", "cited_by_api_url": "https://api.openalex.org/works?filter=cites:W7"},
+        {"title": "B", "openalex_id": None, "cited_by_api_url": "https://api.crossref.org/works/10.1/x"},
+        None,
+    ])
+    monkeypatch.setattr(OpenAlexScraper, "process_single_reference", lambda ref, searcher, limiter: next(answers))
+    searcher = OpenAlexScraper.OpenAlexCrossrefSearcher(rate_limiter=_FreeLimiter())
+    session = _RecordingSession([_citing_page("W99")])
+    searcher.openalex_session = session
+
+    source = tmp_path / "bib.json"
+    source.write_text(json.dumps([_REF_OPENALEX, _REF_CROSSREF, _REF_UNMATCHED]), encoding="utf-8")
+    (tmp_path / "out").mkdir()
+    OpenAlexScraper.process_single_file(str(source), str(tmp_path / "out"), searcher, **kwargs)
+    out = json.loads((tmp_path / "out" / "bib.json").read_text(encoding="utf-8"))
+    return out, [urlsplit(url).netloc for url in session.sent]
+
+
+def test_the_cli_fetches_citing_works_only_for_openalex_matches(keyed_env, tmp_path, monkeypatch):
+    out, hosts = _cli_run(tmp_path, monkeypatch)
+
+    assert len(out) == 3
+    assert out[0]["citing_works_ids"] == [
+        {"openalex_id": "https://openalex.org/W99", "title": None, "authors": [], "year": None, "doi": None, "type": None}
+    ]
+    assert out[1]["citing_works_ids"] == []
+    assert out[2] == _REF_UNMATCHED
+    assert hosts == ["api.openalex.org"]
+
+
+def test_the_cli_fetches_nothing_without_fetch_citations(keyed_env, tmp_path, monkeypatch):
+    out, hosts = _cli_run(tmp_path, monkeypatch, fetch_citations=False)
+
+    assert hosts == []
+    assert "citing_works_ids" not in out[0] and "citing_works_ids" not in out[1]
+    assert out[2] == _REF_UNMATCHED

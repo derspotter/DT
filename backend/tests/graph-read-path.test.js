@@ -390,6 +390,18 @@ process.stdout.write('{}')
       expect([...range.body]).toEqual([1, 2])
     })
 
+    // BE-59 review: send fails an unsatisfiable range with a 416 after setting
+    // the file's own headers; the last error handler answers JSON, keeps the
+    // Content-Range and drops the file's Content-Type.
+    test('an unsatisfiable range answers a JSON 416 with its Content-Range', async () => {
+      const res = await get(`${fileUrl}?v=A`, fx.adminToken).set('Accept-Encoding', 'identity').set('Range', 'bytes=10-20')
+      expect(res.status).toBe(416)
+      expect(res.headers['content-type']).toMatch(/application\/json/)
+      expect(res.headers['content-range']).toBe('bytes */4')
+      expect(res.headers['content-encoding']).toBeUndefined()
+      expect(res.body).toEqual({ error: 'Range Not Satisfiable' })
+    })
+
     // Only a missing manifest means "rebuilt" (409); an unreadable one is a
     // server error, logged, not a reason to reload the graph forever.
     test('an unreadable manifest answers 500 and is logged; a missing one still answers 409', async () => {

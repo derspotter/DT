@@ -279,18 +279,21 @@ export async function uploadPdf(file) {
   })
 }
 
-export async function importSeed(filename, kind) {
+// The import and the extraction run in the corpus they were started from
+// (FE-65b), not in one the user switched to meanwhile.
+export async function importSeed(filename, kind, { corpusId } = {}) {
   return requestJson('/api/ingest/import-seed', {
     method: 'POST',
-    body: { filename, kind },
+    body: Number.isFinite(corpusId) ? { filename, kind, corpusId } : { filename, kind },
     timeout: UPLOAD_TIMEOUT,
     errorMessage: 'Import failed',
   })
 }
 
-export async function extractBibliography(filename) {
+export async function extractBibliography(filename, { corpusId } = {}) {
   return requestJson(`/api/extract-bibliography/${encodeURIComponent(filename)}`, {
     method: 'POST',
+    body: Number.isFinite(corpusId) ? { corpusId } : undefined,
     errorMessage: 'Extraction failed',
   })
 }

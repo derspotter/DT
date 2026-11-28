@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import Database from 'better-sqlite3'
+import bcrypt from 'bcryptjs'
 import request from 'supertest'
 import { jest } from '@jest/globals'
 
@@ -15,6 +16,7 @@ describe('background search run: dead children and failed registration', () => {
   let openAlexQuotaStop = null
   let activeSearchRuns = null
   let authToken = ''
+  let editorToken = ''
   let corpusId = null
   let dbPath = ''
   let tempDir = ''
@@ -53,6 +55,7 @@ describe('background search run: dead children and failed registration', () => {
     // hard-container-stop shape.
     fs.writeFileSync(fakePython, `#!/usr/bin/env node
 console.log(JSON.stringify({ event: 'run_created', runId: Number(process.env.FAKE_RUN_ID || '1') }))
+if (process.env.FAKE_STDERR) process.stderr.write(process.env.FAKE_STDERR)
 if (process.env.FAKE_FINAL_JSON) console.log(process.env.FAKE_FINAL_JSON)
 setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
 `)
@@ -92,10 +95,45 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           finished_at TIMESTAMP
         );
+        CREATE TABLE ingest_entries (
+          id INTEGER PRIMARY KEY,
+          corpus_id INTEGER NOT NULL,
+          ingest_source TEXT NOT NULL,
+          title TEXT,
+          authors TEXT,
+          year TEXT,
+          doi TEXT,
+          source TEXT,
+          publisher TEXT,
+          url TEXT,
+          source_pdf TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE search_results (
+          id INTEGER PRIMARY KEY,
+          search_run_id INTEGER NOT NULL,
+          title TEXT,
+          doi TEXT,
+          openalex_id TEXT,
+          year TEXT,
+          raw_json TEXT
+        );
       `)
+      // An editor of the admin's corpus, the corpus every run here is registered to.
+      const editorId = Number(db.prepare(
+        `INSERT INTO users (username, password_hash, email, account_status, password_set_at, last_corpus_id)
+         VALUES ('failure-editor', ?, 'failure-editor@example.test', 'active', CURRENT_TIMESTAMP, ?)`
+      ).run(bcrypt.hashSync('failure-editor-password', 4), corpusId).lastInsertRowid)
+      db.prepare("INSERT INTO user_corpora (user_id, corpus_id, role) VALUES (?, ?, 'editor')").run(editorId, corpusId)
     } finally {
       db.close()
     }
+    const editorLogin = await request(app).post('/api/auth/login').send({
+      username: 'failure-editor',
+      password: 'failure-editor-password',
+    })
+    expect(editorLogin.status).toBe(200)
+    editorToken = editorLogin.body.token
   })
 
   afterAll(() => {
@@ -109,6 +147,7 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
     delete process.env.FAKE_RUN_ID
     delete process.env.FAKE_EXIT_CODE
     delete process.env.FAKE_FINAL_JSON
+    delete process.env.FAKE_STDERR
     if (tempDir && fs.existsSync(tempDir)) {
       try { fs.rmSync(tempDir, { recursive: true, force: true }) } catch { /* noop */ }
     }
@@ -141,6 +180,99 @@ setTimeout(() => process.exit(Number(process.env.FAKE_EXIT_CODE || '9')), 30)
     expect(row.error).toMatch(/^search process exited \(/)
     expect(row.finished_at).toBeTruthy()
     expect(activeSearchRuns.has(6001)).toBe(false)
+  })
+
+  // A failed run's stored error is child output: the seed API shows it to the
+  // admin only; everyone else reads 'search failed' (D10). A done run's quota
+  // note stays for everyone.
+  test('a failed run shows its error only to the admin', async () => {
+    const withDb = (fn) => {
+      const db = new Database(dbPath)
+      try { return fn(db) } finally { db.close() }
+    }
+    const addResult = (runId) => withDb((db) => db.prepare(
+      `INSERT INTO search_results (search_run_id, title, year, raw_json) VALUES (?, ?, '2020', '{}')`
+    ).run(runId, `Result of ${runId}`))
+    const register = (runId) => withDb((db) => db.prepare(
+      'INSERT INTO search_run_corpora (search_run_id, corpus_id) VALUES (?, ?)'
+    ).run(runId, corpusId))
+    const note = 'OpenAlex quota exhausted; expansion stopped early. Results fetched before the stop are kept.'
+    const runErrors = async (token, runId) => {
+      const list = await request(app).get('/api/seed/sources').set('Authorization', `Bearer ${token}`)
+      expect(list.status).toBe(200)
+      const source = list.body.sources.find((item) => item.source_type === 'search' && String(item.source_key) === String(runId))
+      expect(source).toBeTruthy()
+      const detail = await request(app)
+        .get(`/api/seed/sources/search/${runId}/candidates`)
+        .set('Authorization', `Bearer ${token}`)
+      expect(detail.status).toBe(200)
+      return [source.run.error, detail.body.source_summary.run.error]
+    }
+
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
+    let logged = null
+    try {
+      insertRunningRun(6101)
+      addResult(6101)
+      process.env.FAKE_RUN_ID = '6101'
+      process.env.FAKE_EXIT_CODE = '3'
+      process.env.FAKE_STDERR = 'SECRET-DIAG /srv/private/path'
+      const res = await request(app)
+        .post('/api/keyword-search')
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ query: 'secret failure' })
+      expect(res.status).toBe(202)
+      expect(await waitUntil(() => runStatus(6101)?.status === 'failed')).toBe(true)
+      expect(runStatus(6101).error).toContain('SECRET-DIAG')
+      expect(await waitUntil(() => errorSpy.mock.calls.some(([tag]) => tag === '[/api/keyword-search] Search script failed:'))).toBe(true)
+      logged = errorSpy.mock.calls.find(([tag]) => tag === '[/api/keyword-search] Search script failed:')
+    } finally {
+      delete process.env.FAKE_STDERR
+      errorSpy.mockRestore()
+    }
+
+    expect(await runErrors(editorToken, 6101)).toEqual(['search failed', 'search failed'])
+    for (const text of await runErrors(authToken, 6101)) expect(text).toContain('SECRET-DIAG')
+    // The launch's log line has the whole error, not just its message.
+    expect(logged[1]).toBeInstanceOf(Error)
+    expect(logged[1].message).toContain('SECRET-DIAG')
+
+    // A row that failed before this change holds the same kind of text.
+    withDb((db) => db.prepare(
+      `INSERT INTO search_runs (id, query, status, fetched_count, error) VALUES (6102, 'old failure', 'failed', 1, ?)`
+    ).run('Traceback: SECRET-DIAG /srv/private/path'))
+    addResult(6102)
+    register(6102)
+    expect(await runErrors(editorToken, 6102)).toEqual(['search failed', 'search failed'])
+    for (const text of await runErrors(authToken, 6102)) expect(text).toContain('SECRET-DIAG')
+
+    withDb((db) => db.prepare(
+      `INSERT INTO search_runs (id, query, status, fetched_count, error) VALUES (6103, 'quota stop', 'done', 1, ?)`
+    ).run(note))
+    addResult(6103)
+    register(6103)
+    expect(await runErrors(editorToken, 6103)).toEqual([note, note])
+
+    // Two failure texts are ours, not child output, and everyone reads them:
+    // the OpenAlex rate-limit message (the one the launch maps to 429) and
+    // the restart sweep's 'backend restarted'. Only the rate-limit part of a
+    // longer text is shown.
+    const rateLimit = 'OpenAlex rate limit exceeded. Retry after 5s.'
+    const shared = [
+      [6104, rateLimit, rateLimit],
+      [6105, 'backend restarted', 'backend restarted'],
+      [6106, `Traceback: SECRET-DIAG /srv/private/path\nRuntimeError: ${rateLimit}`, rateLimit],
+    ]
+    for (const [runId, stored] of shared) {
+      withDb((db) => db.prepare(
+        `INSERT INTO search_runs (id, query, status, fetched_count, error) VALUES (?, 'shared failure', 'failed', 1, ?)`
+      ).run(runId, stored))
+      addResult(runId)
+      register(runId)
+    }
+    for (const [runId, , shown] of shared) {
+      expect(await runErrors(editorToken, runId)).toEqual([shown, shown])
+    }
   })
 
   test('a run the child already settled is left alone', async () => {

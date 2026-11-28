@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { ensureSeedSchema, listSeedCandidates, listSeedSources, countSeedCandidates, dismissAllSeedCandidates } from '../src/seed.js'
+import { ensureSeedSchema, listSeedCandidates, listSeedSources, countSeedCandidates, dismissAllSeedCandidates, createStateResolver } from '../src/seed.js'
 
 function createSeedDb() {
   const db = new Database(':memory:')
@@ -191,6 +191,51 @@ describe('seed candidate venue fallback', () => {
     const [candidate] = listSeedCandidates(db, 130, 'search', '7')
 
     expect(candidate.source).toBe('Journal of Labour Studies')
+  })
+})
+
+describe('seed candidate OpenAlex URL ids', () => {
+  let db
+
+  afterEach(() => {
+    db?.close()
+    db = null
+  })
+
+  // The candidate falls back to raw_json.id, a URL, when search_results.openalex_id
+  // is empty; stored works carry the bare id.
+  function urlOnlyCandidateDb(workCorpusId) {
+    const created = createSearchSeedDb()
+    insertSearchResult(created, { id: 'https://openalex.org/W12', display_name: 'Other title' })
+    created.prepare(
+      `INSERT INTO works (id, title, openalex_id, metadata_status, download_status)
+       VALUES (300, 'Different', 'W12', 'matched', 'downloaded')`
+    ).run()
+    created.prepare('INSERT INTO corpus_works (corpus_id, work_id) VALUES (?, 300)').run(workCorpusId)
+    return created
+  }
+
+  test('a search candidate whose OpenAlex id is only its raw URL matches the corpus work', () => {
+    db = urlOnlyCandidateDb(130)
+    const [candidate] = listSeedCandidates(db, 130, 'search', '7')
+    expect(candidate.openalex_id).toBe('https://openalex.org/W12')
+    expect(candidate.state).toBe('downloaded')
+    expect(candidate.downloaded_work_id).toBe(300)
+  })
+
+  test('a URL-form match in another corpus follows the read rule', () => {
+    db = urlOnlyCandidateDb(131)
+    const permitted = listSeedCandidates(db, 130, 'search', '7', {
+      stateResolver: createStateResolver(db, 130, { canReadWork: () => true }),
+    })[0]
+    expect(permitted.state).toBe('downloaded_elsewhere')
+    expect(permitted.downloaded_work_id).toBe(300)
+
+    const refused = listSeedCandidates(db, 130, 'search', '7', {
+      stateResolver: createStateResolver(db, 130, { canReadWork: () => false }),
+    })[0]
+    expect(refused.state).toBe('pending')
+    expect(refused.downloaded_work_id).toBeNull()
   })
 })
 

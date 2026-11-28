@@ -1,6 +1,7 @@
 <script>
   import UpstreamCorpusMap from './UpstreamCorpusMap.svelte'
   import { createUpstreamCorpusItemDownloadUrl } from '../lib/api'
+  import { openDownloadUrl } from '../lib/download'
   import { formatAuthors } from '../lib/works'
 
   export let corpora = []
@@ -122,12 +123,7 @@
     currentDownloadError = false
     try {
       const url = await createUpstreamCorpusItemDownloadUrl(selectedTargetId, item.id)
-      const link = document.createElement('a')
-      link.href = url
-      link.rel = 'noopener'
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
+      openDownloadUrl(url)
       currentDownloadStatus = 'Download started.'
     } catch (err) {
       currentDownloadError = true

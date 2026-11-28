@@ -8,6 +8,7 @@
     fetchScraperRun,
     fetchScraperRuns,
   } from '../lib/api'
+  import { saveBlob } from '../lib/download'
 
   let sourceType = 'eurlex'
   let eurlexForm = {
@@ -187,14 +188,7 @@
     status = 'Downloading generated metadata.bib...'
     try {
       const { blob, filename } = await downloadScraperMetadataDraft(applyResult.event_id)
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = filename || 'metadata.bib'
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
-      URL.revokeObjectURL(url)
+      saveBlob(blob, filename || 'metadata.bib')
       status = 'Generated metadata.bib downloaded.'
     } catch (err) {
       error = err?.message || 'Failed to download generated metadata.bib.'

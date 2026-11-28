@@ -1,14 +1,8 @@
-export function tableExists(db, name) {
-  return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(name))
-}
+import { tableExists, tableHasColumn } from './dbHelpers.js'
 
 const nonNegInt = (value, fallback) => {
   const n = Math.trunc(Number(value))
   return Number.isFinite(n) ? Math.max(n, 0) : fallback
-}
-
-function hasColumn(db, table, column) {
-  return db.prepare(`PRAGMA table_info(${table})`).all().some((col) => col.name === column)
 }
 
 // Python's str.isspace() set, as corpusList's STATUS_SQL trims it (that file's
@@ -105,7 +99,7 @@ export function readWorkStateCounts(db, corpusId, { nowSec, smallCorpusLimit = S
   const scoped = corpusId !== null && corpusId !== undefined
   const compute = () => {
     const now = nowSec ?? Math.floor(Date.now() / 1000)
-    const leased = hasColumn(db, 'works', 'metadata_lease_expires_at') && hasColumn(db, 'works', 'download_lease_expires_at')
+    const leased = tableHasColumn(db, 'works', 'metadata_lease_expires_at') && tableHasColumn(db, 'works', 'download_lease_expires_at')
     let from = 'FROM works w'
     if (scoped) {
       from = corpusIsSmall(db, corpusId, smallCorpusLimit)

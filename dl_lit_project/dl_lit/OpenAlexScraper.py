@@ -986,18 +986,20 @@ def process_single_file(json_file, output_dir, searcher, fetch_citations=True):
 
     for ref in references:
         enriched_ref = process_single_reference(ref, searcher, searcher.rate_limiter)
-        best_match = (enriched_ref or {}).get('best_match_result') or {}
-        cited_by_url = citing_works_url(best_match.get('cited_by_api_url'), best_match.get('id'))
-        if enriched_ref and fetch_citations and cited_by_url:
-            print(f"Fetching citations for: {best_match.get('display_name')}")
-            enriched_ref['citing_works_ids'] = fetch_citing_work_ids(
-                cited_by_url,
-                searcher.rate_limiter, 
-                searcher.headers['User-Agent'].split('/')[-1], # Extract mailto from User-Agent
-                session=searcher.openalex_session,
-                timeout=searcher.openalex_timeout,
-                api_key=searcher.api_key,
-            )
+        # The producer (_build_enrichment_payload) keeps the citation fields at the top level;
+        # an unmatched reference is None and is written back unchanged.
+        if enriched_ref and fetch_citations:
+            cited_by_url = citing_works_url(enriched_ref.get('cited_by_api_url'), enriched_ref.get('openalex_id'))
+            if cited_by_url:
+                print(f"Fetching citations for: {enriched_ref.get('title')}")
+                enriched_ref['citing_works_ids'] = fetch_citing_work_ids(
+                    cited_by_url,
+                    searcher.rate_limiter,
+                    searcher.headers['User-Agent'].split('/')[-1], # Extract mailto from User-Agent
+                    session=searcher.openalex_session,
+                    timeout=searcher.openalex_timeout,
+                    api_key=searcher.api_key,
+                )
         enriched_references.append(enriched_ref if enriched_ref else ref)
 
     with open(output_path, 'w', encoding='utf-8') as f:
